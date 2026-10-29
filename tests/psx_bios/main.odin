@@ -14,7 +14,8 @@
 //   with the other counters still pending. SetDefaultExitFromException
 //   ends the exception after the walk without the hook. WaitEvent with
 //   interrupts blocked gives up instead of hanging. syscall 3 returns 1;
-//   higher numbers deliver class 0xf0000010 spec 0x4000.
+//   higher numbers deliver class 0xf0000010 spec 0x4000. UnDeliverEvent
+//   takes a delivery back.
 //   The kernel layout games read and patch: the exception vector (at 0x00
 //   too), the C0 and B0 tables (every entry callable but the B0 ones the
 //   retail kernel leaves 0), and the pad driver's pointers and vblank
@@ -396,6 +397,16 @@ main :: proc() {
 	cpu.state.r[4] = 4
 	cpu.syscall(0)
 	check("syscall event after syscall 4", test(sys), 1)
+	// UnDeliverEvent takes back a delivery of its class and spec only.
+	b(0x07, 0xf0000010, 0x4000)
+	b(0x20, 0xf0000010, 0x1000)
+	b(0x20, 0xf0000011, 0x4000)
+	check("event after UnDeliverEvent of another spec or class", test(sys), 1)
+	b(0x07, 0xf0000010, 0x4000)
+	b(0x20, 0xf0000010, 0x4000)
+	check("event after UnDeliverEvent", test(sys), 0)
+	b(0x07, 0xf0000010, 0x4000)
+	check("event delivered after UnDeliverEvent", test(sys), 1)
 	cpu.cop0.sr = sr
 
 	// Kernel layout.

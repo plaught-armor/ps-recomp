@@ -214,6 +214,8 @@ bios_b :: proc(fn: u32) {
 		bios.hook = 0
 	case 0x19:
 		bios.hook = arg(0)
+	case 0x20:
+		undeliver_event(arg(0), arg(1))
 	case 0x32:
 		ret(card_open(cpu.mem_cstring(arg(0)), arg(1)))
 	case 0x33:
@@ -614,6 +616,18 @@ deliver_event :: proc(class, spec: u32) {
 			if e.func != 0 {
 				hle_call(e.func)
 			}
+		}
+	}
+}
+
+// UnDeliverEvent: a ready mode 0x2000 event of this class and spec goes
+// back to enabled. v0 is left as it was; the retail kernel leaves a
+// pointer into its event table there.
+@(private)
+undeliver_event :: proc(class, spec: u32) {
+	for &e in events_tab {
+		if e.status == EV_READY && e.mode == EV_MODE_READY && e.class == class && e.spec == spec {
+			e.status = EV_ENABLED
 		}
 	}
 }
