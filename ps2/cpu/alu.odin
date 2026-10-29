@@ -149,6 +149,7 @@ Fpu_Op :: enum u8 {Add, Sub, Mul, Div}
 // The f64 path of the operations, for operands or results with exponent 0
 // or 255. The divisor of a Div is never zero.
 fpu_slow :: proc "contextless" (op: Fpu_Op, a, b: f32) -> f32 {
+	when FALLBACK_COUNT {fallback_fpu_slow[op] += 1}
 	x, y := to_f64(a), to_f64(b)
 	switch op {
 	case .Add: return from_f64(x + y)

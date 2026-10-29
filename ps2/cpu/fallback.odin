@@ -21,6 +21,8 @@ fallback_ee: [r5900.Op]u64
 fallback_vu0, fallback_vu1_upper: [COP2_KEYS]u64
 fallback_vu1_lower: [128 + COP2_KEYS]u64 // opcode, then 128 + the 0x40 key
 fallback_vu1_pair: u64
+// fpu_slow calls, by op: not the interpreter, so outside the calls total.
+fallback_fpu_slow: [Fpu_Op]u64
 
 cop2_key :: #force_inline proc "contextless" (w: u32) -> u32 {
 	fn := w & 63
@@ -57,4 +59,8 @@ fallback_print :: proc() {
 	slice.sort_by(rows[:], proc(a, b: Row) -> bool {return a.n > b.n})
 	fmt.eprintfln("fallback: %d calls", total)
 	for r in rows {fmt.eprintfln("fallback: %d\t%.2f%%\t%s", r.n, 100 * f64(r.n) / f64(total), r.name)}
+	slow: u64
+	for n in fallback_fpu_slow {slow += n}
+	fmt.eprintfln("fallback: %d fpu_slow calls", slow)
+	for n, op in fallback_fpu_slow {if n != 0 {fmt.eprintfln("fallback: %d\tfpu_slow %v", n, op)}}
 }

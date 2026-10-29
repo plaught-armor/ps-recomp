@@ -7,7 +7,9 @@
 // may differ in the last mantissa bit. Rows marked 2 read an operand with
 // exponent 0 and a nonzero mantissa as zero, which the model does too, so
 // they are checked exactly. Then fkey orders exponent-255 values above every
-// host float and treats every exponent-0 value as zero.
+// host float and treats every exponent-0 value as zero. With
+// -define:FALLBACK_COUNT=true, cpu.fpu_slow counts once per row that needs
+// it.
 package main
 
 import "core:fmt"
@@ -202,6 +204,31 @@ VECTORS := [?]Vector{
 
 f :: #force_inline proc(u: u32) -> f32 {return transmute(f32)u}
 
+// Exponent 255, or exponent 0 with a nonzero mantissa.
+special :: proc(u: u32) -> bool {
+	e := u & 0x7f800000
+	return e == 0x7f800000 || (e == 0 && u & 0x007fffff != 0)
+}
+
+// The fpu_slow call a row makes, if any: an operand or the host's result
+// special, past fpu_div's zero divisor and fpu_rsqrt's zero b.
+slow_op :: proc(v: Vector) -> (cpu.Fpu_Op, bool) {
+	a, b := f(v.fs), f(v.ft)
+	r: f32
+	op: cpu.Fpu_Op
+	switch v.op {
+	case .Add: r, op = a + b, .Add
+	case .Sub: r, op = a - b, .Sub
+	case .Mul: r, op = a * b, .Mul
+	case .Div, .Rsqrt:
+		if v.ft & 0x7f800000 == 0 {return {}, false}
+		if v.op == .Rsqrt {b = cpu.fpu_sqrt(b)}
+		r, op = a / b, .Div
+	case .Sqrt: return {}, false
+	}
+	return op, special(transmute(u32)a) || special(transmute(u32)b) || special(transmute(u32)r)
+}
+
 run :: proc(v: Vector) -> u32 {
 	a, b := f(v.fs), f(v.ft)
 	r: f32
@@ -240,9 +267,27 @@ main :: proc() {
 			fails += 1
 		}
 	}
+	when cpu.FALLBACK_COUNT {
+		cpu.fallback_fpu_slow = {}
+		want: [cpu.Fpu_Op]u64
+		for v in VECTORS {
+			if op, ok := slow_op(v); ok {want[op] += 1}
+			run(v)
+		}
+		for n, op in want {
+			if n == 0 || cpu.fallback_fpu_slow[op] != n {
+				fmt.eprintfln("FAIL fallback_fpu_slow[%v] = %d, want %d (nonzero)", op, cpu.fallback_fpu_slow[op], n)
+				fails += 1
+			}
+		}
+	}
 	if fails > 0 {
 		fmt.eprintfln("%d failed", fails)
 		os.exit(1)
 	}
-	fmt.printfln("fpu: %d vectors ok", len(VECTORS))
+	when cpu.FALLBACK_COUNT {
+		fmt.printfln("fpu: %d vectors ok, fpu_slow counted %v", len(VECTORS), cpu.fallback_fpu_slow)
+	} else {
+		fmt.printfln("fpu: %d vectors ok", len(VECTORS))
+	}
 }
