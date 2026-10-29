@@ -1,0 +1,13 @@
+*.o
+*.log
+*.bin
+*.iso
+*.cue
+*.ppm
+*.png
+/rec/
+/PLAN.md
+/.qwen/
+/QWEN.md
+/tests/vu_macro/cases/
+/tests/ee_emit/cases/

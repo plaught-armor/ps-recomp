@@ -1,0 +1,72 @@
+// Booting a PS1 game: the runtime set up in the order it needs and the
+// executable's entry called, the PS1 counterpart of ps2.run.
+package psx
+
+import "core:fmt"
+
+import bios "bios"
+import cpu "cpu"
+import host "host"
+import io "io"
+import spu "spu"
+
+// What run needs from the port.
+Boot :: struct {
+	// The PS-X EXE's bytes and the path of the disc's CUE sheet.
+	exe:      []u8,
+	cue:      string,
+	// The window's title.
+	title:    cstring,
+	// The generated package's executable functions (rec.EXE_FUNCS[:]) and,
+	// generated only with the overlays option, rec.register_overlays.
+	funcs:    []cpu.Func_Entry,
+	overlays: proc(),
+	// A native blob to use in place of the Odin functions ("" none;
+	// load_native).
+	native:   string,
+	// The memory card images (bios.card_files); left empty, the runtime's.
+	cards:    [2]string,
+	// The port's own steps, each stopping the boot on false: `setup` before
+	// the window opens, `hooks` once the game's functions (native ones
+	// included) are registered, where the port installs its replacements
+	// (cpu.hook, cpu.hook_overlay) and host hooks.
+	setup:    proc() -> bool,
+	hooks:    proc() -> bool,
+}
+
+// Set up the runtime for the game b describes and call the executable's
+// entry. False when a step fails, with the reason printed; true when the
+// entry returns.
+run :: proc(b: Boot) -> bool {
+	pc, gp, sp, ok := cpu.load_exe(b.exe)
+	if !ok {
+		fmt.eprintln("not a PS-X EXE")
+		return false
+	}
+	spu.cdrom_open(b.cue) or_return
+	cpu.trace_init() or_return
+	if b.setup != nil {b.setup() or_return}
+	host.platform_init(b.title) or_return
+
+	cpu.register_funcs(b.funcs)
+	if b.overlays != nil {b.overlays()}
+	// On failure load_native prints why and the Odin functions stay.
+	if b.native != "" {load_native(b.native)}
+	if b.hooks != nil {b.hooks() or_return}
+
+	io.events_init()
+	spu.spu_init()
+	spu.xa_init()
+	io.timers_init()
+	io.dma_init()
+	bios.bios_init()
+	if b.cards != {} {bios.card_files = b.cards}
+	bios.memcard_init() or_return
+
+	cpu.state.r[28] = gp
+	cpu.state.r[29] = sp
+	cpu.state.r[30] = sp
+	cpu.cop0.sr = 0x40000401
+	cpu.call(pc)
+	return true
+}

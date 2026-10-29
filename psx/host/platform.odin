@@ -1,0 +1,996 @@
+// Host window, frame pacing and controller input (SDL2).
+package psx_host
+
+import "base:runtime"
+import "core:fmt"
+import "core:hash/xxhash"
+import "core:os"
+import "core:slice"
+import "core:strconv"
+import "core:strings"
+import "core:time"
+import sdl "vendor:sdl2"
+
+import "ps:core"
+import cpu "../cpu"
+import mdec "../mdec"
+import render "../render"
+import io "../io"
+import gpu "../gpu"
+import spu "../spu"
+
+WINDOW_W :: 640
+WINDOW_H :: 480
+// NTSC field rate.
+VBLANK_NS :: 1_000_000_000 / 60
+
+PAD_SELECT :: 0x0100
+PAD_START :: 0x0800
+PAD_UP :: 0x1000
+PAD_RIGHT :: 0x2000
+PAD_DOWN :: 0x4000
+PAD_LEFT :: 0x8000
+PAD_L2 :: 0x0001
+PAD_R2 :: 0x0002
+PAD_L1 :: 0x0004
+PAD_R1 :: 0x0008
+PAD_TRIANGLE :: 0x0010
+PAD_CIRCLE :: 0x0020
+PAD_CROSS :: 0x0040
+PAD_SQUARE :: 0x0080
+
+@(private)
+host: struct {
+	window:      ^sdl.Window,
+	renderer:    ^sdl.Renderer,
+	texture:     ^sdl.Texture,
+	// The picture a hold keeps on screen (hold_picture), shown while it
+	// lasts and then faded out over the live one for `fade` presents: the
+	// texture the window showed when the hold began, of size `held_area`.
+	held:        ^sdl.Texture,
+	held_area:   sdl.Rect,
+	holding:     bool,
+	fade:        int,
+	// Size of the picture last put in `texture`.
+	shown_w:     i32,
+	shown_h:     i32,
+	// Displayed area converted to XRGB8888, at the shown target's
+	// resolution (render_scale_apply).
+	converted:   []u32,
+	// The picture this vblank shows: `converted`, or an extra picture of a
+	// frozen-time pass (shown in place, not copied). Nil while it is a GL
+	// frame slot's still converting: read it through frame_pixels.
+	frame:       []u32,
+	// The GL frame slot the picture is the buffer of (gl_frame_take), or -1.
+	frame_slot:  int,
+	// The GL conversions (Gl_Frame.mark) of this present's picture and the
+	// last one's, -1 when none.
+	frame_mark:  int,
+	last_mark:   int,
+	// Pacing origin: emulated vblank N is due at start + N * VBLANK_NS / speed.
+	start:       time.Tick,
+	// Emulated time per real time; 1 is the console's own speed.
+	speed:       f64,
+	perf_mark:   time.Tick,
+	// End of the last vblank's pacing wait: the emulation and drawing of a
+	// vblank are timed from here (.Perf "late vblank" lines; not with vsync,
+	// whose wait is in the present).
+	work_mark:   time.Tick,
+	unpaced:     bool,
+	// Whether RenderPresent waits for the display's vblank (see vsync_update),
+	// and how many display refreshes each emulated vblank is shown for.
+	vsync:       bool,
+	vsync_shows: int,
+	// Pacing is off while the disc loads (instant_loading) or the screen is
+	// black (skip_black).
+	fast:        bool,
+	// Whether the last present showed nothing but black (see skip_black).
+	black:       bool,
+	// Presents in a row, while the disc loads, whose picture matched the
+	// one before (see instant_loading), and that picture's hash.
+	still:       u64,
+	still_hash:  u64,
+	// When the current fast-forward began, for the perf trace.
+	fast_start:  time.Tick,
+	fast_vblank: u64,
+	quit:        bool,
+	// Display area (x, y, w, h) at the previous present, to tell a repeated
+	// game frame from a new one.
+	last_area:   [4]i32,
+	// DUMP_RAM: presents between main RAM dumps into DUMP.
+	ram_every:   u64,
+	// DUMP_WINDOW=1: frame dumps also save the finished window picture.
+	dump_window: bool,
+	script:      [dynamic]Scripted_Press,
+	stick_script: [dynamic]Scripted_Stick,
+	poke_script: [dynamic]Scripted_Poke,
+	drag_script: [dynamic]Scripted_Drag,
+	point_script: [dynamic]Scripted_Point,
+	// Cycles run at the last .Perf report, for its audio mix rate.
+	perf_cycles:   u64,
+}
+
+@(private)
+AUDIO_HZ :: 44100
+
+// Debug aid: INPUT="<present>:<hex mask>[:<presents>],..." holds each
+// mask from the given present count, for SCRIPT_HOLD presents by default.
+@(private)
+Scripted_Press :: struct {
+	at:   u64,
+	mask: u16,
+	hold: u64,
+}
+
+@(private)
+SCRIPT_HOLD :: 4
+
+@(private)
+parse_script :: proc(spec: string) {
+	for item in strings.split(spec, ",", context.temp_allocator) {
+		parts := strings.split(item, ":", context.temp_allocator)
+		if len(parts) != 2 && len(parts) != 3 {
+			fmt.eprintln(core.ENV_PREFIX + "INPUT: bad entry", item)
+			continue
+		}
+		at, at_ok := strconv.parse_u64(parts[0])
+		mask, mask_ok := strconv.parse_u64(parts[1], 16)
+		hold, hold_ok := u64(SCRIPT_HOLD), true
+		if len(parts) == 3 {
+			hold, hold_ok = strconv.parse_u64(parts[2])
+		}
+		if !at_ok || !mask_ok || !hold_ok {
+			fmt.eprintln(core.ENV_PREFIX + "INPUT: bad entry", item)
+			continue
+		}
+		append(&host.script, Scripted_Press{at, u16(mask), hold})
+	}
+}
+
+// Debug aid: STICK="<present>:<lx>/<ly>/<rx>/<ry>[:<presents>],..."
+// holds analog stick positions (-1..1, after the dead zone) the same way.
+@(private)
+Scripted_Stick :: struct {
+	at:     u64,
+	sticks: Sticks,
+	hold:   u64,
+}
+
+@(private)
+parse_stick_script :: proc(spec: string) {
+	for item in strings.split(spec, ",", context.temp_allocator) {
+		parts := strings.split(item, ":", context.temp_allocator)
+		axes := strings.split(len(parts) >= 2 ? parts[1] : "", "/", context.temp_allocator)
+		ok := (len(parts) == 2 || len(parts) == 3) && len(axes) == 4
+		e := Scripted_Stick{hold = SCRIPT_HOLD}
+		at_ok, hold_ok := false, true
+		if ok {
+			e.at, at_ok = strconv.parse_u64(parts[0])
+			if len(parts) == 3 {
+				e.hold, hold_ok = strconv.parse_u64(parts[2])
+			}
+			v: [4]f32
+			for a, i in axes {
+				f, f_ok := strconv.parse_f32(a)
+				ok = ok && f_ok && f >= -1 && f <= 1
+				v[i] = f
+			}
+			e.sticks = {left = {v[0], v[1]}, right = {v[2], v[3]}}
+		}
+		if !ok || !at_ok || !hold_ok {
+			fmt.eprintln(core.ENV_PREFIX + "STICK: bad entry", item)
+			continue
+		}
+		append(&host.stick_script, e)
+	}
+}
+
+// Debug aid: POKE="<present>:<hex addr>:<hex byte>,..." stores a byte
+// into main RAM at the given present, to drive game state no route reaches.
+@(private)
+Scripted_Poke :: struct {
+	at:    u64,
+	addr:  u32,
+	value: u8,
+}
+
+@(private)
+parse_poke_script :: proc(spec: string) {
+	for item in strings.split(spec, ",", context.temp_allocator) {
+		parts := strings.split(item, ":", context.temp_allocator)
+		if len(parts) != 3 {
+			fmt.eprintln(core.ENV_PREFIX + "POKE: bad entry", item)
+			continue
+		}
+		at, at_ok := strconv.parse_u64(parts[0])
+		addr, addr_ok := strconv.parse_u64(parts[1], 16)
+		value, value_ok := strconv.parse_u64(parts[2], 16)
+		if !at_ok || !addr_ok || !value_ok || value > 0xff || addr & 0x1fffffff >= cpu.RAM_SIZE {
+			fmt.eprintln(core.ENV_PREFIX + "POKE: bad entry", item)
+			continue
+		}
+		append(&host.poke_script, Scripted_Poke{at, u32(addr), u8(value)})
+	}
+}
+
+@(private)
+run_poke_script :: proc() {
+	for e in host.poke_script {
+		if e.at == cpu.presents {
+			cpu.mem_slice(e.addr, 1)[0] = e.value
+		}
+	}
+}
+
+platform_init :: proc(title: cstring) -> bool {
+	if sdl.Init({.VIDEO, .EVENTS, .GAMECONTROLLER}) != 0 {
+		fmt.eprintln("SDL_Init:", sdl.GetError())
+		return false
+	}
+	input_init()
+	host.window = sdl.CreateWindow(
+		title,
+		sdl.WINDOWPOS_CENTERED,
+		sdl.WINDOWPOS_CENTERED,
+		WINDOW_W * 2,
+		WINDOW_H * 2,
+		{.RESIZABLE},
+	)
+	if host.window == nil {
+		fmt.eprintln("SDL_CreateWindow:", sdl.GetError())
+		return false
+	}
+	// Focus that arrived before the first event poll; later changes come as
+	// window events.
+	mouse.focused = .INPUT_FOCUS in sdl.GetWindowFlags(host.window)
+	host.renderer = sdl.CreateRenderer(host.window, -1, {.ACCELERATED})
+	if host.renderer == nil {
+		fmt.eprintln("SDL_CreateRenderer:", sdl.GetError())
+		return false
+	}
+	sdl.RenderSetLogicalSize(host.renderer, WINDOW_W, WINDOW_H)
+	if lib := sdl.LoadObject(SDL_LIBRARY); lib != nil {
+		render_set_vsync = auto_cast sdl.LoadFunction(lib, "SDL_RenderSetVSync")
+	}
+	render.gpu_init(host.window, host.renderer)
+	if !render_scale_apply() {
+		return false
+	}
+	host.start = time.tick_now()
+	host.speed = 1
+	host.perf_mark = host.start
+	host.unpaced = core.env("FAST") == "1"
+	host.ram_every = env_period("DUMP_RAM", 1500) or_return
+	core.dump_init() or_return
+	core.capture_init()
+	render.sprite_dump_init()
+	host.dump_window = core.dump_dir() != "" && core.env("DUMP_WINDOW") == "1"
+	// Debug aid: OSD_PANEL=<n> starts with the panel shown on page n
+	// (from 1).
+	if page, ok := strconv.parse_int(core.env("OSD_PANEL")); ok && page > 0 {
+		osd_panel_shown = true
+		osd_panel_page = page - 1
+	}
+	if spec := core.env("INPUT"); spec != "" {
+		parse_script(spec)
+	}
+	if spec := core.env("STICK"); spec != "" {
+		parse_stick_script(spec)
+	}
+	if spec := core.env("POKE"); spec != "" {
+		parse_poke_script(spec)
+	}
+	if spec := core.env("DRAG"); spec != "" {
+		parse_drag_script(spec)
+	}
+	if spec := core.env("POINT"); spec != "" {
+		parse_point_script(spec)
+	}
+	return record_init() && core.audio_init(AUDIO_HZ, core.env("AUDIO_DUMP"))
+}
+
+// A batch of mixed SPU output.
+platform_audio :: proc(frames: [][2]i16) {
+	pace := core.Audio_Pace.Paced
+	if host.unpaced || skipping {
+		pace = .Off
+	} else if host.fast {
+		pace = .Fast
+	}
+	core.audio_push(frames, host.speed, pace)
+}
+
+platform_shutdown :: proc() {
+	spu.spu_sync()
+	record_close()
+	core.audio_close()
+	core.capture_close()
+	sdl.DestroyTexture(host.texture)
+	sdl.DestroyTexture(host.held)
+	sdl.DestroyRenderer(host.renderer)
+	sdl.DestroyWindow(host.window)
+	sdl.Quit()
+}
+
+platform_should_quit :: proc() -> bool {
+	return host.quit
+}
+
+@(private)
+poll_events :: proc() {
+	ev: sdl.Event
+	for sdl.PollEvent(&ev) {
+		core.input_event(ev)
+		#partial switch ev.type {
+		case .QUIT:
+			host.quit = true
+		case .KEYDOWN:
+			if !core.bind_catch_key(ev.key) && (key_hook == nil || !key_hook(ev.key)) {
+				window_key(ev.key)
+			}
+		case .MOUSEBUTTONDOWN, .MOUSEBUTTONUP:
+			if ev.type == .MOUSEBUTTONDOWN {
+				core.device_used(.Keyboard)
+			}
+			mouse_button(ev.button)
+		case .MOUSEMOTION:
+			mouse_motion(ev.motion)
+		case .MOUSEWHEEL:
+			core.device_used(.Keyboard)
+			mouse_wheel(ev.wheel)
+		case .CONTROLLERBUTTONDOWN:
+			window_button(sdl.GameControllerButton(ev.cbutton.button))
+		case .WINDOWEVENT:
+			window_event(ev.window)
+		}
+	}
+}
+
+// Real nanoseconds from host.start until emulated vblank n is due.
+@(private)
+vblank_due_ns :: proc(n: u64) -> i64 {
+	return i64(f64(n) * VBLANK_NS / host.speed)
+}
+
+// Run emulated time at `speed` times real time from the next vblank on.
+// Game logic still advances per emulated tick, so this changes only how
+// fast those ticks pass in real time. The last vblank keeps its due time, so
+// the coming one is due one vblank at the new speed after it, with no gap or
+// burst however often the speed changes.
+set_speed :: proc(speed: f64) {
+	assert(speed >= core.AUDIO_MIN_SPEED)
+	if speed == host.speed {
+		return
+	}
+	if .Perf in core.trace.active {
+		core.tracef(.Perf, "speed %v -> %v", host.speed, speed)
+	}
+	last := cpu.presents - min(cpu.presents, 1)
+	last_due := time.tick_add(host.start, time.Duration(vblank_due_ns(last)))
+	host.speed = speed
+	host.start = time.tick_add(last_due, -time.Duration(vblank_due_ns(last)))
+}
+
+// Refresh rates SDL reports for a display that runs at the console's own
+// field rate (59.94 Hz NTSC timings round down).
+@(private)
+VSYNC_HZ_MIN :: 59
+@(private)
+VSYNC_HZ_MAX :: 60
+// Most display refreshes per emulated vblank (240 Hz).
+@(private)
+VSYNC_SHOWS_MAX :: 4
+
+// Lock presents to the display's vblank when it refreshes at the console's
+// rate or a whole multiple of it (120, 240 Hz) and emulated time runs at
+// console speed: every emulated vblank then shows for exactly that many
+// display refreshes, with no tearing and no dropped or doubled frame from
+// the two clocks drifting apart. The display clock then sets emulated time;
+// core.audio_push absorbs its small difference from 60 Hz. Any other refresh
+// rate (144 Hz: 2.4 refreshes a vblank) or speed, or no pacing at all (`paced`
+// false), keeps vsync off.
+// SDL_RenderSetVSync came in SDL 2.0.18, and the SDL2.dll that ships with
+// Odin (the one Windows builds use) is 2.0.16, so it is looked up when the
+// renderer is made; without it vsync stays off.
+@(private)
+render_set_vsync: proc "c" (renderer: ^sdl.Renderer, vsync: sdl.bool) -> i32
+
+@(private)
+SDL_LIBRARY :: "SDL2.dll" when ODIN_OS == .Windows else "libSDL2-2.0.so.0"
+
+@(private)
+vsync_update :: proc(paced: bool) {
+	mode: sdl.DisplayMode
+	shows := 0
+	if paced && host.speed == 1 && sdl.GetWindowDisplayMode(host.window, &mode) == 0 {
+		for n in 1 ..= VSYNC_SHOWS_MAX {
+			if mode.refresh_rate >= VSYNC_HZ_MIN * i32(n) && mode.refresh_rate <= VSYNC_HZ_MAX * i32(n) {
+				shows = n
+			}
+		}
+	}
+	want := shows > 0
+	host.vsync_shows = max(shows, 1)
+	if want == host.vsync {
+		return
+	}
+	if render_set_vsync == nil || render_set_vsync(host.renderer, sdl.bool(want)) != 0 {
+		// Backend cannot switch: stay on sleep pacing.
+		want = false
+	}
+	host.vsync = want
+	if .Perf in core.trace.active {
+		core.tracef(.Perf, "vsync %v (%d Hz)", want, mode.refresh_rate)
+	}
+}
+
+// Make the current vblank due now.
+@(private)
+pacing_rebase :: proc() {
+	host.start = time.tick_add(time.tick_now(), -time.Duration(vblank_due_ns(cpu.presents)))
+}
+
+// A positive present count from the setting `name`, or `def` when it is
+// unset.
+@(private)
+env_period :: proc(name: string, def: u64) -> (u64, bool) {
+	spec := core.env(name)
+	if spec == "" {
+		return def, true
+	}
+	n, ok := strconv.parse_u64(spec, 10)
+	if !ok || n == 0 {
+		fmt.eprintf("%s: expected a positive present count: %s\n", core.env_name(name), spec)
+		return 0, false
+	}
+	return n, true
+}
+
+// Debug aid: with DUMP=<dir>, write the displayed area on the presents
+// core.dump_due picks and main RAM every ram_every presents.
+@(private)
+dump_frame :: proc() {
+	if core.dump_due(cpu.presents, host.ram_every) {
+		core.dump_put("ram", "bin", cpu.presents, cpu.ram[:])
+	}
+	if !core.dump_due(cpu.presents) || gpu.display.w <= 0 || gpu.display.h <= 0 {
+		return
+	}
+	fw, fh := frame_size()
+	core.dump_ppm("frame", cpu.presents, int(fw), int(fh), frame_rgb(frame_pixels()[:fw * fh]))
+	// Whole VRAM as 15-bit color, for checking off-screen uploads.
+	if cpu.presents % 150 == 0 {
+		core.dump_ppm("vram", cpu.presents, render.VRAM_W, render.VRAM_H, vram_rgb())
+	}
+}
+
+// XRGB8888 pixels as tightly packed RGB888 bytes, in temp memory.
+frame_rgb :: proc(px: []u32) -> []u8 {
+	out := make([]u8, len(px) * 3, context.temp_allocator)
+	for c, i in px {
+		out[i * 3] = u8(c >> 16)
+		out[i * 3 + 1] = u8(c >> 8)
+		out[i * 3 + 2] = u8(c)
+	}
+	return out
+}
+
+// VRAM as RGB888 read as 15-bit color, in temp memory.
+@(private)
+vram_rgb :: proc() -> []u8 {
+	out := make([]u8, render.VRAM_W * render.VRAM_H * 3, context.temp_allocator)
+	for c, i in render.vram {
+		out[i * 3] = u8(c & 0x1f) << 3
+		out[i * 3 + 1] = u8((c >> 5) & 0x1f) << 3
+		out[i * 3 + 2] = u8((c >> 10) & 0x1f) << 3
+	}
+	return out
+}
+
+// Convert a w x h VRAM area at (x, y) into dst as XRGB8888 (the window
+// texture's format, which the host GPU takes as is), tightly packed, at
+// the shown target's resolution (frame_size): each VRAM pixel is a block of
+// its pixels. 24-bit areas are read from VRAM and widened as blocks.
+// `extra_step` names the extra picture being converted, if one is.
+@(private)
+convert_area :: proc(x, y, w, h: i32, depth24: bool, dst: []u32, extra_step := -1) {
+	c := Convert{x = x, y = y, w = w, h = h, depth24 = depth24, dst = dst}
+	k := render.shown_target().shift
+	assert(len(dst) >= int((w << k) * (h << k)), "conversion target too small")
+	if k == 0 {
+		convert_rows(&c, 0, h)
+		return
+	}
+	if !depth24 && render.shown_target().gl {
+		// The GPU converts into its own buffer, which is shown as is
+		// (convert_display, extra_due); dst is left alone.
+		slot := extra_step >= 0 ? extra_step : render.EXTRA_FRAMES
+		render.gl_frame(slot, x << k, y << k, w << k, h << k)
+		return
+	}
+	c.bloom = render.bloom_effects && !depth24 && render.bloom_prepare(x, y, w, h)
+	if !depth24 {
+		c.post = render.post_now()
+	}
+	if c.post.focus > 0 {
+		render.dof_prepare(x, y, w, h)
+	}
+	c.fx = c.bloom || c.post.focus > 0 || c.post.vignette || c.post.grade.on
+	// A finer target's rows are converted on the raster threads.
+	render.raster_parallel(proc(band, bands: i32, data: rawptr) {
+			c := (^Convert)(data)
+			y0, y1 := render.band_run(0, c.h << render.shown_target().shift, band, bands)
+			convert_rows(c, y0, y1)
+		}, &c)
+}
+
+@(private)
+Convert :: struct {
+	x, y, w, h: i32,
+	depth24:    bool,
+	dst:        []u32,
+	// Add the glow worked out for the area (bloom_prepare); the effects
+	// (post.odin); whether either has anything to do.
+	bloom:      bool,
+	post:       render.Post,
+	fx:         bool,
+}
+
+// Convert rows r0 ..< r1 (shown target pixels from the top) of c.
+@(private)
+convert_rows :: proc(c: ^Convert, r0, r1: i32) #no_bounds_check {
+	x, y, depth24, dst := c.x, c.y, c.depth24, c.dst
+	t := render.shown_target()
+	k := t.shift
+	fw := c.w << k
+	o := int(r0) * int(fw)
+	for row in r0 ..< r1 {
+		if depth24 {
+			vy := (y + row >> k) & (render.VRAM_H - 1)
+			bytes := ([^]u8)(&render.vram[vy * render.VRAM_W])[:render.VRAM_W * 2]
+			start := int(x) * 2
+			for px in 0 ..< int(fw) {
+				b := start + (px >> k) * 3
+				r := u32(bytes[b % (render.VRAM_W * 2)])
+				g := u32(bytes[(b + 1) % (render.VRAM_W * 2)])
+				bl := u32(bytes[(b + 2) % (render.VRAM_W * 2)])
+				dst[o] = r << 16 | g << 8 | bl
+				o += 1
+			}
+			continue
+		}
+		vy := (y << k + row) & (t.h - 1)
+		if k > 0 {
+			line := t.rgb[vy * t.w:][:t.w]
+			if c.fx {
+				fh := c.h << k
+				for px in 0 ..< fw {
+					dst[o] = render.post_pixel(line[(x << k + px) & (t.w - 1)], &c.post, c.bloom, px, row, fw, fh)
+					o += 1
+				}
+				continue
+			}
+			for px in 0 ..< fw {
+				dst[o] = line[(x << k + px) & (t.w - 1)] & 0xffffff
+				o += 1
+			}
+			continue
+		}
+		line := t.pix[vy * t.w:][:t.w]
+		for px in 0 ..< fw {
+			c := u32(line[(x << k + px) & (t.w - 1)])
+			dst[o] = (c & 0x1f) << 19 | (c >> 5 & 0x1f) << 11 | (c >> 10 & 0x1f) << 3
+			o += 1
+		}
+	}
+}
+
+// Size of the displayed area as converted (convert_area).
+frame_size :: proc() -> (w, h: i32) {
+	k := render.shown_target().shift
+	return gpu.display.w << k, gpu.display.h << k
+}
+
+// Whether the present about to run shows the same VRAM area as the last
+// one: a repeat of the game frame on screen.
+display_repeats :: proc() -> bool {
+	return [4]i32{gpu.display.x, gpu.display.y, gpu.display.w, gpu.display.h} == host.last_area
+}
+
+// Point host.frame at what this vblank shows: the displayed VRAM area, or
+// the extra picture of a frozen-time pass when the display is repeating a
+// game frame (checkpoint.odin).
+@(private)
+convert_display :: proc() {
+	repeat := display_repeats()
+	host.last_area = {gpu.display.x, gpu.display.y, gpu.display.w, gpu.display.h}
+	if picture, slot, due := extra_due(repeat); due {
+		host.frame, host.frame_slot = picture, slot
+	} else {
+		host.frame, host.frame_slot = host.converted, -1
+		convert_area(gpu.display.x, gpu.display.y, gpu.display.w, gpu.display.h, gpu.display.depth24, host.frame)
+		if render.shown_target().gl && !gpu.display.depth24 && render.shown_target().shift > 0 {
+			host.frame, host.frame_slot = nil, render.EXTRA_FRAMES
+		}
+	}
+	if host.frame_slot >= 0 {
+		host.frame_mark = render.gpu_gl.frames[host.frame_slot].mark
+	}
+}
+
+// The picture this vblank shows (host.frame), waiting for the GPU to finish
+// converting it when it is a GL frame slot's.
+@(private)
+frame_pixels :: proc() -> []u32 {
+	if host.frame == nil && host.frame_slot >= 0 {
+		host.frame = render.gl_frame_take(host.frame_slot)
+	}
+	return host.frame
+}
+
+// Presents between .Perf reports.
+@(private)
+PERF_PERIOD :: 1000
+
+@(private)
+perf_report :: proc() {
+	if cpu.presents % PERF_PERIOD != 0 {
+		return
+	}
+	now := time.tick_now()
+	secs := time.duration_seconds(time.tick_diff(host.perf_mark, now))
+	audio := core.audio_take_stats()
+	mixed_hz := f64(audio.mixed) * io.CPU_HZ * f64(io.clock_mul) / f64(max(cpu.state.cycles - host.perf_cycles, 1))
+	core.tracef(.Perf, "%d presents in %.3f s (%.1f/s), %d cycles, audio mixed %.1f Hz, queued %.1f ms (lowest %.1f), ran dry %d, dropped %d", PERF_PERIOD, secs, f64(PERF_PERIOD) / secs, cpu.state.cycles, mixed_hz, core.audio_queued_ms(), audio.low_ms, audio.dry, audio.dropped)
+	render.gl_perf()
+	host.perf_cycles = cpu.state.cycles
+	host.perf_mark = now
+}
+
+// Render scale (not a PS1 feature): the display's picture is drawn at this
+// many times VRAM's resolution, 1, 2 or 4 (render_targets_set). A change
+// takes effect at the next present.
+render_scale: i32 = 2
+
+// Bring the hi-res target, the converted frame buffers and the window's
+// textures to render_scale. Waits while a hold keeps a picture in a texture.
+@(private)
+render_scale_apply :: proc() -> bool {
+	k: u32 = render_scale >= 4 ? 2 : render_scale >= 2 ? 1 : 0
+	if host.texture != nil && (render.shown_target().shift == k || host.holding) {
+		return true
+	}
+	render.render_targets_set(render_scale)
+	w, h := i32(render.VRAM_W) << k, i32(render.VRAM_H) << k
+	delete(host.converted)
+	host.converted = make([]u32, w * h)
+	host.frame, host.frame_slot = host.converted, -1
+	for &f in render.extra.frames {
+		delete(f)
+		f = make([]u32, w * h)
+	}
+	render.extra.ready = false
+	if host.texture != nil {
+		sdl.DestroyTexture(host.texture)
+		sdl.DestroyTexture(host.held)
+	}
+	render.gl_show_forget()
+	host.texture = sdl.CreateTexture(host.renderer, .XRGB8888, .STREAMING, w, h)
+	host.held = sdl.CreateTexture(host.renderer, .XRGB8888, .STREAMING, w, h)
+	if host.texture == nil || host.held == nil {
+		fmt.eprintln("SDL_CreateTexture:", sdl.GetError())
+		return false
+	}
+	// Both blend: a hold swaps them.
+	if sdl.SetTextureBlendMode(host.texture, .BLEND) != 0 || sdl.SetTextureBlendMode(host.held, .BLEND) != 0 {
+		fmt.eprintln("SDL_SetTextureBlendMode:", sdl.GetError())
+		return false
+	}
+	host.shown_w, host.shown_h = 0, 0
+	return texture_filter_apply()
+}
+
+@(private)
+present :: proc() {
+	replay_panel()
+	cpu.presents += 1
+	core.trace_window()
+	run_poke_script()
+	run_drag_script()
+	run_point_script()
+	if .Perf in core.trace.active {
+		perf_report()
+	}
+	render_scale_apply()
+	host.last_mark, host.frame_mark = host.frame_mark, -1
+	if gpu.display.w > 0 && gpu.display.h > 0 {
+		convert_display()
+	}
+	if skip_black {
+		host.black = frame_black()
+	}
+	if instant_loading && spu.cd_loading() {
+		picture_still()
+	} else {
+		host.still = 0
+	}
+	dump_frame()
+	if hold_picture > 0 {
+		// The picture on screen stays in its texture; the next live one
+		// goes to the other.
+		if !host.holding {
+			host.holding = true
+			host.held, host.texture = host.texture, host.held
+			host.held_area = {0, 0, host.shown_w, host.shown_h}
+		}
+		hold_picture -= 1
+	} else {
+		if host.holding {
+			host.holding = false
+			host.fade = HOLD_FADE
+		} else if host.fade > 0 {
+			host.fade -= 1
+		}
+		if gpu.display.enabled && gpu.display.w > 0 && gpu.display.h > 0 {
+			fw, fh := frame_size()
+			src := sdl.Rect{0, 0, fw, fh}
+			if host.frame_slot < 0 || !render.gl_show(host.texture, host.frame_slot, fw, fh) {
+				sdl.UpdateTexture(host.texture, &src, &frame_pixels()[0], fw * 4)
+			}
+			host.shown_w, host.shown_h = fw, fh
+		}
+	}
+	draw()
+}
+
+// Presents left to keep showing the picture already in the window instead
+// of the displayed area: the game sets it while the game draws
+// something not meant to be seen (a section change's set-up frame).
+hold_picture := 0
+
+// While set, emulated time runs as fast as the host allows with the sound
+// muted: the game sets it to hurry through a scene the player chose
+// not to watch, holding the picture from before it (hold_picture).
+skipping := false
+
+// Presents a held picture takes to fade out over the live one after the hold
+// (0.6 s at 60 a second).
+@(private)
+HOLD_FADE :: 36
+
+// Run at every emulated vblank after input is read, before pacing; the game
+// uses it to follow the game's state (e.g. to change speed).
+vblank_hook: proc()
+
+// Run at every emulated vblank just before present, e.g. to draw the extra
+// picture present is about to show (the game's smooth motion). Not run in a
+// background machine (preload.odin), which shows nothing.
+present_hook: proc()
+
+// Instant loading: while the drive reads data behind a still picture,
+// emulated time runs as fast as the host allows. The game still sees the
+// drive's own speed, so its loaders behave exactly as on a console; only the
+// wall-clock wait goes away. Movies and XA streams keep real time, and so does
+// anything animated during a load (a transition that plays while the next
+// scene loads), which would otherwise flash past.
+instant_loading := false
+
+// Presents the picture must hold still before a load is hurried. Longer than
+// the few presents a game frame is repeated for, so an animation that only
+// changes every second or third present never counts as still.
+@(private = "file")
+STILL_PRESENTS :: 8
+
+// Black screens: while the picture shown is all black (the game holding a
+// blank screen between scenes, with only music playing), pacing is off. The
+// game still counts every tick of the wait; only the wall-clock wait goes
+// away. Music queued during the skip is dropped, as in any fast-forward.
+skip_black := false
+
+// Brightest channel value still counted as black: the dither of a fade's
+// last steps leaves values this low.
+@(private = "file")
+BLACK_MAX :: 0x10
+
+// Whether the displayed picture is all black (or the display is off).
+@(private = "file")
+frame_black :: proc() -> bool {
+	if !gpu.display.enabled || gpu.display.w <= 0 || gpu.display.h <= 0 {
+		return true
+	}
+	if host.frame_mark >= 0 {
+		// The GPU flags each conversion with a lit pixel. Waiting for this
+		// one is only needed when the last picture was black too: a black
+		// stretch begins one present later, its first picture paced.
+		if lit, known := render.gl_frame_bright(host.last_mark); known && lit {
+			return false
+		}
+		lit, _ := render.gl_frame_bright(host.frame_mark)
+		return !lit
+	}
+	fw, fh := frame_size()
+	s := Frame_Scan{bytes = slice.to_bytes(frame_pixels()[:fw * fh])}
+	render.raster_parallel(proc(band, bands: i32, data: rawptr) {
+			s := (^Frame_Scan)(data)
+			lo, hi := render.band_run(0, i32(len(s.bytes)), band, bands)
+			for b in s.bytes[lo:hi] {
+				if b > BLACK_MAX {
+					s.bright[band] = true
+					return
+				}
+			}
+		}, &s)
+	for b in s.bright {
+		if b {
+			return false
+		}
+	}
+	return true
+}
+
+// The frame split into the raster threads' bands, for frame_black and
+// picture_still: whether each band has a pixel above black, and its hash.
+@(private = "file")
+Frame_Scan :: struct {
+	bytes:  []u8,
+	bright: [render.MAX_BANDS]bool,
+	hash:   [render.MAX_BANDS]u64,
+}
+
+// Count presents the loading picture has held still.
+@(private = "file")
+picture_still :: proc() {
+	fw, fh := frame_size()
+	s := Frame_Scan{bytes = slice.to_bytes(frame_pixels()[:max(fw * fh, 0)])}
+	render.raster_parallel(proc(band, bands: i32, data: rawptr) {
+			s := (^Frame_Scan)(data)
+			lo, hi := render.band_run(0, i32(len(s.bytes)), band, bands)
+			s.hash[band] = xxhash.XXH3_64(s.bytes[lo:hi])
+		}, &s)
+	h := xxhash.XXH3_64(([^]u8)(&s.hash)[:size_of(s.hash)])
+	host.still = h == host.still_hash ? host.still + 1 : 0
+	host.still_hash = h
+}
+
+// Skip pacing while the disc loads, the screen is black or the window holds
+// an earlier picture (hold_picture: nothing live is seen); when that ends,
+// make the current vblank due now so pacing resumes from here instead of
+// waiting out the skipped time.
+@(private)
+fast_forward :: proc() -> bool {
+	loading := instant_loading && spu.cd_loading() && host.still >= STILL_PRESENTS
+	if (loading || skip_black && host.black || skipping || hold_picture > 0) && !mdec.movie_playing() {
+		if !host.fast && .Perf in core.trace.active {
+			core.tracef(.Perf, "fast-forward on")
+			host.fast_start = time.tick_now()
+			host.fast_vblank = cpu.presents
+		}
+		host.fast = true
+		return true
+	}
+	if host.fast {
+		if .Perf in core.trace.active {
+			ms := time.duration_milliseconds(time.tick_since(host.fast_start))
+			n := cpu.presents - host.fast_vblank
+			core.tracef(.Perf, "fast-forward off: %d vblanks in %.1f ms (%.1f ms at console speed), audio queued %.1f ms", n, ms, f64(n) * VBLANK_NS / 1e6, core.audio_queued_ms())
+		}
+		host.fast = false
+		pacing_rebase()
+	}
+	return false
+}
+
+// Called at every emulated vblank: show the frame, read input, and keep
+// emulated time from running ahead of real time. FAST=1 disables pacing.
+platform_frame :: proc() {
+	// Temp memory made during a vblank is dropped at its end; nothing in the
+	// program frees the temp allocator otherwise, and frame dumps put
+	// megabytes in it per dump.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	if io.preload_child {
+		preload_frame()
+		return
+	}
+	poll_events()
+	if present_hook != nil {
+		present_hook()
+	}
+	present()
+	// Before the pause wait, which is not work.
+	if .Perf in core.trace.active {
+		work := time.tick_since(host.work_mark)
+		if host.work_mark != {} && work > VBLANK_NS && !host.vsync {
+			core.tracef(.Perf, "late vblank: %.1f ms of work", time.duration_milliseconds(work))
+		}
+	}
+	pause_wait()
+	if host.quit {
+		platform_shutdown()
+		os.exit(0)
+	}
+	if vblank_hook != nil {
+		vblank_hook()
+	}
+	unpaced := fast_forward() || host.unpaced
+	vsync_update(!unpaced)
+	defer host.work_mark = time.tick_now()
+	if unpaced {
+		return
+	}
+	if host.vsync {
+		// RenderPresent already waited for the display; keep the origin
+		// current so sleep pacing resumes from here if vsync goes off.
+		pacing_rebase()
+		return
+	}
+	due := vblank_due_ns(cpu.presents)
+	for {
+		remaining := due - i64(time.tick_since(host.start))
+		if remaining <= 0 {
+			break
+		}
+		if remaining > 1_000_000 {
+			time.sleep(time.Duration(remaining - 500_000))
+		}
+	}
+	if i64(time.tick_since(host.start)) > vblank_due_ns(cpu.presents + 6) {
+		// Fell behind (slow frame or debugger stop): resync instead of racing.
+		pacing_rebase()
+	}
+}
+
+// Copy the display-sized area at VRAM (x, y) as extra picture `step`, shown
+// at the step+1'th repeat of the frame on screen; step 0 starts a new set.
+// Call inside a pass, after drawing it.
+capture_extra_frame :: proc(x, y: i32, step: int) {
+	assert(io.events_frozen, "extra frame captured outside a pass")
+	assert(step >= 0 && step < render.EXTRA_FRAMES, "extra frame step out of range")
+	if step == 0 {
+		render.extra.count, render.extra.shown = 0, 0
+	}
+	if gpu.display.w <= 0 || gpu.display.h <= 0 || gpu.display.depth24 || step != render.extra.count {
+		render.extra.ready = false
+		return
+	}
+	render.extra.x, render.extra.y = x & (render.VRAM_W - 1), y & (render.VRAM_H - 1)
+	render.extra.w, render.extra.h = gpu.display.w, gpu.display.h
+	render.hi_touch(render.extra.x, render.extra.y, render.extra.w, render.extra.h)
+	convert_area(render.extra.x, render.extra.y, render.extra.w, render.extra.h, false, render.extra.frames[step][:], step)
+	render.extra.count += 1
+	render.extra.ready = true
+	if .Gpu in core.trace.active {
+		core.tracef(.Gpu, "extra frame %d from %d,%d %dx%d", step, render.extra.x, render.extra.y, render.extra.w, render.extra.h)
+	}
+}
+
+// Decide what present shows: the extra pictures replace, in order, the
+// frames the display repeats, until the display moves to the area they were
+// drawn from (that game frame itself is now up). Repeats past the last
+// picture keep showing it. `slot` is the GL frame slot the picture is the
+// buffer of (the picture then nil: frame_pixels waits for it), -1 in
+// software.
+@(private)
+extra_due :: proc(repeat: bool) -> (picture: []u32, slot: int, due: bool) {
+	slot = -1
+	if !render.extra.ready {
+		return
+	}
+	if gpu.display.x == render.extra.x && gpu.display.y == render.extra.y {
+		render.extra.ready = false
+		return
+	}
+	if gpu.display.w != render.extra.w || gpu.display.h != render.extra.h || gpu.display.depth24 {
+		render.extra.ready = false
+		return
+	}
+	if !repeat {
+		return
+	}
+	k := min(render.extra.shown, render.extra.count - 1)
+	render.extra.shown += 1
+	fw, fh := frame_size()
+	if render.shown_target().gl {
+		return nil, k, true
+	}
+	return render.extra.frames[k][:fw * fh], -1, true
+}

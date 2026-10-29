@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Type-check every package on four targets; the Windows host checks its
+  # own in the test job.
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: laytan/setup-odin@v2
+        with:
+          release: dev-2026-10
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: odin check
+        run: |
+          set -e
+          for t in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+            for p in core psx ps2 ps2/host; do
+              echo "== $t $p"
+              odin check $p -no-entry-point -collection:ps=. -target:$t -vet -strict-style
+            done
+            echo "== $t recomp"
+            odin check recomp -collection:ps=. -target:$t -vet -strict-style
+            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/ee_emit; do
+              echo "== $t $p"
+              odin check $p -collection:ps=. -target:$t -vet -strict-style
+            done
+          done
+
+  # Run the coroutine/snapshot/rollback, native code, EE native, EE FPU and lowering tests on each host.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+          - os: ubuntu-24.04-arm
+          - os: macos-14
+          - os: macos-14
+            rosetta: true # darwin_amd64, cross-built and run under Rosetta
+          - os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: laytan/setup-odin@v2
+        with:
+          release: dev-2026-10
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: check windows packages
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          for p in core psx ps2 ps2/host; do odin check $p -no-entry-point -collection:ps=. -vet -strict-style; done
+          odin check recomp -collection:ps=. -vet -strict-style
+      - name: test
+        if: ${{ !matrix.rosetta }}
+        shell: bash
+        run: |
+          set -e
+          odin run tests/core -collection:ps=. -out:core_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/native -collection:ps=. -out:native_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ee_native -collection:ps=. -out:ee_native_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/fpu -collection:ps=. -out:fpu_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/lower -collection:ps=. -out:lower_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/vu -collection:ps=. -out:vu_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/vu_macro -collection:ps=. -out:vu_macro_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ee_emit -collection:ps=. -out:ee_emit_test${{ runner.os == 'Windows' && '.exe' || '' }}
+      - name: test (x86-64 under Rosetta)
+        if: ${{ matrix.rosetta }}
+        run: |
+          softwareupdate --install-rosetta --agree-to-license
+          odin build tests/core -collection:ps=. -target:darwin_amd64 -out:core_test
+          arch -x86_64 ./core_test
+          odin build tests/native -collection:ps=. -target:darwin_amd64 -out:native_test
+          arch -x86_64 ./native_test
+          odin build tests/ee_native -collection:ps=. -target:darwin_amd64 -out:ee_native_test
+          arch -x86_64 ./ee_native_test
+          odin build tests/fpu -collection:ps=. -target:darwin_amd64 -out:fpu_test
+          arch -x86_64 ./fpu_test
+          odin build tests/vu -collection:ps=. -target:darwin_amd64 -out:vu_test
+          arch -x86_64 ./vu_test

@@ -1,0 +1,583 @@
+// EE instructions through the native backend against the interpreter, run
+// on every target in CI. Each instruction is a function of its own (the
+// instruction, then jr $ra), assembled by r5900.native_func for the host and
+// loaded with the runtime's imports; from the same registers, the native
+// function and ps2.exec_insn must leave the same cpu.state.
+package main
+
+import "base:runtime"
+import "core:fmt"
+import "core:os"
+import "core:slice"
+import "ps:core"
+import "ps:ps2"
+import cpu "ps:ps2/cpu"
+import "ps:ps2/mem"
+import "ps:ps2/vu"
+import "ps:recomp/mips"
+import "ps:recomp/native"
+import "ps:recomp/r5900"
+
+Case :: struct {
+	w:  u32,
+	op: r5900.Op, // what the word decodes to
+}
+
+// rs = 1, rt = 2, rd = 3 throughout.
+@(private = "file")
+special :: proc(fn: u32) -> u32 {return 1 << 21 | 2 << 16 | 3 << 11 | fn}
+@(private = "file")
+mmi :: proc(fn: u32, sub: u32 = 0) -> u32 {return 0x1c << 26 | special(fn) | sub << 6}
+// A COP2 transfer (QMFC2 1, CFC2 2, QMTC2 5, CTC2 6) of rt = 2 and VU
+// register rd.
+@(private = "file")
+cop2 :: proc(op, rd: u32) -> u32 {return 0x12 << 26 | op << 21 | 2 << 16 | rd << 11}
+// A VU0 macro op, vf3 = vf1 fn vf2 in the dest lanes.
+@(private = "file")
+macro :: proc(fn: u32, dest: u32 = 15, fd: u32 = 3) -> u32 {return 0x12 << 26 | 1 << 25 | dest << 21 | 2 << 16 | 1 << 11 | fd << 6 | fn}
+// A VU0 macro op in the special layout, of ft = 2 and fs = 1, key k as
+// vu_op switches on it.
+@(private = "file")
+special2 :: proc(k: u32, dest: u32 = 15, ft: u32 = 2, fs: u32 = 1) -> u32 {
+	return 0x12 << 26 | 1 << 25 | dest << 21 | ft << 16 | fs << 11 | (k >> 2) << 6 | 0x3c | (k & 3)
+}
+
+// A COP1 single op, f[fd] = f[fs] fn f[ft]; fmt 0x14 is a word op.
+@(private = "file")
+cop1 :: proc(fn: u32, fd: u32 = 3, fs: u32 = 1, ft: u32 = 2, fmt: u32 = 0x10) -> u32 {
+	return 0x11 << 26 | fmt << 21 | ft << 16 | fs << 11 | fd << 6 | fn
+}
+
+// The COP1 ops native code runs inline on x64; check_fpu checks them.
+@(private = "file", rodata)
+COP1_OPS := [?]r5900.Op {
+	.MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .ADD_S, .SUB_S, .MUL_S, .DIV_S,
+	.ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S,
+	.MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S, .CVT_W_S, .SQRT_S,
+}
+
+// The unaligned loads and stores; check_unaligned checks them.
+@(private = "file", rodata)
+UNALIGNED_OPS := [?]r5900.Op{.LWL, .LWR, .LDL, .LDR, .SWL, .SWR, .SDL, .SDR}
+
+// An unaligned access of rt at UNALIGNED_OFF(rs = 1); rt = 1 is rs.
+@(private = "file")
+unaligned :: proc(op, rt: u32) -> u32 {return op << 26 | 1 << 21 | rt << 16 | UNALIGNED_OFF}
+
+// The operation numbers native code passes to cpu.fpu_slow.
+#assert(int(r5900.Fpu_Op.Add) == int(cpu.Fpu_Op.Add))
+#assert(int(r5900.Fpu_Op.Sub) == int(cpu.Fpu_Op.Sub))
+#assert(int(r5900.Fpu_Op.Mul) == int(cpu.Fpu_Op.Mul))
+#assert(int(r5900.Fpu_Op.Div) == int(cpu.Fpu_Op.Div))
+
+// Shift counts, signs and carries across the word boundary.
+@(rodata)
+VALS := [?]u64 {
+	0,
+	1,
+	31,
+	32,
+	33,
+	63,
+	0x45,
+	0xffffffff_ffffffff,
+	0x80000000_00000000,
+	0x7fffffff_ffffffff,
+	0x12345678_9abcdef0,
+	0xffffffff_80000000,
+	0x00000000_7fffffff,
+	0x80007fff_0001ffff,
+	// float words: infinities, a quiet NaN, the largest values, denormals
+	0x7f800000_ff800000,
+	0x7fc00000_7f7fffff,
+	0xff7fffff_00400000,
+	0x3f800000_ff7fffff, // as y, with x = 0x7fc00000_7f7fffff: acc.x -max, vf.x max
+}
+
+// f32 bits for the COP1 cases: zeros, denormals, the smallest normals,
+// FMAX, infinities and NaN patterns, products and sums that overflow or
+// underflow, and 1 + 2^-24 and 1 + 3 * 2^-24, ties that round to even. As
+// words for CVT.S.W: 2^24 + 1, 2^24 + 3 and -(2^24 + 1), ties likewise.
+@(rodata)
+F_VALS := [?]u32 {
+	0x00000000,
+	0x80000000,
+	0x00000001,
+	0x807fffff,
+	0x00800000,
+	0x80800001,
+	0x7f7fffff,
+	0xff7fffff,
+	0x7f800000,
+	0xff800000,
+	0x7fc00000,
+	0x7fffffff,
+	0xffffffff,
+	0x7f000000,
+	0x1f800000,
+	0x3f800000,
+	0xbf800000,
+	0x3f800001,
+	0x33800000,
+	0x40000000,
+	0xc0490fdb,
+	0x00ffffff,
+	0x01000001,
+	0x01000003,
+	TIE_NEG,
+	// for CVT.W.S: 2^31, -2^31, the largest below 2^31 either side, 0.5
+	0x4f000000,
+	0xcf000000,
+	0x4effffff,
+	0xceffffff,
+	0x3f000000,
+}
+
+@(private = "file")
+TIE_NEG :: ~u32(0x01000001) + 1
+
+// ACC for the COP1 ops: 1, +0, FMAX and -(1 + 2^-23).
+@(private = "file", rodata)
+ACC_VALS := [?]u32{0x3f800000, 0, 0x7fffffff, 0xbf800001}
+
+// Quadword addresses for LQC2 and SQC2, rs - MEM_BACK: unaligned RAM, its
+// end, both uncached mirrors, the scratchpad, and kseg0, which only the
+// runtime's bus reaches.
+@(rodata)
+MEM_ADDRS := [?]u32{0x00001238, 0x01fffff0, 0x20004564, 0x30008000, 0x70000ff8, 0x70003ff0, 0x80010004}
+MEM_BACK :: 12 // the offset field is -12
+
+// Addresses for the unaligned accesses: each of these plus 0 to 7, so
+// every alignment, and rs = that - UNALIGNED_OFF, so the add carries
+// across a 16-byte boundary for some. RAM, the last quadwords of RAM and
+// of the scratchpad, both uncached mirrors, and kseg0.
+@(rodata)
+UNALIGNED_ADDRS := [?]u32{0x0000123c, 0x01ffffe8, 0x2000456c, 0x3000800c, 0x70003fe8, 0x8001000c}
+UNALIGNED_OFF :: 5
+
+ENTRY :: 0x00100000
+
+main :: proc() {
+	cases := [?]Case {
+		{special(0x14), .DSLLV},
+		{special(0x16), .DSRLV},
+		{special(0x17), .DSRAV},
+		{special(0x18), .MULT},
+		{special(0x19), .MULTU},
+		{special(0x1a) &~ (31 << 11), .DIV},
+		{special(0x1b) &~ (31 << 11), .DIVU},
+		{mmi(0x18), .MULT1},
+		{mmi(0x19), .MULTU1},
+		{mmi(0x1a) &~ (31 << 11), .DIV1},
+		{mmi(0x1b) &~ (31 << 11), .DIVU1},
+		{mmi(0x10), .MFHI1},
+		{mmi(0x12), .MFLO1},
+		{mmi(0x11), .MTHI1},
+		{mmi(0x13), .MTLO1},
+		{mmi(0x11) &~ (31 << 21), .MTHI1}, // from r0
+		{mmi(0x08, 0x06), .PCGTH},
+		{mmi(0x29, 0x13), .PNOR},
+		{mmi(0x08, 0x17), .PPACH},
+		{mmi(0x08, 0x16), .PEXTLH},
+		{mmi(0x08, 0x01), .PSUBW},
+		{mmi(0x29, 0x0e), .PCPYUD},
+		{mmi(0x29, 0x0e) &~ (31 << 21 | 31 << 16) | 3 << 21 | 3 << 16, .PCPYUD}, // rs = rt = rd
+		{0x42000039, .DI},
+		{mmi(0x04) &~ (31 << 16), .PLZCW},
+		{cop2(1, 3), .QMFC2},
+		{cop2(1, 0), .QMFC2}, // vf0
+		{cop2(5, 3), .QMTC2},
+		{cop2(5, 0), .QMTC2}, // vf0 stays
+		{cop2(2, 3), .CFC2},
+		{cop2(6, 3), .CTC2},
+		{macro(0x28), .VU0}, // VADD
+		{macro(0x2a, 9), .VU0}, // VMUL.xw
+		{macro(0x29), .VU0}, // VMADD
+		{macro(0x01), .VU0}, // VADDy
+		{macro(0x07, 0xc), .VU0}, // VSUBw.xy
+		{macro(0x08, 5), .VU0}, // VMADDx.yw
+		{macro(0x0e), .VU0}, // VMSUBz
+		{macro(0x19, 2), .VU0}, // VMULy.z
+		{macro(0x1c), .VU0}, // VMULq
+		{macro(0x1e), .VU0}, // VMULi
+		{macro(0x20), .VU0}, // VADDq
+		{macro(0x21, 3), .VU0}, // VMADDq.zw
+		{macro(0x22), .VU0}, // VADDi
+		{macro(0x23), .VU0}, // VMADDi
+		{macro(0x24), .VU0}, // VSUBq
+		{macro(0x25), .VU0}, // VMSUBq
+		{macro(0x26), .VU0}, // VSUBi
+		{macro(0x27, 8), .VU0}, // VMSUBi.x
+		{macro(0x2c), .VU0}, // VSUB
+		{macro(0x2d, 6), .VU0}, // VMSUB.yz
+		{macro(0x2e), .VU0}, // VOPMSUB
+		{macro(0x28, 15, 0), .VU0}, // VADD to vf0: flags only
+		{macro(0x28, 0), .VU0}, // VADD of no lanes
+		{macro(0x2b), .VU0}, // VMAX, left to the interpreter
+		{special2(0x02), .VU0}, // VADDAz
+		{special2(0x29, 9), .VU0}, // VMADDA.xw
+		{special2(0x1c), .VU0}, // VMULAq
+		{special2(0x27), .VU0}, // VMSUBAi
+		{special2(0x2a), .VU0}, // VMULA
+		{special2(0x2e), .VU0}, // VOPMULA
+		{special2(0x2f), .VU0}, // VNOP
+		{special2(0x30, 0xa), .VU0}, // VMOVE.xz
+		{special2(0x30, 15, 0), .VU0}, // VMOVE to vf0
+		{special2(0x31), .VU0}, // VMR32
+		{special2(0x31, 5, 1), .VU0}, // VMR32.yw in place
+		{cop1(0x00), .ADD_S},
+		{cop1(0x00, fd = 1), .ADD_S}, // fd = fs
+		{cop1(0x01), .SUB_S},
+		{cop1(0x02), .MUL_S},
+		{cop1(0x02, fd = 2, fs = 2), .MUL_S}, // all one register
+		{cop1(0x06), .MOV_S},
+		{cop1(0x34) &~ (31 << 6), .C_LT_S},
+		{cop1(0x34, fd = 0, ft = 1), .C_LT_S}, // fs = ft
+		{cop1(0x07), .NEG_S},
+		{cop1(0x07, fd = 1), .NEG_S}, // fd = fs
+		{cop1(0x05), .ABS_S},
+		{cop1(0x20, fmt = 0x14), .CVT_S_W},
+		{cop1(0x03), .DIV_S},
+		{cop1(0x03, fd = 2), .DIV_S}, // fd = ft
+		{cop1(0x18), .ADDA_S},
+		{cop1(0x19), .SUBA_S},
+		{cop1(0x1a), .MULA_S},
+		{cop1(0x1c), .MADD_S},
+		{cop1(0x1c, fd = 2, fs = 2), .MADD_S}, // all one register
+		{cop1(0x1d), .MSUB_S},
+		{cop1(0x1e), .MADDA_S},
+		{cop1(0x1f), .MSUBA_S},
+		{cop1(0x28), .MAX_S},
+		{cop1(0x28, fd = 1), .MAX_S}, // fd = fs
+		{cop1(0x29), .MIN_S},
+		{cop1(0x29, fd = 2), .MIN_S}, // fd = ft
+		{cop1(0x32) &~ (31 << 6), .C_EQ_S},
+		{cop1(0x36) &~ (31 << 6), .C_LE_S},
+		{cop1(0x36, fd = 0, ft = 1), .C_LE_S}, // fs = ft
+		{cop1(0x24), .CVT_W_S},
+		{cop1(0x24, fd = 1), .CVT_W_S}, // fd = fs
+		{cop1(0x04), .SQRT_S},
+		{cop1(0x04, fd = 2), .SQRT_S}, // fd = ft
+		{unaligned(34, 2), .LWL},
+		{unaligned(34, 1), .LWL}, // rt = rs
+		{unaligned(34, 0), .LWL},
+		{unaligned(38, 2), .LWR},
+		{unaligned(38, 1), .LWR},
+		{unaligned(38, 0), .LWR},
+		{unaligned(26, 2), .LDL},
+		{unaligned(26, 1), .LDL},
+		{unaligned(26, 0), .LDL},
+		{unaligned(27, 2), .LDR},
+		{unaligned(27, 1), .LDR},
+		{unaligned(27, 0), .LDR},
+		{unaligned(42, 2), .SWL},
+		{unaligned(42, 1), .SWL},
+		{unaligned(42, 0), .SWL},
+		{unaligned(46, 2), .SWR},
+		{unaligned(46, 1), .SWR},
+		{unaligned(46, 0), .SWR},
+		{unaligned(44, 2), .SDL},
+		{unaligned(44, 1), .SDL},
+		{unaligned(44, 0), .SDL},
+		{unaligned(45, 2), .SDR},
+		{unaligned(45, 1), .SDR},
+		{unaligned(45, 0), .SDR},
+		{special2(0x3b), .VU0}, // VWAITQ
+		{special2(0x38), .VU0}, // VDIV, left to the interpreter
+		{54 << 26 | 1 << 21 | 2 << 16 | (0x10000 - MEM_BACK), .LQC2},
+		{54 << 26 | 1 << 21 | (0x10000 - MEM_BACK), .LQC2}, // vf0 stays
+		{62 << 26 | 1 << 21 | 2 << 16 | (0x10000 - MEM_BACK), .SQC2},
+		{62 << 26 | 1 << 21 | (0x10000 - MEM_BACK), .SQC2}, // vf0 as it is
+	}
+	// The reference CVT.W.S checks against: the i32 limit on the side of
+	// the sign for a NaN or an infinity, as for any |x| >= 2^31.
+	CVT_W :: [?][2]u32 {
+		{0x7fc00000, 0x7fffffff},
+		{0x7f800000, 0x7fffffff},
+		{0x4f000000, 0x7fffffff},
+		{0xffc00000, 0x80000000},
+		{0xff800000, 0x80000000},
+		{0xcf000000, 0x80000000},
+	}
+	for v in CVT_W {
+		if got := u32(cpu.cvt_w(transmute(f32)v[0])); got != v[1] {
+			fmt.eprintfln("FAIL cpu.cvt_w(%08x) = %08x, want %08x", v[0], got, v[1])
+			os.exit(1)
+		}
+	}
+	mem.mem_init()
+	arch := native.Arch(core.NATIVE_ARCH)
+	a := native.make_asm(arch, r5900.native_ram())
+	funcs: [len(cases)]native.Blob_Func
+	slow: map[r5900.Op]int
+	for c, k in cases {
+		if got := r5900.decode(0, c.w).op; got != c.op {
+			fmt.eprintfln("FAIL %08x decodes to %v, want %v", c.w, got, c.op)
+			os.exit(1)
+		}
+		at := u32(ENTRY + 16 * k)
+		words := [?]u32{c.w, 0x03e00008, 0}
+		data: [len(words) * 4]u8
+		for w, n in words {
+			data[4 * n], data[4 * n + 1], data[4 * n + 2], data[4 * n + 3] = u8(w), u8(w >> 8), u8(w >> 16), u8(w >> 24)
+		}
+		f := mips.func_make(at, at + len(data))
+		mips.discover(r5900.RULES, {base = at, data = data[:]}, f, {})
+		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0]}
+		free_all(context.temp_allocator)
+	}
+	// The COP1 ops are inline on x64 only.
+	if arch == .Arm64 {
+		for op in COP1_OPS {delete_key(&slow, op)}
+	}
+	if len(slow) != 0 {
+		fmt.eprintln("FAIL interpreter calls in native code:", slow)
+		os.exit(1)
+	}
+	code, err := core.native_load(native.make_blob(&a, funcs[:], {}), ps2.native_imports())
+	if err != "" {
+		fmt.eprintln("native_load:", err)
+		os.exit(1)
+	}
+	cpu.next_event = max(u64)
+	failed, checks := 0, 0
+	for c, k in cases {
+		run := cast(proc())rawptr(code.base + uintptr(code.funcs[k].off))
+		if slice.contains(COP1_OPS[:], c.op) {
+			failed, checks = check_fpu(c, funcs[k].addr, run, failed, checks)
+			continue
+		}
+		if slice.contains(UNALIGNED_OPS[:], c.op) {
+			failed, checks = check_unaligned(c, funcs[k].addr, run, failed, checks)
+			continue
+		}
+		if c.op == .LQC2 || c.op == .SQC2 {
+			failed, checks = check_mem(c, funcs[k].addr, run, failed, checks)
+			continue
+		}
+		for x in VALS {
+			for y in VALS {
+				start: cpu.Cpu
+				start.r[1].d = {x, ~x ~ y}
+				start.r[2].d = {y, x * 0x9e3779b9}
+				start.r[3].d = {0xdead_beef_0bad_f00d, x ~ (y << 1)}
+				start.hi.d = {x ~ 0x5555, y}
+				start.lo.d = {y ~ 0xaaaa, x}
+				start.cop0[12] = u32(x) | 0x10000
+				// VU0: the values' words as floats, NaNs, infinities and
+				// denormals among them.
+				vu_start := vu.vu0
+				vu_start.vf[0].f = {0, 0, 0, 1}
+				for &v, n in vu_start.vf[1:] {v.u = {u32(x), u32(y >> 32), u32(y), u32(x >> 32) ~ u32(n)}}
+				vu_start.vi[3] = u16(x ~ y)
+				vu_start.acc.u = {u32(y), u32(x), u32(x >> 32), u32(y >> 32)}
+				vu_start.q = transmute(f32)u32(y ~ (x >> 32))
+				vu_start.i = transmute(f32)u32(x ~ (y >> 32))
+				vu_start.mac = u32(y)
+				vu_start.status = u32(x >> 7) & 0xfff
+				cpu.state, vu.vu0 = start, vu_start
+				run()
+				native_got, native_vu := cpu.state, vu.vu0
+				cpu.state, vu.vu0 = start, vu_start
+				ps2.exec_insn(r5900.decode(funcs[k].addr, c.w))
+				// The native function charges its cycles; the interpreter
+				// leaves that to its caller.
+				native_got.cycles = cpu.state.cycles
+				checks += 1
+				// PLZCW writes the low doubleword of rd only, as PCSX2's
+				// MMI.cpp PLZCW does (UL[0] and UL[1]); rd's high one
+				// starts nonzero here.
+				if c.op == .PLZCW && cpu.state.r[3].d[1] != start.r[3].d[1] {
+					failed += 1
+					fmt.eprintfln("FAIL PLZCW rd high %016x, want %016x", cpu.state.r[3].d[1], start.r[3].d[1])
+				}
+				interp_vu := vu.vu0
+				vu_same := runtime.memory_equal(&native_vu, &interp_vu, size_of(vu.Vu))
+				if !same(native_got, cpu.state) || !vu_same {
+					failed += 1
+					if failed > 20 {continue}
+					fmt.eprintfln("FAIL %v %08x rs %016x rt %016x", c.op, c.w, x, y)
+					diff(native_got, cpu.state)
+					if !vu_same {vu_diff(native_vu, interp_vu)}
+				}
+			}
+		}
+	}
+	if failed != 0 {
+		fmt.eprintfln("%d of %d checks failed", failed, checks)
+		os.exit(1)
+	}
+	fmt.printfln("ok ee_native %v: %d instructions, %d checks", arch, len(cases), checks)
+}
+
+// A VU0 quadword load or store at each of MEM_ADDRS, with the watch byte
+// clear and set (which sends a store to the runtime): the native function
+// and the interpreter must leave the same cpu.state, VF registers and
+// quadword in memory.
+@(private = "file")
+check_mem :: proc(c: Case, addr: u32, run: proc(), failed, checks: int) -> (int, int) {
+	failed, checks := failed, checks
+	for at in MEM_ADDRS {
+		for watch in ([?]u8{0, 1}) {
+			Got :: struct {
+				state: cpu.Cpu,
+				vf:    [32]u128,
+				q:     u128,
+			}
+			start: cpu.Cpu
+			start.r[1].d = {u64(at + MEM_BACK), 0x0123_4567_89ab_cdef}
+			start.r[2].d = {u64(at), ~u64(at)}
+			got: [2]Got
+			for interp in 0 ..< 2 {
+				for &v, n in vu.vu0.vf[1:] {v.q = u128(at) << 64 | u128(n + 1) * 0x0101_0101_0101_0101}
+				mem.wr128(at, u128(0xfeed_face_cafe_f00d) << 64 | u128(at))
+				mem.watch_on = watch
+				cpu.state = start
+				if interp == 0 {
+					run()
+				} else {
+					ps2.exec_insn(r5900.decode(addr, c.w))
+				}
+				mem.watch_on = 0
+				got[interp].state = cpu.state
+				for v, n in vu.vu0.vf {got[interp].vf[n] = v.q}
+				got[interp].q = mem.rd128(at)
+			}
+			got[0].state.cycles = got[1].state.cycles
+			checks += 1
+			if !same(got[0].state, got[1].state) || got[0].vf != got[1].vf || got[0].q != got[1].q {
+				failed += 1
+				if failed > 20 {continue}
+				fmt.eprintfln("FAIL %v %08x at %08x watch %d", c.op, c.w, at, watch)
+				diff(got[0].state, got[1].state)
+				for n in 0 ..< 32 {
+					if got[0].vf[n] != got[1].vf[n] {fmt.eprintfln("  vf%d native %032x interp %032x", n, got[0].vf[n], got[1].vf[n])}
+				}
+				if got[0].q != got[1].q {fmt.eprintfln("  memory native %032x interp %032x", got[0].q, got[1].q)}
+			}
+		}
+	}
+	return failed, checks
+}
+
+// An unaligned load or store at each of UNALIGNED_ADDRS plus 0 to 7, with
+// the watch byte clear and set and two values in rt: the native function
+// and the interpreter must leave the same cpu.state and the same two
+// quadwords around the address.
+@(private = "file")
+check_unaligned :: proc(c: Case, addr: u32, run: proc(), failed, checks: int) -> (int, int) {
+	failed, checks := failed, checks
+	for base in UNALIGNED_ADDRS {
+		for k in u32(0) ..< 8 {
+			at := base + k
+			q0 := base &~ 15
+			for watch in ([?]u8{0, 1}) {
+				for v in ([?]u64{0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210}) {
+					start: cpu.Cpu
+					start.r[1].d = {0x5a5a_5a5a_0000_0000 | u64(at - UNALIGNED_OFF), ~v}
+					start.r[2].d = {v, v ~ 0x5555}
+					got: [2]struct {
+						state: cpu.Cpu,
+						q:     [2]u128,
+					}
+					for interp in 0 ..< 2 {
+						mem.wr128(q0, u128(0xfeed_face_cafe_f00d) << 64 | u128(0x8899_aabb_ccdd_ee00) | u128(k))
+						mem.wr128(q0 + 16, u128(0x0f1e_2d3c_4b5a_6978) << 64 | u128(at))
+						mem.watch_on = watch
+						cpu.state = start
+						if interp == 0 {
+							run()
+						} else {
+							ps2.exec_insn(r5900.decode(addr, c.w))
+						}
+						mem.watch_on = 0
+						got[interp].state = cpu.state
+						got[interp].q = {mem.rd128(q0), mem.rd128(q0 + 16)}
+					}
+					got[0].state.cycles = got[1].state.cycles
+					checks += 1
+					if !same(got[0].state, got[1].state) || got[0].q != got[1].q {
+						failed += 1
+						if failed > 20 {continue}
+						fmt.eprintfln("FAIL %v %08x at %08x watch %d rt %016x", c.op, c.w, at, watch, v)
+						diff(got[0].state, got[1].state)
+						if got[0].q != got[1].q {fmt.eprintfln("  memory native %032x interp %032x", got[0].q, got[1].q)}
+					}
+				}
+			}
+		}
+	}
+	return failed, checks
+}
+
+// A COP1 op over each pair of F_VALS in fs and ft, with each of ACC_VALS
+// in ACC and FCR31's C bit set and clear: the native function and the
+// interpreter must leave the same cpu.state.
+@(private = "file")
+check_fpu :: proc(c: Case, addr: u32, run: proc(), failed, checks: int) -> (int, int) {
+	failed, checks := failed, checks
+	for x in F_VALS {
+		for y in F_VALS {
+			for acc in ACC_VALS {
+				for cond in ([?]u32{0, cpu.FCR31_C}) {
+					start: cpu.Cpu
+					for &f, n in start.f {f.u = 0x5a5a0000 | u32(n)}
+					start.f[1].u, start.f[2].u = x, y
+					start.acc.u = acc
+					start.fcr31 = 0x01000001 | cond
+					got: [2]cpu.Cpu
+					for interp in 0 ..< 2 {
+						cpu.state = start
+						if interp == 0 {
+							run()
+						} else {
+							ps2.exec_insn(r5900.decode(addr, c.w))
+						}
+						got[interp] = cpu.state
+					}
+					got[0].cycles = got[1].cycles
+					checks += 1
+					if !same(got[0], got[1]) {
+						failed += 1
+						if failed > 20 {continue}
+						fmt.eprintfln("FAIL %v %08x fs %08x ft %08x acc %08x fcr31 %08x", c.op, c.w, x, y, acc, start.fcr31)
+						for n in 0 ..< 32 {
+							if got[0].f[n].u != got[1].f[n].u {fmt.eprintfln("  f%d native %08x interp %08x", n, got[0].f[n].u, got[1].f[n].u)}
+						}
+						if got[0].acc.u != got[1].acc.u {fmt.eprintfln("  acc native %08x interp %08x", got[0].acc.u, got[1].acc.u)}
+						if got[0].fcr31 != got[1].fcr31 {fmt.eprintfln("  fcr31 native %08x interp %08x", got[0].fcr31, got[1].fcr31)}
+					}
+				}
+			}
+		}
+	}
+	return failed, checks
+}
+
+// The fields where native and interp differ.
+@(private = "file")
+diff :: proc(n, i: cpu.Cpu) {
+	for r in 0 ..< 32 {
+		if n.r[r].q != i.r[r].q {fmt.eprintfln("  r%d native %032x interp %032x", r, n.r[r].q, i.r[r].q)}
+	}
+	if n.hi.q != i.hi.q {fmt.eprintfln("  hi native %032x interp %032x", n.hi.q, i.hi.q)}
+	if n.lo.q != i.lo.q {fmt.eprintfln("  lo native %032x interp %032x", n.lo.q, i.lo.q)}
+	if n.cop0 != i.cop0 {fmt.eprintfln("  cop0 native %x interp %x", n.cop0, i.cop0)}
+	if n.sa != i.sa || n.fcr31 != i.fcr31 || transmute([32]u32)n.f != transmute([32]u32)i.f || n.acc.u != i.acc.u {fmt.eprintln("  sa, fcr31, f or acc")}
+}
+
+@(private = "file")
+vu_diff :: proc(n, i: vu.Vu) {
+	for r in 0 ..< 32 {
+		if n.vf[r].q != i.vf[r].q {fmt.eprintfln("  vf%d native %08x interp %08x", r, n.vf[r].u, i.vf[r].u)}
+	}
+	if n.acc.q != i.acc.q {fmt.eprintfln("  acc native %08x interp %08x", n.acc.u, i.acc.u)}
+	if n.mac != i.mac || n.status != i.status {fmt.eprintfln("  mac/status native %x/%x interp %x/%x", n.mac, n.status, i.mac, i.status)}
+	if n.vi != i.vi || n.q != i.q || n.p != i.p || n.i != i.i || n.r != i.r || n.clip != i.clip {fmt.eprintln("  vi, q, p, i, r or clip")}
+}
+
+@(private = "file")
+same :: proc(n, i: cpu.Cpu) -> bool {
+	n, i := n, i
+	return runtime.memory_equal(&n, &i, size_of(cpu.Cpu))
+}
