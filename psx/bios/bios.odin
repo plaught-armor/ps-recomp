@@ -9,8 +9,6 @@ import "core:strings"
 import "ps:core"
 import cpu "../cpu"
 import io "../io"
-import host "../host"
-import gpu "../gpu"
 
 bios: struct {
 	// HookEntryInt jump buffer: [0]=ra [1]=sp [2]=fp [3..10]=s0-s7 [11]=gp.
@@ -20,6 +18,14 @@ bios: struct {
 	// SysEnqIntRP chain heads by priority.
 	chains:    [4]u32,
 }
+
+// Host input and GPU, set by package psx (hooks.odin) so this package does
+// not pull in the platform layer.
+pad_game: proc() -> u16
+// Analog stick positions, x right and y down, each in -1..1.
+sticks: proc() -> (left, right: [2]f32)
+pad_rumble: proc(small: bool, large: u8)
+gp0_write: proc(w: u32)
 
 // The seed of the BIOS rand() (A0:2F), where the game's random numbers come
 // from.
@@ -49,7 +55,7 @@ ret :: #force_inline proc(v: u32) {
 // as absent.
 bios_pad_vblank :: proc() {
 	if bios.pad_buf[0] != 0 {
-		b := ~host.pad_game()
+		b := ~pad_game()
 		cpu.w8(bios.pad_buf[0], 0x00)
 		cpu.w8(bios.pad_buf[0] + 1, 0x41)
 		cpu.w8(bios.pad_buf[0] + 2, u8(b >> 8))
@@ -96,7 +102,7 @@ bios_a :: proc(fn: u32) {
 	case 0x3f:
 		fmt.eprint("[printf] ", bios_format(cpu.mem_cstring(arg(0)), 1), sep = "")
 	case 0x49:
-		gpu.gp0_write(arg(0))
+		gp0_write(arg(0))
 	case 0x70:
 		ret(1) // _bu_init
 	case 0xab, 0xac:

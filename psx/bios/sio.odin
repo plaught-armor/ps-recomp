@@ -14,7 +14,6 @@ package psx_bios
 import "ps:core"
 import cpu "../cpu"
 import io "../io"
-import host "../host"
 
 @(private)
 SIO_ACK_DELAY :: 400
@@ -114,18 +113,18 @@ pad_command :: proc(cmd: u8) -> (u8, bool) {
 	if cmd != 0x42 && !(cmd == 0x43 && pad.dualshock) {
 		return id, false
 	}
-	b := ~host.pad_game()
+	b := ~pad_game()
 	pad.data[0] = u8(b >> 8)
 	pad.data[1] = u8(b)
 	if !pad.analog {
 		pad.size = PAD_DATA_DIGITAL
 		return id, true
 	}
-	s := host.sticks()
-	pad.data[2] = stick_byte(s.right.x)
-	pad.data[3] = stick_byte(s.right.y)
-	pad.data[4] = stick_byte(s.left.x)
-	pad.data[5] = stick_byte(s.left.y)
+	left, right := sticks()
+	pad.data[2] = stick_byte(right.x)
+	pad.data[3] = stick_byte(right.y)
+	pad.data[4] = stick_byte(left.x)
+	pad.data[5] = stick_byte(left.y)
 	return id, true
 }
 
@@ -196,7 +195,7 @@ pad_motor_byte :: proc(k: int, tx: u8) {
 	if .Sio in core.trace.active && (small != pad.small || large != pad.large) {
 		core.tracef(.Sio, "motor small %v large %d", pad.small, pad.large)
 	}
-	host.pad_rumble(pad.small, pad.large)
+	pad_rumble(pad.small, pad.large)
 }
 
 @(private)

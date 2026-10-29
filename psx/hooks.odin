@@ -4,6 +4,7 @@ package psx
 
 import bios "bios"
 import cpu "cpu"
+import gpu "gpu"
 import gte "gte"
 import host "host"
 import io "io"
@@ -22,6 +23,13 @@ hooks_init :: proc "contextless" () {
 	cpu.ram_keep = ram_keep
 	gte.depth_tag = render.depth_tag
 	io.deliver_irq = bios.deliver_irq
+	bios.pad_game = host.pad_game
+	bios.sticks = proc() -> (left, right: [2]f32) {
+		s := host.sticks()
+		return s.left, s.right
+	}
+	bios.pad_rumble = host.pad_rumble
+	bios.gp0_write = gpu.gp0_write
 	io.event_handlers = event_handler_table
 	io.dma_channels = dma_channel_table
 	spu.platform_audio = host.platform_audio
