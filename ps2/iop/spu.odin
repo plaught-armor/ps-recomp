@@ -13,7 +13,9 @@
 //
 // A port whose sound driver is its own HLE code, not sdrdrv, drives the same
 // voices through spu_write, spu_voice_on, spu_voice_set, spu_voice_off and
-// spu_voice_status.
+// spu_voice_status, and each core's reverb through spu_effect,
+// spu_effect_enable and spu_voice_send (reverb.odin). sdrdrv's effect calls
+// are not handled: its cores stay dry.
 package ps2_iop
 
 import "core:fmt"
@@ -44,12 +46,15 @@ Spu_Voice :: struct {
 	hist:       [2]i32, // ADPCM predictor history
 	pitch:      u32,
 	voll, volr: i32,
+	dry:        bool, // out of the effect send (VMIXEL/VMIXER), which libsd's init opens to every voice
 }
 
 @(private = "file")
 spu: struct {
 	ram:   []u8,
-	voice: [2][24]Spu_Voice,
+	voice:  [2][24]Spu_Voice,
+	effect: [2]bool, // the core's effect enable, ATTR bit 7
+	reverb: [2]Reverb, // its work area is here, not in sound RAM at ESA .. EEA
 }
 
 // libsd parameter and address ids; the low bits name core and voice.
@@ -167,7 +172,12 @@ spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 
 // Add the voices to interleaved stereo at MIX_RATE, the SPU2 output rate.
 spu_mix :: proc(out: []i16) {
-	for &core in spu.voice {
+	for &core, c in spu.voice {
+		// A core runs its reverb only with effects enabled and a mode set.
+		w := &spu.reverb[c]
+		wet := spu.effect[c] && w.mode != 0
+		send: []i32
+		if wet {send = make([]i32, len(out), context.temp_allocator)}
 		for &v in core {
 			if !v.on {continue}
 			for n := 0; n < len(out); n += 2 {
@@ -176,9 +186,19 @@ spu_mix :: proc(out: []i16) {
 				level := v.level
 				s := spu_sample(&v) * level >> 15
 				if v.on {spu_envelope(&v)}
-				out[n] = i16(clamp(i32(out[n]) + s * v.voll >> 14, -32768, 32767))
-				out[n + 1] = i16(clamp(i32(out[n + 1]) + s * v.volr >> 14, -32768, 32767))
+				sl, sr := s * v.voll >> 14, s * v.volr >> 14
+				out[n] = i16(clamp(i32(out[n]) + sl, -32768, 32767))
+				out[n + 1] = i16(clamp(i32(out[n + 1]) + sr, -32768, 32767))
+				if wet && !v.dry {
+					send[n] += sl
+					send[n + 1] += sr
+				}
 			}
+		}
+		if wet {
+			acc := make([]i32, len(out), context.temp_allocator)
+			reverb_mix(w, send, acc)
+			for x, i in acc {out[i] = i16(clamp(i32(out[i]) + x, -32768, 32767))}
 		}
 	}
 }
@@ -234,6 +254,27 @@ spu_voice_set :: proc(core, voice: int, pitch, voll, volr: u32) {
 	v := spu_voice_at(core, voice)
 	v.pitch = spu_pitch(pitch)
 	v.voll, v.volr = spu_volume(voll), spu_volume(volr)
+}
+
+// Put a voice in or out of its core's effect send, as its VMIXEL and VMIXER
+// bits.
+spu_voice_send :: proc(core, voice: int, on: bool) {
+	spu_voice_at(core, voice).dry = !on
+}
+
+// Set a core's effect as libsd's sceSdSetEffectAttr: mode 0 (off) .. 9 the
+// reverb.odin presets, with 0x100 to clear the work area; depth_l and
+// depth_r are the return volume (EVOLL, EVOLR). Delay and feedback, which
+// only echo and delay take, are not applied.
+spu_effect :: proc(core: int, mode: u32, depth_l, depth_r: i16) {
+	assert(core >= 0 && core < 2 && mode & 0xff <= 9, "spu: no such core or effect mode")
+	reverb_set(&spu.reverb[core], mode & 0xff, i32(depth_l), i32(depth_r), mode & 0x100 != 0)
+}
+
+// Turn a core's effects on or off, as SD_C_EFFECT_ENABLE (ATTR bit 7).
+spu_effect_enable :: proc(core: int, on: bool) {
+	assert(core >= 0 && core < 2, "spu: no such core")
+	spu.effect[core] = on
 }
 
 // Key a voice off, as KOFF: its envelope goes to release.

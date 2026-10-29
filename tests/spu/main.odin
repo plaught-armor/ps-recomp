@@ -7,7 +7,8 @@
 // The snapshot part keys a voice on, saves, mixes, scribbles over its
 // blocks and loads: mixing again must give the same samples.
 // The FMOD reverb (reverb_set, reverb_mix) runs each preset over a fixed
-// send; a hash of its return pins the output.
+// send; a hash of its return pins the output. A core's reverb (spu_effect,
+// spu_effect_enable, spu_voice_send) rings on after its voice ends.
 package main
 
 import "core:fmt"
@@ -18,6 +19,7 @@ import iop "ps:ps2/iop"
 LOOP :: 0x1000 // start, plain, end with repeat
 ONCE :: 0x2000 // plain, end without repeat
 SHORT :: 0x3000 // one block, end without repeat
+EFFECT :: 0x4000 // one block, end without repeat
 SNAP :: 0x10000 // varied samples, end with repeat
 BLOCKS :: 3
 
@@ -154,9 +156,45 @@ reverb_presets :: proc() {
 	}
 }
 
+// Play the EFFECT block once on core 0 and mix past its end.
+effect_play :: proc(send: bool) -> []i16 {
+	iop.spu_voice_send(0, 5, send)
+	iop.spu_voice_on(0, 5, key(EFFECT))
+	return mix(0x4000)
+}
+
+// Whether anything is heard after the voice's 28 samples: the reverb.
+tail :: proc(out: []i16) -> bool {
+	for x in out[64:] {if x != 0 {return true}}
+	return false
+}
+
+effects :: proc() {
+	block(EFFECT, 1, 3)
+	dry := effect_play(true)
+	check(!tail(dry), "no reverb before effects are set")
+	iop.spu_effect(0, 0x105, 0x500, 0x500) // hall, cleared
+	check(!tail(effect_play(true)), "no reverb with a mode but effects disabled")
+	iop.spu_effect_enable(0, true)
+	check(tail(effect_play(true)), "hall reverb heard after the voice ends")
+	iop.spu_effect(0, 0x105, 0x500, 0x500)
+	check(!tail(effect_play(false)), "a voice out of the send gets no reverb")
+	iop.spu_effect(0, 0x100, 0, 0)
+	off := effect_play(true)
+	check(len(off) == len(dry), "mode 0 mixes as many samples")
+	for x, i in off {
+		if x != dry[i] {
+			check(false, "mode 0 mixes as with effects disabled")
+			break
+		}
+	}
+	iop.spu_effect_enable(0, false)
+}
+
 game :: proc(_: rawptr) {
 	voices()
 	reverb_presets()
+	effects()
 	for n in 0 ..< BLOCKS {
 		b: [16]u8
 		b[0] = u8(n) << 4 // filters 0..2
