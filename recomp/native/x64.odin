@@ -325,6 +325,10 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Ftoi     = 0x0f5b, // cvttps2dq
 		.Gt32     = 0x0f66, // pcmpgtd
 		.Xor      = 0x0fef, // pxor
+		.Sub8     = 0x0ff8, // psubb
+		.Zip_Lo32 = 0x0f62, // punpckldq
+		.Zip_Hi32 = 0x0f6a, // punpckhdq
+		.Dup16    = 0x0f70, // pshuflw, then pshufhw, of lanes 0
 	}
 	ops := OPS
 	sse :: proc(a: ^Asm, op: u32, dst, src: Vreg, ps := false) {
@@ -342,6 +346,14 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 			emit8(a, 0x66, 0x0f, 0x72, 0xf0 | u8(r), 16) // pslld r, 16
 			emit8(a, 0x66, 0x0f, 0x72, 0xe0 | u8(r), 16) // psrad r, 16
 		}
+	}
+	if op == .Dup16 {
+		emit8(a, 0xf2)
+		op_rr(a, false, ops[op], u8(dst), u8(src))
+		emit8(a, 0, 0xf3)
+		op_rr(a, false, ops[op], u8(dst), u8(dst))
+		emit8(a, 0)
+		return
 	}
 	if op == .Ftoi {emit8(a, 0xf3)}
 	sse(a, ops[op], dst, src, op == .Fadd || op == .Fsub || op == .Fmul || op == .Fdiv || op == .Itof || op == .Ftoi)

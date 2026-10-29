@@ -394,6 +394,28 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 			native.state_store(a, at + 4, .A)
 		}
 		if rd != 0 {copy64(a, GPR * u32(rd), LO + unit)}
+	case .MADD, .MADDU, .MADD1, .MADDU1:
+		// cpu.madd: hi:lo (low words) + the product, each half sign-extended.
+		unit: u32 = 8 if i.op == .MADD1 || i.op == .MADDU1 else 0
+		get(a, .A, rs)
+		get(a, .B, rt)
+		native.state_load(a, .C, LO + unit)
+		native.state_load(a, .LD, HI + unit)
+		native.mul_wide(a, i.op == .MADD || i.op == .MADD1, LO + unit, HI + unit, .A, .B)
+		native.state_load(a, .A, LO + unit)
+		native.alu(a, .Add, .A, .C)
+		native.state_store(a, LO + unit, .A)
+		native.set_cond(a, .Ltu, .A, .C) // the carry
+		native.state_load(a, .B, HI + unit)
+		native.alu(a, .Add, .B, .LD)
+		native.alu(a, .Add, .B, .A)
+		native.state_store(a, HI + unit, .B)
+		for at in ([2]u32{LO + unit, HI + unit}) {
+			native.state_load(a, .A, at)
+			native.alu_imm(a, .Sar, .A, 31)
+			native.state_store(a, at + 4, .A)
+		}
+		if rd != 0 {copy64(a, GPR * u32(rd), LO + unit)}
 	case .PLZCW:
 		// cpu.plzcw, as emit_op calls it
 		get(a, .A, rs)
@@ -607,8 +629,8 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.alu_imm(a, .And, .A, 15)
 		native.alu_imm(a, .Shl, .A, 3)
 		native.state_store(a, SA, .A)
-	case .PADDH, .PSUBW, .PMAXH, .PMINH, .PCGTH, .POR, .PNOR, .PEXTLB, .PEXTUB, .PEXTLH, .PCPYLD,
-	     .PCPYUD, .PPACB, .PPACH:
+	case .PADDH, .PSUBW, .PSUBB, .PMAXH, .PMINH, .PCGTH, .POR, .PNOR, .PAND, .PXOR, .PEXTLB, .PEXTUB,
+	     .PEXTLH, .PEXTLW, .PEXTUW, .PCPYLD, .PCPYUD, .PPACB, .PPACH, .PCPYH:
 		if rd == 0 {return true}
 		// rd = x op y, lane-wise, with the operands in the interpreter's order
 		v: native.Vop
@@ -616,18 +638,24 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		#partial switch i.op {
 		case .PADDH: v = .Add16
 		case .PSUBW: v = .Sub32
+		case .PSUBB: v = .Sub8
 		case .PMAXH: v = .Max16
 		case .PMINH: v = .Min16
 		case .PCGTH: v = .Gt16
 		case .POR: v = .Or
 		case .PNOR: v = .Nor
+		case .PAND: v = .And
+		case .PXOR: v = .Xor
 		case .PEXTLB: v, x, y = .Zip_Lo8, rt, rs
 		case .PEXTUB: v, x, y = .Zip_Hi8, rt, rs
 		case .PEXTLH: v, x, y = .Zip_Lo16, rt, rs
+		case .PEXTLW: v, x, y = .Zip_Lo32, rt, rs
+		case .PEXTUW: v, x, y = .Zip_Hi32, rt, rs
 		case .PCPYLD: v, x, y = .Zip_Lo64, rt, rs
 		case .PCPYUD: v = .Zip_Hi64
 		case .PPACB: v, x, y = .Even8, rt, rs
 		case .PPACH: v, x, y = .Even16, rt, rs
+		case .PCPYH: v, x, y = .Dup16, rt, rt
 		}
 		native.vec_load(a, .V0, GPR * u32(x))
 		native.vec_load(a, .V1, GPR * u32(y))

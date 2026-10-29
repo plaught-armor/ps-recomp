@@ -108,6 +108,11 @@ Vop :: enum u8 {
 	Ftoi,
 	Gt32, // signed: all ones in each 32-bit lane where dst > src
 	Xor,
+	Sub8,
+	Zip_Lo32, // words 0-1 of dst and src interleaved, dst's first
+	Zip_Hi32, // words 2-3 likewise
+	// dst = halfword 0 of src in halfwords 0-3, halfword 4 in halfwords 4-7
+	Dup16,
 }
 
 Label :: distinct i32

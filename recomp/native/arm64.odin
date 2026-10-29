@@ -254,10 +254,19 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Ftoi     = 0x4ea1b800, // fcvtzs .4s
 		.Gt32     = 0x4ea03400, // cmgt .4s
 		.Xor      = 0x6e201c00, // eor .16b
+		.Sub8     = 0x6e208400, // sub .16b
+		.Zip_Lo32 = 0x4e803800, // zip1 .4s
+		.Zip_Hi32 = 0x4e807800, // zip2 .4s
+		.Dup16    = 0x4e402800, // trn1 .8h, then trn1 .4s
 	}
 	ops := OPS
 	if op == .Itof || op == .Ftoi {
 		rrr(a, ops[op], u32(dst), u32(src), 0)
+		return
+	}
+	if op == .Dup16 {
+		rrr(a, ops[op], u32(dst), u32(src), u32(src)) // halfwords 0, 0, 2, 2, 4, 4, 6, 6
+		rrr(a, 0x4e802800, u32(dst), u32(dst), u32(dst)) // trn1 .4s: words 0, 0, 2, 2
 		return
 	}
 	if op == .Andn {

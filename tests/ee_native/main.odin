@@ -185,6 +185,19 @@ main :: proc() {
 		{mmi(0x08, 0x17), .PPACH},
 		{mmi(0x08, 0x16), .PEXTLH},
 		{mmi(0x08, 0x01), .PSUBW},
+		{mmi(0x08, 0x09), .PSUBB},
+		{mmi(0x08, 0x12), .PEXTLW},
+		{mmi(0x28, 0x12), .PEXTUW},
+		{mmi(0x09, 0x12), .PAND},
+		{mmi(0x09, 0x13), .PXOR},
+		{mmi(0x29, 0x1b), .PCPYH},
+		{mmi(0x29, 0x1b) &~ (31 << 16) | 3 << 16, .PCPYH}, // rt = rd
+		{mmi(0x08, 0x12) &~ (31 << 21) | 3 << 21, .PEXTLW}, // rs = rd
+		{mmi(0x00), .MADD},
+		{mmi(0x01), .MADDU},
+		{mmi(0x20), .MADD1},
+		{mmi(0x21), .MADDU1},
+		{mmi(0x00) &~ (31 << 11), .MADD}, // rd = 0
 		{mmi(0x29, 0x0e), .PCPYUD},
 		{mmi(0x29, 0x0e) &~ (31 << 21 | 31 << 16) | 3 << 21 | 3 << 16, .PCPYUD}, // rs = rt = rd
 		{0x42000039, .DI},
