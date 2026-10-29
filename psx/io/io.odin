@@ -215,7 +215,7 @@ timer_value_at :: proc(n: int, at: u64) -> u32 {
 	t := &timers[n]
 	ticks := (at - t.base) / (t.div * clock_mul)
 	v := u64(t.value) + ticks
-	if t.mode & 0x08 != 0 && t.target != 0 {
+	if timer_resets_at_target(n) {
 		v %= u64(t.target) + 1
 	} else {
 		v &= 0xffff
@@ -237,23 +237,38 @@ timer_reschedule :: proc(n: int, now: u64) {
 	// every reschedule.
 	step := t.div * clock_mul
 	cur := u64(timer_value_at(n, now))
-	ticks := 0x10000 - cur
-	if target, ok := timer_irq_target(n); ok {
-		// The counter shows target for a tick, then goes on to 0 (reset at
-		// target: a period of target+1) or counts on through 0xffff.
-		period := target + 1 if t.mode & 0x08 != 0 else 0x10000
-		ticks = target - cur if cur < target else period - cur + target
+	// The counter shows target for a tick, then goes on to 0 (reset at
+	// target: a period of target+1) or counts on through 0xffff. Each IRQ
+	// is due when the counter shows its value; reset at a target below
+	// 0xffff, the counter never shows 0xffff and overflow never comes.
+	period := u64(0x10000)
+	if timer_resets_at_target(n) {
+		period = u64(t.target) + 1
+	}
+	ticks := max(u64)
+	if t.mode & 0x10 != 0 && t.target != 0 {
+		ticks = timer_ticks_to(cur, u64(t.target), period)
+	}
+	if t.mode & 0x20 != 0 && period == 0x10000 {
+		ticks = min(ticks, timer_ticks_to(cur, 0xffff, period))
+	}
+	if ticks == max(u64) {
+		return
 	}
 	events[e] = now - (now - t.base) % step + ticks * step
 	cpu.next_event = min(cpu.next_event, events[e])
 }
 
-// The target the counter's IRQ fires at, or false when it fires at
-// overflow.
+// Ticks until a counter at `cur` next shows `v`, a whole period when it
+// shows it now.
 @(private)
-timer_irq_target :: proc(n: int) -> (u64, bool) {
-	t := &timers[n]
-	return u64(t.target), t.mode & 0x10 != 0 && t.target != 0
+timer_ticks_to :: proc(cur, v, period: u64) -> u64 {
+	return v - cur if cur < v else period - cur + v
+}
+
+@(private)
+timer_resets_at_target :: proc(n: int) -> bool {
+	return timers[n].mode & 0x08 != 0 && timers[n].target != 0
 }
 
 @(private)
@@ -265,8 +280,12 @@ timer_fire :: proc(n: int) {
 	t := &timers[n]
 	t.value = timer_value_at(n, event_due)
 	t.base = event_due
-	_, at_target := timer_irq_target(n)
-	t.mode |= 0x800 if at_target else 0x1000
+	if t.target != 0 && t.value == t.target {
+		t.mode |= 0x800
+	}
+	if t.value == 0xffff {
+		t.mode |= 0x1000
+	}
 	if .Timer in core.trace.active {
 		core.tracef(.Timer, "timer%d fire mode=%x target=%x", n, t.mode, t.target)
 	}
