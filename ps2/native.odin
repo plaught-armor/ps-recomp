@@ -238,6 +238,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.macro"] = p(rawptr(vu.vu0_macro))
 	m["vu.call_micro"] = p(rawptr(vu.vu0_call_micro))
 	m["vu.cmsar"] = p(&vu.vu0.cmsar)
+	m["vu.mem"] = p(&vu.vu0_mem)
 	m["vu.ctrl_read"] = p(rawptr(vu.vu0_ctrl_read))
 	m["vu.ctrl_write"] = p(rawptr(vu.vu0_ctrl_write))
 	m["ps2.bc_cond"] = p(rawptr(native_bc_cond))

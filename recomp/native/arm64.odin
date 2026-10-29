@@ -227,6 +227,12 @@ a64_vec_funnel8 :: proc(a: ^Asm, dst, lo, hi: u32, buf: int) {
 	a64_vec_ldst(a, .V0, dst, true)
 }
 
+// Through x16 = the import's address.
+a64_vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: int, store: bool) {
+	load_imp(a, IP0, base)
+	rrr(a, 0x3ca06800 if store else 0x3ce06800, u32(v), IP0, A64_REG[.A]) // str/ldr q, [x16, x9]
+}
+
 a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	OPS :: [Vop]u32 {
 		.Or       = 0x4ea01c00, // orr .16b

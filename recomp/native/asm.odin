@@ -668,6 +668,17 @@ vec_funnel8 :: proc(a: ^Asm, dst, lo, hi: u32, buf: string) {
 	}
 }
 
+// v = the 16 bytes at byte A, zero-extended, from the address in import
+// base, or with store those 16 bytes = v. Reads A and loses no other Reg.
+vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: string, store: bool) {
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_vec_ldst_at(a, v, imp(a, base), store)
+	case .Arm64:
+		a64_vec_ldst_at(a, v, imp(a, base), store)
+	}
+}
+
 // 64-bit product of x and y (signed or not) into the guest state's fields
 // at lo and hi, neither a cached one. Uses A and B.
 mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {

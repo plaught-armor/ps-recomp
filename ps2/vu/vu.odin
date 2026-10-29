@@ -42,7 +42,7 @@ vu0, vu1: Vu
 // Data memory sizes in bytes. The recompiler's code wraps addresses with them.
 VU0_MEM :: 4 << 10
 VU1_MEM :: 16 << 10
-@(private)
+// Not private: native code addresses it through import "vu.mem".
 vu0_mem: [VU0_MEM]u8
 @(private)
 vu0_micro: [4 << 10]u8

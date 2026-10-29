@@ -298,6 +298,13 @@ x64_vec_funnel8 :: proc(a: ^Asm, dst, lo, hi: u32, buf: int) {
 	x64_vec_ldst(a, .V0, dst, true)
 }
 
+// Through rdx = the import's address.
+x64_vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: int, store: bool) {
+	assert(X64_REG[.A] == 0 && u8(v) < 8, "native: vector index register")
+	op_imp(a, true, 0x8b, RDX, base) // mov rdx, [slot]
+	emit8(a, 0xf3, 0x0f, 0x7f if store else 0x6f, 0x04 | u8(v) << 3, 0x02) // movdqu [rdx + rax]
+}
+
 x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	OPS :: [Vop]u32 {
 		.Or       = 0x0feb, // por

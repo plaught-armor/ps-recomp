@@ -395,6 +395,25 @@ main :: proc() {
 		{special2(0x3d, 15, 0, 3), .VU0}, // VMFIR to vf0, skipped
 		{special2(0x3d, 0xa, 18, 16), .VU0}, // VMFIR.xz vf18 = vi0, fs 16
 		{special2(0x3d, 15, 3, 19), .VU0}, // VMFIR vf3 = vi3, fs 19
+		{special2(0x34), .VU0}, // VLQI vf2 = [vi1++], vi1 0xffff wraps
+		{special2(0x34, 0xa, 3, 2), .VU0}, // VLQI.xz, an even vi
+		{special2(0x34, 0, 3, 4), .VU0}, // VLQI of no lanes, still increments
+		{special2(0x34, 15, 0, 3), .VU0}, // VLQI to vf0, still increments
+		{special2(0x34, 15, 2, 0), .VU0}, // VLQI of [vi0], no increment
+		{special2(0x34, 15, 2, 16), .VU0}, // VLQI with fs 16, vi0
+		{special2(0x34, 5, 18, 19), .VU0}, // VLQI.yw vf18 = [vi3++], fs 19
+		{special2(0x36, 15, 2, 0), .VU0}, // VLQD of [--vi0], vi0 stays 0
+		{special2(0x36, 15, 2, 3), .VU0}, // VLQD vf2 = [--vi3]
+		{special2(0x36, 6, 4, 1), .VU0}, // VLQD.yz vf4 = [--vi1]
+		{special2(0x35, 15, 1, 2), .VU0}, // VSQI vf2 to [vi1++]
+		{special2(0x35, 0xa, 2, 3), .VU0}, // VSQI.xz, an even vi
+		{special2(0x35, 0, 2, 3), .VU0}, // VSQI of no lanes, still increments
+		{special2(0x35, 15, 0, 3), .VU0}, // VSQI to [vi0], no increment
+		{special2(0x35, 15, 16, 3), .VU0}, // VSQI with ft 16, vi0
+		{special2(0x35, 9, 18, 0), .VU0}, // VSQI.xw vf0 to [vi2++], ft 18
+		{special2(0x37, 15, 0, 3), .VU0}, // VSQD to [--vi0], vi0 stays 0
+		{special2(0x37, 15, 2, 4), .VU0}, // VSQD vf4 to [--vi2]
+		{special2(0x37, 3, 1, 5), .VU0}, // VSQD.zw vf5 to [--vi1]
 		{0x4a000038 | (0x40 / 8) << 6, .VU0}, // VCALLMS 0x40
 		{0x4a000039, .VU0}, // VCALLMSR, CMSAR0 0x40 / 8
 		{special(0x0d), .BREAK}, // compiled only: cpu.brk exits
@@ -459,6 +478,8 @@ main :: proc() {
 	}
 	cpu.next_event = max(u64)
 	failed, checks := 0, 0
+	// VU0 data memory as each check starts and as the native code leaves it.
+	vu_mem, native_mem: [vu.VU0_MEM]u8
 	for c, k in cases {
 		run := cast(proc())rawptr(code.base + uintptr(code.funcs[k].off))
 		if slice.contains(COP1_OPS[:], c.op) {
@@ -490,16 +511,24 @@ main :: proc() {
 				vu_start.vf[0].f = {0, 0, 0, 1}
 				for &v, n in vu_start.vf[1:] {v.u = {u32(x), u32(y >> 32), u32(y), u32(x >> 32) ~ u32(n)}}
 				for &r, n in vu_start.vi[1:] {r = u16(x >> (4 * u32(n))) ~ u16(y) ~ u16(n * 0x1111)}
+				// vi0 is nonzero after an integer op with a field of 16.
+				vu_start.vi[0] = u16(y >> 48) ~ u16(x)
 				vu_start.cmsar = 0x40 / 8
 				vu_start.acc.u = {u32(y), u32(x), u32(x >> 32), u32(y >> 32)}
 				vu_start.q = transmute(f32)u32(y ~ (x >> 32))
 				vu_start.i = transmute(f32)u32(x ~ (y >> 32))
 				vu_start.mac = u32(y)
 				vu_start.status = u32(x >> 7) & 0xfff
+				// A pattern of the row too, so a store of what is there
+				// already cannot pass.
+				for &b, i in vu_mem {b = u8(u32(i) * 0x9d ~ u32(k) * 0x3b ~ u32(x) ~ u32(i >> 8))}
 				cpu.state, vu.vu0 = start, vu_start
+				copy(vu.vu0.mem, vu_mem[:])
 				run()
 				native_got, native_vu := cpu.state, vu.vu0
+				copy(native_mem[:], vu.vu0.mem)
 				cpu.state, vu.vu0 = start, vu_start
+				copy(vu.vu0.mem, vu_mem[:])
 				ps2.exec_insn(r5900.decode(funcs[k].addr, c.w))
 				// The native function charges its cycles; the interpreter
 				// leaves that to its caller.
@@ -514,12 +543,18 @@ main :: proc() {
 				}
 				interp_vu := vu.vu0
 				vu_same := runtime.memory_equal(&native_vu, &interp_vu, size_of(vu.Vu))
-				if !same(native_got, cpu.state) || !vu_same {
+				mem_same := slice.equal(native_mem[:], vu.vu0.mem)
+				if !same(native_got, cpu.state) || !vu_same || !mem_same {
 					failed += 1
 					if failed > 20 {continue}
 					fmt.eprintfln("FAIL %v %08x rs %016x rt %016x", c.op, c.w, x, y)
 					diff(native_got, cpu.state)
 					if !vu_same {vu_diff(native_vu, interp_vu)}
+					for o := 0; o < len(native_mem); o += 16 {
+						if !slice.equal(native_mem[o:][:16], vu.vu0.mem[o:][:16]) {
+							fmt.eprintfln("  VU0 memory %03x native %02x interp %02x", o, native_mem[o:][:16], vu.vu0.mem[o:][:16])
+						}
+					}
 				}
 			}
 		}

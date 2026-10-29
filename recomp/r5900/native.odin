@@ -1052,14 +1052,74 @@ vu0_lower :: proc(a: ^native.Asm, w: u32) -> bool {
 	return true
 }
 
+// V0 = its dest lanes, V1's in the others. Loses V2.
+@(private = "file")
+merge_dest :: proc(a: ^native.Asm, dest: u32) {
+	native.vec_load(a, .V2, VU_DEST + 16 * dest, "vu.k")
+	native.vec_op(a, .And, .V0, .V2)
+	native.vec_op(a, .Andn, .V2, .V1)
+	native.vec_op(a, .Or, .V0, .V2)
+}
+
+// VLQI (key 0x34), VSQI (0x35), VLQD (0x36) and VSQD (0x37) of VU0 macro
+// op w, as vu.vu_op runs them: the quadword at (vi[r] & 0xff) * 16 of data
+// memory, import vu.mem, for r = fs & 15 (a load) or ft & 15 (a store).
+// The D forms decrement vi[r] first, even vi[0]; the I forms increment it
+// after, not vi[0]. A load writes the dest lanes of vf[ft], not vf0; a
+// store the dest lanes of the quadword from vf[fs]. vi[0] is 0 after.
+// Uses A, B, C and V0-V2.
+@(private = "file")
+vu0_lq_sq :: proc(a: ^native.Asm, w, key: u32) {
+	dest, ft, fs := (w >> 21) & 15, (w >> 16) & 31, (w >> 11) & 31
+	store := key & 1 != 0
+	r := (ft if store else fs) & 15
+	vi_get(a, .A, r)
+	if key >= 0x36 {
+		native.alu_imm(a, .Sub, .A, 1)
+		if r != 0 {
+			native.mov(a, .B, .A)
+			vi_put(a, r)
+			native.mov(a, .A, .B)
+		}
+	} else if r != 0 {
+		native.mov(a, .B, .A)
+	}
+	native.alu_imm(a, .And, .A, 0xff)
+	native.alu_imm(a, .Shl, .A, 4)
+	if store && dest != 0 {
+		native.vec_load(a, .V0, 16 * fs, "vu.vf")
+		if dest != 15 {
+			native.vec_ldst_at(a, .V1, "vu.mem", false)
+			merge_dest(a, dest)
+		}
+		native.vec_ldst_at(a, .V0, "vu.mem", true)
+	} else if !store && ft != 0 && dest != 0 {
+		native.vec_ldst_at(a, .V0, "vu.mem", false)
+		if dest != 15 {
+			native.vec_load(a, .V1, 16 * ft, "vu.vf")
+			merge_dest(a, dest)
+		}
+		native.vec_store(a, 16 * ft, .V0, "vu.vf")
+	}
+	if key < 0x36 && r != 0 {
+		native.mov(a, .A, .B)
+		native.alu_imm(a, .Add, .A, 1)
+		vi_put(a, r)
+	}
+	native.imp_load(a, .C, "vu.vf", VU_VI)
+	native.alu_imm(a, .And, .C, 0xffff0000)
+	native.imp_store(a, "vu.vf", .C, VU_VI)
+}
+
 // Code for VU0 macro op w as vu.vu_op runs it, or false to leave it there:
 // moves, waits, the float upper ops of the VF registers and ACC with their
 // broadcast, Q and I forms, and ITOF, FTOI and ABS. Results clamp and set
 // MAC and status as vu_put_flags does, and the add and multiply operands
 // clamp first as vu_op's do. MAX and MINI order the raw words by sign and
 // magnitude and write the winner as it is, as ps2/vu vmax and vmin. ITOF,
-// FTOI, ABS, MAX and MINI set no flags. VMFIR and, through vu0_lower, the
-// integer ops and VCALLMS too. Uses A, B, C and V0-V4.
+// FTOI, ABS, MAX and MINI set no flags. VMFIR, the quadword loads and
+// stores of vu0_lq_sq and, through vu0_lower, the integer ops and VCALLMS
+// too. Uses A, B, C and V0-V4.
 @(private = "file")
 vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Max, Mini, Opmul, Opmsub, Move, Mr32, Nop, Itof, Ftoi, Abs}
@@ -1101,6 +1161,9 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x2f: kind = upper ? Kind.Mini : Kind.Nop // VNOP
 	case 0x30: kind = .Move
 	case 0x31: kind = .Mr32
+	case 0x34 ..= 0x37:
+		vu0_lq_sq(a, w, key)
+		return true
 	case 0x38 ..= 0x3a: return vu0_div(a, w, key)
 	case 0x3b: kind = .Nop // VWAITQ
 	case 0x3d:
@@ -1119,10 +1182,7 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 		if dest == 0 {return}
 		if dest != 15 {
 			native.vec_load(a, .V1, off, base)
-			native.vec_load(a, .V2, VU_DEST + 16 * dest, "vu.k")
-			native.vec_op(a, .And, .V0, .V2)
-			native.vec_op(a, .Andn, .V2, .V1)
-			native.vec_op(a, .Or, .V0, .V2)
+			merge_dest(a, dest)
 		}
 		native.vec_store(a, off, .V0, base)
 	}
