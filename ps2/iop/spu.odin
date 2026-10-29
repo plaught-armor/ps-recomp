@@ -10,6 +10,10 @@
 //
 // Voices advance by the samples spu_mix renders, the same clock the FMOD
 // voices run on.
+//
+// A port whose sound driver is its own HLE code, not sdrdrv, drives the same
+// voices through spu_write, spu_voice_on, spu_voice_set, spu_voice_off and
+// spu_voice_status.
 package ps2_iop
 
 import "core:fmt"
@@ -31,6 +35,7 @@ Spu_Voice :: struct {
 	counter:    i32, // samples since its last step
 	ssa, lsa:   u32, // byte addresses in sound RAM
 	nax:        u32, // the block playing
+	endx:       bool, // a block with the end flag has finished since key on
 	flags:      u8, // its loop flags
 	pcm:        [28]i16, // its samples
 	idx:        u32, // the sample playing in it
@@ -94,8 +99,8 @@ spu_block :: proc(v: ^Spu_Voice) {
 }
 
 @(private = "file")
-spu_key_on :: proc(v: ^Spu_Voice) {
-	v.on = true
+spu_start :: proc(v: ^Spu_Voice) {
+	v.on, v.endx = true, false
 	v.phase, v.level, v.counter = .Attack, 0, 0
 	v.nax, v.lsa = v.ssa, v.ssa
 	v.idx, v.frac, v.last, v.hist = 0, 0, {}, {}
@@ -147,6 +152,7 @@ spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 		v.idx += 1
 		if v.idx < 28 {continue}
 		v.idx = 0
+		if v.flags & 1 != 0 {v.endx = true}
 		switch {
 		case v.flags & 1 == 0: v.nax += 16
 		case v.flags & 2 != 0: v.nax = v.lsa
@@ -183,6 +189,68 @@ spu_volume :: proc(r: u32) -> i32 {
 	return i32(i16(u16(r << 1))) >> 1
 }
 
+// A PITCH register value: 4.12, 0x1000 plays at 48 kHz.
+@(private = "file")
+spu_pitch :: proc(r: u32) -> u32 {
+	return min(r & 0xffff, 0x3fff)
+}
+
+// Voice `voice` of core `core`, both clamped to range.
+@(private = "file")
+spu_voice_at :: proc(core, voice: int) -> ^Spu_Voice {
+	return &spu.voice[clamp(core, 0, 1)][clamp(voice, 0, 23)]
+}
+
+// Copy data into sound RAM at byte address addr, clipped at its end.
+// Returns the bytes copied.
+spu_write :: proc(addr: u32, data: []u8) -> u32 {
+	dst := addr & (SPU_RAM_SIZE - 1)
+	return u32(copy(spu.ram[dst:], data))
+}
+
+// What a voice is keyed on with, as register values: pitch 4.12 (0x1000 is
+// 48 kHz), volumes as VOLL and VOLR (spu_volume), envelope as ADSR1 and
+// ADSR2. ssa is a byte address in sound RAM; the loop comes from the
+// blocks' flags.
+Spu_Key :: struct {
+	ssa, pitch, voll, volr, adsr1, adsr2: u32,
+}
+
+// Set a voice up from k and key it on, as SSA, the parameters and KON.
+spu_voice_on :: proc(core, voice: int, k: Spu_Key) {
+	v := spu_voice_at(core, voice)
+	v.ssa = k.ssa & (SPU_RAM_SIZE - 16)
+	v.pitch = spu_pitch(k.pitch)
+	v.voll, v.volr = spu_volume(k.voll), spu_volume(k.volr)
+	v.adsr1, v.adsr2 = k.adsr1 & 0xffff, k.adsr2 & 0xffff
+	spu_start(v)
+}
+
+// Change the pitch and volumes of a voice, playing or not.
+spu_voice_set :: proc(core, voice: int, pitch, voll, volr: u32) {
+	v := spu_voice_at(core, voice)
+	v.pitch = spu_pitch(pitch)
+	v.voll, v.volr = spu_volume(voll), spu_volume(volr)
+}
+
+// Key a voice off, as KOFF: its envelope goes to release.
+spu_voice_off :: proc(core, voice: int) {
+	spu_voice_at(core, voice).phase = .Release
+}
+
+Spu_Status :: struct {
+	on:   bool, // playing (a release that reaches zero or an end without repeat stops it)
+	endx: bool, // ENDX: a block with the end flag has finished since key on
+	envx: u16, // ENVX: the envelope level, 0..0x7fff
+	nax:  u32, // NAX: the block playing, a byte address
+	lsax: u32, // LSAX: the loop start, a byte address
+}
+
+spu_voice_status :: proc(core, voice: int) -> Spu_Status {
+	v := spu_voice_at(core, voice)
+	return {on = v.on, endx = v.endx, envx = u16(v.level), nax = v.nax, lsax = v.lsa}
+}
+
 // sdrdrv: {?, args...} in, the result in the first word out.
 @(private)
 sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
@@ -196,7 +264,7 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		switch w[1] & 0xff00 {
 		case SD_VP_VOLL: v.voll = spu_volume(w[2])
 		case SD_VP_VOLR: v.volr = spu_volume(w[2])
-		case SD_VP_PITCH: v.pitch = min(w[2] & 0xffff, 0x3fff)
+		case SD_VP_PITCH: v.pitch = spu_pitch(w[2])
 		case SD_VP_ADSR1: v.adsr1 = w[2] & 0xffff
 		case SD_VP_ADSR2: v.adsr2 = w[2] & 0xffff
 		}
@@ -205,7 +273,7 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		for i in 0 ..< 24 {
 			if w[2] & (1 << u32(i)) == 0 {continue}
 			switch w[1] & 0xff00 {
-			case SD_S_KON: spu_key_on(&core[i])
+			case SD_S_KON: spu_start(&core[i])
 			case SD_S_KOFF: core[i].phase = .Release
 			}
 		}
@@ -226,11 +294,10 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		src, dst, size := w[3] & (IOP_RAM_SIZE - 1), w[4] & (SPU_RAM_SIZE - 1), w[5]
 		size = min(size, IOP_RAM_SIZE - src, SPU_RAM_SIZE - dst)
 		if w[2] & 1 == 0 {
-			copy(spu.ram[dst:][:size], iop_ram[src:][:size])
+			r = spu_write(dst, iop_ram[src:][:size])
 		} else {
-			copy(iop_ram[src:][:size], spu.ram[dst:][:size])
+			r = u32(copy(iop_ram[src:][:size], spu.ram[dst:][:size]))
 		}
-		r = size
 	case 0x80f0: // sceSdVoiceTransStatus {channel, flag}: always complete
 		r = 1
 	case:

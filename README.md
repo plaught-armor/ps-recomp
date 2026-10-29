@@ -23,7 +23,7 @@ a `recomp` options file, and any per-game code.
 | `core/` | Console-independent runtime: coroutines, save states and rollback, netplay, input and rebinding, audio, recording and replay, Vulkan device, capture |
 | `psx/` | PS1 runtime: `cpu`, `gte`, `gpu` and `render`, `spu`, `mdec`, `bios`, `io`, `host` (SDL2 window, pacing, input), and the interpreter, checkpoints and hooks |
 | `ps2/` | PS2 runtime: `cpu`, `mem`, `dma`, `gif`, `gs` (Vulkan), `vu`, `ipu`, `iop` (HLE IOP modules, memory cards), `kernel`, `r5900` (EE instruction decoder), and the interpreter and bus |
-| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter) |
+| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots) |
 
 ## Requirements
 
@@ -67,6 +67,7 @@ odin run tests/lower -collection:ps=.
 odin run tests/vu -collection:ps=.
 odin run tests/vu_macro -collection:ps=.
 odin run tests/ee_emit -collection:ps=.
+odin run tests/spu -collection:ps=.
 ```
 
 CI type-checks every package on linux and darwin (amd64 and arm64) and runs
