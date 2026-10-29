@@ -20,8 +20,8 @@
 //   native_out       with native_arch: the file the machine code goes to
 //   vu1_capture      optional: a VU1_CAPTURE file (ps2/vu/capture.odin) of
 //                    microcode loaded from data, to compile besides .vutext
-//                    (a missing file is a warning: that microcode runs in
-//                    the interpreter)
+//                    (a missing file, ENOENT, is a warning: that microcode
+//                    runs in the interpreter)
 //
 // Packages hold consecutive functions up to package_insns instructions so
 // each compiles as its own module. Every package has a `register` proc
