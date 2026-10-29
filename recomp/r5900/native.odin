@@ -631,7 +631,8 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.alu_imm(a, .Shl, .A, 3)
 		native.state_store(a, SA, .A)
 	case .PADDH, .PSUBW, .PSUBB, .PMAXH, .PMINH, .PCGTH, .POR, .PNOR, .PAND, .PXOR, .PEXTLB, .PEXTUB,
-	     .PEXTLH, .PEXTLW, .PEXTUW, .PCPYLD, .PCPYUD, .PPACB, .PPACH, .PCPYH:
+	     .PEXTLH, .PEXTLW, .PEXTUW, .PCPYLD, .PCPYUD, .PPACB, .PPACH, .PCPYH, .PADDSH, .PADDUB, .PADDW,
+	     .PADDUW:
 		if rd == 0 {return true}
 		// rd = x op y, lane-wise, with the operands in the interpreter's order
 		v: native.Vop
@@ -657,6 +658,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		case .PPACB: v, x, y = .Even8, rt, rs
 		case .PPACH: v, x, y = .Even16, rt, rs
 		case .PCPYH: v, x, y = .Dup16, rt, rt
+		case .PADDSH: v = .Adds16
+		case .PADDUB: v = .Addu8
+		case .PADDW: v = .Add32
+		case .PADDUW: v = .Addu32
 		}
 		native.vec_load(a, .V0, GPR * u32(x))
 		native.vec_load(a, .V1, GPR * u32(y))
@@ -667,6 +672,32 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.vec_load(a, .V0, GPR * u32(rt))
 		native.vec_shift16(a, .Shl if i.op == .PSLLH else .Shr if i.op == .PSRLH else .Sar, .V0, sa & 15)
 		native.vec_store(a, GPR * u32(rd), .V0)
+	case .PSRAW:
+		if rd == 0 {return true}
+		native.vec_load(a, .V0, GPR * u32(rt))
+		native.vec_shift32(a, .Sar, .V0, sa)
+		native.vec_store(a, GPR * u32(rd), .V0)
+	case .PHMADH:
+		// As the interpreter: the sums v in rd, and the product of the odd
+		// halfwords alone, a, with them in LO = {v0, a0, v2, a2} and
+		// HI = {v1, a1, v3, a3}, which are written when rd is 0 too. The
+		// odd halfwords moved down by a word shift give a.
+		native.vec_load(a, .V0, GPR * u32(rs))
+		native.vec_load(a, .V1, GPR * u32(rt))
+		native.vec_copy(a, .V4, .V0)
+		native.vec_shift32(a, .Shr, .V4, 16)
+		native.vec_op(a, .Madd16, .V0, .V1)
+		native.vec_shift32(a, .Shr, .V1, 16)
+		native.vec_op(a, .Madd16, .V4, .V1)
+		if rd != 0 {native.vec_store(a, GPR * u32(rd), .V0)}
+		native.vec_copy(a, .V1, .V0)
+		native.vec_op(a, .Zip_Lo32, .V1, .V4) // v0, a0, v1, a1
+		native.vec_op(a, .Zip_Hi32, .V0, .V4) // v2, a2, v3, a3
+		native.vec_copy(a, .V4, .V1)
+		native.vec_op(a, .Zip_Lo64, .V4, .V0)
+		native.vec_op(a, .Zip_Hi64, .V1, .V0)
+		native.vec_store(a, LO, .V4)
+		native.vec_store(a, HI, .V1)
 	case .QFSRV:
 		if rd == 0 {return true}
 		// A shift by whole bytes below 16 is a funnel; any other SA, which

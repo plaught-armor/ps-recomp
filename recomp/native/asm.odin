@@ -113,6 +113,13 @@ Vop :: enum u8 {
 	Zip_Hi32, // words 2-3 likewise
 	// dst = halfword 0 of src in halfwords 0-3, halfword 4 in halfwords 4-7
 	Dup16,
+	Adds16, // signed, saturating
+	Addu8, // unsigned, saturating
+	Add32,
+	Addu32, // unsigned, saturating; uses V2 and V3 on x64
+	// dword k = the signed products of halfwords 2k and 2k + 1 added,
+	// wrapping; uses V2 and V3 on arm64
+	Madd16,
 }
 
 Label :: distinct i32
@@ -502,6 +509,8 @@ vec_check :: proc(a: ^Asm, off: u32) {
 
 vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	assert(op != .Even8 || (dst != .V2 && src != .V2), "native: Even8 of V2")
+	SCRATCH :: bit_set[Vreg]{.V2, .V3}
+	assert((op != .Addu32 && op != .Madd16) || (dst not_in SCRATCH && src not_in SCRATCH), "native: vector op of V2 or V3")
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_vec_op(a, op, dst, src)
@@ -627,6 +636,19 @@ vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 		x64_vec_shift16(a, op, v, n)
 	case .Arm64:
 		a64_vec_shift16(a, op, v, n)
+	}
+}
+
+// Each 32-bit lane of v shifted (Shl, Shr or Sar) by n < 32.
+vec_shift32 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
+	assert(op == .Shl || op == .Shr || op == .Sar, "native: vector shift")
+	assert(n < 32, "native: vector shift count")
+	if n == 0 {return}
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_vec_shift32(a, op, v, n)
+	case .Arm64:
+		a64_vec_shift32(a, op, v, n)
 	}
 }
 

@@ -258,6 +258,11 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Zip_Lo32 = 0x4e803800, // zip1 .4s
 		.Zip_Hi32 = 0x4e807800, // zip2 .4s
 		.Dup16    = 0x4e402800, // trn1 .8h, then trn1 .4s
+		.Adds16   = 0x4e600c00, // sqadd .8h
+		.Addu8    = 0x6e200c00, // uqadd .16b
+		.Add32    = 0x4ea08400, // add .4s
+		.Addu32   = 0x6ea00c00, // uqadd .4s
+		.Madd16   = 0x4ea0bc00, // addp .4s, of smull and smull2
 	}
 	ops := OPS
 	if op == .Itof || op == .Ftoi {
@@ -267,6 +272,13 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	if op == .Dup16 {
 		rrr(a, ops[op], u32(dst), u32(src), u32(src)) // halfwords 0, 0, 2, 2, 4, 4, 6, 6
 		rrr(a, 0x4e802800, u32(dst), u32(dst), u32(dst)) // trn1 .4s: words 0, 0, 2, 2
+		return
+	}
+	if op == .Madd16 {
+		v2, v3 := u32(Vreg.V2), u32(Vreg.V3)
+		rrr(a, 0x0e60c000, v2, u32(dst), u32(src)) // smull .4s, .4h: halfwords 0-3
+		rrr(a, 0x4e60c000, v3, u32(dst), u32(src)) // smull2: halfwords 4-7
+		rrr(a, ops[op], u32(dst), v2, v3)
 		return
 	}
 	if op == .Andn {
@@ -367,6 +379,18 @@ a64_vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 		emit32(a, 0x4f005400 | (16 + n) << 16 | r << 5 | r) // shl .8h
 	case .Shr, .Sar:
 		emit32(a, (0x6f000400 if op == .Shr else 0x4f000400) | (32 - n) << 16 | r << 5 | r) // ushr/sshr .8h
+	case .Add, .Sub, .And, .Or, .Xor:
+		unreachable()
+	}
+}
+
+a64_vec_shift32 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
+	r := u32(v)
+	switch op {
+	case .Shl:
+		emit32(a, 0x4f005400 | (32 + n) << 16 | r << 5 | r) // shl .4s
+	case .Shr, .Sar:
+		emit32(a, (0x6f000400 if op == .Shr else 0x4f000400) | (64 - n) << 16 | r << 5 | r) // ushr/sshr .4s
 	case .Add, .Sub, .And, .Or, .Xor:
 		unreachable()
 	}

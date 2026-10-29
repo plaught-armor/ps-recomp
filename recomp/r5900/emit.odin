@@ -303,6 +303,8 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .PADDB: view, expr = "vb", bin("vb", "+")
 	case .PSUBB: view, expr = "vb", bin("vb", "-")
 	case .PADDUB: view, expr = "vb", call("simd_saturating_add", "vb")
+	case .PADDSH: view, expr = "vh", call("simd_saturating_add", "vh")
+	case .PADDUW: view, expr = "vw", call("simd_saturating_add", "vw")
 	case .PMAXH: view, expr = "vh", call("simd_max", "vh")
 	case .PMINH: view, expr = "vh", call("simd_min", "vh")
 	case .PCGTH: view, expr = "vuh", call("simd_lanes_gt", "vh") // u16 lanes already
@@ -310,6 +312,14 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .PSLLH: view, expr = "vuh", fmt.tprintf("intrinsics.simd_shl(t.vuh, #simd[8]u16{{%s}})", splat(8, sh))
 	case .PSRLH: view, expr = "vuh", fmt.tprintf("intrinsics.simd_shr(t.vuh, #simd[8]u16{{%s}})", splat(8, sh))
 	case .PSRAH: view, expr = "vh", fmt.tprintf("intrinsics.simd_shr(t.vh, #simd[8]u16{{%s}})", splat(8, sh))
+	case .PSRAW:
+		view = "vw"
+		expr = fmt.tprintf("transmute(#simd[4]u32)intrinsics.simd_shr(transmute(#simd[4]i32)t.vw, #simd[4]u32{{%s}})", splat(4, u8(i.sa)))
+	case .PHMADH:
+		// As the interpreter: LO and HI are written when rd is 0 too.
+		rd := i.rd == 0 ? "" : fmt.tprintf("; c.r[%d].w = {{c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2]}}", i.rd)
+		append(out, fmt.tprintf("{{s, t := c.r[%d], c.r[%d]; for k in 0 ..< 4 {{a := i32(s.sh[2 * k + 1]) * i32(t.sh[2 * k + 1]); v := a + i32(s.sh[2 * k]) * i32(t.sh[2 * k]); h := (k & 1) != 0 ? &c.hi : &c.lo; h.sw[k &~ 1], h.sw[k | 1] = v, a}}%s}}", i.rs, i.rt, rd))
+		return true
 	case .PAND:  view, expr = "q", bin("q", "&")
 	case .POR:   view, expr = "q", bin("q", "|")
 	case .PXOR:  view, expr = "q", bin("q", "~")
@@ -330,7 +340,7 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	}
 	if i.rd == 0 {return true}
 	#partial switch i.op {
-	case .PSLLH, .PSRLH, .PSRAH, .PCPYH:
+	case .PSLLH, .PSRLH, .PSRAH, .PSRAW, .PCPYH:
 		// shifts by sa and PCPYH read rt only
 		append(out, fmt.tprintf("{{t := c.r[%d]; c.r[%d].%s = %s}}", i.rt, i.rd, view, expr))
 	case:

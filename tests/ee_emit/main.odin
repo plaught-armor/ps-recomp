@@ -31,10 +31,10 @@ COVERED :: Ops{
 	.PADDW, .PSUBW, .PADDH, .PSUBH, .PADDB, .PSUBB, .PADDUB, .PMAXH, .PMINH, .PCGTH, .PCEQH,
 	.PSLLH, .PSRLH, .PSRAH, .PAND, .POR, .PXOR, .PNOR, .PCPYLD, .PCPYUD, .PCPYH,
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
-	.MADD, .MADDU, .MADD1, .MADDU1, .SQRT_S, .RSQRT_S,
+	.PADDSH, .PADDUW, .PSRAW, .PHMADH, .MADD, .MADDU, .MADD1, .MADDU1, .SQRT_S, .RSQRT_S,
 }
 // The shifts by sa: every amount gets a case.
-BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH}
+BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSRAW}
 
 main :: proc() {
 	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}} // rs, rt, rd

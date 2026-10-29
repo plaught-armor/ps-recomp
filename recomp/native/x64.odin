@@ -329,6 +329,11 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Zip_Lo32 = 0x0f62, // punpckldq
 		.Zip_Hi32 = 0x0f6a, // punpckhdq
 		.Dup16    = 0x0f70, // pshuflw, then pshufhw, of lanes 0
+		.Adds16   = 0x0fed, // paddsw
+		.Addu8    = 0x0fdc, // paddusb
+		.Add32    = 0x0ffe, // paddd
+		.Addu32   = 0x0ffe, // paddd, then por of where the sum is below dst
+		.Madd16   = 0x0ff5, // pmaddwd
 	}
 	ops := OPS
 	sse :: proc(a: ^Asm, op: u32, dst, src: Vreg, ps := false) {
@@ -353,6 +358,18 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		emit8(a, 0, 0xf3)
 		op_rr(a, false, ops[op], u8(dst), u8(dst))
 		emit8(a, 0)
+		return
+	}
+	if op == .Addu32 {
+		// Unsigned below as signed after flipping the sign bits.
+		sse(a, 0x0f6f, .V2, dst) // movdqa
+		sse(a, ops[op], dst, src)
+		sse(a, 0x0f76, .V3, .V3) // pcmpeqd: all ones
+		emit8(a, 0x66, 0x0f, 0x72, 0xf0 | u8(Vreg.V3), 31) // pslld v3, 31
+		sse(a, 0x0fef, .V2, .V3) // pxor
+		sse(a, 0x0fef, .V3, dst)
+		sse(a, 0x0f66, .V2, .V3) // pcmpgtd
+		sse(a, 0x0feb, dst, .V2) // por
 		return
 	}
 	if op == .Ftoi {emit8(a, 0xf3)}
@@ -437,6 +454,11 @@ x64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32) {
 x64_vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 	digit: u8 = 6 if op == .Shl else 2 if op == .Shr else 4 // psllw, psrlw, psraw
 	emit8(a, 0x66, 0x0f, 0x71, 0xc0 | digit << 3 | u8(v), u8(n))
+}
+
+x64_vec_shift32 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
+	digit: u8 = 6 if op == .Shl else 2 if op == .Shr else 4 // pslld, psrld, psrad
+	emit8(a, 0x66, 0x0f, 0x72, 0xc0 | digit << 3 | u8(v), u8(n))
 }
 
 x64_set_cond :: proc(a: ^Asm, c: Cond, dst, src: Reg) {

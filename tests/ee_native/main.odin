@@ -88,6 +88,9 @@ VALS := [?]u64 {
 	0xffffffff_80000000,
 	0x00000000_7fffffff,
 	0x80007fff_0001ffff,
+	// halfword extremes: PHMADH's 0x8000 * 0x8000 twice wraps to 0x80000000
+	0x80008000_80008000,
+	0x7fff7fff_80007fff,
 	// float words: infinities, a quiet NaN, the largest values, denormals
 	0x7f800000_ff800000,
 	0x7fc00000_7f7fffff,
@@ -200,6 +203,21 @@ main :: proc() {
 		{mmi(0x21), .MADDU1},
 		{mmi(0x00) &~ (31 << 11), .MADD}, // rd = 0
 		{mmi(0x29, 0x0e), .PCPYUD},
+		{mmi(0x08, 0x14), .PADDSH},
+		{mmi(0x08, 0x14) &~ (31 << 16) | 3 << 16, .PADDSH}, // rt = rd
+		{mmi(0x08, 0x14) &~ (31 << 11), .PADDSH}, // rd = 0
+		{mmi(0x28, 0x10), .PADDUW},
+		{mmi(0x28, 0x10) &~ (31 << 21) | 3 << 21, .PADDUW}, // rs = rd
+		{mmi(0x28, 0x18), .PADDUB},
+		{mmi(0x08, 0x00), .PADDW},
+		{mmi(0x3f, 0), .PSRAW},
+		{mmi(0x3f, 1), .PSRAW},
+		{mmi(0x3f, 31) &~ (31 << 16) | 3 << 16, .PSRAW}, // rt = rd
+		{mmi(0x3f, 16) &~ (31 << 11), .PSRAW}, // rd = 0
+		{mmi(0x09, 0x11), .PHMADH},
+		{mmi(0x09, 0x11) &~ (31 << 16) | 3 << 16, .PHMADH}, // rt = rd
+		{mmi(0x09, 0x11) &~ (31 << 21) | 3 << 21, .PHMADH}, // rs = rd
+		{mmi(0x09, 0x11) &~ (31 << 11), .PHMADH}, // rd = 0: LO and HI only
 		{mmi(0x29, 0x0e) &~ (31 << 21 | 31 << 16) | 3 << 21 | 3 << 16, .PCPYUD}, // rs = rt = rd
 		{0x42000039, .DI},
 		{mmi(0x04) &~ (31 << 16), .PLZCW},

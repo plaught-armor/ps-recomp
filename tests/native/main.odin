@@ -59,7 +59,7 @@ Kind :: enum u8 {
 	Load, // imm: the address, plus IN0 with flag
 	Store, // imm: the address; the slot holds what a load there reads back
 	Vec, // word imm of v over the vectors vec_in gives, or (flag) of P with itself
-	Vec_Shift, // word imm of Q's lanes shifted by op and s
+	Vec_Shift, // word imm of Q's halfwords (words with flag) shifted by op and n
 	Funnel, // word imm of the 16 bytes from byte n of P then Q
 	Any, // not checked
 }
@@ -269,6 +269,19 @@ expect :: proc(c: Case, x, y: u32) -> u32 {
 		return vec_ref(c.v, p, p if c.flag else q)[c.imm]
 	case .Vec_Shift:
 		_, q := vec_in(x, y)
+		if c.flag {
+			for &l in q {
+				#partial switch c.op {
+				case .Shl:
+					l <<= c.n
+				case .Shr:
+					l >>= c.n
+				case .Sar:
+					l = u32(i32(l) >> c.n)
+				}
+			}
+			return q[c.imm]
+		}
 		h := transmute([8]u16)q
 		for &l in h {
 			#partial switch c.op {
@@ -361,6 +374,19 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 		return d - s
 	case .Sub8:
 		for k in 0 ..< 16 {r[k] = db[k] - sb[k]}
+	case .Adds16:
+		for k in 0 ..< 8 {rh[k] = i16(clamp(i32(dh[k]) + i32(sh[k]), -0x8000, 0x7fff))}
+		return transmute([4]u32)rh
+	case .Addu8:
+		for k in 0 ..< 16 {r[k] = u8(min(u32(db[k]) + u32(sb[k]), 0xff))}
+	case .Add32:
+		return d + s
+	case .Addu32:
+		for k in 0 ..< 4 {r4[k] = u32(min(u64(d[k]) + u64(s[k]), 0xffffffff))}
+		return r4
+	case .Madd16:
+		for k in 0 ..< 4 {r4[k] = u32(i32(dh[2 * k]) * i32(sh[2 * k]) + i32(dh[2 * k + 1]) * i32(sh[2 * k + 1]))}
+		return r4
 	case .Zip_Lo32:
 		return {d[0], s[0], d[1], s[1]}
 	case .Zip_Hi32:
@@ -904,14 +930,20 @@ build_vec :: proc() {
 			native.vec_shift16(&a, op, .V2, n)
 			native.vec_store(&a, add_vec({kind = .Vec_Shift, op = op, n = n}), .V2)
 		}
+		for n in ([?]u32{1, 16, 31}) {
+			native.vec_load(&a, .V2, q)
+			native.vec_shift32(&a, op, .V2, n)
+			native.vec_store(&a, add_vec({kind = .Vec_Shift, op = op, n = n, flag = true}), .V2)
+		}
 	}
 	for n in ([?]u32{0, 1, 7, 8, 15}) {
 		native.mov_imm(&a, .A, n)
 		native.vec_funnel8(&a, add_vec({kind = .Funnel, n = n}), p, q, "funnel")
 	}
-	// vec_shift16 by 0 does nothing.
+	// vec_shift16 and vec_shift32 by 0 do nothing.
 	native.vec_load(&a, .V1, p)
 	native.vec_shift16(&a, .Shl, .V1, 0)
+	native.vec_shift32(&a, .Sar, .V1, 0)
 	native.vec_store(&a, add_vec({kind = .Vec, v = .Or, flag = true}), .V1)
 }
 
