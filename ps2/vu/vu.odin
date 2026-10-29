@@ -681,10 +681,21 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 			if budget <= 0 {break}
 		}
 		if budget <= 0 {break}
-		when cpu.FALLBACK_COUNT {left := budget}
+		when cpu.FALLBACK_COUNT {left, from := budget, pc}
 		pc, ended = vu_interp(v, pairs, pc, stop, &budget)
 		// VUCHECK's interpreter-only run is not counted.
-		when cpu.FALLBACK_COUNT {if v == &vu0 && compiled {cpu.fallback_vu0_micro += u64(left - budget)}}
+		when cpu.FALLBACK_COUNT {
+			if compiled {
+				n := u64(left - budget)
+				if v == &vu0 {
+					cpu.fallback_vu0_micro += n
+					cpu.fallback_vu0_micro_at[from / 8] += n
+				} else {
+					cpu.fallback_vu1_micro += n
+					cpu.fallback_vu1_micro_at[from / 8] += n
+				}
+			}
+		}
 		if ended {return}
 	}
 	return pc, false

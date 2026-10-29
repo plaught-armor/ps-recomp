@@ -21,8 +21,12 @@ fallback_ee: [r5900.Op]u64
 fallback_vu0, fallback_vu0_upper, fallback_vu1_upper: [COP2_KEYS]u64
 fallback_vu0_lower, fallback_vu1_lower: [128 + COP2_KEYS]u64 // opcode, then 128 + the 0x40 key
 fallback_vu0_pair, fallback_vu1_pair: u64
-// VU0 micro-mode pairs the interpreter runs outside compiled programs.
-fallback_vu0_micro: u64
+// Micro-mode pairs the interpreter runs outside compiled programs, in all
+// and by the pair it entered at (micro memory is 4 KiB on VU0, 16 KiB on
+// VU1).
+fallback_vu0_micro, fallback_vu1_micro: u64
+fallback_vu0_micro_at: [(4 << 10) / 8]u64
+fallback_vu1_micro_at: [(16 << 10) / 8]u64
 // fpu_slow calls, by op: not the interpreter, so outside the calls total.
 fallback_fpu_slow: [Fpu_Op]u64
 
@@ -66,11 +70,34 @@ fallback_print :: proc() {
 		add(&rows, &total, fmt.tprintf("vu%d pair", unit), u.pair)
 	}
 	add(&rows, &total, "vu0 micro interpreted pair", fallback_vu0_micro)
+	add(&rows, &total, "vu1 micro interpreted pair", fallback_vu1_micro)
 	slice.sort_by(rows[:], proc(a, b: Row) -> bool {return a.n > b.n})
 	fmt.eprintfln("fallback: %d calls", total)
 	for r in rows {fmt.eprintfln("fallback: %d\t%.2f%%\t%s", r.n, 100 * f64(r.n) / f64(total), r.name)}
+	micro_at_print(0, fallback_vu0_micro_at[:], fallback_vu0_micro)
+	micro_at_print(1, fallback_vu1_micro_at[:], fallback_vu1_micro)
 	slow: u64
 	for n in fallback_fpu_slow {slow += n}
 	fmt.eprintfln("fallback: %d fpu_slow calls", slow)
 	for n, op in fallback_fpu_slow {if n != 0 {fmt.eprintfln("fallback: %d\tfpu_slow %v", n, op)}}
+}
+
+// The MICRO_AT_TOP entry pairs of one VU's interpreted micro-mode pairs, most
+// first.
+@(private = "file")
+MICRO_AT_TOP :: 20
+
+@(private = "file")
+micro_at_print :: proc(unit: int, at: []u64, total: u64) {
+	if total == 0 {return}
+	Row :: struct {
+		pc: int,
+		n:  u64,
+	}
+	rows := make([dynamic]Row, context.temp_allocator)
+	for n, i in at {if n != 0 {append(&rows, Row{i * 8, n})}}
+	slice.sort_by(rows[:], proc(a, b: Row) -> bool {return a.n > b.n})
+	for r in rows[:min(len(rows), MICRO_AT_TOP)] {
+		fmt.eprintfln("fallback: %d\t%.2f%%\tvu%d micro from %04x", r.n, 100 * f64(r.n) / f64(total), unit, r.pc)
+	}
 }
