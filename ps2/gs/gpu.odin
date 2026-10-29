@@ -178,18 +178,7 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) {
 		s.cluts = core.vk_buf_create(CLUT_CAP * 512 * 4, {.STORAGE_BUFFER}, RING)
 		s.up = core.vk_buf_create(UP_CAP * 4, {.STORAGE_BUFFER}, RING)
 		s.scan = core.vk_buf_create(scan_size, {.STORAGE_BUFFER, .TRANSFER_SRC}, READBACK)
-		alloc := vk.CommandBufferAllocateInfo {
-			sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
-			commandPool        = core.vkc.pool,
-			level              = .PRIMARY,
-			commandBufferCount = 1,
-		}
-		core.vk_check(vk.AllocateCommandBuffers(core.vkc.device, &alloc, &s.cmd), "vkAllocateCommandBuffers")
-		finfo := vk.FenceCreateInfo {
-			sType = .FENCE_CREATE_INFO,
-			flags = {.SIGNALED},
-		}
-		core.vk_check(vk.CreateFence(core.vkc.device, &finfo, nil, &s.fence), "vkCreateFence")
+		s.cmd, s.fence = core.vk_cmd_create()
 		sinfo := vk.SemaphoreCreateInfo {
 			sType = .SEMAPHORE_CREATE_INFO,
 		}
@@ -201,7 +190,7 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) {
 
 	hw.draw_layout = core.vk_layout_create({.VERTEX, .FRAGMENT}, size_of(Draw_PC))
 	hw.comp_layout = core.vk_layout_create({.COMPUTE}, 128)
-	hw.prim = prim_pipeline(#load("shaders/prim.vert.spv"), #load("shaders/prim.frag.spv"), hw.draw_layout)
+	hw.prim = core.vk_draw_pipeline(#load("shaders/prim.vert.spv"), #load("shaders/prim.frag.spv"), hw.draw_layout)
 	hw.upload = core.vk_compute_pipeline(#load("shaders/upload.comp.spv"), hw.comp_layout)
 	hw.copy = core.vk_compute_pipeline(#load("shaders/copy.comp.spv"), hw.comp_layout)
 	hw.scan = core.vk_compute_pipeline(#load("shaders/scanout.comp.spv"), hw.comp_layout)
@@ -217,12 +206,7 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) {
 
 @(private)
 hw_barrier :: proc(cmd: vk.CommandBuffer) {
-	mb := vk.MemoryBarrier {
-		sType         = .MEMORY_BARRIER,
-		srcAccessMask = {.MEMORY_READ, .MEMORY_WRITE},
-		dstAccessMask = {.MEMORY_READ, .MEMORY_WRITE},
-	}
-	vk.CmdPipelineBarrier(cmd, {.ALL_COMMANDS}, {.ALL_COMMANDS}, {}, 1, &mb, 0, nil, 0, nil)
+	core.vk_barrier(cmd)
 	hw.dirty = {}
 	hw.fb_marked, hw.tex_ok = false, false
 }
@@ -230,19 +214,12 @@ hw_barrier :: proc(cmd: vk.CommandBuffer) {
 @(private)
 hw_begin_slot :: proc() {
 	s := &hw.slots[hw.cur]
-	vk.WaitForFences(core.vkc.device, 1, &s.fence, true, max(u64))
-	vk.ResetFences(core.vkc.device, 1, &s.fence)
+	core.vk_begin(s.cmd, s.fence)
 	s.nverts, s.nstates, s.ncluts, s.nup = 0, 0, 0, 0
 	hw.batch = 0
 	hw.state_ok, hw.clut_ok = false, false
 	hw.rendering = false
 	hw.barrier_due = true // orders this slot after the previous one
-	vk.ResetCommandBuffer(s.cmd, {})
-	info := vk.CommandBufferBeginInfo {
-		sType = .COMMAND_BUFFER_BEGIN_INFO,
-		flags = {.ONE_TIME_SUBMIT},
-	}
-	core.vk_check(vk.BeginCommandBuffer(s.cmd, &info), "vkBeginCommandBuffer")
 }
 
 @(private)
@@ -331,20 +308,7 @@ hw_flush_upload :: proc() {
 @(private)
 hw_submit :: proc(wait, signal: vk.Semaphore) {
 	s := &hw.slots[hw.cur]
-	core.vk_check(vk.EndCommandBuffer(s.cmd), "vkEndCommandBuffer")
-	wait, signal := wait, signal
-	stage := vk.PipelineStageFlags{.TRANSFER}
-	info := vk.SubmitInfo {
-		sType                = .SUBMIT_INFO,
-		waitSemaphoreCount   = wait != 0 ? 1 : 0,
-		pWaitSemaphores      = &wait,
-		pWaitDstStageMask    = &stage,
-		commandBufferCount   = 1,
-		pCommandBuffers      = &s.cmd,
-		signalSemaphoreCount = signal != 0 ? 1 : 0,
-		pSignalSemaphores    = &signal,
-	}
-	core.vk_check(vk.QueueSubmit(core.vkc.queue, 1, &info, s.fence), "vkQueueSubmit")
+	core.vk_submit(s.cmd, s.fence, wait, signal)
 }
 
 // A ring is full: run what the slot holds and start it again.

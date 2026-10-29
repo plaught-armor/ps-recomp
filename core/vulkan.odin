@@ -30,6 +30,8 @@ vkc: struct {
 	swap_ext:  vk.Extent2D,
 	swap_imgs: [dynamic]vk.Image,
 	swap_done: [dynamic]vk.Semaphore, // per image: rendering finished, safe to present
+	// VK_KHR_dynamic_rendering_local_read is on (the device has it).
+	local_read: bool,
 }
 
 vk_check :: proc(r: vk.Result, what: string, loc := #caller_location) {
@@ -67,7 +69,8 @@ vk_instance :: proc(extensions: []cstring) {
 
 // Pick the first device with a graphics and compute queue (and pixel
 // interlock when the caller's shaders need it), and create it with the
-// features the shaders use.
+// features the shaders use; dynamic rendering local read too when the
+// device has it (vkc.local_read).
 vk_device :: proc(pixel_interlock: bool) {
 	n: u32
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, nil)
@@ -109,6 +112,23 @@ vk_device :: proc(pixel_interlock: bool) {
 	vk.GetPhysicalDeviceProperties(vkc.phys, &props)
 	fmt.eprintfln("vulkan: %s", cstring(&props.deviceName[0]))
 	vk.GetPhysicalDeviceMemoryProperties(vkc.phys, &vkc.mem_props)
+	ne: u32
+	vk.EnumerateDeviceExtensionProperties(vkc.phys, nil, &ne, nil)
+	eps := make([]vk.ExtensionProperties, ne, context.temp_allocator)
+	vk.EnumerateDeviceExtensionProperties(vkc.phys, nil, &ne, raw_data(eps))
+	read := vk.PhysicalDeviceDynamicRenderingLocalReadFeatures {
+		sType = .PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES,
+	}
+	for &e in eps {
+		if cstring(&e.extensionName[0]) != vk.KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME {continue}
+		f2 := vk.PhysicalDeviceFeatures2 {
+			sType = .PHYSICAL_DEVICE_FEATURES_2,
+			pNext = &read,
+		}
+		vk.GetPhysicalDeviceFeatures2(vkc.phys, &f2)
+		vkc.local_read = bool(read.dynamicRenderingLocalRead)
+	}
+	read.pNext = nil
 
 	lock := vk.PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
 		sType                        = .PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
@@ -118,6 +138,10 @@ vk_device :: proc(pixel_interlock: bool) {
 		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
 		pNext            = pixel_interlock ? &lock : nil,
 		dynamicRendering = true,
+	}
+	if vkc.local_read {
+		read.pNext = v13.pNext
+		v13.pNext = &read
 	}
 	v12 := vk.PhysicalDeviceVulkan12Features {
 		sType               = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -136,9 +160,10 @@ vk_device :: proc(pixel_interlock: bool) {
 		queueCount       = 1,
 		pQueuePriorities = &prio,
 	}
-	exts: [2]cstring
+	exts: [3]cstring
 	n_exts: u32
 	if pixel_interlock {exts[n_exts] = "VK_EXT_fragment_shader_interlock"; n_exts += 1}
+	if vkc.local_read {exts[n_exts] = vk.KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME; n_exts += 1}
 	if vkc.surface != 0 {exts[n_exts] = "VK_KHR_swapchain"; n_exts += 1}
 	info := vk.DeviceCreateInfo {
 		sType                   = .DEVICE_CREATE_INFO,
@@ -263,4 +288,129 @@ vk_compute_pipeline :: proc(code: []u8, layout: vk.PipelineLayout) -> (p: vk.Pip
 	}
 	vk_check(vk.CreateComputePipelines(vkc.device, 0, 1, &info, nil, &p), "vkCreateComputePipelines")
 	return
+}
+
+// Triangle lists with no attachments: the fragment shader does all memory
+// access itself.
+vk_draw_pipeline :: proc(vert, frag: []u8, layout: vk.PipelineLayout) -> (p: vk.Pipeline) {
+	vm, fm := vk_shader_module(vert), vk_shader_module(frag)
+	defer {
+		vk.DestroyShaderModule(vkc.device, vm, nil)
+		vk.DestroyShaderModule(vkc.device, fm, nil)
+	}
+	stages := [2]vk.PipelineShaderStageCreateInfo {
+		{sType = .PIPELINE_SHADER_STAGE_CREATE_INFO, stage = {.VERTEX}, module = vm, pName = "main"},
+		{sType = .PIPELINE_SHADER_STAGE_CREATE_INFO, stage = {.FRAGMENT}, module = fm, pName = "main"},
+	}
+	vin := vk.PipelineVertexInputStateCreateInfo {
+		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	}
+	ia := vk.PipelineInputAssemblyStateCreateInfo {
+		sType    = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		topology = .TRIANGLE_LIST,
+	}
+	vp := vk.PipelineViewportStateCreateInfo {
+		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		viewportCount = 1,
+		scissorCount  = 1,
+	}
+	rs := vk.PipelineRasterizationStateCreateInfo {
+		sType       = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		polygonMode = .FILL,
+		cullMode    = {},
+		frontFace   = .COUNTER_CLOCKWISE,
+		lineWidth   = 1,
+	}
+	ms := vk.PipelineMultisampleStateCreateInfo {
+		sType                = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		rasterizationSamples = {._1},
+	}
+	cb := vk.PipelineColorBlendStateCreateInfo {
+		sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	}
+	dyn_states := [2]vk.DynamicState{.VIEWPORT, .SCISSOR}
+	dyn := vk.PipelineDynamicStateCreateInfo {
+		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		dynamicStateCount = 2,
+		pDynamicStates    = &dyn_states[0],
+	}
+	rend := vk.PipelineRenderingCreateInfo {
+		sType = .PIPELINE_RENDERING_CREATE_INFO,
+	}
+	info := vk.GraphicsPipelineCreateInfo {
+		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+		pNext               = &rend,
+		stageCount          = 2,
+		pStages             = &stages[0],
+		pVertexInputState   = &vin,
+		pInputAssemblyState = &ia,
+		pViewportState      = &vp,
+		pRasterizationState = &rs,
+		pMultisampleState   = &ms,
+		pColorBlendState    = &cb,
+		pDynamicState       = &dyn,
+		layout              = layout,
+	}
+	vk_check(vk.CreateGraphicsPipelines(vkc.device, 0, 1, &info, nil, &p), "vkCreateGraphicsPipelines")
+	return
+}
+
+// Make every command before visible to every command after.
+vk_barrier :: proc(cmd: vk.CommandBuffer) {
+	mb := vk.MemoryBarrier {
+		sType         = .MEMORY_BARRIER,
+		srcAccessMask = {.MEMORY_READ, .MEMORY_WRITE},
+		dstAccessMask = {.MEMORY_READ, .MEMORY_WRITE},
+	}
+	vk.CmdPipelineBarrier(cmd, {.ALL_COMMANDS}, {.ALL_COMMANDS}, {}, 1, &mb, 0, nil, 0, nil)
+}
+
+// A primary command buffer and its fence, made signalled (vk_begin waits
+// for it first).
+vk_cmd_create :: proc() -> (cmd: vk.CommandBuffer, fence: vk.Fence) {
+	alloc := vk.CommandBufferAllocateInfo {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = vkc.pool,
+		level              = .PRIMARY,
+		commandBufferCount = 1,
+	}
+	vk_check(vk.AllocateCommandBuffers(vkc.device, &alloc, &cmd), "vkAllocateCommandBuffers")
+	finfo := vk.FenceCreateInfo {
+		sType = .FENCE_CREATE_INFO,
+		flags = {.SIGNALED},
+	}
+	vk_check(vk.CreateFence(vkc.device, &finfo, nil, &fence), "vkCreateFence")
+	return
+}
+
+// Wait for cmd's last submit, then begin recording it again.
+vk_begin :: proc(cmd: vk.CommandBuffer, fence: vk.Fence) {
+	fence := fence
+	vk.WaitForFences(vkc.device, 1, &fence, true, max(u64))
+	vk.ResetFences(vkc.device, 1, &fence)
+	vk.ResetCommandBuffer(cmd, {})
+	info := vk.CommandBufferBeginInfo {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.ONE_TIME_SUBMIT},
+	}
+	vk_check(vk.BeginCommandBuffer(cmd, &info), "vkBeginCommandBuffer")
+}
+
+// End cmd and submit it, signalling fence; waiting for semaphore `wait`
+// before transfers and signalling `signal`, each when not 0.
+vk_submit :: proc(cmd: vk.CommandBuffer, fence: vk.Fence, wait, signal: vk.Semaphore) {
+	cmd, wait, signal := cmd, wait, signal
+	vk_check(vk.EndCommandBuffer(cmd), "vkEndCommandBuffer")
+	stage := vk.PipelineStageFlags{.TRANSFER}
+	info := vk.SubmitInfo {
+		sType                = .SUBMIT_INFO,
+		waitSemaphoreCount   = wait != 0 ? 1 : 0,
+		pWaitSemaphores      = &wait,
+		pWaitDstStageMask    = &stage,
+		commandBufferCount   = 1,
+		pCommandBuffers      = &cmd,
+		signalSemaphoreCount = signal != 0 ? 1 : 0,
+		pSignalSemaphores    = &signal,
+	}
+	vk_check(vk.QueueSubmit(vkc.queue, 1, &info, fence), "vkQueueSubmit")
 }
