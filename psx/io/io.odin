@@ -55,7 +55,7 @@ clock_set :: proc(mul: u64) {
 	}
 	clock_mul = mul
 	for n in 0 ..< len(timers) {
-		timer_reschedule(n)
+		timer_reschedule(n, cpu.state.cycles)
 	}
 }
 
@@ -206,8 +206,14 @@ timer_rate :: proc(n: int) -> u64 {
 
 @(private)
 timer_value :: proc(n: int) -> u32 {
+	return timer_value_at(n, cpu.state.cycles)
+}
+
+// The counter value at cycle `at`, not before base.
+@(private)
+timer_value_at :: proc(n: int, at: u64) -> u32 {
 	t := &timers[n]
-	ticks := (cpu.state.cycles - t.base) / (t.div * clock_mul)
+	ticks := (at - t.base) / (t.div * clock_mul)
 	v := u64(t.value) + ticks
 	if t.mode & 0x08 != 0 && t.target != 0 {
 		v %= u64(t.target) + 1
@@ -217,8 +223,9 @@ timer_value :: proc(n: int) -> u32 {
 	return u32(v)
 }
 
+// Schedule counter n's next fire from cycle `now`.
 @(private)
-timer_reschedule :: proc(n: int) {
+timer_reschedule :: proc(n: int, now: u64) {
 	t := &timers[n]
 	e := Event(int(Event.Timer0) + n)
 	unschedule(e)
@@ -229,16 +236,25 @@ timer_reschedule :: proc(n: int) {
 	if t.mode & 0x10 != 0 && t.target != 0 {
 		limit = u64(t.target)
 	}
-	cur := u64(timer_value(n))
+	// Due on a tick boundary counted from base: the part of a tick already
+	// run since the last boundary counts, or a /8 counter would lose it at
+	// every reschedule.
+	step := t.div * clock_mul
+	cur := u64(timer_value_at(n, now))
 	ticks := limit > cur ? limit - cur : limit
-	schedule(e, max(ticks * t.div, 1))
+	events[e] = now - (now - t.base) % step + ticks * step
+	cpu.next_event = min(cpu.next_event, events[e])
 }
 
 @(private)
 timer_fire :: proc(n: int) {
+	// From the cycle the target or overflow was due, not the one
+	// run_events reached it at: counting from there would put the counter
+	// behind by that lateness at every fire, more the more often code runs
+	// long between event checks.
 	t := &timers[n]
-	t.value = timer_value(n)
-	t.base = cpu.state.cycles
+	t.value = timer_value_at(n, event_due)
+	t.base = event_due
 	if t.mode & 0x08 != 0 && t.mode & 0x10 != 0 {
 		t.value = 0
 	}
@@ -247,7 +263,9 @@ timer_fire :: proc(n: int) {
 		core.tracef(.Timer, "timer%d fire mode=%x target=%x", n, t.mode, t.target)
 	}
 	irq_raise(Irq(u32(Irq.Timer0) + u32(n)))
-	timer_reschedule(n)
+	// From the due cycle too: a fire already over runs in the same
+	// run_events, so a long run between checks misses none.
+	timer_reschedule(n, event_due)
 }
 
 timer0_event :: proc() {timer_fire(0)}
@@ -293,7 +311,7 @@ timer_write :: proc(n: int, reg, v: u32) {
 	case 8:
 		t.target = v & 0xffff
 	}
-	timer_reschedule(n)
+	timer_reschedule(n, cpu.state.cycles)
 }
 
 // ---------------------------------------------------------------- DMA
