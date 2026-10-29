@@ -13,6 +13,10 @@
 //   skipping the HookEntryInt handler; an acknowledged counter ends it
 //   with the other counters still pending. WaitEvent with interrupts
 //   blocked gives up instead of hanging.
+//   The kernel layout games read and patch: the exception vector, the C0
+//   and B0 tables, and the pad driver's pointers and vblank acknowledge,
+//   handed over by StartPAD and turned off by ChangeClearPad or by zeroing
+//   its code. SysEnqIntRP of a queued element moves it to the head.
 package main
 
 import "core:fmt"
@@ -68,7 +72,12 @@ ELEM_LATE :: 0x2010
 ELEM_COUNT :: 0x2020
 
 @(private = "file")
+ELEM_NOP :: 0x2030
+
+@(private = "file")
 PAD_WORD :: 0x2100
+@(private = "file")
+PAD_BUF :: 0x2110
 
 @(private = "file")
 calls: struct {
@@ -286,8 +295,82 @@ main :: proc() {
 	check("B(16h)", b(0x16), 0xfffffefe)
 	check("pad word after B(16h)", cpu.r32(PAD_WORD), 0xfffffefe)
 
+	// Kernel layout.
+	bios.bios_init()
+	check("exception vector halfword at 0x86", cpu.r32(0x84) >> 16, 0x275a)
+	check("exception vector jr k0", cpu.r32(0x88), 0x03400008)
+	check("exception vector nop", cpu.r32(0x8c), 0)
+	c0 := b(0x56)
+	check("GetC0Table", c0, 0x674)
+	check("C0(06h)", cpu.r32(c0 + 0x06 * 4), 0xc80)
+	b0 := b(0x57)
+	check("GetB0Table", b0, 0x874)
+	pad := cpu.r32(b0 + 0x5b * 4)
+	if pad < 0x500 || pad + 0x1990 > 0x10000 {
+		fail("ChangeClearPad's code at %#x leaves no room in kernel RAM for its patches", pad)
+	}
+
+	// libpad's pointers into the pad driver stop and restart pad reading.
+	b(0x12, PAD_BUF, 0x22, 0, 0)
+	bios.bios_pad_vblank()
+	check("pad buffer id after InitPAD", u32(cpu.r8(PAD_BUF + 1)), 0x41)
+	cpu.call(pad + 0x894)
+	cpu.w8(PAD_BUF + 1, 0)
+	bios.bios_pad_vblank()
+	check("pad buffer id with reading stopped", u32(cpu.r8(PAD_BUF + 1)), 0)
+	cpu.call(pad + 0x884)
+	bios.bios_pad_vblank()
+	check("pad buffer id with reading restarted", u32(cpu.r8(PAD_BUF + 1)), 0x41)
+	cpu.call(pad + 0x7a0)
+
+	// StartPAD hands the vblank acknowledge to the pad driver's handler in
+	// chain 2: the IRQ event no longer sees vblank, but the hook still runs.
+	test(vb)
+	test(vb_irq)
+	io.irq_regs.stat = 1
+	b(0x13)
+	check("vblank pending after StartPAD", io.irq_regs.stat, 0)
+	check("vblank unmasked by StartPAD", io.irq_regs.mask & 1, 1)
+	hook := calls.hook
+	irq(0)
+	check("vblank root counter event with the pad started", test(vb), 1)
+	check("vblank acknowledged by the pad driver", io.irq_regs.stat, 0)
+	check("vblank IRQ event after the pad driver's acknowledge", test(vb_irq), 0)
+	if calls.hook != hook + 1 {
+		fail("hook ran %d times with the pad started, want 1", calls.hook - hook)
+	}
+	check("ChangeClearPad(0) old flag", b(0x5b, 0), 1)
+	irq(0)
+	check("vblank left pending by ChangeClearPad(0)", io.irq_regs.stat, 1)
+	check("vblank IRQ event after ChangeClearPad(0)", test(vb_irq), 1)
+	check("ChangeClearPad(1) old flag", b(0x5b, 1), 0)
+	for k in u32(0) ..< 9 {
+		cpu.w32(pad + 0x62c + 4 * k, 0)
+	}
+	irq(0)
+	check("vblank left pending after _remove_ChgclrPAD", io.irq_regs.stat, 1)
+	b(0x14)
+	check("ChangeClearRCnt(3) flag after StopPAD", c(0x0a, 3, 0), 1)
+
+	// StartCARD leaves a pending vblank alone.
+	io.irq_regs.stat = 1
+	io.irq_regs.mask = 0
+	b(0x4b)
+	check("vblank pending after StartCARD", io.irq_regs.stat, 1)
+	check("vblank unmasked by StartCARD", io.irq_regs.mask & 1, 1)
+	check("ChangeClearRCnt(3) flag after StartCARD", c(0x0a, 3, 0), 0)
+	b(0x4c)
+
+	// SysEnqIntRP of an element already queued moves it to the head.
+	elem(ELEM_NOP, 0, 0, 0)
+	c(0x02, 0, ELEM_NOP)
+	c(0x02, 0, ELEM_COUNT)
+	check("chain 0 head after re-enqueuing", bios.bios.chains[0], ELEM_COUNT)
+	check("chain 0 second", cpu.r32(ELEM_COUNT), ELEM_NOP)
+	check("chain 0 tail", cpu.r32(ELEM_NOP), 0)
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h)")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver")
 }

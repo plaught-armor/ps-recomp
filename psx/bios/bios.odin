@@ -24,6 +24,14 @@ bios: struct {
 	rcnt_ack:  [4]bool,
 	// A handler called ReturnFromException during deliver_irq.
 	rfe:       bool,
+	// The pad driver's vblank handler is in chain 2 (StartPAD or StartCARD
+	// until StopPAD or StopCARD).
+	sio0:      bool,
+	// ChangeClearPad flag: that handler acknowledges vblank.
+	pad_ack:   bool,
+	// The pad driver reads the pads (InitPAD, until libpad stops it through
+	// the pointer it takes from the driver's code).
+	pad_read:  bool,
 }
 
 // Host input and GPU, set by package psx (hooks.odin) so this package does
@@ -61,6 +69,9 @@ ret :: #force_inline proc(v: u32) {
 // pad (status 0, id 0x41, buttons active-low in transfer order) and port 2
 // as absent.
 bios_pad_vblank :: proc() {
+	if !bios.pad_read {
+		return
+	}
 	if bios.pad_buf[0] != 0 {
 		b := ~pad_game()
 		cpu.w8(bios.pad_buf[0], 0x00)
@@ -159,14 +170,21 @@ bios_b :: proc(fn: u32) {
 		change_thread(arg(0))
 	case 0x12:
 		bios.pad_buf = {arg(0), arg(2)}
+		bios.pad_read = true
 		ret(2)
-	case 0x13, 0x14, 0x5b:
-		ret(1) // StartPAD, StopPAD, ChangeClearPad
+	case 0x13:
+		sio0_start(true)
+		ret(1)
+	case 0x14:
+		sio0_stop()
+		ret(1)
 	case 0x15:
 		// InitPAD2(type, button word): only the two 6-button types start
 		// the driver; anything else is refused.
 		if arg(0) == 0x20000000 || arg(0) == 0x20000001 {
 			bios.pad_word = arg(1)
+			bios.pad_read = true
+			sio0_start(true)
 			ret(2)
 		} else {
 			ret(0)
@@ -206,16 +224,26 @@ bios_b :: proc(fn: u32) {
 		ret(card_nextfile(arg(0), false))
 	case 0x45:
 		ret(card_erase(cpu.mem_cstring(arg(0))))
-	case 0x4a, 0x4b, 0x4c, 0x50:
-		ret(1) // InitCARD, StartCARD, StopCARD, allow_new_card
+	case 0x4a, 0x50:
+		ret(1) // InitCARD, allow_new_card
+	case 0x4b:
+		sio0_start(false)
+		ret(1)
+	case 0x4c:
+		sio0_stop()
+		ret(1)
 	case 0x4e, 0x4f:
 		ret(card_sector(arg(0), arg(1), arg(2), fn == 0x4e))
 	case 0x5c:
 		ret(0)
 	case 0x56:
-		ret(FAKE_C0_TABLE)
+		ret(C0_TABLE)
 	case 0x57:
-		ret(FAKE_B0_TABLE)
+		ret(B0_TABLE)
+	case 0x5b:
+		// ChangeClearPad(flag): returns the old flag.
+		ret(u32(bios.pad_ack))
+		bios.pad_ack = arg(0) != 0
 	case:
 		bios_unknown("B", fn)
 	}
@@ -318,13 +346,38 @@ bios_format :: proc(f: string, first: u32) -> string {
 	return strings.to_string(b)
 }
 
-// GetC0Table/GetB0Table: PsyQ libraries patch BIOS handler code reached
-// through these tables. Point them at scratch kernel RAM so the patches land
-// somewhere harmless; the HLE BIOS never executes that code.
+// GetC0Table/GetB0Table, at the retail kernel's addresses. PsyQ libraries
+// patch kernel code reached through two entries, at fixed offsets: the
+// exception handler (C0 06h) and the pad and card driver (B0 5Bh,
+// ChangeClearPad), up to 0x198c bytes past it. Both point at kernel RAM
+// kept free for those patches; the HLE BIOS never executes that code. Only
+// these two entries are filled.
 @(private)
-FAKE_C0_TABLE :: 0x200
+C0_TABLE :: 0x674
 @(private)
-FAKE_B0_TABLE :: 0x300
+B0_TABLE :: 0x874
+@(private)
+EXC_HANDLER :: 0xc80
+@(private)
+PAD_DRIVER :: 0x4000
+
+// Offsets into the pad driver that libpad takes. It calls the first three
+// through pointers: setPadOutputData(buf1, n1, buf2, n2), and the start and
+// stop of pad reading. _remove_ChgclrPAD zeroes 9 words at the last, the
+// handler's vblank acknowledge; a nonzero word stands in for that code.
+@(private)
+PAD_SET_OUTPUT :: 0x7a0
+@(private)
+PAD_READ_START :: 0x884
+@(private)
+PAD_READ_STOP :: 0x894
+@(private)
+PAD_ACK_CODE :: 0x62c
+
+// The retail exception vector: lui k0, 0; addiu k0, k0, EXC_HANDLER; jr k0;
+// nop. Games copy it until the nop, and test the halfword at 0x86.
+@(private)
+EXC_VECTOR :: [4]u32{0x3c1a0000, 0x275a0000 | EXC_HANDLER, 0x03400008, 0}
 
 // Device control block table (pointer at 0x150, byte size at 0x154). PsyQ's
 // firstfile() looks up the "bu" device here and patches its handler; the
@@ -336,8 +389,20 @@ FAKE_DCB_TABLE :: 0x3000
 DCB_SIZE :: 0x50
 
 bios_init :: proc() {
-	cpu.w32(FAKE_C0_TABLE + 0x18, 0x1000)
-	cpu.w32(FAKE_B0_TABLE + 0x16c, 0x2000)
+	vector := EXC_VECTOR
+	for w, k in vector {
+		cpu.w32(0x80 + 4 * u32(k), w)
+	}
+	cpu.w32(C0_TABLE + 0x06 * 4, EXC_HANDLER)
+	cpu.w32(B0_TABLE + 0x5b * 4, PAD_DRIVER)
+	cpu.w32(PAD_DRIVER + PAD_ACK_CODE, 0x3c011f80) // lui at, 0x1f80
+	cpu.register_funcs(
+		{
+			{PAD_DRIVER + PAD_SET_OUTPUT, proc() {}},
+			{PAD_DRIVER + PAD_READ_START, proc() {bios.pad_read = true}},
+			{PAD_DRIVER + PAD_READ_STOP, proc() {bios.pad_read = false}},
+		},
+	)
 	bios_memset(FAKE_DCB_TABLE, 0, DCB_SIZE + 4)
 	copy(cpu.mem_slice(FAKE_DCB_TABLE + DCB_SIZE, 3), "bu\x00")
 	cpu.w32(FAKE_DCB_TABLE, FAKE_DCB_TABLE + DCB_SIZE)
@@ -559,6 +624,8 @@ run_int_chains :: proc() {
 		switch pri {
 		case 1:
 			rcnt_irqs()
+		case 2:
+			sio0_irq()
 		case 3:
 			irq_events()
 		}
@@ -592,6 +659,41 @@ rcnt_irqs :: proc() {
 	}
 }
 
+// StartPAD and StartCARD enqueue the pad driver's vblank handler in chain 2
+// and hand the vblank acknowledge from the root counter handler to it;
+// StartPAD also acknowledges a pending vblank. StopPAD and StopCARD undo
+// both. The handler sits at the tail of chain 2 here, behind any element
+// the game enqueued before it.
+@(private)
+sio0_start :: proc(ack_vblank: bool) {
+	if ack_vblank {
+		io.irq_regs.stat &~= 1
+	}
+	io.irq_regs.mask |= 1
+	bios.sio0 = true
+	bios.pad_ack = true
+	bios.rcnt_ack[3] = false
+}
+
+@(private)
+sio0_stop :: proc() {
+	bios.sio0 = false
+	bios.rcnt_ack[3] = true
+}
+
+// The pad driver's vblank handler: the pads themselves are read by the
+// host every vblank (bios_pad_vblank), so only the acknowledge is left,
+// unless ChangeClearPad or _remove_ChgclrPAD turned it off.
+@(private)
+sio0_irq :: proc() {
+	if !bios.sio0 || io.irq_regs.stat & io.irq_regs.mask & 1 == 0 {
+		return
+	}
+	if bios.pad_ack && cpu.r32(PAD_DRIVER + PAD_ACK_CODE) != 0 {
+		io.irq_regs.stat &~= 1
+	}
+}
+
 // IRQ number and event class of the kernel's IRQ event handler, in its
 // order. Timer 2 delivers timer 1's class, as on the retail kernel.
 @(private)
@@ -621,6 +723,9 @@ irq_events :: proc() {
 	}
 }
 
+// SysEnqIntRP pushes at the head. An element already in the chain moves to
+// the head instead of being linked twice; the retail kernel would link the
+// head to itself and loop.
 @(private)
 int_chain_enqueue :: proc(pri, elem: u32) {
 	if pri >= len(bios.chains) {
