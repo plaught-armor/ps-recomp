@@ -9,6 +9,7 @@ import "core:strings"
 import "ps:core"
 import cpu "../cpu"
 import io "../io"
+import libc "libc"
 
 bios: struct {
 	// HookEntryInt jump buffer: [0]=ra [1]=sp [2]=fp [3..10]=s0-s7 [11]=gp.
@@ -103,34 +104,63 @@ bios_a :: proc(fn: u32) {
 		core.tracef(.Bios, "A(%02xh) a0=%x a1=%x a2=%x ra=%x", fn, arg(0), arg(1), arg(2), cpu.state.r[31])
 	}
 	switch fn {
+	case 0x0c:
+		ret(libc.strtoul(arg(0), arg(1), arg(2)))
+	case 0x0d:
+		ret(libc.strtol(arg(0), arg(1), arg(2)))
+	case 0x0e, 0x0f:
+		ret(libc.abs(arg(0)))
+	case 0x10, 0x11:
+		ret(libc.atoi(arg(0)))
 	case 0x13:
 		bios_setjmp(arg(0))
+	case 0x15:
+		ret(libc.strcat(arg(0), arg(1)))
 	case 0x17:
-		ret(u32(i32(strings.compare(cpu.mem_cstring(arg(0), 0x10000), cpu.mem_cstring(arg(1), 0x10000)))))
+		ret(libc.strcmp(arg(0), arg(1)))
 	case 0x18:
-		n := arg(2)
-		ret(u32(i32(strings.compare(cpu.mem_cstring(arg(0), n), cpu.mem_cstring(arg(1), n)))))
+		ret(libc.strncmp(arg(0), arg(1), arg(2)))
 	case 0x19:
-		s := cpu.mem_cstring(arg(1), 0x10000)
-		copy(cpu.mem_slice(arg(0), u32(len(s)) + 1), transmute([]u8)s)
-		cpu.w8(arg(0) + u32(len(s)), 0)
-		ret(arg(0))
+		ret(libc.strcpy(arg(0), arg(1)))
+	case 0x1b:
+		ret(libc.strlen(arg(0)))
+	case 0x25:
+		ret(libc.toupper(arg(0)))
+	case 0x26:
+		ret(libc.tolower(arg(0)))
 	case 0x28:
-		bios_memset(arg(0), 0, arg(1))
-		ret(arg(0))
+		ret(libc.memset(arg(0), 0, arg(1)))
+	case 0x29, 0x2d:
+		ret(libc.memcmp(arg(0), arg(1), arg(2)))
 	case 0x2a:
-		bios_memcpy(arg(0), arg(1), arg(2))
-		ret(arg(0))
+		ret(libc.memcpy(arg(0), arg(1), arg(2)))
 	case 0x2b:
-		bios_memset(arg(0), u8(arg(1)), arg(2))
-		ret(arg(0))
+		ret(libc.memset(arg(0), u8(arg(1)), arg(2)))
+	case 0x2c:
+		ret(libc.memmove(arg(0), arg(1), arg(2)))
+	case 0x2e:
+		ret(libc.memchr(arg(0), arg(1), arg(2)))
 	case 0x2f:
 		bios.rand_seed = bios.rand_seed * 0x41c64e6d + 0x3039
 		ret((bios.rand_seed >> 16) & 0x7fff)
 	case 0x30:
 		bios.rand_seed = arg(0)
-	case 0x39, 0x44, 0x72:
-	// InitHeap, FlushCache, CdRemove: nothing to do.
+	case 0x31:
+		libc.qsort(arg(0), arg(1), arg(2), arg(3))
+	case 0x33:
+		ret(libc.malloc(arg(0)))
+	case 0x34:
+		libc.free(arg(0))
+	case 0x36:
+		ret(libc.bsearch(arg(0), arg(1), arg(2), arg(3), arg(4)))
+	case 0x37:
+		ret(libc.calloc(arg(0), arg(1)))
+	case 0x38:
+		ret(libc.realloc(arg(0), arg(1)))
+	case 0x39:
+		libc.init_heap(arg(0), arg(1))
+	case 0x44, 0x72:
+	// FlushCache, CdRemove: nothing to do.
 	case 0x3f:
 		fmt.eprint("[printf] ", bios_format(cpu.mem_cstring(arg(0)), 1), sep = "")
 	case 0x49:
@@ -356,20 +386,6 @@ bios_setjmp :: proc(buf: u32) {
 	ret(0)
 }
 
-@(private)
-bios_memcpy :: proc(dst, src, n: u32) {
-	for i in u32(0) ..< n {
-		cpu.w8(dst + i, cpu.r8(src + i))
-	}
-}
-
-@(private)
-bios_memset :: proc(dst: u32, v: u8, n: u32) {
-	for i in u32(0) ..< n {
-		cpu.w8(dst + i, v)
-	}
-}
-
 // Minimal printf for debug output; `first` is the index of the first vararg.
 @(private)
 bios_format :: proc(f: string, first: u32) -> string {
@@ -507,7 +523,7 @@ bios_init :: proc() {
 			{PAD_DRIVER + PAD_READ_STOP, proc() {bios.pad_read = false}},
 		},
 	)
-	bios_memset(FAKE_DCB_TABLE, 0, DCB_SIZE + 4)
+	libc.memset(FAKE_DCB_TABLE, 0, DCB_SIZE + 4)
 	copy(cpu.mem_slice(FAKE_DCB_TABLE + DCB_SIZE, 3), "bu\x00")
 	cpu.w32(FAKE_DCB_TABLE, FAKE_DCB_TABLE + DCB_SIZE)
 	cpu.w32(0x150, FAKE_DCB_TABLE)

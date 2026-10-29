@@ -16,6 +16,7 @@ import "core:strings"
 
 import "ps:core"
 import cpu "../cpu"
+import libc "libc"
 
 CARD_SIZE :: 128 * 1024
 @(private)
@@ -507,7 +508,7 @@ card_rw :: proc(fd, buf, length: u32, write: bool) -> u32 {
 // sector), system[4].
 @(private)
 write_direntry :: proc(img: ^Card_Image, dst: u32, block: int) {
-	bios_memset(dst, 0, 40)
+	libc.memset(dst, 0, 40)
 	name := dir_name(img, block)
 	copy(cpu.mem_slice(dst, u32(len(name))), name)
 	cpu.w32(dst + 0x14, 0x50)
