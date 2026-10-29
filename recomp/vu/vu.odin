@@ -424,6 +424,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 	dest := (lw >> 21) & 15
 	ft, fs, fd := (lw >> 16) & 31, (lw >> 11) & 31, (lw >> 6) & 31
 	it, is := ft & 15, fs & 15
+	fsf := (lw >> 21) & 3
 	imm11 := u16(i16(u16(lw & 0x7ff) << 5) >> 5)
 	imm15 := u16(((lw >> 10) & 0x7800) | (lw & 0x7ff))
 	imm24 := lw & 0xffffff
@@ -432,6 +433,9 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 		for on, k in L {
 			if on {fmt.sbprintf(sb, "%s[%d] = %s[%d]; ", dst, k, src, k)}
 		}
+	}
+	efu :: proc(sb: ^strings.Builder, fs: u32, p: string) {
+		fmt.sbprintfln(sb, "\t\t\t{{s := vf[%d].f; v.p = %s}", fs, p)
 	}
 	interp :: proc(sb: ^strings.Builder, lw, pc: u32) -> bool {
 		fmt.sbprintfln(sb, "\t\t\tvu.vu1_lower(0x%08x, 0x%04x)", lw, pc)
@@ -538,6 +542,28 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			assert(vif == 1 || lw & 3 == 1, "vu: XTOP exists only on VU1")
 			if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(vu.vifs[%d].%s)", it, vif, lw & 3 == 0 ? "top" : "itop")}
 		case 0x6c: fmt.sbprintfln(sb, "\t\t\tvu.vu1_xgkick(vi[%d])", is) // XGKICK
+		case 0x64: // MFP: no flags, clamped as the interpreter's put_raw
+			if ft == 0 || dest == 0 {return}
+			fmt.sbprint(sb, "\t\t\t{p := fclamp(v.p); ")
+			for on, k in L {
+				if on {fmt.sbprintf(sb, "vf[%d].f[%d] = p; ", ft, k)}
+			}
+			end_block(sb)
+		// The EFU, as the interpreter: P written at once, the operand
+		// unclamped, the sums in the same order.
+		case 0x70: efu(sb, fs, "fclamp(s.x * s.x + s.y * s.y + s.z * s.z)") // ESADD
+		case 0x71: efu(sb, fs, "fdiv(1, s.x * s.x + s.y * s.y + s.z * s.z)") // ERSADD
+		case 0x72: efu(sb, fs, "math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z)") // ELENG
+		case 0x73: efu(sb, fs, "frsqrt(1, s.x * s.x + s.y * s.y + s.z * s.z)") // ERLENG
+		case 0x74: efu(sb, fs, "math.atan(fdiv(s.y, s.x))") // EATANxy
+		case 0x75: efu(sb, fs, "math.atan(fdiv(s.z, s.x))") // EATANxz
+		case 0x76: efu(sb, fs, "fclamp(s.x + s.y + s.z + s.w)") // ESUM
+		case 0x78: efu(sb, fs, fmt.tprintf("math.sqrt(abs(s[%d]))", fsf)) // ESQRT
+		case 0x79: efu(sb, fs, fmt.tprintf("frsqrt(1, s[%d])", fsf)) // ERSQRT
+		case 0x7a: efu(sb, fs, fmt.tprintf("fdiv(1, s[%d])", fsf)) // ERCPR
+		case 0x7c: efu(sb, fs, fmt.tprintf("math.sin(s[%d])", fsf)) // ESIN
+		case 0x7d: efu(sb, fs, fmt.tprintf("math.atan(s[%d])", fsf)) // EATAN
+		case 0x7e: efu(sb, fs, fmt.tprintf("fclamp(math.exp(-s[%d]))", fsf)) // EEXP
 		case: return interp(sb, lw, pc)
 		}
 	case: return interp(sb, lw, pc)
@@ -694,11 +720,11 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, sl
 
 // One VU1 microprogram at micro address 0, compiled whole as run_<n>, as
 // generate compiles a .vutext program (tests/vu_micro). The caller writes
-// the package header and VU_HELPERS.
-emit_micro :: proc(n: int, words: []u32) -> string {
+// the package header and VU_HELPERS. Counts the pair halves that call the
+// interpreter in slow, by opcode.
+emit_micro :: proc(n: int, words: []u32, slow: ^map[string]int) -> string {
 	sb := strings.builder_make()
-	slow: map[string]int
-	emit_program(&sb, n, words, nil, &slow)
+	emit_program(&sb, n, words, nil, slow)
 	return strings.to_string(sb)
 }
 
