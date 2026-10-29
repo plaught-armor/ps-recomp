@@ -17,6 +17,13 @@ bios: struct {
 	pad_buf:   [2]u32,
 	// SysEnqIntRP chain heads by priority.
 	chains:    [4]u32,
+	// B(15h) button word destination, written every vblank.
+	pad_word:  u32,
+	// ChangeClearRCnt flags: timers 0-2 and vblank (3) auto-acknowledge
+	// their IRQ and end the exception. On at boot, as on the retail kernel.
+	rcnt_ack:  [4]bool,
+	// A handler called ReturnFromException during deliver_irq.
+	rfe:       bool,
 }
 
 // Host input and GPU, set by package psx (hooks.odin) so this package does
@@ -64,6 +71,16 @@ bios_pad_vblank :: proc() {
 	if bios.pad_buf[1] != 0 {
 		cpu.w8(bios.pad_buf[1], 0xff)
 	}
+	if bios.pad_word != 0 {
+		cpu.w32(bios.pad_word, pad_dr())
+	}
+}
+
+// B(16h) button word: port 1's first button byte in bits 8-15 and its second
+// in bits 0-7, active-low; port 2, absent, reads 0xffff.
+@(private)
+pad_dr :: proc() -> u32 {
+	return 0xffff0000 | u32(~pad_game())
 }
 
 bios_a :: proc(fn: u32) {
@@ -127,7 +144,7 @@ bios_b :: proc(fn: u32) {
 	case 0x09:
 		ret(close_event(arg(0)))
 	case 0x0a:
-		ret(1)
+		ret(wait_event(arg(0)))
 	case 0x0b:
 		ret(test_event(arg(0)))
 	case 0x0c:
@@ -146,10 +163,27 @@ bios_b :: proc(fn: u32) {
 	case 0x13, 0x14, 0x5b:
 		ret(1) // StartPAD, StopPAD, ChangeClearPad
 	case 0x15:
-		bios.pad_buf = {arg(0), arg(1)}
-		ret(1)
+		// InitPAD2(type, button word): only the two 6-button types start
+		// the driver; anything else is refused.
+		if arg(0) == 0x20000000 || arg(0) == 0x20000001 {
+			bios.pad_word = arg(1)
+			ret(2)
+		} else {
+			ret(0)
+		}
+	case 0x16:
+		// PAD_dr, also stored where B(15h) asked.
+		v := pad_dr()
+		if bios.pad_word != 0 {
+			cpu.w32(bios.pad_word, v)
+		}
+		ret(v)
 	case 0x17:
-	// ReturnFromException: interrupt handlers return normally here.
+		// ReturnFromException. The handler still returns normally here;
+		// deliver_irq then skips the rest of the chains and the hook.
+		if io.irq_regs.in_handler {
+			bios.rfe = true
+		}
 	case 0x18:
 		bios.hook = 0
 	case 0x19:
@@ -199,7 +233,13 @@ bios_c :: proc(fn: u32) {
 		int_chain_dequeue(arg(0), arg(1))
 		ret(0)
 	case 0x0a:
-		ret(1) // ChangeClearRCnt
+		// ChangeClearRCnt(t, flag): returns the old flag.
+		if t := arg(0); t < len(bios.rcnt_ack) {
+			ret(u32(bios.rcnt_ack[t]))
+			bios.rcnt_ack[t] = arg(1) != 0
+		} else {
+			ret(0)
+		}
 	case:
 		bios_unknown("C", fn)
 	}
@@ -303,6 +343,7 @@ bios_init :: proc() {
 	cpu.w32(FAKE_DCB_TABLE, FAKE_DCB_TABLE + DCB_SIZE)
 	cpu.w32(0x150, FAKE_DCB_TABLE)
 	cpu.w32(0x154, DCB_SIZE)
+	bios.rcnt_ack = {0 ..< len(bios.rcnt_ack) = true}
 	threads_init()
 }
 
@@ -316,6 +357,8 @@ EV_ENABLED :: 0x2000
 EV_READY :: 0x4000
 @(private)
 EV_MODE_CALLBACK :: 0x1000
+@(private)
+EV_MODE_READY :: 0x2000
 
 @(private)
 Bios_Event :: struct {
@@ -377,15 +420,60 @@ test_event :: proc(h: u32) -> u32 {
 	return 1
 }
 
+// WaitEvent: 0 for a disabled event, else run time forward (and with it the
+// interrupts that deliver events) until it is ready, then take it back to
+// enabled. A callback event never becomes ready, so waiting on one hangs, as
+// on hardware. The wait gives up with 0 when the event stops being enabled
+// or time cannot advance (frozen for a checkpoint pass). With interrupts
+// blocked (SR IE off, or inside a handler) hardware also hangs on an event
+// only an IRQ readies; here that would freeze the window, so after
+// WAIT_BLOCKED_CYCLES of device events alone it gives up with 0.
+@(private)
+wait_event :: proc(h: u32) -> u32 {
+	e := event_slot(h)
+	if e == nil {
+		return 0
+	}
+	blocked_since := cpu.state.cycles
+	for e.status == EV_ENABLED {
+		if cpu.next_event == io.EVENT_OFF {
+			return 0
+		}
+		if cpu.cop0.sr & 0x401 == 0x401 && !io.irq_regs.in_handler {
+			blocked_since = cpu.state.cycles
+		} else if cpu.state.cycles - blocked_since >= WAIT_BLOCKED_CYCLES {
+			fmt.eprintfln("bios: WaitEvent(%#x) with interrupts blocked never became ready", h)
+			return 0
+		}
+		cpu.state.cycles = max(cpu.state.cycles, cpu.next_event)
+		io.run_events()
+	}
+	if e.status != EV_READY {
+		return 0
+	}
+	e.status = EV_ENABLED
+	return 1
+}
+
+// One second: device events (memory card, CD) still ready events while
+// interrupts are blocked, and finish well within it.
+@(private)
+WAIT_BLOCKED_CYCLES :: io.CPU_HZ
+
+// An enabled event whose class and spec both equal the delivered ones fires:
+// mode 0x2000 marks it ready, mode 0x1000 calls its function if it has one.
 deliver_event :: proc(class, spec: u32) {
 	for &e in events_tab {
-		if e.status != EV_ENABLED || e.class != class || e.spec & spec == 0 {
+		if e.status != EV_ENABLED || e.class != class || e.spec != spec {
 			continue
 		}
-		if e.mode == EV_MODE_CALLBACK && e.func != 0 {
-			hle_call(e.func)
-		} else {
+		switch e.mode {
+		case EV_MODE_READY:
 			e.status = EV_READY
+		case EV_MODE_CALLBACK:
+			if e.func != 0 {
+				hle_call(e.func)
+			}
 		}
 	}
 }
@@ -406,14 +494,12 @@ hle_call :: proc(addr: u32) {
 // registers saved by setjmp in the HookEntryInt buffer and enter the code that
 // follows that setjmp's "returned nonzero" branch. libetc places a call to its
 // dispatcher (trapIntr) there; on hardware that dispatcher ends in
-// ReturnFromException, which is a no-op here, so it simply returns.
+// ReturnFromException, which only flags the end here, so it simply returns.
+// The hook is skipped when a chain handler ended the exception first.
 deliver_irq :: proc() {
 	target: u32 = 0
 	if bios.hook != 0 {
 		target = hook_target(cpu.r32(bios.hook))
-	}
-	if target == 0 && bios.chains == {} {
-		return
 	}
 	if .Irq in core.trace.active {
 		core.tracef(.Irq, "deliver stat=%x mask=%x hook=%x", io.irq_regs.stat, io.irq_regs.mask, target)
@@ -423,8 +509,9 @@ deliver_irq :: proc() {
 	// Exception entry: push the interrupt-enable stack, disabling interrupts.
 	cpu.cop0.sr = (cpu.cop0.sr & ~u32(0x3f)) | ((cpu.cop0.sr << 2) & 0x3c)
 	io.irq_regs.in_handler = true
+	bios.rfe = false
 	run_int_chains()
-	if target != 0 {
+	if target != 0 && !bios.rfe {
 		buf := bios.hook
 		cpu.state.r[29] = cpu.r32(buf + 4)
 		cpu.state.r[30] = cpu.r32(buf + 8)
@@ -436,6 +523,7 @@ deliver_irq :: proc() {
 		cpu.call(target)
 	}
 	io.irq_regs.in_handler = false
+	bios.rfe = false
 	cycles := cpu.state.cycles
 	cpu.state = saved_cpu
 	cpu.state.cycles = cycles
@@ -444,10 +532,13 @@ deliver_irq :: proc() {
 
 // SysEnqIntRP chains, highest priority (0) first. Each element is
 // {next, second, first, unused}: first() runs on every interrupt and, when it
-// returns nonzero, second(result) runs. libpad polls the pad from one.
+// returns nonzero, second(result) runs. libpad polls the pad from one. The
+// kernel's own handlers, enqueued at boot, sit at the tails: the root counter
+// ones in chain 1, the IRQ event one in chain 3. ReturnFromException in any
+// handler ends the walk.
 @(private)
 run_int_chains :: proc() {
-	for head in bios.chains {
+	for head, pri in bios.chains {
 		e := head
 		for guard := 0; e != 0 && guard < 64; guard += 1 {
 			first := cpu.r32(e + 8)
@@ -455,12 +546,77 @@ run_int_chains :: proc() {
 			next := cpu.r32(e)
 			if first != 0 {
 				cpu.call(first)
-				if v := cpu.state.r[2]; v != 0 && second != 0 {
+				if v := cpu.state.r[2]; v != 0 && second != 0 && !bios.rfe {
 					cpu.state.r[4] = v
 					cpu.call(second)
 				}
+				if bios.rfe {
+					return
+				}
 			}
 			e = next
+		}
+		switch pri {
+		case 1:
+			rcnt_irqs()
+		case 3:
+			irq_events()
+		}
+		if bios.rfe {
+			return
+		}
+	}
+}
+
+// IRQ bits of root counters 0-2 and vblank (counter 3).
+@(private)
+RCNT_IRQS :: [4]u32{4, 5, 6, 0}
+
+// The kernel's root counter handlers, vblank first, then timers 2, 1, 0:
+// each pending one delivers event 0xf2000000+n spec 2 and, with
+// ChangeClearRCnt's flag set, acknowledges the IRQ and ends the exception.
+@(private)
+rcnt_irqs :: proc() {
+	irqs := RCNT_IRQS
+	for n := 3; n >= 0; n -= 1 {
+		bit := u32(1) << irqs[n]
+		if io.irq_regs.stat & io.irq_regs.mask & bit == 0 {
+			continue
+		}
+		deliver_event(0xf2000000 + u32(n), 2)
+		if bios.rcnt_ack[n] {
+			io.irq_regs.stat &~= bit
+			bios.rfe = true
+			return
+		}
+	}
+}
+
+// IRQ number and event class of the kernel's IRQ event handler, in its
+// order. Timer 2 delivers timer 1's class, as on the retail kernel.
+@(private)
+IRQ_EVENTS :: [11][2]u32 {
+	{2, 0xf0000003},
+	{9, 0xf0000009},
+	{1, 0xf0000002},
+	{10, 0xf000000a},
+	{8, 0xf000000b},
+	{0, 0xf0000001},
+	{4, 0xf0000005},
+	{5, 0xf0000006},
+	{6, 0xf0000006},
+	{7, 0xf0000008},
+	{3, 0xf0000004},
+}
+
+// Each pending IRQ delivers its class with spec 0x1000. The game
+// acknowledges them; the walk goes on to the hook.
+@(private)
+irq_events :: proc() {
+	events := IRQ_EVENTS
+	for ev in events {
+		if io.irq_regs.stat & io.irq_regs.mask & (u32(1) << ev[0]) != 0 {
+			deliver_event(ev[1], 0x1000)
 		}
 	}
 }

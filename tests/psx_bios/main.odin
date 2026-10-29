@@ -1,0 +1,293 @@
+// The BIOS HLE's events, root counter and IRQ delivery, and the B(15h) pad
+// word, on a bare machine: hand-built handler chains and guest functions
+// stand in for the game, and package psx (which brings the platform layer)
+// is not linked.
+//
+//   DeliverEvent fires an enabled event only on an exact class and spec;
+//   mode 0x2000 marks it ready, mode 0x1000 calls its function if nonzero.
+//   WaitEvent returns 0 when disabled, takes a ready event at once, and
+//   otherwise runs time forward until the event is delivered.
+//   deliver_irq runs the chains, the kernel's root counter handlers at the
+//   tail of chain 1 and its IRQ event handler at the tail of chain 3;
+//   ChangeClearRCnt's flag and ReturnFromException end the walk early,
+//   skipping the HookEntryInt handler; an acknowledged counter ends it
+//   with the other counters still pending. WaitEvent with interrupts
+//   blocked gives up instead of hanging.
+package main
+
+import "core:fmt"
+import "core:os"
+import bios "ps:psx/bios"
+import cpu "ps:psx/cpu"
+import io "ps:psx/io"
+
+@(private = "file")
+failed: int
+
+@(private = "file")
+fail :: proc(format: string, args: ..any) {
+	fmt.eprint("FAIL psx_bios: ")
+	fmt.eprintfln(format, ..args)
+	failed += 1
+}
+
+@(private = "file")
+check :: proc(what: string, got, want: u32) {
+	if got != want {
+		fail("%s = %#x, want %#x", what, got, want)
+	}
+}
+
+// Guest functions.
+@(private = "file")
+FN_CALLBACK :: 0x80001000
+@(private = "file")
+FN_FIRST :: 0x80001100 // first(): returns 1
+@(private = "file")
+FN_SECOND :: 0x80001200 // second(): counts
+@(private = "file")
+FN_SECOND_RFE :: 0x80001300 // second(): ReturnFromException
+@(private = "file")
+FN_FIRST_LATE :: 0x80001400 // first() of a later chain: counts, returns 0
+@(private = "file")
+FN_HOOK :: 0x80001500 // the HookEntryInt handler: counts
+
+// HookEntryInt jump buffer, and the setjmp return site it holds: a jal to
+// FN_HOOK.
+@(private = "file")
+HOOK_BUF :: 0x2040
+@(private = "file")
+HOOK_SITE :: 0x80002080
+
+// Chain elements {next, second, first, unused}.
+@(private = "file")
+ELEM_RFE :: 0x2000
+@(private = "file")
+ELEM_LATE :: 0x2010
+@(private = "file")
+ELEM_COUNT :: 0x2020
+
+@(private = "file")
+PAD_WORD :: 0x2100
+
+@(private = "file")
+calls: struct {
+	callback, second, late, hook: int,
+}
+
+// Vblanks until the waited-for event is delivered.
+@(private = "file")
+deliver_in: int
+
+@(private = "file")
+b :: proc(fn: u32, args: ..u32) -> u32 {
+	for a, k in args {
+		cpu.state.r[4 + k] = a
+	}
+	bios.bios_b(fn)
+	return cpu.state.r[2]
+}
+
+@(private = "file")
+c :: proc(fn: u32, args: ..u32) -> u32 {
+	for a, k in args {
+		cpu.state.r[4 + k] = a
+	}
+	bios.bios_c(fn)
+	return cpu.state.r[2]
+}
+
+@(private = "file")
+open :: proc(class, spec, mode: u32, func: u32 = 0) -> u32 {
+	h := b(0x08, class, spec, mode, func)
+	b(0x0c, h)
+	return h
+}
+
+@(private = "file")
+test :: proc(h: u32) -> u32 {
+	return b(0x0b, h)
+}
+
+@(private = "file")
+irq :: proc(n: u32) {
+	io.irq_regs.stat = 1 << n
+	io.irq_regs.mask = 1 << n
+	bios.deliver_irq()
+}
+
+@(private = "file")
+elem :: proc(a, next, second, first: u32) {
+	cpu.w32(a, next)
+	cpu.w32(a + 4, second)
+	cpu.w32(a + 8, first)
+}
+
+main :: proc() {
+	cpu.register_funcs(
+		{
+			{FN_CALLBACK, proc() {calls.callback += 1}},
+			{FN_FIRST, proc() {cpu.state.r[2] = 1}},
+			{FN_SECOND, proc() {calls.second += 1}},
+			{FN_SECOND_RFE, proc() {bios.bios_b(0x17)}},
+			{FN_FIRST_LATE, proc() {
+					calls.late += 1
+					cpu.state.r[2] = 0
+				}},
+			{FN_HOOK, proc() {calls.hook += 1}},
+		},
+	)
+	io.deliver_irq = bios.deliver_irq
+	bios.pad_game = proc() -> u16 {return 0x0101}
+
+	// DeliverEvent matches class and spec exactly.
+	ev := open(0xf4000001, 0x0004, 0x2000)
+	bios.deliver_event(0xf4000001, 0x0104)
+	check("TestEvent after a superset spec", test(ev), 0)
+	bios.deliver_event(0xf4000001, 0x0004)
+	check("TestEvent after the exact spec", test(ev), 1)
+	spu := open(0xf0000009, 0x20, 0x2000)
+	bios.deliver_event(0xf0000009, 0x21)
+	check("TestEvent of a 0x20 event after 0x21", test(spu), 0)
+	check("TestEvent again", test(ev), 0)
+	b(0x0d, ev)
+	bios.deliver_event(0xf4000001, 0x0004)
+	check("TestEvent of a disabled event", test(ev), 0)
+
+	// Mode 0x1000: the function runs and the event never becomes ready; with
+	// no function nothing happens.
+	cb := open(0xf0000011, 0x0100, 0x1000, FN_CALLBACK)
+	nocb := open(0xf0000011, 0x0100, 0x1000)
+	bios.deliver_event(0xf0000011, 0x0100)
+	if calls.callback != 1 {
+		fail("callback ran %d times, want 1", calls.callback)
+	}
+	check("TestEvent of a callback event", test(cb), 0)
+	check("TestEvent of a callback event without a function", test(nocb), 0)
+
+	// WaitEvent.
+	check("WaitEvent of a disabled event", b(0x0a, ev), 0)
+	b(0x0c, ev)
+	bios.deliver_event(0xf4000001, 0x0004)
+	check("WaitEvent of a ready event", b(0x0a, ev), 1)
+	check("TestEvent after WaitEvent", test(ev), 0)
+	io.events_init()
+	io.event_handlers[.VBlank] = proc() {
+		io.schedule_period(.VBlank, io.FRAME_CYCLES)
+		deliver_in -= 1
+		if deliver_in == 0 {
+			bios.deliver_event(0xf4000001, 0x0004)
+		}
+	}
+	// Interrupts enabled (IEc and IM2), as the game runs.
+	cpu.cop0.sr = 0x401
+	deliver_in = 3
+	start := cpu.state.cycles
+	check("WaitEvent until delivered", b(0x0a, ev), 1)
+	if deliver_in != 0 || cpu.state.cycles - start < 3 * io.FRAME_CYCLES {
+		fail("WaitEvent returned after %d cycles, %d vblanks early", cpu.state.cycles - start, deliver_in)
+	}
+	check("TestEvent after the wait", test(ev), 0)
+
+	// Root counters: vblank (counter 3) auto-acknowledges and ends the
+	// exception while its ChangeClearRCnt flag is set.
+	vb := open(0xf2000003, 2, 0x2000)
+	vb_irq := open(0xf0000001, 0x1000, 0x2000)
+	elem(ELEM_LATE, 0, FN_SECOND, FN_FIRST_LATE)
+	c(0x02, 2, ELEM_LATE)
+	cpu.w32(HOOK_BUF, HOOK_SITE)
+	cpu.w32(HOOK_SITE, 0x0c000000 | (FN_HOOK & 0x0fffffff) >> 2)
+	b(0x19, HOOK_BUF)
+	check("ChangeClearRCnt(3, 1) old flag", c(0x0a, 3, 1), 0)
+	irq(0)
+	check("vblank root counter event", test(vb), 1)
+	check("vblank IRQ acknowledged", io.irq_regs.stat, 0)
+	if calls.late != 0 {
+		fail("chain 2 ran %d times after the root counter ended the exception", calls.late)
+	}
+	check("vblank IRQ event after the exception ended", test(vb_irq), 0)
+	if calls.hook != 0 {
+		fail("hook ran after the root counter ended the exception")
+	}
+	check("ChangeClearRCnt(3, 0) old flag", c(0x0a, 3, 0), 1)
+	irq(0)
+	check("vblank root counter event, no acknowledge", test(vb), 1)
+	check("vblank IRQ left pending", io.irq_regs.stat, 1)
+	if calls.late != 1 {
+		fail("chain 2 ran %d times, want 1", calls.late)
+	}
+	check("vblank IRQ event", test(vb_irq), 1)
+	if calls.hook != 1 {
+		fail("hook ran %d times, want 1", calls.hook)
+	}
+
+	// Ack-and-stop handles one counter per exception: vblank's handler runs
+	// first and ends it, timer 0 waits for the next one.
+	c(0x0a, 3, 1)
+	c(0x0a, 0, 1)
+	t0 := open(0xf2000000, 2, 0x2000)
+	io.irq_regs.stat = 1 << 0 | 1 << 4
+	io.irq_regs.mask = 1 << 0 | 1 << 4
+	bios.deliver_irq()
+	check("vblank event, first exception", test(vb), 1)
+	check("timer 0 event, first exception", test(t0), 0)
+	check("IRQs left after the first exception", io.irq_regs.stat, 1 << 4)
+	bios.deliver_irq()
+	check("timer 0 event, second exception", test(t0), 1)
+	check("IRQs left after the second exception", io.irq_regs.stat, 0)
+	if calls.hook != 1 || calls.late != 1 {
+		fail("acknowledged counters ran the hook %d and chain 2 %d times, want 1 and 1", calls.hook, calls.late)
+	}
+	c(0x0a, 3, 0)
+
+	// Timer 2 delivers its counter event and timer 1's IRQ class.
+	c(0x0a, 2, 0)
+	t2 := open(0xf2000002, 2, 0x2000)
+	t1_irq := open(0xf0000006, 0x1000, 0x2000)
+	irq(6)
+	check("timer 2 root counter event", test(t2), 1)
+	check("timer 2 IRQ event under timer 1's class", test(t1_irq), 1)
+
+	// ReturnFromException in a chain 0 handler skips the later chains.
+	elem(ELEM_RFE, 0, FN_SECOND_RFE, FN_FIRST)
+	c(0x02, 0, ELEM_RFE)
+	irq(0)
+	if calls.late != 2 || calls.hook != 2 {
+		fail("chain 2 (%d) or the hook (%d) ran after ReturnFromException in chain 0", calls.late, calls.hook)
+	}
+	check("vblank root counter event after ReturnFromException", test(vb), 0)
+	c(0x03, 0, ELEM_RFE)
+	elem(ELEM_COUNT, 0, FN_SECOND, FN_FIRST)
+	c(0x02, 0, ELEM_COUNT)
+	// Outside an interrupt ReturnFromException leaves the next one alone.
+	b(0x17)
+	irq(0)
+	if calls.second != 1 || calls.late != 3 || calls.hook != 3 {
+		fail("with no ReturnFromException: second ran %d times, chain 2 %d, hook %d, want 1, 3 and 3", calls.second, calls.late, calls.hook)
+	}
+
+	// WaitEvent with interrupts blocked on an event only an IRQ readies
+	// gives up instead of hanging.
+	deliver_in = -1
+	cpu.cop0.sr = 0
+	start = cpu.state.cycles
+	check("WaitEvent with interrupts blocked", b(0x0a, ev), 0)
+	if cpu.state.cycles - start < io.CPU_HZ {
+		fail("blocked WaitEvent gave up after %d cycles", cpu.state.cycles - start)
+	}
+
+	// B(15h) takes only the two 6-button types; B(16h) and every vblank
+	// store the button word.
+	check("B(15h) of an unknown type", b(0x15, 0x10000001, PAD_WORD), 0)
+	check("B(15h) of a 6-button pad", b(0x15, 0x20000000, PAD_WORD), 2)
+	bios.bios_pad_vblank()
+	check("pad word after vblank", cpu.r32(PAD_WORD), 0xfffffefe)
+	cpu.w32(PAD_WORD, 0)
+	check("B(16h)", b(0x16), 0xfffffefe)
+	check("pad word after B(16h)", cpu.r32(PAD_WORD), 0xfffffefe)
+
+	if failed != 0 {
+		os.exit(1)
+	}
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h)")
+}
