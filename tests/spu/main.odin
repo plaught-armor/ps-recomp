@@ -87,6 +87,7 @@ voices :: proc() {
 	mix(56)
 	st = iop.spu_voice_status(1, 23)
 	check(!st.on && st.endx && st.nax == ONCE + 16, "end without repeat stops")
+	check(st.envx == 0, "end without repeat zeroes ENVX")
 	iop.spu_voice_on(1, 23, key(ONCE))
 	st = iop.spu_voice_status(1, 23)
 	check(st.on && !st.endx && st.nax == ONCE, "key on clears ENDX")

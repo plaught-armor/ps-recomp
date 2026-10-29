@@ -156,8 +156,8 @@ spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 		switch {
 		case v.flags & 1 == 0: v.nax += 16
 		case v.flags & 2 != 0: v.nax = v.lsa
-		case: // end without repeat: the voice stops
-			v.on = false
+		case: // end without repeat: the voice stops, its envelope at 0
+			v.on, v.level = false, 0
 			return s
 		}
 		spu_block(v)
@@ -195,10 +195,11 @@ spu_pitch :: proc(r: u32) -> u32 {
 	return min(r & 0xffff, 0x3fff)
 }
 
-// Voice `voice` of core `core`, both clamped to range.
+// Voice `voice` (0..23) of core `core` (0 or 1).
 @(private = "file")
 spu_voice_at :: proc(core, voice: int) -> ^Spu_Voice {
-	return &spu.voice[clamp(core, 0, 1)][clamp(voice, 0, 23)]
+	assert(core >= 0 && core < 2 && voice >= 0 && voice < 24, "spu: no such voice")
+	return &spu.voice[core][voice]
 }
 
 // Copy data into sound RAM at byte address addr, clipped at its end.
