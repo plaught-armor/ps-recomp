@@ -18,8 +18,9 @@
 //
 // Last, the EFU: each op writes P and MFP reads it back into part of a
 // register, from random P first; then an ESIN reading and an MFP writing
-// the upper's dest. Every program must compile without a call into the
-// interpreter.
+// the upper's dest. Then ILWR and ISWR on each field, at addresses that
+// wrap past the end of VU memory. Every program must compile without a
+// call into the interpreter.
 //
 //   odin run tests/vu_micro -collection:ps=.
 package main
@@ -67,6 +68,10 @@ main :: proc() {
 	SQRT :: 0x39
 	RSQRT :: 0x3a
 	MTIR :: 0x3c
+	ILWR :: 0x3e
+	ISWR :: 0x3f
+	IADDIU :: 0x08
+	IADDI :: 0x32 // an IADD-family op, imm5 in the fd field
 	MFP :: 0x64
 	ESADD :: 0x70
 	ERSADD :: 0x71
@@ -130,6 +135,17 @@ main :: proc() {
 		{
 			NOP_L, upper(ADD, 3, 1, 2), lower_sp(ESIN, 0b0001, 0, 3), upper(ADD, 3, 3, 1),
 			lower_sp(MFP, 0b0101, 3, 0), upper(MULi, 3, 3, 0), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
+		},
+		// ILWR and ISWR on each field. vi4 = 0x7fff is the last quadword
+		// of either VU's memory; one more wraps it to the first. vi6 is
+		// random, so wraps too. ILWR.xyzw keeps w; ILWR to vi0 does nothing.
+		{
+			lower_op(IADDIU, 0xf, 4, 0, 0x7ff), NOP_U, lower_sp(ISWR, 0b1000, 3, 4), NOP_U,
+			lower_sp(ILWR, 0b0100, 5, 4), NOP_U, lower_sp(ISWR, 0b0101, 7, 6), NOP_U,
+			lower_op(0x40, 0, 4, 4, 1 << 6 | IADDI), NOP_U, lower_sp(ISWR, 0b0010, 11, 4), NOP_U,
+			lower_sp(ILWR, 0b0010, 8, 4), NOP_U, lower_sp(ILWR, 0b1000, 10, 4), NOP_U,
+			lower_sp(ILWR, 0b0001, 9, 6), NOP_U, lower_sp(ILWR, 0b1111, 12, 6), NOP_U,
+			lower_sp(ILWR, 0b1111, 0, 6), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
 		},
 	}
 	// VU0 only. DIV vf1.x / vf0.x (I or D) with ADD; SQRT vf1.y with MULq,

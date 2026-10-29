@@ -400,7 +400,7 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 		flags = fmt.tprintf("div_flags(v, vf[%d].f[%d], vf[%d].f[%d]); ", (w >> 11) & 31, (w >> 21) & 3, (w >> 16) & 31, (w >> 23) & 3)
 	case sp == 0x39: // VSQRT
 		flags = fmt.tprintf("div_flags(v, 1, vf[%d].f[%d] < 0 ? 0 : 1); ", (w >> 16) & 31, (w >> 23) & 3)
-	case sp >= 0x34 && sp <= 0x37: // VLQI, VSQI, VLQD, VSQD
+	case sp >= 0x34 && sp <= 0x37, sp == 0x3e, sp == 0x3f: // VLQI, VSQI, VLQD, VSQD, VILWR, VISWR
 		// VLQI with ft 0 or no dest lanes and VSQI with none never touch vf
 		bind = "v := &vu.vu0; vf := &v.vf; vi := &v.vi; _ = vf; "
 	case:
@@ -459,6 +459,22 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			if on {fmt.sbprintf(sb, "%s[%d] = %s[%d]; ", dst, k, src, k)}
 		}
 	}
+	// ILW and ILWR at address addr: the last dest lane wins.
+	ilw :: proc(sb: ^strings.Builder, L: [4]bool, it: u32, addr, mem: string) {
+		if it == 0 || L == {} {return}
+		k := 3
+		for !L[k] {k -= 1}
+		fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(mq(v, %s, %s)[%d])", it, addr, mem, k)
+	}
+	// ISW and ISWR at address addr.
+	isw :: proc(sb: ^strings.Builder, L: [4]bool, it: u32, addr, mem: string) {
+		if L == {} {return}
+		fmt.sbprintf(sb, "\t\t\t{{q := mq(v, %s, %s); x := u32(vi[%d]); ", addr, mem, it)
+		for on, k in L {
+			if on {fmt.sbprintf(sb, "q[%d] = x; ", k)}
+		}
+		end_block(sb)
+	}
 	efu :: proc(sb: ^strings.Builder, fs: u32, p: string) {
 		fmt.sbprintfln(sb, "\t\t\t{{s := vf[%d].f; v.p = %s}", fs, p)
 	}
@@ -483,18 +499,8 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 		fmt.sbprintf(sb, "\t\t\t{{q := mq(v, vi[%d] + 0x%x, %s); ", it, imm11, mem)
 		copy_lanes(sb, L, "q", fmt.tprintf("vf[%d].u", fs))
 		end_block(sb)
-	case 0x04: // ILW: the last dest lane wins
-		if it == 0 || dest == 0 {return}
-		k := 3
-		for !L[k] {k -= 1}
-		fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(mq(v, vi[%d] + 0x%x, %s)[%d])", it, is, imm11, mem, k)
-	case 0x05: // ISW
-		if dest == 0 {return}
-		fmt.sbprintf(sb, "\t\t\t{{q := mq(v, vi[%d] + 0x%x, %s); x := u32(vi[%d]); ", is, imm11, mem, it)
-		for on, k in L {
-			if on {fmt.sbprintf(sb, "q[%d] = x; ", k)}
-		}
-		end_block(sb)
+	case 0x04: ilw(sb, L, it, fmt.tprintf("vi[%d] + 0x%x", is, imm11), mem) // ILW
+	case 0x05: isw(sb, L, it, fmt.tprintf("vi[%d] + 0x%x", is, imm11), mem) // ISW
 	case 0x08: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = vi[%d] + 0x%x", it, is, imm15)} // IADDIU
 	case 0x09: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = vi[%d] - 0x%x", it, is, imm15)} // ISUBIU
 	case 0x10: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16(v.clip & 0xffffff == 0x%x)", imm24) // FCEQ
@@ -572,6 +578,8 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			vif := mem == "vu.VU1_MEM" ? 1 : 0
 			assert(vif == 1 || lw & 3 == 1, "vu: XTOP exists only on VU1")
 			if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(vu.vifs[%d].%s)", it, vif, lw & 3 == 0 ? "top" : "itop")}
+		case 0x3e: ilw(sb, L, it, fmt.tprintf("vi[%d]", is), mem) // ILWR
+		case 0x3f: isw(sb, L, it, fmt.tprintf("vi[%d]", is), mem) // ISWR
 		case 0x6c: fmt.sbprintfln(sb, "\t\t\tvu.vu1_xgkick(vi[%d])", is) // XGKICK
 		case 0x64: // MFP: no flags, clamped as the interpreter's put_raw
 			if ft == 0 || dest == 0 {return}
