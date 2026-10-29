@@ -32,6 +32,8 @@ vkc: struct {
 	swap_done: [dynamic]vk.Semaphore, // per image: rendering finished, safe to present
 	// VK_KHR_dynamic_rendering_local_read is on (the device has it).
 	local_read: bool,
+	// shaderInt64 and shaderFloat64 are on (the device has both).
+	wide:       bool,
 }
 
 vk_check :: proc(r: vk.Result, what: string, loc := #caller_location) {
@@ -69,8 +71,8 @@ vk_instance :: proc(extensions: []cstring) {
 
 // Pick the first device with a graphics and compute queue (and pixel
 // interlock when the caller's shaders need it), and create it with the
-// features the shaders use; dynamic rendering local read too when the
-// device has it (vkc.local_read).
+// features the shaders use; dynamic rendering local read and 64-bit shader
+// arithmetic too when the device has them (vkc.local_read, vkc.wide).
 vk_device :: proc(pixel_interlock: bool) {
 	n: u32
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, nil)
@@ -129,6 +131,9 @@ vk_device :: proc(pixel_interlock: bool) {
 		vkc.local_read = bool(read.dynamicRenderingLocalRead)
 	}
 	read.pNext = nil
+	have: vk.PhysicalDeviceFeatures
+	vk.GetPhysicalDeviceFeatures(vkc.phys, &have)
+	vkc.wide = bool(have.shaderInt64 && have.shaderFloat64)
 
 	lock := vk.PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
 		sType                        = .PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
@@ -151,7 +156,7 @@ vk_device :: proc(pixel_interlock: bool) {
 	f2 := vk.PhysicalDeviceFeatures2 {
 		sType = .PHYSICAL_DEVICE_FEATURES_2,
 		pNext = &v12,
-		features = {fragmentStoresAndAtomics = true},
+		features = {fragmentStoresAndAtomics = true, shaderInt64 = b32(vkc.wide), shaderFloat64 = b32(vkc.wide)},
 	}
 	prio: f32 = 1
 	qinfo := vk.DeviceQueueCreateInfo {
@@ -264,13 +269,15 @@ vk_shader_module :: proc(code: []u8) -> (m: vk.ShaderModule) {
 	return
 }
 
-vk_layout_create :: proc(stages: vk.ShaderStageFlags, push: u32) -> (l: vk.PipelineLayout) {
+vk_layout_create :: proc(stages: vk.ShaderStageFlags, push: u32, sets: []vk.DescriptorSetLayout = nil) -> (l: vk.PipelineLayout) {
 	rng := vk.PushConstantRange {
 		stageFlags = stages,
 		size       = push,
 	}
 	info := vk.PipelineLayoutCreateInfo {
 		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
+		setLayoutCount         = u32(len(sets)),
+		pSetLayouts            = raw_data(sets),
 		pushConstantRangeCount = 1,
 		pPushConstantRanges    = &rng,
 	}
@@ -290,9 +297,11 @@ vk_compute_pipeline :: proc(code: []u8, layout: vk.PipelineLayout) -> (p: vk.Pip
 	return
 }
 
-// Triangle lists with no attachments: the fragment shader does all memory
-// access itself.
-vk_draw_pipeline :: proc(vert, frag: []u8, layout: vk.PipelineLayout) -> (p: vk.Pipeline) {
+// Triangle lists, unblended, into colour attachments of `formats` written
+// through `masks` (one each); with none, the fragment shader does all
+// memory access itself.
+vk_draw_pipeline :: proc(vert, frag: []u8, layout: vk.PipelineLayout, formats: []vk.Format = nil, masks: []vk.ColorComponentFlags = nil) -> (p: vk.Pipeline) {
+	assert(len(formats) == len(masks) && len(formats) <= 4)
 	vm, fm := vk_shader_module(vert), vk_shader_module(frag)
 	defer {
 		vk.DestroyShaderModule(vkc.device, vm, nil)
@@ -325,8 +334,14 @@ vk_draw_pipeline :: proc(vert, frag: []u8, layout: vk.PipelineLayout) -> (p: vk.
 		sType                = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
 		rasterizationSamples = {._1},
 	}
+	blend: [4]vk.PipelineColorBlendAttachmentState
+	for m, i in masks {
+		blend[i].colorWriteMask = m
+	}
 	cb := vk.PipelineColorBlendStateCreateInfo {
-		sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		sType           = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		attachmentCount = u32(len(masks)),
+		pAttachments    = &blend[0],
 	}
 	dyn_states := [2]vk.DynamicState{.VIEWPORT, .SCISSOR}
 	dyn := vk.PipelineDynamicStateCreateInfo {
@@ -335,7 +350,9 @@ vk_draw_pipeline :: proc(vert, frag: []u8, layout: vk.PipelineLayout) -> (p: vk.
 		pDynamicStates    = &dyn_states[0],
 	}
 	rend := vk.PipelineRenderingCreateInfo {
-		sType = .PIPELINE_RENDERING_CREATE_INFO,
+		sType                   = .PIPELINE_RENDERING_CREATE_INFO,
+		colorAttachmentCount    = u32(len(formats)),
+		pColorAttachmentFormats = raw_data(formats),
 	}
 	info := vk.GraphicsPipelineCreateInfo {
 		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
