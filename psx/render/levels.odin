@@ -56,7 +56,7 @@ levels: struct {
 // possibly (fade), meets the target: its pixels go to the ghost layer
 // (ghosts), it reads them back (reader), it touches the ghost layer (acc).
 @(private)
-level_kinds :: proc(f: Gl_Flags, fade: bool, x, y, w, h: i32) -> (ghosts, reader, acc: bool) {
+level_kinds :: proc(f: Gpu_Flags, fade: bool, x, y, w, h: i32) -> (ghosts, reader, acc: bool) {
 	// A ghost's pixels go to the ghost layer: the picture's own are read
 	// only to blend.
 	ghosts = fade && .Flat not_in f && .See_Direct not_in f

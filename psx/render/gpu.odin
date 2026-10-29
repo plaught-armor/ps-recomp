@@ -62,6 +62,9 @@ Target :: struct {
 	// scratch for pixels pulled from its textures, and the ghost layer
 	// lives there.
 	gl:    bool,
+	// Rasterized on Vulkan (vk_target.odin) during a walk; every other path,
+	// and the pixels themselves, stay software (raster_run).
+	vk:    bool,
 }
 
 targets: [2]Target
@@ -299,7 +302,7 @@ gpu_init :: proc(window: ^sdl.Window, renderer: ^sdl.Renderer) {
 	case "vk":
 		vk_init()
 	case:
-		fmt.eprintln(core.ENV_PREFIX + "GPU: not sw, gl or vk:", backend)
+		fmt.eprintln(core.ENV_PREFIX + "GPU: not sw, gl or vk (drawing in software):", backend)
 	}
 }
 
@@ -375,6 +378,7 @@ render_targets_set :: proc(scale: i32) {
 	}
 	target_count = 2
 	if gpu_vk.on {
+		t.vk = true
 		vk_target_make(t)
 	}
 }
@@ -2079,16 +2083,16 @@ exec_polygon :: proc(words: []u32) {
 		if shape.kind == .World {
 			// A fan over a convex polygon: its triangles cover distinct
 			// pixels.
-			level_group(t.gl && shape.n > 3)
+			level_group((t.gl || t.vk) && shape.n > 3)
 			for k in 2 ..< shape.n {
 				draw_triangle(&t, &e, &m, shape.fan[0], shape.fan[k - 1], shape.fan[k])
 			}
 			level_group(false)
 			continue
 		}
-		// The halves of a proper quad cover distinct pixels: the GL queue
+		// The halves of a proper quad cover distinct pixels: the GPU queue
 		// need not order them.
-		group := t.gl && verts == 4 && quad_halves_apart(vs[0], vs[1], vs[2], vs[3])
+		group := (t.gl || t.vk) && verts == 4 && quad_halves_apart(vs[0], vs[1], vs[2], vs[3])
 		level_group(group)
 		draw_triangle(&t, &e, &m, vs[0], vs[1], vs[2])
 		if verts == 4 {

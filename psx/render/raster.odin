@@ -283,8 +283,8 @@ raster_queue :: proc(t: ^Target, d: ^Draw, x0, y0, x1, y1: i32) {
 				hi_only.missed = true
 			}
 		}
-		if t.gl {
-			gl_queue(t, d)
+		if t.gl || t.vk {
+			queue_draw(t, d)
 			return
 		}
 		append(&raster.draws, d^)
@@ -420,14 +420,18 @@ stream_worker :: proc(th: ^thread.Thread) {
 
 // Draw the queues.
 raster_sync :: #force_inline proc() {
-	if len(raster.draws) > 0 || len(raster.native) > 0 || gpu_gl.prim_n > 0 || stream.head != stream.synced {
+	if len(raster.draws) > 0 || len(raster.native) > 0 || prim_queue.prim_n > 0 || stream.head != stream.synced {
 		raster_run()
 	}
 }
 
+// Every CPU read of a target's pixels comes through here first. The
+// Vulkan target's queue is drawn synchronously, so its pixels are the
+// software target's again before the bands below run (the stream is GL's
+// only, so the ghost flush comes here for it too).
 @(private)
 raster_run :: proc() {
-	gl_submit()
+	queue_submit()
 	if stream.head != stream.synced {
 		stream_sync()
 	}
