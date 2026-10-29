@@ -5,7 +5,8 @@
 // through `call`, and `jr $ra` becomes a host return, so the MIPS return
 // address only matters to code that inspects it. `call` resolves a target in
 // this order: hand-written override, recompiled executable function, BIOS
-// vector, recompiled overlay function whose overlay is resident, interpreter.
+// vector or table entry, recompiled overlay function whose overlay is
+// resident, interpreter.
 package psx_cpu
 
 import "core:fmt"
@@ -16,6 +17,9 @@ import "ps:core"
 // Handlers in the packages above this one, set by package psx at init.
 bios_a, bios_b, bios_c: proc(fn: u32)
 bios_syscall: proc()
+// Runs a call to one of the BIOS's B0 and C0 table entries; false for any
+// other address. May be nil.
+bios_entry: proc(addr: u32) -> bool
 irq_check: proc()
 interp_run: proc(start: u32)
 io_read: proc(p: u32, size: u32) -> u32
@@ -199,6 +203,9 @@ call_slow :: proc(addr: u32) {
 		return
 	case 0xc0:
 		bios_c(state.r[9])
+		return
+	}
+	if bios_entry != nil && bios_entry(addr) {
 		return
 	}
 	if fn := resolve_overlay(addr); fn != nil {

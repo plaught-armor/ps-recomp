@@ -16,9 +16,10 @@
 //   interrupts blocked gives up instead of hanging. syscall 3 returns 1;
 //   higher numbers deliver class 0xf0000010 spec 0x4000.
 //   The kernel layout games read and patch: the exception vector (at 0x00
-//   too), the C0 and B0 tables, and the pad driver's pointers and vblank
-//   acknowledge, handed over by StartPAD and turned off by ChangeClearPad
-//   or by zeroing its code. SysEnqIntRP of a queued element moves it to the
+//   too), the C0 and B0 tables (every entry callable but the B0 ones the
+//   retail kernel leaves 0), and the pad driver's pointers and vblank
+//   acknowledge, handed over by StartPAD and turned off by ChangeClearPad or
+//   by zeroing its code. SysEnqIntRP of a queued element moves it to the
 //   head; SysDeqIntRP returns the element it unlinks, or 0. CloseEvent,
 //   EnableEvent and DisableEvent return 1 for any handle, InitPAD 1.
 //   The memory card calls: card status, firstfile/nextfile patterns and the
@@ -372,6 +373,7 @@ main :: proc() {
 	// syscall: critical sections edit SR, 3 returns 1, higher numbers
 	// deliver class 0xf0000010 spec 0x4000.
 	cpu.bios_syscall = bios.bios_syscall
+	cpu.bios_entry = bios.bios_entry
 	cpu.irq_check = io.irq_check
 	io.irq_regs = {}
 	sr := cpu.cop0.sr
@@ -413,6 +415,26 @@ main :: proc() {
 	if pad < 0x500 || pad + 0x1990 > 0x10000 {
 		fail("ChangeClearPad's code at %#x leaves no room in kernel RAM for its patches", pad)
 	}
+	// The other entries call the function they name, except the B0 ones
+	// the retail kernel leaves 0.
+	b0_unset := bit_set[0 ..< 0x60; u128] {
+		0x11, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x5e, 0x5f,
+	}
+	for n in u32(0) ..< 0x60 {
+		if (cpu.r32(b0 + 4 * n) == 0) != (int(n) in b0_unset) {
+			fail("B0(%02xh) = %#x, want 0 exactly where the retail table is 0", n, cpu.r32(b0 + 4 * n))
+		}
+	}
+	for n in u32(0) ..< 0x1e {
+		if cpu.r32(c0 + 4 * n) == 0 {
+			fail("C0(%02xh) is 0", n)
+		}
+	}
+	cpu.call(cpu.r32(b0 + 0x56 * 4))
+	check("GetC0Table through B0(56h)", cpu.state.r[2], 0x674)
+	cpu.state.r[4], cpu.state.r[5] = 0, 1
+	cpu.call(cpu.r32(c0 + 0x0a * 4))
+	check("ChangeClearRCnt through C0(0Ah)", cpu.state.r[2], 1)
 
 	// libpad's pointers into the pad driver stop and restart pad reading.
 	check("InitPAD", b(0x12, PAD_BUF, 0x22, 0, 0), 1)

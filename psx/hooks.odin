@@ -17,6 +17,7 @@ hooks_init :: proc "contextless" () {
 	cpu.bios_b = bios.bios_b
 	cpu.bios_c = bios.bios_c
 	cpu.bios_syscall = bios.bios_syscall
+	cpu.bios_entry = bios.bios_entry
 	cpu.irq_check = io.irq_check
 	cpu.interp_run = interp_run
 	cpu.io_read = io_read

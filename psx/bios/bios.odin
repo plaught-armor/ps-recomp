@@ -280,6 +280,24 @@ bios_c :: proc(fn: u32) {
 	}
 }
 
+// A call to a table entry's stub (TABLE_STUBS): the function it names, with
+// t1 set as the stub sets it.
+bios_entry :: proc(addr: u32) -> bool {
+	off := (addr & 0x1fffffff) - TABLE_STUBS
+	if off >= 8 * (B0_ENTRIES + C0_ENTRIES) || off & 7 != 0 {
+		return false
+	}
+	n := off / 8
+	if n < B0_ENTRIES {
+		cpu.state.r[9] = n
+		bios_b(n)
+	} else {
+		cpu.state.r[9] = n - B0_ENTRIES
+		bios_c(n - B0_ENTRIES)
+	}
+	return true
+}
+
 // syscall with a0 of 3 or more, as the retail kernel's handler does it.
 // 3 is ChangeThreadSubFunction(tcb), the thread switch under ChangeTh
 // (B 10h); the HLE threads have no control blocks to switch by, so a
@@ -374,12 +392,22 @@ bios_format :: proc(f: string, first: u32) -> string {
 // patch kernel code reached through two entries, at fixed offsets: the
 // exception handler (C0 06h) and the pad and card driver (B0 5Bh,
 // ChangeClearPad), up to 0x198c bytes past it. Both point at kernel RAM
-// kept free for those patches; the HLE BIOS never executes that code. Only
-// these two entries are filled.
+// kept free for those patches; the HLE BIOS never executes that code.
+// Every other entry the retail kernel sets points at a stub of its own
+// (TABLE_STUBS); the ones it leaves 0 (B0_UNSET) stay 0.
 @(private)
 C0_TABLE :: 0x674
 @(private)
 B0_TABLE :: 0x874
+@(private)
+B0_ENTRIES :: 0x60
+@(private)
+C0_ENTRIES :: 0x1e
+// The B0 entries the retail kernel leaves 0. Every C0 entry is set.
+@(private)
+B0_UNSET :: bit_set[0 ..< B0_ENTRIES; u128] {
+	0x11, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x5e, 0x5f,
+}
 @(private)
 EXC_HANDLER :: 0xc80
 @(private)
@@ -413,11 +441,34 @@ FAKE_DCB_TABLE :: 0x3000
 @(private)
 DCB_SIZE :: 0x50
 
+// The B0 entries' stubs, then the C0 entries', 8 bytes each: j 0xb0 (or
+// 0xc0) with t1 = the function number in the delay slot, so a call through
+// the table reaches the same function as a call to the vector. bios_entry
+// runs such a call without interpreting the stub.
+@(private)
+TABLE_STUBS :: FAKE_DCB_TABLE + 0x100
+
 bios_init :: proc() {
 	vector := EXC_VECTOR
 	for w, k in vector {
 		cpu.w32(0x00 + 4 * u32(k), w)
 		cpu.w32(0x80 + 4 * u32(k), w)
+	}
+	for n in u32(0) ..< B0_ENTRIES + C0_ENTRIES {
+		stub := TABLE_STUBS + 8 * n
+		if n < B0_ENTRIES {
+			if int(n) in B0_UNSET {
+				cpu.w32(B0_TABLE + 4 * n, 0)
+				continue
+			}
+			cpu.w32(B0_TABLE + 4 * n, stub)
+			cpu.w32(stub, 0x0800002c) // j 0xb0
+			cpu.w32(stub + 4, 0x24090000 | n) // addiu t1, zero, n
+		} else {
+			cpu.w32(C0_TABLE + 4 * (n - B0_ENTRIES), stub)
+			cpu.w32(stub, 0x08000030) // j 0xc0
+			cpu.w32(stub + 4, 0x24090000 | (n - B0_ENTRIES))
+		}
 	}
 	cpu.w32(C0_TABLE + 0x06 * 4, EXC_HANDLER)
 	cpu.w32(B0_TABLE + 0x5b * 4, PAD_DRIVER)
