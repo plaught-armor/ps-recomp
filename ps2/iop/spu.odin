@@ -172,8 +172,10 @@ spu_mix :: proc(out: []i16) {
 			if !v.on {continue}
 			for n := 0; n < len(out); n += 2 {
 				if !v.on {break}
-				s := spu_sample(&v) * v.level >> 15
-				spu_envelope(&v)
+				// The level before the sample: an end without repeat zeroes it.
+				level := v.level
+				s := spu_sample(&v) * level >> 15
+				if v.on {spu_envelope(&v)}
 				out[n] = i16(clamp(i32(out[n]) + s * v.voll >> 14, -32768, 32767))
 				out[n + 1] = i16(clamp(i32(out[n + 1]) + s * v.volr >> 14, -32768, 32767))
 			}

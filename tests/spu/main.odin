@@ -15,6 +15,7 @@ import iop "ps:ps2/iop"
 
 LOOP :: 0x1000 // start, plain, end with repeat
 ONCE :: 0x2000 // plain, end without repeat
+SHORT :: 0x3000 // one block, end without repeat
 SNAP :: 0x10000 // varied samples, end with repeat
 BLOCKS :: 3
 
@@ -93,6 +94,19 @@ voices :: proc() {
 	check(st.on && !st.endx && st.nax == ONCE, "key on clears ENDX")
 	iop.spu_voice_off(1, 23)
 	mix(4)
+
+	// Ends during a slow attack (rate 0x2c: +7 every sample): its last
+	// sample is still heard, and the stopped voice's envelope stays at 0.
+	block(SHORT, 1, 1)
+	k := key(SHORT)
+	k.adsr1 = 0x2c00 | ADSR1 & 0xff
+	iop.spu_voice_on(1, 0, k)
+	out = mix(28)
+	st = iop.spu_voice_status(1, 0)
+	check(!st.on && st.endx && st.envx == 0, "end during attack zeroes ENVX")
+	check(out[54] > 0, "last sample of a one-shot heard")
+	mix(4)
+	check(iop.spu_voice_status(1, 0).envx == 0, "stopped voice's envelope does not run")
 
 	edge: [8]u8
 	check(iop.spu_write(iop.SPU_RAM_SIZE - 4, edge[:]) == 4, "spu_write clipped at the end of sound RAM")
