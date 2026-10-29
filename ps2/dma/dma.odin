@@ -97,7 +97,9 @@ dma_gather :: proc(ch: u32, out: ^[dynamic]u8) {
 // ------------------------------------------------------------ scratchpad
 
 // fromSPR, normal mode: QWC quadwords from SADR in scratchpad to MADR.
-dma_from_spr :: proc() {
+// No bounds checks here: the scratchpad offset is masked and the RAM slice
+// is 16 bytes long; ram_slice still checks the guest address.
+dma_from_spr :: proc() #no_bounds_check {
 	madr := mem.dma_reg(mem.DMA_FROM_SPR, 0x10)
 	qwc := mem.dma_reg(mem.DMA_FROM_SPR, 0x20)
 	sadr := mem.dma_reg(mem.DMA_FROM_SPR, 0x80)
