@@ -92,6 +92,9 @@ VALS := [?]u64 {
 	0x7fc00000_7f7fffff,
 	0xff7fffff_00400000,
 	0x3f800000_ff7fffff, // as y, with x = 0x7fc00000_7f7fffff: acc.x -max, vf.x max
+	// FTOI's limits: 2^31 and -2^31, the largest float below 2^31 and 32767
+	0x4f000000_cf000000,
+	0x4effffff_46fffe00,
 }
 
 // f32 bits for the COP1 cases: zeros, denormals, the smallest normals,
@@ -213,7 +216,17 @@ main :: proc() {
 		{macro(0x2e), .VU0}, // VOPMSUB
 		{macro(0x28, 15, 0), .VU0}, // VADD to vf0: flags only
 		{macro(0x28, 0), .VU0}, // VADD of no lanes
-		{macro(0x2b), .VU0}, // VMAX, left to the interpreter
+		// MAX and MINI against the interpreter's max and min: the values put
+		// +0 and -0, NaNs and infinities against each other across lanes.
+		{macro(0x2b), .VU0}, // VMAX
+		{macro(0x2b, 0xa, 0), .VU0}, // VMAX.xz to vf0: flags only
+		{macro(0x2f, 6), .VU0}, // VMINI.yz
+		{macro(0x10), .VU0}, // VMAXx
+		{macro(0x13, 9), .VU0}, // VMAXw.xw
+		{macro(0x15), .VU0}, // VMINIy
+		{macro(0x16, 4), .VU0}, // VMINIz.y
+		{macro(0x1d), .VU0}, // VMAXi
+		{macro(0x1f, 3), .VU0}, // VMINIi.zw
 		{special2(0x02), .VU0}, // VADDAz
 		{special2(0x29, 9), .VU0}, // VMADDA.xw
 		{special2(0x1c), .VU0}, // VMULAq
@@ -225,6 +238,18 @@ main :: proc() {
 		{special2(0x30, 15, 0), .VU0}, // VMOVE to vf0
 		{special2(0x31), .VU0}, // VMR32
 		{special2(0x31, 5, 1), .VU0}, // VMR32.yw in place
+		{special2(0x10), .VU0}, // VITOF0
+		{special2(0x11, 0xc), .VU0}, // VITOF4.xy
+		{special2(0x12), .VU0}, // VITOF12
+		{special2(0x13, 3, 1), .VU0}, // VITOF15.zw in place
+		{special2(0x10, 15, 0), .VU0}, // VITOF0 to vf0
+		{special2(0x14), .VU0}, // VFTOI0
+		{special2(0x15, 5), .VU0}, // VFTOI4.yw
+		{special2(0x16), .VU0}, // VFTOI12
+		{special2(0x17, 15, 1), .VU0}, // VFTOI15 in place
+		{special2(0x14, 15, 0), .VU0}, // VFTOI0 to vf0
+		{special2(0x1d), .VU0}, // VABS
+		{special2(0x1d, 0xa, 1), .VU0}, // VABS.xz in place
 		{cop1(0x00), .ADD_S},
 		{cop1(0x00, fd = 1), .ADD_S}, // fd = fs
 		{cop1(0x01), .SUB_S},

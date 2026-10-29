@@ -319,6 +319,31 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 		df, sf := transmute([4]f32)d, transmute([4]f32)s
 		rf := df + sf if op == .Fadd else df - sf if op == .Fsub else df * sf if op == .Fmul else df / sf
 		return transmute([4]u32)rf
+	case .Fmax, .Fmin:
+		df, sf := transmute([4]f32)d, transmute([4]f32)s
+		rf: [4]f32
+		for k in 0 ..< 4 {rf[k] = max(df[k], sf[k]) if op == .Fmax else min(df[k], sf[k])}
+		return transmute([4]u32)rf
+	case .Itof:
+		for k in 0 ..< 4 {r4[k] = transmute(u32)f32(i32(s[k]))}
+		return r4
+	case .Ftoi:
+		// Out of range or NaN as the host's instruction gives it.
+		for k in 0 ..< 4 {
+			f := transmute(f32)s[k]
+			switch {
+			case f >= 2147483648.0: r4[k] = 0x80000000 when ODIN_ARCH == .amd64 else 0x7fffffff
+			case f < -2147483648.0: r4[k] = 0x80000000
+			case f != f: r4[k] = 0x80000000 when ODIN_ARCH == .amd64 else 0
+			case: r4[k] = u32(i32(f))
+			}
+		}
+		return r4
+	case .Gt32:
+		for k in 0 ..< 4 {r4[k] = max(u32) if i32(d[k]) > i32(s[k]) else 0}
+		return r4
+	case .Xor:
+		return d ~ s
 	case .Gt16:
 		for k in 0 ..< 8 {rh[k] = -1 if dh[k] > sh[k] else 0}
 		return transmute([4]u32)rh

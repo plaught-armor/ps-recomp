@@ -250,8 +250,18 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Fsub     = 0x4ea0d400, // fsub .4s
 		.Fmul     = 0x6e20dc00, // fmul .4s
 		.Fdiv     = 0x6e20fc00, // fdiv .4s
+		.Fmax     = 0x4e20c400, // fmaxnm .4s
+		.Fmin     = 0x4ea0c400, // fminnm .4s
+		.Itof     = 0x4e21d800, // scvtf .4s
+		.Ftoi     = 0x4ea1b800, // fcvtzs .4s
+		.Gt32     = 0x4ea03400, // cmgt .4s
+		.Xor      = 0x6e201c00, // eor .16b
 	}
 	ops := OPS
+	if op == .Itof || op == .Ftoi {
+		rrr(a, ops[op], u32(dst), u32(src), 0)
+		return
+	}
 	if op == .Andn {
 		rrr(a, ops[op], u32(dst), u32(src), u32(dst))
 		return

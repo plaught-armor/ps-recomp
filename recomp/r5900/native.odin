@@ -772,15 +772,18 @@ fpu_compare :: proc(a: ^native.Asm, c: native.Cond, fs, ft: u32) {
 // Offsets in import vu.k, the runtime's lane masks.
 @(private = "file")
 VU_EXP, VU_SIGN, VU_MAX, VU_ABS, VU_ZERO, VU_DEST :: 0, 16, 32, 48, 64, 80
+@(private = "file")
+VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
 
 // Code for VU0 macro op w as vu.vu_op runs it, or false to leave it there:
-// moves, waits, and the float upper ops of the VF registers and ACC with
-// their broadcast, Q and I forms. Results clamp and set MAC and status as
-// vu_put_flags does, and the add and multiply operands clamp first as
-// vu_op's do. Uses A, B, C and V0-V4.
+// moves, waits, the float upper ops of the VF registers and ACC with their
+// broadcast, Q and I forms, and ITOF, FTOI and ABS. Results clamp and set
+// MAC and status as vu_put_flags does, and the add and multiply operands
+// clamp first as vu_op's do; MAX and MINI compare them raw. ITOF, FTOI and
+// ABS set no flags, as put_raw. Uses A, B, C and V0-V4.
 @(private = "file")
 vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
-	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Opmul, Opmsub, Move, Mr32, Nop}
+	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Max, Mini, Opmul, Opmsub, Move, Mr32, Nop, Itof, Ftoi, Abs}
 	Src :: enum u8 {Vec, Bc, Q, I}
 	dest, ft, fs, fd, bc := (w >> 21) & 15, (w >> 16) & 31, (w >> 11) & 31, (w >> 6) & 31, w & 3
 	fn := w & 63
@@ -793,9 +796,13 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x04 ..= 0x07: kind, src = .Sub, .Bc
 	case 0x08 ..= 0x0b: kind, src = .Madd, .Bc
 	case 0x0c ..= 0x0f: kind, src = .Msub, .Bc
+	case 0x10 ..= 0x13: kind, src = upper ? Kind.Max : Kind.Itof, .Bc
+	case 0x14 ..= 0x17: kind, src = upper ? Kind.Mini : Kind.Ftoi, .Bc
 	case 0x18 ..= 0x1b: kind, src = .Mul, .Bc
 	case 0x1c: kind, src = .Mul, .Q
+	case 0x1d: kind, src = upper ? Kind.Max : Kind.Abs, .I
 	case 0x1e: kind, src = .Mul, .I
+	case 0x1f: if !upper {return false}; kind, src = .Mini, .I // not VCLIP
 	case 0x20: kind, src = .Add, .Q
 	case 0x21: kind, src = .Madd, .Q
 	case 0x22: kind, src = .Add, .I
@@ -807,10 +814,11 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x28: kind = .Add
 	case 0x29: kind = .Madd
 	case 0x2a: kind = .Mul
+	case 0x2b: if !upper {return false}; kind = .Max
 	case 0x2c: kind = .Sub
 	case 0x2d: kind = .Msub
 	case 0x2e: kind = upper ? .Opmsub : .Opmul
-	case 0x2f: if upper {return false}; kind = .Nop // VNOP
+	case 0x2f: kind = upper ? Kind.Mini : Kind.Nop // VNOP
 	case 0x30: if upper {return false}; kind = .Move
 	case 0x31: if upper {return false}; kind = .Mr32
 	case 0x3b: if upper {return false}; kind = .Nop // VWAITQ
@@ -852,6 +860,66 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	switch kind {
 	case .Nop:
 		return true
+	case .Itof:
+		// No clamp: an i32 times 1, 2^-4, 2^-12 or 2^-15 is never infinite,
+		// NaN or denormal.
+		if ft == 0 {return true}
+		native.vec_load(a, .V1, 16 * fs, "vu.vf")
+		native.vec_op(a, .Itof, .V0, .V1)
+		if bc != 0 {
+			native.vec_load(a, .V1, VU_ITOF + 16 * (bc - 1), "vu.k")
+			native.vec_op(a, .Fmul, .V0, .V1)
+		}
+		put(a, 16 * ft, "vu.vf", dest)
+		return true
+	case .Ftoi:
+		// cvt_w of the raw lanes times the scale: |x| >= 2^31, infinite or
+		// NaN saturates by sign.
+		if ft == 0 || dest == 0 {return true}
+		native.vec_load(a, .V0, 16 * fs, "vu.vf")
+		if bc != 0 {
+			native.vec_load(a, .V1, VU_FTOI + 16 * (bc - 1), "vu.k")
+			native.vec_op(a, .Fmul, .V0, .V1)
+		}
+		native.vec_op(a, .Ftoi, .V1, .V0)
+		native.vec_load(a, .V2, VU_ABS, "vu.k")
+		native.vec_op(a, .And, .V2, .V0)
+		native.vec_load(a, .V3, VU_BIG, "vu.k")
+		native.vec_op(a, .Gt32, .V2, .V3) // out of range
+		native.vec_load(a, .V3, VU_SIGN, "vu.k")
+		native.vec_op(a, .And, .V3, .V0)
+		native.vec_load(a, .V4, VU_ZERO, "vu.k")
+		native.vec_op(a, .Eq32, .V4, .V3) // sign clear
+		native.vec_load(a, .V3, VU_SIGN, "vu.k")
+		native.vec_op(a, .Xor, .V3, .V4) // 0x7fffffff or 0x80000000
+		native.vec_op(a, .And, .V3, .V2)
+		native.vec_op(a, .Andn, .V2, .V1)
+		native.vec_op(a, .Or, .V2, .V3)
+		native.vec_copy(a, .V0, .V2)
+		put(a, 16 * ft, "vu.vf", dest)
+		return true
+	case .Abs:
+		if ft == 0 {return true}
+		native.vec_load(a, .V0, 16 * fs, "vu.vf")
+		native.vec_load(a, .V1, VU_ABS, "vu.k")
+		native.vec_op(a, .And, .V0, .V1)
+		clamp(a, .V0, .V1, .V2, .V3)
+		put(a, 16 * ft, "vu.vf", dest)
+		return true
+	case .Max, .Mini:
+		native.vec_load(a, .V0, 16 * fs, "vu.vf")
+		switch src {
+		case .Vec:
+			native.vec_load(a, .V1, 16 * ft, "vu.vf")
+		case .Bc:
+			native.vec_load(a, .V2, 16 * ft, "vu.vf")
+			native.vec_shuf32(a, .V1, .V2, u8(bc))
+		case .Q:
+			native.vec_splat_load(a, .V1, "vu.q")
+		case .I:
+			native.vec_splat_load(a, .V1, "vu.i")
+		}
+		native.vec_op(a, .Fmax if kind == .Max else .Fmin, .V0, .V1)
 	case .Move, .Mr32:
 		// Bits as they are, no flags.
 		if ft == 0 {return true}
