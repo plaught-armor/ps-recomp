@@ -37,7 +37,8 @@ state: struct {
 }
 
 // Write a GS general register (GIF A+D, REGLIST, or decoded PACKED data).
-gs_write :: proc(reg: u8, v: u64) {
+// No bounds checks: reg is range-checked first.
+gs_write :: proc(reg: u8, v: u64) #no_bounds_check {
 	if reg >= len(state.regs) {return}
 	if cpu.debug == 3 {fmt.eprintfln("gs: %02x = %016x", reg, v)}
 	state.regs[reg] = v
@@ -70,9 +71,10 @@ gs_image :: proc(data: []u8) {
 	if state.transfer != nil {state.transfer(data)}
 }
 
-// Privileged GS register (PMODE, DISPFBn, DISPLAYn, ...) by byte offset.
-gs_priv :: proc(off: u32) -> u64 {
-	return (^u64)(&mem.gsregs[off &~ 7])^
+// Privileged GS register (PMODE, DISPFBn, DISPLAYn, ...) by byte offset,
+// masked to mem.gsregs.
+gs_priv :: proc(off: u32) -> u64 #no_bounds_check {
+	return (^u64)(&mem.gsregs[off & (len(mem.gsregs) - 8)])^
 }
 
 // Emulated state, saved and restored by snapshots (snap.odin).
