@@ -16,11 +16,13 @@ COP2_KEYS :: 64 + 128
 
 // EE ops run by exec_insn.
 fallback_ee: [r5900.Op]u64
-// VU0 macro ops (vu0_macro), and VU1 upper ops, lower ops and whole
+// VU0 macro ops (vu0_macro), and each VU's upper ops, lower ops and whole
 // pairs that recompiled microcode leaves to the interpreter.
-fallback_vu0, fallback_vu1_upper: [COP2_KEYS]u64
-fallback_vu1_lower: [128 + COP2_KEYS]u64 // opcode, then 128 + the 0x40 key
-fallback_vu1_pair: u64
+fallback_vu0, fallback_vu0_upper, fallback_vu1_upper: [COP2_KEYS]u64
+fallback_vu0_lower, fallback_vu1_lower: [128 + COP2_KEYS]u64 // opcode, then 128 + the 0x40 key
+fallback_vu0_pair, fallback_vu1_pair: u64
+// VU0 micro-mode pairs the interpreter runs outside compiled programs.
+fallback_vu0_micro: u64
 // fpu_slow calls, by op: not the interpreter, so outside the calls total.
 fallback_fpu_slow: [Fpu_Op]u64
 
@@ -50,12 +52,20 @@ fallback_print :: proc() {
 	// VU0 counts again below, by op.
 	for n, op in fallback_ee {if op != .VU0 {add(&rows, &total, fmt.tprintf("ee %v", op), n)}}
 	for n, k in fallback_vu0 {add(&rows, &total, fmt.tprintf("vu0 %s", cop2_name(k)), n)}
-	for n, k in fallback_vu1_upper {add(&rows, &total, fmt.tprintf("vu1 upper %s", cop2_name(k)), n)}
-	for n, k in fallback_vu1_lower {
-		name := k < 128 ? fmt.tprintf("vu1 lower %02x", k) : fmt.tprintf("vu1 lower 40 %s", cop2_name(k - 128))
-		add(&rows, &total, name, n)
+	units := [2]struct {
+		upper: ^[COP2_KEYS]u64,
+		lower: ^[128 + COP2_KEYS]u64,
+		pair:  u64,
+	}{{&fallback_vu0_upper, &fallback_vu0_lower, fallback_vu0_pair}, {&fallback_vu1_upper, &fallback_vu1_lower, fallback_vu1_pair}}
+	for u, unit in units {
+		for n, k in u.upper {add(&rows, &total, fmt.tprintf("vu%d upper %s", unit, cop2_name(k)), n)}
+		for n, k in u.lower {
+			name := k < 128 ? fmt.tprintf("vu%d lower %02x", unit, k) : fmt.tprintf("vu%d lower 40 %s", unit, cop2_name(k - 128))
+			add(&rows, &total, name, n)
+		}
+		add(&rows, &total, fmt.tprintf("vu%d pair", unit), u.pair)
 	}
-	add(&rows, &total, "vu1 pair", fallback_vu1_pair)
+	add(&rows, &total, "vu0 micro interpreted pair", fallback_vu0_micro)
 	slice.sort_by(rows[:], proc(a, b: Row) -> bool {return a.n > b.n})
 	fmt.eprintfln("fallback: %d calls", total)
 	for r in rows {fmt.eprintfln("fallback: %d\t%.2f%%\t%s", r.n, 100 * f64(r.n) / f64(total), r.name)}

@@ -11,6 +11,9 @@
 // Then single macro ops on edge values: the clamped add and multiply
 // family, flags into vf0, and MAX and MINI.
 //
+// Then a compiled VU0 program: VCALLMS runs it while micro memory holds
+// its code, and the interpreter once a write changes that code.
+//
 // Last, micro memory writes after a program is compiled: each write path
 // (the EE mapping, VIF MPG) moves its VU's micro generation, and on VU1 a
 // write that changes the compiled code makes the next start miss it and
@@ -66,6 +69,26 @@ mpg :: proc(vif: ^vu.Vif, code: []u32) {
 }
 
 @(private = "file")
+vu0_compiled :: proc() {
+	code := [4]u32{0x08 << 25 | 1 << 16 | 5, 1 << 30 | 0xf << 21 | 2 << 16 | 1 << 11 | 3 << 6 | 0x28, 0x8000033c, 0x000002ff}
+	vu.vu0_register_ranges({{0x40, code[:]}}, proc(_: u32, _: ^int) -> (u32, vu.Vu_Exit) {
+		compiled_ran = true
+		return 0x50, .End
+	})
+	call := proc(want: bool, what: string) {
+		compiled_ran = false
+		vu.vu0.tpc = 0
+		vu.vu_op(&vu.vu0, 0x4a000038 | (0x40 / 8) << 6) // VCALLMS
+		if compiled_ran != want || vu.vu0.tpc != 0x50 {fail("%s: compiled ran %v, tpc %04x", what, compiled_ran, vu.vu0.tpc)}
+	}
+	call(true, "VU0 VCALLMS of the compiled code")
+	put(0x48, 0x8000033d)
+	call(false, "VU0 VCALLMS after a write to the compiled code")
+	put(0x48, 0x8000033c)
+	call(true, "VU0 VCALLMS of the compiled code again")
+}
+
+@(private = "file")
 micro_writes :: proc() {
 	g := vu.vu0_micro_gen
 	_ = vu.vu_mem_addr(0x11000000)
@@ -74,7 +97,7 @@ micro_writes :: proc() {
 	mpg(&vu.vifs[0], END_CODE[:])
 	if vu.vu0_micro_gen == g {fail("VU0 MPG kept generation %d", g)}
 
-	vu.vu1_register(END_CODE[:], proc(_: u32, _: ^int) -> (u32, vu.Vu1_Exit) {
+	vu.vu1_register(END_CODE[:], proc(_: u32, _: ^int) -> (u32, vu.Vu_Exit) {
 		compiled_ran = true
 		return 0x10, .End
 	})
@@ -246,6 +269,7 @@ main :: proc() {
 	clamped()
 	flags()
 	minmax()
+	vu0_compiled()
 	micro_writes()
 	fmt.println("vu: ok")
 }

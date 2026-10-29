@@ -2,7 +2,8 @@
 //
 // Options:
 //   exe              the ELF
-//   out              output directory (pNN/code.odin, vu1/code.odin, all.odin)
+//   out              output directory (pNN/code.odin, vu0/code.odin,
+//                    vu1/code.odin, all.odin)
 //   runtime          import path of the ps2 runtime, relative to out
 //   cycles_per_insn  EE cycles charged per instruction
 //   package_insns    instructions per generated package
@@ -22,6 +23,7 @@
 //                    microcode loaded from data, to compile besides .vutext
 //                    (a missing file, ENOENT, is a warning: that microcode
 //                    runs in the interpreter)
+//   vu0_capture      optional: a VU0_CAPTURE file, the same for VU0
 //
 // Packages hold consecutive functions up to package_insns instructions so
 // each compiles as its own module. Every package has a `register` proc
@@ -210,7 +212,8 @@ generate :: proc(o: mips.Options) {
 	}
 
 	// Per backend, the sites that call the interpreter.
-	slow_emit, slow_vu: map[string]int
+	slow_emit: map[string]int
+	slow_vu: [vu.Unit]map[string]int
 	slow_native: [2]map[string]int
 	mips.make_dirs(out)
 	for g, n in groups {
@@ -277,15 +280,21 @@ generate :: proc(o: mips.Options) {
 		}
 		fmt.printfln("native: %d bytes -> %s", len(code.code), path)
 	}
-	programs, ok := vu.generate(img, out, runtime, mips.option_or(o, "vu1_capture", ""), &slow_vu)
-	if !ok {
-		mips.fail("%s: bad .vutext", mips.option(o, "exe"))
+	programs: [vu.Unit]int
+	for unit in vu.Unit {
+		ok: bool
+		capture := mips.option_or(o, unit == .VU0 ? "vu0_capture" : "vu1_capture", "")
+		programs[unit], ok = vu.generate(img, out, runtime, capture, unit, &slow_vu[unit])
+		if !ok {
+			mips.fail("%s: bad .vutext or %v capture", mips.option(o, "exe"), unit)
+		}
 	}
 	if cover {
 		coverage("emit", slow_emit)
 		coverage("native x64", slow_native[0])
 		coverage("native arm64", slow_native[1])
-		coverage("vu", slow_vu)
+		if programs[.VU0] > 0 {coverage("vu0", slow_vu[.VU0])}
+		coverage("vu", slow_vu[.VU1])
 	}
 
 	sb := strings.builder_make()
@@ -295,16 +304,16 @@ generate :: proc(o: mips.Options) {
 	for _, n in groups {
 		fmt.sbprintfln(&sb, "import \"p%02d\"", n)
 	}
-	if programs > 0 {
-		fmt.sbprintln(&sb, "import \"vu1\"")
+	for n, unit in programs {
+		if n > 0 {fmt.sbprintfln(&sb, "import \"vu%d\"", int(unit))}
 	}
 	fmt.sbprintln(&sb, "\nregister_all :: proc() {")
 	fmt.sbprintfln(&sb, "\tcpu.text_range(0x%08x, 0x%08x)", lo, hi)
 	for _, n in groups {
 		fmt.sbprintfln(&sb, "\tp%02d.register()", n)
 	}
-	if programs > 0 {
-		fmt.sbprintln(&sb, "\tvu1.register()")
+	for n, unit in programs {
+		if n > 0 {fmt.sbprintfln(&sb, "\tvu%d.register()", int(unit))}
 	}
 	fmt.sbprintln(&sb, "}")
 	mips.write_file(mips.join(out, "all.odin"), sb.buf[:])

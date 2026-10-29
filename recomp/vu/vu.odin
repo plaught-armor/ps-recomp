@@ -1,5 +1,5 @@
 // The VU1 microprograms of an EE program's .vutext compiled to Odin, as
-// <out>/vu1/code.odin.
+// <out>/vu1/code.odin, and captured VU0 microprograms as <out>/vu0/code.odin.
 //
 // .vutext holds whole programs, each a run of VIF MPG chunks loading
 // consecutive micro memory from address 0. A program becomes one proc with a
@@ -11,8 +11,9 @@
 // the program) returns to the interpreter at that pair.
 //
 // Microcode the EE builds from VIF MPG packets in data has no .vutext; the
-// vu1_capture option names a VU1_CAPTURE file recorded from a run (the
-// runtime's vu/capture.odin). Each captured entry into each captured micro
+// vu0_capture and vu1_capture options name VU0_CAPTURE and VU1_CAPTURE files
+// recorded from a run (the runtime's vu/capture.odin). VU0 microcode comes
+// only from a capture. Each captured entry into each captured micro
 // image becomes a program holding only the pairs reachable from that entry:
 // fallthrough and branch targets, stopping at a JR/JALR (whose captured
 // targets are entries of their own) and after an E bit. Its code is
@@ -20,9 +21,11 @@
 // the live micro memory before running it; a pair no program covers runs in
 // the interpreter.
 //
-// MAC flags are computed only where a later FMAND/FMEQ/FMOR or an exit can
-// see them. Status flags are never computed: no program reads them (no
-// FSEQ/FSAND/FSOR/FSSET), and the EE cannot read VU1 status.
+// On VU1, MAC flags are computed only where a later FMAND/FMEQ/FMOR or an
+// exit can see them. Status flags are never computed: no program reads them
+// (no FSEQ/FSAND/FSOR/FSSET), and the EE cannot read VU1 status. On VU0 the
+// EE reads MAC and status with CFC2 after a program, so both are always
+// computed, as for macro instructions.
 //
 // The same upper ops, and the register-only lower ops, also serve the EE
 // recompiler as VU0 macro instructions (emit_macro), where CFC2 can read MAC
@@ -36,8 +39,21 @@ import "core:slice"
 import "core:strings"
 import "../mips"
 
-@(private = "file")
-MASK :: 0x3ff8
+// Which VU a program runs on.
+Unit :: enum u8 {VU0, VU1}
+
+// Each unit's micro memory as a pair address mask, and its data memory size
+// for mq.
+@(private = "file", rodata)
+MASK := [Unit]u32 {
+	.VU0 = 0xff8,
+	.VU1 = 0x3ff8,
+}
+@(private = "file", rodata)
+MEM := [Unit]string {
+	.VU0 = "vu.VU0_MEM",
+	.VU1 = "vu.VU1_MEM",
+}
 
 @(private = "file")
 Branch :: enum u8 {None, Uncond, Cond, Reg}
@@ -59,7 +75,7 @@ Mode :: enum u8 {
 	Serial, // upper then lower: neither sees the other's writes
 	Lower_First, // the lower reads flags the upper writes, and writes only VI
 	Hazard, // the lower reads or writes the VF register the upper writes
-	Slow, // vu.vu1_pair
+	Slow, // vu.vu0_pair, vu.vu1_pair
 }
 
 @(private = "file")
@@ -160,7 +176,8 @@ classify :: proc(lw, uw: u32) -> Pair {
 		}
 		switch ((lw >> 4) & 0x7c) | (lw & 3) {
 		case 0x3b, 0x3e, 0x3f, 0x68, 0x69, 0x6c, 0x7b: p.mode = .Serial
-		// DIV, SQRT and RSQRT also share status, which micro mode leaves dead
+		// DIV, SQRT and RSQRT also share status: dead on VU1, merged as
+		// vu_pair does by emit_pair on VU0
 		case: p.mode = touches ? .Hazard : .Serial
 		}
 	}
@@ -171,7 +188,7 @@ classify :: proc(lw, uw: u32) -> Pair {
 // Backward dataflow: MAC after pair n is live when a successor reads it
 // before setting it, or control can leave compiled code.
 @(private = "file")
-mac_liveness :: proc(pairs: []Pair, ext: []bool) {
+mac_liveness :: proc(pairs: []Pair, ext: []bool, mask: u32) {
 	n := len(pairs)
 	live_in := make([]bool, n, context.temp_allocator)
 	at :: proc(live_in, ext: []bool, pc: int) -> bool {
@@ -188,7 +205,7 @@ mac_liveness :: proc(pairs: []Pair, ext: []bool) {
 				switch prev.branch {
 				case .None:
 				case .Reg: out = true
-				case .Uncond, .Cond: out ||= at(live_in, ext, int(branch_target(prev.lw, u32(i - 1) * 8)))
+				case .Uncond, .Cond: out ||= at(live_in, ext, int(branch_target(prev.lw, u32(i - 1) * 8, mask)))
 				}
 				if prev.ebit {out = true}
 			}
@@ -202,9 +219,9 @@ mac_liveness :: proc(pairs: []Pair, ext: []bool) {
 }
 
 @(private = "file")
-branch_target :: proc(lw, pc: u32) -> u32 {
+branch_target :: proc(lw, pc, mask: u32) -> u32 {
 	imm11 := i32(i16(u16(lw & 0x7ff) << 5) >> 5)
-	return (pc + 8 + u32(imm11) * 8) & MASK
+	return (pc + 8 + u32(imm11) * 8) & mask
 }
 
 @(private = "file")
@@ -358,9 +375,9 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 
 // VU0 macro instruction w (COP2 with CO set) as one statement for the EE
 // recompiler, with the semantics of the interpreter's vu_op: a block binding
-// VU0 as `v`, `vf` or `vi`, or "" for an op that does nothing. ok is false,
-// with no code, for the ops left to the interpreter (VCALLMS and VCALLMSR,
-// and the lower ops that touch P, R or other registers). The
+// VU0 as `v`, `vf` or `vi`, a call, or "" for an op that does nothing. ok is
+// false, with no code, for the ops left to the interpreter (the lower ops
+// that touch P, R or other registers). The
 // code needs VU_HELPERS and MACRO_HELPERS in its package and the runtime's
 // vu as `vu`.
 emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
@@ -372,8 +389,10 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 	switch {
 	case fn < 0x30 || (fn >= 0x3c && sp < 0x30):
 		if emit_upper(&sb, w, .Mac_Status) {return}
+	case fn == 0x38: return fmt.tprintf("vu.vu0_call_micro(0x%x)", ((w >> 6) & 0x7fff) * 8), true // VCALLMS
+	case fn == 0x39: return "vu.vu0_call_micro(vu.vu0.cmsar * 8)", true // VCALLMSR
 	case fn < 0x3c:
-		if fn > 0x35 || fn == 0x33 {return} // VCALLMS, VCALLMSR, and no op
+		if fn > 0x35 || fn == 0x33 {return} // no op
 		bind = "vi := &vu.vu0.vi; "
 	case sp == 0x30 || sp == 0x31 || sp == 0x3b: // VMOVE, VMR32, VWAITQ
 		bind = "vf := &vu.vu0.vf; "
@@ -389,7 +408,8 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 	}
 	if fn >= 0x30 && (fn < 0x3c || sp >= 0x30) {
 		// The micro lower word (opcode 0x40) has the same fields. Its
-		// fallback calls VU1's interpreter, never right for a macro op.
+		// fallback calls VU0's micro-mode interpreter, never right for a
+		// macro op.
 		if emit_lower(&sb, (w & 0x1ffffff) | 0x40 << 25, 0, "vu.VU0_MEM") {return "", false}
 	}
 	body := strings.trim_space(strings.to_string(sb))
@@ -418,9 +438,14 @@ store :: proc(sb: ^strings.Builder, dst: string, dest: u32, field := "f") {
 	}
 }
 
+// The unit emit_lower's interpreter fallback calls, from its mem.
+@(private = "file", thread_local)
+lower_unit: int
+
 // Emit a non-branch lower op. mem names the VU's data memory size for mq.
 @(private = "file")
 emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: bool) {
+	lower_unit = mem == MEM[.VU0] ? 0 : 1
 	dest := (lw >> 21) & 15
 	ft, fs, fd := (lw >> 16) & 31, (lw >> 11) & 31, (lw >> 6) & 31
 	it, is := ft & 15, fs & 15
@@ -438,8 +463,14 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 		fmt.sbprintfln(sb, "\t\t\t{{s := vf[%d].f; v.p = %s}", fs, p)
 	}
 	interp :: proc(sb: ^strings.Builder, lw, pc: u32) -> bool {
-		fmt.sbprintfln(sb, "\t\t\tvu.vu1_lower(0x%08x, 0x%04x)", lw, pc)
+		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_lower(0x%08x, 0x%04x)", lower_unit, lw, pc)
 		return true
+	}
+	// XTOP and XGKICK exist only on VU1: VU0's interpreter stops on them.
+	if lower_unit == 0 && lw >> 25 == 0x40 && lw & 0x3c == 0x3c {
+		switch ((lw >> 4) & 0x7c) | (lw & 3) {
+		case 0x68, 0x6c: return interp(sb, lw, pc)
+		}
 	}
 	switch lw >> 25 {
 	case 0x00: // LQ
@@ -574,15 +605,22 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 // Emit a whole pair, without its branch. Counts the halves that call the
 // interpreter in slow, by opcode.
 @(private = "file")
-emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int) {
+emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int) {
 	// The keys outlive the temp allocator, which each program frees.
 	count :: proc(slow: ^map[string]int, key: string) {
 		if key not_in slow {slow[strings.clone(key)] = 0}
 		slow[key] += 1
 	}
-	upper :: proc(sb: ^strings.Builder, p: Pair, slow: ^map[string]int) {
-		if !emit_upper(sb, p.uw, p.mac_live ? .Mac : .None) {return}
-		fmt.sbprintfln(sb, "\t\t\tvu.vu1_upper(0x%08x)", p.uw)
+	// VU0 computes status. A DIV-family lower sets it too, and as vu_pair
+	// its write replaces the upper's when it changes status at all.
+	merge := unit == .VU0 && !p.ibit && p.mode != .Slow && p.lw >> 25 == 0x40 && p.lw & 0x3c == 0x3c
+	merge &&= ((p.lw >> 4) & 0x7c) | (p.lw & 3) >= 0x38 && ((p.lw >> 4) & 0x7c) | (p.lw & 3) <= 0x3a
+	upper :: proc(sb: ^strings.Builder, p: Pair, unit: Unit, merge: bool, slow: ^map[string]int) {
+		defer if merge {fmt.sbprintln(sb, "\t\t\tust := v.status\n\t\t\tv.status = st0")}
+		flags := Flags.Mac_Status
+		if unit == .VU1 {flags = p.mac_live ? .Mac : .None}
+		if !emit_upper(sb, p.uw, flags) {return}
+		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_upper(0x%08x)", int(unit), p.uw)
 		fn := p.uw & 63
 		if fn & 0x3c != 0x3c {
 			count(slow, fmt.tprintf("upper %02x", fn))
@@ -590,8 +628,19 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int)
 			count(slow, fmt.tprintf("upper special %02x", ((p.uw >> 4) & 0x7c) | (p.uw & 3)))
 		}
 	}
-	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int) {
-		if !emit_lower(sb, p.lw, pc, "vu.VU1_MEM") {return}
+	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, merge: bool, slow: ^map[string]int) {
+		if !emit_lower(sb, p.lw, pc, MEM[unit]) {
+			if !merge {return}
+			// DIV and RSQRT fs.fsf / ft.ftf, SQRT ft.ftf, as emit_macro
+			ft, fs := (p.lw >> 16) & 31, (p.lw >> 11) & 31
+			if p.lw & 3 == 1 {
+				fmt.sbprintfln(sb, "\t\t\tdiv_flags(v, 1, vf[%d].f[%d] < 0 ? 0 : 1)", ft, (p.lw >> 23) & 3)
+			} else {
+				fmt.sbprintfln(sb, "\t\t\tdiv_flags(v, vf[%d].f[%d], vf[%d].f[%d])", fs, (p.lw >> 21) & 3, ft, (p.lw >> 23) & 3)
+			}
+			fmt.sbprintln(sb, "\t\t\tif v.status == st0 {v.status = ust}")
+			return
+		}
 		fn := p.lw & 63
 		switch {
 		case p.lw >> 25 != 0x40:
@@ -603,17 +652,19 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int)
 		}
 	}
 	if p.ibit { // the upper still reads the old I
-		upper(sb, p, slow)
+		upper(sb, p, unit, false, slow)
 		fmt.sbprintfln(sb, "\t\t\tv.i = transmute(f32)u32(0x%08x)", p.lw)
 		return
 	}
+	if merge {fmt.sbprintln(sb, "\t\t\t{\n\t\t\tst0 := v.status")}
+	defer if merge {fmt.sbprintln(sb, "\t\t\t}")}
 	switch p.mode {
 	case .Serial:
-		upper(sb, p, slow)
-		if p.branch == .None {lower(sb, p, pc, slow)}
+		upper(sb, p, unit, merge, slow)
+		if p.branch == .None {lower(sb, p, pc, unit, merge, slow)}
 	case .Lower_First:
-		lower(sb, p, pc, slow)
-		upper(sb, p, slow)
+		lower(sb, p, pc, unit, merge, slow)
+		upper(sb, p, unit, merge, slow)
 	case .Hazard:
 		// As vu_pair: the lower reads the upper's dest from before the
 		// upper, and its own write to it, if any, wins unless it leaves the
@@ -622,10 +673,10 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int)
 		ud := upper_dest(p.uw)
 		fmt.sbprintln(sb, "\t\t\t{")
 		fmt.sbprintfln(sb, "\t\t\tsaved := vf[%d]", ud)
-		upper(sb, p, slow)
+		upper(sb, p, unit, merge, slow)
 		fmt.sbprintfln(sb, "\t\t\tresult := vf[%d]", ud)
 		fmt.sbprintfln(sb, "\t\t\tvf[%d] = saved", ud)
-		lower(sb, p, pc, slow)
+		lower(sb, p, pc, unit, merge, slow)
 		if (p.lw >> 16) & 31 == ud { // every lower VF write goes to ft
 			fmt.sbprintfln(sb, "\t\t\tif vf[%d].q == saved.q {{vf[%d] = result}}", ud, ud)
 		} else {
@@ -633,7 +684,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int)
 		}
 		fmt.sbprintln(sb, "\t\t\t}")
 	case .Slow:
-		fmt.sbprintfln(sb, "\t\t\tvu.vu1_pair(0x%08x, 0x%08x, 0x%04x)", p.uw, p.lw, pc)
+		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_pair(0x%08x, 0x%08x, 0x%04x)", int(unit), p.uw, p.lw, pc)
 		count(slow, "pair")
 	}
 }
@@ -641,7 +692,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int)
 // Emit a branch's condition into `tk` and its target into `tg`, plus the
 // link register.
 @(private = "file")
-emit_branch :: proc(sb: ^strings.Builder, lw, pc: u32) {
+emit_branch :: proc(sb: ^strings.Builder, lw, pc, mask: u32) {
 	it, is := (lw >> 16) & 15, (lw >> 11) & 15
 	switch lw >> 25 {
 	case 0x20, 0x21, 0x24, 0x25: fmt.sbprintln(sb, "\t\t\ttk := true")
@@ -653,8 +704,8 @@ emit_branch :: proc(sb: ^strings.Builder, lw, pc: u32) {
 	case 0x2f: fmt.sbprintfln(sb, "\t\t\ttk := i16(vi[%d]) >= 0", is)
 	}
 	switch lw >> 25 {
-	case 0x24, 0x25: fmt.sbprintfln(sb, "\t\t\ttg := u32(vi[%d]) * 8 & 0x%x", is, MASK)
-	case: fmt.sbprintfln(sb, "\t\t\ttg: u32 = 0x%04x", branch_target(lw, pc))
+	case 0x24, 0x25: fmt.sbprintfln(sb, "\t\t\ttg := u32(vi[%d]) * 8 & 0x%x", is, mask)
+	case: fmt.sbprintfln(sb, "\t\t\ttg: u32 = 0x%04x", branch_target(lw, pc, mask))
 	}
 	if (lw >> 25 == 0x21 || lw >> 25 == 0x25) && it != 0 {
 		fmt.sbprintfln(sb, "\t\t\tvi[%d] = 0x%x", it, u16((pc + 16) / 8))
@@ -662,14 +713,15 @@ emit_branch :: proc(sb: ^strings.Builder, lw, pc: u32) {
 }
 
 @(private = "file")
-emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, slow: ^map[string]int) {
+emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, unit: Unit, slow: ^map[string]int) {
+	mask := MASK[unit]
 	pairs := make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
-	mac_liveness(pairs, ext)
+	mac_liveness(pairs, ext, mask)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
 
-	fmt.sbprintfln(sb, "run_%d :: proc(pc: u32, budget: ^int) -> (u32, vu.Vu1_Exit) {{", n)
-	fmt.sbprintln(sb, "\tv := &vu.vu1")
+	fmt.sbprintfln(sb, "run_%d :: proc(pc: u32, budget: ^int) -> (u32, vu.Vu_Exit) {{", n)
+	fmt.sbprintfln(sb, "\tv := &vu.vu%d", int(unit))
 	fmt.sbprintln(sb, "\tvf, vi := &v.vf, &v.vi")
 	fmt.sbprintln(sb, "\t_, _ = vf, vi")
 	fmt.sbprintln(sb, "\tpc := pc")
@@ -687,27 +739,27 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, sl
 		     !branch && p.ebit && (i + 1 >= len(pairs) || !plain(next)):
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", pc)
 		case branch:
-			emit_pair(sb, p, pc, slow)
-			emit_branch(sb, p.lw, pc)
-			emit_pair(sb, next, pc + 8, slow)
+			emit_pair(sb, p, pc, unit, slow)
+			emit_branch(sb, p.lw, pc, mask)
+			emit_pair(sb, next, pc + 8, unit, slow)
 			fmt.sbprintln(sb, "\t\t\tif tk {")
 			fmt.sbprintln(sb, "\t\t\t\tbudget^ -= 1")
 			fmt.sbprintln(sb, "\t\t\t\tif budget^ <= 0 {return tg, .Leave}")
 			fmt.sbprintln(sb, "\t\t\t\tpc = tg")
 			fmt.sbprintln(sb, "\t\t\t} else {")
-			fmt.sbprintfln(sb, "\t\t\t\tpc = 0x%04x", (pc + 16) & MASK)
+			fmt.sbprintfln(sb, "\t\t\t\tpc = 0x%04x", (pc + 16) & mask)
 			fmt.sbprintln(sb, "\t\t\t}")
 			fmt.sbprintln(sb, "\t\t\tcontinue")
 		case p.ebit:
-			emit_pair(sb, p, pc, slow)
-			emit_pair(sb, next, pc + 8, slow)
-			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .End", (pc + 16) & MASK)
+			emit_pair(sb, p, pc, unit, slow)
+			emit_pair(sb, next, pc + 8, unit, slow)
+			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .End", (pc + 16) & mask)
 		case:
-			emit_pair(sb, p, pc, slow)
+			emit_pair(sb, p, pc, unit, slow)
 			if i + 1 < len(pairs) && in_ext(ext, i + 1) {
 				fmt.sbprintln(sb, "\t\t\tfallthrough")
 			} else {
-				fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", (pc + 8) & MASK)
+				fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", (pc + 8) & mask)
 			}
 		}
 	}
@@ -718,36 +770,41 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, sl
 	fmt.sbprintln(sb, "}\n")
 }
 
-// One VU1 microprogram at micro address 0, compiled whole as run_<n>, as
-// generate compiles a .vutext program (tests/vu_micro). The caller writes
-// the package header and VU_HELPERS. Counts the pair halves that call the
-// interpreter in slow, by opcode.
-emit_micro :: proc(n: int, words: []u32, slow: ^map[string]int) -> string {
+// One microprogram for unit at micro address 0, compiled whole as run_<n>,
+// as generate compiles a .vutext program (tests/vu_micro). The caller writes
+// the package header and VU_HELPERS, and for VU0 MACRO_HELPERS. Counts the
+// pair halves that call the interpreter in slow, by opcode.
+emit_micro :: proc(n: int, words: []u32, unit: Unit, slow: ^map[string]int) -> string {
 	sb := strings.builder_make()
-	emit_program(&sb, n, words, nil, slow)
+	emit_program(&sb, n, words, nil, unit, slow)
 	return strings.to_string(sb)
 }
 
-// Write out_dir/vu1/code.odin (package vu1); runtime is the ps2 runtime's
-// import path relative to out_dir. Returns the number of programs. Counts
-// the pair halves that call the interpreter in slow, by opcode.
-generate :: proc(img: mips.Image, out_dir, runtime, capture: string, slow: ^map[string]int) -> (programs: int, ok: bool) {
-	progs := find_programs(img) or_return
-	if capture != "" {load_capture(&progs, capture) or_return}
+// Write out_dir/vu<unit>/code.odin (package vu0 or vu1); runtime is the ps2
+// runtime's import path relative to out_dir. Returns the number of programs.
+// Counts the pair halves that call the interpreter in slow, by opcode. VU0
+// has programs only from a capture: without one it writes nothing.
+generate :: proc(img: mips.Image, out_dir, runtime, capture: string, unit: Unit, slow: ^map[string]int) -> (programs: int, ok: bool) {
+	if unit == .VU0 && capture == "" {return 0, true}
+	progs: [dynamic]Prog
+	if unit == .VU1 {progs = find_programs(img) or_return}
+	if capture != "" {load_capture(&progs, capture, unit) or_return}
+	u := int(unit)
 	sb := strings.builder_make()
 	fmt.sbprintln(&sb, "// Generated by ps-recomp. Do not edit.")
-	fmt.sbprintln(&sb, "package vu1\n")
+	fmt.sbprintfln(&sb, "package vu%d\n", u)
 	fmt.sbprintln(&sb, "import \"core:math\"")
 	fmt.sbprintln(&sb, "import \"core:simd\"")
 	fmt.sbprintfln(&sb, "import vu \"%s/vu\"\n", mips.import_path(runtime, 1))
 	fmt.sbprintln(&sb, VU_HELPERS)
+	if unit == .VU0 {fmt.sbprintln(&sb, MACRO_HELPERS)}
 	fmt.sbprintln(&sb, "register :: proc() {")
 	for p, n in progs {
 		if p.ext == nil {
 			fmt.sbprintfln(&sb, "\tvu.vu1_register(code_%d[:], run_%d)", n, n)
 			continue
 		}
-		fmt.sbprint(&sb, "\tvu.vu1_register_ranges({")
+		fmt.sbprintf(&sb, "\tvu.vu%d_register_ranges({{", u)
 		for r, k in ranges(p.ext) {
 			fmt.sbprintf(&sb, "%s{{0x%04x, code_%d_%d[:]}}", k == 0 ? "" : ", ", r[0] * 8, n, k)
 		}
@@ -764,17 +821,17 @@ generate :: proc(img: mips.Image, out_dir, runtime, capture: string, slow: ^map[
 			emit_words(&sb, fmt.tprintf("code_%d_%d", n, k), p.words[r[0] * 2:r[1] * 2])
 			pairs += r[1] - r[0]
 		}
-		emit_program(&sb, n, p.words[:], p.ext, slow)
+		emit_program(&sb, n, p.words[:], p.ext, unit, slow)
 		free_all(context.temp_allocator)
 	}
-	dir, _ := filepath.join({out_dir, "vu1"})
+	dir, _ := filepath.join({out_dir, fmt.tprintf("vu%d", u)})
 	os.make_directory(dir)
 	path, _ := filepath.join({dir, "code.odin"})
 	if err := os.write_entire_file(path, sb.buf[:]); err != nil {
 		fmt.eprintln("cannot write", path, err)
 		return
 	}
-	fmt.printfln("%d VU1 programs, %d pairs -> %s", len(progs), pairs, path)
+	fmt.printfln("%d VU%d programs, %d pairs -> %s", len(progs), u, pairs, path)
 	return len(progs), true
 }
 
@@ -805,23 +862,25 @@ ranges :: proc(ext: []bool) -> [dynamic][2]int {
 	return rs
 }
 
-// Programs from a VU1_CAPTURE file (ps2/vu/capture.odin): for each entry
-// into each captured image, the pairs reachable from it. A JR or JALR ends
-// an extent; its targets were captured as entries of their own. Extents
-// with the same pairs at the same addresses compile once. A missing file
-// (ENOENT) adds no programs, so that microcode runs in the interpreter.
+// Programs from a unit's VU0_CAPTURE or VU1_CAPTURE file
+// (ps2/vu/capture.odin): for each entry into each captured image, the pairs
+// reachable from it. A JR or JALR ends an extent; its targets were captured
+// as entries of their own. Extents with the same pairs at the same addresses
+// compile once. A missing file (ENOENT) adds no programs, so that microcode
+// runs in the interpreter.
 @(private = "file")
-load_capture :: proc(progs: ^[dynamic]Prog, path: string) -> bool {
+load_capture :: proc(progs: ^[dynamic]Prog, path: string, unit: Unit) -> bool {
 	data, err := os.read_entire_file(path, context.allocator)
 	if err == os.General_Error.Not_Exist {
-		fmt.eprintfln("vu: %s missing; VU1 microcode from data runs in the interpreter", path)
+		fmt.eprintfln("vu: %s missing; VU%d microcode from data runs in the interpreter", path, int(unit))
 		return true
 	}
 	if err != nil {
 		fmt.eprintln("vu: cannot read", path, err)
 		return false
 	}
-	IMAGE :: 16 << 10
+	mask := MASK[unit]
+	image := int(mask) + 8
 	images: map[u64][]u32
 	entries: map[u64][dynamic]u32
 	seen: map[[2]u64]bool
@@ -834,22 +893,22 @@ load_capture :: proc(progs: ^[dynamic]Prog, path: string) -> bool {
 		hash := u64(endian_u64(data[pos + 1:]))
 		switch kind {
 		case 'I':
-			if pos + 9 + IMAGE > len(data) {
+			if pos + 9 + image > len(data) {
 				fmt.eprintfln("vu: %s: image at %d cut short", path, pos)
 				return false
 			}
 			if hash not_in images {
-				w := make([]u32, IMAGE / 4)
+				w := make([]u32, image / 4)
 				for &x, k in w {x = endian_u32(data[pos + 9 + k * 4:])}
 				images[hash] = w
 			}
-			pos += 9 + IMAGE
+			pos += 9 + image
 		case 'E':
 			if pos + 13 > len(data) {
 				fmt.eprintfln("vu: %s: entry at %d cut short", path, pos)
 				return false
 			}
-			pc := endian_u32(data[pos + 9:]) & MASK
+			pc := endian_u32(data[pos + 9:]) & mask
 			key := [2]u64{hash, u64(pc)}
 			if key not_in seen {
 				seen[key] = true
@@ -869,10 +928,10 @@ load_capture :: proc(progs: ^[dynamic]Prog, path: string) -> bool {
 	for h in hashes {
 		pcs := entries[h][:]
 		slice.sort(pcs)
-		words := make([dynamic]u32, IMAGE / 4)
+		words := make([dynamic]u32, image / 4)
 		copy(words[:], images[h])
 		for pc in pcs {
-			ext := extent(words[:], pc)
+			ext := extent(words[:], pc, mask)
 			key := strings.builder_make()
 			for r in ranges(ext) {
 				fmt.sbprintf(&key, "%d:", r[0])
@@ -898,7 +957,7 @@ endian_u64 :: proc(b: []u8) -> u64 {return u64(endian_u32(b)) | u64(endian_u32(b
 // JALR or an E bit: fallthrough, branch targets, and the return pair after
 // BAL and JALR. A delay slot is included without following it.
 @(private = "file")
-extent :: proc(words: []u32, entry: u32) -> []bool {
+extent :: proc(words: []u32, entry, mask: u32) -> []bool {
 	n := len(words) / 2
 	ext := make([]bool, n)
 	walked := make([]bool, n, context.temp_allocator)
@@ -921,8 +980,8 @@ extent :: proc(words: []u32, entry: u32) -> []bool {
 		op := p.lw >> 25
 		switch p.branch {
 		case .None:
-		case .Uncond: append(&work, int(branch_target(p.lw, u32(i) * 8) / 8))
-		case .Cond: append(&work, int(branch_target(p.lw, u32(i) * 8) / 8), after)
+		case .Uncond: append(&work, int(branch_target(p.lw, u32(i) * 8, mask) / 8))
+		case .Cond: append(&work, int(branch_target(p.lw, u32(i) * 8, mask) / 8), after)
 		case .Reg:
 		}
 		if op == 0x21 || op == 0x25 {append(&work, after)} // BAL, JALR return

@@ -137,7 +137,7 @@ platform_init :: proc(title: cstring) -> bool {
 @(private)
 quit :: proc(code: int) -> ! {
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
-	vu.vu1_stats_print()
+	vu.vu_stats_print()
 	os.exit(code)
 }
 

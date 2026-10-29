@@ -58,7 +58,7 @@ vu_init :: proc() {
 		v.vf[0].f = {0, 0, 0, 1}
 	}
 	vif_init()
-	vu1_options()
+	vu_options()
 }
 
 // EE mapping of VU memories: 0x11000000 micro0, 0x11004000 mem0,
@@ -436,26 +436,28 @@ vu0_overrun, vu1_overrun: bool
 
 // How compiled microcode stopped: at the E bit's end, or by handing the
 // pair at the returned pc to the interpreter.
-Vu1_Exit :: enum u8 {End, Leave}
+Vu_Exit :: enum u8 {End, Leave}
 
-// A VU1 microprogram compiled ahead of time (rec/vu1). `run` executes from
-// a pair address below len(code)*4; taken branches count against budget.
-Vu1_Run :: #type proc(pc: u32, budget: ^int) -> (u32, Vu1_Exit)
+// A microprogram compiled ahead of time (rec/vu0, rec/vu1). `run` executes
+// from a pair address below len(code)*4; taken branches count against
+// budget.
+Vu_Run :: #type proc(pc: u32, budget: ^int) -> (u32, Vu_Exit)
 
 // Micro memory a compiled program was compiled from: code at pc.
-Vu1_Range :: struct {
+Vu_Range :: struct {
 	pc:   u32,
 	code: []u32,
 }
 
 @(private)
 Vu_Program :: struct {
-	ranges:   []Vu1_Range,
-	run:      Vu1_Run,
+	ranges:   []Vu_Range,
+	run:      Vu_Run,
 	size:     int, // pairs, over all ranges
 	ok_gen:   u32, // the micro generation when ok was checked
 	ok:       bool, // micro memory holds ranges
-	// VU1_STATS: runs entered, range checks, and checks that failed.
+	// VU0_STATS, VU1_STATS: runs entered, range checks, and checks that
+	// failed.
 	runs, checks, misses: u64,
 }
 
@@ -480,6 +482,8 @@ Micro_Table :: struct($N: int) {
 	nocomp:     bool, // interpret everything (VUNOCOMP, capturing)
 }
 
+@(private)
+vu0_table: Micro_Table(len(vu0_micro) / 8)
 @(private)
 vu1_table: Micro_Table(len(vu1_micro) / 8)
 
@@ -506,17 +510,20 @@ vu1_micro_touch :: #force_inline proc() {
 }
 
 // A program compiled from micro memory starting at 0 (a .vutext program).
-vu1_register :: proc(code: []u32, run: Vu1_Run) {
+vu1_register :: proc(code: []u32, run: Vu_Run) {
 	vu1_register_ranges({{0, code}}, run)
 }
 
 // A program compiled from the given runs of micro memory.
-vu1_register_ranges :: proc(ranges: []Vu1_Range, run: Vu1_Run) {
+vu0_register_ranges :: proc(ranges: []Vu_Range, run: Vu_Run) {
+	micro_register(&vu0_table, ranges, run)
+}
+vu1_register_ranges :: proc(ranges: []Vu_Range, run: Vu_Run) {
 	micro_register(&vu1_table, ranges, run)
 }
 
 @(private)
-micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu1_Range, run: Vu1_Run) {
+micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run) {
 	context.allocator = runtime.heap_allocator()
 	p := new(Vu_Program)
 	p.ranges = slice.clone(ranges)
@@ -532,12 +539,20 @@ micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu1_Range, run: Vu1_Run) {
 			for at > 0 && c[at - 1].size < p.size {at -= 1}
 			inject_at(c, at, p)
 			t.compiled[i] = true
+			t.pick_gen[i] = ~u32(0)
 		}
 	}
+	// Picks and stops cached for the current generation predate p.
+	t.stop_gen = ~u32(0)
 }
 
 // The program to run at pc, nil to interpret. pc is a pair address below
-// len(vu1_micro): every caller masks it, so pc / 8 indexes unchecked.
+// the VU's micro memory size: every caller masks it, so pc / 8 indexes
+// unchecked.
+@(private)
+vu0_lookup :: proc(pc: u32) -> ^Vu_Program {
+	return micro_lookup(&vu0_table, vu0_micro[:], vu0_micro_gen, pc)
+}
 @(private)
 vu1_lookup :: proc(pc: u32) -> ^Vu_Program {
 	return micro_lookup(&vu1_table, vu1_micro[:], vu1_micro_gen, pc)
@@ -582,24 +597,32 @@ micro_holds :: proc(p: ^Vu_Program, micro: []u8) -> bool {
 }
 
 @(private)
-vu1_check, vu1_stats: bool
+vu_check, vu0_stats, vu1_stats: bool
 
 // VUNOCOMP=1 runs everything in the interpreter; VUCHECK=1 runs
-// every microprogram both ways and reports differences; VU1_STATS=1
-// prints each compiled program's counters at exit.
-vu1_options :: proc() {
-	vu1_table.nocomp = core.env("VUNOCOMP") != ""
-	vu1_check = core.env("VUCHECK") != ""
+// every microprogram both ways and reports differences; VU0_STATS=1 and
+// VU1_STATS=1 print each compiled program's counters at exit.
+@(private)
+vu_options :: proc() {
+	nocomp := core.env("VUNOCOMP") != ""
+	vu0_table.nocomp, vu1_table.nocomp = nocomp, nocomp
+	vu_check = core.env("VUCHECK") != ""
+	vu0_stats = core.env("VU0_STATS") != ""
 	vu1_stats = core.env("VU1_STATS") != ""
-	vu1_capture_options()
+	vu_capture_options()
 }
 
-vu1_stats_print :: proc() {
-	if !vu1_stats {return}
-	for p, k in vu1_table.programs {
+vu_stats_print :: proc() {
+	if vu0_stats {micro_stats_print(0, vu0_table.programs[:])}
+	if vu1_stats {micro_stats_print(1, vu1_table.programs[:])}
+}
+
+@(private)
+micro_stats_print :: proc(unit: int, programs: []^Vu_Program) {
+	for p, k in programs {
 		if p.runs == 0 && p.checks == 0 {continue}
-		fmt.eprintfln("vu1 program %d at %04x, %d pairs: %d runs, %d checks, %d misses",
-			k, p.ranges[0].pc, p.size, p.runs, p.checks, p.misses)
+		fmt.eprintfln("vu%d program %d at %04x, %d pairs: %d runs, %d checks, %d misses",
+			unit, k, p.ranges[0].pc, p.size, p.runs, p.checks, p.misses)
 	}
 }
 
@@ -608,24 +631,36 @@ vu1_stats_print :: proc() {
 vu1_start :: proc(addr: u32) {
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU1, t)
-	if vu1_capture_file != nil {vu1_capture(addr)}
-	if vu1_check && vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7) != nil {
+	if vu1_cap.file != nil {vu_capture(&vu1, addr)}
+	if vu_check && vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7) != nil {
 		vu1_compare(addr)
 		return
 	}
 	vu1_exec(addr, true)
 }
 
+@(private)
+vu1_exec :: proc(addr: u32, compiled: bool) {
+	pc, ended := micro_exec(&vu1, &vu1_table, &vu1_micro_gen, vu1_pairs[:], addr, compiled)
+	if !ended && !vu1_overrun {
+		vu1_overrun = true
+		fmt.eprintfln("vu1: microprogram at %04x ran %d steps without ending", addr, VU_STEP_LIMIT)
+	}
+	vu1.tpc = pc
+}
+
+// Run v's microprogram at addr until it ends (ended) or overruns the step
+// limit: t's compiled programs where micro memory of generation gen^ holds
+// them, unless !compiled, and the interpreter elsewhere. Inlined into each
+// VU's wrapper, so the VU, its table and its pair cache are constants there.
 // No bounds checks: pc stays masked to a pair address in micro memory,
 // including what compiled code hands back.
 @(private)
-vu1_exec :: proc(addr: u32, compiled: bool) #no_bounds_check {
-	v := &vu1
+micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: []Vu_Pair_Info, addr: u32, compiled: bool) -> (pc: u32, ended: bool) #no_bounds_check {
 	mask := u32(len(v.micro) - 1) &~ 7
-	pc := addr & mask
-	t := &vu1_table
-	if t.stop_gen != vu1_micro_gen {
-		t.stop_gen = vu1_micro_gen
+	pc = addr & mask
+	if t.stop_gen != gen^ {
+		t.stop_gen = gen^
 		t.stop = t.compiled
 	}
 	stop := compiled ? t.stop[:] : nil
@@ -635,44 +670,29 @@ vu1_exec :: proc(addr: u32, compiled: bool) #no_bounds_check {
 		// the interpreter.
 		last: ^Vu_Program
 		for compiled && t.stop[pc / 8] {
-			prog := vu1_lookup(pc)
+			prog := micro_lookup(t, v.micro, gen^, pc)
 			if prog == nil || prog == last {break}
 			last = prog
 			prog.runs += 1
-			exit: Vu1_Exit
+			exit: Vu_Exit
 			pc, exit = prog.run(pc, &budget)
 			pc &= mask
-			if exit == .End {
-				v.tpc = pc
-				return
-			}
+			if exit == .End {return pc, true}
 			if budget <= 0 {break}
 		}
 		if budget <= 0 {break}
-		ended: bool
-		pc, ended = vu1_interp(pc, stop, &budget)
-		if ended {
-			v.tpc = pc
-			return
-		}
+		when cpu.FALLBACK_COUNT {left := budget}
+		pc, ended = vu_interp(v, pairs, pc, stop, &budget)
+		// VUCHECK's interpreter-only run is not counted.
+		when cpu.FALLBACK_COUNT {if v == &vu0 && compiled {cpu.fallback_vu0_micro += u64(left - budget)}}
+		if ended {return}
 	}
-	if !vu1_overrun {
-		vu1_overrun = true
-		fmt.eprintfln("vu1: microprogram at %04x ran %d steps without ending", addr, VU_STEP_LIMIT)
-	}
-	v.tpc = pc
+	return pc, false
 }
 
 // Interpret from pc for at least one pair, until the program ends or
 // control reaches a pair marked in `stop` (compiled code may run there)
-// with no branch or end pending.
-@(private)
-vu1_interp :: proc(pc: u32, stop: []bool, budget: ^int) -> (u32, bool) {
-	return vu_interp(&vu1, vu1_pairs[:], pc, stop, budget)
-}
-
-// Inlined into each VU's wrapper, so the VU and its pair cache are
-// constants there and VU1's loop is the same code as before VU0 shared it.
+// with no branch or end pending. Inlined into micro_exec.
 // No bounds checks: callers pass a masked pc, every later pc is masked, and
 // pairs holds one entry per pair of v.micro; stop is checked against len.
 @(private)
@@ -715,38 +735,54 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 }
 
 // VUCHECK: run the interpreter, then the compiled code from the same
-// state with XGKICK muted, and compare. Status is not compared (compiled
-// code never computes it). The interpreter's results are kept.
+// state, and compare (vu_compare).
+@(private)
+vu0_compare :: proc(addr: u32) {
+	@(static) mem0, mem1: [len(vu0_mem)]u8
+	vu_compare(&vu0, vu0_mem[:], mem0[:], mem1[:], vu0_table.programs[:], vu0_lookup(addr & u32(len(vu0_micro) - 1) &~ 7), addr, vu0_exec)
+}
 @(private)
 vu1_compare :: proc(addr: u32) {
 	@(static) mem0, mem1: [len(vu1_mem)]u8
+	vu_compare(&vu1, vu1_mem[:], mem0[:], mem1[:], vu1_table.programs[:], vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7), addr, vu1_exec)
+}
+
+// Run v's program at addr with exec in the interpreter, then compiled from
+// the same state with XGKICK muted, and report differences; mem is v's data
+// memory, mem0 and mem1 scratch of its size, entry the program compiled at
+// addr. Status is compared on VU0 only: compiled VU1 code never computes it.
+// The interpreter's results are kept.
+@(private)
+vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, entry: ^Vu_Program, addr: u32, exec: proc(addr: u32, compiled: bool)) {
 	@(static) reported: int
-	v0 := vu1
-	mem0 = vu1_mem
+	v0 := v^
+	copy(mem0, mem)
 	vu1_kick_hash = 0
-	vu1_exec(addr, false)
-	v1, kick1 := vu1, vu1_kick_hash
-	mem1 = vu1_mem
-	vu1 = v0
-	vu1_mem = mem0
+	exec(addr, false)
+	v1, kick1 := v^, vu1_kick_hash
+	copy(mem1, mem)
+	v^ = v0
+	copy(mem, mem0)
 	vu1_kick_hash, vu1_kick_mute = 0, true
-	vu1_exec(addr, true)
+	exec(addr, true)
 	vu1_kick_mute = false
-	v2, kick2 := vu1, vu1_kick_hash
+	v2, kick2 := v^, vu1_kick_hash
+	unit := v == &vu1 ? 1 : 0
 	vf_bad := false
 	for k in 0 ..< 32 {vf_bad ||= v1.vf[k].q != v2.vf[k].q}
+	status_bad := unit == 0 && v1.status != v2.status
+	mem_bad := !slice.equal(mem, mem1)
 	prog := -1
-	entry := vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7)
-	for p, k in vu1_table.programs {if p == entry {prog = k}}
-	bad := kick1 != kick2 || vu1_mem != mem1 || vf_bad || v1.vi != v2.vi ||
+	for p, k in programs {if p == entry {prog = k}}
+	bad := kick1 != kick2 || mem_bad || vf_bad || v1.vi != v2.vi ||
 		v1.acc.q != v2.acc.q || v1.q != v2.q || v1.p != v2.p || v1.i != v2.i ||
-		v1.r != v2.r || v1.clip != v2.clip || v1.mac != v2.mac || v1.tpc != v2.tpc
+		v1.r != v2.r || v1.clip != v2.clip || v1.mac != v2.mac || status_bad || v1.tpc != v2.tpc
 	if bad && reported < 20 {
 		reported += 1
-		fmt.eprintfln("vucheck: program %d entry %04x differs: kick %v vf %v vi %v acc %v q %v p %v i %v clip %v mac %v (%04x/%04x) tpc %v mem %v",
-			prog, addr, kick1 != kick2, vf_bad, v1.vi != v2.vi,
+		fmt.eprintfln("vucheck: vu%d program %d entry %04x differs: kick %v vf %v vi %v acc %v q %v p %v i %v clip %v mac %v (%04x/%04x) status %v (%04x/%04x) tpc %v mem %v",
+			unit, prog, addr, kick1 != kick2, vf_bad, v1.vi != v2.vi,
 			v1.acc.q != v2.acc.q, v1.q != v2.q, v1.p != v2.p, v1.i != v2.i, v1.clip != v2.clip,
-			v1.mac != v2.mac, v1.mac, v2.mac, v1.tpc != v2.tpc, vu1_mem != mem1)
+			v1.mac != v2.mac, v1.mac, v2.mac, status_bad, v1.status, v2.status, v1.tpc != v2.tpc, mem_bad)
 		for k in 0 ..< 32 {
 			if v1.vf[k].q != v2.vf[k].q {fmt.eprintfln("  vf%d %v / %v", k, v1.vf[k].f, v2.vf[k].f)}
 		}
@@ -754,11 +790,23 @@ vu1_compare :: proc(addr: u32) {
 			if v1.vi[k] != v2.vi[k] {fmt.eprintfln("  vi%d %04x / %04x", k, v1.vi[k], v2.vi[k])}
 		}
 	}
-	vu1 = v1
-	vu1_mem = mem1
+	v^ = v1
+	copy(mem, mem1)
 }
 
 // Public entry points for compiled microcode.
+vu0_upper :: proc(uw: u32) {
+	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_upper[cpu.cop2_key(uw)] += 1}
+	vu_op(&vu0, uw)
+}
+vu0_lower :: proc(lw, pc: u32) {
+	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_lower[lw >> 25 == 0x40 ? 128 + cpu.cop2_key(lw) : lw >> 25] += 1}
+	vu_lower(&vu0, lw, pc)
+}
+vu0_pair :: proc(uw, lw, pc: u32) {
+	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_pair += 1}
+	vu_pair(&vu0, uw, lw, pc)
+}
 vu1_upper :: proc(uw: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu1_upper[cpu.cop2_key(uw)] += 1}
 	vu_op(&vu1, uw)
@@ -902,11 +950,11 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 		return true, branch
 	case 0x24: // JR
 		t := u32(vi[is]) * 8
-		if v == &vu1 && vu1_capture_file != nil {vu1_capture(t)}
+		if capture_of(v).file != nil {vu_capture(v, t)}
 		return true, t
 	case 0x25: // JALR
 		t := u32(vi[is]) * 8
-		if v == &vu1 && vu1_capture_file != nil {vu1_capture(t)}
+		if capture_of(v).file != nil {vu_capture(v, t)}
 		set_vi(vi, it, u16((pc + 16) / 8))
 		return true, t
 	case 0x28: return vi[it] == vi[is], branch // IBEQ
@@ -952,7 +1000,7 @@ vu1_xgkick :: proc(addr: u16) {
 		total += n
 		if lo & 0x8000 != 0 {break}
 	}
-	if vu1_check {
+	if vu_check {
 		a = start
 		for left := total; left > 0; {
 			seg := min(left, qwords - a)
@@ -971,30 +1019,31 @@ vu1_xgkick :: proc(addr: u16) {
 	}
 }
 
-// Run a VU0 microprogram (VCALLMS, VCALLMSR, VIF0 MSCAL) to its E bit in
-// the interpreter. Like VU1 it runs synchronously, so VU0 is never busy when
-// the EE next looks: the EE is charged no cycles, where hardware would stall
-// it only for a VCALLMS while VU0 still runs or a QMFC2.I/CFC2.I that waits
+// Run a VU0 microprogram (VCALLMS, VCALLMSR, VIF0 MSCAL) to its E bit, as
+// vu1_start: compiled programs (rec/vu0) where they hold, the interpreter
+// elsewhere. Like VU1 it runs synchronously, so VU0 is never busy when the
+// EE next looks: the EE is charged no cycles, where hardware would stall it
+// only for a VCALLMS while VU0 still runs or a QMFC2.I/CFC2.I that waits
 // for the end. No state outlives the call but tpc and the registers.
 vu0_call_micro :: proc(addr: u32) {
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU0, t)
-	v := &vu0
-	pc := addr & (u32(len(v.micro) - 1) &~ 7)
-	budget := VU_STEP_LIMIT
-	ended: bool
-	pc, ended = vu0_interp(pc, &budget)
-	v.tpc = pc
+	if vu0_cap.file != nil {vu_capture(&vu0, addr)}
+	if vu_check && vu0_lookup(addr & u32(len(vu0_micro) - 1) &~ 7) != nil {
+		vu0_compare(addr)
+		return
+	}
+	vu0_exec(addr, true)
+}
+
+@(private)
+vu0_exec :: proc(addr: u32, compiled: bool) {
+	pc, ended := micro_exec(&vu0, &vu0_table, &vu0_micro_gen, vu0_pairs[:], addr, compiled)
 	if !ended && !vu0_overrun {
 		vu0_overrun = true
 		fmt.eprintfln("vu0: microprogram at %04x ran %d steps without ending", addr, VU_STEP_LIMIT)
 	}
-}
-
-// No VU0 program is compiled: no stop keeps the whole run interpreted.
-@(private)
-vu0_interp :: proc(pc: u32, budget: ^int) -> (u32, bool) {
-	return vu_interp(&vu0, vu0_pairs[:], pc, nil, budget)
+	vu0.tpc = pc
 }
 
 // Emulated state, saved and restored by snapshots (snap.odin).
