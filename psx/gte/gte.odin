@@ -7,6 +7,7 @@
 package psx_gte
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:math"
 import "core:simd"
 import cpu "../cpu"
@@ -792,6 +793,11 @@ avsz :: proc(scale: i32, sum: i64) {
 	g.otz = u16(clamp_flag(v >> 12, 0, 0xffff, 18))
 }
 
+// Unknown commands already reported, by function field: a set of their own,
+// as cpu.report_once's is keyed by RAM address.
+@(private = "file")
+unknown_reported: [64]bool
+
 gte_cmd :: proc(cmd: u32) #no_bounds_check {
 	g := &state
 	c := Cmd {
@@ -868,7 +874,10 @@ gte_cmd :: proc(cmd: u32) #no_bounds_check {
 		}
 		push_color()
 	case:
-		cpu.report_once(cmd & 0x3f, "gte: unknown command")
+		if k := cmd & 0x3f; !unknown_reported[k] {
+			unknown_reported[k] = true
+			fmt.eprintfln("gte: unknown command %#02x (ra %#08x) at present %d", k, cpu.state.r[31], cpu.presents)
+		}
 	}
 	if g.flag & 0x7f87e000 != 0 {
 		g.flag |= 0x80000000

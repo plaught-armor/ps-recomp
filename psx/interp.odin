@@ -91,6 +91,7 @@ signed_imm :: #force_inline proc(w: u32) -> u32 {
 
 @(private)
 interp_exec :: proc(st: ^Interp, pc, w: u32) {
+	when cpu.FALLBACK_COUNT {cpu.fallback_interp_insns += 1}
 	r := &cpu.state.r
 	rs := (w >> 21) & 31
 	rt := (w >> 16) & 31

@@ -906,6 +906,7 @@ platform_frame :: proc() {
 	pause_wait()
 	if host.quit {
 		platform_shutdown()
+		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
 		os.exit(0)
 	}
 	if vblank_hook != nil {

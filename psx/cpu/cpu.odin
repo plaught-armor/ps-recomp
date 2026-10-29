@@ -201,10 +201,17 @@ call_slow :: proc(addr: u32) {
 		return
 	}
 	if fn := resolve_overlay(addr); fn != nil {
+		when FALLBACK_COUNT {fallback_overlay[addr] += 1}
 		fn()
 		return
 	}
 	report_once(addr, "interpreting")
+	interpret(addr)
+}
+
+@(private)
+interpret :: proc(addr: u32) {
+	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	interp_run(addr)
 }
 
@@ -225,18 +232,22 @@ report_once :: proc(addr: u32, what: string) {
 // A recompiled function jumped to pc, which is not one of its block labels.
 jump_unknown :: proc(func, pc: u32) {
 	if pc == frame_ret {
+		when FALLBACK_COUNT {fallback_jump[{func, pc, .Return}] += 1}
 		return
 	}
 	if pc < func || !is_ram_addr(pc) {
+		when FALLBACK_COUNT {fallback_jump[{func, pc, .Call}] += 1}
 		call(pc)
 		return
 	}
 	if is_ram_addr(pc) && dispatch.fixed[fn_index(pc)] != nil || resolve_overlay(pc) != nil {
+		when FALLBACK_COUNT {fallback_jump[{func, pc, .Call}] += 1}
 		call(pc)
 		return
 	}
+	when FALLBACK_COUNT {fallback_jump[{func, pc, .Interp}] += 1}
 	report_once(pc, "unlabelled jump target, interpreting")
-	interp_run(pc)
+	interpret(pc)
 }
 
 mult :: #force_inline proc(a, b: u32) {
@@ -286,9 +297,11 @@ bad_insn :: proc(pc, w: u32) {
 	os.exit(1)
 }
 
-// Debug aid: RAMDUMP=<file> saves main RAM for post-mortem; called
-// where the port exits on purpose.
+// Debug aid: RAMDUMP=<file> saves main RAM for post-mortem, and a
+// FALLBACK_COUNT build reports its counters; called where the port exits
+// on purpose.
 ram_dump_env :: proc() {
+	when FALLBACK_COUNT {fallback_dump()}
 	if path := core.env("RAMDUMP"); path != "" {
 		if err := os.write_entire_file(path, ram[:]); err != nil {
 			fmt.eprintln(core.ENV_PREFIX + "RAMDUMP: write failed:", path, err)

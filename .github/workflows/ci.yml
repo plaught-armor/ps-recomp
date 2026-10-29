@@ -26,13 +26,13 @@ jobs:
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu; do
+            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
           done
 
-  # Run the coroutine/snapshot/rollback, native code, EE native, EE FPU and lowering tests on each host.
+  # Run the coroutine/snapshot/rollback, native code, EE native, EE FPU, lowering and PS1 fallback tests on each host.
   test:
     strategy:
       fail-fast: false
@@ -73,6 +73,8 @@ jobs:
           odin run tests/vu_micro -collection:ps=. -out:vu_micro_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_emit -collection:ps=. -out:ee_emit_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/spu -collection:ps=. -out:spu_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_fallback -collection:ps=. -out:psx_fallback_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true -out:psx_fallback_count_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)
         if: ${{ matrix.rosetta }}
         run: |
