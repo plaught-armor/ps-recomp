@@ -26,7 +26,7 @@ jobs:
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_bios; do
+            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_bios tests/psx_bios_libc; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -77,6 +77,7 @@ jobs:
           odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true -out:psx_fallback_count_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_unaligned -collection:ps=. -out:psx_unaligned_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios -collection:ps=. -out:psx_bios_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_bios_libc -collection:ps=. -out:psx_bios_libc_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)
         if: ${{ matrix.rosetta }}
         run: |
