@@ -49,9 +49,12 @@ vif_feed :: proc(v: ^Vif, data: []u8) {
 	}
 }
 
-// Execute VIF codes; returns the words consumed.
+// Execute VIF codes; returns the words consumed. No bounds checks: i stays
+// below len(w), a code runs only when its `need` words are all in w, arg
+// holds the need - 1 after the code (DIRECT and MPG always have one, MASK
+// one, ROW and COL four), and MPG wraps its destination in micro memory.
 @(private)
-vif_run :: proc(v: ^Vif, w: []u32) -> int {
+vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 	i := 0
 	for i < len(w) {
 		code := w[i]
