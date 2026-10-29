@@ -14,6 +14,7 @@ import "core:os"
 
 import "ps:core"
 import cpu "cpu"
+import gte "gte"
 import native "native"
 
 // The native code addresses cpu.state by these offsets
@@ -22,6 +23,18 @@ import native "native"
 #assert(offset_of(cpu.Cpu, hi) == 128)
 #assert(offset_of(cpu.Cpu, lo) == 132)
 #assert(offset_of(cpu.Cpu, cycles) == 136)
+
+// And gte.state by these.
+#assert(offset_of(gte.Gte, v) == 0)
+#assert(type_of(gte.state.v) == [3][3]i16)
+#assert(offset_of(gte.Gte, rgbc) == 18)
+#assert(offset_of(gte.Gte, otz) == 22)
+#assert(offset_of(gte.Gte, ir) == 24)
+#assert(offset_of(gte.Gte, sxy) == 40)
+#assert(offset_of(gte.Gte, sz) == 64)
+#assert(offset_of(gte.Gte, rgb) == 80)
+#assert(offset_of(gte.Gte, res1) == 92)
+#assert(offset_of(gte.Gte, mac) == 96)
 
 // Replace the registered functions with the native code in the file at
 // path. False, with the reason printed, when it cannot be used; the Odin

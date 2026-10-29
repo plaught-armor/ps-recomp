@@ -62,6 +62,7 @@ imports :: proc() -> map[string]u64 {
 	m["cpu.call"] = p(rawptr(cpu.call))
 	m["cpu.jump_unknown"] = p(rawptr(cpu.jump_unknown))
 	m["cpu.trace_block"] = p(rawptr(cpu.trace_block))
+	m["gte.state"] = p(&gte.state)
 	m["gte.gte_read"] = p(rawptr(gte.gte_read))
 	m["gte.gte_write"] = p(rawptr(gte.gte_write))
 	m["gte.gte_cmd"] = p(rawptr(gte.gte_cmd))

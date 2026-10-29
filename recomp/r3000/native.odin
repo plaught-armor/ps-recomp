@@ -3,7 +3,7 @@
 // same instructions in the same order, so a game can switch between them
 // and compare.
 //
-// Runtime procedures and variables are imports by name; psx/native.odin
+// Runtime procedures and variables are imports by name; psx/native
 // lists them. A patch condition must name a bool variable there.
 package r3000
 
@@ -88,6 +88,104 @@ events :: proc(a: ^native.Asm) {
 call_imm :: proc(a: ^native.Asm, name: string, v: u32) {
 	native.mov_imm(a, .A, v)
 	native.call(a, name, .A)
+}
+
+// Field offsets in gte.Gte, through import gte.state; the loader checks
+// them. V0-V2 are 6 bytes apart (xy, then z at 4).
+@(private = "file")
+GTE_RGBC :: 18
+@(private = "file")
+GTE_OTZ :: 22
+@(private = "file")
+GTE_IR :: 24
+@(private = "file")
+GTE_SXY :: 40
+@(private = "file")
+GTE_SZ :: 64
+@(private = "file")
+GTE_RGB :: 80
+@(private = "file")
+GTE_RES1 :: 92
+@(private = "file")
+GTE_MAC :: 96
+
+// A = GTE data register r, as gte.gte_read: inline for r < 28, where a read
+// is a field load; a call for the rest.
+@(private = "file")
+gte_get :: proc(a: ^native.Asm, r: u32) {
+	switch r {
+	case 0, 2, 4:
+		native.imp_load(a, .A, "gte.state", 6 * (r / 2))
+	case 1, 3, 5:
+		native.imp_load(a, .A, "gte.state", 6 * (r / 2) + 4, .B16, true)
+	case 6:
+		native.imp_load(a, .A, "gte.state", GTE_RGBC)
+	case 7:
+		native.imp_load(a, .A, "gte.state", GTE_OTZ, .B16)
+	case 8 ..= 11:
+		native.imp_load(a, .A, "gte.state", GTE_IR + 4 * (r - 8))
+	case 12 ..= 15:
+		// SXY2 for SXYP. The low 16 bits of x and of y, packed.
+		off := GTE_SXY + 8 * (min(r, 14) - 12)
+		native.imp_load(a, .A, "gte.state", off)
+		native.alu_imm(a, .And, .A, 0xffff)
+		native.imp_load(a, .C, "gte.state", off + 4)
+		native.alu_imm(a, .Shl, .C, 16)
+		native.alu(a, .Or, .A, .C)
+	case 16 ..= 19:
+		native.imp_load(a, .A, "gte.state", GTE_SZ + 4 * (r - 16))
+	case 20 ..= 22:
+		native.imp_load(a, .A, "gte.state", GTE_RGB + 4 * (r - 20))
+	case 23:
+		native.imp_load(a, .A, "gte.state", GTE_RES1)
+	case 24 ..= 27:
+		native.imp_load(a, .A, "gte.state", GTE_MAC + 4 * (r - 24))
+	case:
+		call_imm(a, "gte.gte_read", r)
+	}
+}
+
+// GTE data register r = v (A or B), as gte.gte_write: inline for r < 28
+// but SXYP (15), where a write is a field store; a call for the rest. Loses
+// A, B and C.
+@(private = "file")
+gte_put :: proc(a: ^native.Asm, r: u32, v: native.Reg) {
+	switch r {
+	case 0, 2, 4:
+		native.imp_store(a, "gte.state", v, 6 * (r / 2))
+	case 1, 3, 5:
+		native.imp_store(a, "gte.state", v, 6 * (r / 2) + 4, .B16)
+	case 6:
+		native.imp_store(a, "gte.state", v, GTE_RGBC)
+	case 7:
+		native.imp_store(a, "gte.state", v, GTE_OTZ, .B16)
+	case 8 ..= 11:
+		native.alu_imm(a, .Shl, v, 16)
+		native.alu_imm(a, .Sar, v, 16)
+		native.imp_store(a, "gte.state", v, GTE_IR + 4 * (r - 8))
+	case 12 ..= 14:
+		// x and y, each the sign-extended 16 bits.
+		off := GTE_SXY + 8 * (r - 12)
+		native.mov(a, .C, v)
+		native.alu_imm(a, .Shl, .C, 16)
+		native.alu_imm(a, .Sar, .C, 16)
+		native.imp_store(a, "gte.state", .C, off)
+		native.alu_imm(a, .Sar, v, 16)
+		native.imp_store(a, "gte.state", v, off + 4)
+	case 16 ..= 19:
+		native.alu_imm(a, .And, v, 0xffff)
+		native.imp_store(a, "gte.state", v, GTE_SZ + 4 * (r - 16))
+	case 20 ..= 22:
+		native.imp_store(a, "gte.state", v, GTE_RGB + 4 * (r - 20))
+	case 23:
+		native.imp_store(a, "gte.state", v, GTE_RES1)
+	case 24 ..= 27:
+		native.imp_store(a, "gte.state", v, GTE_MAC + 4 * (r - 24))
+	case:
+		if v != .B {native.mov(a, .B, v)}
+		native.mov_imm(a, .A, r)
+		native.call(a, "gte.gte_write", .A, .B)
+	}
 }
 
 @(private = "file")
@@ -278,12 +376,11 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 	case op == 18:
 		switch {
 		case rs == 0 || rs == 2:
-			call_imm(a, "gte.gte_read", rd if rs == 0 else rd + 32)
+			gte_get(a, rd if rs == 0 else rd + 32)
 			result(a, rt, ld)
 		case rs == 4 || rs == 6:
-			native.mov_imm(a, .A, rd if rs == 4 else rd + 32)
 			get(a, .B, rt)
-			native.call(a, "gte.gte_write", .A, .B)
+			gte_put(a, rd if rs == 4 else rd + 32, .B)
 		case rs & 16 != 0:
 			call_imm(a, "gte.gte_cmd", i.w & 0x1ffffff)
 		case:
@@ -323,11 +420,9 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 	case op == 0x32:
 		address(a, i)
 		native.load(a, .B32, false, "cpu.lw")
-		native.mov(a, .B, .A)
-		native.mov_imm(a, .A, rt)
-		native.call(a, "gte.gte_write", .A, .B)
+		gte_put(a, rt, .A)
 	case op == 0x3a:
-		call_imm(a, "gte.gte_read", rt)
+		gte_get(a, rt)
 		native.mov(a, .B, .A)
 		address(a, i)
 		native.store(a, .B32, "cpu.sw")

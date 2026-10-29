@@ -605,24 +605,26 @@ vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 	}
 }
 
-// dst = the 4 bytes at off, a multiple of 4, from the address in import
-// base.
-imp_load :: proc(a: ^Asm, dst: Reg, base: string, off: u32 = 0) {
+// dst = the 4 bytes (w B32) or 2 (B16, extended as signed says) at off
+// from the address in import base. off is a multiple of the width, or
+// under 256.
+imp_load :: proc(a: ^Asm, dst: Reg, base: string, off: u32 = 0, w := Width.B32, signed := false) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_imp_ldst(a, dst, base, false, off)
+		x64_imp_ldst(a, dst, base, false, off, w, signed)
 	case .Arm64:
-		a64_imp_ldst(a, dst, base, false, off)
+		a64_imp_ldst(a, dst, base, false, off, w, signed)
 	}
 }
 
-// The 4 bytes at off from the address in import base = src.
-imp_store :: proc(a: ^Asm, base: string, src: Reg, off: u32 = 0) {
+// The 4 bytes (w B32) or 2 (B16) at off from the address in import base =
+// src. off is as for imp_load.
+imp_store :: proc(a: ^Asm, base: string, src: Reg, off: u32 = 0, w := Width.B32) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_imp_ldst(a, src, base, true, off)
+		x64_imp_ldst(a, src, base, true, off, w, false)
 	case .Arm64:
-		a64_imp_ldst(a, src, base, true, off)
+		a64_imp_ldst(a, src, base, true, off, w, false)
 	}
 }
 

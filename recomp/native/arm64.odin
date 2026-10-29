@@ -372,10 +372,26 @@ a64_vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 }
 
 // Through x16.
-a64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32) {
-	assert(off % 4 == 0 && off / 4 < 4096, "native: import offset")
+a64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32, w: Width, signed: bool) {
+	assert(w == .B16 || w == .B32, "native: import access width")
 	load_imp(a, IP0, imp(a, base))
-	emit32(a, (0xb9000000 if store else 0xb9400000) | off / 4 << 10 | IP0 << 5 | A64_REG[r]) // str/ldr w
+	size: u32 = 2 if w == .B16 else 4
+	op: u32
+	switch {
+	case store:
+		op = 0x78000000 if w == .B16 else 0xb8000000 // sturh, stur w
+	case w == .B16:
+		op = 0x78c00000 if signed else 0x78400000 // ldursh w, ldurh
+	case:
+		op = 0xb8400000 // ldur w
+	}
+	if off % size == 0 && off / size < 4096 {
+		// The scaled form: strh, str w, ldrsh w, ldrh, ldr w.
+		emit32(a, op | 0x01000000 | off / size << 10 | IP0 << 5 | A64_REG[r])
+	} else {
+		assert(off < 256, "native: import offset")
+		emit32(a, op | off << 12 | IP0 << 5 | A64_REG[r])
+	}
 }
 
 a64_vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
