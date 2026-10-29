@@ -215,7 +215,11 @@ fmod_command :: proc(cid, opt, a: u32) {
 			if s != nil && s.freq > 0 {result = u32((voices[st.channel].pos >> 32) * 1000 / u64(s.freq))}
 		}
 	case 0x3c: // Reverb_SetProperties {environment, room (mB), delay, feedback, core flags}
-		if p[4] & 0x300 != 0 {reverb_set(p[0], (i32(p[1]) + 10000) * 0x3fff / 10000)}
+		if p[4] & 0x300 != 0 {
+			// A new mode starts on a cleared work area.
+			evol := clamp((i32(p[1]) + 10000) * 0x3fff / 10000, 0, 0x3fff)
+			reverb_set(&reverb, p[0], evol, evol, (p[0] <= 9 ? p[0] : 0) != reverb.mode)
+		}
 		result = 1
 	case 0x3d: result = song_load(cid, opt, p)
 	case 0x3e: song_free(p[0]); result = 1
@@ -835,7 +839,7 @@ fmod_mix :: proc(out: []i16) {
 			v.pos += step
 		}
 	}
-	reverb_mix(send, acc)
+	reverb_mix(&reverb, send, acc)
 	for x, i in acc {out[i] = i16(clamp(x, -32768, 32767))}
 }
 

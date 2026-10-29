@@ -1,9 +1,12 @@
-// SPU2 reverb, for FMOD's FSOUND_Reverb_SetProperties.
+// SPU2 reverb, for FMOD's FSOUND_Reverb_SetProperties and for the SPU
+// cores' effect (spu_effect).
 //
 // FMOD.IRX sets the environment as the core effect mode and the room level
 // as EVOL; channels whose reverb room is not -10000 join the VMIXE mask.
 // Each mode loads a PSX SPU reverb preset (offsets in 8-byte units), and the
-// core runs the PSX algorithm at half the output rate.
+// core runs the PSX algorithm at half the output rate: 24 kHz for the 48 kHz
+// both mixers render. Preset offsets and work sizes count samples at that
+// rate, as libsd's sceSdSetEffectAttr loads the same values on SPU2.
 // Echo and delay take their preset as is: the delay and feedback FMOD sends
 // are not applied.
 package ps2_iop
@@ -33,37 +36,39 @@ REVERB_WORK := [9]u32{0x1360, 0xfa0, 0x2420, 0x37f0, 0x56f0, 0x7b60, 0xc020, 0xc
 @(private = "file")
 REVERB_MAX :: 0xc020
 
-@(private)
+// One reverb's state: FMOD's, and each SPU core's.
 Reverb :: struct {
 	mode: u32, // 0 off, else 1 .. 9
-	evol: i32, // return volume, 0 .. 0x3fff
+	evol: [2]i32, // return volume, left and right (EVOLL, EVOLR)
 	pos:  u32, // work area position
 	last: [2]i32, // previous half-rate output, for the upsample
 	work: [REVERB_MAX]i16,
 }
 
+// FMOD's reverb.
 @(private)
 reverb: Reverb
 
-// Select a mode and return volume; a new mode starts on a cleared work area.
-reverb_set :: proc(mode: u32, evol: i32) {
-	m := mode <= 9 ? mode : 0
-	if m != reverb.mode {
-		reverb.work = {}
-		reverb.pos, reverb.last = 0, {}
+// Select a mode (0 off, an unknown one is off) and return volumes; clear
+// zeroes the work area and restarts it.
+reverb_set :: proc(w: ^Reverb, mode: u32, evol_l, evol_r: i32, clear: bool) {
+	if clear {
+		w.work = {}
+		w.pos, w.last = 0, {}
 	}
-	reverb.mode, reverb.evol = m, clamp(evol, 0, 0x3fff)
+	w.mode = mode <= 9 ? mode : 0
+	w.evol = {evol_l, evol_r}
 }
 
 // Run the reverb over the interleaved stereo send and add its return to acc.
-reverb_mix :: proc(send, acc: []i32) {
-	if reverb.mode == 0 {return}
-	r := &REVERB_PRESETS[reverb.mode - 1]
-	size := REVERB_WORK[reverb.mode - 1]
+reverb_mix :: proc(w: ^Reverb, send, acc: []i32) {
+	if w.mode == 0 {return}
+	r := &REVERB_PRESETS[w.mode - 1]
+	size := REVERB_WORK[w.mode - 1]
 	vol :: #force_inline proc(r: ^[32]u16, i: int) -> i32 {return i32(i16(r[i]))}
 	// Work area sample at register i (8-byte units) plus d samples.
-	at :: #force_inline proc(r: ^[32]u16, i: int, d: i32, size: u32) -> ^i16 {
-		return &reverb.work[(i32(reverb.pos) + i32(r[i]) * 4 + d) %% i32(size)]
+	at :: #force_inline proc(w: ^Reverb, r: ^[32]u16, i: int, d: i32, size: u32) -> ^i16 {
+		return &w.work[(i32(w.pos) + i32(r[i]) * 4 + d) %% i32(size)]
 	}
 	sat :: #force_inline proc(x: i32) -> i16 {return i16(clamp(x, -32768, 32767))}
 	rd :: #force_inline proc(p: ^i16) -> i32 {return i32(p^)}
@@ -74,38 +79,38 @@ reverb_mix :: proc(send, acc: []i32) {
 		lin := i32(sat((send[n] + send[n + 2]) / 2)) * vol(r, 30) >> 15
 		rin := i32(sat((send[n + 1] + send[n + 3]) / 2)) * vol(r, 31) >> 15
 		// Same side and cross reflections: mLSAME, mRSAME, mLDIFF, mRDIFF.
-		refl :: #force_inline proc(r: ^[32]u16, m, d: int, x, viir, vwall: i32, size: u32) -> i16 {
-			prev := rd(at(r, m, -1, size))
-			return sat(((x + rd(at(r, d, 0, size)) * vwall >> 15) - prev) * viir >> 15 + prev)
+		refl :: #force_inline proc(w: ^Reverb, r: ^[32]u16, m, d: int, x, viir, vwall: i32, size: u32) -> i16 {
+			prev := rd(at(w, r, m, -1, size))
+			return sat(((x + rd(at(w, r, d, 0, size)) * vwall >> 15) - prev) * viir >> 15 + prev)
 		}
-		at(r, 10, 0, size)^ = refl(r, 10, 16, lin, viir, vwall, size)
-		at(r, 11, 0, size)^ = refl(r, 11, 17, rin, viir, vwall, size)
-		at(r, 18, 0, size)^ = refl(r, 18, 25, lin, viir, vwall, size)
-		at(r, 19, 0, size)^ = refl(r, 19, 24, rin, viir, vwall, size)
+		at(w, r, 10, 0, size)^ = refl(w, r, 10, 16, lin, viir, vwall, size)
+		at(w, r, 11, 0, size)^ = refl(w, r, 11, 17, rin, viir, vwall, size)
+		at(w, r, 18, 0, size)^ = refl(w, r, 18, 25, lin, viir, vwall, size)
+		at(w, r, 19, 0, size)^ = refl(w, r, 19, 24, rin, viir, vwall, size)
 		// Comb taps mLCOMB1..4 / mRCOMB1..4.
-		lout := (vol(r, 3) * rd(at(r, 12, 0, size)) + vol(r, 4) * rd(at(r, 14, 0, size)) +
-			vol(r, 5) * rd(at(r, 20, 0, size)) + vol(r, 6) * rd(at(r, 22, 0, size))) >> 15
-		rout := (vol(r, 3) * rd(at(r, 13, 0, size)) + vol(r, 4) * rd(at(r, 15, 0, size)) +
-			vol(r, 5) * rd(at(r, 21, 0, size)) + vol(r, 6) * rd(at(r, 23, 0, size))) >> 15
+		lout := (vol(r, 3) * rd(at(w, r, 12, 0, size)) + vol(r, 4) * rd(at(w, r, 14, 0, size)) +
+			vol(r, 5) * rd(at(w, r, 20, 0, size)) + vol(r, 6) * rd(at(w, r, 22, 0, size))) >> 15
+		rout := (vol(r, 3) * rd(at(w, r, 13, 0, size)) + vol(r, 4) * rd(at(w, r, 15, 0, size)) +
+			vol(r, 5) * rd(at(w, r, 21, 0, size)) + vol(r, 6) * rd(at(w, r, 23, 0, size))) >> 15
 		// Two all-pass stages: mLAPF1/mRAPF1, then mLAPF2/mRAPF2.
-		apf :: #force_inline proc(r: ^[32]u16, m: int, x, d, v: i32, size: u32) -> i32 {
-			t := rd(at(r, m, -d, size))
+		apf :: #force_inline proc(w: ^Reverb, r: ^[32]u16, m: int, x, d, v: i32, size: u32) -> i32 {
+			t := rd(at(w, r, m, -d, size))
 			y := sat(x - (v * t >> 15))
-			at(r, m, 0, size)^ = y
+			at(w, r, m, 0, size)^ = y
 			return i32(y) * v >> 15 + t
 		}
-		lout = apf(r, 26, lout, dapf1, vapf1, size)
-		rout = apf(r, 27, rout, dapf1, vapf1, size)
-		lout = apf(r, 28, lout, dapf2, vapf2, size)
-		rout = apf(r, 29, rout, dapf2, vapf2, size)
-		lout = i32(sat(lout)) * reverb.evol >> 15
-		rout = i32(sat(rout)) * reverb.evol >> 15
-		reverb.pos = (reverb.pos + 1) % size
+		lout = apf(w, r, 26, lout, dapf1, vapf1, size)
+		rout = apf(w, r, 27, rout, dapf1, vapf1, size)
+		lout = apf(w, r, 28, lout, dapf2, vapf2, size)
+		rout = apf(w, r, 29, rout, dapf2, vapf2, size)
+		lout = i32(sat(lout)) * w.evol[0] >> 15
+		rout = i32(sat(rout)) * w.evol[1] >> 15
+		w.pos = (w.pos + 1) % size
 		// Back to the output rate: the midpoint, then the new sample.
-		acc[n] += (reverb.last[0] + lout) / 2
-		acc[n + 1] += (reverb.last[1] + rout) / 2
+		acc[n] += (w.last[0] + lout) / 2
+		acc[n + 1] += (w.last[1] + rout) / 2
 		acc[n + 2] += lout
 		acc[n + 3] += rout
-		reverb.last = {lout, rout}
+		w.last = {lout, rout}
 	}
 }

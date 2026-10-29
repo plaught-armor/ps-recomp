@@ -38,6 +38,7 @@ REVERB_HASH := [9]u64 {
 	0xcb6373d5bfd50937,
 }
 
+rev: iop.Reverb // a work area too big for the stack
 failed: bool
 snap: core.Snapshot
 loaded: bool // not emulated state: tells the run after the load apart
@@ -133,7 +134,7 @@ reverb_presets :: proc() {
 	seed: u32 = 1
 	send, acc: [CHUNK * 2]i32
 	for mode in u32(1) ..= 9 {
-		iop.reverb_set(mode, 0x3fff)
+		iop.reverb_set(&rev, mode, 0x3fff, 0x3fff, true)
 		h: u64 = 0xcbf29ce484222325
 		for c in 0 ..< 0x20000 / CHUNK {
 			for &x in send {
@@ -141,7 +142,7 @@ reverb_presets :: proc() {
 				x = c % 4 == 0 ? i32(seed >> 16) % 16000 - 8000 : 0
 			}
 			acc = {}
-			iop.reverb_mix(send[:], acc[:])
+			iop.reverb_mix(&rev, send[:], acc[:])
 			for x in acc {
 				for b in 0 ..< u32(4) {h = (h ~ u64(u32(x) >> (b * 8) & 0xff)) * 0x100000001b3}
 			}
@@ -151,7 +152,6 @@ reverb_presets :: proc() {
 			failed = true
 		}
 	}
-	iop.reverb_set(0, 0)
 }
 
 game :: proc(_: rawptr) {
