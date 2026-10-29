@@ -306,9 +306,10 @@ a64_vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 }
 
 // Through x16.
-a64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool) {
+a64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32) {
+	assert(off % 4 == 0 && off / 4 < 4096, "native: import offset")
 	load_imp(a, IP0, imp(a, base))
-	emit32(a, (0xb9000000 if store else 0xb9400000) | IP0 << 5 | A64_REG[r]) // str/ldr w
+	emit32(a, (0xb9000000 if store else 0xb9400000) | off / 4 << 10 | IP0 << 5 | A64_REG[r]) // str/ldr w
 }
 
 a64_vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {

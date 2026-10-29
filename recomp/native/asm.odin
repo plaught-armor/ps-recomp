@@ -591,23 +591,24 @@ vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 	}
 }
 
-// dst = the 4 bytes at the address in import base.
-imp_load :: proc(a: ^Asm, dst: Reg, base: string) {
+// dst = the 4 bytes at off, a multiple of 4, from the address in import
+// base.
+imp_load :: proc(a: ^Asm, dst: Reg, base: string, off: u32 = 0) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_imp_ldst(a, dst, base, false)
+		x64_imp_ldst(a, dst, base, false, off)
 	case .Arm64:
-		a64_imp_ldst(a, dst, base, false)
+		a64_imp_ldst(a, dst, base, false, off)
 	}
 }
 
-// The 4 bytes at the address in import base = src.
-imp_store :: proc(a: ^Asm, base: string, src: Reg) {
+// The 4 bytes at off from the address in import base = src.
+imp_store :: proc(a: ^Asm, base: string, src: Reg, off: u32 = 0) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_imp_ldst(a, src, base, true)
+		x64_imp_ldst(a, src, base, true, off)
 	case .Arm64:
-		a64_imp_ldst(a, src, base, true)
+		a64_imp_ldst(a, src, base, true, off)
 	}
 }
 

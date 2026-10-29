@@ -311,7 +311,18 @@ main :: proc() {
 		{unaligned(45, 1), .SDR},
 		{unaligned(45, 0), .SDR},
 		{special2(0x3b), .VU0}, // VWAITQ
-		{special2(0x38), .VU0}, // VDIV, left to the interpreter
+		{special2(0x1f), .VU0}, // VCLIP, left to the interpreter
+		{special2(0x38, 0), .VU0}, // VDIV vf1x / vf2x
+		{special2(0x38, 0xb), .VU0}, // VDIV vf1w / vf2z
+		{special2(0x38, 0x6, 1), .VU0}, // VDIV vf1z / vf1y
+		{special2(0x38, 0x5, 1), .VU0}, // VDIV vf1y / vf1y
+		{special2(0x39, 0), .VU0}, // VSQRT vf2x
+		{special2(0x39, 0xc), .VU0}, // VSQRT vf2w
+		{special2(0x39, 0x8, 1), .VU0}, // VSQRT vf1z
+		{special2(0x3a, 0), .VU0}, // VRSQRT vf1x / sqrt(vf2x)
+		{special2(0x3a, 0xe), .VU0}, // VRSQRT vf1z / sqrt(vf2w)
+		{special2(0x3a, 0x9, 1), .VU0}, // VRSQRT vf1y / sqrt(vf1z)
+		{special2(0x3a, 0xf, 1), .VU0}, // VRSQRT vf1w / sqrt(vf1w)
 		{54 << 26 | 1 << 21 | 2 << 16 | (0x10000 - MEM_BACK), .LQC2},
 		{54 << 26 | 1 << 21 | (0x10000 - MEM_BACK), .LQC2}, // vf0 stays
 		{62 << 26 | 1 << 21 | 2 << 16 | (0x10000 - MEM_BACK), .SQC2},
@@ -354,11 +365,12 @@ main :: proc() {
 		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0]}
 		free_all(context.temp_allocator)
 	}
-	// VDIV is left to the interpreter on purpose.
-	delete_key(&slow, "VU0 special 38")
-	// The COP1 ops are inline on x64 only.
+	// VCLIP is left to the interpreter on purpose.
+	delete_key(&slow, "VU0 special 1f")
+	// The COP1 ops, VDIV, VSQRT and VRSQRT are inline on x64 only.
 	if arch == .Arm64 {
 		for op in COP1_OPS {delete_key(&slow, fmt.tprint(op))}
+		for k in ([?]string{"VU0 special 38", "VU0 special 39", "VU0 special 3a"}) {delete_key(&slow, k)}
 	}
 	if len(slow) != 0 {
 		fmt.eprintln("FAIL interpreter calls in native code:", slow)

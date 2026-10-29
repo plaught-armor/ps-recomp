@@ -417,9 +417,9 @@ x64_vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 }
 
 // Through rdx.
-x64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool) {
+x64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32) {
 	op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
-	op_state(a, false, 0x89 if store else 0x8b, X64_REG[r], 0, RDX)
+	op_state(a, false, 0x89 if store else 0x8b, X64_REG[r], off, RDX)
 }
 
 x64_vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {

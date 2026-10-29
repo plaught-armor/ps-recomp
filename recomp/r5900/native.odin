@@ -772,6 +772,100 @@ VU_EXP, VU_SIGN, VU_MAX, VU_ABS, VU_ZERO, VU_DEST :: 0, 16, 32, 48, 64, 80
 @(private = "file")
 VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
 
+// VDIV (key 0x38), VSQRT (0x39) and VRSQRT (0x3a) of VU0 macro op w, as
+// vu.vu_op runs them: Q, and status I and D with their sticky bits, as
+// vu_div_flags sets them. The results use the host's divss and sqrtss with
+// its default rounding, as the runtime's f32 code does. Uses A, B, C, LD,
+// V0 and V1, and keeps T, which can hold a branch condition across this
+// op in a delay slot. x64 only.
+@(private = "file")
+vu0_div :: proc(a: ^native.Asm, w, key: u32) -> bool {
+	fs, fsf, ft, ftf := (w >> 11) & 31, (w >> 21) & 3, (w >> 16) & 31, (w >> 23) & 3
+	native.imp_load(a, .A, "vu.vf", 16 * fs + 4 * fsf)
+	native.imp_load(a, .B, "vu.vf", 16 * ft + 4 * ftf)
+	// LD = the status bits.
+	flags := native.new_label(a)
+	native.mov_imm(a, .LD, 0)
+	native.mov(a, .C, .B)
+	native.alu_imm(a, .And, .C, 0x7fffffff)
+	if key == 0x39 {
+		// vu_div_flags(v, 1, t[ftf] < 0 ? 0 : 1): D where t < 0, so a
+		// nonzero magnitude that is not a NaN, with the sign set; -0 and
+		// a negative NaN are not below 0.
+		native.alu_imm(a, .Sub, .C, 1)
+		native.br_cmp_imm(a, .Geu, .C, 0x7f800000, flags)
+		native.mov(a, .LD, .B)
+		native.alu_imm(a, .Shr, .LD, 31)
+		native.alu_imm(a, .Shl, .LD, 5)
+	} else {
+		// vu_div_flags(v, s[fsf], t[ftf]): `if b == 0 {f = a == 0 ? 0x10
+		// : 0x20}`, where only +-0 equals 0: I for 0/0, D for x/0.
+		native.br_zero(a, .C, flags, nonzero = true)
+		// set_cond_imm takes C for the 0.
+		native.mov(a, .LD, .A)
+		native.alu_imm(a, .And, .LD, 0x7fffffff)
+		native.set_cond_imm(a, .Eq, .LD, 0)
+		native.alu_imm(a, .Shl, .LD, 4)
+		native.mov_imm(a, .C, 0x20)
+		native.alu(a, .Sub, .C, .LD)
+		native.mov(a, .LD, .C)
+	}
+	native.bind(a, flags)
+	// v.status = (v.status &~ 0x30) | f | f << 6
+	native.imp_load(a, .C, "vu.status")
+	native.alu_imm(a, .And, .C, ~u32(0x30))
+	native.alu(a, .Or, .C, .LD)
+	native.alu_imm(a, .Shl, .LD, 6)
+	native.alu(a, .Or, .C, .LD)
+	native.imp_store(a, "vu.status", .C)
+	// Q into A.
+	store, fmax := native.new_label(a), native.new_label(a)
+	switch key {
+	case 0x38:
+		// cpu.fdiv: a divisor of exponent 0 gives +-FMAX with the sign of
+		// a ^ b, else fclamp(a / b).
+		native.mov(a, .C, .B)
+		native.alu_imm(a, .And, .C, 0x7f800000)
+		native.mov(a, .LD, .A)
+		native.alu(a, .Xor, .LD, .B)
+		native.br_zero(a, .C, fmax)
+		native.float_op(a, .Fdiv, .A, .B)
+	case 0x39:
+		// math.sqrt(abs(t[ftf])), not clamped
+		native.mov(a, .A, .B)
+		native.alu_imm(a, .And, .A, 0x7fffffff)
+		native.float_sqrt(a, .A)
+		native.jmp(a, store)
+	case 0x3a:
+		// cpu.frsqrt: s = sqrt(|b|); s of exponent 0 gives +-FMAX with
+		// the sign of a, else fclamp(a / s).
+		native.alu_imm(a, .And, .B, 0x7fffffff)
+		native.float_sqrt(a, .B)
+		native.mov(a, .C, .B)
+		native.alu_imm(a, .And, .C, 0x7f800000)
+		native.mov(a, .LD, .A)
+		native.br_zero(a, .C, fmax)
+		native.float_op(a, .Fdiv, .A, .B)
+	}
+	// cpu.fclamp: exponent 255 to +-FMAX, exponent 0 to +-0.
+	zero := native.new_label(a)
+	native.mov(a, .LD, .A)
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .And, .C, 0x7f800000)
+	native.br_zero(a, .C, zero)
+	native.br_cmp_imm(a, .Ne, .C, 0x7f800000, store)
+	native.bind(a, fmax) // the sign in LD
+	native.mov(a, .A, .LD)
+	native.alu_imm(a, .And, .A, 0x80000000)
+	native.alu_imm(a, .Or, .A, 0x7f7fffff)
+	native.jmp(a, store)
+	native.bind(a, zero)
+	native.alu_imm(a, .And, .A, 0x80000000)
+	native.bind(a, store)
+	native.imp_store(a, "vu.q", .A)
+	return true
+}
+
 // Code for VU0 macro op w as vu.vu_op runs it, or false to leave it there:
 // moves, waits, the float upper ops of the VF registers and ACC with their
 // broadcast, Q and I forms, and ITOF, FTOI and ABS. Results clamp and set
@@ -819,6 +913,7 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x2f: kind = upper ? Kind.Mini : Kind.Nop // VNOP
 	case 0x30: if upper {return false}; kind = .Move
 	case 0x31: if upper {return false}; kind = .Mr32
+	case 0x38 ..= 0x3a: if upper || a.arch == .Arm64 {return false}; return vu0_div(a, w, key)
 	case 0x3b: if upper {return false}; kind = .Nop // VWAITQ
 	case: return false
 	}
