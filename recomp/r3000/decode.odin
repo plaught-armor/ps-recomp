@@ -16,6 +16,10 @@ Insn :: struct {
 	kind:                       Kind,
 	reads, writes:              Regs,
 	is_load:                    bool,
+	// An lwl/lwr or swl/swr pair lower fused (fuse_pair): the word at the
+	// low address, which need not be aligned; op and imm are the lwr's or
+	// swr's.
+	pair:                       bool,
 }
 
 is_load_op :: proc(op: u32) -> bool {

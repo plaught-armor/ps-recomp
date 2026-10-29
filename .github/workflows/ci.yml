@@ -26,13 +26,13 @@ jobs:
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback; do
+            for p in tests/core tests/native tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
           done
 
-  # Run the coroutine/snapshot/rollback, native code, EE native, EE FPU, lowering and PS1 fallback tests on each host.
+  # Run the coroutine/snapshot/rollback, native code, EE native, EE FPU, lowering, PS1 fallback and PS1 unaligned-word tests on each host.
   test:
     strategy:
       fail-fast: false
@@ -75,6 +75,7 @@ jobs:
           odin run tests/spu -collection:ps=. -out:spu_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_fallback -collection:ps=. -out:psx_fallback_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true -out:psx_fallback_count_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_unaligned -collection:ps=. -out:psx_unaligned_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)
         if: ${{ matrix.rosetta }}
         run: |
@@ -85,6 +86,8 @@ jobs:
           arch -x86_64 ./native_test
           odin build tests/ee_native -collection:ps=. -target:darwin_amd64 -out:ee_native_test
           arch -x86_64 ./ee_native_test
+          odin build tests/psx_unaligned -collection:ps=. -target:darwin_amd64 -out:psx_unaligned_test
+          arch -x86_64 ./psx_unaligned_test
           odin build tests/fpu -collection:ps=. -target:darwin_amd64 -out:fpu_test
           arch -x86_64 ./fpu_test
           odin build tests/vu -collection:ps=. -target:darwin_amd64 -out:vu_test

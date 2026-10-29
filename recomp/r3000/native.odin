@@ -24,6 +24,9 @@ CYCLES :: 136
 @(private = "file", rodata)
 RAM_GUARDS := [?]native.Guard{{"trace.watching", 0xff}, {"cpu.sr_isolate", 0x01}}
 
+// RAM pages (psx/cpu/bus.odin RAM_PAGE_SHIFT).
+PAGE_SHIFT :: 12
+
 // PS1 main RAM as the bus decodes it (psx/cpu/bus.odin in_ram): 2 MiB
 // mirrored below physical 0x800000. A store into a page armed for a
 // checkpoint calls, so the runtime saves the page.
@@ -33,7 +36,7 @@ native_ram :: proc() -> native.Ram {
 		outside = 0x1f800000,
 		size = 2 * 1024 * 1024,
 		pages = "cpu.ram_armed",
-		page_shift = 12,
+		page_shift = PAGE_SHIFT,
 		guards = RAM_GUARDS[:],
 	}
 }
@@ -92,6 +95,32 @@ bad :: proc(a: ^native.Asm, i: Insn) {
 	native.mov_imm(a, .A, i.pc)
 	native.mov_imm(a, .B, i.w)
 	native.call(a, "cpu.bad_insn", .A, .B)
+}
+
+// The word at A of a fused lwl/lwr or swl/swr pair (store: the value in B),
+// which need not be aligned: in place when the word is inside one RAM page,
+// as cpu.lw_u and cpu.sw_u do it, else by calling them. One page keeps it
+// below the end of RAM and under the store's page check.
+@(private = "file")
+word_u :: proc(a: ^native.Asm, store: bool) {
+	slow := "cpu.sw_u" if store else "cpu.lw_u"
+	split, done := native.new_label(a), native.new_label(a)
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .And, .C, (1 << PAGE_SHIFT) - 1)
+	native.br_cmp_imm(a, .Geu, .C, (1 << PAGE_SHIFT) - 3, split)
+	if store {
+		native.store(a, .B32, slow)
+	} else {
+		native.load(a, .B32, false, slow)
+	}
+	native.jmp(a, done)
+	native.bind(a, split)
+	if store {
+		native.call(a, slow, .A, .B)
+	} else {
+		native.call(a, slow, .A)
+	}
+	native.bind(a, done)
 }
 
 // The instruction's result is in A: to its register, or to LD for a load
@@ -232,7 +261,9 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 		WIDTHS :: [7]native.Width{.B8, .B16, .B32, .B32, .B8, .B16, .B32}
 		loads, widths := LOADS, WIDTHS
 		address(a, i)
-		if op == 0x22 || op == 0x26 {
+		if i.pair {
+			word_u(a, false)
+		} else if op == 0x22 || op == 0x26 {
 			get(a, .B, rt)
 			native.call(a, loads[op - 0x20], .A, .B)
 		} else {
@@ -244,12 +275,14 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 		stores := STORES
 		address(a, i)
 		get(a, .B, rt)
-		switch op {
-		case 0x28:
+		switch {
+		case i.pair:
+			word_u(a, true)
+		case op == 0x28:
 			native.store(a, .B8, "cpu.sb")
-		case 0x29:
+		case op == 0x29:
 			native.store(a, .B16, "cpu.sh")
-		case 0x2b:
+		case op == 0x2b:
 			native.store(a, .B32, "cpu.sw")
 		case:
 			native.call(a, stores[op - 0x28], .A, .B)

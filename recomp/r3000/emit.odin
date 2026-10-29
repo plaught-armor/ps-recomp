@@ -158,6 +158,9 @@ emit_op :: proc(i: Insn) -> []string {
 		}
 	case is_load_op(op):
 		a := addr_expr(i)
+		if i.pair {
+			return set_reg(rt, f("cpu.lw_u(%s)", a), true)
+		}
 		switch op {
 		case 0x22, 0x26:
 			return set_reg(rt, f("cpu.%s(%s, %s)", op == 0x22 ? "lwl" : "lwr", a, R(rt)), true)
@@ -166,7 +169,7 @@ emit_op :: proc(i: Insn) -> []string {
 		return set_reg(rt, f("cpu.%s(%s)", names[op - 0x20], a), true)
 	case is_store_op(op):
 		names := [7]string{"sb", "sh", "swl", "sw", "", "", "swr"}
-		return one("cpu.%s(%s, %s)", names[op - 0x28], addr_expr(i), R(rt))
+		return one("cpu.%s(%s, %s)", "sw_u" if i.pair else names[op - 0x28], addr_expr(i), R(rt))
 	case op == 0x32:
 		return one("gte.gte_write(%d, cpu.lw(%s))", rt, addr_expr(i))
 	case op == 0x3a:

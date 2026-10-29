@@ -122,10 +122,18 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 		l.pending += 1
 
 		if i.kind == .Alu || i.kind == .Sys || i.kind == .Bad {
+			// The last instruction i stands for: a fused pair ends at pc + 4.
+			last := pc
+			if p, ok := fuse_pair(&l, i, patches); ok {
+				i = p
+				last = pc + 4
+				l.pending += 1
+				idx += 1
+			}
 			// Load delay: the next instruction still sees the old register
 			// value.
-			nxt, has_next := l.insns[pc + 4]
-			if i.is_load && i.writes != {} && has_next && pc + 4 not_in f.labels && !has_delay(nxt) && pc + 4 not_in skip_delay {
+			nxt, has_next := l.insns[last + 4]
+			if i.is_load && i.writes != {} && has_next && last + 4 not_in f.labels && !has_delay(nxt) && last + 4 not_in skip_delay {
 				rt := 0
 				for r in i.writes {
 					rt = r
@@ -253,6 +261,37 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 		put(&l, {kind = .Return})
 	}
 	return l.steps[:]
+}
+
+// lwl rt, off+3(rs) then lwr rt, off(rs) (or swl then swr) is a word at
+// off(rs) that need not be aligned: one access, as cpu.lw_u and cpu.sw_u.
+// Not when the lwr is a block label or has a patch (it is entered or left
+// on its own), nor for a load with rs == rt: the lwl's write would move
+// the lwr's address. That guard also keeps rt out of the second op's
+// address.
+@(private = "file")
+fuse_pair :: proc(l: ^Lowering, i: Insn, patches: []Patch) -> (Insn, bool) {
+	if i.op != 0x22 && i.op != 0x2a {
+		return {}, false
+	}
+	pc := i.pc + 4
+	nxt, ok := l.insns[pc]
+	if !ok || nxt.op != i.op + 4 || nxt.rs != i.rs || nxt.rt != i.rt || sx16(i.imm) != sx16(nxt.imm) + 3 {
+		return {}, false
+	}
+	if i.is_load && i.rs == i.rt {
+		return {}, false
+	}
+	if pc in l.f.labels {
+		return {}, false
+	}
+	for p in patches {
+		if p.at == pc {return {}, false}
+	}
+	p := nxt
+	p.pair = true
+	if p.is_load {p.reads = {int(p.rs)} - {0}}
+	return p, true
 }
 
 // beq r, r: the branch is always taken.

@@ -5,6 +5,7 @@
 // and never touch I/O.
 package psx_cpu
 
+import "base:intrinsics"
 import "core:fmt"
 
 import "ps:core"
@@ -244,6 +245,27 @@ swr :: proc(a, v: u32) {
 		w = (w & 0x00ffffff) | (v << 24)
 	}
 	sw(al, w)
+}
+
+// The word at a, aligned or not: lwl a+3 then lwr a, which recompiled code
+// fuses into one access (recomp/r3000 lower.odin fuse_pair). In RAM with
+// the word inside one page it is read in place.
+lw_u :: proc(a: u32) -> u32 #no_bounds_check {
+	if o, ok := in_ram(a); ok && o & (RAM_PAGE - 1) <= RAM_PAGE - 4 {
+		return u32(intrinsics.unaligned_load((^u32le)(&ram[o])))
+	}
+	return lwr(a, lwl(a + 3, 0))
+}
+
+// Store the word v at a, aligned or not: swl a+3 then swr a.
+sw_u :: proc(a, v: u32) #no_bounds_check {
+	if o, ok := in_ram(a); ok && o & (RAM_PAGE - 1) <= RAM_PAGE - 4 && !core.trace.watching && cop0.sr & 0x10000 == 0 {
+		ram_guard(o)
+		intrinsics.unaligned_store((^u32le)(&ram[o]), u32le(v))
+		return
+	}
+	swl(a + 3, v)
+	swr(a, v)
 }
 
 @(private)
