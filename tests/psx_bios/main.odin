@@ -13,7 +13,8 @@
 //   skipping the HookEntryInt handler; an acknowledged counter ends it
 //   with the other counters still pending. SetDefaultExitFromException
 //   ends the exception after the walk without the hook. WaitEvent with
-//   interrupts blocked gives up instead of hanging.
+//   interrupts blocked gives up instead of hanging. syscall 3 returns 1;
+//   higher numbers deliver class 0xf0000010 spec 0x4000.
 //   The kernel layout games read and patch: the exception vector (at 0x00
 //   too), the C0 and B0 tables, and the pad driver's pointers and vblank
 //   acknowledge, handed over by StartPAD and turned off by ChangeClearPad
@@ -367,6 +368,33 @@ main :: proc() {
 	cpu.w32(PAD_WORD, 0)
 	check("B(16h)", b(0x16), 0xfffffefe)
 	check("pad word after B(16h)", cpu.r32(PAD_WORD), 0xfffffefe)
+
+	// syscall: critical sections edit SR, 3 returns 1, higher numbers
+	// deliver class 0xf0000010 spec 0x4000.
+	cpu.bios_syscall = bios.bios_syscall
+	cpu.irq_check = io.irq_check
+	io.irq_regs = {}
+	sr := cpu.cop0.sr
+	cpu.cop0.sr = 0x401
+	cpu.state.r[4] = 1
+	cpu.syscall(0)
+	check("EnterCriticalSection with interrupts on", cpu.state.r[2], 1)
+	check("SR after EnterCriticalSection", cpu.cop0.sr & 0x401, 0)
+	cpu.syscall(0)
+	check("EnterCriticalSection with interrupts off", cpu.state.r[2], 0)
+	cpu.state.r[4] = 2
+	cpu.syscall(0)
+	check("SR after ExitCriticalSection", cpu.cop0.sr & 0x401, 0x401)
+	sys := open(0xf0000010, 0x4000, 0x2000)
+	cpu.state.r[2] = 0
+	cpu.state.r[4] = 3
+	cpu.syscall(0)
+	check("syscall 3", cpu.state.r[2], 1)
+	check("syscall event after syscall 3", test(sys), 0)
+	cpu.state.r[4] = 4
+	cpu.syscall(0)
+	check("syscall event after syscall 4", test(sys), 1)
+	cpu.cop0.sr = sr
 
 	// Kernel layout.
 	bios.bios_init()

@@ -32,6 +32,8 @@ bios: struct {
 	// The pad driver reads the pads (InitPAD, until libpad stops it through
 	// the pointer it takes from the driver's code).
 	pad_read:  bool,
+	// syscall 3 was called directly once (bios_syscall).
+	tcb_warn:  bool,
 }
 
 // Host input and GPU, set by package psx (hooks.odin) so this package does
@@ -276,6 +278,23 @@ bios_c :: proc(fn: u32) {
 	case:
 		bios_unknown("C", fn)
 	}
+}
+
+// syscall with a0 of 3 or more, as the retail kernel's handler does it.
+// 3 is ChangeThreadSubFunction(tcb), the thread switch under ChangeTh
+// (B 10h); the HLE threads have no control blocks to switch by, so a
+// direct call returns 1 and stays on the running thread. Anything higher
+// delivers class 0xf0000010 spec 0x4000.
+bios_syscall :: proc() {
+	if arg(0) == 3 {
+		if !bios.tcb_warn {
+			fmt.eprintfln("bios: syscall 3 (switch to TCB %#x) not done; ChangeTh is", arg(1))
+			bios.tcb_warn = true
+		}
+		ret(1)
+		return
+	}
+	deliver_event(0xf0000010, 0x4000)
 }
 
 @(private)

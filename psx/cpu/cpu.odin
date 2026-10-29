@@ -15,6 +15,7 @@ import "ps:core"
 
 // Handlers in the packages above this one, set by package psx at init.
 bios_a, bios_b, bios_c: proc(fn: u32)
+bios_syscall: proc()
 irq_check: proc()
 interp_run: proc(start: u32)
 io_read: proc(p: u32, size: u32) -> u32
@@ -349,8 +350,9 @@ rfe :: proc() {
 	cop0.sr = (cop0.sr & ~u32(0xf)) | ((cop0.sr >> 2) & 0xf)
 }
 
-// `syscall`: the only users are EnterCriticalSection (a0=1) and
-// ExitCriticalSection (a0=2), which the BIOS implements by editing SR.
+// `syscall`: EnterCriticalSection (a0=1) and ExitCriticalSection (a0=2),
+// which the BIOS implements by editing SR, are done here; the BIOS does
+// the rest.
 syscall :: proc(pc: u32) {
 	switch state.r[4] {
 	// The BIOS edits the SR saved on exception entry (bits 0x404), which rfe
@@ -364,6 +366,6 @@ syscall :: proc(pc: u32) {
 	case 0:
 		// NoFunction
 	case:
-		fmt.eprintfln("syscall %d at %#08x", state.r[4], pc)
+		bios_syscall()
 	}
 }
