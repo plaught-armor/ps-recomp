@@ -58,11 +58,15 @@ Adx_Rna :: struct {
 	playing:                bool,
 	since:                  u64, // EE cycles when playback last started
 	clock:                  u64, // sample count times EE_CLOCK not yet played
+	// Bytes of PCM per channel played but not yet returned (the reply was
+	// full, or the channel held nothing), at most a ring's worth: carried so
+	// the channels stay in step.
+	owed:                   [2]u32,
 }
 
 // The PCM an RNA consumed but has not yet mixed. Host output only, so not in
-// snapshots: wr counts samples written per channel, pos is the mixer's read
-// position in samples, 32.32 fixed point.
+// snapshots (rollback keeps the playing ones): wr counts samples written per
+// channel, pos is the mixer's read position in samples, 32.32 fixed point.
 Adx_Out :: struct {
 	ring:   [2][ADX_RING]i16,
 	wr:     [2]u64,
@@ -86,13 +90,50 @@ adx: struct {
 @(private)
 adx_out: [ADX_RNA]Adx_Out // by RNA slot
 
-// Emulated state, saved and restored by snapshots (snap.odin). A load
-// drops the unmixed PCM: it belongs to the run before the load.
+// The rings of the RNAs playing at each rollback record: `slots` has bit i
+// set for RNA slot i, and `outs` holds those rings in slot order.
+@(private)
+adx_rb: [core.RB_FRAMES]struct {
+	slots: u32,
+	outs:  [dynamic]Adx_Out,
+}
+
+// Emulated state, saved and restored by snapshots (snap.odin). A save-state
+// load drops the unmixed PCM: it belongs to the run before the load. A
+// rollback puts back the rings as they were at that frame, so the mix goes
+// on without a gap; a ring is 16 KB, so only the playing ones are kept.
 adx_snap :: proc() {
 	core.snap_add(&adx)
-	append(&core.snap_hooks, core.Snap_Hook{save = proc(id: int) {}, load = proc(id: int) {
-		for &o in adx_out {o.wr, o.pos, o.primed = {}, 0, false}
+	append(&core.snap_hooks, core.Snap_Hook{save = proc(id: int) {
+		if id < core.RB_HOOK_ID {return}
+		context.allocator = core.host_allocator // not the emulated heap
+		rec := &adx_rb[id - core.RB_HOOK_ID]
+		rec.slots = 0
+		clear(&rec.outs)
+		for r, i in adx.rna {
+			if r.handle == 0 || !r.playing {continue}
+			rec.slots |= 1 << u32(i)
+			append(&rec.outs, adx_out[i])
+		}
+	}, load = proc(id: int) {
+		rec := id >= core.RB_HOOK_ID ? &adx_rb[id - core.RB_HOOK_ID] : nil
+		n := 0
+		for &o, i in adx_out {
+			if rec != nil && rec.slots & (1 << u32(i)) != 0 {
+				o = rec.outs[n]
+				n += 1
+			} else {
+				adx_out_reset(&o)
+			}
+		}
 	}})
+}
+
+// Empty `o`. The mixer starts at sample 1, since the first sample it
+// interpolates also reads the one before.
+@(private)
+adx_out_reset :: proc(o: ^Adx_Out) {
+	o.wr, o.pos, o.primed = {}, 1 << 32, false
 }
 
 @(private)
@@ -120,8 +161,7 @@ adx_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		for &r, i in adx.rna {
 			if r.handle != 0 {continue}
 			r = {handle = adx.handles, channels = min(w[0], 2), sj = {w[2], w[3]}}
-			o := &adx_out[i]
-			o.wr, o.pos, o.primed = {}, 0, false
+			adx_out_reset(&adx_out[i])
 			break
 		}
 		w[0] = adx.handles
@@ -229,13 +269,15 @@ adx_sjx_packet :: proc(t: ^Adx_Dtx) -> u32 {
 		for sj, ch in r.sj[:r.channels] {
 			s := adx_sjx_of(sj)
 			if s == nil {continue}
-			bytes := samples * 2 // 16-bit PCM
-			for bytes > 0 && s.count > 0 && out < ADX_ENTRIES {
+			bytes := &r.owed[ch]
+			bytes^ = min(bytes^ + samples * 2, ADX_RING * 2) // 16-bit PCM
+			for bytes^ > 0 && s.count > 0 && out < ADX_ENTRIES {
 				c := &s.held[0]
-				n := min(bytes, c.size)
+				n := min(bytes^, c.size &~ 1) // whole samples
 				adx_ring_put(&adx_out[i], ch, c.addr, n)
+				if c.size - n == 1 {n = c.size} // a stray odd byte goes back with the chunk
 				adx_return(t, &out, s, {c.addr, n})
-				bytes -= n
+				bytes^ -= n &~ 1
 				c.addr += n
 				c.size -= n
 				if c.size > 0 {continue}
@@ -270,9 +312,8 @@ adx_rna_stop :: proc(i: int) {
 	for sj in r.sj[:r.channels] {
 		if s := adx_sjx_of(sj); s != nil {s.flush = true}
 	}
-	r.clock = 0
-	o := &adx_out[i]
-	o.wr, o.pos, o.primed = {}, 0, false
+	r.clock, r.owed = 0, {}
+	adx_out_reset(&adx_out[i])
 }
 
 // Copy `size` bytes of 16-bit PCM at IOP address `addr` into channel `ch`
@@ -294,20 +335,27 @@ adx_mix :: proc(out: []i16) {
 	for &r, k in adx.rna {
 		if r.handle == 0 || !r.playing || r.rate == 0 || r.channels == 0 {continue}
 		o := &adx_out[k]
-		last := r.channels - 1 // a mono stream plays on both sides
-		have := min(o.wr[0], o.wr[last])
-		if have - min(o.pos >> 32, have) > ADX_RING - 4 {
-			o.pos = (have - ADX_RING / 2) << 32 // overrun: keep the newest half
-		}
+		// A mono stream, or a stereo one missing a side, plays on both sides.
+		lc, rc := 0, int(r.channels - 1)
+		if adx_sjx_of(r.sj[lc]) == nil {lc = rc}
+		if adx_sjx_of(r.sj[rc]) == nil {rc = lc}
+		if adx_sjx_of(r.sj[lc]) == nil {continue}
+		have := min(o.wr[lc], o.wr[rc])
+		// Overrun, after a burst: keep the newer half of the side furthest
+		// ahead. The other side then waits for the samples it lacks.
+		hi := max(o.wr[lc], o.wr[rc])
+		if hi - min(o.pos >> 32, hi) > ADX_RING - 4 {o.pos = (hi - ADX_RING / 2) << 32}
 		if !o.primed && have - min(o.pos >> 32, have) < u64(r.rate) / 30 {continue}
 		o.primed = true
-		step := (u64(r.rate) << 32) / MIX_RATE
+		// Each call mixes one vblank: eat what a vblank consumes, rate times
+		// CYCLES_PER_FRAME / EE_CLOCK samples, or the ring creeps.
+		step := u64((u128(r.rate) << 32) * cpu.CYCLES_PER_FRAME / (cpu.EE_CLOCK * u128(len(out) / 2)))
 		for n := 0; n < len(out); n += 2 {
 			i := o.pos >> 32
 			if i + 3 > have {o.primed = false; break} // gauss reads i-1 .. i+2
 			p := u32(o.pos >> 24)
-			l := adx_gauss(o, 0, i, p)
-			s := adx_gauss(o, int(last), i, p)
+			l := adx_gauss(o, lc, i, p)
+			s := adx_gauss(o, rc, i, p)
 			out[n] = i16(clamp(i32(out[n]) + l, -32768, 32767))
 			out[n + 1] = i16(clamp(i32(out[n + 1]) + s, -32768, 32767))
 			o.pos += step
