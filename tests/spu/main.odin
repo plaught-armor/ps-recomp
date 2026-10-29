@@ -6,6 +6,8 @@
 // samples) at pitch 0x1000, one sample per mixed sample, so a block lasts 28.
 // The snapshot part keys a voice on, saves, mixes, scribbles over its
 // blocks and loads: mixing again must give the same samples.
+// The FMOD reverb (reverb_set, reverb_mix) runs each preset over a fixed
+// send; a hash of its return pins the output.
 package main
 
 import "core:fmt"
@@ -22,6 +24,19 @@ BLOCKS :: 3
 // Envelope: fastest attack, sustain at full level, fastest linear release.
 ADSR1 :: 0x00ff
 ADSR2 :: 0x1fc0
+
+// FNV-1a of reverb_mix's return per mode 1 .. 9 for reverb_presets' send.
+REVERB_HASH := [9]u64 {
+	0x28fde966e53c1262,
+	0x91c1da24c37c8fd4,
+	0x31ae4dfafb1f252b,
+	0xcbd57958ce6a939f,
+	0xbc27f64eb0fffc79,
+	0x68b43ebb83b6f583,
+	0x70bcb54b68945c07,
+	0xe3c21c5196cc3ef4,
+	0xcb6373d5bfd50937,
+}
 
 failed: bool
 snap: core.Snapshot
@@ -110,8 +125,38 @@ voices :: proc() {
 	check(iop.spu_write(iop.SPU_RAM_SIZE - 4, edge[:]) == 4, "spu_write clipped at the end of sound RAM")
 }
 
+// Every preset over noise bursts (on 1024 frames, off 3072, so tails
+// ring out), 0x20000 frames in chunks of 1024: twice the largest work area
+// at the half rate.
+reverb_presets :: proc() {
+	CHUNK :: 1024
+	seed: u32 = 1
+	send, acc: [CHUNK * 2]i32
+	for mode in u32(1) ..= 9 {
+		iop.reverb_set(mode, 0x3fff)
+		h: u64 = 0xcbf29ce484222325
+		for c in 0 ..< 0x20000 / CHUNK {
+			for &x in send {
+				seed = seed * 1103515245 + 12345
+				x = c % 4 == 0 ? i32(seed >> 16) % 16000 - 8000 : 0
+			}
+			acc = {}
+			iop.reverb_mix(send[:], acc[:])
+			for x in acc {
+				for b in 0 ..< u32(4) {h = (h ~ u64(u32(x) >> (b * 8) & 0xff)) * 0x100000001b3}
+			}
+		}
+		if h != REVERB_HASH[mode - 1] {
+			fmt.eprintfln("FAIL reverb mode %d: hash %#16x", mode, h)
+			failed = true
+		}
+	}
+	iop.reverb_set(0, 0)
+}
+
 game :: proc(_: rawptr) {
 	voices()
+	reverb_presets()
 	for n in 0 ..< BLOCKS {
 		b: [16]u8
 		b[0] = u8(n) << 4 // filters 0..2
