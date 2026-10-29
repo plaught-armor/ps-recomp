@@ -95,11 +95,17 @@ main :: proc() {
 	if err := os.write_entire_file(path, sb.buf[:]); err != nil {fail("write %s: %v", path, err)}
 	fmt.printfln("ee_emit: %d cases, %d left to the interpreter", n, skipped)
 
-	p, err := os.process_start({command = {"odin", "run", dir, "-collection:ps=" + DIR + "/../..", "-out:" + CASES_DIR + "/ee_emit_cases"}, stdout = os.stdout, stderr = os.stderr})
+	// odin exits 0 on some build errors (an -out: without .exe on Windows), so a
+	// missing binary afterwards fails the test. Remove any stale one first;
+	// -keep-executable leaves the new one to check.
+	out :: CASES_DIR + "/ee_emit_cases" + (".exe" when ODIN_OS == .Windows else "")
+	_ = os.remove(out)
+	p, err := os.process_start({command = {"odin", "run", dir, "-collection:ps=" + DIR + "/../..", "-out:" + out, "-keep-executable"}, stdout = os.stdout, stderr = os.stderr})
 	if err != nil {fail("odin run: %v", err)}
 	st, werr := os.process_wait(p)
 	if werr != nil {fail("odin run: %v", werr)}
 	if !st.success {fail("cases failed (exit %d)", st.exit_code)}
+	if !os.exists(out) {fail("cases not built: %s", out)}
 }
 
 @(private = "file")
