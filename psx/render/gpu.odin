@@ -954,8 +954,8 @@ Plot_Flags :: bit_set[Plot_Flag; u8]
 
 // The Plot_Flags a primitive of mode m drawn under st is plotted with. The
 // specialized set assumes the mask bit is set, not checked, and the texture
-// not raw, as in every primitive Breath of Fire IV draws; anything else is
-// Generic, correct but unspecialized.
+// not raw, as games draw nearly every primitive; anything else is Generic,
+// correct but unspecialized.
 @(private)
 plot_flags :: #force_inline proc(m: ^Prim_Mode, st: ^Draw_State) -> Plot_Flags {
 	if m.raw || st.check_mask || !st.set_mask {

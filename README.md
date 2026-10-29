@@ -28,9 +28,10 @@ a `recomp` options file, and any per-game code.
 ## Requirements
 
 - Odin `dev-2026-10`
-- SDL2 (window, input, audio), OpenGL (PS1 renderer), Vulkan 1.3 (PS2 GS)
-- `glslc` only to rebuild the PS2 shaders (`ps2/gs/shaders/build.sh`); the
-  compiled `.spv` files are committed
+- SDL2 (window, input, audio), OpenGL or Vulkan 1.3 (PS1 renderer, chosen
+  with `GPU=gl` or `GPU=vk`), Vulkan 1.3 (PS2 GS)
+- `glslc` only to rebuild the shaders (`ps2/gs/shaders/build.sh`,
+  `psx/render/shaders/build.sh`); the compiled `.spv` files are committed
 
 ## Building the recompiler
 
@@ -55,15 +56,17 @@ longer without it). Generated code is not vetted: check it without `-vet`.
 
 ## Tests
 
+From the repository root:
+
 ```sh
-cd tests/core   && odin run . -collection:ps=../..
-cd tests/native && odin run . -collection:ps=../..
-cd tests/ee_native && odin run . -collection:ps=../..
-cd tests/fpu    && odin run . -collection:ps=../..
-cd tests/lower  && odin run . -collection:ps=../..
-cd tests/vu     && odin run . -collection:ps=../..
-cd tests/vu_macro && odin run . -collection:ps=../..
-cd tests/ee_emit && odin run . -collection:ps=../..
+odin run tests/core -collection:ps=.
+odin run tests/native -collection:ps=.
+odin run tests/ee_native -collection:ps=.
+odin run tests/fpu -collection:ps=.
+odin run tests/lower -collection:ps=.
+odin run tests/vu -collection:ps=.
+odin run tests/vu_macro -collection:ps=.
+odin run tests/ee_emit -collection:ps=.
 ```
 
 CI type-checks every package on linux and darwin (amd64 and arm64) and runs
@@ -141,6 +144,39 @@ which never returns. `kernel.vblank_hook`, run every vblank, is where the
 port presents the picture, reads input and paces. `ps2/host` does that
 for a port: `host.platform_init(title)` opens the window and audio and sets
 the hook, and `host.pad_hook` lets the game remap each player's input.
+
+```odin
+package main
+
+import "core:os"
+import "core:path/filepath"
+import "ps:ps2"
+import cpu "ps:ps2/cpu"
+import host "ps:ps2/host"
+import iop "ps:ps2/iop"
+import mem "ps:ps2/mem"
+import "rec"
+
+main :: proc() {
+	path := "disc/SLUS_000.00"
+	iop.disc_dir = filepath.dir(path)
+	ps2.init()
+	if !host.platform_init("Game") {
+		os.exit(1)
+	}
+	rec.register_all()
+	data, err := os.read_entire_file(path, context.allocator)
+	if err != nil {
+		os.exit(1)
+	}
+	entry, ok := mem.load_elf(data)
+	if !ok {
+		os.exit(1)
+	}
+	cpu.state.r[29].d[0] = mem.RAM_SIZE - 16
+	ps2.run(entry)
+}
+```
 
 Build with `-define:ENV_PREFIX=GAME_` so settings read `GAME_*`. PS1 cards
 are 128 KiB images, `slot1.mcd` and `slot2.mcd` in the working directory
