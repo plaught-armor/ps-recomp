@@ -763,9 +763,14 @@ ranges :: proc(ext: []bool) -> [dynamic][2]int {
 // Programs from a VU1_CAPTURE file (ps2/vu/capture.odin): for each entry
 // into each captured image, the pairs reachable from it. A JR or JALR ends
 // an extent; its targets were captured as entries of their own. Extents
-// with the same pairs at the same addresses compile once.
+// with the same pairs at the same addresses compile once. A missing file
+// adds no programs, so that microcode runs in the interpreter.
 @(private = "file")
 load_capture :: proc(progs: ^[dynamic]Prog, path: string) -> bool {
+	if !os.exists(path) {
+		fmt.eprintfln("vu: %s missing; VU1 microcode from data runs in the interpreter", path)
+		return true
+	}
 	data, err := os.read_entire_file(path, context.allocator)
 	if err != nil {
 		fmt.eprintln("vu: cannot read", path, err)
