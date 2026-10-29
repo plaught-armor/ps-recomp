@@ -2,9 +2,10 @@
 // reaches the window through present as the software target's does. A
 // walk's draws are queued (prim_queue.odin) and drawn here by the same
 // shader body as the GL target's (shaders/hi_draw.glsl), synchronously: the
-// target's pixels stay in its software buffers, pushed to the GPU over the
-// box the queue covers and pulled back once drawn, so every other path
-// (passes, pictures, the ghost flush, present) stays software.
+// software target's planes are host-cached memory laid out as the GPU's
+// pictures, which the GPU copies over the box the queue covers and back
+// once drawn, so every other path (passes, pictures, the ghost flush,
+// present) reads and writes them in place, staying software.
 //
 // Each level is one draw, behind a barrier, as gl_submit's: a reader of a
 // cell sits above that cell's writers in the same level, so the main
@@ -15,6 +16,7 @@ package psx_render
 
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import vk "vendor:vulkan"
 import "ps:core"
 
@@ -37,20 +39,35 @@ gpu_vk: struct {
 	order:       core.Vk_Buf,
 	vram:        core.Vk_Buf,
 	uni:         core.Vk_Buf,
-	// The target's pictures, made and dropped with it: main (rgb) and tag
-	// (walk << 8 | door), R32UI; the ghost layer (rgb | alpha << 24, z's
-	// bits) and the depth buffer, as the software target keeps them.
-	main, tag:   vk.Image,
-	main_view:   vk.ImageView,
-	tag_view:    vk.ImageView,
-	mem:         [2]vk.DeviceMemory,
-	ghost, zbuf: core.Vk_Buf,
-	// Host-cached, for the CPU reads them back: main, tag, ghost and zbuf
-	// at a target's size each, in that order.
+	// The target's pictures, made and dropped with it, as VK_IMAGES and
+	// VK_BUFS list them.
+	img:         [len(VK_IMAGES)]vk.Image,
+	view:        [len(VK_IMAGES)]vk.ImageView,
+	mem:         [len(VK_IMAGES)]vk.DeviceMemory,
+	bufs:        [len(VK_BUFS)]core.Vk_Buf,
+	// Host-cached: the software target's planes themselves, at VK_IMAGES'
+	// and VK_BUFS' offsets.
 	stage:       core.Vk_Buf,
 	// The box's rows, as one buffer copy each.
 	rows:        []vk.BufferCopy,
 }
+
+// Where each picture's plane sits in the stage: its offset, in bytes per
+// target pixel, and its pixel's size. The images, draw.frag's attachments:
+// main (rgb, R32UI), walk (R16UI) and door (R8UI).
+@(private = "file")
+VK_IMAGES :: [3][2]int{{0, 4}, {16, 2}, {18, 1}}
+@(private = "file")
+VK_FORMATS :: [3]vk.Format{.R32_UINT, .R16_UINT, .R8_UINT}
+// The buffers: the ghost layer's rgb, alpha and z, and the depth buffer.
+@(private = "file")
+VK_BUFS :: [4][2]int{{8, 4}, {19, 1}, {12, 4}, {4, 4}}
+// Main's plane while a pass draws into its own buffer (Pass.hi) in place
+// of the target's: the box's rows go through it.
+@(private = "file")
+VK_PASS :: 20
+@(private = "file")
+VK_STAGE :: 24
 
 // draw.frag's uniforms (std430), gl_submit's.
 @(private = "file")
@@ -66,8 +83,9 @@ Vk_Draw_Uni :: struct {
 // draw.vert's and draw.frag's push constants (shaders/draw_pc.glsl).
 @(private = "file")
 Vk_Draw_Push :: struct {
-	prims, ports, order, vram, ghost, zbuf, uni: vk.DeviceAddress,
-	zpass:                                       i32,
+	prims, ports, order, vram:              vk.DeviceAddress,
+	ghost_rgb, ghost_a, ghost_z, zbuf, uni: vk.DeviceAddress,
+	zpass:                                  i32,
 }
 
 @(private = "file")
@@ -121,9 +139,9 @@ vk_init :: proc() -> bool {
 	sets := [1]vk.DescriptorSetLayout{g.set_layout}
 	g.layout = core.vk_layout_create({.VERTEX, .FRAGMENT}, size_of(Vk_Draw_Push), sets[:])
 	ALL :: vk.ColorComponentFlags{.R, .G, .B, .A}
-	formats := [2]vk.Format{.R32_UINT, .R32_UINT}
+	formats := VK_FORMATS
 	for tag in 0 ..< 2 {
-		masks := [2]vk.ColorComponentFlags{ALL, tag == 1 ? ALL : {}}
+		masks := [3]vk.ColorComponentFlags{ALL, tag == 1 ? ALL : {}, tag == 1 ? ALL : {}}
 		g.draw[tag] = core.vk_draw_pipeline(#load("shaders/draw.vert.spv"), #load("shaders/draw.frag.spv"), g.layout, formats[:], masks[:])
 	}
 	g.cmd, g.fence = core.vk_cmd_create()
@@ -137,20 +155,60 @@ vk_init :: proc() -> bool {
 	return true
 }
 
+// The target with its planes copied out of the stage, made just before a
+// fork (vk_fork_save): the planes are mapped memory the parent shares, and
+// it goes on drawing into them while the child runs.
+@(private = "file")
+vk_fork_saved: Target
+
+// Copy the target's planes out for a child about to be forked.
+vk_fork_save :: proc() {
+	t := targets[1]
+	if !t.vk {
+		return
+	}
+	t.vk = false
+	t.rgb = slice.clone(t.rgb)
+	t.walk = slice.clone(t.walk)
+	t.door = slice.clone(t.door)
+	t.zbuf = slice.clone(t.zbuf)
+	gh := &t.ghost
+	gh.rgb, gh.alpha, gh.z = slice.clone(gh.rgb), slice.clone(gh.alpha), slice.clone(gh.z)
+	vk_fork_saved = t
+}
+
+// The parent, once forked: the copies are the child's alone.
+vk_fork_parent :: proc() {
+	t := &vk_fork_saved
+	if t.rgb == nil {
+		return
+	}
+	delete(t.rgb)
+	delete(t.walk)
+	delete(t.door)
+	delete(t.zbuf)
+	delete(t.ghost.rgb)
+	delete(t.ghost.alpha)
+	delete(t.ghost.z)
+	t^ = {}
+}
+
 // A forked child leaves the parent's device and images alone, and draws
-// the target in software.
+// the target in software, on the planes copied out before the fork.
 vk_fork_child :: proc() {
 	gpu_vk = {}
-	targets[1].vk = false
+	if vk_fork_saved.rgb != nil {
+		targets[1] = vk_fork_saved
+	}
 }
 
 @(private = "file")
-vk_view_create :: proc(img: vk.Image) -> (v: vk.ImageView) {
+vk_view_create :: proc(img: vk.Image, format: vk.Format) -> (v: vk.ImageView) {
 	info := vk.ImageViewCreateInfo {
 		sType = .IMAGE_VIEW_CREATE_INFO,
 		image = img,
 		viewType = .D2,
-		format = .R32_UINT,
+		format = format,
 		subresourceRange = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
 	}
 	core.vk_check(vk.CreateImageView(core.vkc.device, &info, nil, &v), "vkCreateImageView")
@@ -164,24 +222,43 @@ vk_buf_free :: proc(b: ^core.Vk_Buf) {
 	b^ = {}
 }
 
+// Plane `at` (an offset of VK_IMAGES' or VK_BUFS') of an n-pixel stage.
+@(private = "file")
+vk_plane :: proc($T: typeid, at, n: int) -> []T {
+	return ([^]T)(&gpu_vk.stage.ptr[at * n])[:n]
+}
+
 // Give target t (the hi-res one, just made) its images and buffers, the
-// images in the general layout from then on.
+// images in the general layout from then on, and its planes (pixels,
+// walk, door, ghost layer and depth buffer) in the stage.
 @(private)
 vk_target_make :: proc(t: ^Target) {
 	g := &gpu_vk
 	USAGE :: vk.ImageUsageFlags{.COLOR_ATTACHMENT, .INPUT_ATTACHMENT, .TRANSFER_SRC, .TRANSFER_DST}
 	w, h := u32(t.w), u32(t.h)
 	n := int(t.w * t.h)
-	g.main, g.mem[0] = core.vk_image_create(w, h, .R32_UINT, USAGE)
-	g.tag, g.mem[1] = core.vk_image_create(w, h, .R32_UINT, USAGE)
-	g.main_view, g.tag_view = vk_view_create(g.main), vk_view_create(g.tag)
+	for f, i in VK_FORMATS {
+		g.img[i], g.mem[i] = core.vk_image_create(w, h, f, USAGE)
+		g.view[i] = vk_view_create(g.img[i], f)
+	}
 	BUF :: vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
-	g.ghost = core.vk_buf_create(n * 8, BUF, {.DEVICE_LOCAL})
-	g.zbuf = core.vk_buf_create(n * 4, BUF, {.DEVICE_LOCAL})
-	g.stage = core.vk_buf_create(n * 20, {.TRANSFER_SRC, .TRANSFER_DST}, CACHED)
+	for b, i in VK_BUFS {
+		g.bufs[i] = core.vk_buf_create(n * b.y, BUF, {.DEVICE_LOCAL})
+	}
+	g.stage = core.vk_buf_create(n * VK_STAGE, {.TRANSFER_SRC, .TRANSFER_DST}, CACHED)
+	// Zeroed, as make's planes are: new memory's contents are undefined.
+	mem.zero(g.stage.ptr, n * VK_STAGE)
 	g.rows = make([]vk.BufferCopy, t.h)
+	t.rgb = vk_plane(u32, VK_IMAGES[0].x, n)
+	t.walk = vk_plane(u16, VK_IMAGES[1].x, n)
+	t.door = vk_plane(u8, VK_IMAGES[2].x, n)
+	gh := &t.ghost
+	gh.rgb = vk_plane(u32, VK_BUFS[0].x, n)
+	gh.alpha = vk_plane(u8, VK_BUFS[1].x, n)
+	gh.z = vk_plane(f32, VK_BUFS[2].x, n)
+	t.zbuf = vk_plane(u32, VK_BUFS[3].x, n)
 	img := vk.DescriptorImageInfo {
-		imageView   = g.main_view,
+		imageView   = g.view[0],
 		imageLayout = .GENERAL,
 	}
 	write := vk.WriteDescriptorSet {
@@ -194,8 +271,8 @@ vk_target_make :: proc(t: ^Target) {
 	}
 	vk.UpdateDescriptorSets(core.vkc.device, 1, &write, 0, nil)
 	core.vk_begin(g.cmd, g.fence)
-	bars: [2]vk.ImageMemoryBarrier
-	for im, i in ([2]vk.Image{g.main, g.tag}) {
+	bars: [len(VK_IMAGES)]vk.ImageMemoryBarrier
+	for im, i in g.img {
 		bars[i] = {
 			sType = .IMAGE_MEMORY_BARRIER,
 			dstAccessMask = {.MEMORY_READ, .MEMORY_WRITE},
@@ -207,72 +284,63 @@ vk_target_make :: proc(t: ^Target) {
 			subresourceRange = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
 		}
 	}
-	vk.CmdPipelineBarrier(g.cmd, {.TOP_OF_PIPE}, {.ALL_COMMANDS}, {}, 0, nil, 0, nil, 2, &bars[0])
+	vk.CmdPipelineBarrier(g.cmd, {.TOP_OF_PIPE}, {.ALL_COMMANDS}, {}, 0, nil, 0, nil, len(bars), &bars[0])
 	core.vk_submit(g.cmd, g.fence, 0, 0)
 }
 
-// Free target t's images and buffers (none in a forked child).
+// Free target t's images, buffers and with the stage its planes.
 @(private)
 vk_target_drop :: proc(t: ^Target) {
 	g := &gpu_vk
-	if g.main == 0 {
-		return
-	}
 	dev := core.vkc.device
 	vk.DeviceWaitIdle(dev)
-	vk.DestroyImageView(dev, g.main_view, nil)
-	vk.DestroyImageView(dev, g.tag_view, nil)
-	vk.DestroyImage(dev, g.main, nil)
-	vk.DestroyImage(dev, g.tag, nil)
-	for m in g.mem {
-		vk.FreeMemory(dev, m, nil)
+	for i in 0 ..< len(VK_IMAGES) {
+		vk.DestroyImageView(dev, g.view[i], nil)
+		vk.DestroyImage(dev, g.img[i], nil)
+		vk.FreeMemory(dev, g.mem[i], nil)
+	}
+	for &b in g.bufs {
+		vk_buf_free(&b)
 	}
 	vk_buf_free(&g.stage)
-	vk_buf_free(&g.ghost)
-	vk_buf_free(&g.zbuf)
 	delete(g.rows)
 	g.rows = nil
-	g.main, g.tag, g.main_view, g.tag_view, g.mem = 0, 0, 0, 0, {}
+	g.img, g.view, g.mem = {}, {}, {}
 }
 
-// The box x0..<x1, y0..<y1 of target t: its pixels to the GPU (to = true)
-// or back.
+// Whether target t's pixels are a pass's buffer, not its plane in the stage
+// (which then keeps the picture saved for the pass).
 @(private = "file")
-vk_carry :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) #no_bounds_check {
-	g := &gpu_vk
-	n := int(t.w * t.h)
-	main := ([^]u32)(g.stage.ptr)
-	tag := main[n:]
-	ghost := ([^][2]u32)(main[2 * n:])
-	zbuf := main[4 * n:]
-	gh := &t.ghost
+vk_passing :: proc(t: ^Target) -> bool {
+	return rawptr(raw_data(t.rgb)) != &gpu_vk.stage.ptr[VK_IMAGES[0].x * len(t.rgb)]
+}
+
+// The box's rows of a pass's buffer (vk_passing) to VK_PASS's plane
+// (to = true) or back.
+@(private = "file")
+vk_pass_rows :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) {
+	plane := vk_plane(u32, VK_PASS, len(t.rgb))
 	for y in y0 ..< y1 {
-		for x in x0 ..< x1 {
-			i := y * t.w + x
-			if to {
-				main[i] = t.rgb[i]
-				tag[i] = u32(t.walk[i]) << 8 | u32(t.door[i])
-				ghost[i] = {gh.rgb[i] & 0xffffff | u32(gh.alpha[i]) << 24, transmute(u32)gh.z[i]}
-				zbuf[i] = t.zbuf[i]
-			} else {
-				t.rgb[i] = main[i]
-				t.door[i], t.walk[i] = u8(tag[i]), u16(tag[i] >> 8)
-				gh.rgb[i], gh.alpha[i], gh.z[i] = ghost[i].x & 0xffffff, u8(ghost[i].x >> 24), transmute(f32)ghost[i].y
-				t.zbuf[i] = zbuf[i]
-			}
+		row := int(y * t.w)
+		a, b := plane[row + int(x0):row + int(x1)], t.rgb[row + int(x0):row + int(x1)]
+		if to {
+			copy(a, b)
+		} else {
+			copy(b, a)
 		}
 	}
 }
 
-// Copy the box between the staged and the drawn pictures.
+// Copy the box between the planes and the drawn pictures: to them
+// (to = true) or back.
 @(private = "file")
 vk_copy :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) {
 	g := &gpu_vk
-	n := t.w * t.h
+	n := vk.DeviceSize(t.w * t.h)
 	rows := g.rows[:y1 - y0]
-	for buf, i in ([2]core.Vk_Buf{g.ghost, g.zbuf}) {
-		size := vk.DeviceSize(8 >> uint(i))
-		at := vk.DeviceSize(n) * (8 + 8 * vk.DeviceSize(i))
+	bufs, imgs := VK_BUFS, VK_IMAGES
+	for buf, i in g.bufs {
+		at, size := vk.DeviceSize(bufs[i].x) * n, vk.DeviceSize(bufs[i].y)
 		for &r, j in rows {
 			px := vk.DeviceSize((y0 + i32(j)) * t.w + x0)
 			r = {at + px * size, px * size, vk.DeviceSize(x1 - x0) * size}
@@ -286,9 +354,13 @@ vk_copy :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) {
 			vk.CmdCopyBuffer(g.cmd, buf.buf, g.stage.buf, u32(len(rows)), &rows[0])
 		}
 	}
-	for img, i in ([2]vk.Image{g.main, g.tag}) {
+	for img, i in g.img {
+		at, size := vk.DeviceSize(imgs[i].x) * n, vk.DeviceSize(imgs[i].y)
+		if i == 0 && vk_passing(t) {
+			at = VK_PASS * n
+		}
 		r := vk.BufferImageCopy {
-			bufferOffset = vk.DeviceSize((i32(i) * n + y0 * t.w + x0) * 4),
+			bufferOffset = at + vk.DeviceSize(y0 * t.w + x0) * size,
 			bufferRowLength = u32(t.w),
 			imageSubresource = {aspectMask = {.COLOR}, layerCount = 1},
 			imageOffset = {x0, y0, 0},
@@ -303,8 +375,7 @@ vk_copy :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) {
 }
 
 // Draw the queue (raster_run, before its read cells are dropped) and wait
-// for it: the target's pixels it covers are the software target's again
-// on return.
+// for it: the planes hold what it drew on return.
 @(private)
 vk_target_submit :: proc() #no_bounds_check {
 	g, q := &gpu_vk, &prim_queue
@@ -326,7 +397,6 @@ vk_target_submit :: proc() #no_bounds_check {
 		queue_reset()
 		return
 	}
-	vk_carry(t, x0, y0, x1, y1, true)
 	mem.copy(g.prims.ptr, &q.prims[0], q.prim_n * size_of(Gpu_Prim))
 	mem.copy(g.order.ptr, &q.order[0], q.prim_n * size_of(i32))
 	if q.portal_n > 0 {
@@ -350,21 +420,27 @@ vk_target_submit :: proc() #no_bounds_check {
 		w = t.w,
 	}
 	push := Vk_Draw_Push {
-		prims = g.prims.addr,
-		ports = g.ports.addr,
-		order = g.order.addr,
-		vram  = g.vram.addr,
-		ghost = g.ghost.addr,
-		zbuf  = g.zbuf.addr,
-		uni   = g.uni.addr,
+		prims     = g.prims.addr,
+		ports     = g.ports.addr,
+		order     = g.order.addr,
+		vram      = g.vram.addr,
+		ghost_rgb = g.bufs[0].addr,
+		ghost_a   = g.bufs[1].addr,
+		ghost_z   = g.bufs[2].addr,
+		zbuf      = g.bufs[3].addr,
+		uni       = g.uni.addr,
 	}
 	cmd := g.cmd
+	passing := vk_passing(t)
+	if passing {
+		vk_pass_rows(t, x0, y0, x1, y1, true)
+	}
 	core.vk_begin(cmd, g.fence)
 	vk_copy(t, x0, y0, x1, y1, true)
 	core.vk_barrier(cmd)
 	area := vk.Rect2D{{x0, y0}, {u32(x1 - x0), u32(y1 - y0)}}
-	atts: [2]vk.RenderingAttachmentInfo
-	for v, i in ([2]vk.ImageView{g.main_view, g.tag_view}) {
+	atts: [len(VK_IMAGES)]vk.RenderingAttachmentInfo
+	for v, i in g.view {
 		atts[i] = {
 			sType       = .RENDERING_ATTACHMENT_INFO,
 			imageView   = v,
@@ -377,7 +453,7 @@ vk_target_submit :: proc() #no_bounds_check {
 		sType                = .RENDERING_INFO,
 		renderArea           = area,
 		layerCount           = 1,
-		colorAttachmentCount = 2,
+		colorAttachmentCount = len(atts),
 		pColorAttachments    = &atts[0],
 	}
 	vk.CmdBeginRendering(cmd, &rinfo)
@@ -430,7 +506,9 @@ vk_target_submit :: proc() #no_bounds_check {
 	core.vk_submit(cmd, g.fence, 0, 0)
 	fence := g.fence
 	core.vk_check(vk.WaitForFences(core.vkc.device, 1, &fence, true, max(u64)), "vkWaitForFences")
-	vk_carry(t, x0, y0, x1, y1, false)
+	if passing {
+		vk_pass_rows(t, x0, y0, x1, y1, false)
+	}
 	// The shader marks glowing pixels in the picture only: mark the tiles
 	// (bloom_mark) under every additive glowing primitive, which
 	// bloom_prepare clears again where none was drawn.

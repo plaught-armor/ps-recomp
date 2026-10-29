@@ -13,8 +13,13 @@ import io "../io"
 PR_SET_PDEATHSIG :: 1
 
 // Fork a child. In the parent, returns its pid; in the child, 0. ok is
-// false when the fork failed.
+// false when the fork failed, or was not tried inside a frozen-time pass:
+// the pass's saved picture may be the Vulkan target's plane, a mapping the
+// child would share with the parent.
 preload_fork :: proc() -> (pid: i32, ok: bool) {
+	if io.events_frozen {
+		return 0, false
+	}
 	render.raster_sync()
 	// The child mixes on its own thread alone, from where the parent's mix
 	// stands.
@@ -22,7 +27,11 @@ preload_fork :: proc() -> (pid: i32, ok: bool) {
 	parent := linux.getpid()
 	// libc's fork, not the raw syscall: it runs the atfork handlers SDL and
 	// the C library's own locks rely on.
+	render.gpu_fork_save()
 	p := posix.fork()
+	if p != 0 {
+		render.gpu_fork_parent()
+	}
 	if p < 0 {
 		return 0, false
 	}

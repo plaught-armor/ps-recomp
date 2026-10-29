@@ -63,8 +63,9 @@ Target :: struct {
 	// scratch for pixels pulled from its textures, and the ghost layer
 	// lives there.
 	gl:    bool,
-	// Rasterized on Vulkan (vk_target.odin) during a walk; every other path,
-	// and the pixels themselves, stay software (raster_run).
+	// Rasterized on Vulkan (vk_target.odin) during a walk; every other path
+	// stays software (raster_run), on planes in the Vulkan target's
+	// host-cached memory.
 	vk:    bool,
 }
 
@@ -310,6 +311,17 @@ gpu_init :: proc(window: ^sdl.Window, renderer: ^sdl.Renderer) {
 	}
 }
 
+// Before a fork: what the child needs of the parent's GPU backend, copied
+// out.
+gpu_fork_save :: proc() {
+	vk_fork_save()
+}
+
+// The parent, once forked (or the fork failed).
+gpu_fork_parent :: proc() {
+	vk_fork_parent()
+}
+
 // A forked child leaves the parent's GPU backend alone.
 gpu_fork_child :: proc() {
 	gl_fork_child()
@@ -328,16 +340,17 @@ render_targets_set :: proc(scale: i32) {
 		if t.gl {
 			gl_target_drop(t)
 		}
-		if gpu_vk.on {
+		if t.vk {
 			vk_target_drop(t)
+		} else {
+			delete(t.rgb)
+			delete(t.ghost.rgb)
+			delete(t.ghost.alpha)
+			delete(t.ghost.z)
+			delete(t.door)
+			delete(t.walk)
+			delete(t.zbuf)
 		}
-		delete(t.rgb)
-		delete(t.ghost.rgb)
-		delete(t.ghost.alpha)
-		delete(t.ghost.z)
-		delete(t.door)
-		delete(t.walk)
-		delete(t.zbuf)
 		t^ = {}
 		target_count = 1
 	}
@@ -364,15 +377,21 @@ render_targets_set :: proc(scale: i32) {
 		return
 	}
 	t^ = {
-		rgb = make([]u32, n),
 		shift = shift,
 		w = w,
 		h = h,
 		unit = 1 / f32(i32(1) << shift),
-		ghost = {rgb = make([]u32, n), alpha = make([]u8, n), z = make([]f32, n), lo = {w, h}},
-		door = make([]u8, n),
-		walk = make([]u16, n),
-		zbuf = make([]u32, n),
+		ghost = {lo = {w, h}},
+	}
+	if gpu_vk.on {
+		t.vk = true
+		vk_target_make(t)
+	} else {
+		t.rgb = make([]u32, n)
+		t.ghost.rgb, t.ghost.alpha, t.ghost.z = make([]u32, n), make([]u8, n), make([]f32, n)
+		t.door = make([]u8, n)
+		t.walk = make([]u16, n)
+		t.zbuf = make([]u32, n)
 	}
 	slice.fill(t.zbuf, Z_EMPTY)
 	for y in 0 ..< h {
@@ -381,10 +400,6 @@ render_targets_set :: proc(scale: i32) {
 		}
 	}
 	target_count = 2
-	if gpu_vk.on {
-		t.vk = true
-		vk_target_make(t)
-	}
 }
 
 Draw_State :: struct {
