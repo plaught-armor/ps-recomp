@@ -13,10 +13,12 @@
 //   skipping the HookEntryInt handler; an acknowledged counter ends it
 //   with the other counters still pending. WaitEvent with interrupts
 //   blocked gives up instead of hanging.
-//   The kernel layout games read and patch: the exception vector, the C0
-//   and B0 tables, and the pad driver's pointers and vblank acknowledge,
-//   handed over by StartPAD and turned off by ChangeClearPad or by zeroing
-//   its code. SysEnqIntRP of a queued element moves it to the head.
+//   The kernel layout games read and patch: the exception vector (at 0x00
+//   too), the C0 and B0 tables, and the pad driver's pointers and vblank
+//   acknowledge, handed over by StartPAD and turned off by ChangeClearPad
+//   or by zeroing its code. SysEnqIntRP of a queued element moves it to the
+//   head; SysDeqIntRP returns the element it unlinks, or 0. CloseEvent,
+//   EnableEvent and DisableEvent return 1 for any handle, InitPAD 1.
 //   The memory card calls: card status, firstfile/nextfile patterns and the
 //   DIRENTRY, and lseek and read on whole frames. The card images live in
 //   memory only: their paths name a directory that does not exist.
@@ -222,6 +224,13 @@ main :: proc() {
 	check("TestEvent of a callback event", test(cb), 0)
 	check("TestEvent of a callback event without a function", test(nocb), 0)
 
+	// CloseEvent, EnableEvent and DisableEvent return 1 for any handle.
+	check("CloseEvent", b(0x09, nocb), 1)
+	check("CloseEvent of a closed event", b(0x09, nocb), 1)
+	check("EnableEvent of a closed event", b(0x0c, nocb), 1)
+	check("DisableEvent of a bad handle", b(0x0d, 0xf100ffff), 1)
+	check("TestEvent of a closed event after EnableEvent", test(nocb), 0)
+
 	// WaitEvent.
 	check("WaitEvent of a disabled event", b(0x0a, ev), 0)
 	b(0x0c, ev)
@@ -348,6 +357,9 @@ main :: proc() {
 	check("exception vector halfword at 0x86", cpu.r32(0x84) >> 16, 0x275a)
 	check("exception vector jr k0", cpu.r32(0x88), 0x03400008)
 	check("exception vector nop", cpu.r32(0x8c), 0)
+	for k in u32(0) ..< 4 {
+		check("exception vector word at 0x00", cpu.r32(4 * k), cpu.r32(0x80 + 4 * k))
+	}
 	c0 := b(0x56)
 	check("GetC0Table", c0, 0x674)
 	check("C0(06h)", cpu.r32(c0 + 0x06 * 4), 0xc80)
@@ -359,7 +371,7 @@ main :: proc() {
 	}
 
 	// libpad's pointers into the pad driver stop and restart pad reading.
-	b(0x12, PAD_BUF, 0x22, 0, 0)
+	check("InitPAD", b(0x12, PAD_BUF, 0x22, 0, 0), 1)
 	bios.bios_pad_vblank()
 	check("pad buffer id after InitPAD", u32(cpu.r8(PAD_BUF + 1)), 0x41)
 	cpu.call(pad + 0x894)
@@ -416,6 +428,11 @@ main :: proc() {
 	check("chain 0 head after re-enqueuing", bios.bios.chains[0], ELEM_COUNT)
 	check("chain 0 second", cpu.r32(ELEM_COUNT), ELEM_NOP)
 	check("chain 0 tail", cpu.r32(ELEM_NOP), 0)
+	check("SysDeqIntRP of a queued element", c(0x03, 0, ELEM_NOP), ELEM_NOP)
+	check("chain 0 after SysDeqIntRP", cpu.r32(ELEM_COUNT), 0)
+	check("SysDeqIntRP of an element not queued", c(0x03, 0, ELEM_NOP), 0)
+	check("SysDeqIntRP of the head", c(0x03, 0, ELEM_COUNT), ELEM_COUNT)
+	check("chain 0 empty", bios.bios.chains[0], 0)
 
 	// Memory cards.
 	bios.card_files = {"/psx-bios-test-no-such-dir/1.mcd", "/psx-bios-test-no-such-dir/2.mcd"}

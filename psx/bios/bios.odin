@@ -153,15 +153,18 @@ bios_b :: proc(fn: u32) {
 	case 0x08:
 		ret(open_event(arg(0), arg(1), arg(2), arg(3)))
 	case 0x09:
-		ret(close_event(arg(0)))
+		close_event(arg(0))
+		ret(1)
 	case 0x0a:
 		ret(wait_event(arg(0)))
 	case 0x0b:
 		ret(test_event(arg(0)))
 	case 0x0c:
-		ret(set_event_status(arg(0), EV_ENABLED))
+		set_event_status(arg(0), EV_ENABLED)
+		ret(1)
 	case 0x0d:
-		ret(set_event_status(arg(0), EV_DISABLED))
+		set_event_status(arg(0), EV_DISABLED)
+		ret(1)
 	case 0x0e:
 		ret(open_thread(arg(0), arg(1), arg(2)))
 	case 0x0f:
@@ -171,7 +174,7 @@ bios_b :: proc(fn: u32) {
 	case 0x12:
 		bios.pad_buf = {arg(0), arg(2)}
 		bios.pad_read = true
-		ret(2)
+		ret(1)
 	case 0x13:
 		sio0_start(true)
 		ret(1)
@@ -258,8 +261,7 @@ bios_c :: proc(fn: u32) {
 		int_chain_enqueue(arg(0), arg(1))
 		ret(0)
 	case 0x03:
-		int_chain_dequeue(arg(0), arg(1))
-		ret(0)
+		ret(int_chain_dequeue(arg(0), arg(1)))
 	case 0x0a:
 		// ChangeClearRCnt(t, flag): returns the old flag.
 		if t := arg(0); t < len(bios.rcnt_ack) {
@@ -375,7 +377,8 @@ PAD_READ_STOP :: 0x894
 PAD_ACK_CODE :: 0x62c
 
 // The retail exception vector: lui k0, 0; addiu k0, k0, EXC_HANDLER; jr k0;
-// nop. Games copy it until the nop, and test the halfword at 0x86.
+// nop. Games copy it until the nop, and test the halfword at 0x86. The
+// retail kernel writes it at 0x00 as well.
 @(private)
 EXC_VECTOR :: [4]u32{0x3c1a0000, 0x275a0000 | EXC_HANDLER, 0x03400008, 0}
 
@@ -391,6 +394,7 @@ DCB_SIZE :: 0x50
 bios_init :: proc() {
 	vector := EXC_VECTOR
 	for w, k in vector {
+		cpu.w32(0x00 + 4 * u32(k), w)
 		cpu.w32(0x80 + 4 * u32(k), w)
 	}
 	cpu.w32(C0_TABLE + 0x06 * 4, EXC_HANDLER)
@@ -458,21 +462,19 @@ open_event :: proc(class, spec, mode, func: u32) -> u32 {
 }
 
 @(private)
-close_event :: proc(h: u32) -> u32 {
+// CloseEvent, EnableEvent and DisableEvent return 1 whatever the handle,
+// as on the retail kernel.
+close_event :: proc(h: u32) {
 	if e := event_slot(h); e != nil {
 		e^ = {}
-		return 1
 	}
-	return 0
 }
 
 @(private)
-set_event_status :: proc(h, status: u32) -> u32 {
+set_event_status :: proc(h, status: u32) {
 	if e := event_slot(h); e != nil {
 		e.status = status
-		return 1
 	}
-	return 0
 }
 
 @(private)
@@ -736,23 +738,25 @@ int_chain_enqueue :: proc(pri, elem: u32) {
 	bios.chains[pri] = elem
 }
 
+// SysDeqIntRP: the element unlinked, or 0 when it is not in the chain.
 @(private)
-int_chain_dequeue :: proc(pri, elem: u32) {
+int_chain_dequeue :: proc(pri, elem: u32) -> u32 {
 	if pri >= len(bios.chains) {
-		return
+		return 0
 	}
 	if bios.chains[pri] == elem {
 		bios.chains[pri] = cpu.r32(elem)
-		return
+		return elem
 	}
 	e := bios.chains[pri]
 	for guard := 0; e != 0 && guard < 64; guard += 1 {
 		if cpu.r32(e) == elem {
 			cpu.w32(e, cpu.r32(elem))
-			return
+			return elem
 		}
 		e = cpu.r32(e)
 	}
+	return 0
 }
 
 // The setjmp return site is `beqz v0, X; nop; jal T`: the handler is T.
