@@ -48,7 +48,7 @@ slow_addr :: proc(a: u32) -> rawptr {
 	switch a >> 28 {
 	case 0x0, 0x2, 0x3, 0x8, 0xa:
 		p := a & 0x0fffffff
-		if p < RAM_SIZE {return &ram[p]}
+		if p < RAM_SIZE {#no_bounds_check return &ram[p]}
 	case 0x7:
 		// The test keeps the index in range, so it is not checked again.
 		if a - SPR_BASE < SPR_SIZE {#no_bounds_check return &spr[a - SPR_BASE]}
@@ -58,8 +58,11 @@ slow_addr :: proc(a: u32) -> rawptr {
 	return nil
 }
 
+// load, store, rd128 and wr128 index ram only below RAM_SIZE, its length,
+// so they run without bounds checks. As before, a wide access in the last
+// bytes of RAM is not caught.
 @(private)
-load :: #force_inline proc(a: u32, $T: typeid) -> T {
+load :: #force_inline proc(a: u32, $T: typeid) -> T #no_bounds_check {
 	if a < RAM_SIZE {
 		return intrinsics.unaligned_load((^T)(&ram[a]))
 	}
@@ -70,7 +73,7 @@ load :: #force_inline proc(a: u32, $T: typeid) -> T {
 }
 
 @(private)
-store :: #force_inline proc(a: u32, v: $T) {
+store :: #force_inline proc(a: u32, v: $T) #no_bounds_check {
 	if (a & 0x0fffffff) - watch_lo < watch_len {trace_store(a, u128(v))}
 	if a < RAM_SIZE {
 		intrinsics.unaligned_store((^T)(&ram[a]), v)
@@ -92,14 +95,14 @@ wr16 :: #force_inline proc(a: u32, v: u16) {store(a, v)}
 wr32 :: #force_inline proc(a: u32, v: u32) {store(a, v)}
 wr64 :: #force_inline proc(a: u32, v: u64) {store(a, v)}
 
-rd128 :: proc(addr: u32) -> u128 {
+rd128 :: proc(addr: u32) -> u128 #no_bounds_check {
 	a := addr &~ 15
 	if a < RAM_SIZE {return (^u128)(&ram[a])^}
 	if p := slow_addr(a); p != nil {return intrinsics.unaligned_load((^u128)(p))}
 	return hw_read128(a)
 }
 
-wr128 :: proc(addr: u32, v: u128) {
+wr128 :: proc(addr: u32, v: u128) #no_bounds_check {
 	a := addr &~ 15
 	if watch_len != 0 && (a & 0x0fffffff) + 16 > watch_lo && (a & 0x0fffffff) < watch_lo + watch_len {trace_store(a, v)}
 	if a < RAM_SIZE {
