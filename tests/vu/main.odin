@@ -152,6 +152,40 @@ clamped :: proc() {
 	}
 }
 
+// DIV, RSQRT and the EFU clamp their operands as the add and multiply
+// family does, so exponent 255 is a large number the host never sees as
+// an infinity: no host NaN, whose sign differs between hosts (x64 sets
+// it, arm64 does not), reaches Q or P. Each value is the hardware's, where
+// exponent 255 is 2^128 times the mantissa.
+@(private = "file")
+div_efu :: proc() {
+	INF_P, INF_N :: 0x7f800000, 0xff800000
+	Case :: struct {
+		name: string,
+		w:    u32, // fs 1, ft 2, x lanes; ESUM reads all of vf1
+		s, t: [4]u32,
+		want: u32,
+	}
+	cases := [?]Case {
+		// 2^128 / 2^128 = 1: the operands clamp to FMAX, and FMAX / FMAX is 1
+		{"VDIV", 0x4a0003bc, {INF_P, 0, 0, 0}, {INF_P, 0, 0, 0}, 0x3f800000},
+		// -2^128 / 2^128 = -1
+		{"VDIV", 0x4a0003bc, {INF_N, 0, 0, 0}, {INF_P, 0, 0, 0}, 0xbf800000},
+		// 2^128 / sqrt(2^128) = 2^64: FMAX / sqrt(FMAX) is 2^64 exactly, as
+		// sqrt(FMAX) rounds to 2^64 (1 - 2^-24) and FMAX is 2^128 (1 - 2^-24)
+		{"VRSQRT", 0x4a0003be, {INF_P, 0, 0, 0}, {INF_P, 0, 0, 0}, 0x5f800000},
+		// ESUM: 2^128 - 2^128 + 0 + 0 = 0, as FMAX - FMAX
+		{"ESUM", 0x8000077e, {INF_P, INF_N, 0, 0}, {}, 0},
+	}
+	for c in cases {
+		v := c.name == "ESUM" ? &vu.vu1 : &vu.vu0 // the EFU is VU1's
+		v.vf[1].u, v.vf[2].u, v.q, v.p = c.s, c.t, 1, 1
+		vu.vu_op(v, c.w | 2 << 16 | 1 << 11)
+		got := transmute(u32)(c.name == "ESUM" ? v.p : v.q)
+		if got != c.want {fail("%s %08x %08x: %08x, want %08x", c.name, c.s.x, c.t.x, got, c.want)}
+	}
+}
+
 // Flags of a macro op whose fd is vf0: MAC and status still update, vf0
 // stays (0, 0, 0, 1). Status keeps a sticky bit set before the op (Z
 // sticky, bit 6) and gains the S sticky bit; U and O clear, the rest stay.
@@ -267,6 +301,7 @@ main :: proc() {
 	})
 	all_vi()
 	clamped()
+	div_efu()
 	flags()
 	minmax()
 	vu0_compiled()

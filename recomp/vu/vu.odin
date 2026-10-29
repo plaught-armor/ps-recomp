@@ -478,7 +478,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 		end_block(sb)
 	}
 	efu :: proc(sb: ^strings.Builder, fs: u32, p: string) {
-		fmt.sbprintfln(sb, "\t\t\t{{s := vf[%d].f; v.p = %s}", fs, p)
+		fmt.sbprintfln(sb, "\t\t\t{{s := clamp4(vf[%d].f); v.p = %s}", fs, p)
 	}
 	interp :: proc(sb: ^strings.Builder, lw, pc: u32) -> bool {
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_lower(0x%08x, 0x%04x)", lower_unit, lw, pc)
@@ -561,7 +561,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 		case 0x38: // DIV
 			fmt.sbprintfln(sb, "\t\t\tv.q = fdiv(vf[%d].f[%d], vf[%d].f[%d])", fs, (lw >> 21) & 3, ft, (lw >> 23) & 3)
 		case 0x39: // SQRT
-			fmt.sbprintfln(sb, "\t\t\tv.q = math.sqrt(abs(vf[%d].f[%d]))", ft, (lw >> 23) & 3)
+			fmt.sbprintfln(sb, "\t\t\tv.q = math.sqrt(abs(fclamp(vf[%d].f[%d])))", ft, (lw >> 23) & 3)
 		case 0x3a: // RSQRT
 			fmt.sbprintfln(sb, "\t\t\tv.q = frsqrt(vf[%d].f[%d], vf[%d].f[%d])", fs, (lw >> 21) & 3, ft, (lw >> 23) & 3)
 		case 0x3b, 0x7b: // WAITQ, WAITP
@@ -591,7 +591,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			}
 			end_block(sb)
 		// The EFU, as the interpreter: P written at once, the operand
-		// unclamped, the sums in the same order.
+		// clamped, the sums in the same order.
 		case 0x70: efu(sb, fs, "fclamp(s.x * s.x + s.y * s.y + s.z * s.z)") // ESADD
 		case 0x71: efu(sb, fs, "fdiv(1, s.x * s.x + s.y * s.y + s.z * s.z)") // ERSADD
 		case 0x72: efu(sb, fs, "math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z)") // ELENG
@@ -1023,20 +1023,23 @@ fclamp :: #force_inline proc "contextless" (x: f32) -> f32 {
 	return x
 }
 
+// fdiv and frsqrt clamp their operands first, as cpu.fdiv and cpu.frsqrt.
 fdiv :: #force_inline proc "contextless" (a, b: f32) -> f32 {
-	if transmute(u32)b & 0x7f800000 == 0 {
-		sign := (transmute(u32)a ~ transmute(u32)b) & 0x80000000
+	x, y := fclamp(a), fclamp(b)
+	if transmute(u32)y & 0x7f800000 == 0 {
+		sign := (transmute(u32)x ~ transmute(u32)y) & 0x80000000
 		return transmute(f32)(sign | 0x7f7fffff)
 	}
-	return fclamp(a / b)
+	return fclamp(x / y)
 }
 
 frsqrt :: #force_inline proc "contextless" (a, b: f32) -> f32 {
-	s := math.sqrt(abs(b))
+	x := fclamp(a)
+	s := math.sqrt(abs(fclamp(b)))
 	if transmute(u32)s & 0x7f800000 == 0 {
-		return transmute(f32)((transmute(u32)a & 0x80000000) | 0x7f7fffff)
+		return transmute(f32)((transmute(u32)x & 0x80000000) | 0x7f7fffff)
 	}
-	return fclamp(a / s)
+	return fclamp(x / s)
 }
 
 cvt_w :: #force_inline proc "contextless" (x: f32) -> i32 {

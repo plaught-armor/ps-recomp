@@ -167,7 +167,8 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 	}
 	s := v.vf[fs].f
 	t := v.vf[ft].f
-	// The add and multiply family's operands, clamped: the VU has no
+	// The add and multiply family's operands, clamped, and those of SQRT
+	// and the EFU (cpu.fdiv and frsqrt clamp their own): the VU has no
 	// infinities or NaNs, exponent 255 is just a large number, so two of
 	// them multiply to the largest value with the xor of their signs. On
 	// the host a NaN operand would leave the result to whichever NaN the
@@ -302,7 +303,7 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		v.q = cpu.fdiv(s[fsf], t[ftf])
 	case 0x39: // VSQRT
 		vu_div_flags(v, 1, t[ftf] < 0 ? 0 : 1)
-		v.q = math.sqrt(abs(t[ftf]))
+		v.q = math.sqrt(abs(ct[ftf]))
 	case 0x3a: // VRSQRT
 		vu_div_flags(v, s[fsf], t[ftf])
 		v.q = cpu.frsqrt(s[fsf], t[ftf])
@@ -338,20 +339,20 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 	case 0x6c: // XGKICK (VU1 only)
 		if v != &vu1 {cpu.fatal("vu0: XGKICK %08x does not exist on VU0", w)}
 		vu1_xgkick(v.vi[is])
-	case 0x70: v.p = vclamp(s.x * s.x + s.y * s.y + s.z * s.z) // ESADD
-	case 0x71: v.p = cpu.fdiv(1, s.x * s.x + s.y * s.y + s.z * s.z) // ERSADD
-	case 0x72: v.p = math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z) // ELENG
-	case 0x73: v.p = cpu.frsqrt(1, s.x * s.x + s.y * s.y + s.z * s.z) // ERLENG
-	case 0x74: v.p = math.atan(cpu.fdiv(s.y, s.x)) // EATANxy
-	case 0x75: v.p = math.atan(cpu.fdiv(s.z, s.x)) // EATANxz
-	case 0x76: v.p = vclamp(s.x + s.y + s.z + s.w) // ESUM
-	case 0x78: v.p = math.sqrt(abs(s[fsf])) // ESQRT
-	case 0x79: v.p = cpu.frsqrt(1, s[fsf]) // ERSQRT
-	case 0x7a: v.p = cpu.fdiv(1, s[fsf]) // ERCPR
+	case 0x70: v.p = vclamp(cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ESADD
+	case 0x71: v.p = cpu.fdiv(1, cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ERSADD
+	case 0x72: v.p = math.sqrt(cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ELENG
+	case 0x73: v.p = cpu.frsqrt(1, cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ERLENG
+	case 0x74: v.p = math.atan(cpu.fdiv(cs.y, cs.x)) // EATANxy
+	case 0x75: v.p = math.atan(cpu.fdiv(cs.z, cs.x)) // EATANxz
+	case 0x76: v.p = vclamp(cs.x + cs.y + cs.z + cs.w) // ESUM
+	case 0x78: v.p = math.sqrt(abs(cs[fsf])) // ESQRT
+	case 0x79: v.p = cpu.frsqrt(1, cs[fsf]) // ERSQRT
+	case 0x7a: v.p = cpu.fdiv(1, cs[fsf]) // ERCPR
 	case 0x7b: // WAITP
-	case 0x7c: v.p = math.sin(s[fsf]) // ESIN
-	case 0x7d: v.p = math.atan(s[fsf]) // EATAN
-	case 0x7e: v.p = vclamp(math.exp(-s[fsf])) // EEXP
+	case 0x7c: v.p = math.sin(cs[fsf]) // ESIN
+	case 0x7d: v.p = math.atan(cs[fsf]) // EATAN
+	case 0x7e: v.p = vclamp(math.exp(-cs[fsf])) // EEXP
 	case:
 		cpu.fatal("vu%d: unknown op %08x", v == &vu1 ? 1 : 0, w)
 	}

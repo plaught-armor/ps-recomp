@@ -933,7 +933,10 @@ vu0_div :: proc(a: ^native.Asm, w, key: u32) -> bool {
 	native.alu_imm(a, .Shl, .LD, 6)
 	native.alu(a, .Or, .C, .LD)
 	native.imp_store(a, "vu.status", .C)
-	// Q into A.
+	// Q into A, from the clamped operands as cpu.fdiv and frsqrt and
+	// vu_op's VSQRT take them.
+	if key != 0x39 {fclamp_gpr(a, .A, .C)}
+	fclamp_gpr(a, .B, .C)
 	store, fmax := native.new_label(a), native.new_label(a)
 	switch key {
 	case 0x38:
@@ -946,7 +949,7 @@ vu0_div :: proc(a: ^native.Asm, w, key: u32) -> bool {
 		native.br_zero(a, .C, fmax)
 		native.float_op(a, .Fdiv, .A, .B)
 	case 0x39:
-		// math.sqrt(abs(t[ftf])), not clamped
+		// math.sqrt(abs(ct[ftf])), the root not clamped
 		native.mov(a, .A, .B)
 		native.alu_imm(a, .And, .A, 0x7fffffff)
 		native.float_sqrt(a, .A)
@@ -962,20 +965,12 @@ vu0_div :: proc(a: ^native.Asm, w, key: u32) -> bool {
 		native.br_zero(a, .C, fmax)
 		native.float_op(a, .Fdiv, .A, .B)
 	}
-	// cpu.fclamp: exponent 255 to +-FMAX, exponent 0 to +-0.
-	zero := native.new_label(a)
-	native.mov(a, .LD, .A)
-	native.mov(a, .C, .A)
-	native.alu_imm(a, .And, .C, 0x7f800000)
-	native.br_zero(a, .C, zero)
-	native.br_cmp_imm(a, .Ne, .C, 0x7f800000, store)
+	fclamp_gpr(a, .A, .C)
+	native.jmp(a, store)
 	native.bind(a, fmax) // the sign in LD
 	native.mov(a, .A, .LD)
 	native.alu_imm(a, .And, .A, 0x80000000)
 	native.alu_imm(a, .Or, .A, 0x7f7fffff)
-	native.jmp(a, store)
-	native.bind(a, zero)
-	native.alu_imm(a, .And, .A, 0x80000000)
 	native.bind(a, store)
 	native.imp_store(a, "vu.q", .A)
 	return true
@@ -1109,6 +1104,23 @@ vu0_lq_sq :: proc(a: ^native.Asm, w, key: u32) {
 	native.imp_load(a, .C, "vu.vf", VU_VI)
 	native.alu_imm(a, .And, .C, 0xffff0000)
 	native.imp_store(a, "vu.vf", .C, VU_VI)
+}
+
+// r = cpu.fclamp of the f32 bits in r: exponent 255 to +-FMAX, exponent 0
+// to +-0. Uses t.
+@(private = "file")
+fclamp_gpr :: proc(a: ^native.Asm, r, t: native.Reg) {
+	zero, done := native.new_label(a), native.new_label(a)
+	native.mov(a, t, r)
+	native.alu_imm(a, .And, t, 0x7f800000)
+	native.br_zero(a, t, zero)
+	native.br_cmp_imm(a, .Ne, t, 0x7f800000, done)
+	native.alu_imm(a, .And, r, 0x80000000)
+	native.alu_imm(a, .Or, r, 0x7f7fffff)
+	native.jmp(a, done)
+	native.bind(a, zero)
+	native.alu_imm(a, .And, r, 0x80000000)
+	native.bind(a, done)
 }
 
 // Code for VU0 macro op w as vu.vu_op runs it, or false to leave it there:

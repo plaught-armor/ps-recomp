@@ -80,20 +80,26 @@ fclamp :: #force_inline proc(x: f32) -> f32 {
 	return x
 }
 
+// fdiv and frsqrt clamp their operands first, as vu_op does for the add
+// and multiply family: the host then never meets an infinity or NaN, and
+// exponent 255 divides as the large number it is (2^128 / 2^128 is 1, not
+// a NaN whose sign is the host's).
 fdiv :: proc(a, b: f32) -> f32 {
-	if transmute(u32)b & 0x7f800000 == 0 {
-		sign := (transmute(u32)a ~ transmute(u32)b) & 0x80000000
+	x, y := fclamp(a), fclamp(b)
+	if transmute(u32)y & 0x7f800000 == 0 {
+		sign := (transmute(u32)x ~ transmute(u32)y) & 0x80000000
 		return transmute(f32)(sign | 0x7f7fffff)
 	}
-	return fclamp(a / b)
+	return fclamp(x / y)
 }
 
 frsqrt :: proc(a, b: f32) -> f32 {
-	s := math.sqrt(abs(b))
+	x := fclamp(a)
+	s := math.sqrt(abs(fclamp(b)))
 	if transmute(u32)s & 0x7f800000 == 0 {
-		return transmute(f32)((transmute(u32)a & 0x80000000) | 0x7f7fffff)
+		return transmute(f32)((transmute(u32)x & 0x80000000) | 0x7f7fffff)
 	}
-	return fclamp(a / s)
+	return fclamp(x / s)
 }
 
 // EE FPU arithmetic. The EE float format has no infinities, NaNs or
