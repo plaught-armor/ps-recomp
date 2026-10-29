@@ -193,9 +193,23 @@ generate :: proc(o: mips.Options) {
 		code^ = native.make_asm(arch, native_ram())
 	}
 
+	// With coverage, native code for x64 and arm64 both: the one native_out
+	// gets in code, the other into a throwaway Asm, counted only.
+	cover := mips.option_or(o, "coverage", "") == "true"
+	asms: [2]^native.Asm // x64, arm64
+	if code != nil {asms[code.arch == .Arm64 ? 1 : 0] = code}
+	if cover {
+		for &a, k in asms {
+			if a == nil {
+				a = new(native.Asm)
+				a^ = native.make_asm(k == 0 ? .X64_SysV : .Arm64, native_ram())
+			}
+		}
+	}
+
 	// Per backend, the sites that call the interpreter.
-	slow_emit, slow_native: map[Op]int
-	slow_vu: map[string]int
+	slow_emit, slow_vu: map[string]int
+	slow_native: [2]map[string]int
 	mips.make_dirs(out)
 	for g, n in groups {
 		dir := mips.join(out, fmt.tprintf("p%02d", n))
@@ -239,9 +253,11 @@ generate :: proc(o: mips.Options) {
 		fmt.sbprintln(sb, "}\n")
 		for f in g {
 			emit_func(&e, f)
-			if code != nil {
+			for a, x in asms {
+				if a == nil {continue}
 				entries := interior_entries(&e, f)
-				offs := native_func(code, f, entries, cycles, &slow_native)
+				offs := native_func(a, f, entries, cycles, &slow_native[x])
+				if a != code {continue}
 				append(&n_funcs, native.Blob_Func{f.entry, offs[0]})
 				for l, k in entries {append(&n_funcs, native.Blob_Func{l, offs[1 + k]})}
 			}
@@ -263,9 +279,10 @@ generate :: proc(o: mips.Options) {
 	if !ok {
 		mips.fail("%s: bad .vutext", mips.option(o, "exe"))
 	}
-	if mips.option_or(o, "coverage", "") == "true" {
+	if cover {
 		coverage("emit", slow_emit)
-		if code != nil {coverage("native", slow_native)}
+		coverage("native x64", slow_native[0])
+		coverage("native arm64", slow_native[1])
 		coverage("vu", slow_vu)
 	}
 
@@ -294,9 +311,9 @@ generate :: proc(o: mips.Options) {
 // Print the ops of one backend that call the interpreter, the most sites
 // first.
 @(private = "file")
-coverage :: proc(backend: string, slow: map[$K]int) {
+coverage :: proc(backend: string, slow: map[string]int) {
 	Row :: struct {
-		op:    K,
+		op:    string,
 		sites: int,
 	}
 	rows := make([dynamic]Row, 0, len(slow), context.temp_allocator)

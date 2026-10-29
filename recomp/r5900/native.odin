@@ -491,9 +491,6 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		get(a, .B, rt)
 		native.mov_imm(a, .A, u32(rd))
 		native.call(a, "vu.ctrl_write", .A, .B)
-	case .VU0:
-		// vu.vu0_macro, as emit_op calls it, for what vu0_op leaves
-		if !vu0_op(a, i.w) {call_imm(a, "vu.macro", i.w)}
 	case .LQC2, .SQC2:
 		// VF registers live in the VU, 16 bytes each from import vu.vf;
 		// vf0 is fixed, but a store writes what it holds.
@@ -1014,6 +1011,12 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 @(private = "file")
 op :: proc(a: ^native.Asm, i: Insn) -> (slow: bool) {
 	if i.op == .SLL && i.w == 0 {return} // nop
+	if i.op == .VU0 {
+		// vu.vu0_macro, as emit_op calls it, for what vu0_op leaves
+		if vu0_op(a, i.w) {return}
+		call_imm(a, "vu.macro", i.w)
+		return true
+	}
 	if inline_op(a, i) {return}
 	interp(a, i)
 	return true
@@ -1099,7 +1102,7 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 // interior ones the program takes the address of). Returns their code
 // offsets, in context.temp_allocator. Counts the sites that call the
 // interpreter in slow, per op.
-native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[Op]int) -> []u32 {
+native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int) -> []u32 {
 	steps := lower(f, cycles, quiet = true) // emit_func warned
 	labels := make(map[u32]native.Label, context.temp_allocator)
 	pcs := make([dynamic]u32, context.temp_allocator)
@@ -1135,7 +1138,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			block = labels[s.target]
 			native.bind(a, block)
 		case .Op:
-			if op(a, s.i) {slow[s.i.op] += 1}
+			if op(a, s.i) {count_slow(slow, s.i)}
 		case .Cycles:
 			native.state_add64(a, CYCLES, s.n)
 		case .Return:

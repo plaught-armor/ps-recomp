@@ -334,7 +334,7 @@ main :: proc() {
 	arch := native.Arch(core.NATIVE_ARCH)
 	a := native.make_asm(arch, r5900.native_ram())
 	funcs: [len(cases)]native.Blob_Func
-	slow: map[r5900.Op]int
+	slow: map[string]int
 	for c, k in cases {
 		if got := r5900.decode(0, c.w).op; got != c.op {
 			fmt.eprintfln("FAIL %08x decodes to %v, want %v", c.w, got, c.op)
@@ -351,9 +351,11 @@ main :: proc() {
 		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0]}
 		free_all(context.temp_allocator)
 	}
+	// VDIV is left to the interpreter on purpose.
+	delete_key(&slow, "VU0 special 38")
 	// The COP1 ops are inline on x64 only.
 	if arch == .Arm64 {
-		for op in COP1_OPS {delete_key(&slow, op)}
+		for op in COP1_OPS {delete_key(&slow, fmt.tprint(op))}
 	}
 	if len(slow) != 0 {
 		fmt.eprintln("FAIL interpreter calls in native code:", slow)

@@ -24,7 +24,7 @@ Emitter :: struct {
 	pkg:    int,
 	cycles: int, // EE cycles charged per instruction (the EE runs at 294.912 MHz)
 	quiet:  bool, // no per-function warnings
-	slow:   ^map[Op]int, // per op, the sites that call the interpreter
+	slow:   ^map[string]int, // per op, the sites that call the interpreter
 }
 
 hexu :: proc(v: u32) -> string {
@@ -59,6 +59,24 @@ addr_expr :: proc(i: Insn) -> string {
 }
 
 F :: proc(n: u8) -> string {return fmt.tprintf("c.f[%d].f", n)}
+
+// Count i, a site that calls the interpreter, in slow: by op, or a VU0 macro
+// op by its function as recomp/vu counts a VU1 upper one. The keys outlive
+// the temp allocator, which each function frees.
+count_slow :: proc(slow: ^map[string]int, i: Insn) {
+	key: string
+	fn := i.w & 63
+	switch {
+	case i.op != .VU0:
+		key = fmt.tprint(i.op)
+	case fn & 0x3c != 0x3c:
+		key = fmt.tprintf("VU0 %02x", fn)
+	case:
+		key = fmt.tprintf("VU0 special %02x", ((i.w >> 4) & 0x7c) | (i.w & 3))
+	}
+	if key not_in slow {slow[strings.clone(key)] = 0}
+	slow[key] += 1
+}
 
 // Odin statements for a non-control-transfer instruction; slow when they
 // call the interpreter.
@@ -117,6 +135,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .VU0:
 		if code, ok := vu.emit_macro(i.w); !ok {
 			append(out, fmt.tprintf("vu.vu0_macro(%s)", hexu(i.w)))
+			slow = true
 		} else if code != "" {
 			append(out, code)
 		}
@@ -393,7 +412,7 @@ emit_func :: proc(e: ^Emitter, f: ^Func) {
 			fmt.sbprintfln(sb, "\t\tcase %s:", hexu(s.target))
 		case .Op:
 			n := len(body)
-			if emit_op(s.i, &body) {e.slow[s.i.op] += 1}
+			if emit_op(s.i, &body) {count_slow(e.slow, s.i)}
 			for k in n ..< len(body) {body[k] = fmt.tprintf("%s%s", tab, body[k])}
 		case .Cycles:
 			append(&body, fmt.tprintf("c.cycles += %d", s.n))
