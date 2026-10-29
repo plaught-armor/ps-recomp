@@ -220,6 +220,15 @@ main :: proc() {
 		{mmi(0x09, 0x11) &~ (31 << 11), .PHMADH}, // rd = 0: LO and HI only
 		{mmi(0x29, 0x0e) &~ (31 << 21 | 31 << 16) | 3 << 21 | 3 << 16, .PCPYUD}, // rs = rt = rd
 		{0x42000039, .DI},
+		{0x40816000, .MTC0}, // Status = r1
+		{0x40827000, .MTC0}, // EPC = r2
+		{0x40803000, .MTC0}, // Wired = r0
+		{0x42000018, .ERET},
+		{0x4443f800, .CFC1}, // r3 = fcr31
+		{0x44430000, .CFC1}, // r3 = FCR0
+		{0x4440f800, .CFC1}, // to r0
+		{0x44c1f800, .CTC1}, // fcr31 = r1
+		{0x44c10000, .CTC1}, // FCR0 stays
 		{mmi(0x04) &~ (31 << 16), .PLZCW},
 		{cop2(1, 3), .QMFC2},
 		{cop2(1, 0), .QMFC2}, // vf0
@@ -437,6 +446,7 @@ main :: proc() {
 				start.hi.d = {x ~ 0x5555, y}
 				start.lo.d = {y ~ 0xaaaa, x}
 				start.cop0[12] = u32(x) | 0x10000
+				start.fcr31 = u32(y)
 				// VU0: the values' words as floats, NaNs, infinities and
 				// denormals among them.
 				vu_start := vu.vu0

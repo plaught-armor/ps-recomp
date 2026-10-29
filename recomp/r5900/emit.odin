@@ -112,6 +112,13 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .MFLO: set64(out, rd, "c.lo.d[0]")
 	case .MTHI: append(out, fmt.tprintf("c.hi.d[0] = %s", R64(rs)))
 	case .MTLO: append(out, fmt.tprintf("c.lo.d[0] = %s", R64(rs)))
+	case .MTHI1: append(out, fmt.tprintf("c.hi.d[1] = %s", R64(rs)))
+	case .MTLO1: append(out, fmt.tprintf("c.lo.d[1] = %s", R64(rs)))
+	case .MTC0: append(out, fmt.tprintf("c.cop0[%d] = %s", rd, R32(rt)))
+	case .ERET: // lower returns after it; leave ERL if set, else EXL
+		append(out, "if c.cop0[12] & 4 != 0 {c.cop0[12] &~= 4} else {c.cop0[12] &~= 2}")
+	case .CFC1: set64(out, rt, fmt.tprintf("sx32(%s)", rd == 0 ? "0x2e30" : "c.fcr31"))
+	case .CTC1: if rd == 31 {append(out, fmt.tprintf("c.fcr31 = %s", R32(rt)))}
 	case .MFHI1: set64(out, rd, "c.hi.d[1]")
 	case .MFLO1: set64(out, rd, "c.lo.d[1]")
 	case .MULT:  append(out, fmt.tprintf("cpu.mult(%d, %s, %s, 0)", rd, R32(rs), R32(rt)))
@@ -231,7 +238,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	     .BC0F, .BC0T, .BC0FL, .BC0TL, .BC1F, .BC1T, .BC1FL, .BC1TL, .BC2F, .BC2T, .BC2FL, .BC2TL:
 		panic("control transfer in emit_op")
 	case .MFSA, .MTSA, .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI, .MTSAB, .MTSAH,
-	     .MTHI1, .MTLO1, .PMFHL, .PMTHL,
+	     .PMFHL, .PMTHL,
 	     .PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW,
 	     .PADDW, .PSUBW, .PCGTW, .PMAXW, .PADDH, .PSUBH, .PCGTH, .PMAXH, .PADDB, .PSUBB, .PCGTB,
 	     .PADDSW, .PSUBSW, .PEXTLW, .PPACW, .PADDSH, .PSUBSH, .PEXTLH, .PPACH, .PADDSB, .PSUBSB,
@@ -241,8 +248,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	     .PMADDW, .PSLLVW, .PSRLVW, .PMSUBW, .PMFHI, .PMFLO, .PINTH, .PMULTW, .PDIVW, .PCPYLD,
 	     .PMADDH, .PHMADH, .PAND, .PXOR, .PMSUBH, .PHMSBH, .PEXEH, .PREVH, .PMULTH, .PDIVBW, .PEXEW, .PROT3W,
 	     .PMADDUW, .PSRAVW, .PMTHI, .PMTLO, .PINTEH, .PMULTUW, .PDIVUW, .PCPYUD, .POR, .PNOR, .PEXCH, .PCPYH, .PEXCW,
-	     .MFC0, .MTC0, .TLBR, .TLBWI, .TLBWR, .TLBP, .ERET, .EI, .DI,
-	     .CFC1, .CTC1:
+	     .MFC0, .TLBR, .TLBWI, .TLBWR, .TLBP, .EI, .DI:
 		append(out, fmt.tprintf("ps2.exec_insn({{pc = %s, w = %s, op = .%v, rs = %d, rt = %d, rd = %d, sa = %d, fn = %d, imm = %d}})",
 			hexu(i.pc), hexu(i.w), i.op, i.rs, i.rt, i.rd, i.sa, i.fn, i.imm))
 		return true

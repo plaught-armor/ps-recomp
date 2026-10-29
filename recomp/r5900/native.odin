@@ -722,6 +722,34 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.state_load(a, .A, COP0 + 4 * 12)
 		native.alu_imm(a, .And, .A, ~u32(0x10000))
 		native.state_store(a, COP0 + 4 * 12, .A)
+	case .MTC0:
+		get(a, .A, rt)
+		native.state_store(a, COP0 + 4 * u32(rd), .A)
+	case .ERET:
+		// lower returns after it; leave ERL if set, else EXL
+		erl, done := native.new_label(a), native.new_label(a)
+		native.state_load(a, .A, COP0 + 4 * 12)
+		native.mov(a, .B, .A)
+		native.alu_imm(a, .And, .B, 4)
+		native.br_zero(a, .B, erl, nonzero = true)
+		native.alu_imm(a, .And, .A, ~u32(2))
+		native.jmp(a, done)
+		native.bind(a, erl)
+		native.alu_imm(a, .And, .A, ~u32(4))
+		native.bind(a, done)
+		native.state_store(a, COP0 + 4 * 12, .A)
+	case .CFC1:
+		if rt == 0 {return true}
+		if rd == 0 {
+			native.mov_imm(a, .A, 0x2e30)
+		} else {
+			native.state_load(a, .A, FCR31)
+		}
+		put_sx(a, rt, .A)
+	case .CTC1:
+		if rd != 31 {return true}
+		get(a, .A, rt)
+		native.state_store(a, FCR31, .A)
 	case .EI:
 		native.call(a, "kernel.ei")
 	case .SYSCALL:
