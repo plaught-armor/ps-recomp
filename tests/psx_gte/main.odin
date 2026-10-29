@@ -1,7 +1,8 @@
 // GTE register moves as native code, run on every target in CI: mtc2, mfc2,
 // lwc2 and swc2 (data registers) and ctc2 and cfc2 (control registers), the
 // native backend's inline field stores and loads and the calls it keeps,
-// against gte.gte_write and gte.gte_read from the same GTE state.
+// against gte.gte_write and gte.gte_read from the same GTE state. And the
+// inline NCLIP against gte.gte_cmd.
 package main
 
 import "core:fmt"
@@ -110,6 +111,19 @@ gte_state :: proc(k: int) -> gte.Gte_State {
 
 ADDR :: 0x80010000
 
+// NCLIP (COP2 command 0x06).
+NCLIP :: 0x4a000006
+
+// SX/SY halves: sign edges (bit 15 set reads as negative), then noise.
+@(rodata, private = "file")
+EDGES16 := [?]u32{0, 1, 0xffff, 0x7fff, 0x8000, 0x7ffe, 0x8001, 0x4000, 0xc000}
+
+@(private = "file")
+half :: proc() -> u32 {
+	n := next()
+	return EDGES16[n % len(EDGES16)] if n & 0x100 != 0 else n >> 16
+}
+
 main :: proc() {
 	arch := native.Arch(core.NATIVE_ARCH)
 	na := native.make_asm(arch, r3000.native_ram(), r3000.NATIVE_CACHED[:])
@@ -123,6 +137,9 @@ main :: proc() {
 			free_all(context.temp_allocator)
 		}
 	}
+	words := [?]u32{NCLIP, 0, JR_RA, 0, 0}
+	append(&funcs, native.Blob_Func{at, r3000.native_func(&na, build(at, words[:]), nil, 1)})
+	free_all(context.temp_allocator)
 	code, err := core.native_load(native.make_blob(&na, funcs[:], {}), psx_native.imports())
 	if err != "" {
 		fmt.eprintln("FAIL psx_gte: native_load:", err)
@@ -169,6 +186,29 @@ main :: proc() {
 				}
 			}
 		}
+	}
+	// NCLIP over SXY halves; every FLAG outcome (fits, above, below) must
+	// show up.
+	outcomes: map[u32]int
+	defer delete(outcomes)
+	for k in 0 ..< 20000 {
+		start := gte_state(k % len(vals))
+		gte.gte_load(start)
+		for r in u32(12) ..< 15 {gte.gte_write(r, half() | half() << 16)}
+		start = gte.gte_save()
+		gte.gte_cmd(0x06)
+		want := gte.gte_save()
+		outcomes[gte.state.flag] += 1
+		gte.gte_load(start)
+		(cast(proc())rawptr(code.base + uintptr(code.funcs[len(Form) * 32].off)))()
+		if got := gte.gte_save(); got != want {
+			w := transmute(gte.Gte)want
+			fail("nclip sxy %v: mac0 %08x flag %08x, want %08x %08x", w.sxy, u32(gte.state.mac[0]), gte.state.flag, u32(w.mac[0]), w.flag)
+		}
+		checks += 1
+	}
+	for f in ([?]u32{0, 0x80010000, 0x80008000}) {
+		if outcomes[f] == 0 {fail("nclip: no case with flag %08x", f)}
 	}
 	if failed != 0 {
 		os.exit(1)

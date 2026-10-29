@@ -495,6 +495,28 @@ x64_mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	op_state(a, false, 0x89, RDX, hi)
 }
 
+x64_mac64 :: proc(a: ^Asm, op: Mac, x, y: Reg) {
+	op_rr(a, true, 0x63, RCX, X64_REG[x]) // movsxd rcx, x
+	op_rr(a, true, 0x63, RDX, X64_REG[y]) // movsxd rdx, y
+	op_rr(a, true, 0x0faf, RCX, RDX) // imul rcx, rdx
+	switch op {
+	case .Set:
+		op_rr(a, true, 0x89, RCX, 0) // mov rax, rcx
+	case .Add:
+		op_rr(a, true, 0x01, RCX, 0) // add rax, rcx
+	case .Sub:
+		op_rr(a, true, 0x29, RCX, 0) // sub rax, rcx
+	}
+}
+
+x64_mac64_split :: proc(a: ^Asm, dst: Reg) {
+	op_rr(a, true, 0x89, 0, RCX) // mov rcx, rax
+	op_rr(a, true, 0xc1, 7, RCX) // sar rcx, 32
+	emit8(a, 32)
+	op_rr(a, false, 0x89, RCX, X64_REG[dst]) // mov dst, ecx
+	op_rr(a, false, 0x89, 0, 0) // mov eax, eax: the high half cleared
+}
+
 x64_div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	d := X64_REG[y]
 	if y == .A {

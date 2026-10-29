@@ -108,6 +108,39 @@ GTE_RGB :: 80
 GTE_RES1 :: 92
 @(private = "file")
 GTE_MAC :: 96
+@(private = "file")
+GTE_FLAG :: 292
+
+// NCLIP, as gte.gte_cmd: MAC0 = SX0*SY1 + SX1*SY2 + SX2*SY0 - SX0*SY2 -
+// SX1*SY0 - SX2*SY1, summed in 64 bits; FLAG = 0, or bit 16 for a sum above
+// i32 (bit 15 below) with bit 31. Loses A, B and C.
+@(private = "file")
+nclip :: proc(a: ^native.Asm) {
+	Term :: struct {
+		x, y: u32, // SXY entries: SX of x times SY of y
+		op:   native.Mac,
+	}
+	TERMS :: [6]Term{{0, 1, .Set}, {1, 2, .Add}, {2, 0, .Add}, {0, 2, .Sub}, {1, 0, .Sub}, {2, 1, .Sub}}
+	for t in TERMS {
+		native.imp_load(a, .B, "gte.state", GTE_SXY + 8 * t.x)
+		native.imp_load(a, .C, "gte.state", GTE_SXY + 8 * t.y + 4)
+		native.mac64(a, t.op, .B, .C)
+	}
+	native.mac64_split(a, .B)
+	native.imp_store(a, "gte.state", .A, GTE_MAC)
+	// The sum fits i32 when its high half is the low half's sign.
+	store := native.new_label(a)
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .Sar, .C, 31)
+	native.alu(a, .Xor, .C, .B)
+	native.mov_imm(a, .A, 0)
+	native.br_zero(a, .C, store)
+	native.mov_imm(a, .A, 0x80010000)
+	native.br_cmp_imm(a, .Ge, .B, 0, store)
+	native.mov_imm(a, .A, 0x80008000)
+	native.bind(a, store)
+	native.imp_store(a, "gte.state", .A, GTE_FLAG)
+}
 
 // A = GTE data register r, as gte.gte_read: inline for r < 28, where a read
 // is a field load; a call for the rest.
@@ -381,6 +414,8 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 		case rs == 4 || rs == 6:
 			get(a, .B, rt)
 			gte_put(a, rd if rs == 4 else rd + 32, .B)
+		case rs & 16 != 0 && i.w & 0x3f == 0x06:
+			nclip(a)
 		case rs & 16 != 0:
 			call_imm(a, "gte.gte_cmd", i.w & 0x1ffffff)
 		case:

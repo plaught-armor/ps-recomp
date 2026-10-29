@@ -436,6 +436,24 @@ a64_mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	ldst(a, 0xb9000000, T0, S, hi, 4)
 }
 
+a64_mac64 :: proc(a: ^Asm, op: Mac, x, y: Reg) {
+	d := A64_REG[.A]
+	switch op {
+	case .Set:
+		rrr(a, 0x9b207c00, d, A64_REG[x], A64_REG[y]) // smull xA, x, y
+	case .Add:
+		rrr(a, 0x9b200000 | d << 10, d, A64_REG[x], A64_REG[y]) // smaddl xA, x, y, xA
+	case .Sub:
+		rrr(a, 0x9b208000 | d << 10, d, A64_REG[x], A64_REG[y]) // smsubl xA, x, y, xA
+	}
+}
+
+a64_mac64_split :: proc(a: ^Asm, dst: Reg) {
+	d := A64_REG[.A]
+	emit32(a, 0x9360fc00 | d << 5 | A64_REG[dst]) // asr x dst, xA, #32
+	a64_mov(a, .A, .A) // the high half cleared
+}
+
 a64_div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	rrr(a, 0x1ac00c00 if signed else 0x1ac00800, T0, A64_REG[x], A64_REG[y]) // sdiv/udiv w12
 	emit32(a, 0x1b008000 | A64_REG[y] << 16 | A64_REG[x] << 10 | T0 << 5 | T1) // msub w13, w12, y, x

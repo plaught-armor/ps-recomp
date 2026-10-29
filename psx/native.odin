@@ -35,6 +35,7 @@ import native "native"
 #assert(offset_of(gte.Gte, rgb) == 80)
 #assert(offset_of(gte.Gte, res1) == 92)
 #assert(offset_of(gte.Gte, mac) == 96)
+#assert(offset_of(gte.Gte, flag) == 292)
 
 // Replace the registered functions with the native code in the file at
 // path. False, with the reason printed, when it cannot be used; the Odin

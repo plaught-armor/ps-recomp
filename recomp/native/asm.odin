@@ -69,6 +69,13 @@ Alu :: enum u8 {
 	Sar,
 }
 
+// How mac64 takes its product into the sum.
+Mac :: enum u8 {
+	Set, // starts it
+	Add,
+	Sub,
+}
+
 // 128-bit registers for vector operations on 16-byte state fields; a call
 // does not keep them.
 Vreg :: enum u8 {
@@ -690,6 +697,31 @@ mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 		x64_mul_wide(a, signed, lo, hi, x, y)
 	case .Arm64:
 		a64_mul_wide(a, signed, lo, hi, x, y)
+	}
+}
+
+// A, as a 64-bit sum, = the product of x and y (each a signed 32-bit
+// value), or A plus or minus it: a sum of products past 32 bits, read with
+// mac64_split. x and y are not A. Uses rcx and rdx on x64.
+mac64 :: proc(a: ^Asm, op: Mac, x, y: Reg) {
+	assert(x != .A && y != .A, "native: mac64 operand in the sum")
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_mac64(a, op, x, y)
+	case .Arm64:
+		a64_mac64(a, op, x, y)
+	}
+}
+
+// dst = the high 32 bits of mac64's sum in A, and A = its low 32 bits. dst
+// is not A. Uses rcx on x64.
+mac64_split :: proc(a: ^Asm, dst: Reg) {
+	assert(dst != .A, "native: mac64_split into the sum")
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_mac64_split(a, dst)
+	case .Arm64:
+		a64_mac64_split(a, dst)
 	}
 }
 
