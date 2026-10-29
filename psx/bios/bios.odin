@@ -206,6 +206,9 @@ bios_b :: proc(fn: u32) {
 			bios.rfe = true
 		}
 	case 0x18:
+		// SetDefaultExitFromException: the retail default exit buffer
+		// returns through ReturnFromException, which is what no hook
+		// does here.
 		bios.hook = 0
 	case 0x19:
 		bios.hook = arg(0)

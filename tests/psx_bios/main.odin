@@ -11,8 +11,9 @@
 //   tail of chain 1 and its IRQ event handler at the tail of chain 3;
 //   ChangeClearRCnt's flag and ReturnFromException end the walk early,
 //   skipping the HookEntryInt handler; an acknowledged counter ends it
-//   with the other counters still pending. WaitEvent with interrupts
-//   blocked gives up instead of hanging.
+//   with the other counters still pending. SetDefaultExitFromException
+//   ends the exception after the walk without the hook. WaitEvent with
+//   interrupts blocked gives up instead of hanging.
 //   The kernel layout games read and patch: the exception vector (at 0x00
 //   too), the C0 and B0 tables, and the pad driver's pointers and vblank
 //   acknowledge, handed over by StartPAD and turned off by ChangeClearPad
@@ -332,6 +333,21 @@ main :: proc() {
 		fail("with no ReturnFromException: second ran %d times, chain 2 %d, hook %d, want 1, 3 and 3", calls.second, calls.late, calls.hook)
 	}
 
+	// SetDefaultExitFromException: the walk runs to the end, then the
+	// exception ends without the hook; SetCustomExitFromException brings
+	// it back.
+	late, hook := calls.late, calls.hook
+	b(0x18)
+	irq(0)
+	if calls.late != late + 1 || calls.hook != hook {
+		fail("default exit: chain 2 ran %d times, hook %d, want 1 and 0", calls.late - late, calls.hook - hook)
+	}
+	b(0x19, HOOK_BUF)
+	irq(0)
+	if calls.hook != hook + 1 {
+		fail("hook ran %d times after SetCustomExitFromException, want 1", calls.hook - hook)
+	}
+
 	// WaitEvent with interrupts blocked on an event only an IRQ readies
 	// gives up instead of hanging.
 	deliver_in = -1
@@ -391,7 +407,7 @@ main :: proc() {
 	b(0x13)
 	check("vblank pending after StartPAD", io.irq_regs.stat, 0)
 	check("vblank unmasked by StartPAD", io.irq_regs.mask & 1, 1)
-	hook := calls.hook
+	hook = calls.hook
 	irq(0)
 	check("vblank root counter event with the pad started", test(vb), 1)
 	check("vblank acknowledged by the pad driver", io.irq_regs.stat, 0)
