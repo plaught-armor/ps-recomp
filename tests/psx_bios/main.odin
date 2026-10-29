@@ -23,6 +23,7 @@
 //   by zeroing its code. SysEnqIntRP of a queued element moves it to the
 //   head; SysDeqIntRP returns the element it unlinks, or 0. CloseEvent,
 //   EnableEvent and DisableEvent return 1 for any handle, InitPAD 1.
+//   GetConf reads back the table sizes, or what SetConf set.
 //   The memory card calls: card status, firstfile/nextfile patterns and the
 //   DIRENTRY, and lseek and read on whole frames. The card images live in
 //   memory only: their paths name a directory that does not exist.
@@ -89,6 +90,10 @@ PAD_WORD :: 0x2100
 @(private = "file")
 PAD_BUF :: 0x2110
 
+// GetConf's three words.
+@(private = "file")
+CONF_BUF :: 0x2200
+
 // Card file name, DIRENTRY and read buffer.
 @(private = "file")
 CARD_NAME :: 0x6000
@@ -112,6 +117,15 @@ b :: proc(fn: u32, args: ..u32) -> u32 {
 		cpu.state.r[4 + k] = a
 	}
 	bios.bios_b(fn)
+	return cpu.state.r[2]
+}
+
+@(private = "file")
+a :: proc(fn: u32, args: ..u32) -> u32 {
+	for v, k in args {
+		cpu.state.r[4 + k] = v
+	}
+	bios.bios_a(fn)
 	return cpu.state.r[2]
 }
 
@@ -446,6 +460,17 @@ main :: proc() {
 	cpu.state.r[4], cpu.state.r[5] = 0, 1
 	cpu.call(cpu.r32(c0 + 0x0a * 4))
 	check("ChangeClearRCnt through C0(0Ah)", cpu.state.r[2], 1)
+
+	// GetConf reports the HLE's table sizes, then what SetConf set.
+	a(0x9d, CONF_BUF, CONF_BUF + 4, CONF_BUF + 8)
+	check("GetConf events", cpu.r32(CONF_BUF), 32)
+	check("GetConf threads", cpu.r32(CONF_BUF + 4), 16)
+	check("GetConf stack", cpu.r32(CONF_BUF + 8), 0x801fff00)
+	a(0x9c, 16, 4, 0x801ff000)
+	a(0x9d, CONF_BUF, CONF_BUF + 4, CONF_BUF + 8)
+	check("GetConf events after SetConf", cpu.r32(CONF_BUF), 16)
+	check("GetConf threads after SetConf", cpu.r32(CONF_BUF + 4), 4)
+	check("GetConf stack after SetConf", cpu.r32(CONF_BUF + 8), 0x801ff000)
 
 	// libpad's pointers into the pad driver stop and restart pad reading.
 	check("InitPAD", b(0x12, PAD_BUF, 0x22, 0, 0), 1)

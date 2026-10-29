@@ -34,6 +34,8 @@ bios: struct {
 	pad_read:  bool,
 	// syscall 3 was called directly once (bios_syscall).
 	tcb_warn:  bool,
+	// SetConf/GetConf: event and thread control block counts, stack top.
+	conf:      [3]u32,
 }
 
 // Host input and GPU, set by package psx (hooks.odin) so this package does
@@ -135,6 +137,25 @@ bios_a :: proc(fn: u32) {
 		gp0_write(arg(0))
 	case 0x70:
 		ret(1) // _bu_init
+	case 0x9c:
+		// SetConf(events, threads, stack top). The retail kernel rebuilds
+		// itself with tables of the new sizes; the HLE tables are fixed,
+		// so this only records the values for GetConf.
+		if arg(0) > MAX_EVENTS || arg(1) > MAX_THREADS {
+			fmt.eprintfln(
+				"bios: SetConf(%d events, %d threads) beyond the %d and %d here",
+				arg(0),
+				arg(1),
+				MAX_EVENTS,
+				MAX_THREADS,
+			)
+		}
+		bios.conf = {arg(0), arg(1), arg(2)}
+	case 0x9d:
+		// GetConf(&events, &threads, &stack top), stored in the retail order.
+		cpu.w32(arg(2), bios.conf[2])
+		cpu.w32(arg(0), bios.conf[0])
+		cpu.w32(arg(1), bios.conf[1])
 	case 0xab, 0xac:
 		// _card_info / _card_load: complete at once.
 		card_info(arg(0))
@@ -443,6 +464,10 @@ FAKE_DCB_TABLE :: 0x3000
 @(private)
 DCB_SIZE :: 0x50
 
+// The stack top GetConf reports until SetConf: the retail default.
+@(private)
+STACK_TOP :: 0x801fff00
+
 // The B0 entries' stubs, then the C0 entries', 8 bytes each: j 0xb0 (or
 // 0xc0) with t1 = the function number in the delay slot, so a call through
 // the table reaches the same function as a call to the vector. bios_entry
@@ -488,6 +513,7 @@ bios_init :: proc() {
 	cpu.w32(0x150, FAKE_DCB_TABLE)
 	cpu.w32(0x154, DCB_SIZE)
 	bios.rcnt_ack = {0 ..< len(bios.rcnt_ack) = true}
+	bios.conf = {MAX_EVENTS, MAX_THREADS, STACK_TOP}
 	threads_init()
 }
 
