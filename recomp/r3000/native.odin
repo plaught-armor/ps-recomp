@@ -97,6 +97,39 @@ bad :: proc(a: ^native.Asm, i: Insn) {
 	native.call(a, "cpu.bad_insn", .A, .B)
 }
 
+// lo and hi = A / B and A % B (signed or not), as cpu.div and cpu.divu:
+// by 0, hi is A and lo is -1 (signed: 1 when A < 0). Signed by -1, lo is
+// -A and hi 0, which gives the least i32 for itself without the divide
+// that traps on it.
+@(private = "file")
+divide :: proc(a: ^native.Asm, signed: bool) {
+	zero, minus, done := native.new_label(a), native.new_label(a), native.new_label(a)
+	native.br_zero(a, .B, zero)
+	if signed {native.br_cmp_imm(a, .Eq, .B, 0xffffffff, minus)}
+	native.div_wide(a, signed, LO, HI, .A, .B)
+	native.jmp(a, done)
+	if signed {
+		native.bind(a, minus)
+		native.mov_imm(a, .C, 0)
+		native.alu(a, .Sub, .C, .A)
+		native.state_store(a, LO, .C)
+		native.state_store_imm(a, HI, 0)
+		native.jmp(a, done)
+	}
+	native.bind(a, zero)
+	native.state_store(a, HI, .A)
+	if signed {
+		// A >> 31 is 0 or -1; doubled and inverted, -1 or 1.
+		native.alu_imm(a, .Sar, .A, 31)
+		native.alu_imm(a, .Shl, .A, 1)
+		native.not(a, .A)
+		native.state_store(a, LO, .A)
+	} else {
+		native.state_store_imm(a, LO, 0xffffffff)
+	}
+	native.bind(a, done)
+}
+
 // The word at A of a fused lwl/lwr or swl/swr pair (store: the value in B),
 // which need not be aligned: in place when the word is inside one RAM page,
 // as cpu.lw_u and cpu.sw_u do it, else by calling them. One page keeps it
@@ -170,7 +203,7 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 		case 26, 27:
 			get(a, .A, rs)
 			get(a, .B, rt)
-			native.call(a, "cpu.div" if i.fn == 26 else "cpu.divu", .A, .B)
+			divide(a, i.fn == 26)
 		case 32, 33, 34, 35, 36, 37, 38, 39, 42, 43:
 			if rd == 0 {return true}
 			get(a, .A, rs)

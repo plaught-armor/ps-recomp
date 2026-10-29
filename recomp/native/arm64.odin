@@ -420,6 +420,13 @@ a64_mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	ldst(a, 0xb9000000, T0, S, hi, 4)
 }
 
+a64_div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
+	rrr(a, 0x1ac00c00 if signed else 0x1ac00800, T0, A64_REG[x], A64_REG[y]) // sdiv/udiv w12
+	emit32(a, 0x1b008000 | A64_REG[y] << 16 | A64_REG[x] << 10 | T0 << 5 | T1) // msub w13, w12, y, x
+	ldst(a, 0xb9000000, T0, S, lo, 4)
+	ldst(a, 0xb9000000, T1, S, hi, 4)
+}
+
 a64_call :: proc(a: ^Asm, k: int, args: []Reg) {
 	for r, n in args {
 		rrr(a, 0x2a0003e0, u32(n), 0, A64_REG[r]) // mov wn, r

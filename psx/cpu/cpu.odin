@@ -262,7 +262,7 @@ multu :: #force_inline proc(a, b: u32) {
 	state.hi = u32(p >> 32)
 }
 
-div :: proc(a, b: u32) {
+div :: #force_inline proc(a, b: u32) {
 	n, d := i32(a), i32(b)
 	switch {
 	case d == 0:
@@ -277,7 +277,7 @@ div :: proc(a, b: u32) {
 	}
 }
 
-divu :: proc(a, b: u32) {
+divu :: #force_inline proc(a, b: u32) {
 	if b == 0 {
 		state.lo = 0xffffffff
 		state.hi = a

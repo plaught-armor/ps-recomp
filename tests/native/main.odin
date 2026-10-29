@@ -48,6 +48,7 @@ Kind :: enum u8 {
 	Set,
 	Set_Imm,
 	Mul, // imm 0 for the low word, 1 for the high
+	Div, // imm 0 for the quotient, 1 for the remainder, by DIVISOR of s
 	Call3, // f3 of registers d, s, r
 	Br_Zero, // flag: nonzero
 	Br_Cmp, // r c imm
@@ -219,6 +220,10 @@ expect :: proc(c: Case, x, y: u32) -> u32 {
 	case .Mul:
 		p := u64(i64(i32(x)) * i64(i32(yy))) if c.flag else u64(x) * u64(yy)
 		return u32(p >> 32) if c.imm == 1 else u32(p)
+	case .Div:
+		v := y & DIVISOR_AND | DIVISOR_OR
+		if c.flag {return u32(i32(x) % i32(v)) if c.imm == 1 else u32(i32(x) / i32(v))}
+		return x % v if c.imm == 1 else x / v
 	case .Call3:
 		return f3(vals(c.d, x, y), vals(c.s, x, y), vals(c.r, x, y))
 	case .Br_Zero, .Br_Cmp, .Br_Below, .Br_Byte:
@@ -685,6 +690,16 @@ next_of :: proc(x, y: u32) -> u64 {return u64(y) << 32 | u64(x)}
 flags_of :: proc(x, y: u32) -> u8 {return u8(x ~ y)}
 
 // The register after r, for a second operand.
+// A divisor div_wide takes from any value: never 0 (bit 0 set) nor -1
+// (bits 2 and 3 clear), and still of either sign.
+DIVISOR_AND :: 0xfffffff3
+DIVISOR_OR :: 1
+
+divisor :: proc(r: native.Reg) {
+	native.alu_imm(&a, .And, r, DIVISOR_AND)
+	native.alu_imm(&a, .Or, r, DIVISOR_OR)
+}
+
 other :: proc(r: native.Reg) -> native.Reg {
 	return native.Reg((int(r) + 1) % len(native.Reg))
 }
@@ -727,6 +742,13 @@ build_main :: proc() {
 				hi := add({kind = .Mul, d = d, s = s, imm = 1, flag = signed})
 				lo := add({kind = .Mul, d = d, s = s, imm = 0, flag = signed})
 				native.mul_wide(&a, signed, lo, hi, d, s)
+				if d == s {continue}
+				native.state_load(&a, s, IN1)
+				native.state_load(&a, d, IN0)
+				divisor(s)
+				rem := add({kind = .Div, d = d, s = s, imm = 1, flag = signed})
+				quo := add({kind = .Div, d = d, s = s, imm = 0, flag = signed})
+				native.div_wide(&a, signed, quo, rem, d, s)
 			}
 			if d != s {
 				native.state_load(&a, s, IN1)
@@ -784,6 +806,10 @@ build_main :: proc() {
 		load_vals()
 		native.mul_wide(&a, true, add({kind = .Any}), add({kind = .Any}), d, other(d))
 		check_kept({.A, .B})
+		load_vals()
+		divisor(other(d))
+		native.div_wide(&a, true, add({kind = .Any}), add({kind = .Any}), d, other(d))
+		check_kept({.A, other(d)})
 	}
 	for v in ([?]u32{1, 4095, 4096, 0x12345, 0x7fffffff}) {
 		load_vals()

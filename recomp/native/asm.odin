@@ -691,6 +691,20 @@ mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	}
 }
 
+// Quotient and remainder of x by y (signed or not) into the guest state's
+// fields at lo and hi, neither a cached one. y is not 0, nor -1 when x is
+// the least i32 and signed: x64 traps on both. Uses A, and scratch outside
+// the Regs: rcx and rdx on x64, x12 and x13 on arm64.
+div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
+	assert(cache_index(a, lo) < 0 && cache_index(a, hi) < 0, "native: quotient into a cached field")
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_div_wide(a, signed, lo, hi, x, y)
+	case .Arm64:
+		a64_div_wide(a, signed, lo, hi, x, y)
+	}
+}
+
 // Call the Odin procedure in import `name` with 32-bit arguments; a result
 // comes back in A. The cached fields go to the state for it and come back
 // after.

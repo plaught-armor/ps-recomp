@@ -53,8 +53,6 @@ imports :: proc() -> map[string]u64 {
 	m["cpu.swr"] = p(rawptr(cpu.swr))
 	m["cpu.lw_u"] = p(rawptr(cpu.lw_u))
 	m["cpu.sw_u"] = p(rawptr(cpu.sw_u))
-	m["cpu.div"] = p(rawptr(cpu.div))
-	m["cpu.divu"] = p(rawptr(cpu.divu))
 	m["cpu.syscall"] = p(rawptr(cpu.syscall))
 	m["cpu.brk"] = p(rawptr(cpu.brk))
 	m["cpu.mfc0"] = p(rawptr(cpu.mfc0))

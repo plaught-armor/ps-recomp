@@ -2,7 +2,8 @@
 // fuses lwl/lwr and swl/swr pairs only under its guards; cpu.lw_u and
 // cpu.sw_u match the pair they stand for at every alignment, in RAM, across
 // a page, at the end of RAM, in the scratchpad and across into I/O; and the
-// native backend's fused pair leaves what the composed pair does.
+// native backend's fused pair leaves what the composed pair does. Also the
+// native backend's inline div and divu against cpu.div and cpu.divu.
 package main
 
 import "core:fmt"
@@ -30,6 +31,8 @@ SWL_A1 :: 0xa8850003 // swl $a1, 3($a0)
 SWR_A1 :: 0xb8850000 // swr $a1, 0($a0)
 ADDU_V1_V0 :: 0x00401821 // addu $v1, $v0, $0: the load delay slot
 JR_RA :: 0x03e00008
+DIV_A0_A1 :: 0x0085001a
+DIVU_A0_A1 :: 0x0085001b
 
 @(private = "file")
 build :: proc(at: u32, words: []u32, labels: []u32 = nil) -> ^mips.Func {
@@ -205,6 +208,8 @@ check_native :: proc() {
 		{LWL_V0, LWR_V0, JR_RA, 0},
 		{LWL_V0, LWR_V0, ADDU_V1_V0, JR_RA},
 		{SWL_A1, SWR_A1, JR_RA, 0},
+		{DIV_A0_A1, JR_RA, 0, 0},
+		{DIVU_A0_A1, JR_RA, 0, 0},
 	}
 	funcs := FUNCS
 	arch := native.Arch(core.NATIVE_ARCH)
@@ -243,6 +248,27 @@ check_native :: proc() {
 		run(code, 2)
 		snap(got)
 		if !same_mem(want, got) {fail("native store at %08x differs from swl/swr", a)}
+	}
+	// Each by each: by 0, the least i32 by -1, every sign, and others.
+	DIV_ROWS :: [?]u32 {
+		0, 1, 2, 3, 7, 0x7fff, 0x10000, 0x7ffffffe, 0x7fffffff,
+		0x80000000, 0x80000001, 0xfffffff9, 0xfffffffe, 0xffffffff, 0x12345678, 0x9abcdef0,
+	}
+	rows := DIV_ROWS
+	for n in rows {
+		for d in rows {
+			for k in 3 ..< 5 {
+				cpu.state.hi, cpu.state.lo = 0x11111111, 0x22222222
+				if k == 3 {cpu.div(n, d)} else {cpu.divu(n, d)}
+				hi, lo := cpu.state.hi, cpu.state.lo
+				cpu.state.hi, cpu.state.lo = 0x11111111, 0x22222222
+				cpu.state.r[4], cpu.state.r[5] = n, d
+				run(code, k)
+				if cpu.state.hi != hi || cpu.state.lo != lo {
+					fail("native %s %08x, %08x: hi %08x lo %08x, want %08x %08x", "div" if k == 3 else "divu", n, d, cpu.state.hi, cpu.state.lo, hi, lo)
+				}
+			}
+		}
 	}
 }
 

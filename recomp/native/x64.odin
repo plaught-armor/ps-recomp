@@ -484,6 +484,23 @@ x64_mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	op_state(a, false, 0x89, RDX, hi)
 }
 
+x64_div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
+	d := X64_REG[y]
+	if y == .A {
+		op_rr(a, false, 0x89, d, RCX) // mov ecx, eax
+		d = RCX
+	}
+	mov(a, .A, x)
+	if signed {
+		emit8(a, 0x99) // cdq
+	} else {
+		op_rr(a, false, 0x31, RDX, RDX) // xor edx, edx
+	}
+	op_rr(a, false, 0xf7, 7 if signed else 6, d) // eax, edx = edx:eax / d, % d
+	op_state(a, false, 0x89, 0, lo)
+	op_state(a, false, 0x89, RDX, hi)
+}
+
 x64_call :: proc(a: ^Asm, k: int, args: []Reg) {
 	regs := SYSV_ARGS if a.arch == .X64_SysV else WIN_ARGS
 	for r, n in args {
