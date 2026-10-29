@@ -232,18 +232,28 @@ timer_reschedule :: proc(n: int, now: u64) {
 	if t.mode & 0x30 == 0 {
 		return
 	}
-	limit := u64(0x10000)
-	if t.mode & 0x10 != 0 && t.target != 0 {
-		limit = u64(t.target)
-	}
 	// Due on a tick boundary counted from base: the part of a tick already
 	// run since the last boundary counts, or a /8 counter would lose it at
 	// every reschedule.
 	step := t.div * clock_mul
 	cur := u64(timer_value_at(n, now))
-	ticks := limit > cur ? limit - cur : limit
+	ticks := 0x10000 - cur
+	if target, ok := timer_irq_target(n); ok {
+		// The counter shows target for a tick, then goes on to 0 (reset at
+		// target: a period of target+1) or counts on through 0xffff.
+		period := target + 1 if t.mode & 0x08 != 0 else 0x10000
+		ticks = target - cur if cur < target else period - cur + target
+	}
 	events[e] = now - (now - t.base) % step + ticks * step
 	cpu.next_event = min(cpu.next_event, events[e])
+}
+
+// The target the counter's IRQ fires at, or false when it fires at
+// overflow.
+@(private)
+timer_irq_target :: proc(n: int) -> (u64, bool) {
+	t := &timers[n]
+	return u64(t.target), t.mode & 0x10 != 0 && t.target != 0
 }
 
 @(private)
@@ -255,10 +265,8 @@ timer_fire :: proc(n: int) {
 	t := &timers[n]
 	t.value = timer_value_at(n, event_due)
 	t.base = event_due
-	if t.mode & 0x08 != 0 && t.mode & 0x10 != 0 {
-		t.value = 0
-	}
-	t.mode |= 0x800 if t.mode & 0x10 != 0 else 0x1000
+	_, at_target := timer_irq_target(n)
+	t.mode |= 0x800 if at_target else 0x1000
 	if .Timer in core.trace.active {
 		core.tracef(.Timer, "timer%d fire mode=%x target=%x", n, t.mode, t.target)
 	}
