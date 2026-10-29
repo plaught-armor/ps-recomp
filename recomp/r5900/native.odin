@@ -754,6 +754,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.call(a, "kernel.ei")
 	case .SYSCALL:
 		call_imm(a, "kernel.syscall", i.pc)
+	case .BREAK:
+		native.mov_imm(a, .A, i.pc)
+		native.mov_imm(a, .B, i.w)
+		native.call(a, "cpu.brk", .A, .B)
 	case .SYNC, .CACHE, .PREF:
 	case:
 		return false
@@ -977,13 +981,85 @@ vu0_div :: proc(a: ^native.Asm, w, key: u32) -> bool {
 	return true
 }
 
+// The offset of vi from vf in vu.Vu, which ps2/native.odin asserts: the VI
+// registers are reached through import vu.vf.
+@(private = "file")
+VU_VI :: 512
+
+// r = VU0's vi[n & 15] in its low 16 bits, the rest garbage, or
+// sign-extended with signed.
+@(private = "file")
+vi_get :: proc(a: ^native.Asm, r: native.Reg, n: u32, signed := false) {
+	native.imp_load(a, r, "vu.vf", VU_VI + 4 * ((n & 15) >> 1))
+	if signed {
+		if n & 1 == 0 {native.alu_imm(a, .Shl, r, 16)}
+		native.alu_imm(a, .Sar, r, 16)
+	} else if n & 1 != 0 {
+		native.alu_imm(a, .Shr, r, 16)
+	}
+}
+
+// VU0's vi[n & 15] = the low 16 bits of A, by a read and write of the word
+// that holds it. Loses A and C.
+@(private = "file")
+vi_put :: proc(a: ^native.Asm, n: u32) {
+	off := VU_VI + 4 * ((n & 15) >> 1)
+	native.imp_load(a, .C, "vu.vf", off)
+	native.alu_imm(a, .And, .C, n & 1 != 0 ? 0xffff : 0xffff0000)
+	native.alu_imm(a, .And, .A, 0xffff)
+	if n & 1 != 0 {native.alu_imm(a, .Shl, .A, 16)}
+	native.alu(a, .Or, .C, .A)
+	native.imp_store(a, "vu.vf", .C, off)
+}
+
+// Code for VU0 macro op w with fn 0x30-0x3b as vu.vu_op runs it, or false
+// to leave it there: VIADD, VISUB, VIADDI, VIAND, VIOR, VCALLMS and
+// VCALLMSR. As there, an integer op is skipped on a 5-bit destination
+// field of 0 and indexes with its low 4 bits, so a field of 16 writes
+// vi[0]. Uses A, B and C.
+@(private = "file")
+vu0_lower :: proc(a: ^native.Asm, w: u32) -> bool {
+	ft, fs, fd := (w >> 16) & 31, (w >> 11) & 31, (w >> 6) & 31
+	op: native.Alu
+	switch w & 63 {
+	case 0x30, 0x32: op = .Add
+	case 0x31: op = .Sub
+	case 0x34: op = .And
+	case 0x35: op = .Or
+	case 0x38:
+		call_imm(a, "vu.call_micro", ((w >> 6) & 0x7fff) * 8)
+		return true
+	case 0x39:
+		native.imp_load(a, .A, "vu.cmsar")
+		native.alu_imm(a, .Shl, .A, 3)
+		native.call(a, "vu.call_micro", .A)
+		return true
+	case: return false
+	}
+	if w & 63 == 0x32 {
+		// VIADDI: vi[ft] = vi[fs] + imm5, the fd field sign-extended
+		if ft == 0 {return true}
+		vi_get(a, .A, fs)
+		native.alu_imm(a, .Add, .A, u32(i32(fd << 27) >> 27))
+		vi_put(a, ft)
+		return true
+	}
+	if fd == 0 {return true}
+	vi_get(a, .A, fs)
+	vi_get(a, .B, ft)
+	native.alu(a, op, .A, .B)
+	vi_put(a, fd)
+	return true
+}
+
 // Code for VU0 macro op w as vu.vu_op runs it, or false to leave it there:
 // moves, waits, the float upper ops of the VF registers and ACC with their
 // broadcast, Q and I forms, and ITOF, FTOI and ABS. Results clamp and set
 // MAC and status as vu_put_flags does, and the add and multiply operands
 // clamp first as vu_op's do. MAX and MINI order the raw words by sign and
 // magnitude and write the winner as it is, as ps2/vu vmax and vmin. ITOF,
-// FTOI, ABS, MAX and MINI set no flags. Uses A, B, C and V0-V4.
+// FTOI, ABS, MAX and MINI set no flags. VMFIR and, through vu0_lower, the
+// integer ops and VCALLMS too. Uses A, B, C and V0-V4.
 @(private = "file")
 vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Max, Mini, Opmul, Opmsub, Move, Mr32, Nop, Itof, Ftoi, Abs}
@@ -992,6 +1068,7 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	fn := w & 63
 	upper := fn < 0x3c
 	key := upper ? fn : ((w >> 4) & 0x7c) | bc
+	if upper && fn >= 0x30 {return vu0_lower(a, w)}
 	kind: Kind
 	src := Src.Vec
 	switch key {
@@ -1022,10 +1099,18 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x2d: kind = .Msub
 	case 0x2e: kind = upper ? .Opmsub : .Opmul
 	case 0x2f: kind = upper ? Kind.Mini : Kind.Nop // VNOP
-	case 0x30: if upper {return false}; kind = .Move
-	case 0x31: if upper {return false}; kind = .Mr32
-	case 0x38 ..= 0x3a: if upper {return false}; return vu0_div(a, w, key)
-	case 0x3b: if upper {return false}; kind = .Nop // VWAITQ
+	case 0x30: kind = .Move
+	case 0x31: kind = .Mr32
+	case 0x38 ..= 0x3a: return vu0_div(a, w, key)
+	case 0x3b: kind = .Nop // VWAITQ
+	case 0x3d:
+		// VMFIR: vf[ft] = vi[fs & 15] sign-extended, in the dest lanes
+		if ft == 0 {return true}
+		vi_get(a, .A, fs, signed = true)
+		for k in u32(0) ..< 4 {
+			if dest & (8 >> k) != 0 {native.imp_store(a, "vu.vf", .A, 16 * ft + 4 * k)}
+		}
+		return true
 	case: return false
 	}
 	// The dest lanes of V0 into the field at off from import base; loses V1

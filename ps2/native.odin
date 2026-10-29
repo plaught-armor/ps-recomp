@@ -31,6 +31,8 @@ import vu "vu"
 #assert(offset_of(cpu.Cpu, fcr31) == 680)
 #assert(offset_of(cpu.Cpu, cop0) == 684)
 #assert(offset_of(cpu.Cpu, cycles) == 816)
+// And VU0's VI registers by this offset from import vu.vf.
+#assert(offset_of(vu.Vu, vi) - offset_of(vu.Vu, vf) == 512)
 
 // bc_cond for native code, which reads a 32-bit result.
 @(private = "file")
@@ -202,6 +204,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["cpu.call"] = p(rawptr(cpu.call))
 	m["cpu.jump_unknown"] = p(rawptr(cpu.jump_unknown))
 	m["cpu.bad_insn"] = p(rawptr(cpu.bad_insn))
+	m["cpu.brk"] = p(rawptr(cpu.brk))
 	m["cpu.div"] = p(rawptr(cpu.div))
 	m["cpu.divu"] = p(rawptr(cpu.divu))
 	m["cpu.plzcw"] = p(rawptr(cpu.plzcw))
@@ -233,6 +236,8 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.status"] = p(&vu.vu0.status)
 	m["vu.k"] = p(&vu_k)
 	m["vu.macro"] = p(rawptr(vu.vu0_macro))
+	m["vu.call_micro"] = p(rawptr(vu.vu0_call_micro))
+	m["vu.cmsar"] = p(&vu.vu0.cmsar)
 	m["vu.ctrl_read"] = p(rawptr(vu.vu0_ctrl_read))
 	m["vu.ctrl_write"] = p(rawptr(vu.vu0_ctrl_write))
 	m["ps2.bc_cond"] = p(rawptr(native_bc_cond))

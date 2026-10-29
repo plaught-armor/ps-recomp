@@ -42,6 +42,10 @@ special2 :: proc(k: u32, dest: u32 = 15, ft: u32 = 2, fs: u32 = 1) -> u32 {
 	return 0x12 << 26 | 1 << 25 | dest << 21 | ft << 16 | fs << 11 | (k >> 2) << 6 | 0x3c | (k & 3)
 }
 
+// A VU0 macro op of the integer layout, fn 0x30-0x35.
+@(private = "file")
+vi_op :: proc(fn, fs, ft, fd: u32) -> u32 {return 0x12 << 26 | 1 << 25 | ft << 16 | fs << 11 | fd << 6 | fn}
+
 // A COP1 single op, f[fd] = f[fs] fn f[ft]; fmt 0x14 is a word op.
 @(private = "file")
 cop1 :: proc(fn: u32, fd: u32 = 3, fs: u32 = 1, ft: u32 = 2, fmt: u32 = 0x10) -> u32 {
@@ -368,6 +372,32 @@ main :: proc() {
 		{special2(0x3a, 0xe), .VU0}, // VRSQRT vf1z / sqrt(vf2w)
 		{special2(0x3a, 0x9, 1), .VU0}, // VRSQRT vf1y / sqrt(vf1z)
 		{special2(0x3a, 0xf, 1), .VU0}, // VRSQRT vf1w / sqrt(vf1w)
+		{vi_op(0x30, 1, 2, 3), .VU0}, // VIADD
+		{vi_op(0x30, 1, 2, 0), .VU0}, // VIADD to vi0, skipped
+		{vi_op(0x30, 1, 2, 16), .VU0}, // VIADD with fd 16, which writes vi0
+		{vi_op(0x30, 17, 18, 4), .VU0}, // VIADD of fs 17 and ft 18, vi1 and vi2
+		{vi_op(0x30, 3, 4, 3), .VU0}, // VIADD in place, odd
+		{vi_op(0x30, 4, 5, 4), .VU0}, // VIADD in place, even
+		{vi_op(0x30, 2, 2, 2), .VU0}, // VIADD all one register
+		{vi_op(0x31, 1, 2, 3), .VU0}, // VISUB
+		{vi_op(0x31, 2, 1, 6), .VU0}, // VISUB
+		{vi_op(0x34, 5, 6, 7), .VU0}, // VIAND
+		{vi_op(0x35, 5, 6, 8), .VU0}, // VIOR
+		{vi_op(0x35, 5, 6, 16), .VU0}, // VIOR with fd 16
+		{vi_op(0x32, 1, 3, 0x0f), .VU0}, // VIADDI 15
+		{vi_op(0x32, 1, 3, 0x10), .VU0}, // VIADDI -16
+		{vi_op(0x32, 19, 4, 0x1f), .VU0}, // VIADDI -1 of fs 19
+		{vi_op(0x32, 1, 0, 5), .VU0}, // VIADDI to vi0, skipped
+		{vi_op(0x32, 1, 16, 1), .VU0}, // VIADDI with ft 16, which writes vi0
+		{special2(0x3d), .VU0}, // VMFIR vf2 = vi1
+		{special2(0x3d, 5, 2, 2), .VU0}, // VMFIR.yw vf2 = vi2
+		{special2(0x3d, 0, 2, 3), .VU0}, // VMFIR of no lanes
+		{special2(0x3d, 15, 0, 3), .VU0}, // VMFIR to vf0, skipped
+		{special2(0x3d, 0xa, 18, 16), .VU0}, // VMFIR.xz vf18 = vi0, fs 16
+		{special2(0x3d, 15, 3, 19), .VU0}, // VMFIR vf3 = vi3, fs 19
+		{0x4a000038 | (0x40 / 8) << 6, .VU0}, // VCALLMS 0x40
+		{0x4a000039, .VU0}, // VCALLMSR, CMSAR0 0x40 / 8
+		{special(0x0d), .BREAK}, // compiled only: cpu.brk exits
 		{54 << 26 | 1 << 21 | 2 << 16 | (0x10000 - MEM_BACK), .LQC2},
 		{54 << 26 | 1 << 21 | (0x10000 - MEM_BACK), .LQC2}, // vf0 stays
 		{62 << 26 | 1 << 21 | 2 << 16 | (0x10000 - MEM_BACK), .SQC2},
@@ -390,6 +420,12 @@ main :: proc() {
 		}
 	}
 	mem.mem_init()
+	vu.vu_init()
+	// The microprogram at 0x40 VCALLMS and VCALLMSR run: a NOP with the E
+	// bit, then the NOP in its delay slot.
+	for v, n in ([?]u32{0x8000033c, 0x400002ff, 0x8000033c, 0x000002ff}) {
+		(^u32)(&vu.vu0.micro[0x40 + 4 * n])^ = v
+	}
 	arch := native.Arch(core.NATIVE_ARCH)
 	a := native.make_asm(arch, r5900.native_ram())
 	funcs: [len(cases)]native.Blob_Func
@@ -433,6 +469,7 @@ main :: proc() {
 			failed, checks = check_unaligned(c, funcs[k].addr, run, failed, checks)
 			continue
 		}
+		if c.op == .BREAK {continue}
 		if c.op == .LQC2 || c.op == .SQC2 {
 			failed, checks = check_mem(c, funcs[k].addr, run, failed, checks)
 			continue
@@ -452,7 +489,8 @@ main :: proc() {
 				vu_start := vu.vu0
 				vu_start.vf[0].f = {0, 0, 0, 1}
 				for &v, n in vu_start.vf[1:] {v.u = {u32(x), u32(y >> 32), u32(y), u32(x >> 32) ~ u32(n)}}
-				vu_start.vi[3] = u16(x ~ y)
+				for &r, n in vu_start.vi[1:] {r = u16(x >> (4 * u32(n))) ~ u16(y) ~ u16(n * 0x1111)}
+				vu_start.cmsar = 0x40 / 8
 				vu_start.acc.u = {u32(y), u32(x), u32(x >> 32), u32(y >> 32)}
 				vu_start.q = transmute(f32)u32(y ~ (x >> 32))
 				vu_start.i = transmute(f32)u32(x ~ (y >> 32))
