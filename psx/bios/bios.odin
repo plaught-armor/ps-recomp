@@ -234,8 +234,8 @@ bios_b :: proc(fn: u32) {
 		ret(1)
 	case 0x4e, 0x4f:
 		ret(card_sector(arg(0), arg(1), arg(2), fn == 0x4e))
-	case 0x5c:
-		ret(0)
+	case 0x5c, 0x5d:
+		ret(1) // _card_status, _card_wait: idle, every operation is done
 	case 0x56:
 		ret(C0_TABLE)
 	case 0x57:
