@@ -190,7 +190,6 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	r: u32 = 0
 	switch fno {
 	case 0x8000: // sceSdInit
-		if spu.ram == nil {spu.ram = make([]u8, SPU_RAM_SIZE)}
 		for &core in spu.voice {for &v in core {v = {}}}
 	case 0x8010: // sceSdSetParam {id, value}
 		v := spu_voice(w[1])
@@ -224,7 +223,6 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		case SD_VA_NAX & 0xff00: r = v.nax
 		}
 	case 0x80d0: // sceSdVoiceTrans {channel, mode, IOP address, SPU address, size}
-		if spu.ram == nil {spu.ram = make([]u8, SPU_RAM_SIZE)}
 		src, dst, size := w[3] & (IOP_RAM_SIZE - 1), w[4] & (SPU_RAM_SIZE - 1), w[5]
 		size = min(size, IOP_RAM_SIZE - src, SPU_RAM_SIZE - dst)
 		if w[2] & 1 == 0 {
@@ -243,7 +241,10 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	return true
 }
 
-// Emulated state, saved and restored by snapshots (snap.odin).
+// Emulated state, saved and restored by snapshots (snap.odin). Sound RAM is
+// a snapshot area, so it is saved whichever allocator is current when it is
+// first written.
 spu_snap :: proc() {
+	spu.ram = core.snap_area(SPU_RAM_SIZE)
 	core.snap_add(&spu)
 }
