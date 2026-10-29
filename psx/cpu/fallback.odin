@@ -77,7 +77,8 @@ fallback_dump :: proc() {
 	slice.sort_by(rows[:], proc(a, b: Row) -> bool {
 		if a.kind != b.kind {return a.kind < b.kind}
 		if a.n != b.n {return a.n > b.n}
-		return a.pc < b.pc
+		if a.pc != b.pc {return a.pc < b.pc}
+		return a.from < b.from
 	})
 	b := strings.builder_make(context.temp_allocator)
 	fmt.sbprintln(&b, "kind\tpc\tfrom\tcount")
