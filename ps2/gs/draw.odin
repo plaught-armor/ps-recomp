@@ -1,6 +1,12 @@
 // Primitive assembly, rasterisation and the per-pixel pipeline: texture
 // mapping, fog, alpha test, destination alpha test, depth test, blending
 // and masked frame/depth writes.
+//
+// write, vertex, decode_ctx, fetch and pixel run without bounds checks.
+// Every index there is a constant, masked to its array (context &1, prim
+// kind &7, CLUT &511), bounded by a loop over the array, a mip level
+// clamped to 6 (mxl), or the vertex queue count, which vertex checks
+// itself because snapshots restore it.
 package ps2_gs
 
 import "core:math"
@@ -67,7 +73,7 @@ Ctx :: struct {
 }
 
 // Every GS register write lands here after gs_write stores it.
-write :: proc(reg: u8, v: u64) {
+write :: proc(reg: u8, v: u64) #no_bounds_check {
 	switch reg {
 	case GS_PRIM: nq = 0
 	case GS_RGBAQ:
@@ -103,7 +109,7 @@ prim_attrs :: proc() -> u64 {
 }
 
 @(private)
-vertex :: proc(xyz: u64, z: f64, kick: bool) {
+vertex :: proc(xyz: u64, z: f64, kick: bool) #no_bounds_check {
 	prim := prim_attrs()
 	ctx := u32(prim >> 9) & 1
 	off := state.regs[0x18 + ctx]
@@ -111,6 +117,7 @@ vertex :: proc(xyz: u64, z: f64, kick: bool) {
 	v.x = (f32(xyz & 0xffff) - f32(off & 0xffff)) / 16
 	v.y = (f32((xyz >> 16) & 0xffff) - f32((off >> 32) & 0xffff)) / 16
 	v.z = z
+	if nq >= len(queue) {panic("gs: vertex queue overrun")}
 	queue[nq] = v
 	nq += 1
 	kind := prim & 7
@@ -133,7 +140,7 @@ vertex :: proc(xyz: u64, z: f64, kick: bool) {
 }
 
 @(private)
-decode_ctx :: proc(prim: u64) -> (c: Ctx) {
+decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 	r := &state.regs
 	n := u32(prim >> 9) & 1
 	c.iip = prim & (1 << 3) != 0
@@ -396,7 +403,7 @@ wrap :: #force_inline proc(i: i32, mode, size, lo, hi: u32) -> u32 {
 
 // Texel as RGBA8888 (R in the low byte).
 @(private)
-fetch :: proc(t: ^Tex, n, x, y: u32) -> u32 {
+fetch :: proc(t: ^Tex, n, x, y: u32) -> u32 #no_bounds_check {
 	raw := read_raw(t.psm, t.mtbp[n], t.mtbw[n], x, y)
 	switch t.psm {
 	case PSMCT32: return raw
@@ -483,7 +490,7 @@ unpack :: #force_inline proc(c: u32) -> [4]i32 {
 // ---------------------------------------------------------------- pixels
 
 @(private)
-pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {
+pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) #no_bounds_check {
 	px, py := u32(x), u32(y)
 	// The GS interpolates colors in fixed point, so equal vertex colors stay
 	// exact. Float barycentrics can land just below (128 -> 127.99999); the
