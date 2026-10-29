@@ -513,9 +513,7 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 	case .MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .CVT_W_S, .ADD_S, .SUB_S, .MUL_S, .DIV_S, .SQRT_S,
 	     .ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S,
 	     .MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S:
-		// COP1: fs = rd, ft = rt, fd = sa. x64 only; on arm64 they stay in
-		// the interpreter.
-		if a.arch == .Arm64 {return false}
+		// COP1: fs = rd, ft = rt, fd = sa.
 		fs, ft, fd := FPR + 4 * u32(rd), FPR + 4 * u32(rt), FPR + 4 * sa
 		#partial switch i.op {
 		case .MOV_S, .NEG_S, .ABS_S, .CVT_S_W:
@@ -528,7 +526,8 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 			native.state_store(a, fd, .A)
 		case .CVT_W_S:
 			// cpu.cvt_w: out of range or NaN is the i32 limit on the
-			// side of the sign, where the host gives 0x80000000 for both.
+			// side of the sign, where float_to_int gives 0x80000000 for
+			// NaN and for out of range (arm64: a negative one only).
 			native.state_load(a, .A, fs)
 			native.mov(a, .B, .A)
 			native.float_to_int(a, .A)
@@ -693,8 +692,7 @@ br_fspecial :: proc(a: ^native.Asm, r: native.Reg, l: native.Label) {
 
 // A = A op B on f32 bits, as cpu.fpu_add, fpu_sub, fpu_mul and fpu_div
 // with a divisor of nonzero exponent: the host's result unless an operand
-// or the result is special, then cpu.fpu_slow's. Uses B, C and LD. x64
-// only.
+// or the result is special, then cpu.fpu_slow's. Uses B, C and LD.
 @(private = "file")
 fpu_calc :: proc(a: ^native.Asm, v: native.Vop, op: Fpu_Op) {
 	slow, done := native.new_label(a), native.new_label(a)
@@ -713,7 +711,7 @@ fpu_calc :: proc(a: ^native.Asm, v: native.Vop, op: Fpu_Op) {
 
 // The f32 field at to = the one at fs op the one at ft, as fpu_calc; a
 // Div by a divisor of exponent 0 gives +-FMAX with the sign of fs xor ft,
-// as cpu.fpu_div. x64 only.
+// as cpu.fpu_div.
 @(private = "file")
 fpu_arith :: proc(a: ^native.Asm, v: native.Vop, op: Fpu_Op, to, fs, ft: u32) {
 	native.state_load(a, .A, fs)

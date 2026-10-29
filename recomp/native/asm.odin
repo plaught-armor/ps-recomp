@@ -506,46 +506,46 @@ vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 }
 
 // dst = dst op src, Fadd, Fsub, Fmul or Fdiv, on the f32 bits in two
-// registers, rounded to nearest; uses V0 and V1. x64 only.
+// registers, rounded to nearest; uses V0 and V1.
 float_op :: proc(a: ^Asm, op: Vop, dst, src: Reg) {
 	assert(op == .Fadd || op == .Fsub || op == .Fmul || op == .Fdiv, "native: float_op")
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_float_op(a, op, dst, src)
 	case .Arm64:
-		panic("native: float_op on arm64")
+		a64_float_op(a, op, dst, src)
 	}
 }
 
 // r = the square root of the f32 bits in r, rounded to nearest; uses V0.
-// x64 only.
 float_sqrt :: proc(a: ^Asm, r: Reg) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_float_sqrt(a, r)
 	case .Arm64:
-		panic("native: float_sqrt on arm64")
+		a64_float_sqrt(a, r)
 	}
 }
 
-// r = the f32 bits of the i32 in r, rounded to nearest; uses V0. x64 only.
+// r = the f32 bits of the i32 in r, rounded to nearest; uses V0.
 int_to_float :: proc(a: ^Asm, r: Reg) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_int_to_float(a, r)
 	case .Arm64:
-		panic("native: int_to_float on arm64")
+		a64_int_to_float(a, r)
 	}
 }
 
-// r = the i32 of the f32 bits in r, rounded toward zero; out of range or
-// NaN gives 0x80000000. Uses V0. x64 only.
+// r = the i32 of the f32 bits in r, rounded toward zero; NaN gives
+// 0x80000000, and so does out of range, except on arm64, where a positive
+// one gives 0x7fffffff. Uses V0.
 float_to_int :: proc(a: ^Asm, r: Reg) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_float_to_int(a, r)
 	case .Arm64:
-		panic("native: float_to_int on arm64")
+		a64_float_to_int(a, r)
 	}
 }
 

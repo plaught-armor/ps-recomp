@@ -268,6 +268,45 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	if op == .Nor {emit32(a, 0x6e205800 | u32(dst) << 5 | u32(dst))} // mvn .16b
 }
 
+a64_float_op :: proc(a: ^Asm, op: Vop, dst, src: Reg) {
+	S_OPS :: #partial [Vop]u32 {
+		.Fadd = 0x1e202800, // fadd s
+		.Fsub = 0x1e203800, // fsub s
+		.Fmul = 0x1e200800, // fmul s
+		.Fdiv = 0x1e201800, // fdiv s
+	}
+	ops := S_OPS
+	d, v0, v1 := A64_REG[dst], u32(Vreg.V0), u32(Vreg.V1)
+	emit32(a, 0x1e270000 | d << 5 | v0) // fmov s0, wd
+	emit32(a, 0x1e270000 | A64_REG[src] << 5 | v1) // fmov s1, ws
+	rrr(a, ops[op], v0, v0, v1)
+	emit32(a, 0x1e260000 | v0 << 5 | d) // fmov wd, s0
+}
+
+a64_float_sqrt :: proc(a: ^Asm, r: Reg) {
+	d, v0 := A64_REG[r], u32(Vreg.V0)
+	emit32(a, 0x1e270000 | d << 5 | v0) // fmov s0, wr
+	emit32(a, 0x1e21c000 | v0 << 5 | v0) // fsqrt s0, s0
+	emit32(a, 0x1e260000 | v0 << 5 | d) // fmov wr, s0
+}
+
+a64_int_to_float :: proc(a: ^Asm, r: Reg) {
+	d, v0 := A64_REG[r], u32(Vreg.V0)
+	emit32(a, 0x1e220000 | d << 5 | v0) // scvtf s0, wr
+	emit32(a, 0x1e260000 | v0 << 5 | d) // fmov wr, s0
+}
+
+// fcvtzs saturates and gives 0 for NaN; NaN becomes 0x80000000, as on x64.
+// Through w12.
+a64_float_to_int :: proc(a: ^Asm, r: Reg) {
+	d, v0 := A64_REG[r], u32(Vreg.V0)
+	emit32(a, 0x1e270000 | d << 5 | v0) // fmov s0, wr
+	emit32(a, 0x1e380000 | v0 << 5 | d) // fcvtzs wr, s0
+	rrr(a, 0x1e202000, 0, v0, v0) // fcmp s0, s0
+	movw(a, T0, 0x80000000)
+	emit32(a, 0x1a800000 | d << 16 | 0x6 << 12 | T0 << 5 | d) // csel wr, w12, wr, vs
+}
+
 a64_vec_copy :: proc(a: ^Asm, dst, src: Vreg) {
 	rrr(a, 0x4ea01c00, u32(dst), u32(src), u32(src)) // orr .16b
 }

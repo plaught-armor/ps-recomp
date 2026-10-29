@@ -48,7 +48,7 @@ cop1 :: proc(fn: u32, fd: u32 = 3, fs: u32 = 1, ft: u32 = 2, fmt: u32 = 0x10) ->
 	return 0x11 << 26 | fmt << 21 | ft << 16 | fs << 11 | fd << 6 | fn
 }
 
-// The COP1 ops native code runs inline on x64; check_fpu checks them.
+// The COP1 ops native code runs inline; check_fpu checks them.
 @(private = "file", rodata)
 COP1_OPS := [?]r5900.Op {
 	.MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .ADD_S, .SUB_S, .MUL_S, .DIV_S,
@@ -367,9 +367,8 @@ main :: proc() {
 	}
 	// VCLIP is left to the interpreter on purpose.
 	delete_key(&slow, "VU0 special 1f")
-	// The COP1 ops, VDIV, VSQRT and VRSQRT are inline on x64 only.
+	// VDIV, VSQRT and VRSQRT are inline on x64 only.
 	if arch == .Arm64 {
-		for op in COP1_OPS {delete_key(&slow, fmt.tprint(op))}
 		for k in ([?]string{"VU0 special 38", "VU0 special 39", "VU0 special 3a"}) {delete_key(&slow, k)}
 	}
 	if len(slow) != 0 {
