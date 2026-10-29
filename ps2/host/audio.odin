@@ -1,4 +1,4 @@
-// Host audio (ps:core audio.odin): the FMOD and SPU2 voice mixers fill one
+// Host audio (ps:core audio.odin): the FMOD, SPU2 and ADX mixers fill one
 // vblank of sound, which core queues on the SDL device. WAV=<file> also
 // records the mix, for headless checks; core keeps the file valid at every
 // second, since a timed-out run never exits cleanly.
@@ -30,6 +30,7 @@ audio_frame :: proc(push: bool) {
 	t := cpu.prof_start()
 	iop.fmod_mix(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
 	iop.spu_mix(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
+	iop.adx_mix(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
 	cpu.prof_end(.MIX, t)
 	if push {core.audio_push(buf)}
 }

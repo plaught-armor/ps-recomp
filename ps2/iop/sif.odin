@@ -614,5 +614,5 @@ sif_snap :: proc() {
 	core.snap_add(&fileio)
 	core.snap_add(&iop_heap_top)
 	core.snap_add(&iop_heap_last)
-	core.snap_add(&adx)
+	adx_snap()
 }
