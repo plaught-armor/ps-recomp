@@ -17,10 +17,14 @@
 //   and B0 tables, and the pad driver's pointers and vblank acknowledge,
 //   handed over by StartPAD and turned off by ChangeClearPad or by zeroing
 //   its code. SysEnqIntRP of a queued element moves it to the head.
+//   The memory card calls: card status, firstfile/nextfile patterns and the
+//   DIRENTRY, and lseek and read on whole frames. The card images live in
+//   memory only: their paths name a directory that does not exist.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import bios "ps:psx/bios"
 import cpu "ps:psx/cpu"
 import io "ps:psx/io"
@@ -79,6 +83,14 @@ PAD_WORD :: 0x2100
 @(private = "file")
 PAD_BUF :: 0x2110
 
+// Card file name, DIRENTRY and read buffer.
+@(private = "file")
+CARD_NAME :: 0x6000
+@(private = "file")
+CARD_DIR :: 0x6100
+@(private = "file")
+CARD_BUF :: 0x6200
+
 @(private = "file")
 calls: struct {
 	callback, second, late, hook: int,
@@ -123,6 +135,42 @@ irq :: proc(n: u32) {
 	io.irq_regs.stat = 1 << n
 	io.irq_regs.mask = 1 << n
 	bios.deliver_irq()
+}
+
+@(private = "file")
+guest_string :: proc(s: string) -> u32 {
+	for k in 0 ..< len(s) {
+		cpu.w8(CARD_NAME + u32(k), s[k])
+	}
+	cpu.w8(CARD_NAME + u32(len(s)), 0)
+	return CARD_NAME
+}
+
+// firstfile then nextfile until no match; the names found, in card order.
+@(private = "file")
+card_find :: proc(pattern: string) -> (names: [4]string, n: int) {
+	r := b(0x42, guest_string(pattern), CARD_DIR)
+	for r != 0 && n < len(names) {
+		names[n] = strings.clone(cpu.mem_cstring(CARD_DIR), context.temp_allocator)
+		n += 1
+		r = b(0x43, CARD_DIR)
+	}
+	return
+}
+
+@(private = "file")
+check_find :: proc(pattern: string, want: ..string) {
+	names, n := card_find(pattern)
+	if n != len(want) {
+		fail("firstfile %q found %v, want %v", pattern, names[:n], want)
+		return
+	}
+	for name, k in want {
+		if names[k] != name {
+			fail("firstfile %q found %v, want %v", pattern, names[:n], want)
+			return
+		}
+	}
 }
 
 @(private = "file")
@@ -369,8 +417,50 @@ main :: proc() {
 	check("chain 0 second", cpu.r32(ELEM_COUNT), ELEM_NOP)
 	check("chain 0 tail", cpu.r32(ELEM_NOP), 0)
 
+	// Memory cards.
+	bios.card_files = {"/psx-bios-test-no-such-dir/1.mcd", "/psx-bios-test-no-such-dir/2.mcd"}
+	if !bios.memcard_init() {
+		fail("memcard_init with missing images")
+	}
+	save: [300]u8
+	for &x, k in save {
+		x = u8(k)
+	}
+	// Saving the image fails; the card in memory still holds the files.
+	bios.card_write_file(bios.CARD_SLOT_1, "BASLUS-00001AB", save[:])
+	bios.card_write_file(bios.CARD_SLOT_1, "BASLUS-00001CD", save[:])
+	bios.card_write_file(bios.CARD_SLOT_1, "OTHER", save[:])
+	check("_card_status", b(0x5c, 0), 1)
+	check("_card_wait", b(0x5d, 0), 1)
+	check_find("bu00:BASLUS*", "BASLUS-00001AB", "BASLUS-00001CD")
+	check_find("bu00:", "BASLUS-00001AB", "BASLUS-00001CD", "OTHER")
+	check_find("bu00:*", "BASLUS-00001AB", "BASLUS-00001CD", "OTHER")
+	check_find("bu00:BASLUS-00001?D", "BASLUS-00001CD")
+	check_find("bu00:OTHER??", "OTHER")
+	check_find("bu00:BASLUS")
+	check_find("bu10:*")
+	b(0x42, guest_string("bu00:BASLUS-00001CD"), CARD_DIR)
+	check("DIRENTRY attr", cpu.r32(CARD_DIR + 0x14), 0x50)
+	check("DIRENTRY size", cpu.r32(CARD_DIR + 0x18), 0x2000)
+	check("DIRENTRY head sector", cpu.r32(CARD_DIR + 0x20), 2 * 0x40)
+
+	fd := b(0x32, guest_string("bu00:BASLUS-00001AB"), 1)
+	check("read at 0", b(0x34, fd, CARD_BUF, 0x100), 0x100)
+	check("byte 0xff read", u32(cpu.r8(CARD_BUF + 0xff)), 0xff)
+	check("lseek SEEK_SET", b(0x33, fd, 0x40, 0), 0x40)
+	check("read at a position inside a frame", b(0x34, fd, CARD_BUF, 0x80), 0xffffffff)
+	check("lseek SEEK_CUR", b(0x33, fd, 0x40, 1), 0x80)
+	check("lseek SEEK_END", b(0x33, fd, 0, 2), 0x80)
+	check("lseek of an unknown whence", b(0x33, fd, 0, 3), 0xffffffff)
+	check("read of a frame and a half", b(0x34, fd, CARD_BUF, 0xc0), 0x80)
+	check("first byte read at 0x80", u32(cpu.r8(CARD_BUF)), 0x80)
+	check("position after the read", b(0x33, fd, 0, 1), 0x100)
+	b(0x33, fd, 0x2000, 0)
+	check("read at the end of the file", b(0x34, fd, CARD_BUF, 0x80), 0xffffffff)
+	check("close", b(0x36, fd), fd)
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card")
 }

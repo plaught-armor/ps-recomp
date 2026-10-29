@@ -47,11 +47,12 @@ DIR_LAST :: 0x53
 @(private)
 DIR_NONE :: 0xffff
 
-// Card event classes and specs (SwCARD, HwCARD).
+// Card event classes: HwCARD for the low-level sector driver, SwCARD for
+// the "bu" file device; specs IOE (done) and TIMEOUT.
 @(private)
-EV_SWCARD :: 0xf0000011
+EV_HWCARD :: 0xf0000011
 @(private)
-EV_HWCARD :: 0xf4000001
+EV_SWCARD :: 0xf4000001
 @(private)
 EV_SPEC_IOE :: 0x0004
 @(private)
@@ -181,8 +182,8 @@ card_save :: proc(img: ^Card_Image) -> bool {
 
 @(private)
 card_event :: proc(spec: u32) {
-	deliver_event(EV_SWCARD, spec)
 	deliver_event(EV_HWCARD, spec)
+	deliver_event(EV_SWCARD, spec)
 }
 
 // Port byte from _card_info/_card_load/_card_read/_card_write: 0x00 slot 1,
@@ -273,23 +274,45 @@ card_filename :: proc(path: string) -> (slot: int, name: string, ok: bool) {
 	return 0, "", false
 }
 
+// firstfile's search pattern, built as the BIOS builds it: "" is 19 '?';
+// otherwise the name up to a '*', which pads the rest to 20 with '?'.
+@(private)
+card_pattern :: proc(name: string) -> string {
+	buf: [20]u8
+	if name == "" {
+		for &c in buf[:19] {
+			c = '?'
+		}
+		return strings.clone(string(buf[:19]))
+	}
+	n := 0
+	for i in 0 ..< len(name) {
+		if name[i] == '*' {
+			for &c in buf[n:] {
+				c = '?'
+			}
+			n = len(buf)
+			break
+		}
+		if n == len(buf) {
+			break
+		}
+		buf[n] = name[i]
+		n += 1
+	}
+	return strings.clone(string(buf[:n]))
+}
+
+// The BIOS match: every name character equals the pattern's or meets a
+// '?', and the pattern ends there or goes on with a '?'.
 @(private)
 wildcard_match :: proc(pattern, name: string) -> bool {
-	for i in 0 ..< len(pattern) {
-		switch pattern[i] {
-		case '*':
-			return true
-		case '?':
-			if i >= len(name) {
-				return false
-			}
-		case:
-			if i >= len(name) || name[i] != pattern[i] {
-				return false
-			}
+	for i in 0 ..< len(name) {
+		if i >= len(pattern) || (pattern[i] != '?' && pattern[i] != name[i]) {
+			return false
 		}
 	}
-	return len(pattern) == len(name)
+	return len(pattern) <= len(name) || pattern[len(name)] == '?'
 }
 
 // Allocate a chain of `count` free blocks named `name`; returns the first.
@@ -429,19 +452,29 @@ card_seek :: proc(fd, offset, whence: u32) -> u32 {
 	if fl == nil {
 		return 0xffffffff
 	}
-	fl.pos = whence == 1 ? fl.pos + offset : offset
+	switch whence {
+	case 0:
+		fl.pos = offset
+	case 1:
+		fl.pos += offset
+	case 2:
+		// SEEK_END leaves the position where it is, as the retail BIOS does.
+	case:
+		return 0xffffffff
+	}
 	return fl.pos
 }
 
-// B(34h)/B(35h): whole frames, clipped to the file. Async opens complete
+// B(34h)/B(35h): whole frames from a frame-aligned position, clipped to
+// the file; a partial last frame is dropped. Async opens complete
 // immediately; the SwCARD event tells the game.
 card_rw :: proc(fd, buf, length: u32, write: bool) -> u32 {
 	fl := card_fd(fd)
-	if fl == nil || fl.pos >= fl.size {
+	if fl == nil || fl.pos % FRAME_SIZE != 0 || fl.pos >= fl.size {
 		return 0xffffffff
 	}
 	img := &card.images[fl.slot]
-	n := min(length, fl.size - fl.pos)
+	n := min(length - length % FRAME_SIZE, fl.size - fl.pos)
 	blocks, count := file_chain(img, fl.first)
 	done: u32 = 0
 	for done < n {
@@ -470,7 +503,8 @@ card_rw :: proc(fd, buf, length: u32, write: bool) -> u32 {
 	return done
 }
 
-// Fill a BIOS DIRENTRY: name[20], attr, size, next, head, system[4].
+// Fill a BIOS DIRENTRY: name[20], attr, size, next, head (the file's first
+// sector), system[4].
 @(private)
 write_direntry :: proc(img: ^Card_Image, dst: u32, block: int) {
 	bios_memset(dst, 0, 40)
@@ -478,7 +512,7 @@ write_direntry :: proc(img: ^Card_Image, dst: u32, block: int) {
 	copy(cpu.mem_slice(dst, u32(len(name))), name)
 	cpu.w32(dst + 0x14, 0x50)
 	cpu.w32(dst + 0x18, get_u32(frame_ptr(img, block), 4))
-	cpu.w32(dst + 0x20, u32(block))
+	cpu.w32(dst + 0x20, u32(block * BLOCK_SIZE / FRAME_SIZE))
 }
 
 // B(42h)/B(43h) firstfile/nextfile. Returns dst, or 0 when no more match.
@@ -491,12 +525,13 @@ card_nextfile :: proc(dst: u32, first: bool, pattern: string = "") -> u32 {
 			return 0
 		}
 		card.slot = slot
-		card.search = strings.clone(name)
+		card.search = card_pattern(name)
 		card.cursor = 0
 	}
 	img := &card.images[card.slot]
 	for b in card.cursor + 1 ..< CARD_BLOCKS {
-		if dir_state(img, b) == DIR_FIRST && wildcard_match(card.search, dir_name(img, b)) {
+		name := dir_name(img, b)
+		if dir_state(img, b) == DIR_FIRST && name != "" && wildcard_match(card.search, name) {
 			card.cursor = b
 			write_direntry(img, dst, b)
 			return dst
