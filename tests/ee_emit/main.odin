@@ -2,7 +2,7 @@
 // against the interpreter's exec_insn. Two steps in one command: this
 // program generates cases/main.odin, one proc per instruction word emit_op
 // inlines (every MMI word the decoder maps to a covered op, the MADD family
-// and SQRT.S, with rd 0, rs/rt 0 and aliased registers, and every shift
+// and SQRT.S and RSQRT.S, with rd 0, rs/rt 0 and aliased registers, and every shift
 // amount for the shifts by sa), then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
 // leave the whole cpu.state as exec_insn leaves it. The seed is fixed, so a
@@ -31,7 +31,7 @@ COVERED :: Ops{
 	.PADDW, .PSUBW, .PADDH, .PSUBH, .PADDB, .PSUBB, .PADDUB, .PMAXH, .PMINH, .PCGTH, .PCEQH,
 	.PSLLH, .PSRLH, .PSRAH, .PAND, .POR, .PXOR, .PNOR, .PCPYLD, .PCPYUD, .PCPYH,
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
-	.MADD, .MADDU, .MADD1, .MADDU1, .SQRT_S,
+	.MADD, .MADDU, .MADD1, .MADDU1, .SQRT_S, .RSQRT_S,
 }
 // The shifts by sa: every amount gets a case.
 BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH}
@@ -52,6 +52,8 @@ main :: proc() {
 		}
 		// SQRT.S f[rd] = sqrt(f[rt]), with fs = rs (unused)
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x04)
+		// RSQRT.S f[rd] = f[rs] / sqrt(f[rt])
+		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x16)
 	}
 
 	sb := strings.builder_make()

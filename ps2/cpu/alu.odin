@@ -144,10 +144,11 @@ from_f64 :: proc "contextless" (d: f64) -> f32 {
 	return f32(d)
 }
 
-Fpu_Op :: enum u8 {Add, Sub, Mul, Div}
+Fpu_Op :: enum u8 {Add, Sub, Mul, Div, Sqrt}
 
 // The f64 path of the operations, for operands or results with exponent 0
-// or 255. The divisor of a Div is never zero.
+// or 255. The divisor of a Div is never zero; Sqrt is sqrt(|a|) for an a
+// of exponent 255 and ignores b.
 fpu_slow :: proc "contextless" (op: Fpu_Op, a, b: f32) -> f32 {
 	when FALLBACK_COUNT {fallback_fpu_slow[op] += 1}
 	x, y := to_f64(a), to_f64(b)
@@ -156,6 +157,7 @@ fpu_slow :: proc "contextless" (op: Fpu_Op, a, b: f32) -> f32 {
 	case .Sub: return from_f64(x - y)
 	case .Mul: return from_f64(x * y)
 	case .Div: return from_f64(x / y)
+	case .Sqrt: return from_f64(math.sqrt(abs(x)))
 	}
 	return 0
 }
@@ -185,8 +187,11 @@ fpu_div :: proc "contextless" (a, b: f32) -> f32 {
 
 // sqrt(|x|), never negative.
 fpu_sqrt :: proc "contextless" (x: f32) -> f32 {
-	if transmute(u32)x & 0x7f800000 == 0 {return 0}
-	return from_f64(math.sqrt(abs(to_f64(x))))
+	switch transmute(u32)x & 0x7f800000 {
+	case 0:          return 0
+	case 0x7f800000: return fpu_slow(.Sqrt, x, 0)
+	}
+	return from_f64(math.sqrt(abs(f64(x))))
 }
 
 // a / sqrt(|b|). The root is rounded to a float first, as on the hardware;

@@ -53,7 +53,7 @@ cop1 :: proc(fn: u32, fd: u32 = 3, fs: u32 = 1, ft: u32 = 2, fmt: u32 = 0x10) ->
 COP1_OPS := [?]r5900.Op {
 	.MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .ADD_S, .SUB_S, .MUL_S, .DIV_S,
 	.ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S,
-	.MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S, .CVT_W_S, .SQRT_S,
+	.MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S, .CVT_W_S, .SQRT_S, .RSQRT_S,
 }
 
 // The unaligned loads and stores; check_unaligned checks them.
@@ -69,6 +69,7 @@ unaligned :: proc(op, rt: u32) -> u32 {return op << 26 | 1 << 21 | rt << 16 | UN
 #assert(int(r5900.Fpu_Op.Sub) == int(cpu.Fpu_Op.Sub))
 #assert(int(r5900.Fpu_Op.Mul) == int(cpu.Fpu_Op.Mul))
 #assert(int(r5900.Fpu_Op.Div) == int(cpu.Fpu_Op.Div))
+#assert(int(r5900.Fpu_Op.Sqrt) == int(cpu.Fpu_Op.Sqrt))
 
 // Shift counts, signs and carries across the word boundary.
 @(rodata)
@@ -299,6 +300,10 @@ main :: proc() {
 		{cop1(0x24, fd = 1), .CVT_W_S}, // fd = fs
 		{cop1(0x04), .SQRT_S},
 		{cop1(0x04, fd = 2), .SQRT_S}, // fd = ft
+		{cop1(0x16), .RSQRT_S},
+		{cop1(0x16, fd = 1), .RSQRT_S}, // fd = fs
+		{cop1(0x16, fd = 2), .RSQRT_S}, // fd = ft
+		{cop1(0x16, fs = 2), .RSQRT_S}, // fs = ft
 		{unaligned(34, 2), .LWL},
 		{unaligned(34, 1), .LWL}, // rt = rs
 		{unaligned(34, 0), .LWL},

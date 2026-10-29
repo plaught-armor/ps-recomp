@@ -210,9 +210,10 @@ special :: proc(u: u32) -> bool {
 	return e == 0x7f800000 || (e == 0 && u & 0x007fffff != 0)
 }
 
-// The fpu_slow call a row makes, if any: an operand or the host's result
-// special, past fpu_div's zero divisor and fpu_rsqrt's zero b.
-slow_op :: proc(v: Vector) -> (cpu.Fpu_Op, bool) {
+// Add to want the fpu_slow calls a row makes: Sqrt for a root of exponent
+// 255, then the operation when an operand or the host's result is special,
+// past fpu_div's zero divisor and fpu_rsqrt's zero b.
+slow_ops :: proc(v: Vector, want: ^[cpu.Fpu_Op]u64) {
 	a, b := f(v.fs), f(v.ft)
 	r: f32
 	op: cpu.Fpu_Op
@@ -221,12 +222,20 @@ slow_op :: proc(v: Vector) -> (cpu.Fpu_Op, bool) {
 	case .Sub: r, op = a - b, .Sub
 	case .Mul: r, op = a * b, .Mul
 	case .Div, .Rsqrt:
-		if v.ft & 0x7f800000 == 0 {return {}, false}
-		if v.op == .Rsqrt {b = cpu.fpu_sqrt(b)}
+		if v.ft & 0x7f800000 == 0 {return}
+		if v.op == .Rsqrt {
+			if v.ft & 0x7f800000 == 0x7f800000 {want[.Sqrt] += 1}
+			// The root here is not the row's own call: leave it uncounted.
+			counts := cpu.fallback_fpu_slow
+			b = cpu.fpu_sqrt(b)
+			cpu.fallback_fpu_slow = counts
+		}
 		r, op = a / b, .Div
-	case .Sqrt: return {}, false
+	case .Sqrt:
+		if v.fs & 0x7f800000 == 0x7f800000 {want[.Sqrt] += 1}
+		return
 	}
-	return op, special(transmute(u32)a) || special(transmute(u32)b) || special(transmute(u32)r)
+	if special(transmute(u32)a) || special(transmute(u32)b) || special(transmute(u32)r) {want[op] += 1}
 }
 
 run :: proc(v: Vector) -> u32 {
@@ -271,7 +280,7 @@ main :: proc() {
 		cpu.fallback_fpu_slow = {}
 		want: [cpu.Fpu_Op]u64
 		for v in VECTORS {
-			if op, ok := slow_op(v); ok {want[op] += 1}
+			slow_ops(v, &want)
 			run(v)
 		}
 		for n, op in want {

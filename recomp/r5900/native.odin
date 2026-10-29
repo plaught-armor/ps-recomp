@@ -532,7 +532,7 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 	case .MTC1:
 		get(a, .A, rt)
 		native.state_store(a, FPR + 4 * u32(rd), .A)
-	case .MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .CVT_W_S, .ADD_S, .SUB_S, .MUL_S, .DIV_S, .SQRT_S,
+	case .MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .CVT_W_S, .ADD_S, .SUB_S, .MUL_S, .DIV_S, .SQRT_S, .RSQRT_S,
 	     .ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S,
 	     .MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S:
 		// COP1: fs = rd, ft = rt, fd = sa.
@@ -561,29 +561,30 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 			native.alu(a, .Sub, .A, .LD) // 0x7fffffff for a positive one
 			native.state_store(a, fd, .A)
 		case .SQRT_S:
-			// cpu.fpu_sqrt: exponent 0 gives +0, and 255, which the EE
-			// reads as a number, goes to the interpreter. Any other root
-			// is sqrtss of |ft|: the f64 root rounded to f32 is the f32
-			// root, as 53 >= 2 * 24 + 2. Neither the operand nor the root
-			// is denormal, so FTZ and DAZ don't matter, but this relies on
-			// the host's default round to nearest, as fpu_calc does.
-			zero, store, slow, done := native.new_label(a), native.new_label(a), native.new_label(a), native.new_label(a)
 			native.state_load(a, .A, ft)
-			native.alu_imm(a, .And, .A, 0x7fffffff)
+			fpu_root(a)
+			native.state_store(a, fd, .A)
+		case .RSQRT_S:
+			// cpu.fpu_rsqrt: a zero ft gives +-FMAX with the sign of fs,
+			// any other fs / the root of ft as cpu.fpu_div. The root of
+			// a nonzero exponent never has exponent 0, so the divide
+			// needs no zero check.
+			calc, done := native.new_label(a), native.new_label(a)
+			native.state_load(a, .A, ft)
 			native.mov(a, .C, .A)
 			native.alu_imm(a, .And, .C, 0x7f800000)
-			native.br_zero(a, .C, zero)
-			native.br_cmp_imm(a, .Eq, .C, 0x7f800000, slow)
-			native.float_sqrt(a, .A)
-			native.jmp(a, store)
-			native.bind(a, zero)
-			native.mov(a, .A, .C)
-			native.bind(a, store)
-			native.state_store(a, fd, .A)
+			native.br_zero(a, .C, calc, nonzero = true)
+			native.state_load(a, .A, fs)
+			native.alu_imm(a, .And, .A, 0x80000000)
+			native.alu_imm(a, .Or, .A, 0x7fffffff) // FMAX
 			native.jmp(a, done)
-			native.bind(a, slow)
-			interp(a, i)
+			native.bind(a, calc)
+			fpu_root(a)
+			native.mov(a, .B, .A)
+			native.state_load(a, .A, fs)
+			fpu_calc(a, .Fdiv, .Div)
 			native.bind(a, done)
+			native.state_store(a, fd, .A)
 		case .ADD_S: fpu_arith(a, .Fadd, .Add, fd, fs, ft)
 		case .SUB_S: fpu_arith(a, .Fsub, .Sub, fd, fs, ft)
 		case .MUL_S: fpu_arith(a, .Fmul, .Mul, fd, fs, ft)
@@ -703,7 +704,32 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 
 // The operations of import cpu.fpu_slow, as cpu.Fpu_Op numbers them
 // (tests/ee_native checks).
-Fpu_Op :: enum u32 {Add, Sub, Mul, Div}
+Fpu_Op :: enum u32 {Add, Sub, Mul, Div, Sqrt}
+
+// A = cpu.fpu_sqrt of the f32 bits in A: exponent 0 gives +0, and 255,
+// which the EE reads as a number, cpu.fpu_slow's root. Any other root is
+// sqrtss of |A|: the f64 root rounded to f32 is the f32 root, as
+// 53 >= 2 * 24 + 2. Neither the operand nor the root is denormal, so FTZ
+// and DAZ don't matter, but this relies on the host's default round to
+// nearest, as fpu_calc does. Uses B and C.
+@(private = "file")
+fpu_root :: proc(a: ^native.Asm) {
+	zero, slow, done := native.new_label(a), native.new_label(a), native.new_label(a)
+	native.alu_imm(a, .And, .A, 0x7fffffff)
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .And, .C, 0x7f800000)
+	native.br_zero(a, .C, zero)
+	native.br_cmp_imm(a, .Eq, .C, 0x7f800000, slow)
+	native.float_sqrt(a, .A)
+	native.jmp(a, done)
+	native.bind(a, zero)
+	native.mov(a, .A, .C)
+	native.jmp(a, done)
+	native.bind(a, slow)
+	native.mov_imm(a, .C, u32(Fpu_Op.Sqrt))
+	native.call(a, "cpu.fpu_slow", .A, .B, .C)
+	native.bind(a, done)
+}
 
 // Go to l when the f32 bits in r have exponent 0 or 255 and are not +-0, as
 // cpu.fspecial; uses C.

@@ -203,6 +203,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .MUL_S: append(out, fmt.tprintf("%s = fmul(%s, %s)", F(fd), F(fs), F(ft)))
 	case .DIV_S: append(out, fmt.tprintf("%s = cpu.fpu_div(%s, %s)", F(fd), F(fs), F(ft)))
 	case .SQRT_S: append(out, fmt.tprintf("%s = cpu.fpu_sqrt(%s)", F(fd), F(ft)))
+	case .RSQRT_S: append(out, fmt.tprintf("%s = cpu.fpu_rsqrt(%s, %s)", F(fd), F(fs), F(ft)))
 	case .MADD_S: append(out, fmt.tprintf("%s = fadd(c.acc.f, fmul(%s, %s))", F(fd), F(fs), F(ft)))
 	case .MSUB_S: append(out, fmt.tprintf("%s = fsub(c.acc.f, fmul(%s, %s))", F(fd), F(fs), F(ft)))
 	case .MULA_S: append(out, fmt.tprintf("c.acc.f = fmul(%s, %s)", F(fs), F(ft)))
@@ -241,7 +242,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	     .PMADDH, .PHMADH, .PAND, .PXOR, .PMSUBH, .PHMSBH, .PEXEH, .PREVH, .PMULTH, .PDIVBW, .PEXEW, .PROT3W,
 	     .PMADDUW, .PSRAVW, .PMTHI, .PMTLO, .PINTEH, .PMULTUW, .PDIVUW, .PCPYUD, .POR, .PNOR, .PEXCH, .PCPYH, .PEXCW,
 	     .MFC0, .MTC0, .TLBR, .TLBWI, .TLBWR, .TLBP, .ERET, .EI, .DI,
-	     .CFC1, .CTC1, .RSQRT_S:
+	     .CFC1, .CTC1:
 		append(out, fmt.tprintf("ps2.exec_insn({{pc = %s, w = %s, op = .%v, rs = %d, rt = %d, rd = %d, sa = %d, fn = %d, imm = %d}})",
 			hexu(i.pc), hexu(i.w), i.op, i.rs, i.rt, i.rd, i.sa, i.fn, i.imm))
 		return true
