@@ -2,8 +2,9 @@
 // interpreter's vu_op. Two steps in one command: this program generates
 // cases/main.odin, one proc per macro word emit_macro covers (fn and special
 // 0x00-0x2f across dest masks, plus the lower ops it may cover: VMOVE,
-// VMR32, VLQI, VSQI, VLQD, VSQD, VDIV, VSQRT, VRSQRT, VWAITQ and the integer
-// ops, with fd 0, fs/ft 0, aliased and >15 registers), then runs it with
+// VMR32, VLQI, VSQI, VLQD, VSQD, VDIV, VSQRT, VRSQRT, VWAITQ, VMTIR, VMFIR
+// and the integer ops, with fd 0, fs/ft 0, aliased and >15 registers, 16
+// among them), then runs it with
 // `odin run`. Each case runs from random VU0 state (special floats, preset
 // sticky status bits, random MAC, clip and vi) and random VU0 data memory,
 // and must leave the whole VU0 state and data memory as vu_op leaves them.
@@ -33,9 +34,9 @@ main :: proc() {
 	// dest also holds the lower ops' fsf (bits 21-22) and ftf (23-24): these
 	// six masks give every value of both.
 	DESTS := [?]u32{15, 14, 8, 1, 5, 0}
-	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}, {17, 18, 16}} // fs, ft, fd
+	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}, {17, 18, 16}, {16, 16, 19}} // fs, ft, fd
 	FN_LOWER := [?]u32{0x30, 0x31, 0x32, 0x34, 0x35} // VIADD, VISUB, VIADDI, VIAND, VIOR
-	SP_LOWER := [?]u32{0x30, 0x31, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b} // VMOVE, VMR32, VLQI, VSQI, VLQD, VSQD, VDIV, VSQRT, VRSQRT, VWAITQ
+	SP_LOWER := [?]u32{0x30, 0x31, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d} // VMOVE, VMR32, VLQI, VSQI, VLQD, VSQD, VDIV, VSQRT, VRSQRT, VWAITQ, VMTIR, VMFIR
 	words: [dynamic]u32
 	for d in DESTS {
 		for r in REGS {

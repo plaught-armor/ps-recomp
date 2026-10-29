@@ -396,6 +396,8 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 		bind = "vi := &vu.vu0.vi; "
 	case sp == 0x30 || sp == 0x31 || sp == 0x3b: // VMOVE, VMR32, VWAITQ
 		bind = "vf := &vu.vu0.vf; "
+	case sp == 0x3c || sp == 0x3d: // VMTIR, VMFIR
+		bind = "vf := &vu.vu0.vf; vi := &vu.vu0.vi; "
 	case sp == 0x38 || sp == 0x3a: // VDIV, VRSQRT
 		flags = fmt.tprintf("div_flags(v, vf[%d].f[%d], vf[%d].f[%d]); ", (w >> 11) & 31, (w >> 21) & 3, (w >> 16) & 31, (w >> 23) & 3)
 	case sp == 0x39: // VSQRT
