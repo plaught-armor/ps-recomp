@@ -201,7 +201,7 @@ call_slow :: proc(addr: u32) {
 		return
 	}
 	if fn := resolve_overlay(addr); fn != nil {
-		when FALLBACK_COUNT {fallback_overlay[addr] += 1}
+		when FALLBACK_COUNT {dispatch_overlay[addr] += 1}
 		fn()
 		return
 	}

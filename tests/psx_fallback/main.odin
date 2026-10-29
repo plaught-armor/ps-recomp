@@ -2,7 +2,7 @@
 // GTE's unknown-command report keeps out of report_once's set of RAM
 // addresses, each call and jump reaches the interpreter or a function as
 // before, and with -define:FALLBACK_COUNT=true each one counts once under
-// its target.
+// its target, in the fallback table (interpreter work) or the dispatch one.
 //
 //   0x80001000  no function: call interprets
 //   0x80002000  an overlay function, resident (id 0x1234 at slot 0x80001ff0,
@@ -78,11 +78,29 @@ main :: proc() {
 		if len(cpu.fallback_jump) != len(jumps) {
 			fail(fmt.tprintf("fallback_jump has %d keys, want %d", len(cpu.fallback_jump), len(jumps)))
 		}
-		if n := cpu.fallback_overlay[0x80002000]; n != 1 || len(cpu.fallback_overlay) != 1 {
-			fail(fmt.tprintf("fallback_overlay = %v, want 80002000 once", cpu.fallback_overlay))
+		if n := cpu.dispatch_overlay[0x80002000]; n != 1 || len(cpu.dispatch_overlay) != 1 {
+			fail(fmt.tprintf("dispatch_overlay = %v, want 80002000 once", cpu.dispatch_overlay))
+		}
+		// interp_run is stubbed, so no instructions are counted.
+		want_fallback :: "kind\tpc\tfrom\tcount\n" +
+			"interp_insns\t-\t-\t0\n" +
+			"interp\t80000100\t-\t1\n" +
+			"interp\t80001000\t-\t1\n" +
+			"interp\t80003010\t-\t1\n" +
+			"jump_interp\t80003010\t80003000\t1\n"
+		want_dispatch :: "kind\tpc\tfrom\tcount\n" +
+			"jump_call\t80000100\t80003000\t1\n" +
+			"jump_return\t00000000\t80003000\t1\n" +
+			"overlay\t80002000\t-\t1\n"
+		fallback, dispatch := cpu.fallback_tsv()
+		if fallback != want_fallback {
+			fail(fmt.tprintf("fallback table:\n%swant:\n%s", fallback, want_fallback))
+		}
+		if dispatch != want_dispatch {
+			fail(fmt.tprintf("dispatch table:\n%swant:\n%s", dispatch, want_dispatch))
 		}
 		cpu.fallback_dump()
-		fmt.println("ok psx_fallback: gte report set apart; 3 interp entries, 3 jumps, 1 overlay resolve counted")
+		fmt.println("ok psx_fallback: gte report set apart; 3 interp entries, 3 jumps, 1 overlay resolve counted; fallback and dispatch tables split")
 	} else {
 		fmt.println("ok psx_fallback: gte report set apart; 3 interp entries, 1 overlay call")
 	}
