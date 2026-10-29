@@ -772,10 +772,10 @@ VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
 
 // VDIV (key 0x38), VSQRT (0x39) and VRSQRT (0x3a) of VU0 macro op w, as
 // vu.vu_op runs them: Q, and status I and D with their sticky bits, as
-// vu_div_flags sets them. The results use the host's divss and sqrtss with
-// its default rounding, as the runtime's f32 code does. Uses A, B, C, LD,
-// V0 and V1, and keeps T, which can hold a branch condition across this
-// op in a delay slot. x64 only.
+// vu_div_flags sets them. The results use the host's float divide and
+// square root with its default rounding, as the runtime's f32 code does.
+// Uses A, B, C, LD, V0 and V1, and keeps T, which can hold a branch
+// condition across this op in a delay slot.
 @(private = "file")
 vu0_div :: proc(a: ^native.Asm, w, key: u32) -> bool {
 	fs, fsf, ft, ftf := (w >> 11) & 31, (w >> 21) & 3, (w >> 16) & 31, (w >> 23) & 3
@@ -911,7 +911,7 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x2f: kind = upper ? Kind.Mini : Kind.Nop // VNOP
 	case 0x30: if upper {return false}; kind = .Move
 	case 0x31: if upper {return false}; kind = .Mr32
-	case 0x38 ..= 0x3a: if upper || a.arch == .Arm64 {return false}; return vu0_div(a, w, key)
+	case 0x38 ..= 0x3a: if upper {return false}; return vu0_div(a, w, key)
 	case 0x3b: if upper {return false}; kind = .Nop // VWAITQ
 	case: return false
 	}

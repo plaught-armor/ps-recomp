@@ -367,10 +367,6 @@ main :: proc() {
 	}
 	// VCLIP is left to the interpreter on purpose.
 	delete_key(&slow, "VU0 special 1f")
-	// VDIV, VSQRT and VRSQRT are inline on x64 only.
-	if arch == .Arm64 {
-		for k in ([?]string{"VU0 special 38", "VU0 special 39", "VU0 special 3a"}) {delete_key(&slow, k)}
-	}
 	if len(slow) != 0 {
 		fmt.eprintln("FAIL interpreter calls in native code:", slow)
 		os.exit(1)
