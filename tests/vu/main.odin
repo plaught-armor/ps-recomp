@@ -8,6 +8,9 @@
 // interpreter: IADDIU vi<n>, vi0, n for n = 1..15, then IADDIU vi0, vi0, 7,
 // which must leave vi0 zero.
 //
+// Then single macro ops on edge values: the clamped add and multiply
+// family, flags into vf0, and MAX and MINI.
+//
 //   odin run tests/vu -collection:ps=.
 package main
 
@@ -89,6 +92,71 @@ flags :: proc() {
 	if v.status != 0x8c3 {fail("VADD to vf0: status = %03x, want 8c3", v.status)}
 }
 
+// MAX and MINI on the raw words in sign and magnitude order: exponent 255
+// is a large magnitude, denormals order as they are, -0 < +0. The result is
+// the winning word unclamped, and MAC and status keep their old values. Each
+// pair runs both ways round in the vector, broadcast and I forms.
+@(private = "file")
+minmax :: proc() {
+	Pair :: struct {
+		a, b, max, min: u32,
+	}
+	pairs := [?]Pair {
+		{0x00000000, 0x80000000, 0x00000000, 0x80000000}, // +0, -0
+		{0x80000000, 0x80000001, 0x80000000, 0x80000001}, // -0, -denormal
+		{0x00000001, 0x00000000, 0x00000001, 0x00000000}, // denormal, +0
+		{0x7f800000, 0x7f7fffff, 0x7f800000, 0x7f7fffff}, // inf, max
+		{0x7fffffff, 0x7f800000, 0x7fffffff, 0x7f800000}, // NaN, inf
+		{0xffffffff, 0xff800000, 0xff800000, 0xffffffff}, // -NaN, -inf
+		{0xffc00000, 0x7fc00000, 0x7fc00000, 0xffc00000}, // -qNaN, qNaN
+		{0xbf800000, 0x3f800000, 0x3f800000, 0xbf800000}, // -1, 1
+		{0xc0000000, 0xbf800000, 0xbf800000, 0xc0000000}, // -2, -1
+		{0x40000000, 0x3f800000, 0x40000000, 0x3f800000}, // 2, 1
+		{0x807fffff, 0x80000000, 0x80000000, 0x807fffff}, // -denormal, -0
+		{0x007fffff, 0x00800000, 0x00800000, 0x007fffff}, // denormal, smallest normal
+	}
+	MAC, STATUS :: 0x5a, 0x0c3
+	NOISE :: 0x12345678
+	v := &vu.vu0
+	op :: proc(v: ^vu.Vu, dest, fd, fn: u32) {
+		v.mac, v.status = MAC, STATUS
+		vu.vu_op(v, 0x4a000000 | dest << 21 | 2 << 16 | 1 << 11 | fd << 6 | fn) // fs 1, ft 2
+		if v.mac != MAC || v.status != STATUS {fail("fn %02x: mac %02x status %03x, want them kept", fn, v.mac, v.status)}
+	}
+	for p in pairs {
+		for swap in 0 ..< 2 {
+			a, b := swap == 0 ? p.a : p.b, swap == 0 ? p.b : p.a
+			for is_max in 0 ..< 2 {
+				want := is_max == 1 ? p.max : p.min
+				name := is_max == 1 ? "MAX" : "MINI"
+				check :: proc(form, name: string, a, b, want: u32) {
+					got := vu.vu0.vf[3].u
+					if got != {want, want, want, want} {fail("%s%s %08x %08x: vf3 = %08x, want %08x", name, form, a, b, got, want)}
+				}
+				v.vf[1].u, v.vf[2].u, v.vf[3] = {a, a, a, a}, {b, b, b, b}, {}
+				op(v, 0xf, 3, is_max == 1 ? 0x2b : 0x2f)
+				check("", name, a, b, want)
+				for bc in u32(0) ..< 4 {
+					v.vf[2].u, v.vf[3] = {NOISE, NOISE, NOISE, NOISE}, {}
+					v.vf[2].u[bc] = b
+					op(v, 0xf, 3, (is_max == 1 ? 0x10 : 0x14) | bc)
+					check(".bc", name, a, b, want)
+				}
+				v.vf[3], v.i = {}, transmute(f32)b
+				op(v, 0xf, 3, is_max == 1 ? 0x1d : 0x1f)
+				check("i", name, a, b, want)
+			}
+		}
+	}
+	// dest .xz leaves y and w; fd 0 leaves vf0
+	v.vf[1].u, v.vf[2].u = {1, 2, 3, 4}, {4, 3, 2, 1}
+	v.vf[3].u = {NOISE, NOISE, NOISE, NOISE}
+	op(v, 0xa, 3, 0x2b)
+	if v.vf[3].u != {4, NOISE, 3, NOISE} {fail("MAX.xz: vf3 = %08x", v.vf[3].u)}
+	op(v, 0xf, 0, 0x2f)
+	if v.vf[0].f != {0, 0, 0, 1} {fail("MINI to vf0: vf0 = %v", v.vf[0].f)}
+}
+
 // IADDIU into each of vi1-vi15 and vi0, from 0x100.
 @(private = "file")
 all_vi :: proc() {
@@ -125,5 +193,6 @@ main :: proc() {
 	all_vi()
 	clamped()
 	flags()
+	minmax()
 	fmt.println("vu: ok")
 }

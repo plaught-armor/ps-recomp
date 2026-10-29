@@ -104,7 +104,12 @@ find_programs :: proc(img: mips.Image) -> (progs: [dynamic]Prog, ok: bool) {
 
 @(private = "file")
 upper_writes_mac :: proc(uw: u32) -> bool {
-	if uw & 63 < 0x3c {return true}
+	if uw & 63 < 0x3c {
+		switch uw & 63 {
+		case 0x10 ..= 0x17, 0x1d, 0x1f, 0x2b, 0x2f: return false // MAX, MINI
+		}
+		return true
+	}
 	switch ((uw >> 4) & 0x7c) | (uw & 3) {
 	case 0x10 ..= 0x17, 0x1d, 0x1f, 0x2f: return false // ITOF, FTOI, ABS, CLIP, NOP
 	}
@@ -224,29 +229,19 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 		.Sub  = "s - %s",
 		.Madd = "v.acc.f + s * %s",
 		.Msub = "v.acc.f - s * %s",
-		.Max  = "vmax(s, %s)",
-		.Mini = "vmin(s, %s)",
+		.Max  = "vmax",
+		.Mini = "vmin",
 		.Mul  = "s * %s",
 	}
 	BC := [4]string{"sp(t.x)", "sp(t.y)", "sp(t.z)", "sp(t.w)"}
 	// Write r to fd (or ACC), with the flags asked for. The add and
-	// multiply family clamps its operands as the interpreter's vu_op does;
-	// MAX and MINI compare them raw.
+	// multiply family clamps its operands as the interpreter's vu_op does.
 	arith :: proc(sb: ^strings.Builder, expr: string, dst: string, dest, fs, ft: u32, flags: Flags) {
 		if dst == "" && flags == .None {return}
-		raw := strings.has_prefix(expr, "vmax") || strings.has_prefix(expr, "vmin")
-		in4 := raw ? "vf[%d].f; " : "clamp4(vf[%d].f); "
-		e := expr
-		if !raw {
-			e, _ = strings.replace_all(e, "v.q", "fclamp(v.q)", context.temp_allocator)
-			e, _ = strings.replace_all(e, "v.i", "fclamp(v.i)", context.temp_allocator)
-		}
-		fmt.sbprintf(sb, "\t\t\t{{s := ")
-		fmt.sbprintf(sb, in4, fs)
-		if strings.contains(expr, "t") {
-			fmt.sbprintf(sb, "t := ")
-			fmt.sbprintf(sb, in4, ft)
-		}
+		e, _ := strings.replace_all(expr, "v.q", "fclamp(v.q)", context.temp_allocator)
+		e, _ = strings.replace_all(e, "v.i", "fclamp(v.i)", context.temp_allocator)
+		fmt.sbprintf(sb, "\t\t\t{{s := clamp4(vf[%d].f); ", fs)
+		if strings.contains(expr, "t") {fmt.sbprintf(sb, "t := clamp4(vf[%d].f); ", ft)}
 		fmt.sbprintf(sb, "x := clamp4(%s); ", e)
 		if flags != .None {fmt.sbprintf(sb, "v.mac = mac4(x, 0x%x); ", dest)}
 		if flags == .Mac_Status {fmt.sbprintf(sb, "put_status(v); ")}
@@ -284,6 +279,18 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 			return
 		case 0x2f: op, b = .Mini, "t"
 		case: return true
+		}
+		if op == .Max || op == .Mini {
+			// The raw words, unclamped, and no flags: vmax in VU_HELPERS.
+			if vfd == "" {return}
+			fmt.sbprintf(sb, "\t\t\t{{s := vf[%d].u; ", fs)
+			if b != "sp(v.i)" {fmt.sbprintf(sb, "t := vf[%d].u; ", ft)}
+			if b == "sp(v.i)" {b = "spu(transmute(u32)v.i)"}
+			if strings.has_prefix(b, "sp(") {b = strings.concatenate({"spu(", b[3:]}, context.temp_allocator)}
+			fmt.sbprintf(sb, "x := %s(s, %s); ", OPS[op], b)
+			store(sb, vfd, dest, "u")
+			end_block(sb)
+			return
 		}
 		arith(sb, fmt.tprintf(OPS[op], b), vfd, dest, fs, ft, flags)
 		return
@@ -397,16 +404,16 @@ end_block :: proc(sb: ^strings.Builder) {
 	fmt.sbprintln(sb, "}")
 }
 
-// Store the dest lanes of x into dst ("" discards).
+// Store the dest lanes of x into dst's field ("" discards).
 @(private = "file")
-store :: proc(sb: ^strings.Builder, dst: string, dest: u32) {
+store :: proc(sb: ^strings.Builder, dst: string, dest: u32, field := "f") {
 	if dst == "" {return}
 	if dest == 15 {
-		fmt.sbprintf(sb, "%s.f = x", dst)
+		fmt.sbprintf(sb, "%s.%s = x", dst, field)
 		return
 	}
 	for on, k in lanes(dest) {
-		if on {fmt.sbprintf(sb, "%s.f[%d] = x[%d]; ", dst, k, k)}
+		if on {fmt.sbprintf(sb, "%s.%s[%d] = x[%d]; ", dst, field, k, k)}
 	}
 }
 
@@ -666,6 +673,16 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, sl
 	fmt.sbprintln(sb, "}\n")
 }
 
+// One VU1 microprogram at micro address 0, compiled whole as run_<n>, as
+// generate compiles a .vutext program (tests/vu_micro). The caller writes
+// the package header and VU_HELPERS.
+emit_micro :: proc(n: int, words: []u32) -> string {
+	sb := strings.builder_make()
+	slow: map[string]int
+	emit_program(&sb, n, words, nil, &slow)
+	return strings.to_string(sb)
+}
+
 // Write out_dir/vu1/code.odin (package vu1); runtime is the ps2 runtime's
 // import path relative to out_dir. Returns the number of programs. Counts
 // the pair halves that call the interpreter in slow, by opcode.
@@ -911,8 +928,20 @@ cvt_w :: #force_inline proc "contextless" (x: f32) -> i32 {
 	return i32(x)
 }
 
-vmax :: #force_inline proc "contextless" (a, b: [4]f32) -> [4]f32 {return {max(a.x, b.x), max(a.y, b.y), max(a.z, b.z), max(a.w, b.w)}}
-vmin :: #force_inline proc "contextless" (a, b: [4]f32) -> [4]f32 {return {min(a.x, b.x), min(a.y, b.y), min(a.z, b.z), min(a.w, b.w)}}
+spu :: #force_inline proc "contextless" (x: u32) -> [4]u32 {return {x, x, x, x}}
+
+// MAX and MINI as the interpreter's vu_op (ps2/vu vmax): the raw words in
+// sign and magnitude order.
+vmax :: #force_inline proc "contextless" (a, b: [4]u32) -> [4]u32 {
+	ka, kb := transmute(#simd[4]i32)a, transmute(#simd[4]i32)b
+	neg := simd.lanes_lt(ka & kb, 0)
+	return transmute([4]u32)simd.select(neg, simd.min(ka, kb), simd.max(ka, kb))
+}
+vmin :: #force_inline proc "contextless" (a, b: [4]u32) -> [4]u32 {
+	ka, kb := transmute(#simd[4]i32)a, transmute(#simd[4]i32)b
+	neg := simd.lanes_lt(ka & kb, 0)
+	return transmute([4]u32)simd.select(neg, simd.max(ka, kb), simd.min(ka, kb))
+}
 
 // Quadword n of v's data memory of size bytes (vu.VU0_MEM or vu.VU1_MEM),
 // wrapping. Unchecked: the generated code passes vu.vu0 with VU0_MEM and

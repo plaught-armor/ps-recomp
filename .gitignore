@@ -10,5 +10,6 @@
 /.qwen/
 /QWEN.md
 /tests/vu_macro/cases/
+/tests/vu_micro/cases/
 /tests/ee_emit/cases/
 /recomp-bin

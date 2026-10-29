@@ -319,11 +319,6 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 		df, sf := transmute([4]f32)d, transmute([4]f32)s
 		rf := df + sf if op == .Fadd else df - sf if op == .Fsub else df * sf if op == .Fmul else df / sf
 		return transmute([4]u32)rf
-	case .Fmax, .Fmin:
-		df, sf := transmute([4]f32)d, transmute([4]f32)s
-		rf: [4]f32
-		for k in 0 ..< 4 {rf[k] = max(df[k], sf[k]) if op == .Fmax else min(df[k], sf[k])}
-		return transmute([4]u32)rf
 	case .Itof:
 		for k in 0 ..< 4 {r4[k] = transmute(u32)f32(i32(s[k]))}
 		return r4

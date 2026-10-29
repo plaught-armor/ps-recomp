@@ -321,8 +321,6 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Fsub     = 0x0f5c, // subps
 		.Fmul     = 0x0f59, // mulps
 		.Fdiv     = 0x0f5e, // divps
-		.Fmax     = 0x0f5f, // maxps, then the NaN lanes of dst take src's
-		.Fmin     = 0x0f5d, // minps, likewise
 		.Itof     = 0x0f5b, // cvtdq2ps
 		.Ftoi     = 0x0f5b, // cvttps2dq
 		.Gt32     = 0x0f66, // pcmpgtd
@@ -344,18 +342,6 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 			emit8(a, 0x66, 0x0f, 0x72, 0xf0 | u8(r), 16) // pslld r, 16
 			emit8(a, 0x66, 0x0f, 0x72, 0xe0 | u8(r), 16) // psrad r, 16
 		}
-	}
-	if op == .Fmax || op == .Fmin {
-		// The sequence llvm compiles maxnum and minnum to: V2 = src max dst,
-		// dst's lane where they tie or src is NaN; then src's where dst is NaN.
-		x64_vec_copy(a, .V2, src)
-		sse(a, ops[op], .V2, dst, true)
-		sse(a, 0x0fc2, dst, dst, true) // cmpps dst, dst, unord
-		emit8(a, 3)
-		sse(a, 0x0fdb, src, dst) // pand
-		sse(a, 0x0fdf, dst, .V2) // pandn
-		sse(a, 0x0feb, dst, src) // por
-		return
 	}
 	if op == .Ftoi {emit8(a, 0xf3)}
 	sse(a, ops[op], dst, src, op == .Fadd || op == .Fsub || op == .Fmul || op == .Fdiv || op == .Itof || op == .Ftoi)

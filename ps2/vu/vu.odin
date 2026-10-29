@@ -8,6 +8,7 @@ package ps2_vu
 import "base:runtime"
 import "core:fmt"
 import "core:math"
+import "core:simd"
 import "core:slice"
 import "ps:core"
 import cpu "../cpu"
@@ -154,6 +155,13 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 			if dest & (8 >> u32(k)) != 0 {v.vf[n & 31].f[k] = vclamp(r[k])}
 		}
 	}
+	// Write words as they are, without touching flags (MAX, MINI).
+	put_bits :: proc(v: ^Vu, n: u32, dest: u32, r: [4]u32) #no_bounds_check {
+		if n == 0 {return}
+		for k in 0 ..< 4 {
+			if dest & (8 >> u32(k)) != 0 {v.vf[n & 31].u[k] = r[k]}
+		}
+	}
 	s := v.vf[fs].f
 	t := v.vf[ft].f
 	// The add and multiply family's operands, clamped: the VU has no
@@ -163,7 +171,8 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 	// compiler happens to keep.
 	cs, ct := vclamp4(s), vclamp4(t)
 	cq, ci := vclamp(v.q), vclamp(v.i)
-	splat :: proc(x: f32) -> [4]f32 {return {x, x, x, x}}
+	su, tu, iu := v.vf[fs].u, v.vf[ft].u, transmute(u32)v.i
+	splat :: proc(x: $T) -> [4]T {return {x, x, x, x}}
 
 	if fn < 0x3c {
 		switch fn {
@@ -171,13 +180,13 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		case 0x04 ..= 0x07: put(v, fd, dest, cs - splat(ct[bc]))
 		case 0x08 ..= 0x0b: put(v, fd, dest, v.acc.f + cs * splat(ct[bc]))
 		case 0x0c ..= 0x0f: put(v, fd, dest, v.acc.f - cs * splat(ct[bc]))
-		case 0x10 ..= 0x13: put(v, fd, dest, vmax(s, splat(t[bc])))
-		case 0x14 ..= 0x17: put(v, fd, dest, vmin(s, splat(t[bc])))
+		case 0x10 ..= 0x13: put_bits(v, fd, dest, vmax(su, splat(tu[bc])))
+		case 0x14 ..= 0x17: put_bits(v, fd, dest, vmin(su, splat(tu[bc])))
 		case 0x18 ..= 0x1b: put(v, fd, dest, cs * splat(ct[bc]))
 		case 0x1c: put(v, fd, dest, cs * splat(cq))
-		case 0x1d: put(v, fd, dest, vmax(s, splat(v.i)))
+		case 0x1d: put_bits(v, fd, dest, vmax(su, splat(iu)))
 		case 0x1e: put(v, fd, dest, cs * splat(ci))
-		case 0x1f: put(v, fd, dest, vmin(s, splat(v.i)))
+		case 0x1f: put_bits(v, fd, dest, vmin(su, splat(iu)))
 		case 0x20: put(v, fd, dest, cs + splat(cq))
 		case 0x21: put(v, fd, dest, v.acc.f + cs * splat(cq))
 		case 0x22: put(v, fd, dest, cs + splat(ci))
@@ -189,13 +198,13 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		case 0x28: put(v, fd, dest, cs + ct)
 		case 0x29: put(v, fd, dest, v.acc.f + cs * ct)
 		case 0x2a: put(v, fd, dest, cs * ct)
-		case 0x2b: put(v, fd, dest, vmax(s, t))
+		case 0x2b: put_bits(v, fd, dest, vmax(su, tu))
 		case 0x2c: put(v, fd, dest, cs - ct)
 		case 0x2d: put(v, fd, dest, v.acc.f - cs * ct)
 		case 0x2e: // VOPMSUB: fd.xyz = acc - fs.yzx * ft.zxy
 			r := v.acc.f - [4]f32{cs.y * ct.z, cs.z * ct.x, cs.x * ct.y, 0}
 			put(v, fd, 0xe, r)
-		case 0x2f: put(v, fd, dest, vmin(s, t))
+		case 0x2f: put_bits(v, fd, dest, vmin(su, tu))
 		case 0x30: if fd != 0 {v.vi[fd & 15] = v.vi[fs & 15] + v.vi[ft & 15]}
 		case 0x31: if fd != 0 {v.vi[fd & 15] = v.vi[fs & 15] - v.vi[ft & 15]}
 		case 0x32: // VIADDI: imm5 in the fd field
@@ -395,10 +404,25 @@ vu_mem_q :: proc(v: ^Vu, n: u16) -> ^[4]u32 #no_bounds_check {
 	return (^[4]u32)(&v.mem[o])
 }
 
+// MAX and MINI order the raw words by sign and magnitude: exponent 255 is
+// just a large magnitude, denormals order as they are and -0 < +0. The
+// winning word is written unclamped and MAC and status are left alone. This
+// is the behaviour PCSX2 implements (pcsx2/VUops.cpp fp_max, fp_min and
+// applyMinMax; pcsx2/x86/microVU_Upper.inl mVU_FMACa, which skips the flag
+// update for them), described here, no code copied. Read as i32 the words
+// order the same way, except that two negative ones order in reverse.
 @(private)
-vmax :: proc(a, b: [4]f32) -> [4]f32 {return {max(a.x, b.x), max(a.y, b.y), max(a.z, b.z), max(a.w, b.w)}}
+vmax :: proc(a, b: [4]u32) -> [4]u32 {
+	ka, kb := transmute(#simd[4]i32)a, transmute(#simd[4]i32)b
+	neg := simd.lanes_lt(ka & kb, 0)
+	return transmute([4]u32)simd.select(neg, simd.min(ka, kb), simd.max(ka, kb))
+}
 @(private)
-vmin :: proc(a, b: [4]f32) -> [4]f32 {return {min(a.x, b.x), min(a.y, b.y), min(a.z, b.z), min(a.w, b.w)}}
+vmin :: proc(a, b: [4]u32) -> [4]u32 {
+	ka, kb := transmute(#simd[4]i32)a, transmute(#simd[4]i32)b
+	neg := simd.lanes_lt(ka & kb, 0)
+	return transmute([4]u32)simd.select(neg, simd.max(ka, kb), simd.min(ka, kb))
+}
 
 // ------------------------------------------------------------ micro mode
 

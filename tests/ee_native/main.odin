@@ -92,6 +92,8 @@ VALS := [?]u64 {
 	0x7fc00000_7f7fffff,
 	0xff7fffff_00400000,
 	0x3f800000_ff7fffff, // as y, with x = 0x7fc00000_7f7fffff: acc.x -max, vf.x max
+	0xffc00000_807fffff, // a negative NaN, a negative denormal
+	0x007fffff_80000001,
 	// FTOI's limits: 2^31 and -2^31, the largest float below 2^31 and 32767
 	0x4f000000_cf000000,
 	0x4effffff_46fffe00,
@@ -216,10 +218,11 @@ main :: proc() {
 		{macro(0x2e), .VU0}, // VOPMSUB
 		{macro(0x28, 15, 0), .VU0}, // VADD to vf0: flags only
 		{macro(0x28, 0), .VU0}, // VADD of no lanes
-		// MAX and MINI against the interpreter's max and min: the values put
-		// +0 and -0, NaNs and infinities against each other across lanes.
+		// MAX and MINI against the interpreter's raw sign and magnitude
+		// order: the values put +0 and -0, NaNs and infinities of both
+		// signs and denormals against each other across lanes.
 		{macro(0x2b), .VU0}, // VMAX
-		{macro(0x2b, 0xa, 0), .VU0}, // VMAX.xz to vf0: flags only
+		{macro(0x2b, 0xa, 0), .VU0}, // VMAX.xz to vf0: nothing
 		{macro(0x2f, 6), .VU0}, // VMINI.yz
 		{macro(0x10), .VU0}, // VMAXx
 		{macro(0x13, 9), .VU0}, // VMAXw.xw

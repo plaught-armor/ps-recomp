@@ -776,8 +776,9 @@ VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
 // moves, waits, the float upper ops of the VF registers and ACC with their
 // broadcast, Q and I forms, and ITOF, FTOI and ABS. Results clamp and set
 // MAC and status as vu_put_flags does, and the add and multiply operands
-// clamp first as vu_op's do; MAX and MINI compare them raw. ITOF, FTOI and
-// ABS set no flags, as put_raw. Uses A, B, C and V0-V4.
+// clamp first as vu_op's do. MAX and MINI order the raw words by sign and
+// magnitude and write the winner as it is, as ps2/vu vmax and vmin. ITOF,
+// FTOI, ABS, MAX and MINI set no flags. Uses A, B, C and V0-V4.
 @(private = "file")
 vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Max, Mini, Opmul, Opmsub, Move, Mr32, Nop, Itof, Ftoi, Abs}
@@ -904,6 +905,7 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 		put(a, 16 * ft, "vu.vf", dest)
 		return true
 	case .Max, .Mini:
+		if fd == 0 || dest == 0 {return true}
 		native.vec_load(a, .V0, 16 * fs, "vu.vf")
 		switch src {
 		case .Vec:
@@ -916,7 +918,29 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 		case .I:
 			native.vec_splat_load(a, .V1, "vu.i")
 		}
-		native.vec_op(a, .Fmax if kind == .Max else .Fmin, .V0, .V1)
+		// The order key of each word: x ^ 0x7fffffff where x < 0, so
+		// signed lanes compare as sign and magnitude.
+		key :: proc(a: ^native.Asm, dst, x: native.Vreg) {
+			native.vec_load(a, dst, VU_ZERO, "vu.k")
+			native.vec_op(a, .Gt32, dst, x)
+			native.vec_load(a, .V4, VU_ABS, "vu.k")
+			native.vec_op(a, .And, dst, .V4)
+			native.vec_op(a, .Xor, dst, x)
+		}
+		key(a, .V2, .V0)
+		key(a, .V3, .V1)
+		// Where the mask is set fs wins, else t.
+		if kind == .Max {
+			native.vec_op(a, .Gt32, .V2, .V3)
+		} else {
+			native.vec_op(a, .Gt32, .V3, .V2)
+			native.vec_copy(a, .V2, .V3)
+		}
+		native.vec_op(a, .And, .V0, .V2)
+		native.vec_op(a, .Andn, .V2, .V1)
+		native.vec_op(a, .Or, .V0, .V2)
+		put(a, 16 * fd, "vu.vf", dest)
+		return true
 	case .Move, .Mr32:
 		// Bits as they are, no flags.
 		if ft == 0 {return true}

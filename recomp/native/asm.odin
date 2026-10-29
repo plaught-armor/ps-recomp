@@ -102,11 +102,6 @@ Vop :: enum u8 {
 	Fsub,
 	Fmul,
 	Fdiv,
-	// f32 lanes as the host compiles max and min of f32 (llvm's maxnum): a
-	// NaN lane takes the other operand's, and on x64 a tie (+0 and -0)
-	// keeps dst's. Loses src, and V2 on x64.
-	Fmax,
-	Fmin,
 	Itof, // dst = the i32 lanes of src as f32, rounded to nearest
 	// dst = the f32 lanes of src truncated to i32. Out of range or NaN: x64
 	// gives 0x80000000, arm64 the nearest i32 and 0 for NaN.
@@ -502,7 +497,6 @@ vec_check :: proc(a: ^Asm, off: u32) {
 
 vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	assert(op != .Even8 || (dst != .V2 && src != .V2), "native: Even8 of V2")
-	assert((op != .Fmax && op != .Fmin) || (dst != .V2 && src != .V2 && dst != src), "native: Fmax or Fmin of V2")
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_vec_op(a, op, dst, src)
