@@ -7,7 +7,8 @@
 // The snapshot part keys a voice on, saves, mixes, scribbles over its
 // blocks and loads: mixing again must give the same samples.
 // The FMOD reverb (reverb_set, reverb_mix) runs each preset over a fixed
-// send; a hash of its return pins the output. A core's reverb (spu_effect,
+// send, and FMOD's Reverb_SetProperties (fmod_reverb) through a sequence of
+// settings; hashes of its return pin the output. A core's reverb (spu_effect,
 // spu_effect_enable, spu_voice_send) rings on after its voice ends.
 package main
 
@@ -28,6 +29,9 @@ ADSR1 :: 0x00ff
 ADSR2 :: 0x1fc0
 
 // FNV-1a of reverb_mix's return per mode 1 .. 9 for reverb_presets' send.
+// The same for reverb_fmod's sequence.
+REVERB_FMOD_HASH: u64 = 0x9d814a48644cebf5
+
 REVERB_HASH := [9]u64 {
 	0x28fde966e53c1262,
 	0x91c1da24c37c8fd4,
@@ -128,31 +132,66 @@ voices :: proc() {
 	check(iop.spu_write(iop.SPU_RAM_SIZE - 4, edge[:]) == 4, "spu_write clipped at the end of sound RAM")
 }
 
+CHUNK :: 1024
+FNV :: 0xcbf29ce484222325
+
+// Run rev over n chunks of CHUNK frames of noise bursts (on one chunk, off
+// three), hashing its return into h.
+reverb_feed :: proc(seed: ^u32, h: ^u64, n: int) {
+	send, acc: [CHUNK * 2]i32
+	for c in 0 ..< n {
+		for &x in send {
+			seed^ = seed^ * 1103515245 + 12345
+			x = c % 4 == 0 ? i32(seed^ >> 16) % 16000 - 8000 : 0
+		}
+		iop.reverb_mix(&rev, send[:], acc[:])
+		for x in acc {
+			for b in 0 ..< u32(4) {h^ = (h^ ~ u64(u32(x) >> (b * 8) & 0xff)) * 0x100000001b3}
+		}
+		acc = {}
+	}
+}
+
 // Every preset over noise bursts (on 1024 frames, off 3072, so tails
 // ring out), 0x20000 frames in chunks of 1024: twice the largest work area
 // at the half rate.
 reverb_presets :: proc() {
-	CHUNK :: 1024
 	seed: u32 = 1
-	send, acc: [CHUNK * 2]i32
 	for mode in u32(1) ..= 9 {
 		iop.reverb_set(&rev, mode, 0x3fff, 0x3fff, true)
-		h: u64 = 0xcbf29ce484222325
-		for c in 0 ..< 0x20000 / CHUNK {
-			for &x in send {
-				seed = seed * 1103515245 + 12345
-				x = c % 4 == 0 ? i32(seed >> 16) % 16000 - 8000 : 0
-			}
-			acc = {}
-			iop.reverb_mix(&rev, send[:], acc[:])
-			for x in acc {
-				for b in 0 ..< u32(4) {h = (h ~ u64(u32(x) >> (b * 8) & 0xff)) * 0x100000001b3}
-			}
-		}
+		h: u64 = FNV
+		reverb_feed(&seed, &h, 0x20000 / CHUNK)
 		if h != REVERB_HASH[mode - 1] {
 			fmt.eprintfln("FAIL reverb mode %d: hash %#16x", mode, h)
 			failed = true
 		}
+	}
+}
+
+// FMOD's Reverb_SetProperties (fmod_reverb) over a running reverb: room
+// -2500 mB (EVOL 0x2fff) on mode 1, mode 1 again at -1000 mB without a
+// clear, mode 9 with no core flag (ignored), mode 5 at +500 mB (clamped to
+// 0x3fff) from a full work area, then left and right EVOL apart.
+reverb_fmod :: proc() {
+	seed: u32 = 7
+	h: u64 = FNV
+	rev = {}
+	iop.fmod_reverb(&rev, 1, transmute(u32)i32(-2500), 0x100)
+	check(rev.mode == 1 && rev.evol == {0x2fff, 0x2fff}, "fmod_reverb: room level to EVOL")
+	reverb_feed(&seed, &h, 32)
+	iop.fmod_reverb(&rev, 1, transmute(u32)i32(-1000), 0x100)
+	reverb_feed(&seed, &h, 32)
+	iop.fmod_reverb(&rev, 9, 0, 0)
+	check(rev.mode == 1, "fmod_reverb: no core flag, no change")
+	reverb_feed(&seed, &h, 8)
+	iop.fmod_reverb(&rev, 5, 500, 0x200)
+	check(rev.mode == 5 && rev.evol == {0x3fff, 0x3fff}, "fmod_reverb: EVOL clamped")
+	reverb_feed(&seed, &h, 64)
+	iop.reverb_set(&rev, 5, 0x2000, 0x800, false)
+	reverb_feed(&seed, &h, 32)
+	if h != REVERB_FMOD_HASH {
+		fmt.eprintfln("FAIL reverb FMOD sequence: hash %#16x", h)
+		failed = true
 	}
 }
 
@@ -176,6 +215,7 @@ effects :: proc() {
 	iop.spu_effect(0, 0x105, 0x500, 0x500) // hall, cleared
 	check(!tail(effect_play(true)), "no reverb with a mode but effects disabled")
 	iop.spu_effect_enable(0, true)
+	check(!iop.spu_effect(0, 10, 0, 0) && !iop.spu_effect(0, 0x205, 0, 0) && !iop.spu_effect(2, 5, 0, 0), "bad effect mode or core refused")
 	check(tail(effect_play(true)), "hall reverb heard after the voice ends")
 	iop.spu_effect(0, 0x105, 0x500, 0x500)
 	check(!tail(effect_play(false)), "a voice out of the send gets no reverb")
@@ -194,6 +234,7 @@ effects :: proc() {
 game :: proc(_: rawptr) {
 	voices()
 	reverb_presets()
+	reverb_fmod()
 	effects()
 	for n in 0 ..< BLOCKS {
 		b: [16]u8

@@ -157,6 +157,15 @@ fmod_log :: proc(op: u32, wait: u32, p: [^]u32) {
 		p[0], p[1], p[2], p[3], p[4], p[5], p[6])
 }
 
+// Reverb_SetProperties on w: the environment as the mode, the room level
+// (mB, -10000 .. 0) as EVOL, when the core flags name a core. A new mode
+// starts on a cleared work area.
+fmod_reverb :: proc(w: ^Reverb, env, room, flags: u32) {
+	if flags & 0x300 == 0 {return}
+	evol := clamp((i32(room) + 10000) * 0x3fff / 10000, 0, 0x3fff)
+	reverb_set(w, env, evol, evol, (env <= 9 ? env : 0) != w.mode)
+}
+
 @(private)
 fmod_command :: proc(cid, opt, a: u32) {
 	FMOD_INIT :: 0xfffffffe
@@ -215,11 +224,7 @@ fmod_command :: proc(cid, opt, a: u32) {
 			if s != nil && s.freq > 0 {result = u32((voices[st.channel].pos >> 32) * 1000 / u64(s.freq))}
 		}
 	case 0x3c: // Reverb_SetProperties {environment, room (mB), delay, feedback, core flags}
-		if p[4] & 0x300 != 0 {
-			// A new mode starts on a cleared work area.
-			evol := clamp((i32(p[1]) + 10000) * 0x3fff / 10000, 0, 0x3fff)
-			reverb_set(&reverb, p[0], evol, evol, (p[0] <= 9 ? p[0] : 0) != reverb.mode)
-		}
+		fmod_reverb(&reverb, p[0], p[1], p[4])
 		result = 1
 	case 0x3d: result = song_load(cid, opt, p)
 	case 0x3e: song_free(p[0]); result = 1

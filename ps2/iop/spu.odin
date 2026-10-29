@@ -265,10 +265,13 @@ spu_voice_send :: proc(core, voice: int, on: bool) {
 // Set a core's effect as libsd's sceSdSetEffectAttr: mode 0 (off) .. 9 the
 // reverb.odin presets, with 0x100 to clear the work area; depth_l and
 // depth_r are the return volume (EVOLL, EVOLR). Delay and feedback, which
-// only echo and delay take, are not applied.
-spu_effect :: proc(core: int, mode: u32, depth_l, depth_r: i16) {
-	assert(core >= 0 && core < 2 && mode & 0xff <= 9, "spu: no such core or effect mode")
-	reverb_set(&spu.reverb[core], mode & 0xff, i32(depth_l), i32(depth_r), mode & 0x100 != 0)
+// only echo and delay take, are not applied. As libsd, any other mode bits
+// are an error: nothing changes and it returns false, as for a bad core.
+spu_effect :: proc(core: int, mode: u32, depth_l, depth_r: i16) -> bool {
+	m := mode &~ 0x100
+	if core < 0 || core > 1 || m > 9 {return false}
+	reverb_set(&spu.reverb[core], m, i32(depth_l), i32(depth_r), mode & 0x100 != 0)
+	return true
 }
 
 // Turn a core's effects on or off, as SD_C_EFFECT_ENABLE (ATTR bit 7).
