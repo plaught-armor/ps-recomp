@@ -93,7 +93,7 @@ vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 			dst := (imm * 8) % u32(len(v.vu.micro))
 			src := ([^]u8)(&arg[0])[:len(arg) * 4]
 			for b, j in src {v.vu.micro[(dst + u32(j)) % u32(len(v.vu.micro))] = b}
-			if v.vu == &vu1 {vu1_micro_touch()}
+			if v.vu == &vu1 {vu1_micro_touch()} else {vu0_micro_touch()}
 		case 0x50, 0x51: // DIRECT, DIRECTHL
 			gif.gif_feed(1, ([^]u8)(&arg[0])[:len(arg) * 4])
 		case 0x60 ..= 0x7f:

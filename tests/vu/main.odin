@@ -11,6 +11,11 @@
 // Then single macro ops on edge values: the clamped add and multiply
 // family, flags into vf0, and MAX and MINI.
 //
+// Last, micro memory writes after a program is compiled: each write path
+// (the EE mapping, VIF MPG) moves its VU's micro generation, and on VU1 a
+// write that changes the compiled code makes the next start miss it and
+// interpret.
+//
 //   odin run tests/vu -collection:ps=.
 package main
 
@@ -42,6 +47,53 @@ run :: proc(name: string, call: proc()) {
 	if v.vf[3].f != {11, 22, 33, 44} {fail("%s: vf3 = %v", name, v.vf[3].f)}
 	if v.vi[1] != 5 {fail("%s: vi1 = %d", name, v.vi[1])}
 	if v.tpc != 0x50 {fail("%s: tpc = %04x, want 0050", name, v.tpc)}
+}
+
+// An E-bit NOP pair and its delay slot.
+@(private = "file")
+END_CODE := [4]u32{0x8000033c, 1 << 30 | 0x000002ff, 0x8000033c, 0x000002ff}
+
+@(private = "file")
+compiled_ran: bool
+
+// MPG the pairs of code to micro address 0 of vif's VU.
+@(private = "file")
+mpg :: proc(vif: ^vu.Vif, code: []u32) {
+	w := make([]u32, 2 + len(code), context.temp_allocator)
+	w[1] = 0x4a << 24 | u32(len(code) / 2) << 16 // after a NOP, so code is 64-bit aligned
+	copy(w[2:], code)
+	vu.vif_feed(vif, ([^]u8)(raw_data(w))[:len(w) * 4])
+}
+
+@(private = "file")
+micro_writes :: proc() {
+	g := vu.vu0_micro_gen
+	_ = vu.vu_mem_addr(0x11000000)
+	if vu.vu0_micro_gen == g {fail("VU0 micro write through the EE mapping kept generation %d", g)}
+	g = vu.vu0_micro_gen
+	mpg(&vu.vifs[0], END_CODE[:])
+	if vu.vu0_micro_gen == g {fail("VU0 MPG kept generation %d", g)}
+
+	vu.vu1_register(END_CODE[:], proc(_: u32, _: ^int) -> (u32, vu.Vu1_Exit) {
+		compiled_ran = true
+		return 0x10, .End
+	})
+	start := proc(want: bool, what: string) {
+		compiled_ran = false
+		vu.vu1.tpc = 0
+		vu.vu1_start(0)
+		if compiled_ran != want || vu.vu1.tpc != 0x10 {fail("%s: compiled ran %v, tpc %04x", what, compiled_ran, vu.vu1.tpc)}
+	}
+	mpg(&vu.vifs[1], END_CODE[:])
+	start(true, "VU1 MPG of the compiled code")
+	(^u32)(vu.vu_mem_addr(0x11008008))^ = 0x8000033d
+	start(false, "VU1 write through the EE mapping")
+	mpg(&vu.vifs[1], END_CODE[:])
+	start(true, "VU1 MPG of the compiled code again")
+	changed := END_CODE
+	changed[2] = 0x8000033d
+	mpg(&vu.vifs[1], changed[:])
+	start(false, "VU1 MPG of other code")
 }
 
 // The add and multiply family on infinities, NaNs and denormals, which
@@ -194,5 +246,6 @@ main :: proc() {
 	clamped()
 	flags()
 	minmax()
+	micro_writes()
 	fmt.println("vu: ok")
 }

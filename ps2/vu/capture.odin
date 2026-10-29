@@ -43,7 +43,7 @@ vu1_capture_options :: proc() {
 	}
 	vu1_capture_file = f
 	vu1_capture_gen = 0
-	vu1_nocomp = true
+	vu1_table.nocomp = true
 }
 
 // Note that control enters micro memory at addr.

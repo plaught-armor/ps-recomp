@@ -67,7 +67,10 @@ vu_mem_addr :: proc(a: u32) -> rawptr {
 	if a < 0x11000000 || a >= 0x11010000 {return nil}
 	o := a & 0x3fff
 	switch (a >> 14) & 3 {
-	case 0: if o < 4 << 10 {return &vu0_micro[o]}
+	case 0:
+		if o >= len(vu0_micro) {return nil}
+		vu0_micro_touch()
+		return &vu0_micro[o]
 	case 1: if o < VU0_MEM {return &vu0_mem[o]}
 	case 2:
 		vu1_micro_touch()
@@ -446,48 +449,60 @@ Vu1_Range :: struct {
 }
 
 @(private)
-Vu1_Program :: struct {
+Vu_Program :: struct {
 	ranges:   []Vu1_Range,
 	run:      Vu1_Run,
 	size:     int, // pairs, over all ranges
-	ok_gen:   u32, // vu1_micro_gen when ok was checked
+	ok_gen:   u32, // the micro generation when ok was checked
 	ok:       bool, // micro memory holds ranges
 	// VU1_STATS: runs entered, range checks, and checks that failed.
 	runs, checks, misses: u64,
 }
 
+// One VU's compiled programs, N pairs of micro memory. Nothing here is
+// snapshotted: what it caches is keyed by a micro generation, and a
+// generation is never reused.
 @(private)
-vu1_programs: [dynamic]^Vu1_Program
-// Per pair: the programs compiling it, longest first. A pair where none
-// does stays in the interpreter without looking.
+Micro_Table :: struct($N: int) {
+	programs:   [dynamic]^Vu_Program,
+	// Per pair: the programs compiling it, longest first. A pair where none
+	// does stays in the interpreter without looking.
+	candidates: [N][dynamic]^Vu_Program,
+	compiled:   [N]bool, // the pair has candidates
+	// Per pair, for generation pick_gen[i]: the program to run there, or
+	// nil to interpret.
+	pick_gen:   [N]u32,
+	pick:       [N]^Vu_Program,
+	// compiled less the pairs found to have no matching program, for
+	// stop_gen; the interpreter runs on through those.
+	stop:       [N]bool,
+	stop_gen:   u32,
+	nocomp:     bool, // interpret everything (VUNOCOMP, capturing)
+}
+
 @(private)
-vu1_candidates: [len(vu1_micro) / 8][dynamic]^Vu1_Program
-@(private)
-vu1_compiled: [len(vu1_micro) / 8]bool // the pair has candidates
-// Bumped on every write path into VU1 micro memory (vu1_micro_touch); the
-// per-pair choice of program is rechecked when it moves.
+vu1_table: Micro_Table(len(vu1_micro) / 8)
+
+// Bumped on every write path into each VU's micro memory (vu0_micro_touch,
+// vu1_micro_touch); the per-pair choice of program is rechecked when it
+// moves.
+vu0_micro_gen: u32 = 1
 vu1_micro_gen: u32 = 1
-// The last vu1_micro_gen handed out. Not snapshotted: a generation is
-// never reused, even after a rollback restores an older one, so every
-// cache keyed by one stays true to the micro memory it was taken from.
+// The last generation handed out, to either VU. Not snapshotted: a
+// generation is never reused, even after a rollback restores an older one,
+// so every cache keyed by one stays true to the micro memory it was taken
+// from.
 @(private)
-vu1_gen_last: u32 = 1
-// Per pair, for generation vu1_pick_gen[i]: the program to run there, or
-// nil to interpret.
-@(private)
-vu1_pick_gen: [len(vu1_micro) / 8]u32
-@(private)
-vu1_pick: [len(vu1_micro) / 8]^Vu1_Program
-// vu1_compiled less the pairs found to have no matching program, for
-// vu1_stop_gen; the interpreter runs on through those.
-@(private)
-vu1_stop: [len(vu1_micro) / 8]bool
-@(private)
-vu1_stop_gen: u32
+vu_gen_last: u32 = 1
+
+vu0_micro_touch :: #force_inline proc() {
+	vu_gen_last += 1
+	vu0_micro_gen = vu_gen_last
+}
 
 vu1_micro_touch :: #force_inline proc() {
-	vu1_gen_last += 1
-	vu1_micro_gen = vu1_gen_last
+	vu_gen_last += 1
+	vu1_micro_gen = vu_gen_last
 }
 
 // A program compiled from micro memory starting at 0 (a .vutext program).
@@ -497,21 +512,26 @@ vu1_register :: proc(code: []u32, run: Vu1_Run) {
 
 // A program compiled from the given runs of micro memory.
 vu1_register_ranges :: proc(ranges: []Vu1_Range, run: Vu1_Run) {
+	micro_register(&vu1_table, ranges, run)
+}
+
+@(private)
+micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu1_Range, run: Vu1_Run) {
 	context.allocator = runtime.heap_allocator()
-	p := new(Vu1_Program)
+	p := new(Vu_Program)
 	p.ranges = slice.clone(ranges)
 	p.run = run
 	for r in ranges {p.size += len(r.code) / 2}
-	append(&vu1_programs, p)
+	append(&t.programs, p)
 	for r in ranges {
 		for k in 0 ..< len(r.code) / 2 {
-			i := (r.pc / 8 + u32(k)) % len(vu1_candidates)
-			c := &vu1_candidates[i]
-			if c.allocator.procedure == nil {c^ = make([dynamic]^Vu1_Program)}
+			i := (r.pc / 8 + u32(k)) % u32(N)
+			c := &t.candidates[i]
+			if c.allocator.procedure == nil {c^ = make([dynamic]^Vu_Program)}
 			at := len(c)
 			for at > 0 && c[at - 1].size < p.size {at -= 1}
 			inject_at(c, at, p)
-			vu1_compiled[i] = true
+			t.compiled[i] = true
 		}
 	}
 }
@@ -519,15 +539,21 @@ vu1_register_ranges :: proc(ranges: []Vu1_Range, run: Vu1_Run) {
 // The program to run at pc, nil to interpret. pc is a pair address below
 // len(vu1_micro): every caller masks it, so pc / 8 indexes unchecked.
 @(private)
-vu1_lookup :: proc(pc: u32) -> ^Vu1_Program #no_bounds_check {
+vu1_lookup :: proc(pc: u32) -> ^Vu_Program {
+	return micro_lookup(&vu1_table, vu1_micro[:], vu1_micro_gen, pc)
+}
+
+// The program of t to run at pc in micro memory of generation gen.
+@(private)
+micro_lookup :: #force_inline proc(t: ^Micro_Table($N), micro: []u8, gen, pc: u32) -> ^Vu_Program #no_bounds_check {
 	i := pc / 8
-	if vu1_pick_gen[i] == vu1_micro_gen {return vu1_pick[i]}
-	pick: ^Vu1_Program
-	if !vu1_nocomp {
-		for p in vu1_candidates[i] {
-			if p.ok_gen != vu1_micro_gen {
-				p.ok_gen = vu1_micro_gen
-				p.ok = vu1_holds(p)
+	if t.pick_gen[i] == gen {return t.pick[i]}
+	pick: ^Vu_Program
+	if !t.nocomp {
+		for p in t.candidates[i] {
+			if p.ok_gen != gen {
+				p.ok_gen = gen
+				p.ok = micro_holds(p, micro)
 				p.checks += 1
 				if !p.ok {p.misses += 1}
 			}
@@ -537,14 +563,14 @@ vu1_lookup :: proc(pc: u32) -> ^Vu1_Program #no_bounds_check {
 			}
 		}
 	}
-	vu1_pick_gen[i], vu1_pick[i] = vu1_micro_gen, pick
-	if pick == nil {vu1_stop[i] = false}
+	t.pick_gen[i], t.pick[i] = gen, pick
+	if pick == nil {t.stop[i] = false}
 	return pick
 }
 
 @(private)
-vu1_holds :: proc(p: ^Vu1_Program) -> bool {
-	micro := ([^]u32)(&vu1_micro[0])[:len(vu1_micro) / 4]
+micro_holds :: proc(p: ^Vu_Program, micro: []u8) -> bool {
+	micro := ([^]u32)(raw_data(micro))[:len(micro) / 4]
 	for r in p.ranges {
 		at := int(r.pc / 4)
 		if at + len(r.code) > len(micro) {
@@ -556,13 +582,13 @@ vu1_holds :: proc(p: ^Vu1_Program) -> bool {
 }
 
 @(private)
-vu1_nocomp, vu1_check, vu1_stats: bool
+vu1_check, vu1_stats: bool
 
 // VUNOCOMP=1 runs everything in the interpreter; VUCHECK=1 runs
 // every microprogram both ways and reports differences; VU1_STATS=1
 // prints each compiled program's counters at exit.
 vu1_options :: proc() {
-	vu1_nocomp = core.env("VUNOCOMP") != ""
+	vu1_table.nocomp = core.env("VUNOCOMP") != ""
 	vu1_check = core.env("VUCHECK") != ""
 	vu1_stats = core.env("VU1_STATS") != ""
 	vu1_capture_options()
@@ -570,7 +596,7 @@ vu1_options :: proc() {
 
 vu1_stats_print :: proc() {
 	if !vu1_stats {return}
-	for p, k in vu1_programs {
+	for p, k in vu1_table.programs {
 		if p.runs == 0 && p.checks == 0 {continue}
 		fmt.eprintfln("vu1 program %d at %04x, %d pairs: %d runs, %d checks, %d misses",
 			k, p.ranges[0].pc, p.size, p.runs, p.checks, p.misses)
@@ -597,17 +623,18 @@ vu1_exec :: proc(addr: u32, compiled: bool) #no_bounds_check {
 	v := &vu1
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc := addr & mask
-	if vu1_stop_gen != vu1_micro_gen {
-		vu1_stop_gen = vu1_micro_gen
-		vu1_stop = vu1_compiled
+	t := &vu1_table
+	if t.stop_gen != vu1_micro_gen {
+		t.stop_gen = vu1_micro_gen
+		t.stop = t.compiled
 	}
-	stop := compiled ? vu1_stop[:] : nil
+	stop := compiled ? t.stop[:] : nil
 	budget := VU_STEP_LIMIT
 	for budget > 0 {
 		// A program that hands back a pair it compiles leaves that pair to
 		// the interpreter.
-		last: ^Vu1_Program
-		for compiled && vu1_stop[pc / 8] {
+		last: ^Vu_Program
+		for compiled && t.stop[pc / 8] {
 			prog := vu1_lookup(pc)
 			if prog == nil || prog == last {break}
 			last = prog
@@ -710,7 +737,7 @@ vu1_compare :: proc(addr: u32) {
 	for k in 0 ..< 32 {vf_bad ||= v1.vf[k].q != v2.vf[k].q}
 	prog := -1
 	entry := vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7)
-	for p, k in vu1_programs {if p == entry {prog = k}}
+	for p, k in vu1_table.programs {if p == entry {prog = k}}
 	bad := kick1 != kick2 || vu1_mem != mem1 || vf_bad || v1.vi != v2.vi ||
 		v1.acc.q != v2.acc.q || v1.q != v2.q || v1.p != v2.p || v1.i != v2.i ||
 		v1.r != v2.r || v1.clip != v2.clip || v1.mac != v2.mac || v1.tpc != v2.tpc
@@ -980,6 +1007,7 @@ vu_snap :: proc() {
 	core.snap_add(&vu1_micro)
 	core.snap_add(&vu0_overrun)
 	core.snap_add(&vu1_overrun)
+	core.snap_add(&vu0_micro_gen)
 	core.snap_add(&vu1_micro_gen)
 	core.snap_add(&vu0_pairs)
 	core.snap_add(&vu1_pairs)
