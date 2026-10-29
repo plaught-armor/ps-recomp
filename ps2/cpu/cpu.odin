@@ -89,11 +89,13 @@ register :: proc(addr: u32, fn: Func_Proc) {
 	fn_table[(addr - text_lo) >> 2] = fn
 }
 
-lookup :: proc(addr: u32) -> Func_Proc {
-	if addr < text_lo || addr >= text_hi || addr & 3 != 0 {
+// Unchecked: the slot is tested against len(fn_table) first.
+lookup :: proc(addr: u32) -> Func_Proc #no_bounds_check {
+	i := (addr - text_lo) >> 2
+	if addr < text_lo || addr & 3 != 0 || i >= u32(len(fn_table)) {
 		return nil
 	}
-	return fn_table[(addr - text_lo) >> 2]
+	return fn_table[i]
 }
 
 call :: proc(addr: u32) {
