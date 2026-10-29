@@ -76,8 +76,9 @@ vu_mem_addr :: proc(a: u32) -> rawptr {
 	return nil
 }
 
-vu0_set_vf :: proc(n: u8, v: u128) {
-	if n != 0 {vu0.vf[n].q = v}
+// n is a 5-bit register field; the mask keeps it in range unchecked.
+vu0_set_vf :: proc(n: u8, v: u128) #no_bounds_check {
+	if n != 0 {vu0.vf[n & 31].q = v}
 }
 
 vu0_ctrl_read :: proc(n: u8) -> u32 {
@@ -491,9 +492,10 @@ vu1_register_ranges :: proc(ranges: []Vu1_Range, run: Vu1_Run) {
 	}
 }
 
-// The program to run at pc, nil to interpret.
+// The program to run at pc, nil to interpret. pc is a pair address below
+// len(vu1_micro): every caller masks it, so pc / 8 indexes unchecked.
 @(private)
-vu1_lookup :: proc(pc: u32) -> ^Vu1_Program {
+vu1_lookup :: proc(pc: u32) -> ^Vu1_Program #no_bounds_check {
 	i := pc / 8
 	if vu1_pick_gen[i] == vu1_micro_gen {return vu1_pick[i]}
 	pick: ^Vu1_Program
@@ -564,8 +566,10 @@ vu1_start :: proc(addr: u32) {
 	vu1_exec(addr, true)
 }
 
+// No bounds checks: pc stays masked to a pair address in micro memory,
+// including what compiled code hands back.
 @(private)
-vu1_exec :: proc(addr: u32, compiled: bool) {
+vu1_exec :: proc(addr: u32, compiled: bool) #no_bounds_check {
 	v := &vu1
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc := addr & mask
@@ -586,6 +590,7 @@ vu1_exec :: proc(addr: u32, compiled: bool) {
 			prog.runs += 1
 			exit: Vu1_Exit
 			pc, exit = prog.run(pc, &budget)
+			pc &= mask
 			if exit == .End {
 				v.tpc = pc
 				return
@@ -617,8 +622,10 @@ vu1_interp :: proc(pc: u32, stop: []bool, budget: ^int) -> (u32, bool) {
 
 // Inlined into each VU's wrapper, so the VU and its pair cache are
 // constants there and VU1's loop is the same code as before VU0 shared it.
+// No bounds checks: callers pass a masked pc, every later pc is masked, and
+// pairs holds one entry per pair of v.micro; stop is checked against len.
 @(private)
-vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []bool, budget: ^int) -> (u32, bool) {
+vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []bool, budget: ^int) -> (u32, bool) #no_bounds_check {
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc := pc
 	jumping, ending := false, false
