@@ -135,6 +135,7 @@ gte_save :: proc() -> Gte_State {return transmute(Gte_State)state}
 gte_load :: proc(s: Gte_State) {state = transmute(Gte)s}
 
 gte_read :: proc(r: u32) -> u32 #no_bounds_check {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Read][r & 63] += 1}
 	g := &state
 	switch r {
 	case 0, 2, 4:
@@ -205,6 +206,7 @@ leading_count :: proc(v: u32) -> u32 {
 }
 
 gte_write :: proc(r, v: u32) #no_bounds_check {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Write][r & 63] += 1}
 	g := &state
 	v := v
 	if r >= 32 && r <= 39 && gte_matrix_filter != nil {
@@ -799,6 +801,7 @@ avsz :: proc(scale: i32, sum: i64) {
 unknown_reported: [64]bool
 
 gte_cmd :: proc(cmd: u32) #no_bounds_check {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Cmd][cmd & 0x3f] += 1}
 	g := &state
 	c := Cmd {
 		shift = ((cmd >> 19) & 1) * 12,

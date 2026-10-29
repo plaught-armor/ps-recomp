@@ -10,6 +10,8 @@
 //   0x80003000  the jumping function: to 0x80003010 (unlabelled, inside it)
 //               interprets, to 0x80000100 (below it) calls and so interprets,
 //               to 0 (frame_ret outside any call) returns
+//
+// The GTE helpers count by command or register in the helper table.
 package main
 
 import "core:fmt"
@@ -35,6 +37,11 @@ main :: proc() {
 	if 5 in cpu.dispatch.reported {
 		fail("gte command 0x05 marked RAM address 5 as reported")
 	}
+
+	gte.gte_cmd(0x06)
+	gte.gte_cmd(0x06)
+	gte.gte_read(0x3f)
+	gte.gte_write(0x20, 0)
 
 	cpu.interp_run = proc(start: u32) {append(&interpreted, start)}
 	cpu.register_funcs(nil)
@@ -99,8 +106,16 @@ main :: proc() {
 		if dispatch != want_dispatch {
 			fail(fmt.tprintf("dispatch table:\n%swant:\n%s", dispatch, want_dispatch))
 		}
+		want_helper :: "helper\targ\tcount\n" +
+			"gte_cmd\t06\t2\n" +
+			"gte_cmd\t05\t1\n" +
+			"gte_read\t3f\t1\n" +
+			"gte_write\t20\t1\n"
+		if helper := cpu.helper_tsv(); helper != want_helper {
+			fail(fmt.tprintf("helper table:\n%swant:\n%s", helper, want_helper))
+		}
 		cpu.fallback_dump()
-		fmt.println("ok psx_fallback: gte report set apart; 3 interp entries, 3 jumps, 1 overlay resolve counted; fallback and dispatch tables split")
+		fmt.println("ok psx_fallback: gte report set apart; 3 interp entries, 3 jumps, 1 overlay resolve counted; fallback and dispatch tables split; gte helpers counted")
 	} else {
 		fmt.println("ok psx_fallback: gte report set apart; 3 interp entries, 1 overlay call")
 	}

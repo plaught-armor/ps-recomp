@@ -1,7 +1,8 @@
 // FALLBACK_COUNT: how often control leaves recompiled code, by target,
 // reported when the port exits: interpreter work (the fallback) apart from
-// dispatch that stays in recompiled code. Built with -define:FALLBACK_COUNT=true;
-// without it the counters compile away.
+// dispatch that stays in recompiled code, and the helper calls that do one
+// instruction's work. Built with -define:FALLBACK_COUNT=true; without it the
+// counters compile away.
 package psx_cpu
 
 import "core:fmt"
@@ -40,6 +41,20 @@ fallback_jump: map[Jump_Key]u64
 // function.
 dispatch_overlay: map[u32]u64
 
+// Odin procedures that do one instruction's work for recompiled code.
+Helper :: enum u8 {
+	Gte_Cmd, // by command (function field)
+	Gte_Read, // by register, control registers as 32-63
+	Gte_Write,
+}
+
+@(private = "file", rodata)
+HELPER_NAMES := [Helper]string{.Gte_Cmd = "gte_cmd", .Gte_Read = "gte_read", .Gte_Write = "gte_write"}
+
+// Calls by helper and argument, counted at the helper's entry. The
+// interpreter calls the same helpers, so its work counts here too.
+helper_calls: [Helper][64]u64
+
 @(private = "file")
 Row :: struct {
 	kind:     string,
@@ -47,10 +62,10 @@ Row :: struct {
 	n:        u64,
 }
 
-// Totals on stderr, two lines: "fallback:" counts interpreter work only,
+// Totals on stderr, three lines: "fallback:" counts interpreter work only,
 // "dispatch:" the ways out of a function that reach recompiled code (or a
-// BIOS vector) without the interpreter. With a DUMP directory, every
-// counter as rows too (fallback_tsv).
+// BIOS vector) without the interpreter, "helper:" the helper calls. With a
+// DUMP directory, every counter as rows too (fallback_tsv, helper_tsv).
 fallback_dump :: proc() {
 	jumps: [Jump_Outcome]u64
 	interp, overlay: u64
@@ -69,12 +84,23 @@ fallback_dump :: proc() {
 		jumps[.Call],
 		overlay,
 	)
+	helpers: [Helper]u64
+	for counts, h in helper_calls {
+		for n in counts {helpers[h] += n}
+	}
+	fmt.eprintfln(
+		"helper: %d gte commands, %d gte reads, %d gte writes",
+		helpers[.Gte_Cmd],
+		helpers[.Gte_Read],
+		helpers[.Gte_Write],
+	)
 	dir := core.dump_dir()
 	if dir == "" {
 		return
 	}
 	fallback, dispatch := fallback_tsv()
-	for f in ([?][2]string{{"fallback.tsv", fallback}, {"dispatch.tsv", dispatch}}) {
+	tables := [?][2]string{{"fallback.tsv", fallback}, {"dispatch.tsv", dispatch}, {"helper.tsv", helper_tsv()}}
+	for f in tables {
 		name := fmt.tprintf("%s/%s", dir, f[0])
 		if err := os.write_entire_file(name, transmute([]u8)f[1]); err != nil {
 			fmt.eprintln("fallback: write failed:", name, err)
@@ -115,6 +141,33 @@ tsv :: proc(rows: []Row, first: string) -> string {
 	for r in rows {
 		from := r.from == 0 ? "-" : fmt.tprintf("%08x", r.from)
 		fmt.sbprintfln(&b, "%s\t%08x\t%s\t%d", r.kind, r.pc, from, r.n)
+	}
+	return strings.to_string(b)
+}
+
+// The helper calls as a table (temp allocator), columns helper, arg (the
+// command or register), count; rows by count down, then helper, arg.
+helper_tsv :: proc() -> string {
+	Helper_Row :: struct {
+		h:   Helper,
+		arg: u32,
+		n:   u64,
+	}
+	rows := make([dynamic]Helper_Row, context.temp_allocator)
+	for counts, h in helper_calls {
+		for n, arg in counts {
+			if n != 0 {append(&rows, Helper_Row{h, u32(arg), n})}
+		}
+	}
+	slice.sort_by(rows[:], proc(a, b: Helper_Row) -> bool {
+		if a.n != b.n {return a.n > b.n}
+		if a.h != b.h {return HELPER_NAMES[a.h] < HELPER_NAMES[b.h]}
+		return a.arg < b.arg
+	})
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprintln(&b, "helper\targ\tcount")
+	for r in rows {
+		fmt.sbprintfln(&b, "%s\t%02x\t%d", HELPER_NAMES[r.h], r.arg, r.n)
 	}
 	return strings.to_string(b)
 }
