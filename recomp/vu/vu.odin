@@ -58,6 +58,7 @@ Pair :: struct {
 Mode :: enum u8 {
 	Serial, // upper then lower: neither sees the other's writes
 	Lower_First, // the lower reads flags the upper writes, and writes only VI
+	Hazard, // the lower reads or writes the VF register the upper writes
 	Slow, // vu.vu1_pair
 }
 
@@ -143,8 +144,8 @@ classify :: proc(lw, uw: u32) -> Pair {
 	touches := ud != 0 && (ft == ud || fs == ud)
 	p.mode = .Slow
 	switch lw >> 25 {
-	case 0x00: if ud == 0 || ft != ud {p.mode = .Serial}
-	case 0x01: if ud == 0 || fs != ud {p.mode = .Serial}
+	case 0x00: p.mode = ud == 0 || ft != ud ? .Serial : .Hazard
+	case 0x01: p.mode = ud == 0 || fs != ud ? .Serial : .Hazard
 	case 0x04, 0x05, 0x08, 0x09, 0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c ..= 0x2f:
 		p.mode = .Serial
 	case 0x11: // FCSET: unless CLIP also writes the clip flags
@@ -158,9 +159,9 @@ classify :: proc(lw, uw: u32) -> Pair {
 			break
 		}
 		switch ((lw >> 4) & 0x7c) | (lw & 3) {
-		case 0x38 ..= 0x3a: if !touches {p.mode = .Serial} // only status (dead) is shared
 		case 0x3b, 0x3e, 0x3f, 0x68, 0x69, 0x6c, 0x7b: p.mode = .Serial
-		case: if !touches {p.mode = .Serial}
+		// DIV, SQRT and RSQRT also share status, which micro mode leaves dead
+		case: p.mode = touches ? .Hazard : .Serial
 		}
 	}
 	if p.mode == .Slow {p.mac_rd = true} // vu_pair merges against the old flags
@@ -587,6 +588,24 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, slow: ^map[string]int)
 	case .Lower_First:
 		lower(sb, p, pc, slow)
 		upper(sb, p, slow)
+	case .Hazard:
+		// As vu_pair: the lower reads the upper's dest from before the
+		// upper, and its own write to it, if any, wins unless it leaves the
+		// register as it was. A block, as an E-bit pair and its successor
+		// share a case.
+		ud := upper_dest(p.uw)
+		fmt.sbprintln(sb, "\t\t\t{")
+		fmt.sbprintfln(sb, "\t\t\tsaved := vf[%d]", ud)
+		upper(sb, p, slow)
+		fmt.sbprintfln(sb, "\t\t\tresult := vf[%d]", ud)
+		fmt.sbprintfln(sb, "\t\t\tvf[%d] = saved", ud)
+		lower(sb, p, pc, slow)
+		if (p.lw >> 16) & 31 == ud { // every lower VF write goes to ft
+			fmt.sbprintfln(sb, "\t\t\tif vf[%d].q == saved.q {{vf[%d] = result}}", ud, ud)
+		} else {
+			fmt.sbprintfln(sb, "\t\t\tvf[%d] = result", ud)
+		}
+		fmt.sbprintln(sb, "\t\t\t}")
 	case .Slow:
 		fmt.sbprintfln(sb, "\t\t\tvu.vu1_pair(0x%08x, 0x%08x, 0x%04x)", p.uw, p.lw, pc)
 		count(slow, "pair")

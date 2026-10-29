@@ -9,6 +9,9 @@
 //
 // The programs check MAC liveness: an op that leaves MAC alone (MAX, MINI)
 // between a MAC write and a flag read must not let the write be dropped.
+// Then hazard pairs, where the lower reads or writes the VF register the
+// upper writes: the lower must read it from before the upper, and its own
+// write must win unless it leaves the register as it was.
 //
 //   odin run tests/vu_micro -collection:ps=.
 package main
@@ -30,12 +33,31 @@ FMAND_1_2 :: 0x1a << 25 | 1 << 16 | 2 << 11 // FMAND vi1, vi2
 // Upper ops, dest xyzw: fd, fs, ft in their fields.
 upper :: proc(fn, fd, fs, ft: u32) -> u32 {return 15 << 21 | ft << 16 | fs << 11 | fd << 6 | fn}
 
+// Lower ops: opcode 0x40 specials by their sp number, and the others by
+// opcode, with dest (or DIV's field selects), ft, fs and imm11 in place.
+lower_sp :: proc(sp, dest, ft, fs: u32) -> u32 {
+	return 0x40 << 25 | dest << 21 | ft << 16 | fs << 11 | (sp >> 2) << 6 | 0x3c | sp & 3
+}
+lower_op :: proc(op, dest, ft, fs, imm: u32) -> u32 {return op << 25 | dest << 21 | ft << 16 | fs << 11 | imm}
+
 main :: proc() {
 	ADD :: 0x28
 	MAX :: 0x2b
 	MINI :: 0x2f
 	MAXbc :: 0x10
 	MINIi :: 0x1f
+	MULq :: 0x1c
+	MULi :: 0x1e
+	MSUBq :: 0x25
+	LQ :: 0x00
+	SQ :: 0x01
+	MOVE :: 0x30
+	MR32 :: 0x31
+	LQI :: 0x34
+	SQI :: 0x35
+	DIV :: 0x38
+	SQRT :: 0x39
+	MTIR :: 0x3c
 	PROGRAMS := [?][]u32 {
 		// ADD sets MAC; MAX, MINI (each form) leave it for FMAND.
 		{NOP_L, upper(ADD, 3, 1, 2), NOP_L, upper(MAX, 4, 1, 2), FMAND_1_2, NOP_U | E_BIT, NOP_L, NOP_U},
@@ -43,6 +65,18 @@ main :: proc() {
 		{NOP_L, upper(ADD, 3, 1, 2), NOP_L, upper(MAXbc | 2, 4, 1, 2), FMAND_1_2, NOP_U | E_BIT, NOP_L, NOP_U},
 		// MAX writing the register ADD wrote.
 		{NOP_L, upper(ADD, 3, 1, 2), NOP_L, upper(MAX, 3, 3, 1), FMAND_1_2, NOP_U | E_BIT, NOP_L, NOP_U},
+		// The lower reads the upper's dest: DIV (vf3.y / vf3.z), SQRT,
+		// MTIR, SQ and SQI, MOVE and MR32 into another register.
+		{lower_sp(DIV, 0b1001, 3, 3), upper(MULq, 3, 1, 0), lower_sp(MTIR, 2, 5, 3), upper(MULi, 3, 2, 0), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
+		{lower_sp(SQRT, 0b0100, 4, 0), upper(ADD, 4, 1, 2), lower_op(SQ, 0b1011, 6, 4, 0x13), upper(MSUBq, 4, 2, 0), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
+		{lower_sp(SQI, 0b1111, 7, 5), upper(MULq, 5, 5, 0), lower_sp(MOVE, 0b0110, 9, 5), upper(ADD, 5, 1, 5), lower_sp(MR32, 0b1111, 10, 5), upper(MULi, 5, 5, 0), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
+		// The lower writes the upper's dest: MOVE of the register onto
+		// itself (the upper wins), LQI (it wins), LQ of x and z (it wins,
+		// keeping y and w from before the upper). Each result is read by
+		// the next upper, and LQ's is left at the end.
+		{lower_sp(MOVE, 0b1111, 3, 3), upper(MULi, 3, 3, 0), lower_sp(LQI, 0b1111, 3, 6), upper(MSUBq, 3, 3, 0), lower_op(LQ, 0b1010, 3, 4, 0x7f5), upper(ADD, 3, 1, 2), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
+		// Hazard pairs in an E-bit pair and its successor, one case.
+		{NOP_L, upper(ADD, 3, 1, 2), lower_sp(DIV, 0b0110, 1, 3), upper(MULq, 3, 3, 0) | E_BIT, lower_sp(MTIR, 3, 4, 3), upper(ADD, 3, 3, 1)},
 	}
 
 	sb := strings.builder_make()
@@ -101,6 +135,8 @@ main :: proc() {
 	rand.reset(SEED)
 	vu.vu_init()
 	fails, flagged := 0, 0
+	mem := (^[vu.VU1_MEM / 4]u32)(raw_data(vu.vu1.mem))
+	mem_init, mem_want: [vu.VU1_MEM / 4]u32
 	for c, n in CASES {
 		for &b in vu.vu1.micro {b = 0}
 		copy(([^]u32)(&vu.vu1.micro[0])[:len(c.words)], c.words)
@@ -113,22 +149,31 @@ main :: proc() {
 			for k in 1 ..< 16 {init.vi[k] = u16(rand.uint32())}
 			init.vi[2] = 0xffff
 			init.i = transmute(f32)rnd()
+			init.q = transmute(f32)rnd()
 			init.mac = rand.uint32() & 0xffff
+			for &w in mem_init {w = rnd()}
 			vu.vu1 = init
+			copy(mem[:], mem_init[:])
 			vu.vu1_start(0)
 			want := vu.vu1
+			mem_want = mem^
 			vu.vu1 = init
+			copy(mem[:], mem_init[:])
 			budget := 1000
 			pc, exit := c.run(0, &budget)
 			got := vu.vu1
 			if want.mac != init.mac {flagged += 1}
 			same := exit == .End && pc == want.tpc && got.vi == want.vi && got.acc.u == want.acc.u && got.mac == want.mac
+			same &&= transmute(u32)got.q == transmute(u32)want.q && mem^ == mem_want
 			for k in 0 ..< 32 {same &&= got.vf[k].u == want.vf[k].u}
 			if !same {
 				fails += 1
 				if fails < 10 {
-					fmt.eprintfln("FAIL vu_micro program %d: got exit %v pc %04x mac %04x vi1 %04x vf4 %08x, want pc %04x mac %04x vi1 %04x vf4 %08x",
-						n, exit, pc, got.mac, got.vi[1], got.vf[4].u, want.tpc, want.mac, want.vi[1], want.vf[4].u)
+					k := 0 // the first VF register that differs, else vf31
+					for k < 31 && got.vf[k].u == want.vf[k].u {k += 1}
+					fmt.eprintfln("FAIL vu_micro program %d: got exit %v pc %04x mac %04x vi1 %04x vf%d %08x, want pc %04x mac %04x vi1 %04x vf%d %08x; same Q %v, same memory %v",
+						n, exit, pc, got.mac, got.vi[1], k, got.vf[k].u, want.tpc, want.mac, want.vi[1], k, want.vf[k].u,
+						transmute(u32)got.q == transmute(u32)want.q, mem^ == mem_want)
 				}
 				break
 			}
