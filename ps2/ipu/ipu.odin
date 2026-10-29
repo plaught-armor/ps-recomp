@@ -453,7 +453,8 @@ ipu_fill :: proc(bits: u32) -> bool {
 		if ipu.in_n == 0 {return false}
 		v: u128
 		#no_bounds_check v = ipu.in_fifo[ipu.in_r & 7] // masked slot
-		ipu.buf[ipu.fp] = v
+		if ipu.fp >= len(ipu.buf) {panic("ipu: bit buffer overrun")} // snapshots restore fp
+		#no_bounds_check ipu.buf[ipu.fp] = v
 		ipu.in_r = (ipu.in_r + 1) & 7
 		ipu.in_n -= 1
 		ipu.fp += 1
@@ -637,8 +638,10 @@ ipu_mba_increment :: proc() -> u32 {
 	return u32(t.val + 1) | u32(t.len) << 16
 }
 
+// No bounds checks: a 5-bit code of 31 means the longer code starts with
+// five 1 bits, so it indexes DC_LUM1/DC_CHROM1 from 0.
 @(private)
-ipu_dc_diff :: proc(chroma: bool) -> i32 {
+ipu_dc_diff :: proc(chroma: bool) -> i32 #no_bounds_check {
 	t: Ipu_Vlc
 	if !chroma {
 		code := ipu_peek(5)
@@ -655,9 +658,10 @@ ipu_dc_diff :: proc(chroma: bool) -> i32 {
 	return d
 }
 
-// DCT codes of 5 to 12 significant bits below the short tables.
+// DCT codes of 5 to 12 significant bits below the short tables. No bounds
+// checks: each range of code (16 to 511) picks 16 entries of its row.
 @(private)
-ipu_dct_long :: #force_inline proc(code: u32) -> Ipu_Dct {
+ipu_dct_long :: #force_inline proc(code: u32) -> Ipu_Dct #no_bounds_check {
 	switch {
 	case code >= 256: return DCT_LONG[0][(code >> 4) - 16]
 	case code >= 128: return DCT_LONG[1][(code >> 3) - 16]
@@ -687,7 +691,7 @@ ipu_intra_block :: proc() {
 	for i: i32 = 1;; i += 1 {
 		code := ipu_peek(16)
 		t: Ipu_Dct
-		switch {
+		#no_bounds_check switch { // code is 16 bits: each range spans its table exactly
 		case code >= 16384 && !tab_a: t = DCT_NEXT[(code >> 12) - 4]
 		case code >= 1024:            t = tab_a ? DCT_TAB0A[(code >> 8) - 4] : DCT_TAB0[(code >> 8) - 4]
 		case code >= 512:             t = tab_a ? DCT_TAB1A[(code >> 6) - 8] : DCT_TAB1[(code >> 6) - 8]
@@ -729,7 +733,7 @@ ipu_non_intra_block :: proc() {
 	for i: i32 = 0;; i += 1 {
 		code := ipu_peek(16)
 		t: Ipu_Dct
-		switch {
+		#no_bounds_check switch { // code is 16 bits: each range spans its table exactly
 		case code >= 16384: t = i == 0 ? DCT_FIRST[(code >> 12) - 4] : DCT_NEXT[(code >> 12) - 4]
 		case code >= 1024:  t = DCT_TAB0[(code >> 8) - 4]
 		case code >= 512:   t = DCT_TAB1[(code >> 6) - 8]
