@@ -4,7 +4,8 @@
 // against gte.gte_write and gte.gte_read from the same GTE state. And the
 // inline NCLIP against gte.gte_cmd. The Odin backend's output for the same
 // forms and for GTE commands: which call each names, an inline proc or the
-// helper, and the inline ones against the helpers.
+// helper, and the inline ones against the helpers. And RTPS, RTPT and
+// MVMVA against a plain reference (ref.odin).
 package main
 
 import "core:fmt"
@@ -22,7 +23,6 @@ import "ps:recomp/r3000"
 @(private = "file")
 failed: int
 
-@(private = "file")
 fail :: proc(format: string, args: ..any) {
 	fmt.eprint("FAIL psx_gte: ")
 	fmt.eprintfln(format, ..args)
@@ -351,6 +351,7 @@ main :: proc() {
 			checks += 1
 		}
 	}
+	checks += ref_check()
 	if failed != 0 {
 		os.exit(1)
 	}
