@@ -107,7 +107,8 @@ frsqrt :: proc(a, b: f32) -> f32 {
 // FMAX the largest value), exponent 0 is zero whatever the mantissa holds,
 // results of 2^129 or more saturate to +-FMAX and ones below 2^-126 flush
 // to +-0, and x/0 gives +-FMAX. A host float holds neither exponent, so an
-// operation that meets one goes through f64 in fpu_slow. The model follows
+// operation that meets one goes through f64 in fpu_slow (fpu_mul only for
+// an operand of exponent 255). The model follows
 // PS2Recomp's ps2_runtime_macros.h (GPLv3), checked there and in
 // tests/fpu against real-PS2 results from ps2autotests. Left to the host:
 // the hardware rounds differently in the last bit now and then.
@@ -178,9 +179,22 @@ fpu_sub :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	return fspecial(a) | fspecial(b) | fspecial(r) ? fpu_slow(.Sub, a, b) : r
 }
 
+// The special cases inline but one, as fpu_slow gives them: an operand of
+// exponent 0, or a host result below 2^-126, gives +-0, and a host
+// infinity from two host floats is their product one exponent lower with
+// the exponent put back, or +-FMAX from 2^129. Only an operand of exponent
+// 255 times a nonzero goes to fpu_slow.
 fpu_mul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a * b
-	return fspecial(a) | fspecial(b) | fspecial(r) ? fpu_slow(.Mul, a, b) : r
+	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
+	ua, ub := transmute(u32)a, transmute(u32)b
+	sign := (ua ~ ub) & 0x80000000
+	ea, eb := ua & 0x7f800000, ub & 0x7f800000
+	if ea == 0 || eb == 0 || transmute(u32)r & 0x7f800000 == 0 {return transmute(f32)sign}
+	if ea == 0x7f800000 || eb == 0x7f800000 {return fpu_slow(.Mul, a, b)}
+	// The product is near 2^128, so a is 1 or more and a / 2 a host float.
+	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * b)
+	return transmute(f32)(h & 0x7f800000 == 0x7f800000 ? sign | FMAX : h + 0x00800000)
 }
 
 // A zero divisor gives +-FMAX with the sign of a xor b.

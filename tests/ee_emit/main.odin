@@ -1,9 +1,10 @@
 // EE register instructions through the Odin backend (recomp/r5900.emit_op)
 // against the interpreter's exec_insn. Two steps in one command: this
 // program generates cases/main.odin, one proc per instruction word emit_op
-// inlines (every MMI word the decoder maps to a covered op, the MADD family
-// and SQRT.S and RSQRT.S, with rd 0, rs/rt 0 and aliased registers, and every shift
-// amount for the shifts by sa), then runs it with `odin run`. Each case runs
+// inlines (every MMI word the decoder maps to a covered op, the MADD family,
+// SQRT.S, RSQRT.S, MUL.S, MULA.S, MADD.S, MTSAB and MTSAH, with rd 0, rs/rt
+// 0 and aliased registers, and every shift amount for the shifts by sa),
+// then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
 // leave the whole cpu.state as exec_insn leaves it. The seed is fixed, so a
 // run is reproducible. Words emit_op leaves to the interpreter are counted
@@ -32,6 +33,7 @@ COVERED :: Ops{
 	.PSLLH, .PSRLH, .PSRAH, .PAND, .POR, .PXOR, .PNOR, .PCPYLD, .PCPYUD, .PCPYH,
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
 	.PADDSH, .PADDUW, .PSRAW, .PHMADH, .MADD, .MADDU, .MADD1, .MADDU1, .MTHI1, .MTLO1, .SQRT_S, .RSQRT_S,
+	.MUL_S, .MULA_S, .MADD_S, .MTSAB, .MTSAH,
 	.MTC0, .ERET, .CFC1, .CTC1,
 }
 // The shifts by sa: every amount gets a case.
@@ -55,6 +57,12 @@ main :: proc() {
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x04)
 		// RSQRT.S f[rd] = f[rs] / sqrt(f[rt])
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x16)
+		// MUL.S, MULA.S and MADD.S f[rd] = f[rs] * f[rt]
+		for fn in ([?]u32{0x02, 0x1a, 0x1c}) {
+			append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | fn)
+		}
+		// MTSAB and MTSAH from rs
+		append(&words, 0x01 << 26 | r[0] << 21 | 0x18 << 16 | 0xfff5, 0x01 << 26 | r[0] << 21 | 0x19 << 16 | 0x0006)
 	}
 	// COP0 and COP1 moves: MTC0 Status, EPC and Wired (from r0), ERET,
 	// CFC1 fcr31, FCR0 and to r0, CTC1 fcr31 and FCR0 (ignored).
@@ -91,7 +99,7 @@ main :: proc() {
 	fmt.sbprintln(&sb, "}\n")
 	fmt.sbprintln(&sb, strings.to_string(body))
 	fmt.sbprint(&sb, HARNESS)
-	if covered != COVERED {fail("ops with no inline case: %v", COVERED - covered)}
+	if covered != COVERED {fail("inline cases: missing %v, not listed in COVERED %v", COVERED - covered, covered - COVERED)}
 
 	dir :: CASES_DIR
 	if !os.exists(dir) {
@@ -129,7 +137,7 @@ TRIALS :: 300
 
 // Bytes at the signed and unsigned limits, for saturation and sign extension.
 EDGE := [?]u8{0, 1, 0x7f, 0x80, 0x81, 0xfe, 0xff}
-SPECIAL := [?]u32{0, 0x80000000, 0x7f800000, 0xff800000, 0x7fffffff, 0xffffffff, 0x7f7fffff, 0xff7fffff, 1, 0x80000001, 0x3f800000, 0xbf800000, 0x00800000, 0x40800000}
+SPECIAL := [?]u32{0, 0x80000000, 0x7f800000, 0xff800000, 0x7fffffff, 0xffffffff, 0x7f7fffff, 0xff7fffff, 1, 0x80000001, 0x3f800000, 0xbf800000, 0x00800000, 0x40800000, 0x1f800000, 0x5f800000}
 
 rnd128 :: proc() -> (g: cpu.Gpr) {
 	switch rand.uint32() % 3 {

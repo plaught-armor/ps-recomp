@@ -212,7 +212,8 @@ special :: proc(u: u32) -> bool {
 
 // Add to want the fpu_slow calls a row makes: Sqrt for a root of exponent
 // 255, then the operation when an operand or the host's result is special,
-// past fpu_div's zero divisor and fpu_rsqrt's zero b.
+// past fpu_div's zero divisor and fpu_rsqrt's zero b. fpu_mul calls it only
+// for an operand of exponent 255 and none of exponent 0.
 slow_ops :: proc(v: Vector, want: ^[cpu.Fpu_Op]u64) {
 	a, b := f(v.fs), f(v.ft)
 	r: f32
@@ -235,7 +236,40 @@ slow_ops :: proc(v: Vector, want: ^[cpu.Fpu_Op]u64) {
 		if v.fs & 0x7f800000 == 0x7f800000 {want[.Sqrt] += 1}
 		return
 	}
+	if op == .Mul {
+		ea, eb := v.fs & 0x7f800000, v.ft & 0x7f800000
+		if (ea == 0x7f800000 || eb == 0x7f800000) && ea != 0 && eb != 0 {want[op] += 1}
+		return
+	}
 	if special(transmute(u32)a) || special(transmute(u32)b) || special(transmute(u32)r) {want[op] += 1}
+}
+
+// fpu_mul's inline special cases against fpu_slow, the model: every pair of
+// a grid of exponents (0, 1, around 2^+-64, 2^-1 to 2^1, 253 to 255) by
+// mantissas and signs whose operands or host product is special. Returns
+// the failures.
+mul_grid :: proc() -> int {
+	EXPS :: [?]u32{0, 1, 2, 63, 64, 65, 126, 127, 128, 190, 191, 192, 253, 254, 255}
+	MANTS :: [?]u32{0, 1, 0x2aaaab, 0x400000, 0x7fffff}
+	vals: [len(EXPS) * len(MANTS) * 2]u32
+	n := 0
+	for e in EXPS {
+		for m in MANTS {
+			vals[n], vals[n + 1] = e << 23 | m, 0x80000000 | e << 23 | m
+			n += 2
+		}
+	}
+	fails := 0
+	for x in vals {
+		for y in vals {
+			if !special(x) && !special(y) && !special(transmute(u32)(f(x) * f(y))) {continue}
+			got, want := transmute(u32)cpu.fpu_mul(f(x), f(y)), transmute(u32)cpu.fpu_slow(.Mul, f(x), f(y))
+			if got == want {continue}
+			fails += 1
+			if fails <= 10 {fmt.eprintfln("FAIL fpu_mul %08x, %08x: fpu_slow gives %08x, got %08x", x, y, want, got)}
+		}
+	}
+	return fails
 }
 
 run :: proc(v: Vector) -> u32 {
@@ -261,6 +295,7 @@ main :: proc() {
 		fmt.eprintfln("FAIL %v %08x, %08x: PS2 gives %08x, got %08x", v.op, v.fs, v.ft, v.res, got)
 		fails += 1
 	}
+	fails += mul_grid()
 	// Ascending EE floats: each key must be above the one before.
 	order := [?]u32{0xffffffff, 0xff800000, 0xff7fffff, 0xbf800000, 0x80800000, 0x00000000,
 	                0x00800000, 0x3f800000, 0x7f7fffff, 0x7f800000, 0x7fffffff}

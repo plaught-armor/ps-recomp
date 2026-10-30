@@ -291,6 +291,9 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .MTSAB:
 		append(out, fmt.tprintf("c.sa = ((%s ~ %d) & 15) * 8", R32(i.rs), u32(i.imm) & 15))
 		return true
+	case .MTSAH:
+		append(out, fmt.tprintf("c.sa = ((%s ~ %d) & 7) * 16", R32(i.rs), u32(i.imm) & 7))
+		return true
 	case .MFC0:
 		if i.rd == 15 {return false} // PRId stays in the interpreter
 		src := i.rd == 9 ? "u32(c.cycles)" : fmt.tprintf("c.cop0[%d]", i.rd)

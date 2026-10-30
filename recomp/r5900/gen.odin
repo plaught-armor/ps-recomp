@@ -367,7 +367,15 @@ fsub :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 
 fmul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a * b
-	return fspecial(a) | fspecial(b) | fspecial(r) ? cpu.fpu_slow(.Mul, a, b) : r
+	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
+	ua, ub := transmute(u32)a, transmute(u32)b
+	sign := (ua ~ ub) & 0x80000000
+	ea, eb := ua & 0x7f800000, ub & 0x7f800000
+	if ea == 0 || eb == 0 || transmute(u32)r & 0x7f800000 == 0 {return transmute(f32)sign}
+	if ea == 0x7f800000 || eb == 0x7f800000 {return cpu.fpu_slow(.Mul, a, b)}
+	// The product is near 2^128, so a is 1 or more and a / 2 a host float.
+	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * b)
+	return transmute(f32)(h & 0x7f800000 == 0x7f800000 ? sign | cpu.FMAX : h + 0x00800000)
 }
 
 fkey :: #force_inline proc "contextless" (x: f32) -> i32 {
