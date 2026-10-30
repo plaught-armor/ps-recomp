@@ -540,7 +540,13 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 	imm15 := u16(((lw >> 10) & 0x7800) | (lw & 0x7ff))
 	imm24 := lw & 0xffffff
 	L := lanes(dest)
+	// Lane k of src to lane k of dst for the dest lanes; all four as one
+	// whole-array copy.
 	copy_lanes :: proc(sb: ^strings.Builder, L: [4]bool, dst, src: string) {
+		if L == {true, true, true, true} {
+			fmt.sbprintf(sb, "%s = %s; ", dst, src)
+			return
+		}
 		for on, k in L {
 			if on {fmt.sbprintf(sb, "%s[%d] = %s[%d]; ", dst, k, src, k)}
 		}
@@ -578,12 +584,12 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 	case 0x00: // LQ
 		if ft == 0 || dest == 0 {return}
 		fmt.sbprintf(sb, "\t\t\t{{q := mq(v, vi[%d] + 0x%x, %s); ", is, imm11, mem)
-		copy_lanes(sb, L, fmt.tprintf("vf[%d].u", ft), "q")
+		copy_lanes(sb, L, fmt.tprintf("vf[%d].u", ft), "q^")
 		end_block(sb)
 	case 0x01: // SQ
 		if dest == 0 {return}
 		fmt.sbprintf(sb, "\t\t\t{{q := mq(v, vi[%d] + 0x%x, %s); ", it, imm11, mem)
-		copy_lanes(sb, L, "q", fmt.tprintf("vf[%d].u", fs))
+		copy_lanes(sb, L, "q^", fmt.tprintf("vf[%d].u", fs))
 		end_block(sb)
 	case 0x04: ilw(sb, L, it, fmt.tprintf("vi[%d] + 0x%x", is, imm11), mem) // ILW
 	case 0x05: isw(sb, L, it, fmt.tprintf("vi[%d] + 0x%x", is, imm11), mem) // ISW
@@ -629,7 +635,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			if lw & 3 == 2 {fmt.sbprintf(sb, "vi[%d] -= 1; ", is)}
 			if ft != 0 && dest != 0 {
 				fmt.sbprintf(sb, "q := mq(v, vi[%d], %s); ", is, mem)
-				copy_lanes(sb, L, fmt.tprintf("vf[%d].u", ft), "q")
+				copy_lanes(sb, L, fmt.tprintf("vf[%d].u", ft), "q^")
 			}
 			if lw & 3 == 0 && is != 0 {fmt.sbprintf(sb, "vi[%d] += 1; ", is)}
 			fmt.sbprintln(sb, "vi[0] = 0}")
@@ -638,7 +644,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			if lw & 3 == 3 {fmt.sbprintf(sb, "vi[%d] -= 1; ", it)}
 			if dest != 0 {
 				fmt.sbprintf(sb, "q := mq(v, vi[%d], %s); ", it, mem)
-				copy_lanes(sb, L, "q", fmt.tprintf("vf[%d].u", fs))
+				copy_lanes(sb, L, "q^", fmt.tprintf("vf[%d].u", fs))
 			}
 			if lw & 3 == 1 && it != 0 {fmt.sbprintf(sb, "vi[%d] += 1; ", it)}
 			fmt.sbprintln(sb, "vi[0] = 0}")
@@ -1221,8 +1227,11 @@ vmin :: #force_inline proc "contextless" (a, b: [4]u32) -> [4]u32 {
 // Quadword n of v's data memory of size bytes (vu.VU0_MEM or vu.VU1_MEM),
 // wrapping. Unchecked: the generated code passes vu.vu0 with VU0_MEM and
 // vu.vu1 with VU1_MEM, vu_init sets each mem to an array of exactly that
-// size, and the mask keeps the quadword inside it whatever vi holds.
-mq :: #force_inline proc "contextless" (v: ^vu.Vu, n: u16, $size: u32) -> ^[4]u32 #no_bounds_check {
+// size, and the mask keeps the quadword inside it whatever vi holds. size
+// is not a $ parameter: with -use-separate-modules Odin puts a polymorphic
+// instance in a module of its own, where the callers cannot inline it.
+// For the same reason mq is here and not in the runtime's vu package.
+mq :: #force_inline proc "contextless" (v: ^vu.Vu, n: u16, size: u32) -> ^[4]u32 #no_bounds_check {
 	return (^[4]u32)(&v.mem[(u32(n) * 16) & (size - 1)])
 }
 
