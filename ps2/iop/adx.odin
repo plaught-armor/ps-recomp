@@ -331,7 +331,8 @@ adx_ring_put :: proc(o: ^Adx_Out, ch: int, addr, size: u32) {
 // Add the playing streams to interleaved stereo at MIX_RATE, resampled from
 // each stream's rate. A stream starts, and restarts after running dry, only
 // once it holds two vblanks of PCM, since round trips deliver it in bursts.
-adx_mix :: proc(out: []i16) {
+// Not clamped here: the host saturates the sum of every source once.
+adx_mix :: proc(out: []i32) {
 	for &r, k in adx.rna {
 		if r.handle == 0 || !r.playing || r.rate == 0 || r.channels == 0 {continue}
 		o := &adx_out[k]
@@ -356,8 +357,8 @@ adx_mix :: proc(out: []i16) {
 			p := u32(o.pos >> 24)
 			l := adx_gauss(o, lc, i, p)
 			s := adx_gauss(o, rc, i, p)
-			out[n] = i16(clamp(i32(out[n]) + l, -32768, 32767))
-			out[n + 1] = i16(clamp(i32(out[n + 1]) + s, -32768, 32767))
+			out[n] += l
+			out[n + 1] += s
 			o.pos += step
 		}
 	}

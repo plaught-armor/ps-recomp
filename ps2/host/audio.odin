@@ -28,9 +28,17 @@ audio_init :: proc(headless: bool) {
 audio_frame :: proc(push: bool) {
 	buf := make([][2]i16, AUDIO_FRAME, context.temp_allocator)
 	t := cpu.prof_start()
-	iop.fmod_mix(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
-	iop.spu_mix(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
-	iop.adx_mix(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
+	mix_frame(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
 	cpu.prof_end(.MIX, t)
 	if push {core.audio_push(buf)}
+}
+
+// The sources add into one wide buffer, saturated once into out, so a source
+// that cancels another does not leave a clipped residue.
+mix_frame :: proc(out: []i16) {
+	acc := make([]i32, len(out), context.temp_allocator)
+	iop.fmod_mix(acc)
+	iop.spu_mix(acc)
+	iop.adx_mix(acc)
+	for x, i in acc {out[i] = i16(clamp(x, -32768, 32767))}
 }

@@ -787,8 +787,9 @@ gain_3d :: proc(blk: u32, w: [^]u32) -> f32 {
 	return lo / d
 }
 
-// Render interleaved stereo at MIX_RATE.
-fmod_mix :: proc(out: []i16) {
+// Add interleaved stereo at MIX_RATE to out. FMOD's software mixer writes
+// 16-bit PCM, so its sum saturates once, here, before it joins the others.
+fmod_mix :: proc(out: []i32) {
 	acc := make([]i32, len(out), context.temp_allocator)
 	send := make([]i32, len(out), context.temp_allocator) // to the reverb
 	for &v in voices[:num_voices] {
@@ -845,7 +846,7 @@ fmod_mix :: proc(out: []i16) {
 		}
 	}
 	reverb_mix(&reverb, send, acc)
-	for x, i in acc {out[i] = i16(clamp(x, -32768, 32767))}
+	for x, i in acc {out[i] += clamp(x, -32768, 32767)}
 }
 
 // Emulated state, saved and restored by snapshots (snap.odin).

@@ -19,6 +19,7 @@
 package ps2_iop
 
 import "core:fmt"
+import "core:mem"
 import "ps:core"
 import cpu "../cpu"
 
@@ -171,8 +172,12 @@ spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 }
 
 // Add the voices to interleaved stereo at MIX_RATE, the SPU2 output rate.
-spu_mix :: proc(out: []i16) {
+// Each core sums its voices and reverb return wide and saturates once, at its
+// output, so voices that cancel do not clip on the way.
+spu_mix :: proc(out: []i32) {
+	acc := make([]i32, len(out), context.temp_allocator)
 	for &core, c in spu.voice {
+		mem.zero_slice(acc)
 		// A core runs its reverb only with effects enabled and a mode set.
 		w := &spu.reverb[c]
 		wet := spu.effect[c] && w.mode != 0
@@ -187,19 +192,16 @@ spu_mix :: proc(out: []i16) {
 				s := spu_sample(&v) * level >> 15
 				if v.on {spu_envelope(&v)}
 				sl, sr := s * v.voll >> 14, s * v.volr >> 14
-				out[n] = i16(clamp(i32(out[n]) + sl, -32768, 32767))
-				out[n + 1] = i16(clamp(i32(out[n + 1]) + sr, -32768, 32767))
+				acc[n] += sl
+				acc[n + 1] += sr
 				if wet && !v.dry {
 					send[n] += sl
 					send[n + 1] += sr
 				}
 			}
 		}
-		if wet {
-			acc := make([]i32, len(out), context.temp_allocator)
-			reverb_mix(w, send, acc)
-			for x, i in acc {out[i] = i16(clamp(i32(out[i]) + x, -32768, 32767))}
-		}
+		if wet {reverb_mix(w, send, acc)}
+		for x, i in acc {out[i] += clamp(x, -32768, 32767)}
 	}
 }
 

@@ -10,6 +10,9 @@
 // send, and FMOD's Reverb_SetProperties (fmod_reverb) through a sequence of
 // settings; hashes of its return pin the output. A core's reverb (spu_effect,
 // spu_effect_enable, spu_voice_send) rings on after its voice ends.
+// Mixing is wide: voices that cancel leave no clipped residue, a core
+// saturates once at its output, and the host sum is left unclamped for the
+// host. A voice at pitch 0 holds its sample while its envelope steps.
 package main
 
 import "core:fmt"
@@ -21,6 +24,7 @@ LOOP :: 0x1000 // start, plain, end with repeat
 ONCE :: 0x2000 // plain, end without repeat
 SHORT :: 0x3000 // one block, end without repeat
 EFFECT :: 0x4000 // one block, end without repeat
+WIDE :: 0x5000 // one block looping on itself
 SNAP :: 0x10000 // varied samples, end with repeat
 BLOCKS :: 3
 
@@ -48,7 +52,7 @@ rev: iop.Reverb // a work area too big for the stack
 failed: bool
 snap: core.Snapshot
 loaded: bool // not emulated state: tells the run after the load apart
-mixed: [2][BLOCKS * 28 * 2]i16 // before and after the load
+mixed: [2][BLOCKS * 28 * 2]i32 // before and after the load
 
 check :: proc(ok: bool, what: string, loc := #caller_location) {
 	if !ok {
@@ -66,8 +70,8 @@ block :: proc(addr: u32, flags: u8, nib: u8) {
 }
 
 // Mix n stereo samples into silence.
-mix :: proc(n: int) -> []i16 {
-	out := make([]i16, n * 2, context.temp_allocator)
+mix :: proc(n: int) -> []i32 {
+	out := make([]i32, n * 2, context.temp_allocator)
 	iop.spu_mix(out)
 	return out
 }
@@ -130,6 +134,60 @@ voices :: proc() {
 
 	edge: [8]u8
 	check(iop.spu_write(iop.SPU_RAM_SIZE - 4, edge[:]) == 4, "spu_write clipped at the end of sound RAM")
+}
+
+// Mix n stereo samples onto a buffer already holding `base`, as the host's
+// is after the sources before the SPU2.
+mix_onto :: proc(n: int, base: i32) -> []i32 {
+	out := make([]i32, n * 2, context.temp_allocator)
+	for &x in out {x = base}
+	iop.spu_mix(out)
+	return out
+}
+
+// Saturation happens once per core output and once at the host, not per
+// voice or per source.
+wide :: proc() {
+	block(WIDE, 7, 7) // every sample 7 << 12, near full scale at full volume
+	neg := key(WIDE)
+	neg.voll, neg.volr = 0x4001, 0x4001 // -0x3fff
+
+	// Two full-scale voices in opposite phase cancel, over a buffer another
+	// source filled near the top: no clipped residue.
+	iop.spu_voice_on(1, 10, key(WIDE))
+	iop.spu_voice_on(1, 11, neg)
+	out := mix_onto(56, 20000)
+	ok := true
+	for x in out {if abs(x - 20000) > 1 {ok = false}}
+	check(ok, "cancelling voices sum to silence")
+	check(iop.spu_voice_status(1, 10).envx == 0x7fff, "cancelling voices at full level")
+
+	// Two in phase saturate once, at the core's output.
+	iop.spu_voice_on(1, 11, key(WIDE))
+	out = mix_onto(28, 0)
+	check(out[54] == 32767 && out[55] == 32767, "a core saturates its sum")
+
+	// The core's output adds onto the host buffer unclamped, and the other
+	// sources, silent, leave it as it is: the host saturates the total.
+	iop.spu_voice_off(1, 11)
+	mix(4)
+	out = mix_onto(28, 30000)
+	check(out[54] > 32767, "a core adds onto the host sum unclamped")
+	iop.fmod_mix(out)
+	iop.adx_mix(out)
+	check(out[54] > 32767, "silent FMOD and ADX leave the host sum")
+
+	// Pitch 0, as a game pauses a voice: the voice holds its sample while
+	// its envelope still steps, so a key off releases it to silence.
+	iop.spu_voice_set(1, 10, 0, 0x3fff, 0x3fff)
+	out = mix(28)
+	held := out[0] != 0
+	for x in out {if x != out[0] {held = false}}
+	check(held, "pitch 0 holds a constant sample")
+	iop.spu_voice_off(1, 10)
+	mix(4)
+	st := iop.spu_voice_status(1, 10)
+	check(!st.on && st.envx == 0, "pitch 0 envelope releases to zero")
 }
 
 CHUNK :: 1024
@@ -196,14 +254,14 @@ reverb_fmod :: proc() {
 }
 
 // Play the EFFECT block once on core 0 and mix past its end.
-effect_play :: proc(send: bool) -> []i16 {
+effect_play :: proc(send: bool) -> []i32 {
 	iop.spu_voice_send(0, 5, send)
 	iop.spu_voice_on(0, 5, key(EFFECT))
 	return mix(0x4000)
 }
 
 // Whether anything is heard after the voice's 28 samples: the reverb.
-tail :: proc(out: []i16) -> bool {
+tail :: proc(out: []i32) -> bool {
 	for x in out[64:] {if x != 0 {return true}}
 	return false
 }
@@ -233,6 +291,7 @@ effects :: proc() {
 
 game :: proc(_: rawptr) {
 	voices()
+	wide()
 	reverb_presets()
 	reverb_fmod()
 	effects()
