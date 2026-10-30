@@ -1,7 +1,8 @@
 // GTE register moves as native code, run on every target in CI: mtc2, mfc2,
 // lwc2 and swc2 (data registers) and ctc2 and cfc2 (control registers), the
-// native backend's inline field stores and loads and the calls it keeps,
-// against gte.gte_write and gte.gte_read from the same GTE state. And the
+// native backend's inline field stores and loads, with
+// gte.gte_matrix_filter set and not, against gte.gte_write and gte.gte_read
+// from the same GTE state, and a few registers against their values. And the
 // inline NCLIP against gte.gte_cmd. The Odin backend's output for the same
 // forms and for GTE commands: which call each names, an inline proc or the
 // helper, and the inline ones against the helpers. And RTPS, RTPT and
@@ -220,6 +221,67 @@ main :: proc() {
 			}
 		}
 	}
+	// Rotation and translation writes take gte.gte_matrix_filter's value
+	// while it is set.
+	gte.gte_matrix_filter = proc(r, v: u32) -> u32 {return v ~ r * 0x01010101}
+	for k in 0 ..< len(vals) {
+		start := gte_state(k)
+		for r in u32(0) ..< 8 {
+			for v in vals {
+				gte.gte_load(start)
+				gte.gte_write(r + 32, v)
+				want := gte.gte_save()
+				gte.gte_load(start)
+				cpu.state.r[4] = v
+				run(code, .Ctc2, r)
+				if gte.gte_save() != want {fail("filtered ctc2 %d = %08x from state %d: GTE state differs", r, v, k)}
+				checks += 1
+			}
+		}
+	}
+	gte.gte_matrix_filter = nil
+	// Register w = v reads back as want from register r, by the helpers
+	// and natively: LZCR of 0 and -1 is 32, FLAG bit 31 sums bits 13-18
+	// and 23-30 and no others, H reads sign-extended, IRGB fills IR1-3.
+	Reg_Case :: struct {
+		w, v, r, want: u32,
+	}
+	reg_cases := [?]Reg_Case {
+		{30, 0, 31, 32},
+		{30, 0xffffffff, 31, 32},
+		{30, 1, 31, 31},
+		{30, 0xfffffffe, 31, 31},
+		{30, 0x40000000, 31, 1},
+		{30, 0x80000000, 31, 1},
+		{63, 0x00001000, 63, 0x00001000},
+		{63, 0x00002000, 63, 0x80002000},
+		{63, 0x00040000, 63, 0x80040000},
+		{63, 0x00080000, 63, 0x00080000},
+		{63, 0x00780000, 63, 0x00780000},
+		{63, 0x00800000, 63, 0x80800000},
+		{63, 0x40000000, 63, 0xc0000000},
+		{63, 0x80000fff, 63, 0},
+		{63, 0xffffffff, 63, 0xfffff000},
+		{58, 0x8000, 58, 0xffff8000},
+		{58, 0x12347fff, 58, 0x7fff},
+		{28, 0x7fff, 29, 0x7fff},
+		{28, 0x8421, 9, 0x80},
+	}
+	for c in reg_cases {
+		gte.gte_load(gte_state(0))
+		gte.gte_write(c.w, c.v)
+		if got := gte.gte_read(c.r); got != c.want {
+			fail("gte_write(%d, %08x): gte_read(%d) %08x, want %08x", c.w, c.v, c.r, got, c.want)
+		}
+		gte.gte_load(gte_state(0))
+		cpu.state.r[4] = c.v
+		run(code, .Ctc2 if c.w >= 32 else .Mtc2, c.w % 32)
+		run(code, .Cfc2 if c.r >= 32 else .Mfc2, c.r % 32)
+		if got := cpu.state.r[2]; got != c.want {
+			fail("native %d = %08x: %d reads %08x, want %08x", c.w, c.v, c.r, got, c.want)
+		}
+		checks += 1
+	}
 	// NCLIP over SXY halves; every FLAG outcome (fits, above, below) must
 	// show up.
 	outcomes: map[u32]int
@@ -257,10 +319,10 @@ main :: proc() {
 			checks += 1
 		}
 	}
-	// The Odin backend's output for the same forms names gte.data_read or
-	// gte.data_write, which inline in a port, for the data registers but
-	// SXYP writes and 28-31, and the helper for the rest. Each named call
-	// runs against the helper.
+	// The Odin backend's output for the same forms names gte.data_read and
+	// gte.data_write for the data registers, gte.ctrl_read and
+	// gte.ctrl_write for the control registers, all inline in a port. Each
+	// named call runs against the helper.
 	for f in Form {
 		for r in u32(0) ..< 32 {
 			code := [?]u32{word(f, r), 0, JR_RA, 0, 0}
@@ -270,31 +332,29 @@ main :: proc() {
 			ctl := f == .Ctc2 || f == .Cfc2
 			g := r + 32 if ctl else r
 			write := f == .Mtc2 || f == .Ctc2 || f == .Lwc2
-			fold := !ctl && r < 28 && !(write && r == 15)
-			want_name := write ? (fold ? "data_write" : "gte_write") : (fold ? "data_read" : "gte_read")
+			want_name := write ? (ctl ? "ctrl_write" : "data_write") : (ctl ? "ctrl_read" : "data_read")
 			if name != want_name || reg != g {
 				fail("odin %v %d: calls gte.%s(%d), want gte.%s(%d)", f, r, name, reg, want_name, g)
 			}
-			if fold {
-				for k in 0 ..< len(vals) {
-					start := gte_state(k)
+			for k in 0 ..< len(vals) {
+				start := gte_state(k)
+				gte.gte_load(start)
+				if !write {
+					got := gte.ctrl_read(g) if ctl else gte.data_read(g)
+					if want := gte.gte_read(g); got != want {
+						fail("odin %v %d from state %d: %08x, want %08x", f, r, k, got, want)
+					}
+					checks += 1
+					continue
+				}
+				for v in vals {
 					gte.gte_load(start)
-					if !write {
-						if got, want := gte.data_read(g), gte.gte_read(g); got != want {
-							fail("odin %v %d from state %d: %08x, want %08x", f, r, k, got, want)
-						}
-						checks += 1
-						continue
-					}
-					for v in vals {
-						gte.gte_load(start)
-						gte.gte_write(g, v)
-						want := gte.gte_save()
-						gte.gte_load(start)
-						gte.data_write(g, v)
-						if gte.gte_save() != want {fail("odin %v %d = %08x from state %d: GTE state differs", f, r, v, k)}
-						checks += 1
-					}
+					gte.gte_write(g, v)
+					want := gte.gte_save()
+					gte.gte_load(start)
+					if ctl {gte.ctrl_write(g, v)} else {gte.data_write(g, v)}
+					if gte.gte_save() != want {fail("odin %v %d = %08x from state %d: GTE state differs", f, r, v, k)}
+					checks += 1
 				}
 			}
 			free_all(context.temp_allocator)

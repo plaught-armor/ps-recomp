@@ -270,6 +270,17 @@ x64_alu_imm :: proc(a: ^Asm, op: Alu, dst: Reg, v: u32) {
 	}
 }
 
+// Without lzcnt, which baseline x86-64 lacks: 31 less the highest set bit,
+// that taken as -1 for 0. Uses ecx.
+x64_clz :: proc(a: ^Asm, dst: Reg) {
+	d := X64_REG[dst]
+	emit8(a, 0xb9, 0xff, 0xff, 0xff, 0xff) // mov ecx, -1
+	op_rr(a, false, 0x0fbd, d, d) // bsr d, d
+	op_rr(a, false, 0x0f44, d, RCX) // cmovz d, ecx
+	op_rr(a, false, 0xf7, 3, d) // neg d
+	op_imm(a, ALU_DIGIT[.Add], d, 31)
+}
+
 x64_not :: proc(a: ^Asm, dst: Reg) {
 	op_rr(a, false, 0xf7, 2, X64_REG[dst])
 }

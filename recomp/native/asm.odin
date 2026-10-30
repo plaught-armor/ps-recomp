@@ -480,6 +480,16 @@ alu_imm :: proc(a: ^Asm, op: Alu, dst: Reg, v: u32) {
 	}
 }
 
+// dst = the leading zero bits of dst, 32 for 0
+clz :: proc(a: ^Asm, dst: Reg) {
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_clz(a, dst)
+	case .Arm64:
+		a64_clz(a, dst)
+	}
+}
+
 // dst = ~dst
 not :: proc(a: ^Asm, dst: Reg) {
 	switch a.arch {

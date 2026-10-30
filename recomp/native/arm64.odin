@@ -448,6 +448,11 @@ a64_vec_shift32 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 	}
 }
 
+a64_clz :: proc(a: ^Asm, dst: Reg) {
+	d := A64_REG[dst]
+	rrr(a, 0x5ac01000, d, d, 0) // clz wd, wd
+}
+
 a64_not :: proc(a: ^Asm, dst: Reg) {
 	d := A64_REG[dst]
 	rrr(a, 0x2a2003e0, d, 0, d) // orn wd, wzr, wd

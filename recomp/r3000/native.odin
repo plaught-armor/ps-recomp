@@ -115,7 +115,43 @@ GTE_RES1 :: 92
 @(private = "file")
 GTE_MAC :: 96
 @(private = "file")
+GTE_LZCS :: 112
+@(private = "file")
+GTE_LZCR :: 116
+@(private = "file")
 GTE_FLAG :: 292
+
+// Where control register r, 32-62, is in gte.Gte, and how it maps: a
+// matrix field pair (16 bits each in the register), a field written as 16
+// bits masked (H) or sign-extended, or a word.
+@(private = "file")
+Ctrl :: struct {
+	off:  u32,
+	kind: enum u8 {
+		Word,
+		Pair,
+		Half, // H: written masked, read sign-extended
+		Short, // a matrix's last field, DQA, ZSF3, ZSF4: written sign-extended
+	},
+}
+
+@(private = "file")
+gte_ctrl :: proc(r: u32) -> Ctrl {
+	switch r {
+	case 32 ..= 55:
+		// RT, LLM and LCM at 120, 156 and 192, five registers each; TR,
+		// BK and FC at 228, 240 and 252, three each.
+		n := (r - 32) / 8
+		k := (r - 32) % 8
+		if k < 5 {return {120 + 36 * n + 8 * k, .Pair if k < 4 else .Short}}
+		return {228 + 12 * n + 4 * (k - 5), .Word}
+	case 58:
+		return {272, .Half}
+	case 59, 61, 62:
+		return {264 + 4 * (r - 56), .Short}
+	}
+	return {264 + 4 * (r - 56), .Word} // OFX, OFY, DQB
+}
 
 // The proc for GTE command w but NCLIP: RTPS, RTPT and MVMVA their own,
 // as in the Odin output; the rest gte.gte_cmd.
@@ -163,8 +199,8 @@ nclip :: proc(a: ^native.Asm) {
 	native.imp_store(a, "gte.state", .A, GTE_FLAG)
 }
 
-// A = GTE data register r, as gte.gte_read: inline for r < 28, where a read
-// is a field load; a call for the rest.
+// A = GTE register r (control registers as 32-63), as gte.gte_read: a
+// field load, or for IRGB and ORGB the IR1-3 packed. Loses B and C.
 @(private = "file")
 gte_get :: proc(a: ^native.Asm, r: u32) {
 	switch r {
@@ -180,12 +216,7 @@ gte_get :: proc(a: ^native.Asm, r: u32) {
 		native.imp_load(a, .A, "gte.state", GTE_IR + 4 * (r - 8))
 	case 12 ..= 15:
 		// SXY2 for SXYP. The low 16 bits of x and of y, packed.
-		off := GTE_SXY + 8 * (min(r, 14) - 12)
-		native.imp_load(a, .A, "gte.state", off)
-		native.alu_imm(a, .And, .A, 0xffff)
-		native.imp_load(a, .C, "gte.state", off + 4)
-		native.alu_imm(a, .Shl, .C, 16)
-		native.alu(a, .Or, .A, .C)
+		pair_get(a, GTE_SXY + 8 * (min(r, 14) - 12))
 	case 16 ..= 19:
 		native.imp_load(a, .A, "gte.state", GTE_SZ + 4 * (r - 16))
 	case 20 ..= 22:
@@ -194,14 +225,67 @@ gte_get :: proc(a: ^native.Asm, r: u32) {
 		native.imp_load(a, .A, "gte.state", GTE_RES1)
 	case 24 ..= 27:
 		native.imp_load(a, .A, "gte.state", GTE_MAC + 4 * (r - 24))
+	case 28, 29:
+		// IR1-3, each >> 7 and held to 0-31, five bits apiece.
+		native.mov_imm(a, .A, 0)
+		for k in u32(0) ..< 3 {
+			low, done := native.new_label(a), native.new_label(a)
+			native.imp_load(a, .C, "gte.state", GTE_IR + 4 * (k + 1))
+			native.alu_imm(a, .Sar, .C, 7)
+			native.br_cmp_imm(a, .Ge, .C, 0, low)
+			native.mov_imm(a, .C, 0)
+			native.bind(a, low)
+			native.br_cmp_imm(a, .Le, .C, 0x1f, done)
+			native.mov_imm(a, .C, 0x1f)
+			native.bind(a, done)
+			if k > 0 {native.alu_imm(a, .Shl, .C, 5 * k)}
+			native.alu(a, .Or, .A, .C)
+		}
+	case 30:
+		native.imp_load(a, .A, "gte.state", GTE_LZCS)
+	case 31:
+		native.imp_load(a, .A, "gte.state", GTE_LZCR)
+	case 63:
+		native.imp_load(a, .A, "gte.state", GTE_FLAG)
 	case:
-		call_imm(a, "gte.gte_read", r)
+		c := gte_ctrl(r)
+		switch c.kind {
+		case .Pair:
+			pair_get(a, c.off)
+		case .Half:
+			native.imp_load(a, .A, "gte.state", c.off, .B16, true)
+		case .Word, .Short:
+			native.imp_load(a, .A, "gte.state", c.off)
+		}
 	}
 }
 
-// GTE data register r = v (A or B), as gte.gte_write: inline for r < 28
-// but SXYP (15), where a write is a field store; a call for the rest. Loses
-// A, B and C.
+// A = the low 16 bits of the i32 fields at off and off + 4, packed.
+@(private = "file")
+pair_get :: proc(a: ^native.Asm, off: u32) {
+	native.imp_load(a, .A, "gte.state", off)
+	native.alu_imm(a, .And, .A, 0xffff)
+	native.imp_load(a, .C, "gte.state", off + 4)
+	native.alu_imm(a, .Shl, .C, 16)
+	native.alu(a, .Or, .A, .C)
+}
+
+// The i32 fields at off and off + 4 = the sign-extended low and high 16
+// bits of v. Loses v and C.
+@(private = "file")
+pair_put :: proc(a: ^native.Asm, off: u32, v: native.Reg) {
+	native.mov(a, .C, v)
+	native.alu_imm(a, .Shl, .C, 16)
+	native.alu_imm(a, .Sar, .C, 16)
+	native.imp_store(a, "gte.state", .C, off)
+	native.alu_imm(a, .Sar, v, 16)
+	native.imp_store(a, "gte.state", v, off + 4)
+}
+
+// GTE register r = v (A or B), as gte.gte_write: field stores, SXYP's push
+// of the FIFO and LZCS's count among them. A rotation or translation
+// register calls gte.gte_write while gte.gte_matrix_filter is set. Loses A,
+// B and C.
 @(private = "file")
 gte_put :: proc(a: ^native.Asm, r: u32, v: native.Reg) {
 	switch r {
@@ -219,13 +303,14 @@ gte_put :: proc(a: ^native.Asm, r: u32, v: native.Reg) {
 		native.imp_store(a, "gte.state", v, GTE_IR + 4 * (r - 8))
 	case 12 ..= 14:
 		// x and y, each the sign-extended 16 bits.
-		off := GTE_SXY + 8 * (r - 12)
-		native.mov(a, .C, v)
-		native.alu_imm(a, .Shl, .C, 16)
-		native.alu_imm(a, .Sar, .C, 16)
-		native.imp_store(a, "gte.state", .C, off)
-		native.alu_imm(a, .Sar, v, 16)
-		native.imp_store(a, "gte.state", v, off + 4)
+		pair_put(a, GTE_SXY + 8 * (r - 12), v)
+	case 15:
+		// SXY0 = SXY1, SXY1 = SXY2, then SXY2 as for 14.
+		for off in u32(0) ..< 4 {
+			native.imp_load(a, .C, "gte.state", GTE_SXY + 4 * off + 8)
+			native.imp_store(a, "gte.state", .C, GTE_SXY + 4 * off)
+		}
+		pair_put(a, GTE_SXY + 16, v)
 	case 16 ..= 19:
 		native.alu_imm(a, .And, v, 0xffff)
 		native.imp_store(a, "gte.state", v, GTE_SZ + 4 * (r - 16))
@@ -235,10 +320,66 @@ gte_put :: proc(a: ^native.Asm, r: u32, v: native.Reg) {
 		native.imp_store(a, "gte.state", v, GTE_RES1)
 	case 24 ..= 27:
 		native.imp_store(a, "gte.state", v, GTE_MAC + 4 * (r - 24))
+	case 28:
+		// IR1-3 = five bits apiece << 7.
+		for k in u32(0) ..< 3 {
+			native.mov(a, .C, v)
+			if k > 0 {native.alu_imm(a, .Shr, .C, 5 * k)}
+			native.alu_imm(a, .And, .C, 0x1f)
+			native.alu_imm(a, .Shl, .C, 7)
+			native.imp_store(a, "gte.state", .C, GTE_IR + 4 * (k + 1))
+		}
+	case 29, 31:
+	// read-only
+	case 30:
+		// LZCR: the leading bits equal to the sign bit.
+		native.imp_store(a, "gte.state", v, GTE_LZCS)
+		native.mov(a, .C, v)
+		native.alu_imm(a, .Sar, .C, 31)
+		native.alu(a, .Xor, .C, v)
+		native.clz(a, .C)
+		native.imp_store(a, "gte.state", .C, GTE_LZCR)
+	case 63:
+		// Bit 31 is set when any of bits 13-18 and 23-30 is.
+		store := native.new_label(a)
+		native.alu_imm(a, .And, v, 0x7ffff000)
+		native.mov(a, .C, v)
+		native.alu_imm(a, .And, .C, 0x7f87e000)
+		native.br_zero(a, .C, store)
+		native.alu_imm(a, .Or, v, 0x80000000)
+		native.bind(a, store)
+		native.imp_store(a, "gte.state", v, GTE_FLAG)
 	case:
-		if v != .B {native.mov(a, .B, v)}
-		native.mov_imm(a, .A, r)
-		native.call(a, "gte.gte_write", .A, .B)
+		done := native.new_label(a)
+		if r <= 39 {
+			// The filter's address, both halves, is not zero: the call.
+			other: native.Reg = .A if v == .B else .B
+			inline := native.new_label(a)
+			native.imp_load(a, .C, "gte.matrix_filter")
+			native.imp_load(a, other, "gte.matrix_filter", 4)
+			native.alu(a, .Or, .C, other)
+			native.br_zero(a, .C, inline)
+			if v != .B {native.mov(a, .B, v)}
+			native.mov_imm(a, .A, r)
+			native.call(a, "gte.gte_write", .A, .B)
+			native.jmp(a, done)
+			native.bind(a, inline)
+		}
+		c := gte_ctrl(r)
+		switch c.kind {
+		case .Pair:
+			pair_put(a, c.off, v)
+		case .Half:
+			native.alu_imm(a, .And, v, 0xffff)
+			native.imp_store(a, "gte.state", v, c.off)
+		case .Short:
+			native.alu_imm(a, .Shl, v, 16)
+			native.alu_imm(a, .Sar, v, 16)
+			native.imp_store(a, "gte.state", v, c.off)
+		case .Word:
+			native.imp_store(a, "gte.state", v, c.off)
+		}
+		native.bind(a, done)
 	}
 }
 

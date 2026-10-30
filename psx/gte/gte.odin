@@ -95,7 +95,7 @@ saturate5 :: #force_inline proc(v: i32) -> u32 {
 }
 
 @(private)
-matrix_read :: proc(m: ^[3][3]i32, k: u32) -> u32 {
+matrix_read :: #force_inline proc(m: ^[3][3]i32, k: u32) -> u32 {
 	switch k {
 	case 0:
 		return pack16(m[0][0], m[0][1])
@@ -110,7 +110,7 @@ matrix_read :: proc(m: ^[3][3]i32, k: u32) -> u32 {
 }
 
 @(private)
-matrix_write :: proc(m: ^[3][3]i32, k, v: u32) {
+matrix_write :: #force_inline proc(m: ^[3][3]i32, k, v: u32) {
 	lo, hi := sext16(v), sext16(v >> 16)
 	switch k {
 	case 0:
@@ -134,8 +134,8 @@ gte_save :: proc() -> Gte_State {return transmute(Gte_State)state}
 
 gte_load :: proc(s: Gte_State) {state = transmute(Gte)s}
 
-// GTE data register r, 0-27, the ones whose read is a field load. Recompiled
-// code calls it with a constant r, and the switch folds away.
+// GTE data register r, 0-31. Recompiled code calls it with a constant r,
+// and the switch folds away.
 data_read :: #force_inline proc(r: u32) -> u32 #no_bounds_check {
 	g := &state
 	switch r {
@@ -162,23 +162,20 @@ data_read :: #force_inline proc(r: u32) -> u32 #no_bounds_check {
 		return g.res1
 	case 24 ..= 27:
 		return u32(g.mac[r - 24])
-	}
-	return 0
-}
-
-gte_read :: proc(r: u32) -> u32 #no_bounds_check {
-	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Read][r & 63] += 1}
-	if r < 28 {
-		return data_read(r)
-	}
-	g := &state
-	switch r {
 	case 28, 29:
 		return saturate5(g.ir[1]) | saturate5(g.ir[2]) << 5 | saturate5(g.ir[3]) << 10
 	case 30:
 		return g.lzcs
 	case 31:
 		return g.lzcr
+	}
+	return 0
+}
+
+// GTE control register r, 32-63, as data_read.
+ctrl_read :: #force_inline proc(r: u32) -> u32 #no_bounds_check {
+	g := &state
+	switch r {
 	case 32 ..= 36:
 		return matrix_read(&g.rt, r - 32)
 	case 37 ..= 39:
@@ -212,14 +209,18 @@ gte_read :: proc(r: u32) -> u32 #no_bounds_check {
 	return 0
 }
 
+gte_read :: proc(r: u32) -> u32 {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Read][r & 63] += 1}
+	return data_read(r) if r < 32 else ctrl_read(r)
+}
+
 @(private)
-leading_count :: proc(v: u32) -> u32 {
+leading_count :: #force_inline proc(v: u32) -> u32 {
 	return intrinsics.count_leading_zeros(v & 0x80000000 != 0 ? ~v : v)
 }
 
-// GTE data register r = v, for r 0-27 but SXYP (15): the writes that are a
-// field store. Recompiled code calls it with a constant r, and the switch
-// folds away.
+// GTE data register r = v, for r 0-31. Recompiled code calls it with a
+// constant r, and the switch folds away.
 data_write :: #force_inline proc(r, v: u32) #no_bounds_check {
 	g := &state
 	switch r {
@@ -245,21 +246,6 @@ data_write :: #force_inline proc(r, v: u32) #no_bounds_check {
 		g.res1 = v
 	case 24 ..= 27:
 		g.mac[r - 24] = i32(v)
-	}
-}
-
-gte_write :: proc(r, v: u32) #no_bounds_check {
-	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Write][r & 63] += 1}
-	if r < 28 && r != 15 {
-		data_write(r, v)
-		return
-	}
-	g := &state
-	v := v
-	if r >= 32 && r <= 39 && gte_matrix_filter != nil {
-		v = gte_matrix_filter(r, v)
-	}
-	switch r {
 	case 15:
 		g.sxy[0] = g.sxy[1]
 		g.sxy[1] = g.sxy[2]
@@ -273,6 +259,17 @@ gte_write :: proc(r, v: u32) #no_bounds_check {
 		g.lzcr = leading_count(v)
 	case 29, 31:
 	// read-only
+	}
+}
+
+// GTE control register r = v, for r 32-63, as data_write.
+ctrl_write :: #force_inline proc(r, v: u32) #no_bounds_check {
+	g := &state
+	v := v
+	if r >= 32 && r <= 39 && gte_matrix_filter != nil {
+		v = gte_matrix_filter(r, v)
+	}
+	switch r {
 	case 32 ..= 36:
 		matrix_write(&g.rt, r - 32, v)
 	case 37 ..= 39:
@@ -305,6 +302,11 @@ gte_write :: proc(r, v: u32) #no_bounds_check {
 			g.flag |= 0x80000000
 		}
 	}
+}
+
+gte_write :: proc(r, v: u32) {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Write][r & 63] += 1}
+	if r < 32 {data_write(r, v)} else {ctrl_write(r, v)}
 }
 
 // ---------------------------------------------------------------- arithmetic

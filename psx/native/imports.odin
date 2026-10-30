@@ -66,6 +66,7 @@ imports :: proc() -> map[string]u64 {
 	m["gte.state"] = p(&gte.state)
 	m["gte.gte_read"] = p(rawptr(gte.gte_read))
 	m["gte.gte_write"] = p(rawptr(gte.gte_write))
+	m["gte.matrix_filter"] = p(&gte.gte_matrix_filter)
 	m["gte.gte_cmd"] = p(rawptr(gte.gte_cmd))
 	m["gte.cmd_rtps"] = p(rawptr(gte.cmd_rtps))
 	m["gte.cmd_rtpt"] = p(rawptr(gte.cmd_rtpt))

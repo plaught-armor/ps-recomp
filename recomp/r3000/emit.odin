@@ -151,7 +151,7 @@ emit_op :: proc(i: Insn) -> []string {
 		switch {
 		case rs == 0 || rs == 2:
 			r := rs == 0 ? rd : rd + 32
-			return set_reg(rt, gte_get(r), r >= 28)
+			return set_reg(rt, gte_get(r))
 		case rs == 4 || rs == 6:
 			return one("%s, %s)", gte_put(rs == 4 ? rd : rd + 32), R(rt))
 		case rs & 16 != 0:
@@ -202,20 +202,18 @@ gte_cmd_call :: proc(cmd: u32) -> string {
 	return fmt.aprintf("gte.gte_cmd(0x%x)", cmd)
 }
 
-// A read of GTE register r (control registers as 32-63): data registers
-// 0-27, a field load, inline through gte.data_read; the rest through
-// gte.gte_read.
+// A read of GTE register r (control registers as 32-63), inline through
+// gte.data_read or gte.ctrl_read.
 @(private = "file")
 gte_get :: proc(r: u32) -> string {
-	return fmt.aprintf("gte.%s(%d)", r < 28 ? "data_read" : "gte_read", r)
+	return fmt.aprintf("gte.%s(%d)", r < 32 ? "data_read" : "ctrl_read", r)
 }
 
 // The open call that writes GTE register r, to be closed with the value and
-// ")": data registers 0-27 but SXYP (15), a field store, inline through
-// gte.data_write; the rest through gte.gte_write.
+// ")": inline through gte.data_write or gte.ctrl_write.
 @(private = "file")
 gte_put :: proc(r: u32) -> string {
-	return fmt.aprintf("gte.%s(%d", r < 28 && r != 15 ? "data_write" : "gte_write", r)
+	return fmt.aprintf("gte.%s(%d", r < 32 ? "data_write" : "ctrl_write", r)
 }
 
 @(private = "file")
