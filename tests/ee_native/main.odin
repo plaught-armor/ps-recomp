@@ -346,6 +346,36 @@ main :: proc() {
 		{mmi(0x29, 0x1e) &~ (31 << 21), .PEXCW},
 		{mmi(0x29, 0x1e) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PEXCW}, // rt = rd
 		{mmi(0x29, 0x1e) &~ (31 << 21) &~ (31 << 11), .PEXCW}, // rd = 0
+		{mmi(0x09, 0x02), .PSLLVW},
+		{mmi(0x09, 0x02) &~ (31 << 16) | 3 << 16, .PSLLVW}, // rt = rd
+		{mmi(0x09, 0x02) &~ (31 << 21) | 3 << 21, .PSLLVW}, // rs = rd
+		{mmi(0x09, 0x02) &~ (31 << 21), .PSLLVW}, // rs = 0
+		{mmi(0x09, 0x02) &~ (31 << 16), .PSLLVW}, // rt = 0
+		{mmi(0x09, 0x02) &~ (31 << 11), .PSLLVW}, // rd = 0
+		{mmi(0x09, 0x03), .PSRLVW},
+		{mmi(0x09, 0x03) &~ (31 << 16) | 3 << 16, .PSRLVW}, // rt = rd
+		{mmi(0x09, 0x03) &~ (31 << 21) | 3 << 21, .PSRLVW}, // rs = rd
+		{mmi(0x09, 0x03) &~ (31 << 21), .PSRLVW}, // rs = 0
+		{mmi(0x09, 0x03) &~ (31 << 16), .PSRLVW}, // rt = 0
+		{mmi(0x09, 0x03) &~ (31 << 11), .PSRLVW}, // rd = 0
+		{mmi(0x29, 0x03), .PSRAVW},
+		{mmi(0x29, 0x03) &~ (31 << 16) | 3 << 16, .PSRAVW}, // rt = rd
+		{mmi(0x29, 0x03) &~ (31 << 21) | 3 << 21, .PSRAVW}, // rs = rd
+		{mmi(0x29, 0x03) &~ (31 << 21), .PSRAVW}, // rs = 0
+		{mmi(0x29, 0x03) &~ (31 << 16), .PSRAVW}, // rt = 0
+		{mmi(0x29, 0x03) &~ (31 << 11), .PSRAVW}, // rd = 0
+		{mmi(0x08, 0x1e) &~ (31 << 21), .PEXT5},
+		{mmi(0x08, 0x1e) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PEXT5}, // rt = rd
+		{mmi(0x08, 0x1e) &~ (31 << 21) &~ (31 << 11), .PEXT5}, // rd = 0
+		{mmi(0x08, 0x1f) &~ (31 << 21), .PPAC5},
+		{mmi(0x08, 0x1f) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PPAC5}, // rt = rd
+		{mmi(0x08, 0x1f) &~ (31 << 21) &~ (31 << 11), .PPAC5}, // rd = 0
+		{mmi(0x28, 0x04), .PADSBH},
+		{mmi(0x28, 0x04) &~ (31 << 16) | 3 << 16, .PADSBH}, // rt = rd
+		{mmi(0x28, 0x04) &~ (31 << 21) | 3 << 21, .PADSBH}, // rs = rd
+		{mmi(0x28, 0x04) &~ (31 << 21), .PADSBH}, // rs = 0
+		{mmi(0x28, 0x04) &~ (31 << 16), .PADSBH}, // rt = 0
+		{mmi(0x28, 0x04) &~ (31 << 11), .PADSBH}, // rd = 0
 		{mmi(0x3c, 0) &~ (31 << 21), .PSLLW},
 		{mmi(0x3c, 1) &~ (31 << 21), .PSLLW},
 		{mmi(0x3c, 31) &~ (31 << 21 | 31 << 16) | 3 << 16, .PSLLW}, // rt = rd

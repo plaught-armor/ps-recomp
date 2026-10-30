@@ -745,6 +745,47 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 			native.vec_op(a, .Or, .V0, .V1)
 		}
 		native.vec_store(a, GPR * u32(rd), .V0)
+	case .PSLLVW, .PSRLVW, .PSRAVW:
+		if rd == 0 {return true}
+		// The low word of each doubleword of rt shifted by that of rs (the
+		// host masks the count to 5 bits as the guest does), sign-extended.
+		for k in u32(0) ..< 2 {
+			off := 8 * k
+			if rt == 0 {native.mov_imm(a, .A, 0)} else {native.state_load(a, .A, GPR * u32(rt) + off)}
+			if rs == 0 {native.mov_imm(a, .B, 0)} else {native.state_load(a, .B, GPR * u32(rs) + off)}
+			native.alu(a, .Shl if i.op == .PSLLVW else .Shr if i.op == .PSRLVW else .Sar, .A, .B)
+			native.state_store(a, GPR * u32(rd) + off, .A)
+			native.alu_imm(a, .Sar, .A, 31)
+			native.state_store(a, GPR * u32(rd) + off + 4, .A)
+		}
+	case .PEXT5, .PPAC5:
+		if rd == 0 {return true}
+		// Each field of rt's words (bit, width) isolated by a shift up and
+		// one down, moved to its place and ORed into V1.
+		Field :: struct {from, n, to: u32}
+		EXT :: [4]Field{{0, 5, 3}, {5, 5, 11}, {10, 5, 19}, {15, 1, 31}}
+		PAC :: [4]Field{{3, 5, 0}, {11, 5, 5}, {19, 5, 10}, {31, 1, 15}}
+		native.vec_load(a, .V0, GPR * u32(rt))
+		for f, k in (EXT if i.op == .PEXT5 else PAC) {
+			t: native.Vreg = .V1 if k == 0 else .V4
+			native.vec_copy(a, t, .V0)
+			native.vec_shift32(a, .Shl, t, 32 - f.from - f.n)
+			native.vec_shift32(a, .Shr, t, 32 - f.n)
+			native.vec_shift32(a, .Shl, t, f.to)
+			if k != 0 {native.vec_op(a, .Or, .V1, .V4)}
+		}
+		native.vec_store(a, GPR * u32(rd), .V1)
+	case .PADSBH:
+		if rd == 0 {return true}
+		// rs - rt in the low doubleword, rs + rt in the high
+		native.vec_load(a, .V0, GPR * u32(rs))
+		native.vec_load(a, .V1, GPR * u32(rt))
+		native.vec_copy(a, .V4, .V0)
+		native.vec_op(a, .Sub16, .V0, .V1)
+		native.vec_op(a, .Add16, .V4, .V1)
+		native.vec_op(a, .Zip_Hi64, .V4, .V4)
+		native.vec_op(a, .Zip_Lo64, .V0, .V4)
+		native.vec_store(a, GPR * u32(rd), .V0)
 	case .PHMADH:
 		// As the interpreter: the sums v in rd, and the product of the odd
 		// halfwords alone, a, with them in LO = {v0, a0, v2, a2} and

@@ -289,6 +289,10 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 		fmt.sbprint(&sb, ")")
 		return strings.to_string(sb)
 	}
+	// each word of rt, masked by m, then shifted left (or right) by n
+	field :: proc(m: u32, n: u8, right := false) -> string {
+		return fmt.tprintf("intrinsics.simd_%s(t.vw & #simd[4]u32{{%d, %d, %d, %d}}, #simd[4]u32{{%s}})", right ? "shr" : "shl", m, m, m, m, splat(4, n))
+	}
 	evens :: proc(n: int) -> []int {
 		idx := make([]int, n, context.temp_allocator)
 		for k in 0 ..< n {idx[k] = 2 * k}
@@ -356,6 +360,19 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .PSRAW:
 		view = "vw"
 		expr = fmt.tprintf("transmute(#simd[4]u32)intrinsics.simd_shr(transmute(#simd[4]i32)t.vw, #simd[4]u32{{%s}})", splat(4, u8(i.sa)))
+	// The low word of each doubleword of rt shifted by that of rs, sign-extended
+	case .PSLLVW: view, expr = "d", "{sx32(t.w[0] << (s.w[0] & 31)), sx32(t.w[2] << (s.w[2] & 31))}"
+	case .PSRLVW: view, expr = "d", "{sx32(t.w[0] >> (s.w[0] & 31)), sx32(t.w[2] >> (s.w[2] & 31))}"
+	case .PSRAVW: view, expr = "d", "{sx32(u32(t.sw[0] >> (s.w[0] & 31))), sx32(u32(t.sw[2] >> (s.w[2] & 31)))}"
+	// 1-5-5-5 colors to 8-bit channels and back, each field moved in place
+	case .PEXT5:
+		view = "vw"
+		expr = fmt.tprintf("%s | %s | %s | %s", field(0x1f, 3), field(0x3e0, 6), field(0x7c00, 9), field(0x8000, 16))
+	case .PPAC5:
+		view = "vw"
+		expr = fmt.tprintf("%s | %s | %s | %s", field(0xf8, 3, true), field(0xf800, 6, true), field(0xf80000, 9, true), field(0x80000000, 16, true))
+	// rs - rt in halfwords 0-3, rs + rt in 4-7
+	case .PADSBH: view, expr = "vuh", "intrinsics.simd_shuffle(s.vuh - t.vuh, s.vuh + t.vuh, 0, 1, 2, 3, 12, 13, 14, 15)"
 	case .PHMADH:
 		// As the interpreter: LO and HI are written when rd is 0 too.
 		rd := i.rd == 0 ? "" : fmt.tprintf("; c.r[%d].w = {{c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2]}}", i.rd)
@@ -391,8 +408,9 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	if i.rd == 0 {return true}
 	#partial switch i.op {
 	case .PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW, .PCPYH, .PABSH, .PABSW,
-	     .PEXEH, .PREVH, .PEXCH, .PEXEW, .PROT3W, .PEXCW:
-		// shifts by sa, PCPYH, the absolute values and the permutes read rt only
+	     .PEXEH, .PREVH, .PEXCH, .PEXEW, .PROT3W, .PEXCW, .PEXT5, .PPAC5:
+		// shifts by sa, PCPYH, the absolute values, the permutes and the
+		// color packs read rt only
 		append(out, fmt.tprintf("{{t := c.r[%d]; c.r[%d].%s = %s}}", i.rt, i.rd, view, expr))
 	case:
 		append(out, fmt.tprintf("{{s, t := c.r[%d], c.r[%d]; c.r[%d].%s = %s}}", i.rs, i.rt, i.rd, view, expr))
