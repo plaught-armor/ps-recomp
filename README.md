@@ -38,7 +38,16 @@ a `recomp` options file, and any per-game code.
 ```sh
 odin build recomp -collection:ps=. -out:recomp-bin
 ./recomp-bin path/to/recomp.tsv
+./recomp-bin path/to/game.cue [source dir]
 ```
+
+Given a disc image (a `.cue` sheet, or a single-track `.bin` or `.iso`)
+in place of an options file, recomp needs no options: it compiles the
+executable `SYSTEM.CNF` names to machine code for the host, into
+`<serial>.<arch>.bin` in the working directory, and to Odin source too
+when given a source directory. Code the executable loads from other files
+(PS1 overlays) is not found; an ELF without `.text` has its executable
+sections compiled whole, data in them included.
 
 The options file is tab-separated: a `key<TAB>value` header row, then one
 option per row; lines starting with `#` are comments. `backend` (`r3000` or
@@ -133,12 +142,16 @@ With `disc`, the path of the user's disc image (a `.cue` sheet, or a
 single-track `.bin` or `.iso`), `exe` is read from the image: it is a path
 on the disc, and left out it is the executable `SYSTEM.CNF` names.
 
-For `r5900`, give `exe` (the ELF), `out`, `runtime` (`ps:ps2`),
-`cycles_per_insn` and `package_insns`; the code range defaults to the
-ELF's `.text`, or give `code_lo` and `code_hi`, or, for code split by data,
-`code_ranges`: the path of a tab-separated file with a `lo<TAB>hi` header
-row and one hex range per row, in ascending order. `overlays` (PS1) also
-needs `package_insns`.
+Without `code_lo` and `code_hi`, the PS-X EXE's whole text segment is
+code. Without `out` no Odin source is written; `runtime`,
+`cycles_per_insn` and `package_insns` have defaults, named in the
+backend's header comment.
+
+For `r5900`, give `exe` (the ELF), `out` and `runtime` (`ps:ps2`); the
+code range defaults to the ELF's `.text`, or give `code_lo` and `code_hi`,
+or, for code split by data, `code_ranges`: the path of a tab-separated
+file with a `lo<TAB>hi` header row and one hex range per row, in
+ascending order.
 
 PS1 (imports `psx "ps:psx"`): pass the path of the disc image (a `.cue`
 sheet, or a single-track `.bin` or `.iso`) and the generated functions to

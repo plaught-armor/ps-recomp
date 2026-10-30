@@ -37,6 +37,41 @@ word :: proc(img: Image, addr: u32) -> (u32, bool) {
 	return u32le(img.data, int(o)), true
 }
 
+// The options for a disc image alone: the backend SYSTEM.CNF's executable
+// needs, machine code for this host into <serial>.<arch>.bin (the executable's
+// name when it has no serial) and, given source, Odin source there; the
+// backends default the rest.
+disc_options :: proc(image, source: string) -> Options {
+	d, ok := disc.open(image)
+	if !ok {
+		fail("%s: not a disc image", image)
+	}
+	defer disc.close(&d)
+	cnf, found := disc.system_cnf(&d)
+	if !found {
+		fail("%s: no SYSTEM.CNF naming the executable", image)
+	}
+	o := Options {
+		path = image,
+	}
+	o.values["backend"] = cnf.ps2 ? "r5900" : "r3000"
+	o.values["disc"] = image
+	o.values["quiet"] = "true"
+	o.values["native_arch"] = HOST_ARCH
+	name := cnf.serial
+	if name == "" {
+		name = cnf.boot[strings.last_index_byte(cnf.boot, '/') + 1:]
+	}
+	o.values["native_out"] = fmt.aprintf("%s.%s.bin", name, HOST_ARCH)
+	if source != "" {
+		o.values["out"] = source
+	}
+	return o
+}
+
+// The native_arch of the machine recomp runs on.
+HOST_ARCH :: "arm64" when ODIN_ARCH == .arm64 else "x64_win" when ODIN_OS == .Windows else "x64_sysv"
+
 // The executable's bytes and its name: option `exe`, a file; or, with
 // option `disc` (a .cue sheet, or a single-track .bin or .iso), the file at
 // disc path `exe` on that image, by default the one SYSTEM.CNF names.

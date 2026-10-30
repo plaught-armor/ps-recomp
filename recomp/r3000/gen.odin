@@ -6,12 +6,16 @@
 //   disc             optional: a disc image (a .cue sheet, or a
 //                    single-track .bin or .iso) to read exe from; overlays
 //                    stay files
-//   out              output directory (exe.odin, ovl_NN/funcs.odin,
-//                    overlays.odin)
-//   runtime          import path of the psx runtime package, relative to out
-//   code_lo, code_hi the executable's code range (hex); the rest is data
-//   cycles_per_insn  average cost per instruction including memory stalls
-//   package_insns    instructions per generated overlay package
+//   out              optional: output directory (exe.odin, ovl_NN/funcs.odin,
+//                    overlays.odin); without it no Odin source is written
+//   runtime          import path of the psx runtime package, relative to
+//                    out; by default ps:psx
+//   code_lo, code_hi optional: the executable's code range (hex), the rest
+//                    data; by default the whole text segment
+//   cycles_per_insn  optional: average cost per instruction including memory
+//                    stalls; by default CYCLES_PER_INSN
+//   package_insns    optional: instructions per generated overlay package;
+//                    by default PACKAGE_INSNS
 //   overlays         optional: directory with manifest.tsv (file, slot)
 //   funcs            optional: listed entries (space, entry); space is `ram`
 //                    for the executable, else an overlay's file name less .bin
@@ -58,6 +62,12 @@ Overlay :: struct {
 	img:  mips.Image,
 }
 
+// The defaults of cycles_per_insn and package_insns: the PS1 port's values.
+// Timing loops in the PsyQ libraries (VSync timeout, CD waits) assume about
+// 2 cycles per instruction.
+CYCLES_PER_INSN :: 2
+PACKAGE_INSNS :: 50000
+
 @(private = "file")
 Package :: struct {
 	name: string,
@@ -85,9 +95,9 @@ Program :: struct {
 generate :: proc(o: mips.Options) {
 	p: Program
 	p.exe = mips.load_psx_exe(o)
-	p.out = mips.option(o, "out")
-	p.runtime = mips.option(o, "runtime")
-	p.cycles = mips.parse_int(mips.option(o, "cycles_per_insn"))
+	p.out = mips.option_or(o, "out", "")
+	p.runtime = mips.option_or(o, "runtime", "ps:psx")
+	p.cycles = mips.parse_int(mips.option_or(o, "cycles_per_insn", fmt.tprint(CYCLES_PER_INSN)))
 	p.quiet = mips.option_or(o, "quiet", "") == "true"
 	if s := mips.option_or(o, "native_arch", ""); s != "" {
 		arch, ok := native.parse_arch(s)
@@ -128,7 +138,10 @@ generate :: proc(o: mips.Options) {
 		}
 		p.patches = patches[:]
 	}
-	code_lo, code_hi := mips.parse_hex(mips.option(o, "code_lo")), mips.parse_hex(mips.option(o, "code_hi"))
+	code_lo, code_hi := mips.image_range(p.exe)
+	if s := mips.option_or(o, "code_lo", ""); s != "" {
+		code_lo, code_hi = mips.parse_hex(s), mips.parse_hex(mips.option(o, "code_hi"))
+	}
 	// References into any module's code: data words and lui pairs anywhere.
 	lo, hi := code_lo, code_hi
 	for ov in p.overlays {
@@ -141,7 +154,7 @@ generate :: proc(o: mips.Options) {
 	}
 	recomp_exe(&p, code_lo, code_hi)
 	if p.overlays != nil {
-		recomp_overlays(&p, mips.parse_int(mips.option(o, "package_insns")))
+		recomp_overlays(&p, mips.parse_int(mips.option_or(o, "package_insns", fmt.tprint(PACKAGE_INSNS))))
 	}
 	if p.code != nil {
 		path := mips.option(o, "native_out")
@@ -200,8 +213,10 @@ recomp_exe :: proc(p: ^Program, code_lo, code_hi: u32) {
 		line(&b, "\t{{%s, %s}},", hexu(f.entry), names[k])
 	}
 	line(&b, "}")
-	mips.make_dirs(p.out)
-	mips.write_file(mips.join(p.out, "exe.odin"), b.buf[:])
+	if p.out != "" {
+		mips.make_dirs(p.out)
+		mips.write_file(mips.join(p.out, "exe.odin"), b.buf[:])
+	}
 	fmt.printfln("exe: %d functions, %d instructions", len(funcs), n)
 }
 
@@ -278,6 +293,10 @@ recomp_overlays :: proc(p: ^Program, package_insns: int) {
 			append(&cur.rows, fmt.aprintf("\t{{%s, %s, %s, {{%s}}, %s}},", hexu(f.entry), hexu(slot), hexu(ov_id), strings.join(sig[:], ", "), ref))
 		}
 	}
+	fmt.printfln("overlays: %d packages, %d unique functions, %d instructions", len(packages), len(emitted), total)
+	if p.out == "" {
+		return
+	}
 	for pkg in packages {
 		dir := mips.join(p.out, pkg.name)
 		mips.make_dirs(dir)
@@ -318,5 +337,4 @@ recomp_overlays :: proc(p: ^Program, package_insns: int) {
 	}
 	line(&b, "}")
 	mips.write_file(mips.join(p.out, "overlays.odin"), b.buf[:])
-	fmt.printfln("overlays: %d packages, %d unique functions, %d instructions", len(packages), len(emitted), total)
 }
