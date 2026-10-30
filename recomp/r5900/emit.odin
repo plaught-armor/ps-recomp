@@ -229,7 +229,8 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .SQ: append(out, fmt.tprintf("wr128(%s, %s)", addr_expr(i), rt == 0 ? "u128(0)" : fmt.tprintf("c.r[%d].q", rt)))
 	case .LWC1: append(out, fmt.tprintf("c.f[%d].u = rd32(%s)", rt, addr_expr(i)))
 	case .SWC1: append(out, fmt.tprintf("wr32(%s, c.f[%d].u)", addr_expr(i), rt))
-	case .LQC2: append(out, fmt.tprintf("vu.vu0_set_vf(%d, rd128(%s))", rt, addr_expr(i)))
+	// vu.vu0_set_vf: VF0 stays, the read still happens (it may be I/O)
+	case .LQC2: append(out, rt == 0 ? fmt.tprintf("_ = rd128(%s)", addr_expr(i)) : fmt.tprintf("vu.vu0.vf[%d].q = rd128(%s)", rt, addr_expr(i)))
 	case .SQC2: append(out, fmt.tprintf("wr128(%s, vu.vu0.vf[%d].q)", addr_expr(i), rt))
 	case .LWL, .LWR, .LDL, .LDR:
 		if rt != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = mem.%v(%s, %s)", rt, i.op, addr_expr(i), R64(rt)))}

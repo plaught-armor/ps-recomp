@@ -4,7 +4,7 @@
 // inlines (every MMI and SPECIAL word the decoder maps to a covered op, the
 // MADD family, the immediate ops and REGIMM traps at each of IMMS, MFC0,
 // TLBR, TLBWI, TLBWR, TLBP, MFC1, MTC1, SQRT.S,
-// RSQRT.S, MUL.S, MULA.S, MADD.S, DIV.S, CVT.W.S, QMTC2, MFSA, MTSA, MTSAB
+// RSQRT.S, MUL.S, MULA.S, MADD.S, DIV.S, CVT.W.S, QMTC2, LQC2, MFSA, MTSA, MTSAB
 // and MTSAH, with rd 0,
 // rs/rt 0 and aliased registers, and every shift amount for the shifts by
 // sa), then runs it with `odin run`. Each case runs
@@ -40,7 +40,7 @@ COVERED :: Ops{
 	.PSLLH, .PSRLH, .PSRAH, .PAND, .POR, .PXOR, .PNOR, .PCPYLD, .PCPYUD, .PCPYH,
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
 	.PADDSH, .PADDUW, .PSRAW, .PHMADH, .MADD, .MADDU, .MADD1, .MADDU1, .MTHI1, .MTLO1, .SQRT_S, .RSQRT_S,
-	.MUL_S, .MULA_S, .MADD_S, .DIV_S, .CVT_W_S, .QMTC2, .MFSA, .MTSA, .MTSAB, .MTSAH,
+	.MUL_S, .MULA_S, .MADD_S, .DIV_S, .CVT_W_S, .QMTC2, .LQC2, .MFSA, .MTSA, .MTSAB, .MTSAH,
 	.QFSRV, .PLZCW, .MFHI1, .MFLO1, .MULT1, .MULTU1, .DIV1, .DIVU1,
 	.MTC0, .ERET, .CFC1, .CTC1, .C_F_S,
 	.PADDSB, .PSUBSB, .PSUBSH, .PADDSW, .PSUBSW, .PADDUH, .PSUBUH, .PSUBUB, .PSUBUW,
@@ -96,6 +96,11 @@ main :: proc() {
 		}
 		// CVT.W.S f[rd] = f[rs]; QMTC2 vf[rd] = rt
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[0] << 11 | r[2] << 6 | 0x24, 0x12 << 26 | 0x05 << 21 | r[1] << 16 | r[2] << 11)
+		// LQC2 vf[rt] = (base + imm), the harness pointing the base into
+		// the scratchpad; a base of r0 would read below RAM
+		if r[0] != 0 {
+			for imm in ([?]u32{0, 0x0017, 0xfff0}) {append(&words, 0x36 << 26 | r[0] << 21 | r[1] << 16 | imm)}
+		}
 		// MFSA to rd; MTSA, MTSAB and MTSAH from rs
 		append(&words, r[2] << 11 | 0x28)
 		append(&words, r[0] << 21 | 0x29)
@@ -298,6 +303,11 @@ main :: proc() {
 				}
 			}
 			taken := trap && trap_taken(c.w, &init)
+			if op == .LQC2 {
+				// base + imm somewhere in the scratchpad, any low bits
+				init.r[(c.w >> 21) & 31].w[0] = mem.SPR_BASE + rand.uint32() % (mem.SPR_SIZE - 32) + 16 - u32(i32(i16(c.w)))
+				for k in 0 ..< mem.SPR_SIZE / 16 {(^u128)(&mem.spr[k * 16])^ = rand.uint128()}
+			}
 			vf: [32]vu.Vf
 			for k in 1 ..< 32 {vf[k].q = rand.uint128()}
 			cpu.state = init
