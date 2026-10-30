@@ -24,9 +24,11 @@ Gpr :: struct #raw_union {
 	sb: [16]i8,
 	// SIMD views for MMI instructions the recompiler emits inline
 	vw: #simd[4]u32,
+	vsw: #simd[4]i32,
 	vh: #simd[8]i16,
 	vuh: #simd[8]u16,
 	vb: #simd[16]u8,
+	vsb: #simd[16]i8,
 }
 
 Fpr :: struct #raw_union {

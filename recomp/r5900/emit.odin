@@ -281,6 +281,14 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 		for k in 0 ..< n / 2 {idx[2 * k], idx[2 * k + 1] = base + k, n + base + k}
 		return idx
 	}
+	// rt's lanes in the order idx gives them
+	perm :: proc(view: string, idx: []int) -> string {
+		sb := strings.builder_make(context.temp_allocator)
+		fmt.sbprintf(&sb, "intrinsics.simd_shuffle(t.%s, t.%s", view, view)
+		for k in idx {fmt.sbprintf(&sb, ", %d", k)}
+		fmt.sbprint(&sb, ")")
+		return strings.to_string(sb)
+	}
 	evens :: proc(n: int) -> []int {
 		idx := make([]int, n, context.temp_allocator)
 		for k in 0 ..< n {idx[k] = 2 * k}
@@ -318,6 +326,24 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .PADDUB: view, expr = "vb", call("simd_saturating_add", "vb")
 	case .PADDSH: view, expr = "vh", call("simd_saturating_add", "vh")
 	case .PADDUW: view, expr = "vw", call("simd_saturating_add", "vw")
+	case .PADDSB: view, expr = "vsb", call("simd_saturating_add", "vsb")
+	case .PSUBSB: view, expr = "vsb", call("simd_saturating_sub", "vsb")
+	case .PSUBSH: view, expr = "vh", call("simd_saturating_sub", "vh")
+	case .PADDSW: view, expr = "vsw", call("simd_saturating_add", "vsw")
+	case .PSUBSW: view, expr = "vsw", call("simd_saturating_sub", "vsw")
+	case .PADDUH: view, expr = "vuh", call("simd_saturating_add", "vuh")
+	case .PSUBUH: view, expr = "vuh", call("simd_saturating_sub", "vuh")
+	case .PSUBUB: view, expr = "vb", call("simd_saturating_sub", "vb")
+	case .PSUBUW: view, expr = "vw", call("simd_saturating_sub", "vw")
+	case .PMAXW: view, expr = "vsw", call("simd_max", "vsw")
+	case .PMINW: view, expr = "vsw", call("simd_min", "vsw")
+	case .PCGTB: view, expr = "vb", call("simd_lanes_gt", "vsb")
+	case .PCGTW: view, expr = "vw", call("simd_lanes_gt", "vsw")
+	case .PCEQB: view, expr = "vb", call("simd_lanes_eq", "vb")
+	case .PCEQW: view, expr = "vw", call("simd_lanes_eq", "vw")
+	// |rt| saturating: the larger of rt and 0 - rt saturated
+	case .PABSH: view, expr = "vh", "intrinsics.simd_max(t.vh, intrinsics.simd_saturating_sub(#simd[8]i16{}, t.vh))"
+	case .PABSW: view, expr = "vsw", "intrinsics.simd_max(t.vsw, intrinsics.simd_saturating_sub(#simd[4]i32{}, t.vsw))"
 	case .PMAXH: view, expr = "vh", call("simd_max", "vh")
 	case .PMINH: view, expr = "vh", call("simd_min", "vh")
 	case .PCGTH: view, expr = "vuh", call("simd_lanes_gt", "vh") // u16 lanes already
@@ -325,6 +351,8 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .PSLLH: view, expr = "vuh", fmt.tprintf("intrinsics.simd_shl(t.vuh, #simd[8]u16{{%s}})", splat(8, sh))
 	case .PSRLH: view, expr = "vuh", fmt.tprintf("intrinsics.simd_shr(t.vuh, #simd[8]u16{{%s}})", splat(8, sh))
 	case .PSRAH: view, expr = "vh", fmt.tprintf("intrinsics.simd_shr(t.vh, #simd[8]u16{{%s}})", splat(8, sh))
+	case .PSLLW: view, expr = "vw", fmt.tprintf("intrinsics.simd_shl(t.vw, #simd[4]u32{{%s}})", splat(4, u8(i.sa)))
+	case .PSRLW: view, expr = "vw", fmt.tprintf("intrinsics.simd_shr(t.vw, #simd[4]u32{{%s}})", splat(4, u8(i.sa)))
 	case .PSRAW:
 		view = "vw"
 		expr = fmt.tprintf("transmute(#simd[4]u32)intrinsics.simd_shr(transmute(#simd[4]i32)t.vw, #simd[4]u32{{%s}})", splat(4, u8(i.sa)))
@@ -348,13 +376,23 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	case .PPACB:  view, expr = "vb", shuffle("vb", evens(16))
 	case .PPACH:  view, expr = "vuh", shuffle("vuh", evens(8))
 	case .PCPYH:  view, expr = "vuh", "intrinsics.simd_shuffle(t.vuh, t.vuh, 0, 0, 0, 0, 4, 4, 4, 4)"
+	case .PPACW:  view, expr = "vw", shuffle("vw", evens(4))
+	case .PINTH:  view, expr = "vuh", shuffle("vuh", {0, 12, 1, 13, 2, 14, 3, 15})
+	case .PINTEH: view, expr = "vuh", shuffle("vuh", {0, 8, 2, 10, 4, 12, 6, 14})
+	case .PEXEH:  view, expr = "vuh", perm("vuh", {2, 1, 0, 3, 6, 5, 4, 7})
+	case .PREVH:  view, expr = "vuh", perm("vuh", {3, 2, 1, 0, 7, 6, 5, 4})
+	case .PEXCH:  view, expr = "vuh", perm("vuh", {0, 2, 1, 3, 4, 6, 5, 7})
+	case .PEXEW:  view, expr = "vw", perm("vw", {2, 1, 0, 3})
+	case .PROT3W: view, expr = "vw", perm("vw", {1, 2, 0, 3})
+	case .PEXCW:  view, expr = "vw", perm("vw", {0, 2, 1, 3})
 	case .QFSRV:  view, expr = "q", "c.sa == 0 ? t.q : (t.q >> c.sa) | (s.q << (128 - c.sa))"
 	case: return false
 	}
 	if i.rd == 0 {return true}
 	#partial switch i.op {
-	case .PSLLH, .PSRLH, .PSRAH, .PSRAW, .PCPYH:
-		// shifts by sa and PCPYH read rt only
+	case .PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW, .PCPYH, .PABSH, .PABSW,
+	     .PEXEH, .PREVH, .PEXCH, .PEXEW, .PROT3W, .PEXCW:
+		// shifts by sa, PCPYH, the absolute values and the permutes read rt only
 		append(out, fmt.tprintf("{{t := c.r[%d]; c.r[%d].%s = %s}}", i.rt, i.rd, view, expr))
 	case:
 		append(out, fmt.tprintf("{{s, t := c.r[%d], c.r[%d]; c.r[%d].%s = %s}}", i.rs, i.rt, i.rd, view, expr))

@@ -36,9 +36,12 @@ COVERED :: Ops{
 	.MUL_S, .MULA_S, .MADD_S, .MFSA, .MTSA, .MTSAB, .MTSAH,
 	.QFSRV, .PLZCW, .MFHI1, .MFLO1, .MULT1, .MULTU1, .DIV1, .DIVU1,
 	.MTC0, .ERET, .CFC1, .CTC1, .C_F_S,
+	.PADDSB, .PSUBSB, .PSUBSH, .PADDSW, .PSUBSW, .PADDUH, .PSUBUH, .PSUBUB, .PSUBUW,
+	.PCGTB, .PCGTW, .PCEQB, .PCEQW, .PMAXW, .PMINW, .PABSH, .PABSW, .PSLLW, .PSRLW,
+	.PPACW, .PINTH, .PINTEH, .PEXEH, .PEXEW, .PREVH, .PROT3W, .PEXCH, .PEXCW,
 }
 // The shifts by sa: every amount gets a case.
-BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSRAW}
+BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW}
 
 main :: proc() {
 	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}} // rs, rt, rd
