@@ -134,7 +134,7 @@ pmsubh :: proc(rd, rs, rt: u8) {pmulh(.Msub, rd, rs, rt)}
 
 // PHMADH and PHMSBH: for each word, the product of the odd halfwords a plus
 // or less that of the even ones, with LO = {v0, a0, v2, a2} and
-// HI = {v1, a1, v3, a3}.
+// HI = {v1, a1, v3, a3}. PHMSBH's odd words hold the complement ~a.
 @(private = "file")
 phm :: proc(add: bool, rd, rs, rt: u8) #no_bounds_check {
 	s, t := state.r[rs & 31], state.r[rt & 31]
@@ -144,7 +144,7 @@ phm :: proc(add: bool, rd, rs, rt: u8) #no_bounds_check {
 		v := add ? a + b : a - b
 		dst := (k & 1) != 0 ? &state.hi : &state.lo
 		dst.sw[(k >> 1) * 2] = v
-		dst.sw[(k >> 1) * 2 + 1] = a
+		dst.sw[(k >> 1) * 2 + 1] = add ? a : ~a
 	}
 	if rd != 0 {state.r[rd & 31].w = {state.lo.w[0], state.hi.w[0], state.lo.w[2], state.hi.w[2]}}
 }

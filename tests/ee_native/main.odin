@@ -876,9 +876,21 @@ main :: proc() {
 		// PMFHL.SLW: 2^31 and -2^32 + max(i32) saturate
 		{mmi(0x30, 2), {}, {}, {0x80000000, 0, 0x7fffffff, 0}, {0, 0, 0xffffffff, 0},
 		 {0x7fffffff, 0, 0x80000000, 0xffffffff}, {0x80000000, 0, 0x7fffffff, 0}, {0, 0, 0xffffffff, 0}},
-		// PHMSBH: 3 * 11 - 2 * 7, 5 * 1 - 4 * 1, -0x8000 * 1 - -0x8000 * -0x8000, 1 * 1 - 1 * 2
+		// PHMSBH: 3 * 11 - 2 * 7, 5 * 1 - 4 * 1, -0x8000 * 1 - -0x8000 * -0x8000, 1 * 1 - 1 * 2;
+		// the odd words of LO and HI the complements of 33, 5, -0x8000 and 1
 		{mmi(0x09, 0x15), {0x00030002, 0x00050004, 0x80008000, 0x00010001}, {0x000b0007, 0x00010001, 0x00018000, 0x00010002}, {}, {},
-		 {19, 1, 0xbfff8000, 0xffffffff}, {19, 33, 0xbfff8000, 0xffff8000}, {1, 5, 0xffffffff, 1}},
+		 {19, 1, 0xbfff8000, 0xffffffff}, {19, 0xffffffde, 0xbfff8000, 0x00007fff}, {1, 0xfffffffa, 0xffffffff, 0xfffffffe}},
+		// PDIVBW: min(i32) / -1, 7 / -1, -7 / -1 and 0 / -1, the divisor rt's
+		// low halfword alone
+		{mmi(0x09, 0x1d), {0x80000000, 7, 0xfffffff9, 0}, {0x1234ffff, 0, 0, 0}, {}, {},
+		 {}, {0x80000000, 0xfffffff9, 7, 0}, {}},
+		// PDIVBW by zero: the quotient 1 for a negative word, -1 for the rest;
+		// the remainder the word
+		{mmi(0x09, 0x1d), {5, 0xfffffffb, 0, 0x80000000}, {0xabcd0000, 0, 0, 0}, {}, {},
+		 {}, {0xffffffff, 1, 0xffffffff, 1}, {5, 0xfffffffb, 0, 0x80000000}},
+		// DIV1: min(i32) / -1 into LO and HI's upper halves; the lower stay
+		{mmi(0x1a), {0x80000000, 0, 0, 0}, {0xffffffff, 0, 0, 0}, {1, 2, 3, 4}, {5, 6, 7, 8},
+		 {}, {1, 2, 0x80000000, 0xffffffff}, {5, 6, 0, 0}},
 	}
 	for v in fixed {
 		cpu.state = {}
