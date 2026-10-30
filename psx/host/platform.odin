@@ -61,7 +61,7 @@ host: struct {
 	// frozen-time pass (shown in place, not copied). Nil while it is a GL
 	// frame slot's still converting: read it through frame_pixels.
 	frame:       []u32,
-	// The GL frame slot the picture is the buffer of (gl_frame_take), or -1.
+	// The GPU frame slot the picture is the buffer of (gpu_frame_take), or -1.
 	frame_slot:  int,
 	// The GL conversions (Gl_Frame.mark) of this present's picture and the
 	// last one's, -1 when none.
@@ -501,11 +501,11 @@ convert_area :: proc(x, y, w, h: i32, depth24: bool, dst: []u32, extra_step := -
 		convert_rows(&c, 0, h)
 		return
 	}
-	if !depth24 && render.shown_target().gl {
+	if !depth24 && render.gpu_frames() {
 		// The GPU converts into its own buffer, which is shown as is
 		// (convert_display, extra_due); dst is left alone.
 		slot := extra_step >= 0 ? extra_step : render.EXTRA_FRAMES
-		render.gl_frame(slot, x << k, y << k, w << k, h << k)
+		render.gpu_frame(slot, x << k, y << k, w << k, h << k)
 		return
 	}
 	render.raster_sync()
@@ -610,21 +610,21 @@ convert_display :: proc() {
 	} else {
 		host.frame, host.frame_slot = host.converted, -1
 		convert_area(gpu.display.x, gpu.display.y, gpu.display.w, gpu.display.h, gpu.display.depth24, host.frame)
-		if render.shown_target().gl && !gpu.display.depth24 && render.shown_target().shift > 0 {
+		if render.gpu_frames() && !gpu.display.depth24 && render.shown_target().shift > 0 {
 			host.frame, host.frame_slot = nil, render.EXTRA_FRAMES
 		}
 	}
 	if host.frame_slot >= 0 {
-		host.frame_mark = render.gpu_gl.frames[host.frame_slot].mark
+		host.frame_mark = render.gpu_frame_mark(host.frame_slot)
 	}
 }
 
 // The picture this vblank shows (host.frame), waiting for the GPU to finish
-// converting it when it is a GL frame slot's.
+// converting it when it is a GPU frame slot's.
 @(private)
 frame_pixels :: proc() -> []u32 {
 	if host.frame == nil && host.frame_slot >= 0 {
-		host.frame = render.gl_frame_take(host.frame_slot)
+		host.frame = render.gpu_frame_take(host.frame_slot)
 	}
 	return host.frame
 }
@@ -804,10 +804,10 @@ frame_black :: proc() -> bool {
 		// The GPU flags each conversion with a lit pixel. Waiting for this
 		// one is only needed when the last picture was black too: a black
 		// stretch begins one present later, its first picture paced.
-		if lit, known := render.gl_frame_bright(host.last_mark); known && lit {
+		if lit, known := render.gpu_frame_bright(host.last_mark); known && lit {
 			return false
 		}
-		lit, _ := render.gl_frame_bright(host.frame_mark)
+		lit, _ := render.gpu_frame_bright(host.frame_mark)
 		return !lit
 	}
 	fw, fh := frame_size()
@@ -969,7 +969,7 @@ capture_extra_frame :: proc(x, y: i32, step: int) {
 // Decide what present shows: the extra pictures replace, in order, the
 // frames the display repeats, until the display moves to the area they were
 // drawn from (that game frame itself is now up). Repeats past the last
-// picture keep showing it. `slot` is the GL frame slot the picture is the
+// picture keep showing it. `slot` is the GPU frame slot the picture is the
 // buffer of (the picture then nil: frame_pixels waits for it), -1 in
 // software.
 @(private)
@@ -992,7 +992,7 @@ extra_due :: proc(repeat: bool) -> (picture: []u32, slot: int, due: bool) {
 	k := min(render.extra.shown, render.extra.count - 1)
 	render.extra.shown += 1
 	fw, fh := frame_size()
-	if render.shown_target().gl {
+	if render.gpu_frames() {
 		return nil, k, true
 	}
 	return render.extra.frames[k][:fw * fh], -1, true

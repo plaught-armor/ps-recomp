@@ -1,0 +1,42 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_GOOGLE_include_directive : require
+// gl_target.odin's BLOOM_CS on Vulkan (vk_frame): the glow of the area at
+// the PS1's resolution (bloom_prepare), stage 0 averaging each block of
+// glowing pixels into dst, 1 blurring src across into dst, 2 blurring it
+// down; with `every`, all pixels averaged: the depth of field's blur
+// (dof_prepare).
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "frame_pc.glsl"
+const int TAPS[9] = int[9](1, 8, 28, 56, 70, 56, 28, 8, 1);
+
+void main() {
+	int k = pc.u.size_k.z;
+	ivec4 area = pc.u.area;
+	ivec2 n = area.zw >> k;
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= n.x || p.y >= n.y) {
+		return;
+	}
+	ivec3 acc = ivec3(0);
+	if (pc.stage == 0) {
+		int s = 1 << k;
+		for (int dy = 0; dy < s; dy++) {
+			for (int dx = 0; dx < s; dx++) {
+				uint c = rgb_at(area.xy + (p << k) + ivec2(dx, dy));
+				if (pc.every != 0 || (c & 0x01000000u) != 0u) {
+					acc += lanes(c);
+				}
+			}
+		}
+		acc = (acc + ((1 << (2 * k)) >> 1)) >> (2 * k);
+	} else {
+		ivec2 d = pc.stage == 1 ? ivec2(1, 0) : ivec2(0, 1);
+		for (int i = 0; i < 9; i++) {
+			ivec2 q = clamp(p + (i - 4) * d, ivec2(0), n - 1);
+			acc += lanes(pc.src.v[q.y * n.x + q.x]) * TAPS[i];
+		}
+		acc = (acc + 128) >> 8;
+	}
+	pc.dst.v[p.y * n.x + p.x] = pack(acc);
+}

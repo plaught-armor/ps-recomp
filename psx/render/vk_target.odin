@@ -54,6 +54,34 @@ gpu_vk: struct {
 	stage:       core.Vk_Buf,
 	// The box's rows, as one buffer copy each.
 	rows:        []vk.BufferCopy,
+	// The conversions (vk_frame): frame.comp's and bloom.comp's pipelines
+	// and layout; the area's pixels copied to the device (made with the
+	// target), as two runs a row at most (copies); the glow's and the
+	// depth of field's blur stages at the PS1's resolution; the uniforms,
+	// the lit flag, and each frame slot's pixels read back.
+	frame_layout: vk.PipelineLayout,
+	frame_pipe:  vk.Pipeline,
+	bloom_pipe:  vk.Pipeline,
+	frame_rgb:   core.Vk_Buf,
+	copies:      []vk.BufferCopy,
+	glow, blur:  [2]core.Vk_Buf,
+	frame_uni:   core.Vk_Buf,
+	frame_lit:   core.Vk_Buf,
+	frames:      [EXTRA_FRAMES + 1]Vk_Frame,
+	// Whether each of the last GL_MARKS conversions has a lit pixel
+	// (conversion n's is bright[n % GL_MARKS]) and the conversions made.
+	bright:      [GL_MARKS]bool,
+	marks:       int,
+}
+
+// An area of the target converted to XRGB8888 (vk_frame): its pixels, a
+// row of w each, in buf (host-cached), and its conversion's number.
+@(private)
+Vk_Frame :: struct {
+	buf:  core.Vk_Buf,
+	px:   int,
+	w:    i32,
+	mark: int,
 }
 
 // Where each picture's plane sits in the stage: its offset, in bytes per
@@ -82,6 +110,20 @@ Vk_Draw_Uni :: struct {
 	k:     i32,
 	size:  [2]f32,
 	w:     i32,
+}
+
+// frame.comp's and bloom.comp's uniforms (shaders/frame_pc.glsl).
+@(private = "file")
+Vk_Frame_Uni :: struct {
+	area, size_k, fx, dof, vig: [4]i32,
+	grade:                      [4][4]i32,
+}
+
+// frame.comp's and bloom.comp's push constants (shaders/frame_pc.glsl).
+@(private = "file")
+Vk_Frame_Push :: struct {
+	rgb, src, dst, glow, blur, px, bright, uni: vk.DeviceAddress,
+	stage, every:                               i32,
 }
 
 // draw.vert's and draw.frag's push constants (shaders/draw_pc.glsl).
@@ -148,6 +190,15 @@ vk_init :: proc() -> bool {
 		masks := [3]vk.ColorComponentFlags{ALL, tag == 1 ? ALL : {}, tag == 1 ? ALL : {}}
 		g.draw[tag] = core.vk_draw_pipeline(#load("shaders/draw.vert.spv"), #load("shaders/draw.frag.spv"), g.layout, formats[:], masks[:])
 	}
+	g.frame_layout = core.vk_layout_create({.COMPUTE}, size_of(Vk_Frame_Push))
+	g.frame_pipe = core.vk_compute_pipeline(#load("shaders/frame.comp.spv"), g.frame_layout)
+	g.bloom_pipe = core.vk_compute_pipeline(#load("shaders/bloom.comp.spv"), g.frame_layout)
+	for i in 0 ..< 2 {
+		g.glow[i] = core.vk_buf_create(VRAM_W * VRAM_H * 4, {.STORAGE_BUFFER}, {.DEVICE_LOCAL})
+		g.blur[i] = core.vk_buf_create(VRAM_W * VRAM_H * 4, {.STORAGE_BUFFER}, {.DEVICE_LOCAL})
+	}
+	g.frame_uni = core.vk_buf_create(size_of(Vk_Frame_Uni), {.STORAGE_BUFFER}, HOST)
+	g.frame_lit = core.vk_buf_create(size_of(u32), {.STORAGE_BUFFER}, HOST)
 	g.cmd, g.fence = core.vk_cmd_create()
 	g.prims = core.vk_buf_create(size_of(prim_queue.prims), {.STORAGE_BUFFER}, HOST)
 	g.ports = core.vk_buf_create(size_of(prim_queue.portals), {.STORAGE_BUFFER}, HOST)
@@ -256,6 +307,8 @@ vk_target_make :: proc(t: ^Target) {
 	// Zeroed, as make's planes are: new memory's contents are undefined.
 	mem.zero(g.stage.ptr, n * VK_STAGE)
 	g.rows = make([]vk.BufferCopy, t.h)
+	g.frame_rgb = core.vk_buf_create(n * 4, {.STORAGE_BUFFER, .TRANSFER_DST}, {.DEVICE_LOCAL})
+	g.copies = make([]vk.BufferCopy, 2 * t.h)
 	t.rgb = vk_plane(u32, VK_IMAGES[0].x, n)
 	t.walk = vk_plane(u16, VK_IMAGES[1].x, n)
 	t.door = vk_plane(u8, VK_IMAGES[2].x, n)
@@ -310,8 +363,10 @@ vk_target_drop :: proc(t: ^Target) {
 		vk_buf_free(&b)
 	}
 	vk_buf_free(&g.stage)
+	vk_buf_free(&g.frame_rgb)
 	delete(g.rows)
-	g.rows = nil
+	delete(g.copies)
+	g.rows, g.copies = nil, nil
 	g.img, g.view, g.mem = {}, {}, {}
 }
 
@@ -557,4 +612,131 @@ vk_target_submit :: proc() #no_bounds_check {
 		}
 	}
 	queue_reset()
+}
+
+// Convert the target's picture over the area (target pixels, wrapping) to
+// XRGB8888 (convert_area) in frame slot `slot`, as gl_frame does, and wait
+// for it: the planes are read as they stand after raster_sync.
+@(private)
+vk_frame :: proc(slot: int, x, y, w, h: i32) {
+	g := &gpu_vk
+	t := shown_target()
+	f := &g.frames[slot]
+	assert(t.vk, "a Vulkan conversion of a target not on the device")
+	assert(w > 0 && h > 0 && w <= t.w && h <= t.h, "conversion area outside the target")
+	raster_sync()
+	px := int(w * h)
+	if f.buf.size < px * 4 {
+		if f.buf.buf != 0 {
+			vk_buf_free(&f.buf)
+		}
+		f.buf = core.vk_buf_create(px * 4, {.STORAGE_BUFFER}, CACHED)
+	}
+	f.px, f.w, f.mark = px, w, g.marks
+	g.marks += 1
+	post := post_now()
+	cols: [4][4]i32
+	for j in 0 ..< 3 {
+		cols[j] = {post.grade.m[0][j], post.grade.m[1][j], post.grade.m[2][j], 0}
+	}
+	cols[3] = {post.grade.add[0], post.grade.add[1], post.grade.add[2], 0}
+	(^Vk_Frame_Uni)(g.frame_uni.ptr)^ = {
+		area   = {x, y, w, h},
+		size_k = {t.w, t.h, i32(t.shift), 0},
+		fx     = {i32(bloom_effects), BLOOM_GAIN, i32(post.grade.on), 0},
+		dof    = {post.focus, DOF_BAND, DOF_RAMP, 0},
+		vig    = {i32(post.vignette), VIGNETTE_FROM, VIGNETTE_MOST, 0},
+		grade  = cols,
+	}
+	intrinsics.volatile_store((^u32)(g.frame_lit.ptr), 0)
+	// The area's rows to the device, each in two runs where it wraps; a
+	// pass's buffer (vk_passing) through VK_PASS's plane.
+	n := len(t.rgb)
+	passing := vk_passing(t)
+	at := vk.DeviceSize((passing ? VK_PASS : VK_IMAGES[0].x) * n)
+	plane := vk_plane(u32, VK_PASS, n)
+	cn := 0
+	for r in 0 ..< h {
+		row := int(((y + r) & (t.h - 1)) * t.w)
+		x0, left := x & (t.w - 1), w
+		for left > 0 {
+			m := min(left, t.w - x0)
+			o := row + int(x0)
+			if passing {
+				copy(plane[o:][:m], t.rgb[o:][:m])
+			}
+			b := vk.DeviceSize(o * 4)
+			g.copies[cn] = {at + b, b, vk.DeviceSize(m * 4)}
+			cn += 1
+			x0, left = 0, left - m
+		}
+	}
+	cmd := g.cmd
+	core.vk_begin(cmd, g.fence)
+	vk.CmdCopyBuffer(cmd, g.stage.buf, g.frame_rgb.buf, u32(cn), &g.copies[0])
+	core.vk_barrier(cmd)
+	push := Vk_Frame_Push {
+		rgb    = g.frame_rgb.addr,
+		glow   = g.glow[0].addr,
+		blur   = g.blur[0].addr,
+		px     = f.buf.addr,
+		bright = g.frame_lit.addr,
+		uni    = g.frame_uni.addr,
+	}
+	if bloom_effects {
+		vk_blur(&push, g.glow, false, w, h, t.shift)
+	}
+	if post.focus > 0 {
+		vk_blur(&push, g.blur, true, w, h, t.shift)
+	}
+	vk.CmdBindPipeline(cmd, .COMPUTE, g.frame_pipe)
+	vk.CmdPushConstants(cmd, g.frame_layout, {.COMPUTE}, 0, size_of(push), &push)
+	vk.CmdDispatch(cmd, u32(w + 15) / 16, u32(h + 15) / 16, 1)
+	host := vk.MemoryBarrier {
+		sType         = .MEMORY_BARRIER,
+		srcAccessMask = {.MEMORY_WRITE},
+		dstAccessMask = {.HOST_READ},
+	}
+	vk.CmdPipelineBarrier(cmd, {.ALL_COMMANDS}, {.HOST}, {}, 1, &host, 0, nil, 0, nil)
+	core.vk_submit(cmd, g.fence, 0, 0)
+	fence := g.fence
+	core.vk_check(vk.WaitForFences(core.vkc.device, 1, &fence, true, max(u64)), "vkWaitForFences")
+	g.bright[f.mark % GL_MARKS] = intrinsics.volatile_load((^u32)(g.frame_lit.ptr)) != 0
+}
+
+// Record bloom.comp's stages over a w x h area into bufs, ending in
+// bufs[0]: the glow, or with `every` the depth of field's blur, at the
+// target's shift k.
+@(private = "file")
+vk_blur :: proc(push: ^Vk_Frame_Push, bufs: [2]core.Vk_Buf, every: bool, w, h: i32, k: u32) {
+	g := &gpu_vk
+	cmd := g.cmd
+	vk.CmdBindPipeline(cmd, .COMPUTE, g.bloom_pipe)
+	push.every = i32(every)
+	for stage in i32(0) ..< 3 {
+		push.stage = stage
+		push.src, push.dst = bufs[stage & 1 ~ 1].addr, bufs[stage & 1].addr
+		vk.CmdPushConstants(cmd, g.frame_layout, {.COMPUTE}, 0, size_of(push^), push)
+		vk.CmdDispatch(cmd, u32((w >> k) + 15) / 16, u32((h >> k) + 15) / 16, 1)
+		core.vk_barrier(cmd)
+	}
+}
+
+// Frame slot `slot`'s pixels (vk_frame waited for them), valid until the
+// slot is converted again.
+@(private)
+vk_frame_take :: proc(slot: int) -> []u32 {
+	f := &gpu_vk.frames[slot]
+	return ([^]u32)(f.buf.ptr)[:f.px]
+}
+
+// Whether conversion `mark` (Vk_Frame.mark) has a pixel above black;
+// `known` false when its flag has since been reused.
+@(private)
+vk_frame_bright :: proc(mark: int) -> (bright, known: bool) {
+	g := &gpu_vk
+	if mark < 0 || mark >= g.marks || g.marks - mark > GL_MARKS {
+		return false, false
+	}
+	return g.bright[mark % GL_MARKS], true
 }

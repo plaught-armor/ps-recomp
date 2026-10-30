@@ -161,6 +161,41 @@ shown_target :: #force_inline proc() -> ^Target {
 	return &targets[target_count - 1]
 }
 
+// Whether the shown target's picture is converted on the GPU, into a frame
+// slot (gl_frame or vk_frame) the host shows, not into the host's buffer.
+gpu_frames :: proc() -> bool {
+	t := shown_target()
+	return t.gl || t.vk
+}
+
+// Convert the shown target's area into frame slot `slot` on its GPU.
+gpu_frame :: proc(slot: int, x, y, w, h: i32) {
+	if shown_target().vk {
+		vk_frame(slot, x, y, w, h)
+	} else {
+		gl_frame(slot, x, y, w, h)
+	}
+}
+
+// Frame slot `slot`'s pixels, waiting for its conversion.
+gpu_frame_take :: proc(slot: int) -> []u32 {
+	return shown_target().vk ? vk_frame_take(slot) : gl_frame_take(slot)
+}
+
+// Frame slot `slot`'s conversion's number, for gpu_frame_bright.
+gpu_frame_mark :: proc(slot: int) -> int {
+	return shown_target().vk ? gpu_vk.frames[slot].mark : gpu_gl.frames[slot].mark
+}
+
+// Whether conversion `mark` has a pixel above black; `known` false when
+// its flag has since been reused.
+gpu_frame_bright :: proc(mark: int) -> (bright, known: bool) {
+	if shown_target().vk {
+		return vk_frame_bright(mark)
+	}
+	return gl_frame_bright(mark)
+}
+
 // A hi-res target pixel holds 8-bit channels as the display shows them,
 // r << 16 | g << 8 | b, and the mask bit at HI_MASK: draws shade and blend
 // it at 8 bits a channel, undithered (not a PS1 feature), while VRAM keeps

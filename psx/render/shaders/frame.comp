@@ -1,0 +1,76 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_GOOGLE_include_directive : require
+// gl_target.odin's CONV_CS on Vulkan (vk_frame): the area converted to
+// XRGB8888 as convert_rows does, row by row into px, with the effects
+// (post_pixel): fx.x the glow (bloom.comp's, in glow) added at gain fx.y,
+// dof (focus step, 0 off; DOF_BAND; DOF_RAMP) mixing toward the blur in
+// blur, fx.z the grade, vig.x the vignette (VIGNETTE_FROM, VIGNETTE_MOST).
+// A lit pixel sets bright.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "frame_pc.glsl"
+shared bool lit;
+
+// Where pixel p falls between glow pixels (bloom_split): the two it mixes
+// and the second's weight in 256ths.
+ivec3 split(int p, int n, int k) {
+	int s = 1 << k;
+	int q = 2 * p + 1 - s;
+	int lo = (q + 2 * s) / (2 * s) - 1;
+	int f = (q - lo * 2 * s) * 128 / s;
+	return ivec3(max(lo, 0), min(lo + 1, n - 1), f);
+}
+
+// The four pixels of a PS1-resolution image b (a row of n.x pixels each)
+// around the splits sx, sy, mixed (bloom_sample).
+ivec3 bilerp(Buf b, int w, ivec3 sx, ivec3 sy) {
+	ivec3 top = lanes(b.v[sy.x * w + sx.x]) * (256 - sx.z) + lanes(b.v[sy.x * w + sx.y]) * sx.z;
+	ivec3 bottom = lanes(b.v[sy.y * w + sx.x]) * (256 - sx.z) + lanes(b.v[sy.y * w + sx.y]) * sx.z;
+	return (top * (256 - sy.z) + bottom * sy.z + 32768) >> 16;
+}
+
+void main() {
+	if (gl_LocalInvocationIndex == 0u) {
+		lit = false;
+	}
+	barrier();
+	ivec4 area = pc.u.area;
+	int k = pc.u.size_k.z;
+	ivec3 dof = pc.u.dof.xyz, vig = pc.u.vig.xyz;
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x < area.z && p.y < area.w) {
+		uint c = rgb_at(area.xy + p);
+		ivec2 n = area.zw >> k;
+		ivec3 sx = split(p.x, n.x, k), sy = split(p.y, n.y, k);
+		int z = int(c >> 25 & 63u);
+		int w = z == 0 || dof.x == 0 ? 0 : clamp((abs(z - dof.x) - dof.y) * 256 / dof.z, 0, 256);
+		if (w > 0) {
+			c = pack((lanes(c) * (256 - w) + bilerp(pc.blur, n.x, sx, sy) * w + 128) >> 8);
+		}
+		if (pc.u.fx.x > 0) {
+			c = pack(min(lanes(c) + ((bilerp(pc.glow, n.x, sx, sy) * pc.u.fx.y + 128) >> 8), ivec3(255)));
+		}
+		if (pc.u.fx.z != 0) {
+			ivec3 l = lanes(c);
+			ivec3 v = pc.u.grade[0].xyz * l.x + pc.u.grade[1].xyz * l.y + pc.u.grade[2].xyz * l.z + pc.u.grade[3].xyz + 128;
+			c = pack(clamp(v, 0, 255 * 256 + 255) >> 8);
+		}
+		if (vig.x != 0) {
+			int nx = abs(2 * p.x + 1 - area.z) * 256 / area.z;
+			int ny = abs(2 * p.y + 1 - area.w) * 256 / area.w;
+			int r2 = (nx * nx + ny * ny) >> 8;
+			int dark = clamp((r2 - vig.y) * vig.z / (512 - vig.y), 0, vig.z);
+			c = pack((lanes(c) * (256 - dark) + 128) >> 8);
+		}
+		c &= 0xffffffu;
+		pc.px.v[p.y * area.z + p.x] = c;
+		// A channel byte above BLACK_MAX (0x10).
+		if (max(c & 255u, max(c >> 8 & 255u, c >> 16 & 255u)) > 0x10u) {
+			lit = true;
+		}
+	}
+	barrier();
+	if (gl_LocalInvocationIndex == 0u && lit) {
+		atomicOr(pc.bright.v[0], 1u);
+	}
+}
