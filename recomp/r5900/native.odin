@@ -872,18 +872,51 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.call(a, "cpu.pdivbw", .A, .B)
 	case .QFSRV:
 		if rd == 0 {return true}
-		// A shift by whole bytes below 16 is a funnel; any other SA, which
-		// only MTSA can set, goes to the interpreter.
-		odd, done := native.new_label(a), native.new_label(a)
+		// rd = the 128 bits at bit SA of rs:rt, or 0 for SA >= 128, as the
+		// interpreter's u128 shifts give. A shift by whole bytes is a
+		// funnel. Any other, which only MTSA can set, takes for lane k
+		// words q + k and q + k + 1 of rs:rt, from SA = 32q + r; the
+		// second is shifted by 1 then by ~r & 31 = 31 - r, so r = 0 moves
+		// nothing across without a branch.
+		bits, zero, done := native.new_label(a), native.new_label(a), native.new_label(a)
 		native.state_load(a, .A, SA)
+		native.br_cmp_imm(a, .Geu, .A, 128, zero)
 		native.mov(a, .C, .A)
-		native.alu_imm(a, .And, .C, ~u32(0x78))
-		native.br_zero(a, .C, odd, nonzero = true)
+		native.alu_imm(a, .And, .C, 7)
+		native.br_zero(a, .C, bits, nonzero = true)
 		native.alu_imm(a, .Shr, .A, 3)
 		native.vec_funnel8(a, GPR * u32(rd), GPR * u32(rt), GPR * u32(rs), "ps2.funnel")
 		native.jmp(a, done)
-		native.bind(a, odd)
-		interp(a, i)
+		native.bind(a, bits)
+		native.vec_load(a, .V0, GPR * u32(rt))
+		native.vec_store(a, 0, .V0, "ps2.funnel")
+		native.vec_load(a, .V0, GPR * u32(rs))
+		native.vec_store(a, 16, .V0, "ps2.funnel")
+		native.mov(a, .LD, .A)
+		native.alu_imm(a, .And, .LD, 31)
+		native.mov(a, .C, .LD)
+		native.not(a, .C)
+		// V1 = words q to q + 3, V2 = words q + 1 to q + 4; q <= 3, so
+		// they end within the 32 bytes.
+		native.alu_imm(a, .Shr, .A, 5)
+		native.alu_imm(a, .Shl, .A, 2)
+		native.vec_ldst_at(a, .V1, "ps2.funnel", false)
+		native.alu_imm(a, .Add, .A, 4)
+		native.vec_ldst_at(a, .V2, "ps2.funnel", false)
+		native.vec_store(a, 0, .V1, "ps2.funnel")
+		native.vec_store(a, 16, .V2, "ps2.funnel")
+		for k in u32(0) ..< 4 {
+			native.imp_load(a, .A, "ps2.funnel", 4 * k)
+			native.imp_load(a, .B, "ps2.funnel", 16 + 4 * k)
+			native.alu(a, .Shr, .A, .LD)
+			native.alu_imm(a, .Shl, .B, 1)
+			native.alu(a, .Shl, .B, .C)
+			native.alu(a, .Or, .A, .B)
+			native.state_store(a, GPR * u32(rd) + 4 * k, .A)
+		}
+		native.jmp(a, done)
+		native.bind(a, zero)
+		for k in u32(0) ..< 4 {native.state_store_imm(a, GPR * u32(rd) + 4 * k, 0)}
 		native.bind(a, done)
 	case .MFC0:
 		if rt == 0 {return true}
@@ -1137,6 +1170,47 @@ fpu_compare :: proc(a: ^native.Asm, c: native.Cond, fs, ft: u32) {
 VU_EXP, VU_SIGN, VU_MAX, VU_ABS, VU_ZERO, VU_DEST :: 0, 16, 32, 48, 64, 80
 @(private = "file")
 VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
+
+// VCLIP (key 0x1f) of VU0 macro op w, as vu.vu_op runs it: the judgment
+// of fs.xyz against +-|ft.w| shifted into clip. The interpreter compares
+// host floats, with no denormal flush, which order as their magnitude
+// bits do when neither is a NaN: a NaN |ft.w| or a NaN lane sets no bit,
+// and a lane whose magnitude is above |ft.w|'s sets bit 2k when positive,
+// 2k + 1 when negative. Uses A, B, C and LD, and keeps T.
+@(private = "file")
+vu0_clip :: proc(a: ^native.Asm, w: u32) -> bool {
+	fs, ft := (w >> 11) & 31, (w >> 16) & 31
+	done := native.new_label(a)
+	native.mov_imm(a, .LD, 0)
+	// B = |ft.w| + 1: a magnitude above |ft.w| is at or above B.
+	native.imp_load(a, .B, "vu.vf", 16 * ft + 12)
+	native.alu_imm(a, .And, .B, 0x7fffffff)
+	native.br_cmp_imm(a, .Geu, .B, 0x7f800001, done)
+	native.alu_imm(a, .Add, .B, 1)
+	for k in u32(0) ..< 3 {
+		skip := native.new_label(a)
+		native.imp_load(a, .A, "vu.vf", 16 * fs + 4 * k)
+		native.mov(a, .C, .A)
+		native.alu_imm(a, .And, .C, 0x7fffffff)
+		native.br_cmp_imm(a, .Geu, .C, 0x7f800001, skip)
+		native.set_cond(a, .Geu, .C, .B)
+		native.br_zero(a, .C, skip)
+		// (1 + sign) << 2k
+		native.alu_imm(a, .Shr, .A, 31)
+		native.alu_imm(a, .Add, .A, 1)
+		if k != 0 {native.alu_imm(a, .Shl, .A, 2 * k)}
+		native.alu(a, .Or, .LD, .A)
+		native.bind(a, skip)
+	}
+	native.bind(a, done)
+	// v.clip = ((v.clip << 6) | f) & 0xffffff
+	native.imp_load(a, .A, "vu.clip")
+	native.alu_imm(a, .Shl, .A, 6)
+	native.alu(a, .Or, .A, .LD)
+	native.alu_imm(a, .And, .A, 0xffffff)
+	native.imp_store(a, "vu.clip", .A)
+	return true
+}
 
 // VDIV (key 0x38), VSQRT (0x39) and VRSQRT (0x3a) of VU0 macro op w, as
 // vu.vu_op runs them: Q, and status I and D with their sticky bits, as
@@ -1405,7 +1479,7 @@ vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	case 0x1c: kind, src = .Mul, .Q
 	case 0x1d: kind, src = upper ? Kind.Max : Kind.Abs, .I
 	case 0x1e: kind, src = .Mul, .I
-	case 0x1f: if !upper {return false}; kind, src = .Mini, .I // not VCLIP
+	case 0x1f: if !upper {return vu0_clip(a, w)}; kind, src = .Mini, .I
 	case 0x20: kind, src = .Add, .Q
 	case 0x21: kind, src = .Madd, .Q
 	case 0x22: kind, src = .Add, .I

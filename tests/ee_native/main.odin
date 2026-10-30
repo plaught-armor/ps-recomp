@@ -849,7 +849,9 @@ main :: proc() {
 		{unaligned(57, 2), .SWC1},
 		{unaligned(57, 0), .SWC1}, // f0
 		{special2(0x3b), .VU0}, // VWAITQ
-		{special2(0x1f), .VU0}, // VCLIP, left to the interpreter
+		{special2(0x1f), .VU0}, // VCLIP
+		{special2(0x1f, ft = 1), .VU0}, // VCLIP vf1, vf1w
+		{special2(0x1f, ft = 0), .VU0}, // VCLIP vf1, vf0w = 1
 		{special2(0x38, 0), .VU0}, // VDIV vf1x / vf2x
 		{special2(0x38, 0xb), .VU0}, // VDIV vf1w / vf2z
 		{special2(0x38, 0x6, 1), .VU0}, // VDIV vf1z / vf1y
@@ -999,8 +1001,6 @@ main :: proc() {
 		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0]}
 		free_all(context.temp_allocator)
 	}
-	// VCLIP is left to the interpreter on purpose.
-	delete_key(&slow, "VU0 special 1f")
 	if len(slow) != 0 {
 		fmt.eprintln("FAIL interpreter calls in native code:", slow)
 		os.exit(1)
@@ -1042,6 +1042,9 @@ main :: proc() {
 				start.cop0[12] = u32(x) | 0x10000
 				start.fcr31 = u32(y)
 				start.sa = u32(x) & 127
+				// QFSRV: every SA, and the 128 to 255 only direct state can
+				// hold, which shift everything out.
+				if c.op == .QFSRV {start.sa = u32(x ~ y) & 255}
 				// VU0: the values' words as floats, NaNs, infinities and
 				// denormals among them.
 				vu_start := vu.vu0
@@ -1056,6 +1059,10 @@ main :: proc() {
 				vu_start.i = transmute(f32)u32(x ~ (y >> 32))
 				vu_start.mac = u32(y)
 				vu_start.status = u32(x >> 7) & 0xfff
+				// Bits above the 24 too, which the shift drops.
+				vu_start.clip = u32(x ~ (y << 7))
+				// VCLIP of vf2w: every value against every value of vf1x.
+				if c.w == special2(0x1f) {vu_start.vf[2].u[3] = u32(y)}
 				// A pattern of the row too, so a store of what is there
 				// already cannot pass.
 				for &b, i in vu_mem {b = u8(u32(i) * 0x9d ~ u32(k) * 0x3b ~ u32(x) ~ u32(i >> 8))}

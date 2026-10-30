@@ -246,6 +246,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.i"] = p(&vu.vu0.i)
 	m["vu.mac"] = p(&vu.vu0.mac)
 	m["vu.status"] = p(&vu.vu0.status)
+	m["vu.clip"] = p(&vu.vu0.clip)
 	m["vu.k"] = p(&vu_k)
 	m["vu.macro"] = p(rawptr(vu.vu0_macro))
 	m["vu.call_micro"] = p(rawptr(vu.vu0_call_micro))
