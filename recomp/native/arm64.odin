@@ -515,6 +515,12 @@ a64_call :: proc(a: ^Asm, k: int, args: []Reg) {
 	rrr(a, 0x2a0003e0, A64_REG[.A], 0, 0) // mov w9, w0
 }
 
+// a64_call's sequence with no arguments, to a label in the code.
+a64_call_func :: proc(a: ^Asm, l: Label) {
+	emit32(a, 0xaa0003e0 | CTX << 16) // mov x0, the context
+	a64_call_label(a, l)
+}
+
 a64_jmp :: proc(a: ^Asm, l: Label) {
 	branch(a, 0x14000000, .A64_B26, l)
 }

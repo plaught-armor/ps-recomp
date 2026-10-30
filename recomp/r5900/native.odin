@@ -1862,8 +1862,11 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 // Machine code for f into a: its entry, then one for each of entries (the
 // interior ones the program takes the address of). Returns their code
 // offsets, in context.temp_allocator. Counts the sites that call the
-// interpreter in slow, per op.
-native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int) -> []u32 {
+// interpreter in slow, per op. funcs holds a label in a for the entry of
+// each function a gets: f's is bound here, and a jal to one is a direct
+// call, where cpu.call would look the same code up in its table and call
+// it (nothing registers over the native functions after load_native).
+native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil) -> []u32 {
 	steps := lower(f, cycles, quiet = true) // emit_func warned
 	labels := make(map[u32]native.Label, context.temp_allocator)
 	pcs := make([dynamic]u32, context.temp_allocator)
@@ -1876,6 +1879,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 	slice.sort(pcs[:])
 	offs := make([]u32, 1 + len(entries), context.temp_allocator)
 	offs[0] = u32(native.func_begin(a, "cpu.state"))
+	if l, ok := funcs[f.entry]; ok {native.bind_at(a, l, int(offs[0]))}
 	trace(a, f.entry)
 	events(a)
 	go(a, f, labels, f.entry)
@@ -1910,7 +1914,11 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			go(a, f, labels, s.target)
 			leaves = true
 		case .Call:
-			call_imm(a, "cpu.call", s.target)
+			if l, ok := funcs[s.target]; ok {
+				native.call_func(a, l)
+			} else {
+				call_imm(a, "cpu.call", s.target)
+			}
 		case .Branch:
 			branch_cond(a, s.i)
 			append(&ifs, -1)

@@ -2,7 +2,8 @@
 // on every target in CI. Each instruction is a function of its own (the
 // instruction, then jr $ra), assembled by r5900.native_func for the host and
 // loaded with the runtime's imports; from the same registers, the native
-// function and ps2.exec_insn must leave the same cpu.state.
+// function and ps2.exec_insn must leave the same cpu.state. A jal is a
+// direct call when its target is in the blob, else cpu.call.
 package main
 
 import "base:runtime"
@@ -1125,11 +1126,73 @@ main :: proc() {
 			}
 		}
 	}
+	failed += check_calls(arch)
+	checks += 2
 	if failed != 0 {
 		fmt.eprintfln("%d of %d checks failed", failed, checks)
 		os.exit(1)
 	}
 	fmt.printfln("ok ee_native %v: %d instructions, %d checks", arch, len(cases), checks)
+}
+
+// A jal to a function in the blob is a direct call to its native code, one
+// to a function outside it goes through cpu.call. The function in the blob
+// is registered too, as an Odin function adding something else, so a call
+// through the table would show.
+@(private = "file")
+check_calls :: proc(arch: native.Arch) -> (failed: int) {
+	IN, OUT, CALL_IN, CALL_OUT :: u32(0x00200000), u32(0x00200100), u32(0x00200200), u32(0x00200300)
+	jal :: proc(t: u32) -> u32 {return 0x03 << 26 | (t >> 2) & 0x3ffffff}
+	addiu :: proc(rt, rs: u32, imm: u32) -> u32 {return 0x09 << 26 | rs << 21 | rt << 16 | imm}
+	JR_RA :: 0x03e00008
+	Prog :: struct {
+		at:    u32,
+		words: [5]u32,
+	}
+	// The callee adds 1 to r3; each caller sets r2 in the delay slot and
+	// adds 0x10 to r3 after the call.
+	progs := [?]Prog {
+		{IN, {addiu(3, 3, 1), JR_RA, 0, 0, 0}},
+		{CALL_IN, {jal(IN), addiu(2, 0, 5), addiu(3, 3, 0x10), JR_RA, 0}},
+		{CALL_OUT, {jal(OUT), addiu(2, 0, 6), addiu(3, 3, 0x10), JR_RA, 0}},
+	}
+	a := native.make_asm(arch, r5900.native_ram())
+	labels := make(map[u32]native.Label)
+	defer delete(labels)
+	for p in progs {labels[p.at] = native.new_label(&a)}
+	funcs: [len(progs)]native.Blob_Func
+	slow: map[string]int
+	defer delete(slow)
+	for p, k in progs {
+		data: [len(p.words) * 4]u8
+		for w, n in p.words {
+			data[4 * n], data[4 * n + 1], data[4 * n + 2], data[4 * n + 3] = u8(w), u8(w >> 8), u8(w >> 16), u8(w >> 24)
+		}
+		f := mips.func_make(p.at, p.at + len(data))
+		mips.discover(r5900.RULES, {base = p.at, data = data[:]}, f, {})
+		funcs[k] = {p.at, r5900.native_func(&a, f, {}, 1, &slow, labels)[0]}
+		free_all(context.temp_allocator)
+	}
+	code, err := core.native_load(native.make_blob(&a, funcs[:], {}), ps2.native_imports())
+	if err != "" {
+		fmt.eprintln("native_load:", err)
+		os.exit(1)
+	}
+	cpu.text_range(IN, CALL_OUT + 0x100)
+	cpu.register(IN, proc() {cpu.state.r[3].d[0] += 0x1000})
+	cpu.register(OUT, proc() {cpu.state.r[3].d[0] += 0x100})
+	for k in 1 ..< len(progs) {
+		cpu.state = {}
+		run := cast(proc())rawptr(code.base + uintptr(code.funcs[k].off))
+		run()
+		want := [3]u64{k == 1 ? 0x11 : 0x110, u64(4 + k), u64(progs[k].at + 8)}
+		got := [3]u64{cpu.state.r[3].d[0], cpu.state.r[2].d[0], cpu.state.r[31].d[0]}
+		if got != want {
+			failed += 1
+			fmt.eprintfln("FAIL jal %08x: r3 r2 ra %x, want %x", progs[k].words[0], got, want)
+		}
+	}
+	return
 }
 
 // A VU0 quadword load or store at each of MEM_ADDRS, with the watch byte

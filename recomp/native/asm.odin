@@ -337,6 +337,12 @@ func_begin :: proc(a: ^Asm, state: string) -> int {
 	return at
 }
 
+// Bind l to off, a func_begin or func_entry result, for call_func.
+bind_at :: proc(a: ^Asm, l: Label, off: int) {
+	assert(a.labels[l] == -1, "native: label bound twice")
+	a.labels[l] = off
+}
+
 // Another entry into the function being emitted, which shares its
 // epilogue: its body jumps into the function's code. Returns its offset.
 func_entry :: proc(a: ^Asm, state: string) -> int {
@@ -814,6 +820,20 @@ call :: proc(a: ^Asm, name: string, args: ..Reg) {
 	cache_sync(a, false)
 }
 
+// Call the function at label l (bound with bind_at), passing the context
+// as the runtime's call table does, so the callee's prologue is entered the
+// same way. As call, the cached fields go to the state and come back after.
+call_func :: proc(a: ^Asm, l: Label) {
+	cache_sync(a, true)
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_call_func(a, l)
+	case .Arm64:
+		a64_call_func(a, l)
+	}
+	cache_sync(a, false)
+}
+
 // A = the value at guest address A: read from RAM in place when it is
 // there, else the result of import `slow` called with A. Narrow signed
 // values are sign-extended. Loses B and C.
@@ -1123,7 +1143,9 @@ patch :: proc(a: ^Asm, f: Fixup, to: int) {
 		put32(a, f.at, u32(i32(to - (f.at + 4))))
 	case .A64_B26:
 		d := (to - f.at) / 4
-		assert(d >= -(1 << 25) && d < 1 << 25, "native: branch out of range")
+		if d < -(1 << 25) || d >= 1 << 25 {
+			fmt.panicf("native: branch out of range (+-128 MiB) at %d to %d, code %d bytes", f.at, to, len(a.code))
+		}
 		put32(a, f.at, get32(a, f.at) | u32(d) & 0x3ffffff)
 	case .A64_B19:
 		d := (to - f.at) / 4

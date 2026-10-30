@@ -668,6 +668,13 @@ x64_call :: proc(a: ^Asm, k: int, args: []Reg) {
 	op_imp(a, false, 0xff, 2, k) // call [slot]
 }
 
+// x64_call's sequence with no arguments, to a label in the code.
+x64_call_func :: proc(a: ^Asm, l: Label) {
+	regs := SYSV_ARGS if a.arch == .X64_SysV else WIN_ARGS
+	op_rr(a, true, 0x89, R12, regs[0]) // the context
+	x64_call_label(a, l)
+}
+
 x64_jmp :: proc(a: ^Asm, l: Label) {
 	jump(a, -1, l)
 }

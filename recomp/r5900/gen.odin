@@ -211,6 +211,13 @@ generate :: proc(o: mips.Options) {
 		}
 	}
 
+	// Per Asm, a label for each function's entry, for direct calls.
+	entry_labels: [2]map[u32]native.Label
+	for a, x in asms {
+		if a == nil {continue}
+		for f in funcs {entry_labels[x][f.entry] = native.new_label(a)}
+	}
+
 	// Per backend, the sites that call the interpreter.
 	slow_emit: map[string]int
 	slow_vu: [vu.Unit]map[string]int
@@ -261,7 +268,7 @@ generate :: proc(o: mips.Options) {
 			for a, x in asms {
 				if a == nil {continue}
 				entries := interior_entries(&e, f)
-				offs := native_func(a, f, entries, cycles, &slow_native[x])
+				offs := native_func(a, f, entries, cycles, &slow_native[x], entry_labels[x])
 				if a != code {continue}
 				append(&n_funcs, native.Blob_Func{f.entry, offs[0]})
 				for l, k in entries {append(&n_funcs, native.Blob_Func{l, offs[1 + k]})}
