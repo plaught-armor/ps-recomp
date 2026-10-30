@@ -6,11 +6,12 @@
 // thread at the same time. Each pixel still sees its draws in order, so the
 // picture is the same as drawing them one by one.
 //
-// With the hi-res target on the GPU (gl_target.odin), VRAM's draws are
-// drawn as they are queued instead, by the stream's threads, each owning
-// interleaved bands of VRAM's rows, while the walk goes on; raster_sync
-// waits for them. A draw texturing from VRAM a draw before it in the stream
-// wrote (another band's rows, maybe) first waits for the stream to empty.
+// With the hi-res target on the GPU (gl_target.odin, vk_target.odin),
+// VRAM's draws are drawn as they are queued instead, by the stream's
+// threads, each owning interleaved bands of VRAM's rows, while the walk
+// goes on; raster_sync waits for them. A draw texturing from VRAM a draw
+// before it in the stream wrote (another band's rows, maybe) first waits
+// for the stream to empty.
 //
 // Queued hi-res draws read their textures from VRAM while VRAM's draws run,
 // so a VRAM draw over texels a queued hi-res draw reads, or a hi-res draw
@@ -296,7 +297,7 @@ raster_queue :: proc(t: ^Target, d: ^Draw, x0, y0, x1, y1: i32) {
 		sync_cause = .Other
 	}
 	cells_add(&raster.writes, x0, y0, x1 - x0 + 1, y1 - y0 + 1)
-	if targets[1].gl && !io.preload_child {
+	if stream_on() {
 		if d.m.textured && texture_cells(&stream.writes, &d.env.st, &d.m) {
 			sync_cause = .Vram_Raw
 			stream_drain()
@@ -351,25 +352,35 @@ stream_tail :: #force_inline proc() -> i64 {
 	return t
 }
 
-// Wait for the stream's threads to draw everything handed to them.
+// Wait for the stream's threads to draw everything handed to them; with
+// count, the wait goes into sync_t under sync_cause.
 @(private)
-stream_drain :: proc() {
+stream_drain :: proc(count := true) {
 	h := stream.head
 	if stream_tail() != h {
 		t0 := time.tick_now()
 		for spin := 0; stream_tail() != h; spin += 1 {
 			core.spin_pause(spin)
 		}
-		sync_t[sync_cause] += time.tick_since(t0)
-		sync_n[sync_cause] += 1
+		if count {
+			sync_t[sync_cause] += time.tick_since(t0)
+			sync_n[sync_cause] += 1
+		}
 	}
 	stream.writes = {}
+}
+
+// Whether VRAM's draws run on the stream: with the hi-res target on the
+// GPU, but in a forked child, which has no stream threads.
+@(private)
+stream_on :: #force_inline proc() -> bool {
+	return (targets[1].gl || targets[1].vk) && !io.preload_child
 }
 
 // Whether VRAM's draws run on the stream and some are not synced yet.
 @(private)
 stream_live :: #force_inline proc() -> bool {
-	return targets[1].gl && !io.preload_child && stream.head != stream.synced
+	return stream_on() && stream.head != stream.synced
 }
 
 // Hand the stream a job laying VRAM's ghost layer over it, in order with
@@ -385,10 +396,11 @@ stream_ghost_flush :: proc(t: ^Target) {
 	t.ghost.lo, t.ghost.hi = {t.w, t.h}, {0, 0}
 }
 
-// Drain the stream, then merge its ghost boxes into VRAM's ghost layer.
+// Drain the stream (count as stream_drain), then merge its ghost boxes
+// into VRAM's ghost layer.
 @(private)
-stream_sync :: proc() {
-	stream_drain()
+stream_sync :: proc(count := true) {
+	stream_drain(count)
 	for &sb, i in stream.bands {
 		raster_ghost_merge(&sb.ra)
 		sb.ra = raster_make(&targets[0], nil, i32(i), STREAM_BANDS)
@@ -445,11 +457,12 @@ raster_native_run :: proc() {
 
 // Every CPU read of a target's pixels comes through here first. The
 // Vulkan target's queue is drawn synchronously, so its pixels are the
-// software target's again before the bands below run (the stream is GL's
-// only, so the ghost flush comes here for it too).
+// software target's again before the bands below run, while the stream
+// draws VRAM's.
 @(private)
 raster_run :: proc() {
-	// The Vulkan target's queue is drawn and waited for here.
+	// The Vulkan target's queue is drawn and waited for here, the stream
+	// with it: the whole wait is counted once, below.
 	t0 := time.tick_now()
 	defer if gpu_vk.on {
 		sync_t[sync_cause] += time.tick_since(t0)
@@ -457,7 +470,7 @@ raster_run :: proc() {
 	}
 	queue_submit()
 	if stream.head != stream.synced {
-		stream_sync()
+		stream_sync(!gpu_vk.on)
 	}
 	bands := raster_pool()
 	n := bands
