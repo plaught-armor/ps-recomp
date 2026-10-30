@@ -323,6 +323,12 @@ flag_set :: #force_inline proc(bits: u32) {
 	intrinsics.volatile_store(&state.flag, state.flag | bits)
 }
 
+// MAC1-3 and IR1-3 follow Mednafen and DuckStation, which agree and are
+// checked against hardware tests; psx-spx leaves both points open. A sum is
+// range-checked after every addition and wrapped to 44 bits each time
+// (mac_sum; a sum of two terms needs only the one check), and IR saturates
+// from the 32-bit MAC, not from the 44-bit sum shifted (set_mac).
+
 // Range-check a MAC1-3 sum against 44 bits and return it wrapped to 44 bits.
 @(private)
 check_mac :: proc(i: int, v: i64) -> i64 #no_bounds_check {
@@ -334,11 +340,18 @@ check_mac :: proc(i: int, v: i64) -> i64 #no_bounds_check {
 	return (v << 20) >> 20
 }
 
+// t + a + b + c for MAC i, checked and wrapped after each addition (t, a
+// translation << 12, needs no check of its own).
+@(private)
+mac_sum :: #force_inline proc(i: int, t, a, b, c: i64) -> i64 #no_bounds_check {
+	return check_mac(i, check_mac(i, check_mac(i, t + a) + b) + c)
+}
+
+// Set MAC i from a sum and return it, the 32-bit value IR saturates from.
 @(private)
 set_mac :: proc(i: int, v: i64, shift: u32) -> i64 #no_bounds_check {
-	r := check_mac(i, v) >> shift
-	state.mac[i] = i32(r)
-	return r
+	state.mac[i] = i32(check_mac(i, v) >> shift)
+	return i64(state.mac[i])
 }
 
 @(private)
@@ -471,9 +484,9 @@ rtp :: #force_inline proc(c: Cmd) #no_bounds_check {
 	m := &g.rt
 	xfull := i64(g.tr[0]) << 12 + i64(m[0][0]) * vx + i64(m[0][1]) * vy + i64(m[0][2]) * vz
 	yfull := i64(g.tr[1]) << 12 + i64(m[1][0]) * vx + i64(m[1][1]) * vy + i64(m[1][2]) * vz
-	x := set_mac(1, xfull, c.shift)
-	y := set_mac(2, yfull, c.shift)
-	zfull := check_mac(3, i64(g.tr[2]) << 12 + i64(m[2][0]) * vx + i64(m[2][1]) * vy + i64(m[2][2]) * vz)
+	x := set_mac(1, mac_sum(1, i64(g.tr[0]) << 12, i64(m[0][0]) * vx, i64(m[0][1]) * vy, i64(m[0][2]) * vz), c.shift)
+	y := set_mac(2, mac_sum(2, i64(g.tr[1]) << 12, i64(m[1][0]) * vx, i64(m[1][1]) * vy, i64(m[1][2]) * vz), c.shift)
+	zfull := mac_sum(3, i64(g.tr[2]) << 12, i64(m[2][0]) * vx, i64(m[2][1]) * vy, i64(m[2][2]) * vz)
 	g.mac[3] = i32(zfull >> c.shift)
 	set_ir(1, x, c.lm)
 	set_ir(2, y, c.lm)
@@ -545,10 +558,19 @@ rtpt :: #force_inline proc(c: Cmd) #no_bounds_check {
 	for r in 0 ..< 3 {
 		full[r] = I(i64(g.tr[r]) << 12) + I(i64(m[r][0])) * vx + I(i64(m[r][1])) * vy + I(i64(m[r][2])) * vz
 	}
+	// mac_sum and set_mac by lane: checked and wrapped after each addition,
+	// IR1 and IR2 from the 32-bit MACs.
+	sum: [3]I
+	for r in 0 ..< 3 {
+		a := wrap(u32(r + 1), I(i64(g.tr[r]) << 12) + I(i64(m[r][0])) * vx, &flag)
+		a = wrap(u32(r + 1), a + I(i64(m[r][1])) * vy, &flag)
+		sum[r] = wrap(u32(r + 1), a + I(i64(m[r][2])) * vz, &flag)
+	}
 	shift := U(u64(c.shift))
-	x := simd.shr(wrap(1, full[0], &flag), shift)
-	y := simd.shr(wrap(2, full[1], &flag), shift)
-	zfull := wrap(3, full[2], &flag)
+	low32 :: #force_inline proc(v: I) -> I {return simd.shr(simd.shl(v, U(32)), U(32))}
+	x := low32(simd.shr(sum[0], shift))
+	y := low32(simd.shr(sum[1], shift))
+	zfull := sum[2]
 	lo: i64 = c.lm ? 0 : -0x8000
 	flag |= bit(out(x, lo, 0x7fff), 24)
 	flag |= bit(out(y, lo, 0x7fff), 23)
@@ -703,7 +725,7 @@ exact_sub :: proc(full: [3]f64, whole: [2]i32) -> (sub: [2]i8) {
 @(private)
 mat_vec :: proc(c: Cmd, m: ^[3][3]i32, vec: [3]i64, t: [3]i64) #no_bounds_check {
 	for i in 0 ..< 3 {
-		s := t[i] << 12 + i64(m[i][0]) * vec[0] + i64(m[i][1]) * vec[1] + i64(m[i][2]) * vec[2]
+		s := mac_sum(i + 1, t[i] << 12, i64(m[i][0]) * vec[0], i64(m[i][1]) * vec[1], i64(m[i][2]) * vec[2])
 		set_ir(i + 1, set_mac(i + 1, s, c.shift), c.lm)
 	}
 }
