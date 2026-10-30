@@ -16,6 +16,8 @@
 // the same code.
 package vu
 
+import "core:fmt"
+import "core:strings"
 import "../mips"
 import "../native"
 
@@ -211,45 +213,7 @@ div :: proc(a: ^native.Asm, u: Unit, w, key: u32, status: bool) -> bool {
 		native.alu(a, .Or, .C, .LD)
 		native.imp_store(a, IMPORTS[u][.Status], .C)
 	}
-	// Q into A, from the clamped operands as cpu.fdiv and frsqrt and
-	// vu_op's VSQRT take them.
-	if key != 0x39 {fclamp_gpr(a, .A, .C)}
-	fclamp_gpr(a, .B, .C)
-	store, fmax := native.new_label(a), native.new_label(a)
-	switch key {
-	case 0x38:
-		// cpu.fdiv: a divisor of exponent 0 gives +-FMAX with the sign of
-		// a ^ b, else fclamp(a / b).
-		native.mov(a, .C, .B)
-		native.alu_imm(a, .And, .C, 0x7f800000)
-		native.mov(a, .LD, .A)
-		native.alu(a, .Xor, .LD, .B)
-		native.br_zero(a, .C, fmax)
-		native.float_op(a, .Fdiv, .A, .B)
-	case 0x39:
-		// math.sqrt(abs(ct[ftf])), the root not clamped
-		native.mov(a, .A, .B)
-		native.alu_imm(a, .And, .A, 0x7fffffff)
-		native.float_sqrt(a, .A)
-		native.jmp(a, store)
-	case 0x3a:
-		// cpu.frsqrt: s = sqrt(|b|); s of exponent 0 gives +-FMAX with
-		// the sign of a, else fclamp(a / s).
-		native.alu_imm(a, .And, .B, 0x7fffffff)
-		native.float_sqrt(a, .B)
-		native.mov(a, .C, .B)
-		native.alu_imm(a, .And, .C, 0x7f800000)
-		native.mov(a, .LD, .A)
-		native.br_zero(a, .C, fmax)
-		native.float_op(a, .Fdiv, .A, .B)
-	}
-	fclamp_gpr(a, .A, .C)
-	native.jmp(a, store)
-	native.bind(a, fmax) // the sign in LD
-	native.mov(a, .A, .LD)
-	native.alu_imm(a, .And, .A, 0x80000000)
-	native.alu_imm(a, .Or, .A, 0x7f7fffff)
-	native.bind(a, store)
+	quotient(a, key)
 	native.imp_store(a, IMPORTS[u][.Q], .A)
 	return true
 }
@@ -387,6 +351,108 @@ lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
 	native.imp_load(a, .C, IMPORTS[u][.Vf], VU_VI)
 	native.alu_imm(a, .And, .C, 0xffff0000)
 	native.imp_store(a, IMPORTS[u][.Vf], .C, VU_VI)
+}
+
+// A = cpu.fdiv(A, B) for key 0x38, math.sqrt(abs(B)) unclamped for 0x39
+// (vu_op's VSQRT), cpu.frsqrt(A, B) for 0x3a, from the operands clamped as
+// those take them. Uses C and LD.
+@(private = "file")
+quotient :: proc(a: ^native.Asm, key: u32) {
+	if key != 0x39 {fclamp_gpr(a, .A, .C)}
+	fclamp_gpr(a, .B, .C)
+	store, fmax := native.new_label(a), native.new_label(a)
+	switch key {
+	case 0x38:
+		// cpu.fdiv: a divisor of exponent 0 gives +-FMAX with the sign of
+		// a ^ b, else fclamp(a / b).
+		native.mov(a, .C, .B)
+		native.alu_imm(a, .And, .C, 0x7f800000)
+		native.mov(a, .LD, .A)
+		native.alu(a, .Xor, .LD, .B)
+		native.br_zero(a, .C, fmax)
+		native.float_op(a, .Fdiv, .A, .B)
+	case 0x39:
+		// math.sqrt(abs(ct[ftf])), the root not clamped
+		native.mov(a, .A, .B)
+		native.alu_imm(a, .And, .A, 0x7fffffff)
+		native.float_sqrt(a, .A)
+		native.jmp(a, store)
+	case 0x3a:
+		// cpu.frsqrt: s = sqrt(|b|); s of exponent 0 gives +-FMAX with
+		// the sign of a, else fclamp(a / s).
+		native.alu_imm(a, .And, .B, 0x7fffffff)
+		native.float_sqrt(a, .B)
+		native.mov(a, .C, .B)
+		native.alu_imm(a, .And, .C, 0x7f800000)
+		native.mov(a, .LD, .A)
+		native.br_zero(a, .C, fmax)
+		native.float_op(a, .Fdiv, .A, .B)
+	}
+	fclamp_gpr(a, .A, .C)
+	native.jmp(a, store)
+	native.bind(a, fmax) // the sign in LD
+	native.mov(a, .A, .LD)
+	native.alu_imm(a, .And, .A, 0x80000000)
+	native.alu_imm(a, .Or, .A, 0x7f7fffff)
+	native.bind(a, store)
+}
+
+// The import of the EFU's sin, atan and exp, shared by both units:
+// proc(key, x: u32) -> u32.
+@(private = "file")
+EFU :: "vu.efu"
+
+// EFU op key (0x70-0x7e, not WAITP) of lw, as vu.vu_op runs it: P from the
+// clamped fs lanes, written at once, no flags. The arithmetic is inline, in
+// the interpreter's order; sin, atan and exp come from import vu.efu. Uses
+// A, B, C and LD, and keeps T.
+@(private = "file")
+efu :: proc(a: ^native.Asm, u: Unit, lw, key: u32) {
+	fs, fsf := (lw >> 11) & 31, (lw >> 21) & 3
+	lane :: proc(a: ^native.Asm, u: Unit, r: native.Reg, fs, k: u32) {
+		native.imp_load(a, r, IMPORTS[u][.Vf], 16 * fs + 4 * k)
+		fclamp_gpr(a, r, .C)
+	}
+	switch key {
+	case 0x70 ..= 0x73: // s.x * s.x + s.y * s.y + s.z * s.z
+		lane(a, u, .A, fs, 0)
+		native.float_op(a, .Fmul, .A, .A)
+		for k in u32(1) ..< 3 {
+			lane(a, u, .B, fs, k)
+			native.float_op(a, .Fmul, .B, .B)
+			native.float_op(a, .Fadd, .A, .B)
+		}
+	case 0x76: // s.x + s.y + s.z + s.w
+		lane(a, u, .A, fs, 0)
+		for k in u32(1) ..< 4 {
+			lane(a, u, .B, fs, k)
+			native.float_op(a, .Fadd, .A, .B)
+		}
+	case 0x74, 0x75: // EATANxy, EATANxz: fdiv(s.y or s.z, s.x)
+		lane(a, u, .A, fs, key == 0x74 ? 1 : 2)
+		lane(a, u, .B, fs, 0)
+		quotient(a, 0x38)
+	case:
+		lane(a, u, .A, fs, fsf)
+	}
+	switch key {
+	case 0x70, 0x76: // ESADD, ESUM
+		fclamp_gpr(a, .A, .C)
+	case 0x71, 0x73, 0x79, 0x7a: // ERSADD, ERLENG, ERSQRT, ERCPR: of 1
+		native.mov(a, .B, .A)
+		native.mov_imm(a, .A, 0x3f800000)
+		quotient(a, key == 0x71 || key == 0x7a ? 0x38 : 0x3a)
+	case 0x72: // ELENG: no abs, the sum is not negative
+		native.float_sqrt(a, .A)
+	case 0x78: // ESQRT
+		native.alu_imm(a, .And, .A, 0x7fffffff)
+		native.float_sqrt(a, .A)
+	case 0x74, 0x75, 0x7c ..= 0x7e: // EATANxy, EATANxz, ESIN, EATAN, EEXP
+		native.mov(a, .B, .A)
+		native.mov_imm(a, .A, key)
+		native.call(a, EFU, .A, .B)
+	}
+	native.imp_store(a, IMPORTS[u][.P], .A)
 }
 
 // r = cpu.fclamp of the f32 bits in r: exponent 255 to +-FMAX, exponent 0
@@ -736,9 +802,9 @@ vi_test :: proc(a: ^native.Asm, u: Unit, it: u32, c: native.Cond, imm: u32) {
 // Code for non-branch lower op lw at pc as vu.odin's emit_lower writes it,
 // else a call of the interpreter's. status: a DIV-family op sets status
 // (VU0 outside an I-bit or slow pair). Uses A, B, C, LD and V0-V4, and
-// keeps T.
+// keeps T. Counts a call of the interpreter's in slow, as emit_pair.
 @(private = "file")
-micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool) {
+micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^map[string]int) {
 	dest := (lw >> 21) & 15
 	ft, fs := (lw >> 16) & 31, (lw >> 11) & 31
 	it, is := ft & 15, fs & 15
@@ -746,7 +812,16 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool) {
 	imm15 := ((lw >> 10) & 0x7800) | (lw & 0x7ff)
 	imm24 := lw & 0xffffff
 	key := ((lw >> 4) & 0x7c) | (lw & 3)
-	interp :: proc(a: ^native.Asm, u: Unit, lw, pc: u32) {
+	interp :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int) {
+		fn := lw & 63
+		switch {
+		case lw >> 25 != 0x40:
+			count_slow(slow, fmt.tprintf("lower %02x", lw >> 25))
+		case fn < 0x3c:
+			count_slow(slow, fmt.tprintf("lower 40 %02x", fn))
+		case:
+			count_slow(slow, fmt.tprintf("lower 40 special %02x", ((lw >> 4) & 0x7c) | (lw & 3)))
+		}
 		native.mov_imm(a, .A, lw)
 		native.mov_imm(a, .B, pc)
 		native.call(a, IMPORTS[u][.Lower], .A, .B)
@@ -816,12 +891,12 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool) {
 			switch lw & 63 {
 			case 0x30, 0x31, 0x32, 0x34, 0x35: if int_op(a, u, lw) {return}
 			}
-			interp(a, u, lw, pc)
+			interp(a, u, lw, pc, slow)
 			return
 		}
 		switch key {
 		case 0x30, 0x31, 0x34 ..= 0x37, 0x3b, 0x3d, 0x7b: // MOVE, MR32, LQI-SQD, WAITQ, MFIR, WAITP
-			if key != 0x7b && !op(a, u, lw, .None) {interp(a, u, lw, pc)}
+			if key != 0x7b && !op(a, u, lw, .None) {interp(a, u, lw, pc, slow)}
 		case 0x38 ..= 0x3a: // DIV, SQRT, RSQRT
 			div(a, u, lw, key, status)
 		case 0x3c: // MTIR
@@ -841,7 +916,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool) {
 			}
 		case 0x68, 0x69: // XTOP (VU1 only), XITOP: as emit_lower
 			if u == .VU0 && key == 0x68 {
-				interp(a, u, lw, pc)
+				interp(a, u, lw, pc, slow)
 				return
 			}
 			if it == 0 {return}
@@ -849,15 +924,17 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool) {
 			vi_put(a, u, it)
 		case 0x6c: // XGKICK (VU1 only)
 			if u == .VU0 {
-				interp(a, u, lw, pc)
+				interp(a, u, lw, pc, slow)
 				return
 			}
 			vi_get(a, u, .A, is)
 			native.alu_imm(a, .And, .A, 0xffff)
 			native.call(a, IMPORTS[u][.Xgkick], .A)
-		case: interp(a, u, lw, pc) // the EFU and the rest
+		case 0x70 ..= 0x76, 0x78 ..= 0x7a, 0x7c ..= 0x7e: // the EFU
+			efu(a, u, lw, key)
+		case: interp(a, u, lw, pc, slow)
 		}
-	case: interp(a, u, lw, pc)
+	case: interp(a, u, lw, pc, slow)
 	}
 }
 
@@ -866,12 +943,17 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool) {
 // keys from 0x30, are not upper ops: op would take them for integer or
 // lower ones.
 @(private = "file")
-micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair) {
+micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair, slow: ^map[string]int) {
 	flags := Flags.Mac_Status
 	if u == .VU1 {flags = Flags.Mac if p.mac_live else Flags.None}
 	fn := p.uw & 63
 	inline := fn < 0x30 || (fn >= 0x3c && ((p.uw >> 4) & 0x7c) | (p.uw & 3) < 0x30)
 	if inline && op(a, u, p.uw, flags) {return}
+	if fn & 0x3c != 0x3c {
+		count_slow(slow, fmt.tprintf("upper %02x", fn))
+	} else {
+		count_slow(slow, fmt.tprintf("upper special %02x", ((p.uw >> 4) & 0x7c) | (p.uw & 3)))
+	}
 	native.mov_imm(a, .A, p.uw)
 	native.call(a, IMPORTS[u][.Upper], .A)
 }
@@ -879,15 +961,16 @@ micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair) {
 // Pair p at pc, without its branch, as emit_pair orders its halves. Uses
 // A, B, C, LD and V0-V4, and keeps T.
 @(private = "file")
-micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32) {
+micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]int) {
 	vf, scratch, status := IMPORTS[u][.Vf], IMPORTS[u][.Scratch], IMPORTS[u][.Status]
 	if p.ibit { // the upper still reads the old I
-		micro_upper(a, u, p)
+		micro_upper(a, u, p, slow)
 		native.mov_imm(a, .A, p.lw)
 		native.imp_store(a, IMPORTS[u][.I], .A)
 		return
 	}
 	if p.mode == .Slow {
+		count_slow(slow, "pair")
 		native.mov_imm(a, .A, p.uw)
 		native.mov_imm(a, .B, p.lw)
 		native.mov_imm(a, .C, pc)
@@ -903,8 +986,8 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32) {
 		native.imp_load(a, .A, status)
 		native.imp_store(a, scratch, .A, SCR_ST0)
 	}
-	upper :: proc(a: ^native.Asm, u: Unit, p: Pair, merge: bool) {
-		micro_upper(a, u, p)
+	upper :: proc(a: ^native.Asm, u: Unit, p: Pair, merge: bool, slow: ^map[string]int) {
+		micro_upper(a, u, p, slow)
 		if !merge {return}
 		status, scratch := IMPORTS[u][.Status], IMPORTS[u][.Scratch]
 		native.imp_load(a, .A, status)
@@ -912,8 +995,8 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32) {
 		native.imp_load(a, .A, scratch, SCR_ST0)
 		native.imp_store(a, status, .A)
 	}
-	lower :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, merge: bool) {
-		micro_lower(a, u, p.lw, pc, merge)
+	lower :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, merge: bool, slow: ^map[string]int) {
+		micro_lower(a, u, p.lw, pc, merge, slow)
 		if !merge {return}
 		status, scratch := IMPORTS[u][.Status], IMPORTS[u][.Scratch]
 		same := native.new_label(a)
@@ -927,11 +1010,11 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32) {
 	}
 	switch p.mode {
 	case .Serial:
-		upper(a, u, p, merge)
-		if p.branch == .None {lower(a, u, p, pc, merge)}
+		upper(a, u, p, merge, slow)
+		if p.branch == .None {lower(a, u, p, pc, merge, slow)}
 	case .Lower_First:
-		lower(a, u, p, pc, merge)
-		upper(a, u, p, merge)
+		lower(a, u, p, pc, merge, slow)
+		upper(a, u, p, merge, slow)
 	case .Hazard:
 		// As vu_pair: the lower reads the upper's dest from before the
 		// upper, and its own write to it, if any, wins unless it leaves the
@@ -939,12 +1022,12 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32) {
 		ud := upper_dest(p.uw)
 		native.vec_load(a, .V0, 16 * ud, vf)
 		native.vec_store(a, SCR_SAVED, .V0, scratch)
-		upper(a, u, p, merge)
+		upper(a, u, p, merge, slow)
 		native.vec_load(a, .V0, 16 * ud, vf)
 		native.vec_store(a, SCR_RESULT, .V0, scratch)
 		native.vec_load(a, .V0, SCR_SAVED, scratch)
 		native.vec_store(a, 16 * ud, .V0, vf)
-		lower(a, u, p, pc, merge)
+		lower(a, u, p, pc, merge, slow)
 		keep := native.new_label(a)
 		if (p.lw >> 16) & 31 == ud { // every lower VF write goes to ft
 			native.vec_load(a, .V0, 16 * ud, vf)
@@ -990,11 +1073,20 @@ micro_branch :: proc(a: ^native.Asm, u: Unit, lw, pc, mask: u32) {
 	}
 }
 
+// The keys outlive the temp allocator, which each program frees.
+@(private = "file")
+count_slow :: proc(slow: ^map[string]int, key: string) {
+	if slow == nil {return}
+	if key not_in slow {slow[strings.clone(key)] = 0}
+	slow[key] += 1
+}
+
 // The native function for a microprogram of unit u: words from micro
 // address 0, compiling the pairs ext marks (nil: all) and entered at
 // entries, as emit_program compiles it. Returns its code offset. The run
-// ABI is this file's header's.
-native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32, u: Unit) -> int {
+// ABI is this file's header's. Counts the halves that call the interpreter
+// in slow, by opcode, when it is not nil.
+native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32, u: Unit, slow: ^map[string]int = nil) -> int {
 	mask := MASK[u]
 	pairs, _ := analyze(words, ext, entries, u)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
@@ -1040,9 +1132,9 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 			leave(a, exit, pc)
 		case branch:
 			op := p.lw >> 25
-			micro_pair(a, u, p, pc)
+			micro_pair(a, u, p, pc, slow)
 			micro_branch(a, u, p.lw, pc, mask)
-			micro_pair(a, u, next, pc + 8)
+			micro_pair(a, u, next, pc + 8, slow)
 			not_taken, go := native.new_label(a), native.new_label(a)
 			cond := op >= 0x28
 			reg := op == 0x24 || op == 0x25
@@ -1068,11 +1160,11 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 			native.bind(a, not_taken)
 			if cond {goto(a, labels, exit, (pc + 16) & mask)}
 		case p.ebit:
-			micro_pair(a, u, p, pc)
-			micro_pair(a, u, next, pc + 8)
+			micro_pair(a, u, p, pc, slow)
+			micro_pair(a, u, next, pc + 8, slow)
 			leave(a, exit, (pc + 16) & mask, end = true)
 		case:
-			micro_pair(a, u, p, pc)
+			micro_pair(a, u, p, pc, slow)
 			if i + 1 >= len(pairs) || !in_ext(ext, i + 1) {leave(a, exit, (pc + 8) & mask)}
 		}
 	}

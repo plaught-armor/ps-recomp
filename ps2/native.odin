@@ -11,6 +11,7 @@ package ps2
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:math"
 import "core:os"
 
 import "ps:core"
@@ -44,6 +45,19 @@ native_bc_cond :: proc(w: u32) -> u32 {return bc_cond(w) ? 1 : 0}
 @(private = "file")
 native_fpu_slow :: proc(x, y, op: u32) -> u32 {
 	return transmute(u32)cpu.fpu_slow(cpu.Fpu_Op(op), transmute(f32)x, transmute(f32)y)
+}
+
+// The EFU's sin, atan and exp for native microprograms (recomp/vu/native.odin
+// efu), from x, the clamped lane or EATANxy's and EATANxz's quotient, as
+// vu.vu_op computes P.
+@(private = "file")
+native_efu :: proc(key, x: u32) -> u32 {
+	f := transmute(f32)x
+	switch key {
+	case 0x7c: return transmute(u32)math.sin(f) // ESIN
+	case 0x7e: return transmute(u32)cpu.fclamp(math.exp(-f)) // EEXP
+	}
+	return transmute(u32)math.atan(f) // EATANxy, EATANxz, EATAN
 }
 
 // The page bytes of native code's RAM (recomp/r5900/native.odin
@@ -288,6 +302,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu1.scratch"] = p(&vu.native_run[1].scratch)
 	m["ps2.bc_cond"] = p(rawptr(native_bc_cond))
 	m["cpu.fpu_slow"] = p(rawptr(native_fpu_slow))
+	m["vu.efu"] = p(rawptr(native_efu))
 	return m
 }
 

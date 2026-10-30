@@ -26,7 +26,7 @@ jobs:
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/compat; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/compat; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -82,6 +82,7 @@ jobs:
           odin run tests/vu -collection:ps=. -out:vu_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/vu_macro -collection:ps=. -out:vu_macro_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/vu_micro -collection:ps=. -out:vu_micro_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/vu_native -collection:ps=. -out:vu_native_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_emit -collection:ps=. -out:ee_emit_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/spu -collection:ps=. -out:spu_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_fallback -collection:ps=. -out:psx_fallback_test${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -122,3 +123,5 @@ jobs:
           arch -x86_64 ./fpu_test
           odin build tests/vu -collection:ps=. -target:darwin_amd64 -out:vu_test
           arch -x86_64 ./vu_test
+          odin build tests/vu_native -collection:ps=. -target:darwin_amd64 -out:vu_native_test
+          arch -x86_64 ./vu_native_test
