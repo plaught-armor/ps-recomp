@@ -464,7 +464,7 @@ Cmd :: struct {
 }
 
 @(private)
-rtp :: proc(c: Cmd) #no_bounds_check {
+rtp :: #force_inline proc(c: Cmd) #no_bounds_check {
 	g := &state
 	v := g.v[0]
 	vx, vy, vz := i64(v[0]), i64(v[1]), i64(v[2])
@@ -517,7 +517,7 @@ rtp :: proc(c: Cmd) #no_bounds_check {
 // testing all lanes at once flags as the three rtp calls do; MAC and IR end
 // as V2 leaves them. The divides and the depth tags run in vertex order.
 @(private)
-rtpt :: proc(c: Cmd) #no_bounds_check {
+rtpt :: #force_inline proc(c: Cmd) #no_bounds_check {
 	I :: #simd[4]i64
 	U :: #simd[4]u64
 	F :: #simd[4]f64
@@ -770,7 +770,7 @@ light_vertex :: proc(c: Cmd, n: int, tail: Light_Tail) #no_bounds_check {
 }
 
 @(private)
-mvmva :: proc(c: Cmd, cmd: u32) #no_bounds_check {
+mvmva :: #force_inline proc(c: Cmd, cmd: u32) #no_bounds_check {
 	g := &state
 	m: ^[3][3]i32
 	garbage: [3][3]i32
@@ -845,6 +845,33 @@ cmd_avsz4 :: #force_inline proc() {
 	flag_sum()
 }
 
+// RTPS, RTPT and MVMVA whole, FLAG included: commands recompiled code runs
+// often but too large to inline, so the Odin output calls them directly in
+// place of gte_cmd (no switch, no helper count). gte_cmd runs them through
+// these too, the only copy of each.
+cmd_rtps :: proc(cmd: u32) #no_bounds_check {
+	state.flag = 0
+	rtp(cmd_fields(cmd))
+	flag_sum()
+}
+
+cmd_rtpt :: proc(cmd: u32) #no_bounds_check {
+	state.flag = 0
+	rtpt(cmd_fields(cmd))
+	flag_sum()
+}
+
+cmd_mvmva :: proc(cmd: u32) #no_bounds_check {
+	state.flag = 0
+	mvmva(cmd_fields(cmd), cmd)
+	flag_sum()
+}
+
+@(private)
+cmd_fields :: #force_inline proc(cmd: u32) -> Cmd {
+	return {shift = ((cmd >> 19) & 1) * 12, lm = (cmd >> 10) & 1 != 0}
+}
+
 @(private)
 nclip :: #force_inline proc() {
 	s := &state.sxy
@@ -865,16 +892,13 @@ flag_sum :: #force_inline proc() {
 gte_cmd :: proc(cmd: u32) #no_bounds_check {
 	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Cmd][cmd & 0x3f] += 1}
 	g := &state
-	c := Cmd {
-		shift = ((cmd >> 19) & 1) * 12,
-		lm    = (cmd >> 10) & 1 != 0,
-	}
+	c := cmd_fields(cmd)
 	g.flag = 0
 	switch cmd & 0x3f {
 	case 0x01:
-		rtp(c)
+		cmd_rtps(cmd)
 	case 0x30:
-		rtpt(c)
+		cmd_rtpt(cmd)
 	case 0x06:
 		nclip()
 	case 0x0c:
@@ -896,7 +920,7 @@ gte_cmd :: proc(cmd: u32) #no_bounds_check {
 	case 0x29:
 		interpolate(c, color_scaled())
 	case 0x12:
-		mvmva(c, cmd)
+		cmd_mvmva(cmd)
 	case 0x13:
 		light_vertex(c, 0, .Depth)
 	case 0x16:

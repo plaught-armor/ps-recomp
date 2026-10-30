@@ -180,7 +180,8 @@ emit_op :: proc(i: Insn) -> []string {
 }
 
 // The call for GTE command cmd: NCLIP, AVSZ3 and AVSZ4, small and without
-// the shift or lm bit, through their inline procs; the rest through
+// the shift or lm bit, through their inline procs; RTPS, RTPT and MVMVA
+// through their own procs, given the command word; the rest through
 // gte.gte_cmd.
 @(private = "file")
 gte_cmd_call :: proc(cmd: u32) -> string {
@@ -191,6 +192,12 @@ gte_cmd_call :: proc(cmd: u32) -> string {
 		return "gte.cmd_avsz3()"
 	case 0x2e:
 		return "gte.cmd_avsz4()"
+	case 0x01:
+		return fmt.aprintf("gte.cmd_rtps(0x%x)", cmd)
+	case 0x30:
+		return fmt.aprintf("gte.cmd_rtpt(0x%x)", cmd)
+	case 0x12:
+		return fmt.aprintf("gte.cmd_mvmva(0x%x)", cmd)
 	}
 	return fmt.aprintf("gte.gte_cmd(0x%x)", cmd)
 }

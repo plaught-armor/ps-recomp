@@ -280,25 +280,39 @@ main :: proc() {
 			free_all(context.temp_allocator)
 		}
 	}
-	// NCLIP, AVSZ3 and AVSZ4 name their inline procs, RTPS gte_cmd; the
-	// inline ones run against gte_cmd.
+	// NCLIP, AVSZ3 and AVSZ4 name their inline procs, RTPS, RTPT and MVMVA
+	// their own procs with the command word, NCDS gte_cmd; all but gte_cmd
+	// run against gte_cmd. Both shifts and lm settings, and every MVMVA
+	// matrix, vector and translation field.
 	Cmd_Case :: struct {
-		w:    u32,
-		name: string,
-		run:  proc(),
+		w:     u32,
+		name:  string,
+		whole: bool, // takes the command word
+		run:   proc(cmd: u32),
 	}
 	cmds := [?]Cmd_Case {
-		{NCLIP, "cmd_nclip", gte.cmd_nclip},
-		{0x4a00002d, "cmd_avsz3", gte.cmd_avsz3},
-		{0x4a00002e, "cmd_avsz4", gte.cmd_avsz4},
-		{0x4a180001, "gte_cmd", nil},
+		{NCLIP, "cmd_nclip", false, proc(_: u32) {gte.cmd_nclip()}},
+		{0x4a00002d, "cmd_avsz3", false, proc(_: u32) {gte.cmd_avsz3()}},
+		{0x4a00002e, "cmd_avsz4", false, proc(_: u32) {gte.cmd_avsz4()}},
+		{0x4a180001, "cmd_rtps", true, gte.cmd_rtps},
+		{0x4a100401, "cmd_rtps", true, gte.cmd_rtps},
+		{0x4a280030, "cmd_rtpt", true, gte.cmd_rtpt},
+		{0x4a200430, "cmd_rtpt", true, gte.cmd_rtpt},
+		{0x4a486012, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4a480012, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4a49e012, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4a4a6412, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4a4ec012, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4a43a412, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4a4da012, "cmd_mvmva", true, gte.cmd_mvmva},
+		{0x4ae80413, "gte_cmd", true, nil},
 	}
 	for c in cmds {
 		code := [?]u32{c.w, 0, JR_RA, 0, 0}
 		b := strings.builder_make(context.temp_allocator)
 		r3000.emit_func(build(0x80002000, code[:]), &b, "f", nil, 1)
 		name, arg := emitted_gte_call(strings.to_string(b))
-		if name != c.name || (c.run == nil && arg != c.w & 0x1ffffff) {
+		if name != c.name || arg != (c.whole ? c.w & 0x1ffffff : 0) {
 			fail("odin %08x: calls gte.%s(%#x), want gte.%s", c.w, name, arg, c.name)
 		}
 		free_all(context.temp_allocator)
@@ -312,8 +326,8 @@ main :: proc() {
 			gte.gte_cmd(c.w & 0x1ffffff)
 			want := gte.gte_save()
 			gte.gte_load(start)
-			c.run()
-			if gte.gte_save() != want {fail("odin %s from state %d: GTE state differs", c.name, k)}
+			c.run(c.w & 0x1ffffff)
+			if gte.gte_save() != want {fail("odin %08x from state %d: GTE state differs", c.w, k)}
 			checks += 1
 		}
 	}
