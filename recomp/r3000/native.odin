@@ -157,7 +157,7 @@ gte_ctrl :: proc(r: u32) -> Ctrl {
 	return {264 + 4 * (r - 56), .Word} // OFX, OFY, DQB
 }
 
-// The proc for GTE command w but NCLIP, AVSZ3 and AVSZ4: RTPS, RTPT and MVMVA their own,
+// The proc for GTE command w but NCLIP, AVSZ3, AVSZ4 and MVMVA: RTPS and RTPT their own,
 // as in the Odin output; the rest gte.gte_cmd.
 @(private = "file")
 gte_cmd_proc :: proc(w: u32) -> string {
@@ -166,8 +166,6 @@ gte_cmd_proc :: proc(w: u32) -> string {
 		return "gte.cmd_rtps"
 	case 0x30:
 		return "gte.cmd_rtpt"
-	case 0x12:
-		return "gte.cmd_mvmva"
 	}
 	return "gte.gte_cmd"
 }
@@ -201,6 +199,151 @@ nclip :: proc(a: ^native.Asm) {
 	native.mov_imm(a, .A, 0x80008000)
 	native.bind(a, store)
 	native.imp_store(a, "gte.state", .A, GTE_FLAG)
+}
+
+// FLAG |= bit. Loses C.
+@(private = "file")
+gte_flag :: proc(a: ^native.Asm, bit: u32) {
+	native.imp_load(a, .C, "gte.state", GTE_FLAG)
+	native.alu_imm(a, .Or, .C, bit)
+	native.imp_store(a, "gte.state", .C, GTE_FLAG)
+}
+
+// MAC i's sum in A checked and wrapped to 44 bits, as gte.check_mac: FLAG
+// bit 31 - i for a sum above, 28 - i below. Loses B and C.
+@(private = "file")
+mac_check :: proc(a: ^native.Asm, i: u32) {
+	done, below := native.new_label(a), native.new_label(a)
+	native.mac64_wrap(a, 44, .B)
+	native.br_zero(a, .B, done)
+	native.br_cmp_imm(a, .Lt, .B, 0, below)
+	gte_flag(a, 1 << (31 - i))
+	native.jmp(a, done)
+	native.bind(a, below)
+	gte_flag(a, 1 << (28 - i))
+	native.bind(a, done)
+}
+
+// A = the checked sum in A shifted right by shift, its low 32 bits: MAC i
+// as gte.set_mac takes it. Loses B and C.
+@(private = "file")
+mac_value :: proc(a: ^native.Asm, shift: u32) {
+	native.mac64_split(a, .B)
+	if shift != 0 {
+		native.alu_imm(a, .Shr, .A, shift)
+		native.alu_imm(a, .Shl, .B, 32 - shift)
+		native.alu(a, .Or, .A, .B)
+	}
+}
+
+// IR i's value from MAC i in A, as gte.set_ir: held to 0 (lm) or -0x8000,
+// and to 0x7fff, with FLAG bit 25 - i; stored only when store. Loses C.
+@(private = "file")
+ir_set :: proc(a: ^native.Asm, i: u32, lm, store: bool) {
+	lo: u32 = 0 if lm else 0xffff8000
+	done, held, low := native.new_label(a), native.new_label(a), native.new_label(a)
+	native.br_cmp_imm(a, .Lt, .A, lo, low)
+	native.br_cmp_imm(a, .Le, .A, 0x7fff, done)
+	native.mov_imm(a, .A, 0x7fff)
+	native.jmp(a, held)
+	native.bind(a, low)
+	native.mov_imm(a, .A, lo)
+	native.bind(a, held)
+	gte_flag(a, 1 << (25 - i))
+	native.bind(a, done)
+	if store {native.imp_store(a, "gte.state", .A, GTE_IR + 4 * i)}
+}
+
+// MVMVA for command word w, as gte.cmd_mvmva, its fields fixed: MAC1-3 =
+// M * V + (T << 12), each sum checked after every addition, then IR1-3
+// from MAC (saturated), FLAG from 0. M is RT, LLM, LCM or (mx 3) a garbage
+// matrix of R << 4, IR0 and RT entries; V is V0-V2 or IR1-3; T is TR, BK,
+// none, or FC as hardware gets it wrong (cv 2: the FC term with the first
+// column, its IR saturated unlimited, then the other two columns alone).
+// The rows' MAC go out first and IR after, as V may be IR. Loses A, B and C.
+@(private = "file")
+mvmva :: proc(a: ^native.Asm, w: u32) {
+	GTE_RT :: 120
+	GTE_TR :: 228
+	MATRIX :: [4]u32{GTE_RT, GTE_RT + 36, GTE_RT + 72, 0}
+	TRANS :: [4]u32{GTE_TR, GTE_TR + 12, GTE_TR + 24, 0}
+	mx, v, cv := (w >> 17) & 3, (w >> 15) & 3, (w >> 13) & 3
+	shift: u32 = ((w >> 19) & 1) * 12
+	lm := (w >> 10) & 1 != 0
+	matrices, trans := MATRIX, TRANS
+	// B = M[row][col].
+	entry :: proc(a: ^native.Asm, base, mx, row, col: u32) {
+		switch {
+		case mx != 3:
+			native.imp_load(a, .B, "gte.state", base + 12 * row + 4 * col)
+		case row == 0 && col < 2:
+			// R << 4, negated in the first column
+			native.imp_load(a, .B, "gte.state", GTE_RGBC, .B16)
+			native.alu_imm(a, .And, .B, 0xff)
+			native.alu_imm(a, .Shl, .B, 4)
+			if col == 0 {
+				native.mov_imm(a, .C, 0)
+				native.alu(a, .Sub, .C, .B)
+				native.mov(a, .B, .C)
+			}
+		case row == 0:
+			native.imp_load(a, .B, "gte.state", GTE_IR)
+		case:
+			// RT13 along row 1, RT22 along row 2
+			native.imp_load(a, .B, "gte.state", GTE_RT + 8 if row == 1 else GTE_RT + 16)
+		}
+	}
+	// C = V[col].
+	vec :: proc(a: ^native.Asm, v, col: u32) {
+		if v == 3 {
+			native.imp_load(a, .C, "gte.state", GTE_IR + 4 * (col + 1))
+		} else {
+			native.imp_load(a, .C, "gte.state", 6 * v + 2 * col, .B16, true)
+		}
+	}
+	// A = T[row] << 12 (t not 0) plus M[row][col] * V[col] for col in from
+	// ..< to, checked after each addition; with whole, a full row as
+	// gte.mac_sum, its first term checked even without T.
+	sum :: proc(a: ^native.Asm, base, mx, v, row, t, from, to: u32, whole: bool) {
+		if t != 0 {
+			native.imp_load(a, .B, "gte.state", t + 4 * row)
+			native.mov_imm(a, .C, 0x1000)
+			native.mac64(a, .Set, .B, .C)
+		}
+		for col in from ..< to {
+			entry(a, base, mx, row, col)
+			vec(a, v, col)
+			native.mac64(a, .Set if t == 0 && col == from else .Add, .B, .C)
+			if whole || t != 0 || col != from {mac_check(a, row + 1)}
+		}
+	}
+	native.mov_imm(a, .A, 0)
+	native.imp_store(a, "gte.state", .A, GTE_FLAG)
+	for row in u32(0) ..< 3 {
+		if cv == 2 {
+			sum(a, matrices[mx], mx, v, row, trans[cv], 0, 1, false)
+			mac_value(a, shift)
+			ir_set(a, row + 1, false, false)
+			sum(a, matrices[mx], mx, v, row, 0, 1, 3, false)
+		} else {
+			sum(a, matrices[mx], mx, v, row, trans[cv], 0, 3, true)
+		}
+		mac_value(a, shift)
+		native.imp_store(a, "gte.state", .A, GTE_MAC + 4 * (row + 1))
+	}
+	for row in u32(1) ..= 3 {
+		native.imp_load(a, .A, "gte.state", GTE_MAC + 4 * row)
+		ir_set(a, row, lm, true)
+	}
+	// FLAG bit 31 for any error bit, as gte.flag_sum.
+	done := native.new_label(a)
+	native.imp_load(a, .C, "gte.state", GTE_FLAG)
+	native.mov(a, .B, .C)
+	native.alu_imm(a, .And, .B, 0x7f87e000)
+	native.br_zero(a, .B, done)
+	native.alu_imm(a, .Or, .C, 0x80000000)
+	native.imp_store(a, "gte.state", .C, GTE_FLAG)
+	native.bind(a, done)
 }
 
 // AVSZ3 (SZ1-3, scale ZSF3) or AVSZ4 (SZ0-3, ZSF4), as gte.gte_cmd: MAC0 =
@@ -648,6 +791,8 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 			avsz(a, GTE_ZSF3, 1)
 		case rs & 16 != 0 && i.w & 0x3f == 0x2e:
 			avsz(a, GTE_ZSF4, 0)
+		case rs & 16 != 0 && i.w & 0x3f == 0x12:
+			mvmva(a, i.w)
 		case rs & 16 != 0:
 			call_imm(a, gte_cmd_proc(i.w), i.w & 0x1ffffff)
 		case:

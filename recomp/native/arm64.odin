@@ -489,6 +489,15 @@ a64_mac64_split :: proc(a: ^Asm, dst: Reg) {
 	a64_mov(a, .A, .A) // the high half cleared
 }
 
+a64_mac64_wrap :: proc(a: ^Asm, n: u32, dst: Reg) {
+	d := A64_REG[.A]
+	emit32(a, 0x93400000 | (n - 1) << 10 | d << 5 | T0) // sbfx x12, xA, #0, #n
+	rrr(a, 0xcb000000, T1, d, T0) // sub x13, xA, x12
+	emit32(a, 0x9340fc00 | n << 16 | T1 << 5 | T1) // asr x13, x13, #n
+	rrr(a, 0x2a0003e0, A64_REG[dst], 0, T1) // mov w dst, w13
+	rrr(a, 0xaa0003e0, d, 0, T0) // mov xA, x12
+}
+
 a64_div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	rrr(a, 0x1ac00c00 if signed else 0x1ac00800, T0, A64_REG[x], A64_REG[y]) // sdiv/udiv w12
 	emit32(a, 0x1b008000 | A64_REG[y] << 16 | A64_REG[x] << 10 | T0 << 5 | T1) // msub w13, w12, y, x

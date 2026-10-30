@@ -872,7 +872,8 @@ cmd_avsz4 :: #force_inline proc() {
 // RTPS, RTPT and MVMVA whole, FLAG included: commands recompiled code runs
 // often but too large to inline, so the Odin output calls them directly in
 // place of gte_cmd (no switch, no helper count). gte_cmd runs them through
-// these too, the only copy of each.
+// these too, the only copy of each here; native code has MVMVA as its own
+// (recomp/r3000/native.odin).
 cmd_rtps :: proc(cmd: u32) #no_bounds_check {
 	state.flag = 0
 	rtp(cmd_fields(cmd))

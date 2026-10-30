@@ -6,7 +6,8 @@
 // inline NCLIP, AVSZ3 and AVSZ4 against gte.gte_cmd. The Odin backend's output for the same
 // forms and for GTE commands: which call each names, an inline proc or the
 // helper, and the inline ones against the helpers. And RTPS, RTPT and
-// MVMVA against a plain reference (ref.odin).
+// MVMVA against a plain reference, and the native MVMVA for every command
+// word against gte.gte_cmd (ref.odin).
 package main
 
 import "core:fmt"
@@ -168,11 +169,18 @@ main :: proc() {
 		}
 	}
 	// NCLIP, AVSZ3 and AVSZ4 inline, then commands called by the native
-	// code: RTPS, RTPT and MVMVA through their own procs, NCDS through
-	// gte_cmd.
-	NATIVE_CMDS :: [?]u32{NCLIP, AVSZ3, AVSZ4, 0x4a180001, 0x4a200430, 0x4a486012, 0x4a4ec012, 0x4a43a412, 0x4ae80413}
+	// code: RTPS and RTPT through their own procs, NCDS through gte_cmd.
+	// Then MVMVA inline, every command word (ref_native_mvmva).
+	NATIVE_CMDS :: [?]u32{NCLIP, AVSZ3, AVSZ4, 0x4a180001, 0x4a200430, 0x4ae80413}
 	for w in NATIVE_CMDS {
 		words := [?]u32{w, 0, JR_RA, 0, 0}
+		append(&funcs, native.Blob_Func{at, r3000.native_func(&na, build(at, words[:]), nil, 1)})
+		at += 0x20
+		free_all(context.temp_allocator)
+	}
+	mvmva_first := len(funcs)
+	for n in u32(0) ..< 256 {
+		words := [?]u32{mvmva_word(n), 0, JR_RA, 0, 0}
 		append(&funcs, native.Blob_Func{at, r3000.native_func(&na, build(at, words[:]), nil, 1)})
 		at += 0x20
 		free_all(context.temp_allocator)
@@ -457,6 +465,7 @@ main :: proc() {
 		}
 	}
 	checks += ref_check()
+	checks += ref_native_mvmva(code, mvmva_first)
 	if failed != 0 {
 		os.exit(1)
 	}

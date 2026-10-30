@@ -82,7 +82,7 @@ ALLOWED := [?]Allowed {
 	{proc(w: u32) -> bool {return w >> 26 == 0x2e}, {.Emit} + NATIVE, "cpu.swr", "SWR unfused: lower fuses the pairs, a lone one is cold"},
 	{proc(w: u32) -> bool {return gte_cmd(w, 0x01)}, {.Emit} + NATIVE, "gte.cmd_rtps", "RTPS: its own proc, given the command word"},
 	{proc(w: u32) -> bool {return gte_cmd(w, 0x30)}, {.Emit} + NATIVE, "gte.cmd_rtpt", "RTPT: its own proc, given the command word"},
-	{proc(w: u32) -> bool {return gte_cmd(w, 0x12)}, {.Emit} + NATIVE, "gte.cmd_mvmva", "MVMVA: its own proc, given the command word"},
+	{proc(w: u32) -> bool {return gte_cmd(w, 0x12)}, {.Emit}, "gte.cmd_mvmva", "MVMVA: its own proc, given the command word (native code runs it inline)"},
 	{proc(w: u32) -> bool {
 			fn := w & 0x3f
 			return w >> 25 == 0x25 && fn != 0x01 && fn != 0x30 && fn != 0x12 && fn != 0x06 && fn != 0x2d && fn != 0x2e

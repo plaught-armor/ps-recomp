@@ -3,12 +3,14 @@
 // its FLAG bit, the UNR divide and its table as listed there. Where psx-spx
 // leaves it open this follows Mednafen: each MAC1-3 sum is checked against 44
 // bits after every addition and wrapped, and IR1-3 saturate from the 32-bit
-// MAC register. Run against gte.gte_cmd over random and edge states.
+// MAC register. Run against gte.gte_cmd over random and edge states. And the
+// native backend's MVMVA, every command word, against gte.gte_cmd.
 package main
 
 import "base:intrinsics"
 import "core:fmt"
 import "core:strings"
+import "ps:core"
 import gte "ps:psx/gte"
 
 @(private = "file")
@@ -347,4 +349,52 @@ ref_check :: proc() -> int {
 		if !clean[c] {fail("ref %v: no run with FLAG 0", c)}
 	}
 	return runs[.Rtps] + runs[.Rtpt] + runs[.Mvmva]
+}
+
+// The MVMVA command word n of 256: sf, lm, mx, v and cv from n's bits.
+mvmva_word :: proc(n: u32) -> u32 {
+	return 0x4a400012 | (n >> 7 & 1) << 19 | (n >> 6 & 1) << 10 | (n >> 4 & 3) << 17 | (n >> 2 & 3) << 15 | (n & 3) << 13
+}
+
+// Native MVMVA for each of the 256 command words (code.funcs from first, in
+// mvmva_word order) against gte.gte_cmd, from the reference's states and
+// from noise in every word (operands past 16 bits, sums past 64 bits before
+// the wrap). Each word must set every MAC and IR FLAG bit; some must leave
+// FLAG 0.
+ref_native_mvmva :: proc(code: core.Native_Code, first: int) -> int {
+	STATES :: 240
+	checks := 0
+	clean := 0
+	for n in u32(0) ..< 256 {
+		w := mvmva_word(n)
+		f := cast(proc())rawptr(code.base + uintptr(code.funcs[first + int(n)].off))
+		seen: u32
+		bad := 0
+		for k in 0 ..< STATES {
+			if k % 5 == 4 {
+				words: [size_of(gte.Gte_State) / 4]u32
+				for &x in words {x = ref_rand()}
+				gte.gte_load(transmute(gte.Gte_State)words)
+			} else {
+				ref_state(Ref_Kind(k % len(Ref_Kind)))
+			}
+			start := gte.gte_save()
+			gte.gte_cmd(w & 0x1ffffff)
+			want := gte.gte_save()
+			seen |= gte.state.flag
+			if gte.state.flag == 0 {clean += 1}
+			gte.gte_load(start)
+			f()
+			checks += 1
+			if gte.gte_save() == want {continue}
+			bad += 1
+			if bad == 1 {
+				fmt.eprintfln("native mvmva %08x from state %d:%s", w, k, ref_diff(gte.state, transmute(gte.Gte)want))
+			}
+		}
+		if bad != 0 {fail("native mvmva %08x: %d of %d runs differ from gte_cmd", w, bad, STATES)}
+		if missing := 0xffc00000 &~ seen; missing != 0 {fail("native mvmva %08x: FLAG bits %08x never set", w, missing)}
+	}
+	if clean == 0 {fail("native mvmva: no run with FLAG 0")}
+	return checks
 }

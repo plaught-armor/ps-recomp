@@ -771,6 +771,20 @@ mac64_split :: proc(a: ^Asm, dst: Reg) {
 	}
 }
 
+// A's mac64 sum = itself wrapped to its low n bits (sign-extended from bit
+// n - 1), and dst = what the wrap took off, in units of 1 << n: 0 when the
+// sum fit, above 0 for a sum above, below 0 for one below. dst is not A; 0
+// < n < 64. Uses rcx and rdx on x64, x12 and x13 on arm64.
+mac64_wrap :: proc(a: ^Asm, n: u32, dst: Reg) {
+	assert(dst != .A && 0 < n && n < 64, "native: mac64_wrap operands")
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_mac64_wrap(a, n, dst)
+	case .Arm64:
+		a64_mac64_wrap(a, n, dst)
+	}
+}
+
 // Quotient and remainder of x by y (signed or not) into the guest state's
 // fields at lo and hi, neither a cached one. y is not 0, nor -1 when x is
 // the least i32 and signed: x64 traps on both. Uses A, and scratch outside
