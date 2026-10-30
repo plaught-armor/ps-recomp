@@ -12,7 +12,8 @@
 // spu_effect_enable, spu_voice_send) rings on after its voice ends.
 // Mixing is wide: voices that cancel leave no clipped residue, a core
 // saturates once at its output, and the host sum is left unclamped for the
-// host. A voice at pitch 0 holds its sample while its envelope steps.
+// host. A voice at pitch 0 holds its sample while its envelope steps. A
+// core's master volume (spu_master) scales its output before it saturates.
 package main
 
 import "core:fmt"
@@ -190,6 +191,38 @@ wide :: proc() {
 	check(!st.on && st.envx == 0, "pitch 0 envelope releases to zero")
 }
 
+// A loud voice's output before master volume existed (8a73a97).
+PRE_MASTER :: 28557
+
+// MVOLL and MVOLR scale a core's output, in the format of a voice volume.
+master :: proc() {
+	// Never set, it is an exact unity: the output is as it was before. A
+	// master volume set to 0x3fff is a step under it.
+	iop.spu_voice_on(1, 10, key(WIDE))
+	full := mix(28)[54]
+	check(full == PRE_MASTER, "an unset master volume leaves the output as it was")
+	iop.spu_master(1, 0x3fff, 0x2ccc)
+	out := mix(28)
+	check(out[54] == i32(i64(full) * 0x3fff >> 14), "MVOLL 0x3fff scales by 0x3fff/0x4000")
+	check(out[55] == i32(i64(full) * 0x2ccc >> 14), "MVOLR 0x2ccc scales the right output")
+	iop.spu_master(1, 0x4001, 0)
+	out = mix(28)
+	check(out[54] == i32(i64(full) * -0x3fff >> 14), "a negative MVOLL inverts")
+	check(out[55] == 0, "MVOLR 0 mutes the right output")
+	iop.spu_master(1, 0x8000, 0x3fff)
+	out = mix(28)
+	check(out[54] == i32(i64(full) * 0x3fff >> 14), "a sweeping MVOLL is taken at full scale")
+
+	// Every voice of a core at full level and volume: the sum times the
+	// master volume saturates, it does not wrap.
+	iop.spu_master(1, 0x3fff, 0x3fff)
+	for v in 0 ..< 24 {iop.spu_voice_on(1, v, key(WIDE))}
+	out = mix(28)
+	check(out[54] == 32767 && out[55] == 32767, "a loud core saturates through the master volume")
+	for v in 0 ..< 24 {iop.spu_voice_off(1, v)}
+	mix(4)
+}
+
 CHUNK :: 1024
 FNV :: 0xcbf29ce484222325
 
@@ -292,6 +325,7 @@ effects :: proc() {
 game :: proc(_: rawptr) {
 	voices()
 	wide()
+	master()
 	reverb_presets()
 	reverb_fmod()
 	effects()

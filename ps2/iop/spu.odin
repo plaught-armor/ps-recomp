@@ -13,9 +13,10 @@
 //
 // A port whose sound driver is its own HLE code, not sdrdrv, drives the same
 // voices through spu_write, spu_voice_on, spu_voice_set, spu_voice_off and
-// spu_voice_status, and each core's reverb through spu_effect,
-// spu_effect_enable and spu_voice_send (reverb.odin). sdrdrv's effect calls
-// are not handled: its cores stay dry.
+// spu_voice_status, each core's reverb through spu_effect,
+// spu_effect_enable and spu_voice_send (reverb.odin), and each core's master
+// volume through spu_master. sdrdrv's effect and master volume calls are not
+// handled: its cores stay dry, at full volume.
 package ps2_iop
 
 import "core:fmt"
@@ -56,6 +57,10 @@ spu: struct {
 	voice:  [2][24]Spu_Voice,
 	effect: [2]bool, // the core's effect enable, ATTR bit 7
 	reverb: [2]Reverb, // its work area is here, not in sound RAM at ESA .. EEA
+	// MVOLL, MVOLR as spu_volume gives them, or 0x4000 until set: an exact
+	// unity (x * 0x4000 >> 14 == x) that spu_volume never returns, where its
+	// 0x3fff loses a step on loud samples.
+	master: [2][2]i32,
 }
 
 // libsd parameter and address ids; the low bits name core and voice.
@@ -201,12 +206,18 @@ spu_mix :: proc(out: []i32) {
 			}
 		}
 		if wet {reverb_mix(w, send, acc)}
-		for x, i in acc {out[i] += clamp(x, -32768, 32767)}
+		// The master volume scales the core's whole output, reverb included
+		// (an assumption from PCSX2 practice, not checked on hardware); 24
+		// loud voices times a volume overflow 32 bits.
+		m := spu.master[c]
+		for x, i in acc {out[i] += i32(clamp(i64(x) * i64(m[i & 1]) >> 14, -32768, 32767))}
 	}
 }
 
-// A volume register: fixed volumes are 15-bit signed; sweeps (bit 15) are
-// taken at full scale.
+// A volume register (VOLL, VOLR, MVOLL, MVOLR share one format): with bit
+// 15 clear, bits 14-0 are a signed level, half the gain, so 0x3fff is unity
+// and 0x4000 (-0x4000) inverts; with bit 15 set the level sweeps, and sweeps
+// are taken at full scale.
 @(private = "file")
 spu_volume :: proc(r: u32) -> i32 {
 	if r & 0x8000 != 0 {return 0x3fff}
@@ -274,6 +285,15 @@ spu_effect :: proc(core: int, mode: u32, depth_l, depth_r: i16) -> bool {
 	if core < 0 || core > 1 || m > 9 {return false}
 	reverb_set(&spu.reverb[core], m, i32(depth_l), i32(depth_r), mode & 0x100 != 0)
 	return true
+}
+
+// Set a core's master volume, as MVOLL and MVOLR register values
+// (spu_volume). It scales the core's output, voices and reverb, before it
+// saturates. Until set it is an exact unity, which keeps the output of
+// ports that never set it.
+spu_master :: proc(core: int, l, r: u32) {
+	assert(core >= 0 && core < 2, "spu: no such core")
+	spu.master[core] = {spu_volume(l), spu_volume(r)}
 }
 
 // Turn a core's effects on or off, as SD_C_EFFECT_ENABLE (ATTR bit 7).
@@ -362,5 +382,6 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 // first written.
 spu_snap :: proc() {
 	spu.ram = core.snap_area(SPU_RAM_SIZE)
+	spu.master = {{0x4000, 0x4000}, {0x4000, 0x4000}}
 	core.snap_add(&spu)
 }
