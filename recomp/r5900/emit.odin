@@ -51,6 +51,28 @@ set32 :: proc(out: ^[dynamic]string, n: u8, expr: string) {
 	if n != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = sx32(%s)", n, expr))}
 }
 
+// VU0 control register n as vu.vu0_ctrl_read reads it (read), or the
+// statement vu0_ctrl_write makes of it with %s the value, "" for none.
+vu0_ctrl :: proc(n: u8, read: bool) -> string {
+	switch n {
+	case 0:      return read ? "u32(vu.vu0.vi[0])" : ""
+	case 1 ..< 16:
+		return read ? fmt.tprintf("u32(vu.vu0.vi[%d])", n) : fmt.tprintf("vu.vu0.vi[%d] = u16(%%s)", n)
+	case 16:     return read ? "vu.vu0.status" : "vu.vu0.status = %s"
+	case 17:     return read ? "vu.vu0.mac" : ""
+	case 18:     return read ? "vu.vu0.clip" : "vu.vu0.clip = %s"
+	case 20:     return read ? "vu.vu0.r" : "vu.vu0.r = %s & 0x7fffff"
+	case 21:     return read ? "transmute(u32)vu.vu0.i" : "vu.vu0.i = transmute(f32)%s"
+	case 22:     return read ? "transmute(u32)vu.vu0.q" : "vu.vu0.q = transmute(f32)%s"
+	case 26:     return read ? "vu.vu0.tpc" : ""
+	case 27:     return read ? "vu.vu0.cmsar" : "vu.vu0.cmsar = %s"
+	case 28:     return read ? "vu.vu0.fbrst" : "vu.vu0.fbrst = %s"
+	case 31:     return read ? "vu.vu1.cmsar" : ""
+	}
+	// VPU-STAT (29, both VUs idle) and the unused ones
+	return read ? "u32(0)" : ""
+}
+
 addr_expr :: proc(i: Insn) -> string {
 	off := sx16(i.imm)
 	if i.rs == 0 {return hexu(u32(off))}
@@ -176,8 +198,15 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 		if rt != 0 {append(out, fmt.tprintf("c.r[%d].q = vu.vu0.vf[%d].q", rt, rd))}
 	case .QMTC2:
 		if rd != 0 {append(out, fmt.tprintf("vu.vu0.vf[%d].q = c.r[%d].q", rd, rt))}
-	case .CFC2:  set32(out, rt, fmt.tprintf("vu.vu0_ctrl_read(%d)", rd))
-	case .CTC2:  append(out, fmt.tprintf("vu.vu0_ctrl_write(%d, %s)", rd, R32(rt)))
+	// vu.vu0_ctrl_read and vu0_ctrl_write, by register; a write to
+	// CMSAR1 starts VU1 and stays a call
+	case .CFC2:  set32(out, rt, vu0_ctrl(rd, true))
+	case .CTC2:
+		if rd == 31 {
+			append(out, fmt.tprintf("vu.vu0_ctrl_write(%d, %s)", rd, R32(rt)))
+		} else if f := vu0_ctrl(rd, false); f != "" {
+			append(out, fmt.tprintf(f, R32(rt)))
+		}
 	case .VU0:
 		if code, ok := vu.emit_macro(i.w); !ok {
 			append(out, fmt.tprintf("vu.vu0_macro(%s)", hexu(i.w)))
