@@ -344,13 +344,20 @@ coverage :: proc(backend: string, slow: map[string]int) {
 // everything else to the runtime.
 FAST_HELPERS :: `sx32 :: #force_inline proc "contextless" (v: u32) -> u64 {return u64(i64(i32(v)))}
 
+// cpu.mult, cpu.multu and cpu.madd: LO and HI of pipe unit = the low and
+// high words of the product p, each sign-extended.
+mulw :: #force_inline proc "contextless" (p: u64, unit: int) {
+	cpu.state.lo.d[unit] = sx32(u32(p))
+	cpu.state.hi.d[unit] = sx32(u32(p >> 32))
+}
+
 // cpu.fcond: set or clear the FPU condition bit.
 fcond :: #force_inline proc "contextless" (t: bool) {
 	if t {cpu.state.fcr31 |= cpu.FCR31_C} else {cpu.state.fcr31 &~= cpu.FCR31_C}
 }
 
-// cpu.fpu_add, cpu.fpu_sub, cpu.fpu_wide, cpu.fpu_mul, cpu.fpu_sqrt and
-// cpu.fkey.
+// cpu.fpu_add, cpu.fpu_sub, cpu.fpu_wide, cpu.fpu_mul, cpu.fpu_div,
+// cpu.fpu_sqrt and cpu.fkey.
 fspecial :: #force_inline proc "contextless" (x: f32) -> bool {
 	t := transmute(u32)x & 0x7fffffff
 	return t != 0 && t - 0x00800000 >= 0x7f000000
@@ -395,6 +402,23 @@ fmul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	// host float.
 	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * transmute(f32)ub)
 	return transmute(f32)(h & 0x7f800000 == 0x7f800000 ? sign | cpu.FMAX : h + 0x00800000)
+}
+
+// cpu.fpu_div. Not fdiv: vu.VU_HELPERS has one.
+fpdiv :: #force_inline proc "contextless" (a, b: f32) -> f32 {
+	ua, ub := transmute(u32)a, transmute(u32)b
+	if ub & 0x7f800000 == 0 {return transmute(f32)(((ua ~ ub) & 0x80000000) | cpu.FMAX)}
+	r := a / b
+	return fspecial(a) | fspecial(b) | fspecial(r) ? cpu.fpu_slow(.Div, a, b) : r
+}
+
+// cpu.cvt_w.
+fcvtw :: #force_inline proc "contextless" (x: f32) -> i32 {
+	u := transmute(u32)x
+	if u & 0x7f800000 >= 0x4f000000 { // |x| >= 2^31
+		return u & 0x80000000 != 0 ? min(i32) : max(i32)
+	}
+	return i32(x)
 }
 
 // The host root of a normal float is the f64 one rounded, as 53 >= 2 * 24 + 2.

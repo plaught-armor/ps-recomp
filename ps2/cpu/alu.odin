@@ -239,8 +239,10 @@ frsqrt :: proc(a, b: f32) -> f32 {
 // tests/fpu against real-PS2 results from ps2autotests. Left to the host:
 // the hardware rounds differently in the last bit now and then.
 //
-// fadd, fsub, fmul and fsqrt in recomp/r5900 FAST_HELPERS are inline
-// copies of fpu_add, fpu_sub, fpu_mul and fpu_sqrt, fwide of fpu_wide.
+// fadd, fsub, fmul, fpdiv and fsqrt in recomp/r5900 FAST_HELPERS are inline
+// copies of fpu_add, fpu_sub, fpu_mul, fpu_div and fpu_sqrt, fwide of
+// fpu_wide and fcvtw of cvt_w; mulw writes LO and HI as mult, multu and
+// madd do.
 FMAX :: 0x7fffffff
 
 // True when a host operation cannot be trusted with x: exponent 255, or

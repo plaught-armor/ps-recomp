@@ -4,14 +4,15 @@
 // inlines (every MMI and SPECIAL word the decoder maps to a covered op, the
 // MADD family, the immediate ops and REGIMM traps at each of IMMS, MFC0,
 // TLBR, TLBWI, TLBWR, TLBP, MFC1, MTC1, SQRT.S,
-// RSQRT.S, MUL.S, MULA.S, MADD.S, MFSA, MTSA, MTSAB and MTSAH, with rd 0,
+// RSQRT.S, MUL.S, MULA.S, MADD.S, DIV.S, CVT.W.S, QMTC2, MFSA, MTSA, MTSAB
+// and MTSAH, with rd 0,
 // rs/rt 0 and aliased registers, and every shift amount for the shifts by
 // sa), then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
-// leave the whole cpu.state as exec_insn leaves it. First FAST_HELPERS'
-// fadd, fsub, fmul and fsqrt must give cpu.fpu_add, fpu_sub, fpu_mul and
-// fpu_sqrt's bits on a grid of floats and random ones near the ends of the
-// exponent range. The seed is fixed, so a
+// leave the whole cpu.state and VU0's VF registers as exec_insn leaves them.
+// First FAST_HELPERS' fadd, fsub, fmul, fpdiv, fsqrt and fcvtw must give
+// cpu.fpu_add, fpu_sub, fpu_mul, fpu_div, fpu_sqrt and cvt_w's bits on a grid
+// of floats and random ones near the ends of the exponent range. The seed is fixed, so a
 // run is reproducible. Words emit_op leaves to the interpreter are counted
 // and skipped. cases/ is generated, not checked in.
 //
@@ -22,6 +23,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "ps:recomp/r5900"
+import "ps:recomp/vu"
 
 DIR :: #directory
 CASES_DIR :: DIR + "/cases"
@@ -38,7 +40,7 @@ COVERED :: Ops{
 	.PSLLH, .PSRLH, .PSRAH, .PAND, .POR, .PXOR, .PNOR, .PCPYLD, .PCPYUD, .PCPYH,
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
 	.PADDSH, .PADDUW, .PSRAW, .PHMADH, .MADD, .MADDU, .MADD1, .MADDU1, .MTHI1, .MTLO1, .SQRT_S, .RSQRT_S,
-	.MUL_S, .MULA_S, .MADD_S, .MFSA, .MTSA, .MTSAB, .MTSAH,
+	.MUL_S, .MULA_S, .MADD_S, .DIV_S, .CVT_W_S, .QMTC2, .MFSA, .MTSA, .MTSAB, .MTSAH,
 	.QFSRV, .PLZCW, .MFHI1, .MFLO1, .MULT1, .MULTU1, .DIV1, .DIVU1,
 	.MTC0, .ERET, .CFC1, .CTC1, .C_F_S,
 	.PADDSB, .PSUBSB, .PSUBSH, .PADDSW, .PSUBSW, .PADDUH, .PSUBUH, .PSUBUB, .PSUBUW,
@@ -61,6 +63,7 @@ IMM_OPS :: [?]u32{0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x18, 0x19}
 IMMS :: [?]u32{0, 1, 0x7fff, 0x8000, 0xffff}
 
 main :: proc() {
+	helper_clashes()
 	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}} // rs, rt, rd
 	words: [dynamic]u32
 	for r in REGS {
@@ -87,10 +90,12 @@ main :: proc() {
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x04)
 		// RSQRT.S f[rd] = f[rs] / sqrt(f[rt])
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x16)
-		// MUL.S, MULA.S and MADD.S f[rd] = f[rs] * f[rt]
-		for fn in ([?]u32{0x02, 0x1a, 0x1c}) {
+		// MUL.S, MULA.S, MADD.S and DIV.S f[rd] = f[rs] op f[rt]
+		for fn in ([?]u32{0x02, 0x1a, 0x1c, 0x03}) {
 			append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | fn)
 		}
+		// CVT.W.S f[rd] = f[rs]; QMTC2 vf[rd] = rt
+		append(&words, 0x11 << 26 | 0x10 << 21 | r[0] << 11 | r[2] << 6 | 0x24, 0x12 << 26 | 0x05 << 21 | r[1] << 16 | r[2] << 11)
 		// MFSA to rd; MTSA, MTSAB and MTSAH from rs
 		append(&words, r[2] << 11 | 0x28)
 		append(&words, r[0] << 21 | 0x29)
@@ -158,6 +163,24 @@ main :: proc() {
 	if werr != nil {fail("odin run: %v", werr)}
 	if !st.success {fail("cases failed (exit %d)", st.exit_code)}
 	if !os.exists(out) {fail("cases not built: %s", out)}
+}
+
+// A package with inline COP2 macro code gets FAST_HELPERS, VU_HELPERS and
+// MACRO_HELPERS together (gen.odin), so no top-level name may repeat
+// across them.
+@(private = "file")
+helper_clashes :: proc() {
+	seen: map[string]string
+	for h in ([?][2]string{{"FAST_HELPERS", r5900.FAST_HELPERS}, {"VU_HELPERS", vu.VU_HELPERS}, {"MACRO_HELPERS", vu.MACRO_HELPERS}}) {
+		for line in strings.split_lines(h[1]) {
+			end := strings.index(line, " :: ")
+			if end <= 0 || line[0] == ' ' || line[0] == '\t' || line[0] == '/' {continue}
+			name := line[:end]
+			if name == "_" {continue}
+			if prev, ok := seen[name]; ok {fail("%s declared in both %s and %s", name, prev, h[0])}
+			seen[name] = h[0]
+		}
+	}
 }
 
 @(private = "file")
@@ -236,6 +259,7 @@ drift :: proc() -> (fails: int) {
 		x := vals[i]
 		a := transmute(f32)x
 		same("fsqrt", x, 0, fsqrt(a), cpu.fpu_sqrt(a), &fails)
+		same("fcvtw", x, 0, transmute(f32)fcvtw(a), transmute(f32)cpu.cvt_w(a), &fails)
 		// the grid pairs all, a random value pairs with its neighbour
 		ys := i < n ? vals[:n] : vals[i - 1:i]
 		for y in ys {
@@ -243,6 +267,7 @@ drift :: proc() -> (fails: int) {
 			same("fadd", x, y, fadd(a, b), cpu.fpu_add(a, b), &fails)
 			same("fsub", x, y, fsub(a, b), cpu.fpu_sub(a, b), &fails)
 			same("fmul", x, y, fmul(a, b), cpu.fpu_mul(a, b), &fails)
+			same("fpdiv", x, y, fpdiv(a, b), cpu.fpu_div(a, b), &fails)
 		}
 	}
 	return
@@ -273,11 +298,15 @@ main :: proc() {
 				}
 			}
 			taken := trap && trap_taken(c.w, &init)
+			vf: [32]vu.Vf
+			for k in 1 ..< 32 {vf[k].q = rand.uint128()}
 			cpu.state = init
+			vu.vu0.vf = vf
 			trapped = false
 			c.f()
-			got, got_trapped, got_pc := cpu.state, trapped, trapped_pc
+			got, got_vf, got_trapped, got_pc := cpu.state, vu.vu0.vf, trapped, trapped_pc
 			cpu.state = init
+			vu.vu0.vf = vf
 			trapped = false
 			ps2.exec_insn(r5900.decode(0, c.w))
 			// A trap calls cpu.trap at its pc in both, exactly when the
@@ -289,7 +318,7 @@ main :: proc() {
 				if fails < 10 {fmt.eprintfln("FAIL ee_emit %08x: trap %v, emitted %v at %08x, interp %v at %08x", c.w, taken, got_trapped, got_pc, trapped, trapped_pc)}
 				break
 			}
-			if runtime.memory_compare(&got, &cpu.state, size_of(cpu.Cpu)) != 0 {
+			if runtime.memory_compare(&got, &cpu.state, size_of(cpu.Cpu)) != 0 || runtime.memory_compare(&got_vf, &vu.vu0.vf, size_of(got_vf)) != 0 {
 				fails += 1
 				if fails < 10 {
 					fmt.eprintfln("FAIL ee_emit %08x: got r3 %32x hi %32x lo %32x f3 %08x, want r3 %32x hi %32x lo %32x f3 %08x",

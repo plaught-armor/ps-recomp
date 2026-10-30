@@ -152,14 +152,18 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .CTC1: if rd == 31 {append(out, fmt.tprintf("c.fcr31 = %s", R32(rt)))}
 	case .MFHI1: set64(out, rd, "c.hi.d[1]")
 	case .MFLO1: set64(out, rd, "c.lo.d[1]")
-	case .MULT:  append(out, fmt.tprintf("cpu.mult(%d, %s, %s, 0)", rd, R32(rs), R32(rt)))
-	case .MULTU: append(out, fmt.tprintf("cpu.multu(%d, %s, %s, 0)", rd, R32(rs), R32(rt)))
-	case .MULT1:  append(out, fmt.tprintf("cpu.mult(%d, %s, %s, 1)", rd, R32(rs), R32(rt)))
-	case .MULTU1: append(out, fmt.tprintf("cpu.multu(%d, %s, %s, 1)", rd, R32(rs), R32(rt)))
-	case .MADD:   append(out, fmt.tprintf("cpu.madd(%d, %s, %s, 0, true)", rd, R32(rs), R32(rt)))
-	case .MADDU:  append(out, fmt.tprintf("cpu.madd(%d, %s, %s, 0, false)", rd, R32(rs), R32(rt)))
-	case .MADD1:  append(out, fmt.tprintf("cpu.madd(%d, %s, %s, 1, true)", rd, R32(rs), R32(rt)))
-	case .MADDU1: append(out, fmt.tprintf("cpu.madd(%d, %s, %s, 1, false)", rd, R32(rs), R32(rt)))
+	case .MULT, .MULTU, .MULT1, .MULTU1, .MADD, .MADDU, .MADD1, .MADDU1:
+		// cpu.mult, cpu.multu and cpu.madd
+		unit := i.op == .MULT1 || i.op == .MULTU1 || i.op == .MADD1 || i.op == .MADDU1 ? 1 : 0
+		p := fmt.tprintf("u64(%s) * u64(%s)", R32(rs), R32(rt))
+		if i.op == .MULT || i.op == .MULT1 || i.op == .MADD || i.op == .MADD1 {
+			p = fmt.tprintf("u64(i64(i32(%s)) * i64(i32(%s)))", R32(rs), R32(rt))
+		}
+		if i.op == .MADD || i.op == .MADDU || i.op == .MADD1 || i.op == .MADDU1 {
+			p = fmt.tprintf("(c.hi.d[%d] << 32 | c.lo.d[%d] & 0xffffffff) + %s", unit, unit, p)
+		}
+		append(out, fmt.tprintf("mulw(%s, %d)", p, unit))
+		set64(out, rd, fmt.tprintf("c.lo.d[%d]", unit))
 	case .DIV:   append(out, fmt.tprintf("cpu.div(%s, %s, 0)", R32(rs), R32(rt)))
 	case .DIVU:  append(out, fmt.tprintf("cpu.divu(%s, %s, 0)", R32(rs), R32(rt)))
 	case .DIV1:  append(out, fmt.tprintf("cpu.div(%s, %s, 1)", R32(rs), R32(rt)))
@@ -167,7 +171,8 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .PLZCW: append(out, fmt.tprintf("cpu.plzcw(%s, u32(%s >> 32), %d)", R32(rs), R64(rs), rd))
 	case .QMFC2:
 		if rt != 0 {append(out, fmt.tprintf("c.r[%d].q = vu.vu0.vf[%d].q", rt, rd))}
-	case .QMTC2: append(out, fmt.tprintf("vu.vu0_set_vf(%d, c.r[%d].q)", rd, rt))
+	case .QMTC2:
+		if rd != 0 {append(out, fmt.tprintf("vu.vu0.vf[%d].q = c.r[%d].q", rd, rt))}
 	case .CFC2:  set32(out, rt, fmt.tprintf("vu.vu0_ctrl_read(%d)", rd))
 	case .CTC2:  append(out, fmt.tprintf("vu.vu0_ctrl_write(%d, %s)", rd, R32(rt)))
 	case .VU0:
@@ -251,7 +256,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .ADD_S: append(out, fmt.tprintf("%s = fadd(%s, %s)", F(fd), F(fs), F(ft)))
 	case .SUB_S: append(out, fmt.tprintf("%s = fsub(%s, %s)", F(fd), F(fs), F(ft)))
 	case .MUL_S: append(out, fmt.tprintf("%s = fmul(%s, %s)", F(fd), F(fs), F(ft)))
-	case .DIV_S: append(out, fmt.tprintf("%s = cpu.fpu_div(%s, %s)", F(fd), F(fs), F(ft)))
+	case .DIV_S: append(out, fmt.tprintf("%s = fpdiv(%s, %s)", F(fd), F(fs), F(ft)))
 	case .SQRT_S: append(out, fmt.tprintf("%s = fsqrt(%s)", F(fd), F(ft)))
 	case .RSQRT_S: append(out, fmt.tprintf("%s = cpu.fpu_rsqrt(%s, %s)", F(fd), F(fs), F(ft)))
 	case .MADD_S: append(out, fmt.tprintf("%s = fadd(c.acc.f, fmul(%s, %s))", F(fd), F(fs), F(ft)))
@@ -268,7 +273,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .C_LT_S: append(out, fmt.tprintf("fcond(fkey(%s) < fkey(%s))", F(fs), F(ft)))
 	case .C_LE_S: append(out, fmt.tprintf("fcond(fkey(%s) <= fkey(%s))", F(fs), F(ft)))
 	case .CVT_S_W: append(out, fmt.tprintf("%s = f32(c.f[%d].i)", F(fd), fs))
-	case .CVT_W_S: append(out, fmt.tprintf("c.f[%d].i = cpu.cvt_w(%s)", fd, F(fs)))
+	case .CVT_W_S: append(out, fmt.tprintf("c.f[%d].i = fcvtw(%s)", fd, F(fs)))
 	case .INVALID:
 		append(out, fmt.tprintf("cpu.bad_insn(%s, %s)", hexu(i.pc), hexu(i.w)))
 		return true
