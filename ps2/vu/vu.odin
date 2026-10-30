@@ -46,10 +46,18 @@ VU1_MEM :: 16 << 10
 vu0_mem: [VU0_MEM]u8
 @(private)
 vu0_micro: [4 << 10]u8
-@(private)
+// Not private: native code addresses it through import "vu1.mem".
 vu1_mem: [VU1_MEM]u8
 @(private)
 vu1_micro: [16 << 10]u8
+
+// What a native microprogram (recomp/vu/native.odin) of a unit reads and
+// leaves: imports <unit>.run_pc, .run_budget and .scratch.
+Native_Run :: struct #align (16) {
+	scratch:    [64]u8, // SCRATCH_SIZE there
+	pc, budget: i32,
+}
+native_run: [2]Native_Run
 
 vu_init :: proc() {
 	vu0.mem, vu0.micro = vu0_mem[:], vu0_micro[:]

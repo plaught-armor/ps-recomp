@@ -30,8 +30,8 @@ ID :: "SLUS-12345.0123456789abcdef"
 // A blob header (magic, version, arch) and a few bytes of body.
 @(private = "file")
 blob :: proc(version, arch: u32) -> []u8 {
-	b := make([]u8, 32, context.temp_allocator)
-	endian.put_u32(b[0:], .Little, 0x4e525350)
+	b := make([]u8, core.NATIVE_HEADER, context.temp_allocator)
+	endian.put_u32(b[0:], .Little, core.NATIVE_MAGIC)
 	endian.put_u32(b[4:], .Little, version)
 	endian.put_u32(b[8:], .Little, arch)
 	return b
@@ -56,25 +56,28 @@ test_dirs :: proc(data: string) -> (dir: string) {
 }
 
 @(private = "file")
+V :: core.NATIVE_VERSION
+
+@(private = "file")
 test_blob :: proc(dir: string) {
 	check(core.COMMIT == "dev", "a test build is dev")
 	check(!core.blob_cached(dir, "abc"), "no blob cached")
-	check(core.blob_store(dir, blob(1, core.NATIVE_ARCH), "abc"), "store")
+	check(core.blob_store(dir, blob(V, core.NATIVE_ARCH), "abc"), "store")
 	check(core.blob_cached(dir, "abc"), "blob cached")
 	check(!core.blob_cached(dir, "abd"), "blob of another commit")
 	check(!core.blob_cached(dir, "dev"), "blob for a dev build")
 	key, err := os.read_entire_file(core.disc_path(dir, .Native_Key, context.temp_allocator), context.temp_allocator)
-	check(err == nil && string(key) == "1 abc\n", "key")
-	check(core.blob_store(dir, blob(1, core.NATIVE_ARCH), "dev"), "store from a dev build")
+	check(err == nil && string(key) == fmt.tprintf("%d abc\n", V), "key")
+	check(core.blob_store(dir, blob(V, core.NATIVE_ARCH), "dev"), "store from a dev build")
 	check(!core.blob_cached(dir, "dev"), "dev blob for a dev build")
 	other_arch := core.NATIVE_ARCH == 1 ? u32(3) : u32(1)
-	bad := [][]u8{blob(1, other_arch), blob(2, core.NATIVE_ARCH), blob(1, core.NATIVE_ARCH)[:8]}
+	bad := [][]u8{blob(V, other_arch), blob(V + 1, core.NATIVE_ARCH), blob(V, core.NATIVE_ARCH)[:8]}
 	for b, i in bad {
 		check(core.blob_store(dir, b, "abc"), "store")
 		check(!core.blob_cached(dir, "abc"), fmt.tprintf("bad blob %d", i))
 	}
 	// A blob whose key is gone is not cached.
-	check(core.blob_store(dir, blob(1, core.NATIVE_ARCH), "abc"), "store")
+	check(core.blob_store(dir, blob(V, core.NATIVE_ARCH), "abc"), "store")
 	check(os.remove(core.disc_path(dir, .Native_Key, context.temp_allocator)) == nil, "remove key")
 	check(!core.blob_cached(dir, "abc"), "blob with no key")
 	files, _ := os.read_all_directory_by_path(dir, context.temp_allocator)

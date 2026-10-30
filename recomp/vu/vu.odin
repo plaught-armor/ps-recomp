@@ -91,7 +91,7 @@ lanes :: proc(dest: u32) -> [4]bool {
 
 // Which flags an upper op computes: none, MAC (micro mode, where it is
 // live), or MAC and status (macro mode).
-@(private = "file")
+@(private)
 Flags :: enum u8 {None, Mac, Mac_Status}
 
 // Emit the upper op, or nothing and slow when it is not specialized.

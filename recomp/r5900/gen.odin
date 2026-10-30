@@ -26,6 +26,8 @@
 //   native_arch      optional: also compile to machine code, for x64_sysv,
 //                    x64_win or arm64 (ps2/native.odin loads it)
 //   native_out       with native_arch: the file the machine code goes to
+//   native_vu        with native_arch: "true" compiles the VU programs to
+//                    machine code too (recomp/vu/native.odin)
 //   vu1_capture      optional: a VU1_CAPTURE file (ps2/vu/capture.odin) of
 //                    microcode loaded from data, to compile besides .vutext
 //                    (a missing file, ENOENT, is a warning: that microcode
@@ -317,7 +319,17 @@ generate :: proc(o: mips.Options) {
 	}
 	if code != nil {
 		path := mips.option(o, "native_out")
-		if !native.write_blob(path, code, n_funcs[:], nil) {
+		// The VU microprograms too, with native_vu: the runtime runs them
+		// natively once it knows them (ps2/vu).
+		vus: [dynamic]native.Blob_Vu
+		if mips.option_or(o, "native_vu", "") == "true" {
+			for unit in vu.Unit {
+				if !vu.native_programs(code, img, vu_capture(o, unit), unit, &vus) {
+					mips.fail("%s: bad .vutext or %v capture", img.name, unit)
+				}
+			}
+		}
+		if !native.write_blob(path, code, n_funcs[:], nil, vus[:]) {
 			mips.fail("cannot write %s", path)
 		}
 		fmt.printfln("native: %d bytes -> %s", len(code.code), path)
@@ -328,8 +340,7 @@ generate :: proc(o: mips.Options) {
 	for unit in vu.Unit {
 		if out == "" {break}
 		ok: bool
-		capture := mips.option_or(o, unit == .VU0 ? "vu0_capture" : "vu1_capture", "")
-		programs[unit], ok = vu.generate(img, out, runtime, capture, unit, &slow_vu[unit])
+		programs[unit], ok = vu.generate(img, out, runtime, vu_capture(o, unit), unit, &slow_vu[unit])
 		if !ok {
 			mips.fail("%s: bad .vutext or %v capture", img.name, unit)
 		}
@@ -365,6 +376,12 @@ generate :: proc(o: mips.Options) {
 	}
 	fmt.sbprintln(&sb, "}")
 	mips.write_file(mips.join(out, "all.odin"), sb.buf[:])
+}
+
+// The VU0_CAPTURE or VU1_CAPTURE file for unit, or "".
+@(private = "file")
+vu_capture :: proc(o: mips.Options, unit: vu.Unit) -> string {
+	return mips.option_or(o, unit == .VU0 ? "vu0_capture" : "vu1_capture", "")
 }
 
 // Print the ops of one backend that call the interpreter, the most sites
