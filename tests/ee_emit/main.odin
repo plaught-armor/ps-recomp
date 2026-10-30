@@ -8,7 +8,10 @@
 // rs/rt 0 and aliased registers, and every shift amount for the shifts by
 // sa), then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
-// leave the whole cpu.state as exec_insn leaves it. The seed is fixed, so a
+// leave the whole cpu.state as exec_insn leaves it. First FAST_HELPERS'
+// fadd, fsub, fmul and fsqrt must give cpu.fpu_add, fpu_sub, fpu_mul and
+// fpu_sqrt's bits on a grid of floats and random ones near the ends of the
+// exponent range. The seed is fixed, so a
 // run is reproducible. Words emit_op leaves to the interpreter are counted
 // and skipped. cases/ is generated, not checked in.
 //
@@ -212,11 +215,45 @@ trap_taken :: proc(w: u32, c: ^cpu.Cpu) -> bool {
 	return false
 }
 
+// FAST_HELPERS' float copies against cpu's, the bits of every pair of a
+// grid and of random pairs. Returns the failures.
+drift :: proc() -> (fails: int) {
+	EXPS := [?]u32{0, 1, 2, 3, 63, 64, 126, 127, 128, 129, 190, 191, 251, 252, 253, 254, 255}
+	MANTS := [?]u32{0, 1, 0x2aaaab, 0x400000, 0x7ffffe, 0x7fffff}
+	vals: [dynamic]u32
+	defer delete(vals)
+	for e in EXPS {
+		for m in MANTS {append(&vals, e << 23 | m, 0x80000000 | e << 23 | m)}
+	}
+	for _ in 0 ..< 200_000 {append(&vals, rand.uint32() & 0x807fffff | EXPS[rand.uint32() % len(EXPS)] << 23)}
+	same :: proc(name: string, x, y: u32, got, want: f32, fails: ^int) {
+		if transmute(u32)got == transmute(u32)want {return}
+		fails^ += 1
+		if fails^ < 10 {fmt.eprintfln("FAIL ee_emit drift %s %08x, %08x: cpu gives %08x, FAST_HELPERS %08x", name, x, y, transmute(u32)want, transmute(u32)got)}
+	}
+	n := len(EXPS) * len(MANTS) * 2
+	for i in 0 ..< len(vals) {
+		x := vals[i]
+		a := transmute(f32)x
+		same("fsqrt", x, 0, fsqrt(a), cpu.fpu_sqrt(a), &fails)
+		// the grid pairs all, a random value pairs with its neighbour
+		ys := i < n ? vals[:n] : vals[i - 1:i]
+		for y in ys {
+			b := transmute(f32)y
+			same("fadd", x, y, fadd(a, b), cpu.fpu_add(a, b), &fails)
+			same("fsub", x, y, fsub(a, b), cpu.fpu_sub(a, b), &fails)
+			same("fmul", x, y, fmul(a, b), cpu.fpu_mul(a, b), &fails)
+		}
+	}
+	return
+}
+
 main :: proc() {
+	rand.reset(SEED)
+	fails := drift()
 	rand.reset(SEED)
 	cpu.trap_hook = trap_hook
 	defer cpu.trap_hook = nil
-	fails := 0
 	for c in CASES {
 		op := r5900.decode(0, c.w).op
 		trap := op == .TGE || op == .TGEU || op == .TLT || op == .TLTU || op == .TEQ || op == .TNE || op == .TRAPI

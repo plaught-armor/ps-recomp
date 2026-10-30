@@ -231,14 +231,16 @@ frsqrt :: proc(a, b: f32) -> f32 {
 // FMAX the largest value), exponent 0 is zero whatever the mantissa holds,
 // results of 2^129 or more saturate to +-FMAX and ones below 2^-126 flush
 // to +-0, and x/0 gives +-FMAX. A host float holds neither exponent, so an
-// operation that meets one goes through f64 in fpu_slow (fpu_mul only for
-// an operand of exponent 255). The model follows
+// operation that meets one goes through f64 in fpu_slow, the model, but
+// for the forms fpu_add, fpu_sub, fpu_mul and fpu_sqrt scale by a power of
+// two into host floats and back: exact, as the f64 result rounded to f32
+// is the f32 result (53 >= 2 * 24 + 2). The model follows
 // PS2Recomp's ps2_runtime_macros.h (GPLv3), checked there and in
 // tests/fpu against real-PS2 results from ps2autotests. Left to the host:
 // the hardware rounds differently in the last bit now and then.
 //
-// fadd, fsub and fmul in recomp/r5900 FAST_HELPERS are inline copies of
-// fpu_add, fpu_sub and fpu_mul.
+// fadd, fsub, fmul and fsqrt in recomp/r5900 FAST_HELPERS are inline
+// copies of fpu_add, fpu_sub, fpu_mul and fpu_sqrt, fwide of fpu_wide.
 FMAX :: 0x7fffffff
 
 // True when a host operation cannot be trusted with x: exponent 255, or
@@ -293,21 +295,47 @@ fpu_slow :: proc "contextless" (op: Fpu_Op, a, b: f32) -> f32 {
 	return 0
 }
 
+// a + b when a, b or the host sum r has exponent 255, so that one operand
+// is 2^127 or more: the host sum of the halves with the exponent put back,
+// +-FMAX from 2^129. An operand of exponent 0 or 1 halves to +-0, too
+// small to move the sum; a nonzero sum is 2^104 or more, so a half-sum of
+// exponent 0 is +-0, the sign as the host gives it, as fpu_slow's.
+fpu_wide :: #force_inline proc "contextless" (ua, ub: u32) -> f32 {
+	ha := ua & 0x7f800000 >= 0x01000000 ? ua - 0x00800000 : ua & 0x80000000
+	hb := ub & 0x7f800000 >= 0x01000000 ? ub - 0x00800000 : ub & 0x80000000
+	h := transmute(u32)(transmute(f32)ha + transmute(f32)hb)
+	switch h & 0x7f800000 {
+	case 0:          return transmute(f32)h
+	case 0x7f800000: return transmute(f32)(h | FMAX)
+	}
+	return transmute(f32)(h + 0x00800000)
+}
+
+// An operand of exponent 0 with a nonzero mantissa or a host sum below
+// 2^-126 goes to fpu_slow, the rest of the special cases to fpu_wide.
 fpu_add :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a + b
-	return fspecial(a) | fspecial(b) | fspecial(r) ? fpu_slow(.Add, a, b) : r
+	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
+	ua, ub := transmute(u32)a, transmute(u32)b
+	if max(ua & 0x7f800000, ub & 0x7f800000, transmute(u32)r & 0x7f800000) == 0x7f800000 {return fpu_wide(ua, ub)}
+	return fpu_slow(.Add, a, b)
 }
 
+// a - b as a + -b, which rounds the same and gives the same zero.
 fpu_sub :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a - b
-	return fspecial(a) | fspecial(b) | fspecial(r) ? fpu_slow(.Sub, a, b) : r
+	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
+	ua, ub := transmute(u32)a, transmute(u32)b
+	if max(ua & 0x7f800000, ub & 0x7f800000, transmute(u32)r & 0x7f800000) == 0x7f800000 {return fpu_wide(ua, ub ~ 0x80000000)}
+	return fpu_slow(.Sub, a, b)
 }
 
-// The special cases inline but one, as fpu_slow gives them: an operand of
-// exponent 0, or a host result below 2^-126, gives +-0, and a host
-// infinity from two host floats is their product one exponent lower with
-// the exponent put back, or +-FMAX from 2^129. Only an operand of exponent
-// 255 times a nonzero goes to fpu_slow.
+// The special cases inline, as fpu_slow gives them: an operand of exponent
+// 0, or a host result below 2^-126, gives +-0; else the product with an
+// operand of exponent 255, or that is a host infinity, is the product with
+// that operand one exponent lower, the exponent put back, or +-FMAX from
+// 2^129. With an operand of exponent 255 the product is 4 or more, and the
+// other operand of exponent 255 a host infinity or NaN, so +-FMAX.
 fpu_mul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a * b
 	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
@@ -315,9 +343,10 @@ fpu_mul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	sign := (ua ~ ub) & 0x80000000
 	ea, eb := ua & 0x7f800000, ub & 0x7f800000
 	if ea == 0 || eb == 0 || transmute(u32)r & 0x7f800000 == 0 {return transmute(f32)sign}
-	if ea == 0x7f800000 || eb == 0x7f800000 {return fpu_slow(.Mul, a, b)}
-	// The product is near 2^128, so a is 1 or more and a / 2 a host float.
-	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * b)
+	if eb == 0x7f800000 {ua, ub = ub, ua}
+	// The product is near 2^128 or more, so a is 1 or more and a / 2 a
+	// host float.
+	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * transmute(f32)ub)
 	return transmute(f32)(h & 0x7f800000 == 0x7f800000 ? sign | FMAX : h + 0x00800000)
 }
 
@@ -329,11 +358,13 @@ fpu_div :: proc "contextless" (a, b: f32) -> f32 {
 	return fspecial(a) | fspecial(b) | fspecial(r) ? fpu_slow(.Div, a, b) : r
 }
 
-// sqrt(|x|), never negative.
+// sqrt(|x|), never negative. For exponent 255 the root of |x| / 4, a host
+// float, then the exponent one higher.
 fpu_sqrt :: proc "contextless" (x: f32) -> f32 {
-	switch transmute(u32)x & 0x7f800000 {
+	u := transmute(u32)x & 0x7fffffff
+	switch u & 0x7f800000 {
 	case 0:          return 0
-	case 0x7f800000: return fpu_slow(.Sqrt, x, 0)
+	case 0x7f800000: return transmute(f32)(transmute(u32)math.sqrt(transmute(f32)(u - 0x01000000)) + 0x00800000)
 	}
 	return from_f64(math.sqrt(abs(f64(x))))
 }

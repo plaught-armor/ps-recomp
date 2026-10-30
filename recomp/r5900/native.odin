@@ -1010,27 +1010,28 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 Fpu_Op :: enum u32 {Add, Sub, Mul, Div, Sqrt}
 
 // A = cpu.fpu_sqrt of the f32 bits in A: exponent 0 gives +0, and 255,
-// which the EE reads as a number, cpu.fpu_slow's root. Any other root is
-// sqrtss of |A|: the f64 root rounded to f32 is the f32 root, as
-// 53 >= 2 * 24 + 2. Neither the operand nor the root is denormal, so FTZ
-// and DAZ don't matter, but this relies on the host's default round to
-// nearest, as fpu_calc does. Uses B and C.
+// which the EE reads as a number, the root of |A| / 4 with the exponent
+// one higher. Any other root is sqrtss of |A|: the f64 root rounded to f32
+// is the f32 root, as 53 >= 2 * 24 + 2. Neither the operand nor the root
+// is denormal, so FTZ and DAZ don't matter, but this relies on the host's
+// default round to nearest, as fpu_calc does. Uses C.
 @(private = "file")
 fpu_root :: proc(a: ^native.Asm) {
-	zero, slow, done := native.new_label(a), native.new_label(a), native.new_label(a)
+	zero, root, done := native.new_label(a), native.new_label(a), native.new_label(a)
 	native.alu_imm(a, .And, .A, 0x7fffffff)
 	native.mov(a, .C, .A)
 	native.alu_imm(a, .And, .C, 0x7f800000)
 	native.br_zero(a, .C, zero)
-	native.br_cmp_imm(a, .Eq, .C, 0x7f800000, slow)
+	native.br_cmp_imm(a, .Ne, .C, 0x7f800000, root)
+	native.alu_imm(a, .Sub, .A, 0x01000000)
+	native.float_sqrt(a, .A)
+	native.alu_imm(a, .Add, .A, 0x00800000)
+	native.jmp(a, done)
+	native.bind(a, root)
 	native.float_sqrt(a, .A)
 	native.jmp(a, done)
 	native.bind(a, zero)
 	native.mov(a, .A, .C)
-	native.jmp(a, done)
-	native.bind(a, slow)
-	native.mov_imm(a, .C, u32(Fpu_Op.Sqrt))
-	native.call(a, "cpu.fpu_slow", .A, .B, .C)
 	native.bind(a, done)
 }
 
@@ -1050,7 +1051,8 @@ br_fspecial :: proc(a: ^native.Asm, r: native.Reg, l: native.Label) {
 // A = A op B on f32 bits, as cpu.fpu_add, fpu_sub, fpu_mul and fpu_div
 // with a divisor of nonzero exponent: the host's result unless an operand
 // or the result is special, then cpu.fpu_slow's, which a Mul has inline
-// but for an operand of exponent 255 (fpu_mul_special). Uses B, C and LD.
+// (fpu_mul_special) and an Add or Sub too when an operand or the result
+// has exponent 255 (fpu_wide). Uses B, C and LD.
 @(private = "file")
 fpu_calc :: proc(a: ^native.Asm, v: native.Vop, op: Fpu_Op) {
 	slow, done := native.new_label(a), native.new_label(a)
@@ -1062,34 +1064,81 @@ fpu_calc :: proc(a: ^native.Asm, v: native.Vop, op: Fpu_Op) {
 	native.mov(a, .A, .LD)
 	native.jmp(a, done)
 	native.bind(a, slow)
-	if op == .Mul {
-		call := native.new_label(a)
-		fpu_mul_special(a, call, done)
+	switch op {
+	case .Mul:
+		fpu_mul_special(a, done)
+		native.bind(a, done)
+		return
+	case .Add, .Sub:
+		wide, call := native.new_label(a), native.new_label(a)
+		for r in ([?]native.Reg{.A, .B, .LD}) {
+			native.mov(a, .C, r)
+			native.alu_imm(a, .And, .C, 0x7f800000)
+			native.br_cmp_imm(a, .Eq, .C, 0x7f800000, wide)
+		}
+		native.jmp(a, call)
+		native.bind(a, wide)
+		fpu_wide(a, op == .Sub)
+		native.jmp(a, done)
 		native.bind(a, call)
+	case .Div, .Sqrt:
 	}
 	native.mov_imm(a, .C, u32(op))
 	native.call(a, "cpu.fpu_slow", .A, .B, .C)
 	native.bind(a, done)
 }
 
-// cpu.fpu_mul's special cases for A * B, the host's product in LD: +-0
-// when an operand or LD has exponent 0; on to call when an operand has
-// exponent 255; else LD is an infinity, and A = the product one exponent
-// lower with the exponent put back, or +-FMAX from 2^129. Then on to done.
-// Uses C and LD.
+// A = cpu.fpu_wide of A and B, B negated first for a Sub: the host sum of
+// the halves, an operand of exponent 0 or 1 halved to +-0, then a sum of
+// exponent 0 as it is, 255 as +-FMAX, else with the exponent put back.
+// Uses B and C.
 @(private = "file")
-fpu_mul_special :: proc(a: ^native.Asm, call, done: native.Label) {
-	zero, fmax := native.new_label(a), native.new_label(a)
+fpu_wide :: proc(a: ^native.Asm, sub: bool) {
+	if sub {native.alu_imm(a, .Xor, .B, 0x80000000)}
+	for r in ([?]native.Reg{.A, .B}) {
+		tiny, next := native.new_label(a), native.new_label(a)
+		native.mov(a, .C, r)
+		native.alu_imm(a, .And, .C, 0x7f800000)
+		native.br_cmp_imm(a, .Ltu, .C, 0x01000000, tiny)
+		native.alu_imm(a, .Sub, r, 0x00800000)
+		native.jmp(a, next)
+		native.bind(a, tiny)
+		native.alu_imm(a, .And, r, 0x80000000)
+		native.bind(a, next)
+	}
+	native.float_op(a, .Fadd, .A, .B)
+	done, fmax := native.new_label(a), native.new_label(a)
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .And, .C, 0x7f800000)
+	native.br_zero(a, .C, done)
+	native.br_cmp_imm(a, .Eq, .C, 0x7f800000, fmax)
+	native.alu_imm(a, .Add, .A, 0x00800000)
+	native.jmp(a, done)
+	native.bind(a, fmax)
+	native.alu_imm(a, .Or, .A, 0x7fffffff) // FMAX
+	native.bind(a, done)
+}
+
+// cpu.fpu_mul's special cases for A * B, the host's product in LD: +-0
+// when an operand or LD has exponent 0; else, with B swapped into A when
+// B has exponent 255, A = the product with A one exponent lower and the
+// exponent put back, or +-FMAX from 2^129. Then on to done. Uses B, C and
+// LD.
+@(private = "file")
+fpu_mul_special :: proc(a: ^native.Asm, done: native.Label) {
+	zero, fmax, keep := native.new_label(a), native.new_label(a), native.new_label(a)
 	for r in ([?]native.Reg{.A, .B, .LD}) {
 		native.mov(a, .C, r)
 		native.alu_imm(a, .And, .C, 0x7f800000)
 		native.br_zero(a, .C, zero)
 	}
-	for r in ([?]native.Reg{.A, .B}) {
-		native.mov(a, .C, r)
-		native.alu_imm(a, .And, .C, 0x7f800000)
-		native.br_cmp_imm(a, .Eq, .C, 0x7f800000, call)
-	}
+	native.mov(a, .C, .B)
+	native.alu_imm(a, .And, .C, 0x7f800000)
+	native.br_cmp_imm(a, .Ne, .C, 0x7f800000, keep)
+	native.mov(a, .C, .A)
+	native.mov(a, .A, .B)
+	native.mov(a, .B, .C)
+	native.bind(a, keep)
 	native.mov(a, .C, .A)
 	native.alu(a, .Xor, .C, .B)
 	native.alu_imm(a, .And, .C, 0x80000000)

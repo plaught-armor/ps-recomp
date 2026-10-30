@@ -9,10 +9,12 @@
 // they are checked exactly. Then fkey orders exponent-255 values above every
 // host float and treats every exponent-0 value as zero. With
 // -define:FALLBACK_COUNT=true, cpu.fpu_slow counts once per row that needs
-// it.
+// it. The forms fpu_add, fpu_sub, fpu_mul and fpu_sqrt have inline are
+// checked against fpu_slow, the model, on a grid and random operands.
 package main
 
 import "core:fmt"
+import "core:math/rand"
 import "core:os"
 import cpu "ps:ps2/cpu"
 
@@ -210,10 +212,10 @@ special :: proc(u: u32) -> bool {
 	return e == 0x7f800000 || (e == 0 && u & 0x007fffff != 0)
 }
 
-// Add to want the fpu_slow calls a row makes: Sqrt for a root of exponent
-// 255, then the operation when an operand or the host's result is special,
-// past fpu_div's zero divisor and fpu_rsqrt's zero b. fpu_mul calls it only
-// for an operand of exponent 255 and none of exponent 0.
+// Add to want the fpu_slow calls a row makes: the operation when an operand
+// or the host's result is special, past fpu_div's zero divisor and
+// fpu_rsqrt's zero b, but for an Add or Sub with an operand or result of
+// exponent 255 (fpu_wide). fpu_mul and fpu_sqrt never call it.
 slow_ops :: proc(v: Vector, want: ^[cpu.Fpu_Op]u64) {
 	a, b := f(v.fs), f(v.ft)
 	r: f32
@@ -224,33 +226,26 @@ slow_ops :: proc(v: Vector, want: ^[cpu.Fpu_Op]u64) {
 	case .Mul: r, op = a * b, .Mul
 	case .Div, .Rsqrt:
 		if v.ft & 0x7f800000 == 0 {return}
-		if v.op == .Rsqrt {
-			if v.ft & 0x7f800000 == 0x7f800000 {want[.Sqrt] += 1}
-			// The root here is not the row's own call: leave it uncounted.
-			counts := cpu.fallback_fpu_slow
-			b = cpu.fpu_sqrt(b)
-			cpu.fallback_fpu_slow = counts
-		}
+		if v.op == .Rsqrt {b = cpu.fpu_sqrt(b)}
 		r, op = a / b, .Div
 	case .Sqrt:
-		if v.fs & 0x7f800000 == 0x7f800000 {want[.Sqrt] += 1}
 		return
 	}
-	if op == .Mul {
-		ea, eb := v.fs & 0x7f800000, v.ft & 0x7f800000
-		if (ea == 0x7f800000 || eb == 0x7f800000) && ea != 0 && eb != 0 {want[op] += 1}
-		return
-	}
-	if special(transmute(u32)a) || special(transmute(u32)b) || special(transmute(u32)r) {want[op] += 1}
+	if op == .Mul {return}
+	ur := transmute(u32)r
+	if !special(transmute(u32)a) && !special(transmute(u32)b) && !special(ur) {return}
+	if op != .Div && max(transmute(u32)a & 0x7f800000, transmute(u32)b & 0x7f800000, ur & 0x7f800000) == 0x7f800000 {return}
+	want[op] += 1
 }
 
-// fpu_mul's inline special cases against fpu_slow, the model: every pair of
-// a grid of exponents (0, 1, around 2^+-64, 2^-1 to 2^1, 253 to 255) by
-// mantissas and signs whose operands or host product is special. Returns
-// the failures.
-mul_grid :: proc() -> int {
-	EXPS :: [?]u32{0, 1, 2, 63, 64, 65, 126, 127, 128, 190, 191, 192, 253, 254, 255}
-	MANTS :: [?]u32{0, 1, 0x2aaaab, 0x400000, 0x7fffff}
+// The inline special cases of fpu_add, fpu_sub, fpu_mul and fpu_sqrt
+// against fpu_slow, the model, bits and fcr31 both: every pair of a grid
+// of exponents (0, 1, around 2^+-64, 2^-1 to 2^1, 252 to 255) by mantissas
+// and signs whose operands or host result is special, then random pairs
+// with exponents near the ends. Returns the failures.
+grid :: proc() -> int {
+	EXPS :: [?]u32{0, 1, 2, 63, 64, 65, 126, 127, 128, 190, 191, 192, 252, 253, 254, 255}
+	MANTS :: [?]u32{0, 1, 0x2aaaab, 0x400000, 0x7ffffe, 0x7fffff}
 	vals: [len(EXPS) * len(MANTS) * 2]u32
 	n := 0
 	for e in EXPS {
@@ -260,14 +255,77 @@ mul_grid :: proc() -> int {
 		}
 	}
 	fails := 0
-	for x in vals {
-		for y in vals {
-			if !special(x) && !special(y) && !special(transmute(u32)(f(x) * f(y))) {continue}
-			got, want := transmute(u32)cpu.fpu_mul(f(x), f(y)), transmute(u32)cpu.fpu_slow(.Mul, f(x), f(y))
-			if got == want {continue}
-			fails += 1
-			if fails <= 10 {fmt.eprintfln("FAIL fpu_mul %08x, %08x: fpu_slow gives %08x, got %08x", x, y, want, got)}
+	FCR31 :: 0x5a5a5a5a
+	cpu.state.fcr31 = FCR31
+	check :: proc(op: cpu.Fpu_Op, x, y: u32, fails: ^int) {
+		a, b := f(x), f(y)
+		got: f32
+		host: f32
+		switch op {
+		case .Add:  got, host = cpu.fpu_add(a, b), a + b
+		case .Sub:  got, host = cpu.fpu_sub(a, b), a - b
+		case .Mul:  got, host = cpu.fpu_mul(a, b), a * b
+		case .Sqrt: got = cpu.fpu_sqrt(a)
+		case .Div:  return
 		}
+		if op != .Sqrt && !special(x) && !special(y) && !special(transmute(u32)host) {return}
+		want := cpu.fpu_slow(op, a, b)
+		if transmute(u32)got == transmute(u32)want && cpu.state.fcr31 == FCR31 {return}
+		fails^ += 1
+		if fails^ <= 10 {fmt.eprintfln("FAIL fpu %v %08x, %08x: fpu_slow gives %08x, got %08x, fcr31 %08x", op, x, y, transmute(u32)want, transmute(u32)got, cpu.state.fcr31)}
+		cpu.state.fcr31 = FCR31
+	}
+	for x in vals {
+		check(.Sqrt, x, 0, &fails)
+		for y in vals {
+			for op in ([?]cpu.Fpu_Op{.Add, .Sub, .Mul}) {check(op, x, y, &fails)}
+		}
+	}
+	RAND_EXPS :: [?]u32{0, 1, 2, 3, 125, 126, 127, 128, 129, 250, 251, 252, 253, 254, 255}
+	r := rand.create(0x0fb0_5eed)
+	gen := rand.default_random_generator(&r)
+	pick :: proc(gen: rand.Generator) -> u32 {
+		exps := RAND_EXPS
+		return rand.uint32(gen) & 0x807fffff | exps[rand.uint32(gen) % len(exps)] << 23
+	}
+	for _ in 0 ..< 1_000_000 {
+		x, y := pick(gen), pick(gen)
+		check(.Sqrt, x, 0, &fails)
+		for op in ([?]cpu.Fpu_Op{.Add, .Sub, .Mul}) {check(op, x, y, &fails)}
+	}
+	// Results worked by hand: x - x at +-FMAX is +0, the root of a negative
+	// exponent-255 value that of its magnitude, and sums whose half lands
+	// at exponent 254 (the result at 255) or 253, or reaches 2^129.
+	Hand :: struct {op: cpu.Fpu_Op, x, y, want: u32}
+	HAND :: [?]Hand{
+		{.Sub, 0x7fffffff, 0x7fffffff, 0x00000000},
+		{.Sub, 0xffffffff, 0xffffffff, 0x00000000},
+		{.Add, 0xffffffff, 0x7fffffff, 0x00000000},
+		{.Sqrt, 0x7f800000, 0, 0x5f800000},
+		{.Sqrt, 0xff800000, 0, 0x5f800000},
+		{.Sqrt, 0xffffffff, 0, 0x5fb504f3},
+		{.Add, 0x7f000000, 0x7f000000, 0x7f800000},
+		{.Add, 0x7f7fffff, 0x7f7fffff, 0x7fffffff},
+		{.Sub, 0x7f800000, 0x7f000000, 0x7f000000},
+		{.Add, 0x7fffffff, 0x7fffffff, 0x7fffffff},
+		{.Sub, 0xffffffff, 0x7f800000, 0xffffffff},
+		{.Add, 0x7f800000, 0x00000001, 0x7f800000},
+		{.Mul, 0x7f800000, 0x3f000000, 0x7f000000},
+		{.Mul, 0x3f000000, 0xff800000, 0xff000000},
+		{.Mul, 0x7f800000, 0x7f800000, 0x7fffffff},
+	}
+	for h in HAND {
+		got: f32
+		switch h.op {
+		case .Add:  got = cpu.fpu_add(f(h.x), f(h.y))
+		case .Sub:  got = cpu.fpu_sub(f(h.x), f(h.y))
+		case .Mul:  got = cpu.fpu_mul(f(h.x), f(h.y))
+		case .Sqrt: got = cpu.fpu_sqrt(f(h.x))
+		case .Div:
+		}
+		if transmute(u32)got == h.want {continue}
+		fails += 1
+		fmt.eprintfln("FAIL fpu %v %08x, %08x: want %08x, got %08x", h.op, h.x, h.y, h.want, transmute(u32)got)
 	}
 	return fails
 }
@@ -295,7 +353,7 @@ main :: proc() {
 		fmt.eprintfln("FAIL %v %08x, %08x: PS2 gives %08x, got %08x", v.op, v.fs, v.ft, v.res, got)
 		fails += 1
 	}
-	fails += mul_grid()
+	fails += grid()
 	// Ascending EE floats: each key must be above the one before.
 	order := [?]u32{0xffffffff, 0xff800000, 0xff7fffff, 0xbf800000, 0x80800000, 0x00000000,
 	                0x00800000, 0x3f800000, 0x7f7fffff, 0x7f800000, 0x7fffffff}
@@ -318,9 +376,11 @@ main :: proc() {
 			slow_ops(v, &want)
 			run(v)
 		}
+		// Rows reach fpu_slow's Add, Sub and Div; fpu_mul and fpu_sqrt
+		// have every case inline.
 		for n, op in want {
-			if n == 0 || cpu.fallback_fpu_slow[op] != n {
-				fmt.eprintfln("FAIL fallback_fpu_slow[%v] = %d, want %d (nonzero)", op, cpu.fallback_fpu_slow[op], n)
+			if (n == 0) != (op == .Mul || op == .Sqrt) || cpu.fallback_fpu_slow[op] != n {
+				fmt.eprintfln("FAIL fallback_fpu_slow[%v] = %d, want %d (nonzero but for Mul and Sqrt)", op, cpu.fallback_fpu_slow[op], n)
 				fails += 1
 			}
 		}

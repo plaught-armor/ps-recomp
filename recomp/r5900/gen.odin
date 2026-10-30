@@ -349,20 +349,38 @@ fcond :: #force_inline proc "contextless" (t: bool) {
 	if t {cpu.state.fcr31 |= cpu.FCR31_C} else {cpu.state.fcr31 &~= cpu.FCR31_C}
 }
 
-// cpu.fpu_add, cpu.fpu_sub, cpu.fpu_mul and cpu.fkey.
+// cpu.fpu_add, cpu.fpu_sub, cpu.fpu_wide, cpu.fpu_mul, cpu.fpu_sqrt and
+// cpu.fkey.
 fspecial :: #force_inline proc "contextless" (x: f32) -> bool {
 	t := transmute(u32)x & 0x7fffffff
 	return t != 0 && t - 0x00800000 >= 0x7f000000
 }
 
+fwide :: #force_inline proc "contextless" (ua, ub: u32) -> f32 {
+	ha := ua & 0x7f800000 >= 0x01000000 ? ua - 0x00800000 : ua & 0x80000000
+	hb := ub & 0x7f800000 >= 0x01000000 ? ub - 0x00800000 : ub & 0x80000000
+	h := transmute(u32)(transmute(f32)ha + transmute(f32)hb)
+	switch h & 0x7f800000 {
+	case 0:          return transmute(f32)h
+	case 0x7f800000: return transmute(f32)(h | cpu.FMAX)
+	}
+	return transmute(f32)(h + 0x00800000)
+}
+
 fadd :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a + b
-	return fspecial(a) | fspecial(b) | fspecial(r) ? cpu.fpu_slow(.Add, a, b) : r
+	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
+	ua, ub := transmute(u32)a, transmute(u32)b
+	if max(ua & 0x7f800000, ub & 0x7f800000, transmute(u32)r & 0x7f800000) == 0x7f800000 {return fwide(ua, ub)}
+	return cpu.fpu_slow(.Add, a, b)
 }
 
 fsub :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	r := a - b
-	return fspecial(a) | fspecial(b) | fspecial(r) ? cpu.fpu_slow(.Sub, a, b) : r
+	if !(fspecial(a) | fspecial(b) | fspecial(r)) {return r}
+	ua, ub := transmute(u32)a, transmute(u32)b
+	if max(ua & 0x7f800000, ub & 0x7f800000, transmute(u32)r & 0x7f800000) == 0x7f800000 {return fwide(ua, ub ~ 0x80000000)}
+	return cpu.fpu_slow(.Sub, a, b)
 }
 
 fmul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
@@ -372,10 +390,21 @@ fmul :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	sign := (ua ~ ub) & 0x80000000
 	ea, eb := ua & 0x7f800000, ub & 0x7f800000
 	if ea == 0 || eb == 0 || transmute(u32)r & 0x7f800000 == 0 {return transmute(f32)sign}
-	if ea == 0x7f800000 || eb == 0x7f800000 {return cpu.fpu_slow(.Mul, a, b)}
-	// The product is near 2^128, so a is 1 or more and a / 2 a host float.
-	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * b)
+	if eb == 0x7f800000 {ua, ub = ub, ua}
+	// The product is near 2^128 or more, so a is 1 or more and a / 2 a
+	// host float.
+	h := transmute(u32)(transmute(f32)(ua - 0x00800000) * transmute(f32)ub)
 	return transmute(f32)(h & 0x7f800000 == 0x7f800000 ? sign | cpu.FMAX : h + 0x00800000)
+}
+
+// The host root of a normal float is the f64 one rounded, as 53 >= 2 * 24 + 2.
+fsqrt :: #force_inline proc "contextless" (x: f32) -> f32 {
+	u := transmute(u32)x & 0x7fffffff
+	switch u & 0x7f800000 {
+	case 0:          return 0
+	case 0x7f800000: return transmute(f32)(transmute(u32)math.sqrt(transmute(f32)(u - 0x01000000)) + 0x00800000)
+	}
+	return math.sqrt(transmute(f32)u)
 }
 
 fkey :: #force_inline proc "contextless" (x: f32) -> i32 {

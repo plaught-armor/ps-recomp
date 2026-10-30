@@ -252,7 +252,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .SUB_S: append(out, fmt.tprintf("%s = fsub(%s, %s)", F(fd), F(fs), F(ft)))
 	case .MUL_S: append(out, fmt.tprintf("%s = fmul(%s, %s)", F(fd), F(fs), F(ft)))
 	case .DIV_S: append(out, fmt.tprintf("%s = cpu.fpu_div(%s, %s)", F(fd), F(fs), F(ft)))
-	case .SQRT_S: append(out, fmt.tprintf("%s = cpu.fpu_sqrt(%s)", F(fd), F(ft)))
+	case .SQRT_S: append(out, fmt.tprintf("%s = fsqrt(%s)", F(fd), F(ft)))
 	case .RSQRT_S: append(out, fmt.tprintf("%s = cpu.fpu_rsqrt(%s, %s)", F(fd), F(fs), F(ft)))
 	case .MADD_S: append(out, fmt.tprintf("%s = fadd(c.acc.f, fmul(%s, %s))", F(fd), F(fs), F(ft)))
 	case .MSUB_S: append(out, fmt.tprintf("%s = fsub(c.acc.f, fmul(%s, %s))", F(fd), F(fs), F(ft)))

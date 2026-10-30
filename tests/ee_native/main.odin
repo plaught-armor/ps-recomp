@@ -193,6 +193,12 @@ F_VALS := [?]u32 {
 	0x7fffffff,
 	0xffffffff,
 	0x7f000000,
+	// exponents 254 and 255 for the scaled forms: halves at the FMAX
+	// boundary, a root of a negative
+	0x7f400001,
+	0xfe800000,
+	0xff000001,
+	0x7f800001,
 	0x1f800000,
 	0x3f800000,
 	0xbf800000,
