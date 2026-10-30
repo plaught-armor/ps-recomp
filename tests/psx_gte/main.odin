@@ -3,7 +3,7 @@
 // native backend's inline field stores and loads, with
 // gte.gte_matrix_filter set and not, against gte.gte_write and gte.gte_read
 // from the same GTE state, and a few registers against their values. And the
-// inline NCLIP against gte.gte_cmd. The Odin backend's output for the same
+// inline NCLIP, AVSZ3 and AVSZ4 against gte.gte_cmd. The Odin backend's output for the same
 // forms and for GTE commands: which call each names, an inline proc or the
 // helper, and the inline ones against the helpers. And RTPS, RTPT and
 // MVMVA against a plain reference (ref.odin).
@@ -116,8 +116,10 @@ gte_state :: proc(k: int) -> gte.Gte_State {
 
 ADDR :: 0x80010000
 
-// NCLIP (COP2 command 0x06).
+// NCLIP (COP2 command 0x06), AVSZ3 (0x2d) and AVSZ4 (0x2e).
 NCLIP :: 0x4a000006
+AVSZ3 :: 0x4b58002d
+AVSZ4 :: 0x4b68002e
 
 // SX/SY halves: sign edges (bit 15 set reads as negative), then noise.
 @(rodata, private = "file")
@@ -165,9 +167,10 @@ main :: proc() {
 			free_all(context.temp_allocator)
 		}
 	}
-	// NCLIP inline, then commands called by the native code: RTPS, RTPT
-	// and MVMVA through their own procs, NCDS through gte_cmd.
-	NATIVE_CMDS :: [?]u32{NCLIP, 0x4a180001, 0x4a200430, 0x4a486012, 0x4a4ec012, 0x4a43a412, 0x4ae80413}
+	// NCLIP, AVSZ3 and AVSZ4 inline, then commands called by the native
+	// code: RTPS, RTPT and MVMVA through their own procs, NCDS through
+	// gte_cmd.
+	NATIVE_CMDS :: [?]u32{NCLIP, AVSZ3, AVSZ4, 0x4a180001, 0x4a200430, 0x4a486012, 0x4a4ec012, 0x4a43a412, 0x4ae80413}
 	for w in NATIVE_CMDS {
 		words := [?]u32{w, 0, JR_RA, 0, 0}
 		append(&funcs, native.Blob_Func{at, r3000.native_func(&na, build(at, words[:]), nil, 1)})
@@ -304,6 +307,48 @@ main :: proc() {
 	}
 	for f in ([?]u32{0, 0x80010000, 0x80008000}) {
 		if outcomes[f] == 0 {fail("nclip: no case with flag %08x", f)}
+	}
+	// AVSZ3 and AVSZ4 from noise and from 16-bit SZ and scales; OTZ held
+	// at 0 and at 0xffff (FLAG bit 18), OTZ in range, and MAC0 above and
+	// below i32 must all show up.
+	Avsz_Outcome :: enum {
+		Held_Low,
+		Held_High,
+		In_Range,
+		Above,
+		Below,
+	}
+	avsz_seen: [Avsz_Outcome]int
+	for w, n in ([?]u32{AVSZ3, AVSZ4}) {
+		for k in 0 ..< 20000 {
+			gte.gte_load(gte_state(k % len(vals)))
+			if k & 1 != 0 {
+				for r in u32(16) ..< 20 {gte.gte_write(r, half() >> (next() % 16))}
+				gte.gte_write(61, half())
+				gte.gte_write(62, half())
+			}
+			start := gte.gte_save()
+			gte.gte_cmd(w & 0x1ffffff)
+			want := gte.gte_save()
+			wg := transmute(gte.Gte)want
+			if wg.flag & (1 << 18) == 0 {
+				avsz_seen[.In_Range] += 1
+			} else {
+				avsz_seen[.Held_Low if wg.otz == 0 else .Held_High] += 1
+			}
+			if wg.flag & (1 << 16) != 0 {avsz_seen[.Above] += 1}
+			if wg.flag & (1 << 15) != 0 {avsz_seen[.Below] += 1}
+			gte.gte_load(start)
+			(cast(proc())rawptr(code.base + uintptr(code.funcs[len(Form) * 32 + 1 + n].off)))()
+			if got := gte.gte_save(); got != want {
+				g := transmute(gte.Gte)got
+				fail("native %08x from state %d: mac0 %08x otz %04x flag %08x, want %08x %04x %08x", w, k, u32(g.mac[0]), g.otz, g.flag, u32(wg.mac[0]), wg.otz, wg.flag)
+			}
+			checks += 1
+		}
+	}
+	for c, o in avsz_seen {
+		if c == 0 {fail("avsz: no case %v", o)}
 	}
 	native_cmds := NATIVE_CMDS
 	for w, n in native_cmds[1:] {

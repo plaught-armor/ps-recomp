@@ -119,6 +119,10 @@ GTE_LZCS :: 112
 @(private = "file")
 GTE_LZCR :: 116
 @(private = "file")
+GTE_ZSF3 :: 284
+@(private = "file")
+GTE_ZSF4 :: 288
+@(private = "file")
 GTE_FLAG :: 292
 
 // Where control register r, 32-62, is in gte.Gte, and how it maps: a
@@ -153,7 +157,7 @@ gte_ctrl :: proc(r: u32) -> Ctrl {
 	return {264 + 4 * (r - 56), .Word} // OFX, OFY, DQB
 }
 
-// The proc for GTE command w but NCLIP: RTPS, RTPT and MVMVA their own,
+// The proc for GTE command w but NCLIP, AVSZ3 and AVSZ4: RTPS, RTPT and MVMVA their own,
 // as in the Odin output; the rest gte.gte_cmd.
 @(private = "file")
 gte_cmd_proc :: proc(w: u32) -> string {
@@ -197,6 +201,60 @@ nclip :: proc(a: ^native.Asm) {
 	native.mov_imm(a, .A, 0x80008000)
 	native.bind(a, store)
 	native.imp_store(a, "gte.state", .A, GTE_FLAG)
+}
+
+// AVSZ3 (SZ1-3, scale ZSF3) or AVSZ4 (SZ0-3, ZSF4), as gte.gte_cmd: MAC0 =
+// the scale times the sum (SZ unsigned, the scale signed), in 64 bits; OTZ = MAC0 >> 12 held to 0-0xffff.
+// FLAG = bit 16 for a sum above i32 (bit 15 below), bit 18 for OTZ held,
+// with bit 31 for either. Loses A, B and C.
+@(private = "file")
+avsz :: proc(a: ^native.Asm, scale: u32, first: u32) {
+	native.imp_load(a, .B, "gte.state", scale)
+	for k in first ..< 4 {
+		native.imp_load(a, .C, "gte.state", GTE_SZ + 4 * k)
+		native.mac64(a, .Set if k == first else .Add, .B, .C)
+	}
+	native.mac64_split(a, .B)
+	// SZ is unsigned: the scale << 32 more for each with bit 31 set.
+	for k in first ..< 4 {
+		next := native.new_label(a)
+		native.imp_load(a, .C, "gte.state", GTE_SZ + 4 * k)
+		native.br_cmp_imm(a, .Ge, .C, 0, next)
+		native.imp_load(a, .C, "gte.state", scale)
+		native.alu(a, .Add, .B, .C)
+		native.bind(a, next)
+	}
+	native.imp_store(a, "gte.state", .A, GTE_MAC)
+	// The sum fits i32 when its high half is the low half's sign.
+	fits, otz, held, store := native.new_label(a), native.new_label(a), native.new_label(a), native.new_label(a)
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .Sar, .C, 31)
+	native.alu(a, .Xor, .C, .B)
+	native.br_zero(a, .C, fits)
+	native.mov_imm(a, .C, 0x80010000)
+	native.br_cmp_imm(a, .Ge, .B, 0, otz)
+	native.mov_imm(a, .C, 0x80008000)
+	native.jmp(a, otz)
+	native.bind(a, fits)
+	native.mov_imm(a, .C, 0)
+	native.bind(a, otz)
+	// Below 0 holds at 0; at 1 << 28 or above, at 0xffff.
+	low := native.new_label(a)
+	native.br_cmp_imm(a, .Lt, .B, 0, low)
+	native.br_zero(a, .B, held, true)
+	native.br_cmp_imm(a, .Geu, .A, 0x10000000, held)
+	native.alu_imm(a, .Shr, .A, 12)
+	native.jmp(a, store)
+	native.bind(a, low)
+	native.mov_imm(a, .A, 0)
+	native.alu_imm(a, .Or, .C, 0x80040000)
+	native.jmp(a, store)
+	native.bind(a, held)
+	native.mov_imm(a, .A, 0xffff)
+	native.alu_imm(a, .Or, .C, 0x80040000)
+	native.bind(a, store)
+	native.imp_store(a, "gte.state", .A, GTE_OTZ, .B16)
+	native.imp_store(a, "gte.state", .C, GTE_FLAG)
 }
 
 // A = GTE register r (control registers as 32-63), as gte.gte_read: a
@@ -578,6 +636,10 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 			gte_put(a, rd if rs == 4 else rd + 32, .B)
 		case rs & 16 != 0 && i.w & 0x3f == 0x06:
 			nclip(a)
+		case rs & 16 != 0 && i.w & 0x3f == 0x2d:
+			avsz(a, GTE_ZSF3, 1)
+		case rs & 16 != 0 && i.w & 0x3f == 0x2e:
+			avsz(a, GTE_ZSF4, 0)
 		case rs & 16 != 0:
 			call_imm(a, gte_cmd_proc(i.w), i.w & 0x1ffffff)
 		case:
