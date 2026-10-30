@@ -525,14 +525,32 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.vec_load(a, .V0, GPR * u32(rt))
 		native.vec_store(a, 16 * u32(rd), .V0, "vu.vf")
 	case .CFC2:
+		// As vu.vu0_ctrl_read, by register
 		if rt == 0 {return true}
-		native.mov_imm(a, .A, u32(rd))
-		native.call(a, "vu.ctrl_read", .A)
+		if rd < 16 {
+			vi_get(a, .A, u32(rd))
+			native.alu_imm(a, .And, .A, 0xffff)
+		} else if f, ok := vu0_ctrl(rd, true); ok {
+			native.imp_load(a, .A, f)
+		} else {
+			native.mov_imm(a, .A, 0)
+		}
 		put_sx(a, rt, .A)
 	case .CTC2:
-		get(a, .B, rt)
-		native.mov_imm(a, .A, u32(rd))
-		native.call(a, "vu.ctrl_write", .A, .B)
+		// As vu.vu0_ctrl_write, by register; a write to CMSAR1 starts VU1
+		// and stays a call.
+		if rd == 31 {
+			get(a, .B, rt)
+			native.mov_imm(a, .A, u32(rd))
+			native.call(a, "vu.ctrl_write", .A, .B)
+		} else if rd != 0 && rd < 16 {
+			get(a, .A, rt)
+			vi_put(a, u32(rd))
+		} else if f, ok := vu0_ctrl(rd, false); ok {
+			get(a, .A, rt)
+			if rd == 20 {native.alu_imm(a, .And, .A, 0x7fffff)}
+			native.imp_store(a, f, .A)
+		}
 	case .LQC2, .SQC2:
 		// VF registers live in the VU, 16 bytes each from import vu.vf;
 		// vf0 is fixed, but a store writes what it holds.
@@ -1382,6 +1400,27 @@ vi_get :: proc(a: ^native.Asm, r: native.Reg, n: u32, signed := false) {
 	} else if n & 1 != 0 {
 		native.alu_imm(a, .Shr, r, 16)
 	}
+}
+
+// The import holding VU0 control register n (16 up) as vu.vu0_ctrl_read
+// reads it (read) or vu0_ctrl_write writes it, else false: the read-only
+// ones on a write, and those that read as 0. A write to R keeps its low
+// 23 bits; CMSAR1's is the caller's.
+@(private = "file")
+vu0_ctrl :: proc(n: u8, read: bool) -> (string, bool) {
+	switch n {
+	case 16: return "vu.status", true
+	case 17: return "vu.mac", read
+	case 18: return "vu.clip", true
+	case 20: return "vu.r", true
+	case 21: return "vu.i", true
+	case 22: return "vu.q", true
+	case 26: return "vu.tpc", read
+	case 27: return "vu.cmsar", true
+	case 28: return "vu.fbrst", true
+	case 31: return "vu.cmsar1", read
+	}
+	return "", false
 }
 
 // VU0's vi[n & 15] = the low 16 bits of A, by a read and write of the word

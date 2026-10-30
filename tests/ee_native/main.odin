@@ -597,8 +597,42 @@ main :: proc() {
 		{cop2(1, 0), .QMFC2}, // vf0
 		{cop2(5, 3), .QMTC2},
 		{cop2(5, 0), .QMTC2}, // vf0 stays
+		// Every VU0 control register, and the ones that read as 0 (19, 29);
+		// a CTC2 to CMSAR1 starts VU1 and is a call either way.
+		{cop2(2, 0), .CFC2},
+		{cop2(2, 1), .CFC2},
+		{cop2(2, 2), .CFC2},
 		{cop2(2, 3), .CFC2},
+		{cop2(2, 15), .CFC2},
+		{cop2(2, 16), .CFC2},
+		{cop2(2, 17), .CFC2},
+		{cop2(2, 18), .CFC2},
+		{cop2(2, 19), .CFC2},
+		{cop2(2, 20), .CFC2},
+		{cop2(2, 21), .CFC2},
+		{cop2(2, 22), .CFC2},
+		{cop2(2, 26), .CFC2},
+		{cop2(2, 27), .CFC2},
+		{cop2(2, 28), .CFC2},
+		{cop2(2, 29), .CFC2},
+		{cop2(2, 31), .CFC2},
+		{cop2(2, 3) &~ (31 << 16), .CFC2}, // to r0
+		{cop2(6, 0), .CTC2},
+		{cop2(6, 1), .CTC2},
+		{cop2(6, 2), .CTC2},
 		{cop2(6, 3), .CTC2},
+		{cop2(6, 15), .CTC2},
+		{cop2(6, 16), .CTC2},
+		{cop2(6, 17), .CTC2},
+		{cop2(6, 18), .CTC2},
+		{cop2(6, 19), .CTC2},
+		{cop2(6, 20), .CTC2},
+		{cop2(6, 21), .CTC2},
+		{cop2(6, 22), .CTC2},
+		{cop2(6, 26), .CTC2},
+		{cop2(6, 27), .CTC2},
+		{cop2(6, 28), .CTC2},
+		{cop2(6, 29), .CTC2},
 		{macro(0x28), .VU0}, // VADD
 		{macro(0x2a, 9), .VU0}, // VMUL.xw
 		{macro(0x29), .VU0}, // VMADD
@@ -1076,10 +1110,16 @@ main :: proc() {
 				vu_start.acc.u = {u32(y), u32(x), u32(x >> 32), u32(y >> 32)}
 				vu_start.q = transmute(f32)u32(y ~ (x >> 32))
 				vu_start.i = transmute(f32)u32(x ~ (y >> 32))
-				vu_start.mac = u32(y)
+				// Not rt's word, so a CTC2 to the read-only MAC shows.
+				vu_start.mac = u32(y ~ (x << 11)) ~ 0x5a5a
 				vu_start.status = u32(x >> 7) & 0xfff
 				// Bits above the 24 too, which the shift drops.
 				vu_start.clip = u32(x ~ (y << 7))
+				// R's bits above the 23 too, which a write drops.
+				vu_start.r = u32(y ~ (x << 3))
+				vu_start.tpc = u32(x >> 16)
+				vu_start.fbrst = u32(y >> 8)
+				vu.vu1.cmsar = u32(x ~ y) & 0xffff
 				// VCLIP of vf2w: every value against every value of vf1x.
 				if c.w == special2(0x1f) {vu_start.vf[2].u[3] = u32(y)}
 				// A pattern of the row too, so a store of what is there
