@@ -650,6 +650,45 @@ word_u :: proc(a: ^native.Asm, store: bool) {
 	native.bind(a, done)
 }
 
+// A lone lwl, lwr, swl or swr, as cpu.lwl and the others do it: the aligned
+// word through the lw path, the bytes merged, a store's word back through
+// the sw path. With s the byte offset times 8 for lwr and swr, and 3 less
+// the byte offset times 8 for lwl and swl, the bytes kept are
+// ~(~0 << s) and the merged part is w << s for lwl and v << s for swr; lwr
+// and swl shift right. A load's word ends in A. The address is made again
+// after the load, which loses B and C: T and LD may be live, and the load
+// has not changed rs.
+@(private = "file")
+word_part :: proc(a: ^native.Asm, i: Insn) {
+	store := is_store_op(i.op)
+	shift: native.Alu = .Shl if i.op == 0x22 || i.op == 0x2e else .Shr
+	address(a, i)
+	native.alu_imm(a, .And, .A, ~u32(3))
+	native.load(a, .B32, false, "cpu.lw")
+	native.mov(a, .B, .A)
+	address(a, i)
+	native.alu_imm(a, .And, .A, 3)
+	if i.op == 0x22 || i.op == 0x2a {native.alu_imm(a, .Xor, .A, 3)}
+	native.alu_imm(a, .Shl, .A, 3)
+	if !store {native.alu(a, shift, .B, .A)}
+	native.mov_imm(a, .C, 0xffffffff)
+	native.alu(a, shift, .C, .A)
+	native.not(a, .C)
+	if store {
+		native.alu(a, .And, .B, .C)
+		get(a, .C, i.rt)
+		native.alu(a, shift, .C, .A)
+		native.alu(a, .Or, .B, .C)
+		address(a, i)
+		native.alu_imm(a, .And, .A, ~u32(3))
+		native.store(a, .B32, "cpu.sw")
+	} else {
+		get(a, .A, i.rt)
+		native.alu(a, .And, .A, .C)
+		native.alu(a, .Or, .A, .B)
+	}
+}
+
 // The instruction's result is in A: to its register, or to LD for a load
 // whose slot instruction must still see the old value.
 @(private = "file")
@@ -799,35 +838,37 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 			return false
 		}
 	case is_load_op(op):
-		LOADS :: [7]string{"cpu.lb", "cpu.lh", "cpu.lwl", "cpu.lw", "cpu.lbu", "cpu.lhu", "cpu.lwr"}
+		LOADS :: [7]string{"cpu.lb", "cpu.lh", "", "cpu.lw", "cpu.lbu", "cpu.lhu", ""}
 		WIDTHS :: [7]native.Width{.B8, .B16, .B32, .B32, .B8, .B16, .B32}
 		loads, widths := LOADS, WIDTHS
-		address(a, i)
-		if i.pair {
-			word_u(a, false)
-		} else if op == 0x22 || op == 0x26 {
-			get(a, .B, rt)
-			native.call(a, loads[op - 0x20], .A, .B)
+		if op == 0x22 || op == 0x26 {
+			if i.pair {
+				address(a, i)
+				word_u(a, false)
+			} else {
+				word_part(a, i)
+			}
 		} else {
+			address(a, i)
 			native.load(a, widths[op - 0x20], op < 0x24, loads[op - 0x20])
 		}
 		result(a, rt, ld)
 	case is_store_op(op):
-		STORES :: [7]string{"cpu.sb", "cpu.sh", "cpu.swl", "cpu.sw", "", "", "cpu.swr"}
-		stores := STORES
+		if (op == 0x2a || op == 0x2e) && !i.pair {
+			word_part(a, i)
+			return true
+		}
 		address(a, i)
 		get(a, .B, rt)
-		switch {
-		case i.pair:
-			word_u(a, true)
-		case op == 0x28:
+		switch op {
+		case 0x28:
 			native.store(a, .B8, "cpu.sb")
-		case op == 0x29:
+		case 0x29:
 			native.store(a, .B16, "cpu.sh")
-		case op == 0x2b:
+		case 0x2b:
 			native.store(a, .B32, "cpu.sw")
 		case:
-			native.call(a, stores[op - 0x28], .A, .B)
+			word_u(a, true)
 		}
 	case op == 0x32:
 		address(a, i)

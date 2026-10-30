@@ -3,10 +3,11 @@
 // cpu.sw_u match the pair they stand for at every alignment, in RAM, across
 // a page, at the end of RAM, in the scratchpad and across into I/O; a plain
 // word or half running past the scratchpad's end stays in it; and the
-// native backend's fused pair leaves what the composed pair does. Also the
-// native backend's inline div and divu against cpu.div and cpu.divu, mfc0
-// against cpu.mfc0, and its aligned loads and stores, lwc2 and swc2 too,
-// against the bus and the memory itself in and around the scratchpad.
+// native backend's fused pair leaves what the composed pair does, and its
+// lone lwl, lwr, swl and swr what the bus's do. Also the native backend's
+// inline div and divu against cpu.div and cpu.divu, mfc0 against cpu.mfc0,
+// and its aligned loads and stores, lwc2 and swc2 too, against the bus and
+// the memory itself in and around the scratchpad.
 package main
 
 import "core:fmt"
@@ -325,6 +326,87 @@ check_native :: proc() {
 	cpu.cop0 = {}
 }
 
+// A lone lwl, lwr, swl and swr as native code against cpu.lwl and the
+// others at every address and 3 past it, which reaches the I/O word: a
+// load, one whose delay slot reads the old value, one with rt the base
+// register, and the stores, plain, with the cache isolated and while memory
+// tracing watches.
+@(private = "file")
+check_lone :: proc() {
+	FUNCS :: [?][3]u32 {
+		{0x88820000, JR_RA, 0}, // lwl $v0, 0($a0)
+		{0x98820000, JR_RA, 0}, // lwr $v0, 0($a0)
+		{0x88820000, ADDU_V1_V0, JR_RA},
+		{0x98820000, ADDU_V1_V0, JR_RA},
+		{0x88840000, JR_RA, 0}, // lwl $a0, 0($a0)
+		{0x98840000, JR_RA, 0}, // lwr $a0, 0($a0)
+		{0xa8850000, JR_RA, 0}, // swl $a1, 0($a0)
+		{0xb8850000, JR_RA, 0}, // swr $a1, 0($a0)
+	}
+	funcs := FUNCS
+	arch := native.Arch(core.NATIVE_ARCH)
+	na := native.make_asm(arch, r3000.native_ram(), r3000.NATIVE_CACHED[:])
+	blob_funcs: [len(FUNCS)]native.Blob_Func
+	for w, k in funcs {
+		at := u32(0x80004000 + 0x20 * k)
+		words := [?]u32{w[0], w[1], w[2], 0, 0}
+		blob_funcs[k] = {at, r3000.native_func(&na, build(at, words[:]), nil, 1)}
+		free_all(context.temp_allocator)
+	}
+	code, err := core.native_load(native.make_blob(&na, blob_funcs[:], {}), psx_native.imports())
+	if err != "" {
+		fmt.eprintln("FAIL psx_unaligned: native_load:", err)
+		os.exit(1)
+	}
+	run :: proc(code: core.Native_Code, k: int) {(cast(proc())rawptr(code.base + uintptr(code.funcs[k].off)))()}
+	cpu.next_event = max(u64)
+	want, got: ^Mem = new(Mem), new(Mem)
+	defer free(want)
+	defer free(got)
+	V :: 0xc3a59617
+	for base in ADDRS {
+		for a in ([2]u32{base, base + 3}) {
+			for k in 0 ..< 6 {
+				left := funcs[k][0] >> 26 == 0x22
+				fill()
+				cur := a if k >= 4 else 0x5a5a5a5a
+				ld := cpu.lwl(a, cur) if left else cpu.lwr(a, cur)
+				cpu.state.r[2], cpu.state.r[3], cpu.state.r[4] = 0x5a5a5a5a, 0, a
+				run(code, k)
+				g := cpu.state.r[4] if k >= 4 else cpu.state.r[2]
+				if g != ld {fail("native %08x at %08x: %08x, want %08x", funcs[k][0], a, g, ld)}
+				if k == 2 || k == 3 {
+					if cpu.state.r[3] != 0x5a5a5a5a {fail("native %08x at %08x: slot saw %08x, want the old v0", funcs[k][0], a, cpu.state.r[3])}
+				}
+			}
+			for k in 6 ..< 8 {
+				for mode in 0 ..< 3 {
+					store :: proc(code: core.Native_Code, k: int, mode: int, a: u32, natively: bool) {
+						fill()
+						cpu.cop0.sr = 0x10000 if mode == 1 else 0
+						core.trace.watching = mode == 2
+						if natively {
+							cpu.state.r[4], cpu.state.r[5] = a, V
+							run(code, k)
+						} else if k == 6 {
+							cpu.swl(a, V)
+						} else {
+							cpu.swr(a, V)
+						}
+						cpu.cop0.sr = 0
+						core.trace.watching = false
+					}
+					store(code, k, mode, a, false)
+					snap(want)
+					store(code, k, mode, a, true)
+					snap(got)
+					if !same_mem(want, got) {fail("native %08x at %08x in mode %d differs from the bus", funcs[k][0], a, mode)}
+				}
+			}
+		}
+	}
+}
+
 // Each aligned load and store, lwc2 and swc2 through GTE data register 0,
 // as native code in and around the scratchpad, in each segment: the bus
 // (psx/cpu/bus.odin SCRATCH_MASK) has it at 0x1f800000 and 0x9f800000
@@ -458,6 +540,7 @@ main :: proc() {
 	check_bus()
 	check_straddle()
 	check_native()
+	check_lone()
 	check_scratch()
 	if failed != 0 {
 		os.exit(1)
