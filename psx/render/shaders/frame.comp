@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_GOOGLE_include_directive : require
-// gl_target.odin's CONV_CS on Vulkan (vk_frame): the area converted to
+// On Vulkan (vk_frame), the area converted to
 // XRGB8888 as convert_rows does, row by row into px, with the effects
 // (post_pixel): fx.x the glow (bloom.comp's, in glow) added at gain fx.y,
 // dof (focus step, 0 off; DOF_BAND; DOF_RAMP) mixing toward the blur in

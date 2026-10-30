@@ -25,30 +25,20 @@ package psx_render
 import "core:slice"
 import gte "../gte"
 
-// A picture at the hi-res target's resolution (picture_take): its pixels,
-// or with the GL target a texture of the GPU's, tex_w x tex_h, holding it
-// when `held`.
+// A picture at the hi-res target's resolution (picture_take): its pixels.
 Picture_Hi :: struct {
-	pix:          [dynamic]u32,
-	tex:          u32,
-	tex_w, tex_h: i32,
-	held:         bool,
+	pix: [dynamic]u32,
 }
 
 // Forget the picture hi holds (its storage is kept).
 picture_hi_clear :: proc(hi: ^Picture_Hi) {
 	clear(&hi.pix)
-	hi.held = false
 }
 
 // Make dst hold the picture src does.
 picture_hi_copy :: proc(dst, src: ^Picture_Hi) {
 	resize(&dst.pix, len(src.pix))
 	copy(dst.pix[:], src.pix[:])
-	dst.held = false
-	if src.held {
-		gl_picture_copy(dst, src)
-	}
 }
 
 // A picture to lay (lay_picture): w x h pixels, at packet positions 0..w,
@@ -120,9 +110,6 @@ picture_walk_begin :: proc() {
 		if depth_walk.now == 0 {
 			raster_sync()
 			for &t in live_targets() {
-				if t.gl {
-					gl_walks_clear()
-				}
 				slice.zero(t.walk)
 			}
 			depth_walk.now = 1
@@ -169,7 +156,7 @@ picture_lay :: proc(t: ^Target, p: ^Lay, door: u8, outside: Maybe(u8) = nil) #no
 	pw := p.w << k
 	hi := false
 	if t.shift > 0 && p.hi != nil {
-		hi = t.gl ? p.hi.held && p.hi.tex_w == pw && p.hi.tex_h == p.ht << k : i64(len(p.hi.pix)) >= i64(pw) * i64(p.ht << k)
+		hi = i64(len(p.hi.pix)) >= i64(pw) * i64(p.ht << k)
 	}
 	// The back's pixels, not the opening's outline, bound the picture: the
 	// back may reach past the opening's sides.
@@ -179,12 +166,6 @@ picture_lay :: proc(t: ^Target, p: ^Lay, door: u8, outside: Maybe(u8) = nil) #no
 	y1 := min(((gpu.y2 - gpu.off_y + 1) << k) - 1, (p.ht << k) - 1)
 	if k > 0 {
 		hi_touch((x0 >> k) + gpu.off_x, (y0 >> k) + gpu.off_y, (x1 >> k) - (x0 >> k) + 1, (y1 >> k) - (y0 >> k) + 1)
-	}
-	if t.gl {
-		if x0 <= x1 && y0 <= y1 {
-			gl_picture_lay(p, door, outside, x0, y0, x1, y1, hi)
-		}
-		return
 	}
 	if k > 0 {
 		picture_rows(u32, t, p, door, outside, hi, x0, y0, x1, y1)
@@ -283,10 +264,6 @@ picture_take :: proc(x, y, w, h: i32, pixels: []u16, hi: ^Picture_Hi) #no_bounds
 	}
 	t := &targets[1]
 	k := t.shift
-	if t.gl {
-		gl_picture_take(hi, x << k, y << k, w << k, h << k)
-		return
-	}
 	resize(&hi.pix, int(w << k) * int(h << k))
 	for row in 0 ..< h << k {
 		for col in 0 ..< w << k {

@@ -1,8 +1,7 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_GOOGLE_include_directive : require
-// The hi-res target's queue (vk_target.odin), as gl_target.odin's DRAW_VS:
-// each primitive its box, two triangles.
+// The hi-res target's queue (vk_target.odin): each primitive its box, two triangles.
 #include "prim.glsl"
 #define READ readonly
 #include "draw_pc.glsl"

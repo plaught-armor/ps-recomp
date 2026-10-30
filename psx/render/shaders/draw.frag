@@ -2,11 +2,10 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_ARB_gpu_shader_int64 : require
 #extension GL_GOOGLE_include_directive : require
-// The hi-res target's queue (vk_target.odin), as gl_target.odin's DRAW_FS:
-// the same hi_draw.glsl over the main picture as an input attachment read
-// in place (dynamic rendering local read), walk and door as their own
-// pictures, and the ghost layer and depth buffer as buffers, a pixel at
-// y * w + x.
+// The hi-res target's queue (vk_target.odin): hi_draw.glsl over the main
+// picture as an input attachment read in place (dynamic rendering local
+// read), walk and door as their own pictures, and the ghost layer and
+// depth buffer as buffers, a pixel at y * w + x.
 //
 // With INTERLOCK (draw_lock.frag.spv, when the device has ordered pixel
 // interlock), the pictures are storage images read and written inside the
@@ -38,7 +37,7 @@ layout(location = 2) out uint out_door;
 // hi_draw.glsl's walk << 8 | door, split by main.
 uint out_tag;
 
-// gl_submit's uniforms, as hi_draw.glsl names them (main sets them).
+// vk_target_submit's uniforms, as hi_draw.glsl names them (main sets them).
 vec4 see0, see1, see2, see3, see4, see5, fog0;
 uint fog_c;
 int k, zpass;
@@ -92,7 +91,7 @@ void ghost_put(ivec2 p, uvec2 v) {
 #undef main
 
 // queue_ghost_flush's rectangle (Gpu_Flag.Ghost_Flush, bit 31): the ghost
-// layer laid over the picture and cleared, as ghost_rows and GL's pass 0.
+// layer laid over the picture and cleared, as ghost_rows does.
 void ghost_flush() {
 	ivec2 xy = ivec2(gl_FragCoord.xy);
 	uvec2 gv = ghost_at(xy);

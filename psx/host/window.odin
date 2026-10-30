@@ -19,7 +19,6 @@ import "core:time"
 import sdl "vendor:sdl2"
 
 import "ps:core"
-import render "../render"
 import io "../io"
 import gpu "../gpu"
 import cpu "../cpu"
@@ -219,13 +218,11 @@ draw :: proc() {
 		}
 	}
 	sdl.RenderPresent(host.renderer)
-	render.gl_shown()
 	for _ in 1 ..< (host.vsync ? host.vsync_shows : 1) {
 		// The back buffer is undefined after a present: draw it again.
 		compose()
 		osd_draw()
 		sdl.RenderPresent(host.renderer)
-		render.gl_shown()
 	}
 }
 

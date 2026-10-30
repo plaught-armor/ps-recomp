@@ -5,7 +5,7 @@
 // conversion's lit flag and the uniforms; all but rgb and the uniforms are
 // rows of their area's width.
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Buf { uint v[]; };
-// gl_frame's uniforms: the area (target pixels, wrapping), the target's
+// vk_frame's uniforms: the area (target pixels, wrapping), the target's
 // size and shift, the effects (post_pixel) and the grade's columns 0..2,
 // then its offset.
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Uni {

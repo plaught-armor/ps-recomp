@@ -10,7 +10,6 @@ import "core:fmt"
 import "core:math"
 import "core:simd"
 import "core:slice"
-import sdl "vendor:sdl2"
 import gte "../gte"
 import cpu "../cpu"
 import io "../io"
@@ -58,10 +57,6 @@ Target :: struct {
 	// The hi-res target's depth buffer (depth_buffer.odin; on the host GPU
 	// its own).
 	zbuf:  []u32,
-	// Drawn on the host GPU (gl_target.odin): pix, door and walk are then
-	// scratch for pixels pulled from its textures, and the ghost layer
-	// lives there.
-	gl:    bool,
 	// Rasterized on Vulkan (vk_target.odin), every draw queued; every other
 	// path stays software, on planes in the Vulkan target's host-cached
 	// memory, after raster_sync.
@@ -161,38 +156,30 @@ shown_target :: #force_inline proc() -> ^Target {
 }
 
 // Whether the shown target's picture is converted on the GPU, into a frame
-// slot (gl_frame or vk_frame) the host shows, not into the host's buffer.
+// slot (vk_frame) the host shows, not into the host's buffer.
 gpu_frames :: proc() -> bool {
-	t := shown_target()
-	return t.gl || t.vk
+	return shown_target().vk
 }
 
 // Convert the shown target's area into frame slot `slot` on its GPU.
 gpu_frame :: proc(slot: int, x, y, w, h: i32) {
-	if shown_target().vk {
-		vk_frame(slot, x, y, w, h)
-	} else {
-		gl_frame(slot, x, y, w, h)
-	}
+	vk_frame(slot, x, y, w, h)
 }
 
 // Frame slot `slot`'s pixels, waiting for its conversion.
 gpu_frame_take :: proc(slot: int) -> []u32 {
-	return shown_target().vk ? vk_frame_take(slot) : gl_frame_take(slot)
+	return vk_frame_take(slot)
 }
 
 // Frame slot `slot`'s conversion's number, for gpu_frame_bright.
 gpu_frame_mark :: proc(slot: int) -> int {
-	return shown_target().vk ? gpu_vk.frames[slot].mark : gpu_gl.frames[slot].mark
+	return gpu_vk.frames[slot].mark
 }
 
 // Whether conversion `mark` has a pixel above black; `known` false when
 // its flag has since been reused.
 gpu_frame_bright :: proc(mark: int) -> (bright, known: bool) {
-	if shown_target().vk {
-		return vk_frame_bright(mark)
-	}
-	return gl_frame_bright(mark)
+	return vk_frame_bright(mark)
 }
 
 // A hi-res target pixel holds 8-bit channels as the display shows them,
@@ -266,7 +253,8 @@ hi_pixel :: #force_inline proc(c: u16) -> u32 {
 // the hi-res target only. The footstep dust puff's soft gray runs out at
 // 6 / 31, not 0, at the edges of its quad, so under the close camera it
 // lifted a hard-edged box out of the focus's shadow at its feet; less
-// that, its gradient meets the edges at nothing. GL_DRAW_FS has it too.
+// that, its gradient meets the edges at nothing. shaders/hi_draw.glsl has it
+// too.
 @(private)
 GLOW_FLOOR :: 6 << 3
 
@@ -316,40 +304,38 @@ target_index :: #force_inline proc(t: ^Target, x, y: i32) -> i32 {
 	return (y & (t.h - 1)) * t.w + (x & (t.w - 1))
 }
 
-// Start the backend drawing the hi-res target: GPU=sw (none), gl or vk;
-// GL=0 or GL=1 is sw or gl; unset, gl when hardware_renderer. Call after the
-// SDL renderer of `window` exists.
-gpu_init :: proc(window: ^sdl.Window, renderer: ^sdl.Renderer) {
+// Draw the hi-res target on the GPU ([window] hardware); set before
+// platform_init. GPU overrides it.
+hardware_renderer := true
+
+// Start the backend drawing the hi-res target: GPU=sw (none) or vk; unset,
+// vk when hardware_renderer.
+gpu_init :: proc() {
 	backend := core.env("GPU")
-	if backend == "" {
-		switch core.env("GL") {
-		case "0":
-			backend = "sw"
-		case "1":
-			backend = "gl"
-		case:
-			backend = hardware_renderer ? "gl" : "sw"
-		}
+	// GL=0 and GL=1 chose sw and the GL target, which is gone.
+	if gl := core.env("GL"); gl != "" {
+		fmt.eprintln(core.ENV_PREFIX + "GL is gone and ignored, use " + core.ENV_PREFIX + "GPU=sw or vk:", gl)
+	}
+	asked := backend != ""
+	if !asked {
+		backend = hardware_renderer ? "vk" : "sw"
 	}
 	switch backend {
 	case "sw":
-	case "gl":
-		gl_init(window, renderer)
 	case "vk":
-		// Without a device that will do, software, as gl falls back.
+		// Without a device that will do, software.
 		if !vk_init() {
-			fmt.eprintln(core.ENV_PREFIX + "GPU=vk: no Vulkan device that will do (drawing in software)")
+			fmt.eprintln(asked ? core.ENV_PREFIX + "GPU=vk: no Vulkan device that will do (drawing in software)" : "no Vulkan device that will do (drawing in software)")
 		}
 	case:
-		fmt.eprintln(core.ENV_PREFIX + "GPU: not sw, gl or vk (drawing in software):", backend)
+		fmt.eprintln(core.ENV_PREFIX + "GPU: not sw or vk (drawing in software):", backend)
 	}
 }
 
 // A forked child draws no hi-res target (it shows nothing) and leaves the
 // parent's GPU backend alone.
 gpu_fork_child :: proc() {
-	if gpu_gl.on || gpu_vk.on {
-		gpu_gl.on = false
+	if gpu_vk.on {
 		gpu_vk = {}
 		target_count = 1
 	}
@@ -365,9 +351,6 @@ render_targets_set :: proc(scale: i32) {
 	if target_count == 2 {
 		raster_sync()
 		t := &targets[1]
-		if t.gl {
-			gl_target_drop(t)
-		}
 		if t.vk {
 			vk_target_drop(t)
 		} else {
@@ -388,22 +371,6 @@ render_targets_set :: proc(scale: i32) {
 	w, h := i32(VRAM_W) << shift, i32(VRAM_H) << shift
 	n := int(w * h)
 	t := &targets[1]
-	if gpu_gl.on {
-		raster_sync()
-		t^ = {
-			rgb = make([]u32, n),
-			shift = shift,
-			w = w,
-			h = h,
-			unit = 1 / f32(i32(1) << shift),
-			ghost = {lo = {w, h}},
-			door = make([]u8, n),
-			walk = make([]u16, n),
-		}
-		target_count = 2
-		gl_target_make(t)
-		return
-	}
 	t^ = {
 		shift = shift,
 		w = w,
@@ -685,7 +652,7 @@ smooth_split :: #force_inline proc(s: Attr_Step, area: i64, lo, hi: i32) -> (i0,
 }
 
 // Perspective texture mapping (not a PS1 feature) in whole numbers, worked
-// out the same way by both renderers (gl_target.odin, persp_coord): a
+// out the same way by both renderers (shaders/hi_draw.glsl, persp_coord): a
 // corner's weight w is its nearness to the lens against the nearest
 // corner's, in PERSP_ONEths, and a pixel's coordinate is
 // sum(a t w) / sum(a w) over its edge weights a, shifted right by shift
@@ -887,9 +854,7 @@ gpu_ghost_flush :: proc() {
 	}
 	for &t in drawn_targets() {
 		g := &t.ghost
-		if t.gl {
-			gl_ghost_flush(&t)
-		} else if t.vk {
+		if t.vk {
 			queue_ghost_flush(&t)
 			continue
 		} else if streamed && t.shift == 0 {
@@ -1358,9 +1323,7 @@ tri_setup :: proc(tri: ^Tri, t: ^Target, st: ^Draw_State, m: ^Prim_Mode, va, vb,
 	if tri.persp {
 		tri.pw = persp_setup(v0, v1, v2, area)
 	}
-	if !t.gl {
-		tri_steps(tri, m, step)
-	}
+	tri_steps(tri, m, step)
 	// A finer target samples between the VRAM pixels and so can reach
 	// texels the GPU never reads, such as the column past a scaled sprite's
 	// edge (lines around sprites). It keeps to the texels the triangle reads
@@ -1888,9 +1851,7 @@ fill_rect :: proc(x, y, w, h: i32, c: u16) {
 				f.rows = rows
 			}
 		}
-		if t.gl {
-			gl_fill(x, y, w, h, c, f.rows)
-		} else if t.shift > 0 {
+		if t.shift > 0 {
 			raster_parallel(proc(band, bands: i32, data: rawptr) {
 					f := (^Fill)(data)
 					y0, y1 := band_run(0, f.h << f.t.shift, band, bands)
@@ -2025,6 +1986,16 @@ cmd_len :: proc(op: u32) -> int {
 	return 1
 }
 
+// Whether two triangles va vb vc and vb vc vd (a quad's halves) cover
+// distinct pixels: the corners off the shared edge lie strictly on its two
+// sides.
+@(private)
+quad_halves_apart :: proc(va, vb, vc, vd: Vertex) -> bool {
+	s0 := edge(vb, vc, va.sx, va.sy)
+	s3 := edge(vb, vc, vd.sx, vd.sy)
+	return s0 > 0 && s3 < 0 || s0 < 0 && s3 > 0
+}
+
 @(private)
 exec_polygon :: proc(words: []u32) {
 	op := words[0] >> 24
@@ -2139,7 +2110,7 @@ exec_polygon :: proc(words: []u32) {
 		if shape.kind == .World {
 			// A fan over a convex polygon: its triangles cover distinct
 			// pixels.
-			level_group((t.gl || t.vk) && shape.n > 3)
+			level_group(t.vk && shape.n > 3)
 			for k in 2 ..< shape.n {
 				draw_triangle(&t, &e, &m, shape.fan[0], shape.fan[k - 1], shape.fan[k])
 			}
@@ -2148,7 +2119,7 @@ exec_polygon :: proc(words: []u32) {
 		}
 		// The halves of a proper quad cover distinct pixels: the GPU queue
 		// need not order them.
-		group := (t.gl || t.vk) && verts == 4 && quad_halves_apart(vs[0], vs[1], vs[2], vs[3])
+		group := t.vk && verts == 4 && quad_halves_apart(vs[0], vs[1], vs[2], vs[3])
 		level_group(group)
 		draw_triangle(&t, &e, &m, vs[0], vs[1], vs[2])
 		if verts == 4 {
@@ -2325,8 +2296,7 @@ gp0_exec :: proc(words: []u32) {
 }
 
 move_image :: proc(sx, sy, dx, dy, w, h: i32) #no_bounds_check {
-	// The game moves an area onto itself every frame: no pixel changes, and
-	// on GL it would cost two reads back from the GPU.
+	// The game moves an area onto itself every frame: no pixel changes.
 	if sx == dx && sy == dy {
 		return
 	}
@@ -2335,22 +2305,10 @@ move_image :: proc(sx, sy, dx, dy, w, h: i32) #no_bounds_check {
 	hi_touch(sx, sy, w, h)
 	hi_touch(dx, dy, w, h)
 	for &t in live_targets() {
-		k := t.shift
-		if t.gl && gl_move(sx << k, sy << k, dx << k, dy << k, w << k, h << k) {
-			continue
-		}
-		if t.gl {
-			gl_settle()
-			gl_pull(sx << k, sy << k, w << k, h << k)
-			gl_pull(dx << k, dy << k, w << k, h << k)
-		}
-		if k > 0 {
+		if t.shift > 0 {
 			move_pixels(&t, t.rgb, sx, sy, dx, dy, w, h)
 		} else {
 			move_pixels(&t, t.pix, sx, sy, dx, dy, w, h)
-		}
-		if t.gl {
-			gl_push(dx << k, dy << k, w << k, h << k)
 		}
 	}
 }
@@ -2399,16 +2357,8 @@ vram_replace :: proc(src: ^[VRAM_W * VRAM_H]u16, keep := [4]i32{}) #no_bounds_ch
 			{0, y0 << k, x0 << k - 1, y1 << k - 1},
 			{x1 << k, y0 << k, t.w - 1, y1 << k - 1},
 		}
-		if t.gl {
-			gl_puts_apply()
-			gl_vram_upload()
-		}
 		for b in boxes {
 			if b.z < b.x || b.w < b.y {
-				continue
-			}
-			if t.gl {
-				gl_pass(1, b)
 				continue
 			}
 			for y in b.y ..= b.w {
@@ -2428,9 +2378,7 @@ vram_put :: proc(x, y: i32, c: u16) #no_bounds_check {
 	raster_sync()
 	hi_touch(x, y, 1, 1)
 	vram_at(x, y)^ = c
-	if target_count == 2 && targets[1].gl {
-		gl_put(x, y, c)
-	} else if target_count == 2 {
+	if target_count == 2 {
 		t := &targets[1]
 		n := i32(1) << t.shift
 		for dy in 0 ..< n {

@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_GOOGLE_include_directive : require
-// gl_target.odin's BLOOM_CS on Vulkan (vk_frame): the glow of the area at
+// On Vulkan (vk_frame), the glow of the area at
 // the PS1's resolution (bloom_prepare), stage 0 averaging each block of
 // glowing pixels into dst, 1 blurring src across into dst, 2 blurring it
 // down; with `every`, all pixels averaged: the depth of field's blur

@@ -13,10 +13,6 @@ Pass :: struct {
 	hi:         []u32,
 	hi_tiles:   u128,
 	hi_swapped: bool,
-	// The same as a texture when the target is drawn on the host GPU
-	// (gl_target.odin), and the target width it was made for.
-	hi_gl:      u32,
-	hi_gl_w:    i32,
 	depths:     Depth_Undo,
 	// The pass this one runs inside, nil for one saved from the running
 	// machine.
@@ -69,21 +65,12 @@ hi_load :: proc(mask, whole: u128) {
 		return
 	}
 	cp.hi_tiles |= fresh
-	gl := targets[1].gl
 	if o := cp.outer; o != nil && o.hi_swapped && hi_saved(o) {
 		lack := fresh &~ whole &~ o.hi_tiles
 		o.hi_tiles |= lack
-		if gl {
-			gl_copy_tiles(cp.hi_gl, o.hi_gl, lack)
-		} else {
-			hi_copy_tiles(cp.hi, o.hi, lack)
-		}
+		hi_copy_tiles(cp.hi, o.hi, lack)
 	}
-	if gl {
-		gl_copy_tiles(gpu_gl.main, cp.hi_gl, fresh &~ whole)
-	} else {
-		hi_copy_tiles(targets[1].rgb, cp.hi, fresh &~ whole)
-	}
+	hi_copy_tiles(targets[1].rgb, cp.hi, fresh &~ whole)
 }
 
 // Whether cp holds a saved picture of the hi-res target as it is now.
@@ -91,11 +78,7 @@ hi_saved :: proc(cp: ^Pass) -> bool {
 	if target_count != 2 {
 		return false
 	}
-	t := &targets[1]
-	if t.gl {
-		return cp.hi_gl != 0 && cp.hi_gl_w == t.w
-	}
-	return len(cp.hi) == len(t.rgb)
+	return len(cp.hi) == len(targets[1].rgb)
 }
 
 // Copy the hi-res target's tiles in mask (VRAM tiles, as vram_tiles) from
@@ -128,13 +111,9 @@ hi_copy_tiles :: proc(dst, src: []u32, mask: u128) #no_bounds_check {
 }
 
 // Name the VRAM a pass has just put in place (a room's, from key 1; 0 is
-// the machine's own), so the hi-res target keeps a GPU copy of each apart
-// and swapping one in uploads only what changed (gl_vram_use).
+// the machine's own).
 vram_world :: proc(key: u32) {
 	vram_key = key
-	if target_count == 2 && targets[1].gl {
-		gl_vram_use(key)
-	}
 }
 
 // The VRAM in place, as vram_world named it.

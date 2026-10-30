@@ -9,7 +9,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Ord
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Vram { uint v[]; };
 // A plane of the target; the ghost layer's alpha has four pixels a word.
 layout(buffer_reference, std430, buffer_reference_align = 4) READ coherent buffer Plane { uint v[]; };
-// gl_submit's uniforms; w is the target's width.
+// vk_target_submit's uniforms; w is the target's width.
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Uni {
 	vec4 see[6];
 	vec4 fog0;

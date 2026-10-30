@@ -5,7 +5,7 @@
 // down (9 binomial taps, BLOOM_TAPS), stretched back bilinearly and added
 // to the picture at BLOOM_GAIN. The target itself is left as drawn; only
 // the picture shown gets the glow. Integer arithmetic throughout, the same
-// as the GPU's (gl_target.odin, BLOOM_CS and CONV_CS), so both give the same
+// as the GPU's (shaders/bloom.comp and frame.comp), so both give the same
 // pixels. Set from the config ([window] bloom_effects).
 package psx_render
 

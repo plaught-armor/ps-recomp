@@ -9,9 +9,6 @@ package psx_render
 QUEUE_PRIMS :: 1 << 16
 @(private)
 QUEUE_PORTALS :: 256
-// Primitives queued before they are sent on unasked (queue_add).
-@(private)
-QUEUE_EAGER :: 512
 
 // A primitive as the shader reads it (std430). See queue_tri for the
 // fields.
@@ -92,15 +89,14 @@ prim_queue: struct {
 	portal_n:    int,
 	// Each queued primitive's level (levels.odin).
 	level_of:    [QUEUE_PRIMS]u8,
-	// The queue by level (gl_submit), as the shader reads it.
+	// The queue by level (vk_target_submit), as the shader reads it.
 	order:       [QUEUE_PRIMS]i32,
 }
 
 // Queue draw d of target t (raster_queue).
 @(private)
 queue_draw :: proc(t: ^Target, d: ^Draw) {
-	assert(raster.on || t.gl || t.vk, "a software target queues only a walk's draws")
-	gl_puts_apply()
+	assert(raster.on || t.vk, "a software target queues only a walk's draws")
 	switch d.kind {
 	case .Triangle:
 		queue_tri(t, d)
@@ -327,12 +323,6 @@ queue_add :: proc(t: ^Target, p: ^Gpu_Prim, f: Gpu_Flags, fade: bool) {
 	p.h.x = transmute(i32)f
 	g.prims[g.prim_n] = p^
 	g.prim_n += 1
-	// Sent on before the frame ends, the GL target draws while the CPU runs
-	// on: a pull then waits only for the rest. (The Vulkan target's draws
-	// are waited for, so it sends only full queues and pulls.)
-	if g.prim_n >= QUEUE_EAGER && !levels.group && gpu_gl.on {
-		queue_submit()
-	}
 }
 
 // Order the queue by level, keeping queue order within one: level lv's
@@ -359,9 +349,7 @@ queue_order :: proc() -> (first: [LEVELS + 2]i32, top: int) {
 // are dropped).
 @(private)
 queue_submit :: proc() {
-	if gpu_gl.on {
-		gl_submit()
-	} else if gpu_vk.on {
+	if gpu_vk.on {
 		vk_target_submit()
 	}
 }

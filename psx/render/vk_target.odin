@@ -1,14 +1,14 @@
 // The hi-res target on Vulkan (GPU=vk), headless: no surface, the picture
 // reaches the window through present as the software target's does. Its
 // draws are queued (prim_queue.odin) and drawn here by the same
-// shader body as the GL target's (shaders/hi_draw.glsl), synchronously: the
+// shader body (shaders/hi_draw.glsl), synchronously: the
 // software target's planes are host-cached memory laid out as the GPU's
 // pictures, which the GPU copies over the box the queue covers and back
 // once drawn, so every other path (passes, pictures, the ghost flush,
 // present) reads and writes them in place after raster_sync, staying
 // software.
 //
-// Each level is one draw, behind a barrier, as gl_submit's: a reader of a
+// Each level is one draw, behind a barrier: a reader of a
 // cell sits above that cell's writers in the same level, so the main
 // picture is read in place as an input attachment (dynamic rendering local
 // read) and the ghost layer and depth buffer as buffers, a pixel at
@@ -20,6 +20,11 @@ import "core:fmt"
 import "core:mem"
 import vk "vendor:vulkan"
 import "ps:core"
+
+// Conversions whose black flags are kept (gpu_frame_bright): more than
+// convert in the presents an extra picture waits to be shown.
+@(private)
+FRAME_MARKS :: 16
 
 @(private)
 gpu_vk: struct {
@@ -73,9 +78,9 @@ gpu_vk: struct {
 	frame_uni:   core.Vk_Buf,
 	frame_lit:   core.Vk_Buf,
 	frames:      [EXTRA_FRAMES + 1]Vk_Frame,
-	// Whether each of the last GL_MARKS conversions has a lit pixel
-	// (conversion n's is bright[n % GL_MARKS]) and the conversions made.
-	bright:      [GL_MARKS]bool,
+	// Whether each of the last FRAME_MARKS conversions has a lit pixel
+	// (conversion n's is bright[n % FRAME_MARKS]) and the conversions made.
+	bright:      [FRAME_MARKS]bool,
 	marks:       int,
 }
 
@@ -106,7 +111,7 @@ VK_PASS :: 20
 @(private = "file")
 VK_STAGE :: 24
 
-// draw.frag's uniforms (std430), gl_submit's.
+// draw.frag's uniforms (std430).
 @(private = "file")
 Vk_Draw_Uni :: struct {
 	see:   [6][4]f32,
@@ -415,7 +420,7 @@ vk_copy :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) {
 }
 
 // Upload the VRAM cells the queued draws read (raster.reads) that changed
-// since last uploaded, as gl_vram_sync: the GPU's copy is idle between
+// since last uploaded: the GPU's copy is idle between
 // submits (vk_target_submit waits for each), so they go straight into it.
 @(private = "file")
 vk_vram_sync :: proc() #no_bounds_check {
@@ -599,7 +604,7 @@ vk_target_submit :: proc() #no_bounds_check {
 }
 
 // Convert the target's picture over the area (target pixels, wrapping) to
-// XRGB8888 (convert_area) in frame slot `slot`, as gl_frame does, and wait
+// XRGB8888 (convert_area) in frame slot `slot`, and wait
 // for it: the planes are read as they stand after raster_sync.
 @(private)
 vk_frame :: proc(slot: int, x, y, w, h: i32) {
@@ -685,7 +690,7 @@ vk_frame :: proc(slot: int, x, y, w, h: i32) {
 	core.vk_submit(cmd, g.fence, 0, 0)
 	fence := g.fence
 	core.vk_check(vk.WaitForFences(core.vkc.device, 1, &fence, true, max(u64)), "vkWaitForFences")
-	g.bright[f.mark % GL_MARKS] = intrinsics.volatile_load((^u32)(g.frame_lit.ptr)) != 0
+	g.bright[f.mark % FRAME_MARKS] = intrinsics.volatile_load((^u32)(g.frame_lit.ptr)) != 0
 }
 
 // Record bloom.comp's stages over a w x h area into bufs, ending in
@@ -719,8 +724,8 @@ vk_frame_take :: proc(slot: int) -> []u32 {
 @(private)
 vk_frame_bright :: proc(mark: int) -> (bright, known: bool) {
 	g := &gpu_vk
-	if mark < 0 || mark >= g.marks || g.marks - mark > GL_MARKS {
+	if mark < 0 || mark >= g.marks || g.marks - mark > FRAME_MARKS {
 		return false, false
 	}
-	return g.bright[mark % GL_MARKS], true
+	return g.bright[mark % FRAME_MARKS], true
 }

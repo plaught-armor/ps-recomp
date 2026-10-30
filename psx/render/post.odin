@@ -15,7 +15,7 @@
 //
 // They go on in that order, the glow added after the depth of field. The
 // target itself is left as drawn. Integer arithmetic throughout, the same as
-// the GPU's (gl_target.odin, BLOOM_CS and CONV_CS), so both give the same
+// the GPU's (shaders/bloom.comp and frame.comp), so both give the same
 // pixels. Set from the config ([window] depth_of_field, vignette; the grade's
 // own switch is the field code's).
 package psx_render

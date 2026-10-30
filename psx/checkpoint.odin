@@ -131,7 +131,7 @@ checkpoint_save :: proc(cp: ^Checkpoint) -> bool {
 	if gpu.gp.need != 0 || gpu.gp.polyline || gpu.gp.uploading || gpu.gp.downloading {
 		return false
 	}
-	render.gl_settle()
+	render.raster_sync()
 	cp.kept = {}
 	cp.ram_ver = cpu.ram_ver
 	cpu.ram_armed = true
@@ -143,10 +143,7 @@ checkpoint_save :: proc(cp: ^Checkpoint) -> bool {
 	cp.vram_key = render.vram_key
 	cp.pass.hi_tiles = 0
 	cp.pass.hi_swapped = false
-	if render.target_count == 2 && render.targets[1].gl {
-		render.gl_hi_swap(&cp.pass, true)
-		cp.pass.hi_swapped = true
-	} else if render.target_count == 2 {
+	if render.target_count == 2 {
 		if len(cp.pass.hi) != len(render.targets[1].rgb) {
 			delete(cp.pass.hi)
 			cp.pass.hi = make([]u32, len(render.targets[1].rgb))
@@ -184,7 +181,7 @@ checkpoint_save :: proc(cp: ^Checkpoint) -> bool {
 // pass, go back to the pass it ran in).
 checkpoint_restore :: proc(cp: ^Checkpoint) {
 	assert(io.events_frozen, "restore without a checkpoint")
-	render.gl_settle()
+	render.raster_sync()
 	ram_put_back(cp)
 	when RAM_KEEP_CHECK {
 		for p in u32(0) ..< RAM_PAGES {
@@ -202,11 +199,7 @@ checkpoint_restore :: proc(cp: ^Checkpoint) {
 	render.vram = cp.vram
 	render.vram_world(cp.vram_key)
 	if cp.pass.hi_swapped && render.hi_saved(&cp.pass) {
-		if render.targets[1].gl {
-			render.gl_hi_swap(&cp.pass, false)
-		} else {
-			render.targets[1].rgb, cp.pass.hi = cp.pass.hi, render.targets[1].rgb
-		}
+		render.targets[1].rgb, cp.pass.hi = cp.pass.hi, render.targets[1].rgb
 	}
 	cp.pass.hi_tiles = 0
 	cp.pass.hi_swapped = false

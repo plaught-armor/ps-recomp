@@ -28,8 +28,8 @@ a `recomp` options file, and any per-game code.
 ## Requirements
 
 - Odin `dev-2026-10`
-- SDL2 (window, input, audio), OpenGL or Vulkan 1.3 (PS1 renderer, chosen
-  with `GPU=gl` or `GPU=vk`), Vulkan 1.3 (PS2 GS)
+- SDL2 (window, input, audio), Vulkan 1.3 (PS1 renderer, `GPU=sw` draws in
+  software; PS2 GS)
 - `glslc` only to rebuild the shaders (`ps2/gs/shaders/build.sh`,
   `psx/render/shaders/build.sh`); the compiled `.spv` files are committed
 

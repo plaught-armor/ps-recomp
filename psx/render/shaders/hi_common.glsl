@@ -1,5 +1,5 @@
-// Shared by the GL and Vulkan targets' fragment shaders (gl_target.odin,
-// vk_target.odin): the hi-res pixel format.
+// Shared by the Vulkan target's shaders (vk_target.odin): the hi-res pixel
+// format.
 const uint HI_MASK = 0x80000000u, HI_GLOW = 0x01000000u, HI_DEPTH = 0x7e000000u;
 // The bits a pixel laid over another takes from it (pixel_kept).
 const uint HI_KEPT = HI_MASK | HI_DEPTH;

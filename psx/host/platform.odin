@@ -58,12 +58,12 @@ host: struct {
 	// resolution (render_scale_apply).
 	converted:   []u32,
 	// The picture this vblank shows: `converted`, or an extra picture of a
-	// frozen-time pass (shown in place, not copied). Nil while it is a GL
+	// frozen-time pass (shown in place, not copied). Nil while it is a GPU
 	// frame slot's still converting: read it through frame_pixels.
 	frame:       []u32,
 	// The GPU frame slot the picture is the buffer of (gpu_frame_take), or -1.
 	frame_slot:  int,
-	// The GL conversions (Gl_Frame.mark) of this present's picture and the
+	// The GPU conversions (gpu_frame_mark) of this present's picture and the
 	// last one's, -1 when none.
 	frame_mark:  int,
 	last_mark:   int,
@@ -252,7 +252,7 @@ platform_init :: proc(title: cstring) -> bool {
 	if lib := sdl.LoadObject(SDL_LIBRARY); lib != nil {
 		render_set_vsync = auto_cast sdl.LoadFunction(lib, "SDL_RenderSetVSync")
 	}
-	render.gpu_init(host.window, host.renderer)
+	render.gpu_init()
 	if !render_scale_apply() {
 		return false
 	}
@@ -643,7 +643,6 @@ perf_report :: proc() {
 	audio := core.audio_take_stats()
 	mixed_hz := f64(audio.mixed) * io.CPU_HZ * f64(io.clock_mul) / f64(max(cpu.state.cycles - host.perf_cycles, 1))
 	core.tracef(.Perf, "%d presents in %.3f s (%.1f/s), %d cycles, audio mixed %.1f Hz, queued %.1f ms (lowest %.1f), ran dry %d, dropped %d", PERF_PERIOD, secs, f64(PERF_PERIOD) / secs, cpu.state.cycles, mixed_hz, core.audio_queued_ms(), audio.low_ms, audio.dry, audio.dropped)
-	render.gl_perf()
 	render.sync_perf()
 	host.perf_cycles = cpu.state.cycles
 	host.perf_mark = now
@@ -676,7 +675,6 @@ render_scale_apply :: proc() -> bool {
 		sdl.DestroyTexture(host.texture)
 		sdl.DestroyTexture(host.held)
 	}
-	render.gl_show_forget()
 	host.texture = sdl.CreateTexture(host.renderer, .XRGB8888, .STREAMING, w, h)
 	host.held = sdl.CreateTexture(host.renderer, .XRGB8888, .STREAMING, w, h)
 	if host.texture == nil || host.held == nil {
@@ -736,9 +734,7 @@ present :: proc() {
 		if gpu.display.enabled && gpu.display.w > 0 && gpu.display.h > 0 {
 			fw, fh := frame_size()
 			src := sdl.Rect{0, 0, fw, fh}
-			if host.frame_slot < 0 || !render.gl_show(host.texture, host.frame_slot, fw, fh) {
-				sdl.UpdateTexture(host.texture, &src, &frame_pixels()[0], fw * 4)
-			}
+			sdl.UpdateTexture(host.texture, &src, &frame_pixels()[0], fw * 4)
 			host.shown_w, host.shown_h = fw, fh
 		}
 	}

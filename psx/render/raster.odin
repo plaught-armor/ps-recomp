@@ -6,12 +6,11 @@
 // thread at the same time. Each pixel still sees its draws in order, so the
 // picture is the same as drawing them one by one.
 //
-// With the hi-res target on the GPU (gl_target.odin, vk_target.odin),
-// VRAM's draws are drawn as they are queued instead, by the stream's
-// threads, each owning interleaved bands of VRAM's rows, while the walk
-// goes on; raster_sync waits for them. A draw texturing from VRAM a draw
-// before it in the stream wrote (another band's rows, maybe) first waits
-// for the stream to empty.
+// With the hi-res target on the GPU (vk_target.odin), VRAM's draws are
+// drawn as they are queued instead, by the stream's threads, each owning
+// interleaved bands of VRAM's rows, while the walk goes on; raster_sync
+// waits for them. A draw texturing from VRAM a draw before it in the stream
+// wrote (another band's rows, maybe) first waits for the stream to empty.
 //
 // Queued hi-res draws read their textures from VRAM while VRAM's draws run,
 // so a VRAM draw over texels a queued hi-res draw reads, or a hi-res draw
@@ -284,7 +283,7 @@ raster_queue :: proc(t: ^Target, d: ^Draw, x0, y0, x1, y1: i32) {
 				hi_only.missed = true
 			}
 		}
-		if t.gl || t.vk {
+		if t.vk {
 			queue_draw(t, d)
 			return
 		}
@@ -374,7 +373,7 @@ stream_drain :: proc(count := true) {
 // GPU, but in a forked child, which has no stream threads.
 @(private)
 stream_on :: #force_inline proc() -> bool {
-	return (targets[1].gl || targets[1].vk) && !io.preload_child
+	return targets[1].vk && !io.preload_child
 }
 
 // Whether VRAM's draws run on the stream and some are not synced yet.
@@ -537,6 +536,15 @@ raster_draw :: #force_inline proc($P: typeid, ra: ^Raster, d: ^Draw) {
 	}
 }
 
+// Before VRAM pixels x0..=x1, y0..=y1 are drawn straight away (no walk
+// queues them), draw the GPU target's queue if it reads them.
+@(private)
+queue_read_sync :: #force_inline proc(t: ^Target, x0, y0, x1, y1: i32) {
+	if t.shift == 0 && prim_queue.prim_n > 0 && x0 <= x1 && y0 <= y1 && cells_hit(&raster.reads, x0, y0, x1 - x0 + 1, y1 - y0 + 1) {
+		raster_sync()
+	}
+}
+
 // Draw a triangle into target t (VRAM or the hi-res target, queued during
 // a walk, and always on the host GPU).
 @(private)
@@ -550,12 +558,12 @@ draw_triangle :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, va, vb, vc: Verte
 		k := t.shift
 		hi_touch(tri.min_x >> k, tri.min_y >> k, (tri.max_x >> k) - (tri.min_x >> k) + 1, (tri.max_y >> k) - (tri.min_y >> k) + 1)
 	}
-	if raster.on || t.gl || t.vk {
+	if raster.on || t.vk {
 		d.kind, d.env, d.m = .Triangle, e^, m^
 		raster_queue(t, &d, tri.min_x, tri.min_y, tri.max_x, tri.max_y)
 		return
 	}
-	gl_vram_write(t, tri.min_x, tri.min_y, tri.max_x, tri.max_y)
+	queue_read_sync(t, tri.min_x, tri.min_y, tri.max_x, tri.max_y)
 	ra := raster_make(t, e)
 	if t.shift > 0 {
 		tri_rows(u32, &ra, m, tri)
@@ -571,7 +579,7 @@ rect_issue :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, x, y, w, h, r, g, b,
 		x0, y0 := max(x, e.st.x1), max(y, e.st.y1)
 		hi_touch(x0, y0, min(x + w - 1, e.st.x2) - x0 + 1, min(y + h - 1, e.st.y2) - y0 + 1)
 	}
-	if raster.on || t.gl || t.vk {
+	if raster.on || t.vk {
 		x0, y0 := max(x, e.st.x1), max(y, e.st.y1)
 		x1, y1 := min(x + w - 1, e.st.x2), min(y + h - 1, e.st.y2)
 		if x0 > x1 || y0 > y1 {
@@ -586,7 +594,7 @@ rect_issue :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, x, y, w, h, r, g, b,
 		raster_queue(t, &d, x0, y0, x1, y1)
 		return
 	}
-	gl_vram_write(t, max(x, e.st.x1), max(y, e.st.y1), min(x + w - 1, e.st.x2), min(y + h - 1, e.st.y2))
+	queue_read_sync(t, max(x, e.st.x1), max(y, e.st.y1), min(x + w - 1, e.st.x2), min(y + h - 1, e.st.y2))
 	ra := raster_make(t, e)
 	if t.shift > 0 {
 		draw_rect(u32, &ra, m, x, y, w, h, r, g, b, u, v)
@@ -602,7 +610,7 @@ line_issue :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, a, b: Vertex) {
 		x0, y0 := max(min(a.x, b.x), e.st.x1), max(min(a.y, b.y), e.st.y1)
 		hi_touch(x0, y0, min(max(a.x, b.x), e.st.x2) - x0 + 1, min(max(a.y, b.y), e.st.y2) - y0 + 1)
 	}
-	if raster.on || t.gl || t.vk {
+	if raster.on || t.vk {
 		x0, y0 := max(min(a.x, b.x), e.st.x1), max(min(a.y, b.y), e.st.y1)
 		x1, y1 := min(max(a.x, b.x), e.st.x2), min(max(a.y, b.y), e.st.y2)
 		if x0 > x1 || y0 > y1 {
@@ -617,7 +625,7 @@ line_issue :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, a, b: Vertex) {
 		raster_queue(t, &d, x0, y0, x1, y1)
 		return
 	}
-	gl_vram_write(t, max(min(a.x, b.x), e.st.x1), max(min(a.y, b.y), e.st.y1), min(max(a.x, b.x), e.st.x2), min(max(a.y, b.y), e.st.y2))
+	queue_read_sync(t, max(min(a.x, b.x), e.st.x1), max(min(a.y, b.y), e.st.y1), min(max(a.x, b.x), e.st.x2), min(max(a.y, b.y), e.st.y2))
 	ra := raster_make(t, e)
 	if t.shift > 0 {
 		draw_line(u32, &ra, m, a, b)

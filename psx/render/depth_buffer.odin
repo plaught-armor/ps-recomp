@@ -31,8 +31,8 @@
 // A pixel's word is the walk's key (0xffff less its count) << 16 and its
 // depth in quarter view units, so a word left by an earlier walk is larger
 // than any of this one's and counts as empty: no clear between walks, and
-// keeping the nearer is one min (the GPU's atomic min, gl_target.odin, whose
-// levels each lay down their depths before they draw).
+// keeping the nearer is one min (the GPU's atomic min, shaders/draw.frag,
+// whose levels each lay down their depths before they draw).
 package psx_render
 
 import "core:slice"
@@ -56,7 +56,7 @@ Z_EMPTY :: max(u32)
 
 // Depth steps a pixel may stand behind the one there and still be drawn:
 // a fixed part for a polygon and for a sprite, and the depth's share past
-// it as a shift. GL_DRAW_FS has them too.
+// it as a shift. shaders/hi_draw.glsl has them too.
 @(private)
 Z_BIAS :: 2 * Z_SCALE
 @(private)
@@ -64,8 +64,8 @@ Z_BIAS_SPRITE :: 48 * Z_SCALE
 @(private)
 Z_BIAS_SHIFT :: 7
 // View units a decal's depth is taken nearer (Prim_Shape decal): past
-// Z_BIAS, so the surface it lies on never draws over it. GL_DRAW_FS has it
-// too.
+// Z_BIAS, so the surface it lies on never draws over it.
+// shaders/hi_draw.glsl has it too.
 @(private)
 Z_LIFT :: f32(4)
 
@@ -77,9 +77,6 @@ z_walk_begin :: proc() -> u32 {
 		z_walk = 1
 		raster_sync()
 		for &t in live_targets() {
-			if t.gl {
-				gl_zbuf_clear()
-			}
 			slice.fill(t.zbuf, Z_EMPTY)
 		}
 	}
