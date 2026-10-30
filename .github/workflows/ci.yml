@@ -40,8 +40,8 @@ jobs:
         include:
           - os: ubuntu-24.04
           - os: ubuntu-24.04-arm
-          - os: macos-14
-          - os: macos-14
+          - os: macos-15
+          - os: macos-15
             rosetta: true # darwin_amd64, cross-built and run under Rosetta
           - os: windows-2022
     runs-on: ${{ matrix.os }}
