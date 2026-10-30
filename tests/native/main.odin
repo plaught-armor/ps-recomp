@@ -252,11 +252,11 @@ expect :: proc(c: Case, x, y: u32) -> u32 {
 			for k in 0 ..< width_bytes(c.w) {v |= u32(mem_pat(o + k)) << (8 * uint(k))}
 			return narrow(v, c.w, c.signed)
 		}
-		if o, ok := win_at(addr); ok {return narrow(win_word(o), c.w, c.signed)}
+		if o, ok := win_at(addr, c.w); ok {return narrow(win_word(o), c.w, c.signed)}
 		return narrow(FAR ~ addr, c.w, c.signed)
 	case .Store:
 		if c.w >= .B64 {return wide_store(c.imm, c.w, int(c.n), c.flag, x, y)}
-		if o, ok := win_at(c.imm); ok {
+		if o, ok := win_at(c.imm, c.w); ok {
 			// A slow store, while a guard is set, leaves the window as it was.
 			return narrow(y if guards_of(x, y) == {0, 0} else win_word(o), c.w, false)
 		}
@@ -465,8 +465,9 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 // 16 pages, and again at 0x10000000 up, a mirror off the fast path. `far`
 // is what a slow store outside RAM got; a slow load outside RAM reads far
 // ^ address. A slow store into RAM writes the value ^ SLOW_TAG, so a load
-// back tells which path it took. The window is 1K at WIN_AT, reached in
-// place off the fast path.
+// back tells which path it took. The window is 1K at WIN_AT in every
+// segment, reached in place off the fast path by an access that lies whole
+// in it; one running past its end is slow.
 MEM_SIZE :: 0x10000
 mem: [MEM_SIZE + 16]u8 // the tail is what a wide access at the last bytes reads
 mem_pages: [MEM_SIZE >> 12]u8
@@ -479,7 +480,7 @@ MIRROR_MASK :: 0xfffc0000
 MIRROR_BITS :: 0x10000000
 WIN_AT :: 0x1f800000
 WIN_SIZE :: 0x400
-win: [WIN_SIZE + 16]u8
+win: [WIN_SIZE]u8
 
 mem_ram :: proc() -> native.Ram {
 	return {
@@ -492,6 +493,7 @@ mem_ram :: proc() -> native.Ram {
 		mirror_mask = MIRROR_MASK,
 		mirror_bits = MIRROR_BITS,
 		window = "win",
+		window_mask = 0x1fffffff,
 		window_at = WIN_AT,
 		window_size = WIN_SIZE,
 	}
@@ -502,7 +504,10 @@ mem_at :: proc(addr: u32) -> (int, bool) {
 	return int(p & (MEM_SIZE - 1)), p < 0x40000 || addr & MIRROR_MASK == MIRROR_BITS
 }
 
-win_at :: proc(addr: u32) -> (int, bool) {return int(addr - WIN_AT), addr - WIN_AT < WIN_SIZE}
+win_at :: proc(addr: u32, w: native.Width) -> (int, bool) {
+	o := (addr & 0x1fffffff) - WIN_AT
+	return int(o), o <= WIN_SIZE - u32(width_bytes(w))
+}
 win_pat :: proc(o: int) -> u8 {return u8(o * 11 + 0x5b)}
 
 win_word :: proc(o: int) -> u32 {
@@ -581,7 +586,7 @@ mem_word :: proc(o: int) -> u32 {
 wide_load :: proc(addr: u32, w: native.Width, k: int) -> u32 {
 	if 4 * k >= width_bytes(w) {return junk(k)}
 	if o, ok := mem_at(addr); ok {return mem_word(o + 4 * k)}
-	if o, ok := win_at(addr); ok {return win_word(o + 4 * k)}
+	if o, ok := win_at(addr, w); ok {return win_word(o + 4 * k)}
 	return FAR_WIDE[k] ~ addr
 }
 
@@ -593,7 +598,7 @@ wide_src :: proc(y: u32, k: int, zero: bool) -> u32 {return 0 if zero else y + u
 // Word k that a wide load from addr reads back after a wide store there.
 wide_store :: proc(addr: u32, w: native.Width, k: int, zero: bool, x, y: u32) -> u32 {
 	v := wide_src(y, k, zero)
-	if o, ok := win_at(addr); ok {return v if guards_of(x, y) == {0, 0} else win_word(o + 4 * k)}
+	if o, ok := win_at(addr, w); ok {return v if guards_of(x, y) == {0, 0} else win_word(o + 4 * k)}
 	o, ok := mem_at(addr)
 	switch {
 	case !ok:
@@ -654,6 +659,7 @@ MEM_ADDRS := [?]u32 {
 	0x1f800010,
 	0x1f8003f8,
 	0x1f800400,
+	0x9f800010,
 	0xbfc00000,
 }
 
