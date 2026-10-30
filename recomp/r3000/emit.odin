@@ -150,11 +150,12 @@ emit_op :: proc(i: Insn) -> []string {
 	case op == 18:
 		switch {
 		case rs == 0 || rs == 2:
-			return set_reg(rt, f("gte.gte_read(%d)", rs == 0 ? rd : rd + 32), true)
+			r := rs == 0 ? rd : rd + 32
+			return set_reg(rt, gte_get(r), r >= 28)
 		case rs == 4 || rs == 6:
-			return one("gte.gte_write(%d, %s)", rs == 4 ? rd : rd + 32, R(rt))
+			return one("%s, %s)", gte_put(rs == 4 ? rd : rd + 32), R(rt))
 		case rs & 16 != 0:
-			return one("gte.gte_cmd(0x%x)", i.w & 0x1ffffff)
+			return one(gte_cmd_call(i.w & 0x1ffffff))
 		}
 	case is_load_op(op):
 		a := addr_expr(i)
@@ -171,11 +172,43 @@ emit_op :: proc(i: Insn) -> []string {
 		names := [7]string{"sb", "sh", "swl", "sw", "", "", "swr"}
 		return one("cpu.%s(%s, %s)", "sw_u" if i.pair else names[op - 0x28], addr_expr(i), R(rt))
 	case op == 0x32:
-		return one("gte.gte_write(%d, cpu.lw(%s))", rt, addr_expr(i))
+		return one("%s, cpu.lw(%s))", gte_put(rt), addr_expr(i))
 	case op == 0x3a:
-		return one("cpu.sw(%s, gte.gte_read(%d))", addr_expr(i), rt)
+		return one("cpu.sw(%s, %s)", addr_expr(i), gte_get(rt))
 	}
 	return one("cpu.bad_insn(%s, %s)", hexu(i.pc), hexu(i.w))
+}
+
+// The call for GTE command cmd: NCLIP, AVSZ3 and AVSZ4, small and without
+// the shift or lm bit, through their inline procs; the rest through
+// gte.gte_cmd.
+@(private = "file")
+gte_cmd_call :: proc(cmd: u32) -> string {
+	switch cmd & 0x3f {
+	case 0x06:
+		return "gte.cmd_nclip()"
+	case 0x2d:
+		return "gte.cmd_avsz3()"
+	case 0x2e:
+		return "gte.cmd_avsz4()"
+	}
+	return fmt.aprintf("gte.gte_cmd(0x%x)", cmd)
+}
+
+// A read of GTE register r (control registers as 32-63): data registers
+// 0-27, a field load, inline through gte.data_read; the rest through
+// gte.gte_read.
+@(private = "file")
+gte_get :: proc(r: u32) -> string {
+	return fmt.aprintf("gte.%s(%d)", r < 28 ? "data_read" : "gte_read", r)
+}
+
+// The open call that writes GTE register r, to be closed with the value and
+// ")": data registers 0-27 but SXYP (15), a field store, inline through
+// gte.data_write; the rest through gte.gte_write.
+@(private = "file")
+gte_put :: proc(r: u32) -> string {
+	return fmt.aprintf("gte.%s(%d", r < 28 && r != 15 ? "data_write" : "gte_write", r)
 }
 
 @(private = "file")

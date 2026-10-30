@@ -134,8 +134,9 @@ gte_save :: proc() -> Gte_State {return transmute(Gte_State)state}
 
 gte_load :: proc(s: Gte_State) {state = transmute(Gte)s}
 
-gte_read :: proc(r: u32) -> u32 #no_bounds_check {
-	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Read][r & 63] += 1}
+// GTE data register r, 0-27, the ones whose read is a field load. Recompiled
+// code calls it with a constant r, and the switch folds away.
+data_read :: #force_inline proc(r: u32) -> u32 #no_bounds_check {
 	g := &state
 	switch r {
 	case 0, 2, 4:
@@ -161,6 +162,17 @@ gte_read :: proc(r: u32) -> u32 #no_bounds_check {
 		return g.res1
 	case 24 ..= 27:
 		return u32(g.mac[r - 24])
+	}
+	return 0
+}
+
+gte_read :: proc(r: u32) -> u32 #no_bounds_check {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Read][r & 63] += 1}
+	if r < 28 {
+		return data_read(r)
+	}
+	g := &state
+	switch r {
 	case 28, 29:
 		return saturate5(g.ir[1]) | saturate5(g.ir[2]) << 5 | saturate5(g.ir[3]) << 10
 	case 30:
@@ -205,13 +217,11 @@ leading_count :: proc(v: u32) -> u32 {
 	return intrinsics.count_leading_zeros(v & 0x80000000 != 0 ? ~v : v)
 }
 
-gte_write :: proc(r, v: u32) #no_bounds_check {
-	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Write][r & 63] += 1}
+// GTE data register r = v, for r 0-27 but SXYP (15): the writes that are a
+// field store. Recompiled code calls it with a constant r, and the switch
+// folds away.
+data_write :: #force_inline proc(r, v: u32) #no_bounds_check {
 	g := &state
-	v := v
-	if r >= 32 && r <= 39 && gte_matrix_filter != nil {
-		v = gte_matrix_filter(r, v)
-	}
 	switch r {
 	case 0, 2, 4:
 		// One store for x and y: two half stores cannot forward to the
@@ -227,11 +237,6 @@ gte_write :: proc(r, v: u32) #no_bounds_check {
 		g.ir[r - 8] = sext16(v)
 	case 12 ..= 14:
 		g.sxy[r - 12] = {sext16(v), sext16(v >> 16)}
-	case 15:
-		g.sxy[0] = g.sxy[1]
-		g.sxy[1] = g.sxy[2]
-		g.sxy[2] = {sext16(v), sext16(v >> 16)}
-
 	case 16 ..= 19:
 		g.sz[r - 16] = v & 0xffff
 	case 20 ..= 22:
@@ -240,6 +245,25 @@ gte_write :: proc(r, v: u32) #no_bounds_check {
 		g.res1 = v
 	case 24 ..= 27:
 		g.mac[r - 24] = i32(v)
+	}
+}
+
+gte_write :: proc(r, v: u32) #no_bounds_check {
+	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Write][r & 63] += 1}
+	if r < 28 && r != 15 {
+		data_write(r, v)
+		return
+	}
+	g := &state
+	v := v
+	if r >= 32 && r <= 39 && gte_matrix_filter != nil {
+		v = gte_matrix_filter(r, v)
+	}
+	switch r {
+	case 15:
+		g.sxy[0] = g.sxy[1]
+		g.sxy[1] = g.sxy[2]
+		g.sxy[2] = {sext16(v), sext16(v >> 16)}
 	case 28:
 		g.ir[1] = i32(v & 0x1f) << 7
 		g.ir[2] = i32((v >> 5) & 0x1f) << 7
@@ -800,6 +824,44 @@ avsz :: proc(scale: i32, sum: i64) {
 @(private = "file")
 unknown_reported: [64]bool
 
+// NCLIP, AVSZ3 and AVSZ4 whole, FLAG included: small commands that use
+// neither the shift nor the lm bit, for the Odin output to inline in place
+// of a gte_cmd call.
+cmd_nclip :: #force_inline proc() {
+	state.flag = 0
+	nclip()
+	flag_sum()
+}
+
+cmd_avsz3 :: #force_inline proc() {
+	state.flag = 0
+	avsz(state.zsf3, i64(state.sz[1]) + i64(state.sz[2]) + i64(state.sz[3]))
+	flag_sum()
+}
+
+cmd_avsz4 :: #force_inline proc() {
+	state.flag = 0
+	avsz(state.zsf4, i64(state.sz[0]) + i64(state.sz[1]) + i64(state.sz[2]) + i64(state.sz[3]))
+	flag_sum()
+}
+
+@(private)
+nclip :: #force_inline proc() {
+	s := &state.sxy
+	n :=
+		i64(s[0][0]) * i64(s[1][1]) + i64(s[1][0]) * i64(s[2][1]) + i64(s[2][0]) * i64(s[0][1]) -
+		i64(s[0][0]) * i64(s[2][1]) - i64(s[1][0]) * i64(s[0][1]) - i64(s[2][0]) * i64(s[1][1])
+	set_mac0(n)
+}
+
+// FLAG bit 31: set when any of its error bits is.
+@(private)
+flag_sum :: #force_inline proc() {
+	if state.flag & 0x7f87e000 != 0 {
+		state.flag |= 0x80000000
+	}
+}
+
 gte_cmd :: proc(cmd: u32) #no_bounds_check {
 	when cpu.FALLBACK_COUNT {cpu.helper_calls[.Gte_Cmd][cmd & 0x3f] += 1}
 	g := &state
@@ -814,11 +876,7 @@ gte_cmd :: proc(cmd: u32) #no_bounds_check {
 	case 0x30:
 		rtpt(c)
 	case 0x06:
-		s := &g.sxy
-		n :=
-			i64(s[0][0]) * i64(s[1][1]) + i64(s[1][0]) * i64(s[2][1]) + i64(s[2][0]) * i64(s[0][1]) -
-			i64(s[0][0]) * i64(s[2][1]) - i64(s[1][0]) * i64(s[0][1]) - i64(s[2][0]) * i64(s[1][1])
-		set_mac0(n)
+		nclip()
 	case 0x0c:
 		d1, d2, d3 := i64(g.rt[0][0]), i64(g.rt[1][1]), i64(g.rt[2][2])
 		i1, i2, i3 := i64(g.ir[1]), i64(g.ir[2]), i64(g.ir[3])
@@ -882,7 +940,5 @@ gte_cmd :: proc(cmd: u32) #no_bounds_check {
 			fmt.eprintfln("gte: unknown command %#02x (ra %#08x) at present %d", k, cpu.state.r[31], cpu.presents)
 		}
 	}
-	if g.flag & 0x7f87e000 != 0 {
-		g.flag |= 0x80000000
-	}
+	flag_sum()
 }

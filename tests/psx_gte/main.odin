@@ -2,11 +2,15 @@
 // lwc2 and swc2 (data registers) and ctc2 and cfc2 (control registers), the
 // native backend's inline field stores and loads and the calls it keeps,
 // against gte.gte_write and gte.gte_read from the same GTE state. And the
-// inline NCLIP against gte.gte_cmd.
+// inline NCLIP against gte.gte_cmd. The Odin backend's output for the same
+// forms and for GTE commands: which call each names, an inline proc or the
+// helper, and the inline ones against the helpers.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
+import "core:strings"
 import "ps:core"
 import psx_native "ps:psx/native"
 import cpu "ps:psx/cpu"
@@ -124,6 +128,29 @@ half :: proc() -> u32 {
 	return EDGES16[n % len(EDGES16)] if n & 0x100 != 0 else n >> 16
 }
 
+// The first call into package gte in Odin source: its name and first
+// argument.
+@(private = "file")
+emitted_gte_call :: proc(src: string) -> (name: string, arg: u32) {
+	at := strings.index(src, "gte.")
+	if at < 0 {
+		return "", 0
+	}
+	rest := src[at + 4:]
+	open := strings.index_byte(rest, '(')
+	if open < 0 {
+		return "", 0
+	}
+	name = rest[:open]
+	rest = rest[open + 1:]
+	end := strings.index_any(rest, ",)")
+	if end < 0 {
+		return name, 0
+	}
+	v, _ := strconv.parse_uint(rest[:end])
+	return name, u32(v)
+}
+
 main :: proc() {
 	arch := native.Arch(core.NATIVE_ARCH)
 	na := native.make_asm(arch, r3000.native_ram(), r3000.NATIVE_CACHED[:])
@@ -209,6 +236,86 @@ main :: proc() {
 	}
 	for f in ([?]u32{0, 0x80010000, 0x80008000}) {
 		if outcomes[f] == 0 {fail("nclip: no case with flag %08x", f)}
+	}
+	// The Odin backend's output for the same forms names gte.data_read or
+	// gte.data_write, which inline in a port, for the data registers but
+	// SXYP writes and 28-31, and the helper for the rest. Each named call
+	// runs against the helper.
+	for f in Form {
+		for r in u32(0) ..< 32 {
+			code := [?]u32{word(f, r), 0, JR_RA, 0, 0}
+			b := strings.builder_make(context.temp_allocator)
+			r3000.emit_func(build(0x80002000, code[:]), &b, "f", nil, 1)
+			name, reg := emitted_gte_call(strings.to_string(b))
+			ctl := f == .Ctc2 || f == .Cfc2
+			g := r + 32 if ctl else r
+			write := f == .Mtc2 || f == .Ctc2 || f == .Lwc2
+			fold := !ctl && r < 28 && !(write && r == 15)
+			want_name := write ? (fold ? "data_write" : "gte_write") : (fold ? "data_read" : "gte_read")
+			if name != want_name || reg != g {
+				fail("odin %v %d: calls gte.%s(%d), want gte.%s(%d)", f, r, name, reg, want_name, g)
+			}
+			if fold {
+				for k in 0 ..< len(vals) {
+					start := gte_state(k)
+					gte.gte_load(start)
+					if !write {
+						if got, want := gte.data_read(g), gte.gte_read(g); got != want {
+							fail("odin %v %d from state %d: %08x, want %08x", f, r, k, got, want)
+						}
+						checks += 1
+						continue
+					}
+					for v in vals {
+						gte.gte_load(start)
+						gte.gte_write(g, v)
+						want := gte.gte_save()
+						gte.gte_load(start)
+						gte.data_write(g, v)
+						if gte.gte_save() != want {fail("odin %v %d = %08x from state %d: GTE state differs", f, r, v, k)}
+						checks += 1
+					}
+				}
+			}
+			free_all(context.temp_allocator)
+		}
+	}
+	// NCLIP, AVSZ3 and AVSZ4 name their inline procs, RTPS gte_cmd; the
+	// inline ones run against gte_cmd.
+	Cmd_Case :: struct {
+		w:    u32,
+		name: string,
+		run:  proc(),
+	}
+	cmds := [?]Cmd_Case {
+		{NCLIP, "cmd_nclip", gte.cmd_nclip},
+		{0x4a00002d, "cmd_avsz3", gte.cmd_avsz3},
+		{0x4a00002e, "cmd_avsz4", gte.cmd_avsz4},
+		{0x4a180001, "gte_cmd", nil},
+	}
+	for c in cmds {
+		code := [?]u32{c.w, 0, JR_RA, 0, 0}
+		b := strings.builder_make(context.temp_allocator)
+		r3000.emit_func(build(0x80002000, code[:]), &b, "f", nil, 1)
+		name, arg := emitted_gte_call(strings.to_string(b))
+		if name != c.name || (c.run == nil && arg != c.w & 0x1ffffff) {
+			fail("odin %08x: calls gte.%s(%#x), want gte.%s", c.w, name, arg, c.name)
+		}
+		free_all(context.temp_allocator)
+		if c.run == nil {
+			continue
+		}
+		for k in 0 ..< 2000 {
+			gte.gte_load(gte_state(k % len(vals)))
+			for r in u32(12) ..< 20 {gte.gte_write(r, half() | half() << 16)}
+			start := gte.gte_save()
+			gte.gte_cmd(c.w & 0x1ffffff)
+			want := gte.gte_save()
+			gte.gte_load(start)
+			c.run()
+			if gte.gte_save() != want {fail("odin %s from state %d: GTE state differs", c.name, k)}
+			checks += 1
+		}
 	}
 	if failed != 0 {
 		os.exit(1)
