@@ -1,10 +1,11 @@
 // EE register instructions through the Odin backend (recomp/r5900.emit_op)
 // against the interpreter's exec_insn. Two steps in one command: this
 // program generates cases/main.odin, one proc per instruction word emit_op
-// inlines (every MMI word the decoder maps to a covered op, the MADD family,
-// SQRT.S, RSQRT.S, MUL.S, MULA.S, MADD.S, MFSA, MTSA, MTSAB and MTSAH, with
-// rd 0, rs/rt 0 and aliased registers, and every shift amount for the shifts
-// by sa), then runs it with `odin run`. Each case runs
+// inlines (every MMI and SPECIAL word the decoder maps to a covered op, the
+// MADD family, the immediate ops at each of IMMS, MFC1, MTC1, SQRT.S,
+// RSQRT.S, MUL.S, MULA.S, MADD.S, MFSA, MTSA, MTSAB and MTSAH, with rd 0,
+// rs/rt 0 and aliased registers, and every shift amount for the shifts by
+// sa), then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
 // leave the whole cpu.state as exec_insn leaves it. The seed is fixed, so a
 // run is reproducible. Words emit_op leaves to the interpreter are counted
@@ -42,24 +43,41 @@ COVERED :: Ops{
 	.PSLLVW, .PSRLVW, .PSRAVW, .PEXT5, .PPAC5, .PADSBH,
 	.PMFHI, .PMFLO, .PMTHI, .PMTLO, .PMFHL, .PMTHL, .PMULTW, .PMULTUW, .PMADDW, .PMADDUW, .PMSUBW,
 	.PMULTH, .PMADDH, .PMSUBH, .PHMSBH, .PDIVW, .PDIVUW, .PDIVBW,
+	.SLL, .SRL, .SRA, .SLLV, .SRLV, .SRAV, .DSLL, .DSRL, .DSRA, .DSLL32, .DSRL32, .DSRA32,
+	.DSLLV, .DSRLV, .DSRAV, .MOVZ, .MOVN, .MFHI, .MFLO, .MTHI, .MTLO, .MULT, .MULTU, .DIV, .DIVU,
+	.ADD, .ADDU, .SUB, .SUBU, .DADD, .DADDU, .DSUB, .DSUBU, .AND, .OR, .XOR, .NOR, .SLT, .SLTU,
+	.ADDI, .ADDIU, .DADDI, .DADDIU, .SLTI, .SLTIU, .ANDI, .ORI, .XORI, .LUI, .MFC1, .MTC1, .SYNC,
 }
 // The shifts by sa and PMFHL's variants: every sa gets a case.
-BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW, .PMFHL}
+BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW, .PMFHL, .SLL, .SRL, .SRA, .DSLL, .DSRL, .DSRA, .DSLL32, .DSRL32, .DSRA32}
+// The immediate ops' opcodes, and immediates at zero, one and the limits
+// of the sign extension.
+IMM_OPS :: [?]u32{0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x18, 0x19}
+IMMS :: [?]u32{0, 1, 0x7fff, 0x8000, 0xffff}
 
 main :: proc() {
 	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}} // rs, rt, rd
 	words: [dynamic]u32
 	for r in REGS {
 		seen: Ops
-		for fn in u32(0) ..< 64 {
-			for sa in u32(0) ..< 32 {
-				w := 0x1c << 26 | r[0] << 21 | r[1] << 16 | r[2] << 11 | sa << 6 | fn
-				op := r5900.decode(0, w).op
-				if op not_in COVERED || (op in seen && op not_in BY_SA) {continue}
-				seen += {op}
-				append(&words, w)
+		// MMI and SPECIAL words; MFSA and MTSA are below
+		for major in ([?]u32{0x1c, 0}) {
+			for fn in u32(0) ..< 64 {
+				for sa in u32(0) ..< 32 {
+					w := major << 26 | r[0] << 21 | r[1] << 16 | r[2] << 11 | sa << 6 | fn
+					op := r5900.decode(0, w).op
+					if op not_in COVERED || (op in seen && op not_in BY_SA) || op == .MFSA || op == .MTSA {continue}
+					seen += {op}
+					append(&words, w)
+				}
 			}
 		}
+		// the immediate ops, rt = rd
+		for op in IMM_OPS {
+			for imm in IMMS {append(&words, op << 26 | r[0] << 21 | r[2] << 16 | imm)}
+		}
+		// MFC1 rd = f[rs]; MTC1 f[rd] = rt
+		append(&words, 0x11 << 26 | r[2] << 16 | r[0] << 11, 0x11 << 26 | 0x04 << 21 | r[1] << 16 | r[2] << 11)
 		// SQRT.S f[rd] = sqrt(f[rt]), with fs = rs (unused)
 		append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | 0x04)
 		// RSQRT.S f[rd] = f[rs] / sqrt(f[rt])

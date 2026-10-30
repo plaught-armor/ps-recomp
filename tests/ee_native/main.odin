@@ -28,6 +28,12 @@ Case :: struct {
 special :: proc(fn: u32) -> u32 {return 1 << 21 | 2 << 16 | 3 << 11 | fn}
 @(private = "file")
 mmi :: proc(fn: u32, sub: u32 = 0) -> u32 {return 0x1c << 26 | special(fn) | sub << 6}
+// A shift of rt = 2 by sa into rd = 3.
+@(private = "file")
+shift :: proc(fn, sa: u32) -> u32 {return 2 << 16 | 3 << 11 | sa << 6 | fn}
+// An immediate op of rs = 1 into rt = 3.
+@(private = "file")
+imm_op :: proc(op, imm: u32) -> u32 {return op << 26 | 1 << 21 | 3 << 16 | imm}
 // A COP2 transfer (QMFC2 1, CFC2 2, QMTC2 5, CTC2 6) of rt = 2 and VU
 // register rd.
 @(private = "file")
@@ -65,7 +71,23 @@ COP1_OPS := [?]r5900.Op {
 @(private = "file", rodata)
 UNALIGNED_OPS := [?]r5900.Op{.LWL, .LWR, .LDL, .LDR, .SWL, .SWR, .SDL, .SDR}
 
-// An unaligned access of rt at UNALIGNED_OFF(rs = 1); rt = 1 is rs.
+// The aligned loads and stores, which check_unaligned checks too, at the
+// addresses their width allows.
+@(private = "file", rodata)
+ALIGNED_OPS := [?]r5900.Op{.LB, .LBU, .LH, .LHU, .LW, .LWU, .LD, .LQ, .SB, .SH, .SW, .SD, .SQ, .LWC1, .SWC1}
+
+// The alignment an access needs; LQ and SQ ignore the low four bits.
+@(private = "file")
+align :: proc(op: r5900.Op) -> u32 {
+	#partial switch op {
+	case .LH, .LHU, .SH: return 2
+	case .LW, .LWU, .SW, .LWC1, .SWC1: return 4
+	case .LD, .SD: return 8
+	}
+	return 1
+}
+
+// An access of rt at UNALIGNED_OFF(rs = 1); rt = 1 is rs.
 @(private = "file")
 unaligned :: proc(op, rt: u32) -> u32 {return op << 26 | 1 << 21 | rt << 16 | UNALIGNED_OFF}
 
@@ -599,6 +621,97 @@ main :: proc() {
 		{cop1(0x16, fd = 1), .RSQRT_S}, // fd = fs
 		{cop1(0x16, fd = 2), .RSQRT_S}, // fd = ft
 		{cop1(0x16, fs = 2), .RSQRT_S}, // fs = ft
+		// The base ISA's register ops.
+		{shift(0x00, 0), .SLL},
+		{shift(0x00, 1), .SLL},
+		{shift(0x00, 31), .SLL},
+		{shift(0x00, 7) &~ (31 << 11), .SLL}, // rd = 0
+		{shift(0x02, 0), .SRL},
+		{shift(0x02, 1), .SRL},
+		{shift(0x02, 31), .SRL},
+		{shift(0x03, 0), .SRA},
+		{shift(0x03, 1), .SRA},
+		{shift(0x03, 31), .SRA},
+		{shift(0x38, 0), .DSLL},
+		{shift(0x38, 1), .DSLL},
+		{shift(0x38, 31), .DSLL},
+		{shift(0x3a, 0), .DSRL},
+		{shift(0x3a, 31), .DSRL},
+		{shift(0x3b, 0), .DSRA},
+		{shift(0x3b, 31), .DSRA},
+		{shift(0x3c, 0), .DSLL32},
+		{shift(0x3c, 31), .DSLL32},
+		{shift(0x3e, 0), .DSRL32},
+		{shift(0x3e, 31), .DSRL32},
+		{shift(0x3f, 0), .DSRA32},
+		{shift(0x3f, 31), .DSRA32},
+		{shift(0x3f, 5) &~ (31 << 16) | 3 << 16, .DSRA32}, // rt = rd
+		{special(0x04), .SLLV},
+		{special(0x06), .SRLV},
+		{special(0x07), .SRAV},
+		{special(0x04) &~ (31 << 16) | 3 << 16, .SLLV}, // rt = rd
+		{special(0x07) &~ (31 << 21) | 3 << 21, .SRAV}, // rs = rd
+		{special(0x0a), .MOVZ},
+		{special(0x0b), .MOVN},
+		{special(0x0a) &~ (31 << 16), .MOVZ}, // rt = 0: always
+		{special(0x0b) &~ (31 << 16), .MOVN}, // rt = 0: never
+		{special(0x0a) &~ (31 << 11), .MOVZ}, // rd = 0
+		{special(0x0b) &~ (31 << 16) | 3 << 16, .MOVN}, // rt = rd
+		{0x0000000f, .SYNC},
+		{3 << 11 | 0x10, .MFHI},
+		{3 << 11 | 0x12, .MFLO},
+		{0x10, .MFHI}, // to r0
+		{1 << 21 | 0x11, .MTHI},
+		{1 << 21 | 0x13, .MTLO},
+		{0x13, .MTLO}, // from r0
+		{special(0x20), .ADD},
+		{special(0x21), .ADDU},
+		{special(0x22), .SUB},
+		{special(0x23), .SUBU},
+		{special(0x2c), .DADD},
+		{special(0x2d), .DADDU},
+		{special(0x2e), .DSUB},
+		{special(0x2f), .DSUBU},
+		{special(0x24), .AND},
+		{special(0x25), .OR},
+		{special(0x26), .XOR},
+		{special(0x27), .NOR},
+		{special(0x2a), .SLT},
+		{special(0x2b), .SLTU},
+		{special(0x21) &~ (31 << 21), .ADDU}, // rs = 0
+		{special(0x21) &~ (31 << 16), .ADDU}, // rt = 0
+		{special(0x21) &~ (31 << 11), .ADDU}, // rd = 0
+		{special(0x2d) &~ (31 << 21), .DADDU},
+		{special(0x2d) &~ (31 << 16), .DADDU},
+		{special(0x25) &~ (31 << 21), .OR},
+		{special(0x25) &~ (31 << 16), .OR},
+		{special(0x23) &~ (31 << 16) | 1 << 16, .SUBU}, // rs = rt
+		{special(0x2a) &~ (31 << 16) | 1 << 16, .SLT},
+		{special(0x2b) &~ (31 << 21), .SLTU}, // 0 < rt
+		{imm_op(0x08, 0x7fff), .ADDI},
+		{imm_op(0x09, 0x8000), .ADDIU},
+		{imm_op(0x09, 0xffff), .ADDIU},
+		{imm_op(0x09, 0x1234) &~ (31 << 21), .ADDIU}, // li
+		{imm_op(0x09, 1) &~ (31 << 16), .ADDIU}, // rt = 0
+		{imm_op(0x09, 0x7fff) &~ (31 << 16) | 1 << 16, .ADDIU}, // rt = rs
+		{imm_op(0x18, 0x8000), .DADDI},
+		{imm_op(0x19, 0x7fff), .DADDIU},
+		{imm_op(0x19, 0xffff), .DADDIU},
+		{imm_op(0x0a, 0x8000), .SLTI},
+		{imm_op(0x0a, 1), .SLTI},
+		{imm_op(0x0b, 0xffff), .SLTIU},
+		{imm_op(0x0b, 0x45), .SLTIU},
+		{imm_op(0x0c, 0xffff), .ANDI},
+		{imm_op(0x0c, 0x8001), .ANDI},
+		{imm_op(0x0d, 0x8001), .ORI},
+		{imm_op(0x0d, 0xbeef) &~ (31 << 21), .ORI}, // rs = 0
+		{imm_op(0x0e, 0xffff), .XORI},
+		{imm_op(0x0e, 0) &~ (31 << 16) | 1 << 16, .XORI}, // rt = rs
+		{imm_op(0x0f, 0x8000) &~ (31 << 21), .LUI},
+		{imm_op(0x0f, 0x7fff) &~ (31 << 21), .LUI},
+		{imm_op(0x0f, 0xffff) &~ (31 << 21 | 31 << 16), .LUI}, // to r0
+		{47 << 26 | 1 << 21 | 0x07 << 16 | 0x40, .CACHE}, // DXWBIN
+		{51 << 26 | 1 << 21 | 0x40, .PREF},
 		{unaligned(34, 2), .LWL},
 		{unaligned(34, 1), .LWL}, // rt = rs
 		{unaligned(34, 0), .LWL},
@@ -623,6 +736,49 @@ main :: proc() {
 		{unaligned(45, 2), .SDR},
 		{unaligned(45, 1), .SDR},
 		{unaligned(45, 0), .SDR},
+		// the aligned ones
+		{unaligned(32, 2), .LB},
+		{unaligned(32, 1), .LB},
+		{unaligned(32, 0), .LB},
+		{unaligned(36, 2), .LBU},
+		{unaligned(36, 1), .LBU},
+		{unaligned(36, 0), .LBU},
+		{unaligned(33, 2), .LH},
+		{unaligned(33, 1), .LH},
+		{unaligned(33, 0), .LH},
+		{unaligned(37, 2), .LHU},
+		{unaligned(37, 1), .LHU},
+		{unaligned(37, 0), .LHU},
+		{unaligned(35, 2), .LW},
+		{unaligned(35, 1), .LW},
+		{unaligned(35, 0), .LW},
+		{unaligned(39, 2), .LWU},
+		{unaligned(39, 1), .LWU},
+		{unaligned(39, 0), .LWU},
+		{unaligned(55, 2), .LD},
+		{unaligned(55, 1), .LD},
+		{unaligned(55, 0), .LD},
+		{unaligned(30, 2), .LQ},
+		{unaligned(30, 1), .LQ},
+		{unaligned(30, 0), .LQ},
+		{unaligned(40, 2), .SB},
+		{unaligned(40, 1), .SB},
+		{unaligned(40, 0), .SB},
+		{unaligned(41, 2), .SH},
+		{unaligned(41, 1), .SH},
+		{unaligned(41, 0), .SH},
+		{unaligned(43, 2), .SW},
+		{unaligned(43, 1), .SW},
+		{unaligned(43, 0), .SW},
+		{unaligned(63, 2), .SD},
+		{unaligned(63, 1), .SD},
+		{unaligned(63, 0), .SD},
+		{unaligned(31, 2), .SQ},
+		{unaligned(31, 1), .SQ},
+		{unaligned(31, 0), .SQ},
+		{unaligned(49, 2), .LWC1}, // f2
+		{unaligned(57, 2), .SWC1},
+		{unaligned(57, 0), .SWC1}, // f0
 		{special2(0x3b), .VU0}, // VWAITQ
 		{special2(0x1f), .VU0}, // VCLIP, left to the interpreter
 		{special2(0x38, 0), .VU0}, // VDIV vf1x / vf2x
@@ -783,7 +939,7 @@ main :: proc() {
 			failed, checks = check_fpu(c, funcs[k].addr, run, failed, checks)
 			continue
 		}
-		if slice.contains(UNALIGNED_OPS[:], c.op) {
+		if slice.contains(UNALIGNED_OPS[:], c.op) || slice.contains(ALIGNED_OPS[:], c.op) {
 			failed, checks = check_unaligned(c, funcs[k].addr, run, failed, checks)
 			continue
 		}
@@ -914,22 +1070,26 @@ check_mem :: proc(c: Case, addr: u32, run: proc(), failed, checks: int) -> (int,
 	return failed, checks
 }
 
-// An unaligned load or store at each of UNALIGNED_ADDRS plus 0 to 7, with
-// the watch byte clear and set and two values in rt: the native function
-// and the interpreter must leave the same cpu.state and the same two
-// quadwords around the address.
+// An unaligned load or store at each of UNALIGNED_ADDRS plus 0 to 7, an
+// aligned one at those of them its width allows, with the watch byte clear
+// and set and two values in rt (and f2): the native function and the
+// interpreter must leave the same cpu.state and the same two quadwords
+// around the address.
 @(private = "file")
 check_unaligned :: proc(c: Case, addr: u32, run: proc(), failed, checks: int) -> (int, int) {
 	failed, checks := failed, checks
 	for base in UNALIGNED_ADDRS {
 		for k in u32(0) ..< 8 {
 			at := base + k
+			if at % align(c.op) != 0 {continue}
 			q0 := base &~ 15
 			for watch in ([?]u8{0, 1}) {
 				for v in ([?]u64{0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210}) {
 					start: cpu.Cpu
 					start.r[1].d = {0x5a5a_5a5a_0000_0000 | u64(at - UNALIGNED_OFF), ~v}
 					start.r[2].d = {v, v ~ 0x5555}
+					for &f, n in start.f {f.u = 0x5a5a0000 | u32(n)}
+					start.f[2].u = u32(v >> 16)
 					got: [2]struct {
 						state: cpu.Cpu,
 						q:     [2]u128,
