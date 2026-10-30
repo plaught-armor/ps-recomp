@@ -8,6 +8,7 @@
 package ps2_kernel
 
 import "core:fmt"
+import "core:strings"
 import "ps:core"
 import cpu "../cpu"
 import iop "../iop"
@@ -82,6 +83,7 @@ k: struct {
 	threads:      [256]^Thread,
 	thread_end:   int, // past the highest thread id ever used; loops stop here
 	current:      ^Thread,
+	dead:         ^Thread, // deleted by exit_delete_thread, not yet freed
 	semas:        [256]^Sema,
 	intc:         [dynamic]Handler,
 	dmac:         [dynamic]Handler,
@@ -129,6 +131,57 @@ kernel_init :: proc() {
 
 // ------------------------------------------------------------- syscalls
 
+// Syscalls the retail kernel (SCPH-90001) defines that this HLE does not
+// implement, with their ps2sdk names. A program calling one expects an effect
+// we do not provide, so it stops the run; numbers the retail table leaves
+// undefined only print and return, as retail does.
+//
+// Generated from a syscall index of that BIOS (one row per table slot:
+// number, ps2sdk names, handler, size, verdict against this file, note):
+//   awk -F'\t' '$5=="UNHANDLED" {n=$2; gsub(/-/,"",n); if (n=="") n="?";
+//     printf "\t%s = \"%s\",\n", $1, n}' ee_syscalls.tsv
+// then 0x75 (_print) removed, since this file implements it.
+@(rodata)
+ROM_ONLY_SYSCALLS := [0x83]string {
+	0x01 = "ResetEE",
+	0x05 = "ResumeIntrDispatch",
+	0x06 = "_LoadExecPS2",
+	0x07 = "_ExecPS2",
+	0x09 = "RFU009",
+	0x0a = "AddSbusIntcHandler",
+	0x0b = "RemoveSbusIntcHandler",
+	0x0c = "Interrupt2Iop",
+	0x0d = "SetVTLBRefillHandler",
+	0x0e = "SetVCommonHandler",
+	0x0f = "SetVInterruptHandler",
+	0x3b = "RFU059",
+	0x49 = "iDeleteSema",
+	0x4c = "GetGsHParam",
+	0x4d = "GetGsVParam",
+	0x4e = "SetGsHParam",
+	0x4f = "SetGsVParam",
+	0x50 = "CreateEventFlag",
+	0x51 = "DeleteEventFlag",
+	0x52 = "SetEventFlag",
+	0x53 = "iSetEventFlag",
+	0x60 = "KSeg0",
+	0x61 = "EnableCache",
+	0x62 = "DisableCache",
+	0x65 = "?",
+	0x66 = "CpuConfig",
+	0x69 = "RFU105",
+	0x6a = "iCpuConfig",
+	0x6c = "SetCPUTimerHandler",
+	0x6d = "SetCPUTimer",
+	0x6e = "SetOsdConfigParam2",
+	0x6f = "GetOsdConfigParam2",
+	0x72 = "SetPgifHandler",
+	0x7b = "_ExecOSD",
+	0x7d = "PSMode",
+	0x80 = "_GetGsDxDyOffset",
+	0x82 = "_InitTLB",
+}
+
 syscall :: proc(pc: u32) {
 	c := &cpu.state
 	n := i32(i16(c.r[3].d[0]))
@@ -142,6 +195,12 @@ syscall :: proc(pc: u32) {
 	if cpu.debug == 2 {
 		fmt.eprintfln("syscall %x(%08x, %08x, %08x, %08x) thread %d pc %08x ra %08x", n, a0, a1, a2, a3, k.current.id, pc, u32(c.r[31].d[0]))
 	}
+	// Retail differs in two ways this HLE does not copy. It neither masks nor
+	// bounds-checks the number, where this dispatcher, SetSyscall and
+	// GetEntryAddress mask it to 0xff. And it runs a negative number's
+	// handler on the caller's stack with interrupts left as they are, but
+	// masks interrupts and switches to a kernel stack for a positive one.
+	//
 	// Syscalls the program installed itself (SetSyscall, or a direct write
 	// to the table) run its own code.
 	if fn := mem.rd32(SYSCALL_TABLE + u32(abs(n) & 0xff) * 4); fn < 0x80000000 {
@@ -174,7 +233,7 @@ syscall :: proc(pc: u32) {
 	case 0x21: ret = delete_thread(i32(a0))
 	case 0x22: ret = start_thread(i32(a0), a1)
 	case 0x23: exit_thread()
-	case 0x24: exit_thread()
+	case 0x24: exit_delete_thread()
 	case 0x25, 0x26: ret = terminate_thread(i32(a0))
 	case 0x27, 0x28: // Disable/EnableDispatchThread
 	case 0x29, 0x2a: ret = change_priority(i32(a0), i32(a1))
@@ -221,14 +280,133 @@ syscall :: proc(pc: u32) {
 	case 0x79: iop.sif_reg_set(a0, a1)
 	case 0x7a: ret = i64(iop.sif_reg_get(a0))
 	case 0x7c: ret = -1 // Deci2Call: no debugger attached
+	case 0x75: // _print(format, ...)
+		f, ok := guest_string(a0, PRINT_MAX_STRING)
+		fmt.eprint("[_print] ", ok ? print_format(f, 5) : "?\n", sep = "")
 	case 0x7e: ret = 0 // MachineType
 	case 0x7f: ret = mem.RAM_SIZE // GetMemorySize
 	case:
-		fmt.eprintfln("kernel: unhandled syscall %d (a0 %08x a1 %08x) at %08x ra %08x",
+		if m := abs(n); m < len(ROM_ONLY_SYSCALLS) && ROM_ONLY_SYSCALLS[m] != "" {
+			cpu.fatal("unimplemented syscall %d %s (a0 %08x a1 %08x) at %08x", n, ROM_ONLY_SYSCALLS[m], a0, a1, pc)
+		}
+		fmt.eprintfln("kernel: undefined syscall %d (a0 %08x a1 %08x) at %08x ra %08x",
 			n, a0, a1, pc, u32(c.r[31].d[0]))
 	}
 	_ = t0
 	c.r[2].d[0] = u64(ret)
+}
+
+// _print's limits: the guest controls the format, so widths and string
+// lengths are clamped and a bad pointer prints as `?`.
+PRINT_MAX_WIDTH :: 64
+PRINT_MAX_STRING :: 1024
+
+// A guest C string, or ok false if it starts outside RAM. It stops at
+// `limit` bytes or the end of RAM.
+guest_string :: proc(a: u32, limit: int) -> (s: string, ok: bool) {
+	p := int(a & 0x0fffffff)
+	if a == 0 || p >= mem.RAM_SIZE {return "", false}
+	end := min(p + limit, mem.RAM_SIZE)
+	n := p
+	for n < end && mem.ram[n] != 0 {n += 1}
+	return string(mem.ram[p:n]), true
+}
+
+// Format a printf string for _print. The arguments after the format are in
+// registers from `first` up to t3 (EE EABI); conversions past those print
+// as `?`. An `l` size reads the whole 64-bit register, otherwise its low 32
+// bits. Only d, i, u, o, x, X, p, c, s and %% convert; anything else (%n
+// included) is copied out as written. Each conversion's spec is rebuilt
+// from the parsed flags, never passed through from the guest.
+print_format :: proc(f: string, first: int) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	r := first
+	i := 0
+	for i < len(f) {
+		ch := f[i]
+		i += 1
+		if ch != '%' {
+			strings.write_byte(&b, ch)
+			continue
+		}
+		start := i - 1
+		flags: [5]u8
+		nflags := 0
+		for i < len(f) && strings.index_byte("-+ #0", f[i]) >= 0 {
+			if nflags < len(flags) && strings.index_byte(string(flags[:nflags]), f[i]) < 0 {
+				flags[nflags] = f[i]
+				nflags += 1
+			}
+			i += 1
+		}
+		width, prec := 0, -1
+		for i < len(f) && '0' <= f[i] && f[i] <= '9' {
+			width = min(width * 10 + int(f[i] - '0'), PRINT_MAX_WIDTH)
+			i += 1
+		}
+		if i < len(f) && f[i] == '.' {
+			i += 1
+			prec = 0
+			for i < len(f) && '0' <= f[i] && f[i] <= '9' {
+				prec = min(prec * 10 + int(f[i] - '0'), PRINT_MAX_WIDTH)
+				i += 1
+			}
+		}
+		long := false
+		for i < len(f) && (f[i] == 'l' || f[i] == 'h') {
+			long ||= f[i] == 'l'
+			i += 1
+		}
+		if i >= len(f) {
+			strings.write_string(&b, f[start:])
+			break
+		}
+		conv := f[i]
+		i += 1
+		verb: u8
+		switch conv {
+		case '%':
+			strings.write_byte(&b, '%')
+			continue
+		case 'd', 'i', 'u': verb = 'd'
+		case 'o', 'x', 'X': verb = conv
+		case 'p': verb = 'x'
+		case 'c', 's': verb = 's'
+		case:
+			strings.write_string(&b, f[start:i])
+			continue
+		}
+		if r > 11 {
+			strings.write_byte(&b, '?')
+			continue
+		}
+		v := cpu.state.r[r].d[0]
+		r += 1
+		// Precision goes into the spec only for integers; strings are cut here.
+		spec_buf: [24]u8
+		spec := strings.builder_from_bytes(spec_buf[:])
+		strings.write_byte(&spec, '%')
+		strings.write_string(&spec, string(flags[:nflags]))
+		if width > 0 {strings.write_int(&spec, width)}
+		if prec >= 0 && verb != 's' {
+			strings.write_byte(&spec, '.')
+			strings.write_int(&spec, prec)
+		}
+		strings.write_byte(&spec, verb)
+		switch conv {
+		case 'd', 'i':
+			fmt.sbprintf(&b, strings.to_string(spec), long ? i64(v) : i64(i32(u32(v))))
+		case 'c':
+			c := [1]u8{u8(v)}
+			fmt.sbprintf(&b, strings.to_string(spec), string(c[:]))
+		case 's':
+			s, ok := guest_string(u32(v), prec >= 0 ? prec : PRINT_MAX_STRING)
+			fmt.sbprintf(&b, strings.to_string(spec), ok ? s : "?")
+		case:
+			fmt.sbprintf(&b, strings.to_string(spec), long ? v : u64(u32(v)))
+		}
+	}
+	return strings.to_string(b)
 }
 
 // -------------------------------------------------------------- threads
@@ -286,6 +464,7 @@ delete_thread :: proc(id: i32) -> i64 {
 @(private)
 thread_main :: proc(arg: rawptr) {
 	t := (^Thread)(arg)
+	reap()
 	for {
 		cpu.call(t.entry)
 		t.status = .Dormant
@@ -318,6 +497,31 @@ exit_thread :: proc() {
 	reschedule()
 	// Restarted: run the entry again on a fresh frame of thread_main.
 	cpu.fatal("exited thread %d resumed", t.id)
+}
+
+// ExitDeleteThread: end the current thread and free its slot, so the id can
+// be created again. The thread's coroutine is still running here; whichever
+// thread runs next frees it (reap).
+exit_delete_thread :: proc() {
+	t := k.current
+	if t.id == 1 {cpu.fatal("main thread exited")}
+	// Every resume point reaps, so a second death cannot find one pending.
+	if k.dead != nil {cpu.fatal("thread %d deleted with thread %d not yet freed", t.id, k.dead.id)}
+	t.status = .Dormant
+	k.threads[t.id] = nil
+	k.dead = t
+	reschedule()
+	cpu.fatal("deleted thread %d resumed", t.id)
+}
+
+// Free the thread exit_delete_thread left behind, once off its coroutine.
+@(private)
+reap :: proc() {
+	t := k.dead
+	if t == nil || t == k.current {return}
+	k.dead = nil
+	core.co_kill(t.co)
+	free(t)
 }
 
 terminate_thread :: proc(id: i32) -> i64 {
@@ -498,6 +702,7 @@ switch_to :: proc(next: ^Thread) {
 	cpu.state = next.regs
 	cpu.state.cycles = cycles
 	core.co_switch(next.co)
+	reap()
 }
 
 // Guest cycles skipped while every thread waits, for STATS.
