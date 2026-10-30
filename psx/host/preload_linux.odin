@@ -13,13 +13,10 @@ import io "../io"
 PR_SET_PDEATHSIG :: 1
 
 // Fork a child. In the parent, returns its pid; in the child, 0. ok is
-// false when the fork failed, or was not tried inside a frozen-time pass:
-// the pass's saved picture may be the Vulkan target's plane, a mapping the
-// child would share with the parent.
+// false when the fork failed. Inside a frozen-time pass the child ends the
+// pass too; it has no hi-res target, so it never reads the pass's saved
+// picture (on Vulkan, a mapping it shares with the parent).
 preload_fork :: proc() -> (pid: i32, ok: bool) {
-	if io.events_frozen {
-		return 0, false
-	}
 	render.raster_sync()
 	// The child mixes on its own thread alone, from where the parent's mix
 	// stands.
