@@ -590,6 +590,37 @@ uv_clamp :: proc(vs: []Hw_Vert, fst: bool, tw, th: u32) {
 	for &v in vs {v.st_min, v.st_max = lo, hi}
 }
 
+// Upscaled, a sprite covers every sample of the GS pixels it covers
+// natively (x0 <= p < x1) and no other. Its edges at half pixels otherwise
+// leave the later samples of its last row and column unwritten and write the
+// earlier ones of the pixel before its first: a picture copied with sprites
+// from -0.5 to 255.5 keeps stale samples on its last row and column, which a
+// repeating texture's seam then reads. Move each edge to the next whole pixel
+// and extend the texture coordinates with it. Point sampled, keep them inside
+// the vertices' range so the extension reads the edge texel; bilinear,
+// uv_clamp has already done so.
+@(private)
+sprite_snap :: proc(vs: []Hw_Vert, point: bool, fst: bool, tw, th: u32) {
+	if point {
+		lo, hi := [2]f32{max(f32), max(f32)}, [2]f32{-max(f32), -max(f32)}
+		for v in vs {
+			uv := fst ? [2]f32{v.s, v.t} : [2]f32{v.s / v.q * f32(tw), v.t / v.q * f32(th)}
+			lo, hi = linalg.min(lo, uv), linalg.max(hi, uv)
+		}
+		for &v in vs {v.st_min, v.st_max = lo, linalg.max(hi - 1.0 / 16, lo)}
+	}
+	// vs[0] and vs[1] differ in x only, vs[0] and vs[2] in y only.
+	dx, dy := vs[1].x - vs[0].x, vs[2].y - vs[0].y
+	if dx == 0 || dy == 0 {return}
+	ds, dt := (vs[1].s - vs[0].s) / dx, (vs[2].t - vs[0].t) / dy
+	for &v in vs {
+		x, y := math.ceil(v.x), math.ceil(v.y)
+		v.s += (x - v.x) * ds
+		v.t += (y - v.y) * dt
+		v.x, v.y = x, y
+	}
+}
+
 // Queue a primitive of `kind` from the vertex queue.
 @(private)
 hw_draw :: proc(c: ^Ctx, kind: u64) {
@@ -665,6 +696,7 @@ hw_draw :: proc(c: ^Ctx, kind: u64) {
 		n = 6
 	}
 	if c.tme && c.tex.bilinear && hw.scale > 1 && kind >= 3 {uv_clamp(out[:n], c.fst, c.tex.w, c.tex.h)}
+	if kind == 6 && hw.scale > 1 {sprite_snap(out[:n], c.tme && !c.tex.bilinear, c.fst, c.tex.w, c.tex.h)}
 	copy(([^]Hw_Vert)(s.verts.ptr)[s.nverts:][:n], out[:n])
 	s.nverts += n
 }
