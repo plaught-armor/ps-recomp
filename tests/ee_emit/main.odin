@@ -294,12 +294,29 @@ main :: proc() {
 			for k in 0 ..< 32 {init.f[k].u = rand.uint32() % 2 == 0 ? SPECIAL[rand.uint32() % len(SPECIAL)] : rand.uint32()}
 			init.acc.u, init.fcr31, init.sa = rand.uint32(), rand.uint32(), rand.uint32() & 127
 			init.cop0[12] = rand.uint32()
+			rs, rt := (c.w >> 21) & 31, (c.w >> 16) & 31
 			if trap {
 				// every other trial rs equal to rt or the immediate, so the
 				// equal and not-equal sides both run
-				rs, rt := (c.w >> 21) & 31, (c.w >> 16) & 31
 				if n % 2 == 1 && rs != 0 {
 					init.r[rs].d[0] = c.w >> 26 == 1 ? u64(i64(i16(c.w))) : init.r[rt].d[0]
+				}
+			}
+			if op == .DIV || op == .DIVU || op == .DIV1 || op == .DIVU1 {
+				// every fourth trial a zero divisor, every fourth MIN over -1
+				switch n % 4 {
+				case 1: if rt != 0 {init.r[rt].w[0] = 0}
+				case 2:
+					if rs != 0 {init.r[rs].w[0] = 0x80000000}
+					if rt != 0 {init.r[rt].w[0] = 0xffffffff}
+				}
+			}
+			if op == .PLZCW && rs != 0 {
+				// words of 0 and all ones, either way round; rd's high
+				// doubleword is random, so a write there shows
+				switch n % 4 {
+				case 1: init.r[rs].w[0], init.r[rs].w[1] = 0, 0xffffffff
+				case 3: init.r[rs].w[0], init.r[rs].w[1] = 0xffffffff, 0
 				}
 			}
 			taken := trap && trap_taken(c.w, &init)

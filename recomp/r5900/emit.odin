@@ -164,11 +164,14 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 		}
 		append(out, fmt.tprintf("mulw(%s, %d)", p, unit))
 		set64(out, rd, fmt.tprintf("c.lo.d[%d]", unit))
-	case .DIV:   append(out, fmt.tprintf("cpu.div(%s, %s, 0)", R32(rs), R32(rt)))
-	case .DIVU:  append(out, fmt.tprintf("cpu.divu(%s, %s, 0)", R32(rs), R32(rt)))
-	case .DIV1:  append(out, fmt.tprintf("cpu.div(%s, %s, 1)", R32(rs), R32(rt)))
-	case .DIVU1: append(out, fmt.tprintf("cpu.divu(%s, %s, 1)", R32(rs), R32(rt)))
-	case .PLZCW: append(out, fmt.tprintf("cpu.plzcw(%s, u32(%s >> 32), %d)", R32(rs), R64(rs), rd))
+	// cpu.div, cpu.divu and cpu.plzcw
+	case .DIV:   append(out, fmt.tprintf("divw(%s, %s, 0)", R32(rs), R32(rt)))
+	case .DIVU:  append(out, fmt.tprintf("divuw(%s, %s, 0)", R32(rs), R32(rt)))
+	case .DIV1:  append(out, fmt.tprintf("divw(%s, %s, 1)", R32(rs), R32(rt)))
+	case .DIVU1: append(out, fmt.tprintf("divuw(%s, %s, 1)", R32(rs), R32(rt)))
+	case .PLZCW:
+		// the high doubleword of rd stays
+		if rd != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = plzw(%s) | plzw(u32(%s >> 32)) << 32", rd, R32(rs), R64(rs)))}
 	case .QMFC2:
 		if rt != 0 {append(out, fmt.tprintf("c.r[%d].q = vu.vu0.vf[%d].q", rt, rd))}
 	case .QMTC2:

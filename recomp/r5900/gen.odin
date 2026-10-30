@@ -351,6 +351,40 @@ mulw :: #force_inline proc "contextless" (p: u64, unit: int) {
 	cpu.state.hi.d[unit] = sx32(u32(p >> 32))
 }
 
+// cpu.div.
+divw :: #force_inline proc "contextless" (a, b: u32, unit: int) {
+	n, d := i32(a), i32(b)
+	switch {
+	case d == 0:
+		cpu.state.lo.d[unit] = n < 0 ? 1 : ~u64(0)
+		cpu.state.hi.d[unit] = sx32(a)
+	case n == min(i32) && d == -1:
+		cpu.state.lo.d[unit] = sx32(0x80000000)
+		cpu.state.hi.d[unit] = 0
+	case:
+		cpu.state.lo.d[unit] = sx32(u32(n / d))
+		cpu.state.hi.d[unit] = sx32(u32(n % d))
+	}
+}
+
+// cpu.divu.
+divuw :: #force_inline proc "contextless" (a, b: u32, unit: int) {
+	if b == 0 {
+		cpu.state.lo.d[unit] = ~u64(0)
+		cpu.state.hi.d[unit] = sx32(a)
+		return
+	}
+	cpu.state.lo.d[unit] = sx32(a / b)
+	cpu.state.hi.d[unit] = sx32(a % b)
+}
+
+// cpu.plzcw's count for one word.
+plzw :: #force_inline proc "contextless" (v: u32) -> u64 {
+	v := v
+	if v & 0x80000000 != 0 {v = ~v}
+	return v == 0 ? 31 : u64(intrinsics.count_leading_zeros(v)) - 1
+}
+
 // cpu.fcond: set or clear the FPU condition bit.
 fcond :: #force_inline proc "contextless" (t: bool) {
 	if t {cpu.state.fcr31 |= cpu.FCR31_C} else {cpu.state.fcr31 &~= cpu.FCR31_C}

@@ -242,7 +242,7 @@ frsqrt :: proc(a, b: f32) -> f32 {
 // fadd, fsub, fmul, fpdiv and fsqrt in recomp/r5900 FAST_HELPERS are inline
 // copies of fpu_add, fpu_sub, fpu_mul, fpu_div and fpu_sqrt, fwide of
 // fpu_wide and fcvtw of cvt_w; mulw writes LO and HI as mult, multu and
-// madd do.
+// madd do, divw and divuw are div and divu, plzw plzcw's count.
 FMAX :: 0x7fffffff
 
 // True when a host operation cannot be trusted with x: exponent 255, or
