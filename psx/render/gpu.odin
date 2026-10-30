@@ -846,16 +846,25 @@ blend8 :: proc(abr: u32, back, front: u32) -> u32 #no_bounds_check {
 gpu_ghost_flush :: proc() {
 	// With VRAM's draws still running on the stream, its threads lay VRAM's
 	// layer after them; the GPU target's only needs its queue submitted.
+	// The Vulkan target's flush is queued after its draws: only VRAM's are
+	// drawn first.
 	streamed := stream_live()
 	if !streamed {
 		sync_cause = .Ghost
-		raster_sync()
+		if gpu_vk.on {
+			raster_native_run()
+		} else {
+			raster_sync()
+		}
 		sync_cause = .Other
 	}
 	for &t in drawn_targets() {
 		g := &t.ghost
 		if t.gl {
 			gl_ghost_flush(&t)
+		} else if t.vk {
+			queue_ghost_flush(&t)
+			continue
 		} else if streamed && t.shift == 0 {
 			stream_ghost_flush(&t)
 			continue

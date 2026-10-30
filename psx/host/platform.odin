@@ -644,6 +644,7 @@ perf_report :: proc() {
 	mixed_hz := f64(audio.mixed) * io.CPU_HZ * f64(io.clock_mul) / f64(max(cpu.state.cycles - host.perf_cycles, 1))
 	core.tracef(.Perf, "%d presents in %.3f s (%.1f/s), %d cycles, audio mixed %.1f Hz, queued %.1f ms (lowest %.1f), ran dry %d, dropped %d", PERF_PERIOD, secs, f64(PERF_PERIOD) / secs, cpu.state.cycles, mixed_hz, core.audio_queued_ms(), audio.low_ms, audio.dry, audio.dropped)
 	render.gl_perf()
+	render.sync_perf()
 	host.perf_cycles = cpu.state.cycles
 	host.perf_mark = now
 }

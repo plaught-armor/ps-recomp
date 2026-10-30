@@ -1481,7 +1481,6 @@ gl_perf :: proc() {
 	st := &g.stat
 	core.tracef(.Perf, "gl: %d submits, %d segments, %d prims, %d uploads; %d pulls of %d px; submit %.3f s, pull %.3f s", st.submits, st.segs, st.prims, st.uploads, st.pulls, st.pull_px, time.duration_seconds(st.submit_t), time.duration_seconds(st.pull_t))
 	st^ = {}
-	sync_perf()
 }
 
 // Lay picture p over the target's pixels its door back drew (tag

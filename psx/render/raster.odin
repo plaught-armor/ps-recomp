@@ -425,12 +425,36 @@ raster_sync :: #force_inline proc() {
 	}
 }
 
+// Draw VRAM's queue alone, the Vulkan target's left queued: the cells it
+// writes are none its queued draws read (raster_queue syncs first), so
+// those draws see the same VRAM after.
+@(private)
+raster_native_run :: proc() {
+	if len(raster.native) == 0 {
+		return
+	}
+	t0 := time.tick_now()
+	bands := raster_pool()
+	raster_band(bands, bands, nil)
+	raster_ghost_merge(&raster.passes[bands])
+	clear(&raster.native)
+	raster.writes = {}
+	sync_t[sync_cause] += time.tick_since(t0)
+	sync_n[sync_cause] += 1
+}
+
 // Every CPU read of a target's pixels comes through here first. The
 // Vulkan target's queue is drawn synchronously, so its pixels are the
 // software target's again before the bands below run (the stream is GL's
 // only, so the ghost flush comes here for it too).
 @(private)
 raster_run :: proc() {
+	// The Vulkan target's queue is drawn and waited for here.
+	t0 := time.tick_now()
+	defer if gpu_vk.on {
+		sync_t[sync_cause] += time.tick_since(t0)
+		sync_n[sync_cause] += 1
+	}
 	queue_submit()
 	if stream.head != stream.synced {
 		stream_sync()

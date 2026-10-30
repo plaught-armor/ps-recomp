@@ -67,7 +67,27 @@ void ghost_put(ivec2 p, uvec2 v) {
 #include "hi_draw.glsl"
 #undef main
 
+// queue_ghost_flush's rectangle (Gpu_Flag.Ghost_Flush, bit 31): the ghost
+// layer laid over the picture and cleared, as ghost_rows and GL's pass 0.
+void ghost_flush() {
+	ivec2 xy = ivec2(gl_FragCoord.xy);
+	uvec2 gv = ghost_at(xy);
+	uint ga = gv.x >> 24;
+	if (pc.zpass != 0 || ga == 0u) {
+		discard;
+	}
+	uint m = main_at(xy);
+	ghost_put(xy, uvec2(gv.x & 0xffffffu, gv.y));
+	out_c = fade_mix(m, gv.x & 0xffffffu, float(ga) / 255.0) & 0xffffffu | m & HI_KEPT;
+}
+
 void main() {
+	if (prims[pid].h.x < 0) {
+		ghost_flush();
+		out_walk = 0u;
+		out_door = 0u;
+		return;
+	}
 	see0 = pc.u.see[0];
 	see1 = pc.u.see[1];
 	see2 = pc.u.see[2];

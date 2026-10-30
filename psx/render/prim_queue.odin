@@ -63,6 +63,8 @@ Gpu_Flag :: enum u32 {
 	Z_Plane,
 	Z_Exact,
 	Z_Decal,
+	// queue_ghost_flush's rectangle: the ghost layer laid over the picture.
+	Ghost_Flush,
 }
 
 @(private)
@@ -272,6 +274,32 @@ queue_line :: proc(t: ^Target, d: ^Draw) {
 		}
 	}
 	level_group(false)
+}
+
+// Queue laying target t's ghost layer over it and clearing it, as
+// ghost_rows does, over the ghost box: one rectangle the shader draws
+// alone (Gpu_Flag.Ghost_Flush), after every ghost queued before and before
+// every taker after.
+@(private)
+queue_ghost_flush :: proc(t: ^Target) {
+	g, gh := &prim_queue, &t.ghost
+	if gh.lo.x < gh.hi.x && gh.lo.y < gh.hi.y {
+		k := t.shift
+		x0, y0 := gh.lo.x >> k, gh.lo.y >> k
+		w, h := ((gh.hi.x - 1) >> k) - x0 + 1, ((gh.hi.y - 1) >> k) - y0 + 1
+		hi_touch(x0, y0, w, h)
+		if g.prim_n == QUEUE_PRIMS || levels_full() {
+			queue_submit()
+		}
+		g.level_of[g.prim_n] = level_place(x0, y0, w, h, false, true, true, true, false, false, g.prim_n > 0)
+		g.prims[g.prim_n] = {
+			box = {gh.lo.x, gh.lo.y, gh.hi.x - 1, gh.hi.y - 1},
+			h = {transmute(i32)Gpu_Flags{.Rect, .Ghost_Flush}, 0, 0, 0},
+		}
+		g.prim_n += 1
+	}
+	gh.lo, gh.hi = {t.w, t.h}, {0, 0}
+	levels.ghost_live = {}
 }
 
 // Add primitive p with flags f, fading possibly (fade), to the queue,
