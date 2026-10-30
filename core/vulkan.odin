@@ -84,25 +84,35 @@ vk_instance :: proc(extensions: []cstring) -> bool {
 	return true
 }
 
-// Pick the first device with a graphics and compute queue (and pixel
-// interlock when the caller's shaders need it), and create it with the
-// features the shaders use; dynamic rendering local read and 64-bit shader
-// arithmetic too when the device has them (vkc.local_read, vkc.wide). False,
-// reported, when no device will do.
+// Pick the first Vulkan 1.3 device with a graphics and compute queue and
+// the features every renderer uses (synchronization2, demote to helper
+// invocation, independent blend; pixel interlock too when the caller's
+// shaders need it), and create it with them; dynamic rendering local read
+// and 64-bit shader arithmetic too when the device has them
+// (vkc.local_read, vkc.wide). False, reported, when no device will do.
 vk_device :: proc(pixel_interlock: bool) -> bool {
 	n: u32
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, nil)
 	devs := make([]vk.PhysicalDevice, n, context.temp_allocator)
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, raw_data(devs))
 	for d in devs {
+		// Vulkan 1.3's feature struct is only valid to ask a 1.3 device.
+		dp: vk.PhysicalDeviceProperties
+		vk.GetPhysicalDeviceProperties(d, &dp)
+		if dp.apiVersion < vk.API_VERSION_1_3 {continue}
 		lock := vk.PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
 			sType = .PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
 		}
-		f2 := vk.PhysicalDeviceFeatures2 {
-			sType = .PHYSICAL_DEVICE_FEATURES_2,
+		v13 := vk.PhysicalDeviceVulkan13Features {
+			sType = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
 			pNext = &lock,
 		}
+		f2 := vk.PhysicalDeviceFeatures2 {
+			sType = .PHYSICAL_DEVICE_FEATURES_2,
+			pNext = &v13,
+		}
 		vk.GetPhysicalDeviceFeatures2(d, &f2)
+		if !v13.synchronization2 || !v13.shaderDemoteToHelperInvocation || !f2.features.independentBlend {continue}
 		if pixel_interlock && !lock.fragmentShaderPixelInterlock {continue}
 		qn: u32
 		vk.GetPhysicalDeviceQueueFamilyProperties(d, &qn, nil)
@@ -121,8 +131,9 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 		if vkc.phys != nil {break}
 	}
 	if vkc.phys == nil {
-		fmt.eprintln(
-			pixel_interlock ? "vulkan: no device with fragment shader pixel interlock" : "vulkan: no device with a graphics and compute queue",
+		fmt.eprintfln(
+			"vulkan: no Vulkan 1.3 device with a graphics and compute queue, synchronization2, demote to helper invocation%s",
+			pixel_interlock ? ", independent blend and fragment shader pixel interlock" : " and independent blend",
 		)
 		return false
 	}
@@ -156,9 +167,11 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 		fragmentShaderPixelInterlock = true,
 	}
 	v13 := vk.PhysicalDeviceVulkan13Features {
-		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-		pNext            = pixel_interlock ? &lock : nil,
-		dynamicRendering = true,
+		sType                          = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		pNext                          = pixel_interlock ? &lock : nil,
+		synchronization2               = true,
+		shaderDemoteToHelperInvocation = true,
+		dynamicRendering               = true,
 	}
 	if vkc.local_read {
 		read.pNext = v13.pNext
@@ -172,7 +185,12 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 	f2 := vk.PhysicalDeviceFeatures2 {
 		sType = .PHYSICAL_DEVICE_FEATURES_2,
 		pNext = &v12,
-		features = {fragmentStoresAndAtomics = true, shaderInt64 = b32(vkc.wide), shaderFloat64 = b32(vkc.wide)},
+		features = {
+			independentBlend         = true,
+			fragmentStoresAndAtomics = true,
+			shaderInt64              = b32(vkc.wide),
+			shaderFloat64            = b32(vkc.wide),
+		},
 	}
 	prio: f32 = 1
 	qinfo := vk.DeviceQueueCreateInfo {
