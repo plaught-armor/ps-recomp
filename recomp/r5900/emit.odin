@@ -264,10 +264,11 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	// vu.vu0_set_vf: VF0 stays, the read still happens (it may be I/O)
 	case .LQC2: append(out, rt == 0 ? fmt.tprintf("_ = rd128(%s)", addr_expr(i)) : fmt.tprintf("vu.vu0.vf[%d].q = rd128(%s)", rt, addr_expr(i)))
 	case .SQC2: append(out, fmt.tprintf("wr128(%s, vu.vu0.vf[%d].q)", addr_expr(i), rt))
+	// mem.LWL and the rest, by their FAST_HELPERS copies lwl and the rest
 	case .LWL, .LWR, .LDL, .LDR:
-		if rt != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = mem.%v(%s, %s)", rt, i.op, addr_expr(i), R64(rt)))}
+		if rt != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = %s(%s, %s)", rt, strings.to_lower(fmt.tprint(i.op), context.temp_allocator), addr_expr(i), R64(rt)))}
 	case .SWL, .SWR, .SDL, .SDR:
-		append(out, fmt.tprintf("mem.%v(%s, %s)", i.op, addr_expr(i), R64(rt)))
+		append(out, fmt.tprintf("%s(%s, %s)", strings.to_lower(fmt.tprint(i.op), context.temp_allocator), addr_expr(i), R64(rt)))
 	// No TLB: nothing, as the interpreter.
 	case .SYNC, .CACHE, .PREF, .TLBR, .TLBWI, .TLBWR, .TLBP:
 	case .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI:

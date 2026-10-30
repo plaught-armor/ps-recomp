@@ -5,11 +5,12 @@
 // MADD family, the immediate ops and REGIMM traps at each of IMMS, MFC0,
 // TLBR, TLBWI, TLBWR, TLBP, MFC1, MTC1, SQRT.S,
 // RSQRT.S, MUL.S, MULA.S, MADD.S, DIV.S, CVT.W.S, QMTC2, LQC2, CFC2, CTC2,
-// MFSA, MTSA, MTSAB and MTSAH, with rd 0,
+// the unaligned loads and stores, MFSA, MTSA, MTSAB and MTSAH, with rd 0,
 // rs/rt 0 and aliased registers, and every shift amount for the shifts by
 // sa), then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
-// leave the whole cpu.state and VU0's registers as exec_insn leaves them.
+// leave the whole cpu.state, VU0's registers and the scratchpad as
+// exec_insn leaves them.
 // First FAST_HELPERS' fadd, fsub, fmul, fpdiv, fsqrt, fprsqrt and fcvtw must
 // give cpu.fpu_add, fpu_sub, fpu_mul, fpu_div, fpu_sqrt, fpu_rsqrt and cvt_w's
 // bits on a grid of floats and random ones near the ends of the exponent
@@ -42,6 +43,7 @@ COVERED :: Ops{
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
 	.PADDSH, .PADDUW, .PSRAW, .PHMADH, .MADD, .MADDU, .MADD1, .MADDU1, .MTHI1, .MTLO1, .SQRT_S, .RSQRT_S,
 	.MUL_S, .MULA_S, .MADD_S, .DIV_S, .CVT_W_S, .QMTC2, .LQC2, .CFC2, .CTC2, .MFSA, .MTSA, .MTSAB, .MTSAH,
+	.LWL, .LWR, .LDL, .LDR, .SWL, .SWR, .SDL, .SDR,
 	.QFSRV, .PLZCW, .MFHI1, .MFLO1, .MULT1, .MULTU1, .DIV1, .DIVU1,
 	.MTC0, .ERET, .CFC1, .CTC1, .C_F_S,
 	.PADDSB, .PSUBSB, .PSUBSH, .PADDSW, .PSUBSW, .PADDUH, .PSUBUH, .PSUBUB, .PSUBUW,
@@ -122,6 +124,15 @@ main :: proc() {
 		for rt in ([?]u32{0, 3}) {
 			append(&words, 0x12 << 26 | 0x02 << 21 | rt << 16 | cr << 11)
 			if cr != 31 {append(&words, 0x12 << 26 | 0x06 << 21 | rt << 16 | cr << 11)}
+		}
+	}
+
+	// LWL, LWR, LDL, LDR, SWL, SWR, SDL and SDR at each byte offset of a
+	// doubleword, from a positive and a negative immediate, with rt 6, rt
+	// the base and rt r0; the harness points the base into the scratchpad
+	for op in ([?]u32{0x22, 0x26, 0x1a, 0x1b, 0x2a, 0x2e, 0x2c, 0x2d}) {
+		for rt in ([?]u32{6, 5, 0}) {
+			for k in u32(0) ..< 8 {append(&words, op << 26 | 5 << 21 | rt << 16 | k, op << 26 | 5 << 21 | rt << 16 | (0xfff0 + k))}
 		}
 	}
 
@@ -335,6 +346,18 @@ main :: proc() {
 				init.r[(c.w >> 21) & 31].w[0] = mem.SPR_BASE + rand.uint32() % (mem.SPR_SIZE - 32) + 16 - u32(i32(i16(c.w)))
 				for k in 0 ..< mem.SPR_SIZE / 16 {(^u128)(&mem.spr[k * 16])^ = rand.uint128()}
 			}
+			unaligned: bool
+			#partial switch op {case .LWL, .LWR, .LDL, .LDR, .SWL, .SWR, .SDL, .SDR: unaligned = true}
+			if unaligned {
+				// base + imm in the scratchpad, at the immediate's byte offset
+				imm := u32(i32(i16(c.w)))
+				init.r[rs].w[0] = mem.SPR_BASE + (rand.uint32() % (mem.SPR_SIZE - 16) &~ 7) + 8 - imm + (imm & 7)
+				for k in 0 ..< mem.SPR_SIZE / 16 {(^u128)(&mem.spr[k * 16])^ = rand.uint128()}
+			}
+			// copies of the scratchpad, static and by mem_copy: as values
+			// they would be 16K aggregates to the compiler
+			@(static) spr, got_spr: [mem.SPR_SIZE]u8
+			if unaligned {runtime.mem_copy_non_overlapping(&spr, &mem.spr, mem.SPR_SIZE)}
 			// VU0's registers all random (the memories are not used here)
 			v0: vu.Vu
 			for k in 1 ..< 32 {v0.vf[k].q = rand.uint128()}
@@ -349,6 +372,10 @@ main :: proc() {
 			trapped = false
 			c.f()
 			got, got_vu0, got_trapped, got_pc := cpu.state, vu.vu0, trapped, trapped_pc
+			if unaligned {
+				runtime.mem_copy_non_overlapping(&got_spr, &mem.spr, mem.SPR_SIZE)
+				runtime.mem_copy_non_overlapping(&mem.spr, &spr, mem.SPR_SIZE)
+			}
 			cpu.state = init
 			vu.vu0 = v0
 			trapped = false
@@ -362,7 +389,7 @@ main :: proc() {
 				if fails < 10 {fmt.eprintfln("FAIL ee_emit %08x: trap %v, emitted %v at %08x, interp %v at %08x", c.w, taken, got_trapped, got_pc, trapped, trapped_pc)}
 				break
 			}
-			if runtime.memory_compare(&got, &cpu.state, size_of(cpu.Cpu)) != 0 || runtime.memory_compare(&got_vu0, &vu.vu0, size_of(vu.Vu)) != 0 {
+			if runtime.memory_compare(&got, &cpu.state, size_of(cpu.Cpu)) != 0 || runtime.memory_compare(&got_vu0, &vu.vu0, size_of(vu.Vu)) != 0 || (unaligned && runtime.memory_compare(&got_spr, &mem.spr, mem.SPR_SIZE) != 0) {
 				fails += 1
 				if fails < 10 {
 					fmt.eprintfln("FAIL ee_emit %08x: got r3 %32x hi %32x lo %32x f3 %08x, want r3 %32x hi %32x lo %32x f3 %08x",

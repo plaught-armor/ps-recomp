@@ -511,4 +511,53 @@ wr16 :: #force_inline proc(a: u32, v: u16) {if p := fast(a); p != nil {intrinsic
 wr32 :: #force_inline proc(a: u32, v: u32) {if p := fast(a); p != nil {intrinsics.unaligned_store((^u32)(p), v)} else {mem.wr32(a, v)}}
 wr64 :: #force_inline proc(a: u32, v: u64) {if p := fast(a); p != nil {intrinsics.unaligned_store((^u64)(p), v)} else {mem.wr64(a, v)}}
 wr128 :: #force_inline proc(a: u32, v: u128) {if p := fast(a &~ 15); p != nil {intrinsics.unaligned_store((^u128)(p), v)} else {mem.wr128(a, v)}}
+
+// mem.LWL, LWR, SWL, SWR, LDL, LDR, SDL and SDR over the aligned word or
+// doubleword, I/O through rd32, rd64, wr32 and wr64 as the others.
+lwl :: #force_inline proc(a: u32, rt: u64) -> u64 {
+	s := a & 3
+	return sx32((u32(rt) & (0x00ffffff >> (s * 8))) | (rd32(a &~ 3) << (24 - s * 8)))
+}
+
+lwr :: #force_inline proc(a: u32, rt: u64) -> u64 {
+	s := a & 3
+	m := rd32(a &~ 3)
+	if s == 0 {return sx32(m)}
+	return (rt & 0xffffffff_00000000) | u64((u32(rt) & (0xffffffff << (32 - s * 8))) | (m >> (s * 8)))
+}
+
+swl :: #force_inline proc(a: u32, rt: u64) {
+	s := a & 3
+	mask := s == 3 ? 0 : u32(0xffffff00) << (s * 8)
+	wr32(a &~ 3, (rd32(a &~ 3) & mask) | (u32(rt) >> (24 - s * 8)))
+}
+
+swr :: #force_inline proc(a: u32, rt: u64) {
+	s := a & 3
+	mask := s == 0 ? 0 : u32(0xffffffff) >> (32 - s * 8)
+	wr32(a &~ 3, (rd32(a &~ 3) & mask) | (u32(rt) << (s * 8)))
+}
+
+ldl :: #force_inline proc(a: u32, rt: u64) -> u64 {
+	s := u64(a & 7)
+	return (rt & (0x00ffffff_ffffffff >> (s * 8))) | (rd64(a &~ 7) << (56 - s * 8))
+}
+
+ldr :: #force_inline proc(a: u32, rt: u64) -> u64 {
+	s := u64(a & 7)
+	mask := s == 0 ? 0 : u64(0xffffffff_ffffffff) << (64 - s * 8)
+	return (rt & mask) | (rd64(a &~ 7) >> (s * 8))
+}
+
+sdl :: #force_inline proc(a: u32, rt: u64) {
+	s := u64(a & 7)
+	mask := s == 7 ? 0 : u64(0xffffffff_ffffff00) << (s * 8)
+	wr64(a &~ 7, (rd64(a &~ 7) & mask) | (rt >> (56 - s * 8)))
+}
+
+sdr :: #force_inline proc(a: u32, rt: u64) {
+	s := u64(a & 7)
+	mask := s == 0 ? 0 : u64(0xffffffff_ffffffff) >> (64 - s * 8)
+	wr64(a &~ 7, (rd64(a &~ 7) & mask) | (rt << (s * 8)))
+}
 `
