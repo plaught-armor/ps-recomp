@@ -66,6 +66,9 @@ imports :: proc() -> map[string]u64 {
 	m["gte.gte_read"] = p(rawptr(gte.gte_read))
 	m["gte.gte_write"] = p(rawptr(gte.gte_write))
 	m["gte.gte_cmd"] = p(rawptr(gte.gte_cmd))
+	m["gte.cmd_rtps"] = p(rawptr(gte.cmd_rtps))
+	m["gte.cmd_rtpt"] = p(rawptr(gte.cmd_rtpt))
+	m["gte.cmd_mvmva"] = p(rawptr(gte.cmd_mvmva))
 	m["io.run_events"] = p(rawptr(io.run_events))
 	return m
 }

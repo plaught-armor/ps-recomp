@@ -164,9 +164,15 @@ main :: proc() {
 			free_all(context.temp_allocator)
 		}
 	}
-	words := [?]u32{NCLIP, 0, JR_RA, 0, 0}
-	append(&funcs, native.Blob_Func{at, r3000.native_func(&na, build(at, words[:]), nil, 1)})
-	free_all(context.temp_allocator)
+	// NCLIP inline, then commands called by the native code: RTPS, RTPT
+	// and MVMVA through their own procs, NCDS through gte_cmd.
+	NATIVE_CMDS :: [?]u32{NCLIP, 0x4a180001, 0x4a200430, 0x4a486012, 0x4a4ec012, 0x4a43a412, 0x4ae80413}
+	for w in NATIVE_CMDS {
+		words := [?]u32{w, 0, JR_RA, 0, 0}
+		append(&funcs, native.Blob_Func{at, r3000.native_func(&na, build(at, words[:]), nil, 1)})
+		at += 0x20
+		free_all(context.temp_allocator)
+	}
 	code, err := core.native_load(native.make_blob(&na, funcs[:], {}), psx_native.imports())
 	if err != "" {
 		fmt.eprintln("FAIL psx_gte: native_load:", err)
@@ -236,6 +242,20 @@ main :: proc() {
 	}
 	for f in ([?]u32{0, 0x80010000, 0x80008000}) {
 		if outcomes[f] == 0 {fail("nclip: no case with flag %08x", f)}
+	}
+	native_cmds := NATIVE_CMDS
+	for w, n in native_cmds[1:] {
+		for k in 0 ..< 2000 {
+			gte.gte_load(gte_state(k % len(vals)))
+			for r in u32(12) ..< 20 {gte.gte_write(r, half() | half() << 16)}
+			start := gte.gte_save()
+			gte.gte_cmd(w & 0x1ffffff)
+			want := gte.gte_save()
+			gte.gte_load(start)
+			(cast(proc())rawptr(code.base + uintptr(code.funcs[len(Form) * 32 + 1 + n].off)))()
+			if gte.gte_save() != want {fail("native %08x from state %d: GTE state differs", w, k)}
+			checks += 1
+		}
 	}
 	// The Odin backend's output for the same forms names gte.data_read or
 	// gte.data_write, which inline in a port, for the data registers but

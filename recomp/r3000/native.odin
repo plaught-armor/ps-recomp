@@ -111,6 +111,21 @@ GTE_MAC :: 96
 @(private = "file")
 GTE_FLAG :: 292
 
+// The proc for GTE command w but NCLIP: RTPS, RTPT and MVMVA their own,
+// as in the Odin output; the rest gte.gte_cmd.
+@(private = "file")
+gte_cmd_proc :: proc(w: u32) -> string {
+	switch w & 0x3f {
+	case 0x01:
+		return "gte.cmd_rtps"
+	case 0x30:
+		return "gte.cmd_rtpt"
+	case 0x12:
+		return "gte.cmd_mvmva"
+	}
+	return "gte.gte_cmd"
+}
+
 // NCLIP, as gte.gte_cmd: MAC0 = SX0*SY1 + SX1*SY2 + SX2*SY0 - SX0*SY2 -
 // SX1*SY0 - SX2*SY1, summed in 64 bits; FLAG = 0, or bit 16 for a sum above
 // i32 (bit 15 below) with bit 31. Loses A, B and C.
@@ -417,7 +432,7 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 		case rs & 16 != 0 && i.w & 0x3f == 0x06:
 			nclip(a)
 		case rs & 16 != 0:
-			call_imm(a, "gte.gte_cmd", i.w & 0x1ffffff)
+			call_imm(a, gte_cmd_proc(i.w), i.w & 0x1ffffff)
 		case:
 			return false
 		}
