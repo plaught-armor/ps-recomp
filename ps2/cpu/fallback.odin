@@ -27,6 +27,9 @@ fallback_vu0_pair, fallback_vu1_pair: u64
 fallback_vu0_micro, fallback_vu1_micro: u64
 fallback_vu0_micro_at: [(4 << 10) / 8]u64
 fallback_vu1_micro_at: [(16 << 10) / 8]u64
+// Compiled-program runs that left at once from the pc they were entered at,
+// by {unit, program index, pc}: an entry with no case label.
+fallback_vu_unlabelled: map[[3]u32]u64
 // fpu_slow calls, by op: not the interpreter, so outside the calls total.
 fallback_fpu_slow: [Fpu_Op]u64
 
@@ -76,6 +79,9 @@ fallback_print :: proc() {
 	for r in rows {fmt.eprintfln("fallback: %d\t%.2f%%\t%s", r.n, 100 * f64(r.n) / f64(total), r.name)}
 	micro_at_print(0, fallback_vu0_micro_at[:], fallback_vu0_micro)
 	micro_at_print(1, fallback_vu1_micro_at[:], fallback_vu1_micro)
+	for key, n in fallback_vu_unlabelled {
+		fmt.eprintfln("fallback: %d\tvu%d program %d entered unlabelled at %04x", n, key[0], key[1], key[2])
+	}
 	slow: u64
 	for n in fallback_fpu_slow {slow += n}
 	fmt.eprintfln("fallback: %d fpu_slow calls", slow)

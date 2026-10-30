@@ -78,11 +78,32 @@ Mode :: enum u8 {
 	Slow, // vu.vu0_pair, vu.vu1_pair
 }
 
+// -define:VU_CLAMP_ELIDE=false clamps every operand, as the interpreter.
+VU_CLAMP_ELIDE :: #config(VU_CLAMP_ELIDE, true)
+
+// The lanes of each VF register (dest bits: x 8, y 4, z 2, w 1) known to
+// hold a value clamp4 leaves alone, along straight-line code: an operand
+// read only from those lanes skips its clamp4.
+@(private = "file")
+Known :: [32]u8
+
+// What every pair entered from a jump, a call or a resume knows: vf0 is
+// always (0, 0, 0, 1).
+@(private = "file")
+KNOWN_NONE :: Known{0 = 15}
+
 @(private = "file")
 Prog :: struct {
 	words: [dynamic]u32, // lw, uw from micro address 0
-	ext:   []bool, // the pairs compiled, for a captured image; nil: all
+	ext:     []bool, // the pairs compiled, for a captured image; nil: all
+	entries: []u32, // every captured entry pc of the unit, for a captured image; {0} for a .vutext program
 }
+
+// A .vutext program is entered at pc 0, after an E-bit pair (the next
+// program of a bundle) or at a branch target; dispatch_targets adds the
+// last two. An MSCAL anywhere else reaches the interpreter until a label.
+@(private = "file")
+VUTEXT_ENTRIES := [1]u32{0}
 
 @(private = "file")
 find_programs :: proc(img: mips.Image) -> (progs: [dynamic]Prog, ok: bool) {
@@ -105,7 +126,7 @@ find_programs :: proc(img: mips.Image) -> (progs: [dynamic]Prog, ok: bool) {
 			return progs, false
 		}
 		if addr == 0 {
-			append(&progs, Prog{})
+			append(&progs, Prog{entries = VUTEXT_ENTRIES[:]})
 			end = 0
 		}
 		if len(progs) == 0 || addr != end {
@@ -235,8 +256,10 @@ lanes :: proc(dest: u32) -> [4]bool {
 Flags :: enum u8 {None, Mac, Mac_Status}
 
 // Emit the upper op, or nothing and slow when it is not specialized.
+// known, when not nil, is updated for the registers written and elides
+// clamps of operands it covers.
 @(private = "file")
-emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) {
+emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags, known: ^Known) -> (slow: bool) {
 	dest := (uw >> 21) & 15
 	ft, fs, fd := (uw >> 16) & 31, (uw >> 11) & 31, (uw >> 6) & 31
 	fn := uw & 63
@@ -253,18 +276,27 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 	}
 	BC := [4]string{"sp(t.x)", "sp(t.y)", "sp(t.z)", "sp(t.w)"}
 	// Write r to fd (or ACC), with the flags asked for. The add and
-	// multiply family clamps its operands as the interpreter's vu_op does.
-	arith :: proc(sb: ^strings.Builder, expr: string, dst: string, dest, fs, ft: u32, flags: Flags) {
+	// multiply family clamps its operands as the interpreter's vu_op does,
+	// except the lanes read (sl of fs, tl of ft) known clamped.
+	arith :: proc(sb: ^strings.Builder, expr: string, dst: string, dest, fs, ft, sl, tl: u32, flags: Flags, known: ^Known) {
 		if dst == "" && flags == .None {return}
+		operand :: proc(known: ^Known, r, l: u32) -> string {
+			if known != nil && u32(known[r]) & l == l {return fmt.tprintf("vf[%d].f", r)}
+			return fmt.tprintf("clamp4(vf[%d].f)", r)
+		}
 		e, _ := strings.replace_all(expr, "v.q", "fclamp(v.q)", context.temp_allocator)
 		e, _ = strings.replace_all(e, "v.i", "fclamp(v.i)", context.temp_allocator)
-		fmt.sbprintf(sb, "\t\t\t{{s := clamp4(vf[%d].f); ", fs)
-		if strings.contains(expr, "t") {fmt.sbprintf(sb, "t := clamp4(vf[%d].f); ", ft)}
+		fmt.sbprintf(sb, "\t\t\t{{s := %s; ", operand(known, fs, sl))
+		if strings.contains(expr, "t") {fmt.sbprintf(sb, "t := %s; ", operand(known, ft, tl))}
 		fmt.sbprintf(sb, "x := clamp4(%s); ", e)
 		if flags != .None {fmt.sbprintf(sb, "v.mac = mac4(x, 0x%x); ", dest)}
 		if flags == .Mac_Status {fmt.sbprintf(sb, "put_status(v); ")}
 		store(sb, dst, dest)
 		end_block(sb)
+	}
+	// fd's dest lanes now hold a clamp4 result.
+	wrote :: proc(known: ^Known, fd, dest: u32) {
+		if known != nil && fd != 0 {known[fd] |= u8(dest)}
 	}
 	vfd := fd == 0 ? "" : fmt.tprintf("vf[%d]", fd)
 	if fn < 0x3c {
@@ -293,14 +325,22 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 		case 0x2c: op, b = .Sub, "t"
 		case 0x2d: op, b = .Msub, "t"
 		case 0x2e: // OPMSUB
-			arith(sb, "v.acc.f - [4]f32{s.y * t.z, s.z * t.x, s.x * t.y, 0}", vfd, 0xe, fs, ft, flags)
+			arith(sb, "v.acc.f - [4]f32{s.y * t.z, s.z * t.x, s.x * t.y, 0}", vfd, 0xe, fs, ft, 0xe, 0xe, flags, known)
+			wrote(known, fd, 0xe)
 			return
 		case 0x2f: op, b = .Mini, "t"
 		case: return true
 		}
 		if op == .Max || op == .Mini {
 			// The raw words, unclamped, and no flags: vmax in VU_HELPERS.
+			// Each lane is one of the operands' lanes, so it is known when
+			// both are.
 			if vfd == "" {return}
+			if known != nil {
+				kt: u8 = 0 // v.i is never known
+				if b == "t" {kt = known[ft]} else if fn < 0x1c && known[ft] & (8 >> bc) != 0 {kt = 15}
+				known[fd] = known[fd] &~ u8(dest) | u8(dest) & known[fs] & kt
+			}
 			fmt.sbprintf(sb, "\t\t\t{{s := vf[%d].u; ", fs)
 			if b != "sp(v.i)" {fmt.sbprintf(sb, "t := vf[%d].u; ", ft)}
 			if b == "sp(v.i)" {b = "spu(transmute(u32)v.i)"}
@@ -310,7 +350,10 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 			end_block(sb)
 			return
 		}
-		arith(sb, fmt.tprintf(OPS[op], b), vfd, dest, fs, ft, flags)
+		tl: u32 = b == "t" ? dest : 0
+		if fn < 0x1c {tl = 8 >> bc}
+		arith(sb, fmt.tprintf(OPS[op], b), vfd, dest, fs, ft, dest, tl, flags, known)
+		wrote(known, fd, dest)
 		return
 	}
 	sp := ((uw >> 4) & 0x7c) | (uw & 3)
@@ -328,6 +371,7 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 			fs, SCALE[bc])
 		store(sb, fmt.tprintf("vf[%d]", ft), dest)
 		end_block(sb)
+		wrote(known, ft, dest)
 		return
 	case 0x14 ..= 0x17: // FTOI
 		if ft == 0 || dest == 0 {return}
@@ -337,6 +381,7 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 			if on {fmt.sbprintf(sb, "vf[%d].i[%d] = cvt_w(s[%d] * %s); ", ft, k, k, SCALE[bc])}
 		}
 		end_block(sb)
+		if known != nil {known[ft] &~= u8(dest)}
 		return
 	case 0x18 ..= 0x1b: op, b = .Mul, BC[bc]
 	case 0x1c: op, b = .Mul, "sp(v.q)"
@@ -345,6 +390,7 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 		fmt.sbprintf(sb, "\t\t\t{{s := vf[%d].f; x := clamp4([4]f32{{abs(s.x), abs(s.y), abs(s.z), abs(s.w)}}); ", fs)
 		store(sb, fmt.tprintf("vf[%d]", ft), dest)
 		end_block(sb)
+		wrote(known, ft, dest)
 		return
 	case 0x1e: op, b = .Mul, "sp(v.i)"
 	case 0x1f: // CLIP
@@ -364,12 +410,14 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags) -> (slow: bool) 
 	case 0x2c: op, b = .Sub, "t"
 	case 0x2d: op, b = .Msub, "t"
 	case 0x2e: // OPMULA
-		arith(sb, "[4]f32{s.y * t.z, s.z * t.x, s.x * t.y, 0}", acc, 0xe, fs, ft, flags)
+		arith(sb, "[4]f32{s.y * t.z, s.z * t.x, s.x * t.y, 0}", acc, 0xe, fs, ft, 0xe, 0xe, flags, known)
 		return
 	case 0x2f: return // NOP
 	case: return true
 	}
-	arith(sb, fmt.tprintf(OPS[op], b), acc, dest, fs, ft, flags)
+	tl: u32 = b == "t" ? dest : 0
+	if sp < 0x10 || (sp >= 0x18 && sp < 0x1c) {tl = 8 >> bc}
+	arith(sb, fmt.tprintf(OPS[op], b), acc, dest, fs, ft, dest, tl, flags, known)
 	return
 }
 
@@ -388,7 +436,7 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 	flags := ""
 	switch {
 	case fn < 0x30 || (fn >= 0x3c && sp < 0x30):
-		if emit_upper(&sb, w, .Mac_Status) {return}
+		if emit_upper(&sb, w, .Mac_Status, nil) {return}
 	case fn == 0x38: return fmt.tprintf("vu.vu0_call_micro(0x%x)", ((w >> 6) & 0x7fff) * 8), true // VCALLMS
 	case fn == 0x39: return "vu.vu0_call_micro(vu.vu0.cmsar * 8)", true // VCALLMSR
 	case fn < 0x3c:
@@ -612,10 +660,26 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 	return
 }
 
-// Emit a whole pair, without its branch. Counts the halves that call the
-// interpreter in slow, by opcode.
+// Whether lower op lw can write a VF register (its ft). Lists the ops that
+// cannot, so an op not listed counts as a writer.
 @(private = "file")
-emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int) {
+lower_writes_vf :: proc(lw: u32) -> bool {
+	switch lw >> 25 {
+	case 0x01, 0x04, 0x05, 0x08, 0x09, 0x10 ..= 0x18, 0x1a ..= 0x1c, 0x20 ..= 0x2f: return false
+	case 0x40:
+		if lw & 0x3c != 0x3c {return false}
+		switch ((lw >> 4) & 0x7c) | (lw & 3) {
+		case 0x35, 0x37 ..= 0x3c, 0x3e, 0x3f, 0x68, 0x69, 0x6c, 0x70 ..= 0x76, 0x78 ..= 0x7e: return false
+		}
+	}
+	return true
+}
+
+// Emit pair p at pc, without its branch. Counts the halves that call the
+// interpreter in slow, by opcode. known, when not nil, tracks the clamped
+// lanes past it.
+@(private = "file")
+emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known) {
 	// The keys outlive the temp allocator, which each program frees.
 	count :: proc(slow: ^map[string]int, key: string) {
 		if key not_in slow {slow[strings.clone(key)] = 0}
@@ -625,11 +689,12 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 	// its write replaces the upper's when it changes status at all.
 	merge := unit == .VU0 && !p.ibit && p.mode != .Slow && p.lw >> 25 == 0x40 && p.lw & 0x3c == 0x3c
 	merge &&= ((p.lw >> 4) & 0x7c) | (p.lw & 3) >= 0x38 && ((p.lw >> 4) & 0x7c) | (p.lw & 3) <= 0x3a
-	upper :: proc(sb: ^strings.Builder, p: Pair, unit: Unit, merge: bool, slow: ^map[string]int) {
+	upper :: proc(sb: ^strings.Builder, p: Pair, unit: Unit, merge: bool, slow: ^map[string]int, known: ^Known) {
 		defer if merge {fmt.sbprintln(sb, "\t\t\tust := v.status\n\t\t\tv.status = st0")}
 		flags := Flags.Mac_Status
 		if unit == .VU1 {flags = p.mac_live ? .Mac : .None}
-		if !emit_upper(sb, p.uw, flags) {return}
+		if !emit_upper(sb, p.uw, flags, known) {return}
+		if known != nil {known^ = KNOWN_NONE}
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_upper(0x%08x)", int(unit), p.uw)
 		fn := p.uw & 63
 		if fn & 0x3c != 0x3c {
@@ -638,8 +703,9 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			count(slow, fmt.tprintf("upper special %02x", ((p.uw >> 4) & 0x7c) | (p.uw & 3)))
 		}
 	}
-	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, merge: bool, slow: ^map[string]int) {
+	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, merge: bool, slow: ^map[string]int, known: ^Known) {
 		if !emit_lower(sb, p.lw, pc, MEM[unit]) {
+			if known != nil && lower_writes_vf(p.lw) {known[(p.lw >> 16) & 31] &~= u8((p.lw >> 21) & 15)}
 			if !merge {return}
 			// DIV and RSQRT fs.fsf / ft.ftf, SQRT ft.ftf, as emit_macro
 			ft, fs := (p.lw >> 16) & 31, (p.lw >> 11) & 31
@@ -651,6 +717,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			fmt.sbprintln(sb, "\t\t\tif v.status == st0 {v.status = ust}")
 			return
 		}
+		if known != nil {known^ = KNOWN_NONE}
 		fn := p.lw & 63
 		switch {
 		case p.lw >> 25 != 0x40:
@@ -662,7 +729,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 		}
 	}
 	if p.ibit { // the upper still reads the old I
-		upper(sb, p, unit, false, slow)
+		upper(sb, p, unit, false, slow, known)
 		fmt.sbprintfln(sb, "\t\t\tv.i = transmute(f32)u32(0x%08x)", p.lw)
 		return
 	}
@@ -670,11 +737,11 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 	defer if merge {fmt.sbprintln(sb, "\t\t\t}")}
 	switch p.mode {
 	case .Serial:
-		upper(sb, p, unit, merge, slow)
-		if p.branch == .None {lower(sb, p, pc, unit, merge, slow)}
+		upper(sb, p, unit, merge, slow, known)
+		if p.branch == .None {lower(sb, p, pc, unit, merge, slow, known)}
 	case .Lower_First:
-		lower(sb, p, pc, unit, merge, slow)
-		upper(sb, p, unit, merge, slow)
+		lower(sb, p, pc, unit, merge, slow, known)
+		upper(sb, p, unit, merge, slow, known)
 	case .Hazard:
 		// As vu_pair: the lower reads the upper's dest from before the
 		// upper, and its own write to it, if any, wins unless it leaves the
@@ -683,19 +750,21 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 		ud := upper_dest(p.uw)
 		fmt.sbprintln(sb, "\t\t\t{")
 		fmt.sbprintfln(sb, "\t\t\tsaved := vf[%d]", ud)
-		upper(sb, p, unit, merge, slow)
+		upper(sb, p, unit, merge, slow, known)
 		fmt.sbprintfln(sb, "\t\t\tresult := vf[%d]", ud)
 		fmt.sbprintfln(sb, "\t\t\tvf[%d] = saved", ud)
-		lower(sb, p, pc, unit, merge, slow)
+		lower(sb, p, pc, unit, merge, slow, known)
 		if (p.lw >> 16) & 31 == ud { // every lower VF write goes to ft
 			fmt.sbprintfln(sb, "\t\t\tif vf[%d].q == saved.q {{vf[%d] = result}}", ud, ud)
 		} else {
 			fmt.sbprintfln(sb, "\t\t\tvf[%d] = result", ud)
 		}
 		fmt.sbprintln(sb, "\t\t\t}")
+		if known != nil && ud != 0 {known[ud] = 0} // either half's value
 	case .Slow:
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_pair(0x%08x, 0x%08x, 0x%04x)", int(unit), p.uw, p.lw, pc)
 		count(slow, "pair")
+		if known != nil {known^ = KNOWN_NONE}
 	}
 }
 
@@ -722,13 +791,43 @@ emit_branch :: proc(sb: ^strings.Builder, lw, pc, mask: u32) {
 	}
 }
 
+// The pairs the switch can be entered at other than by falling through: the
+// entries, every static branch target, and the pair after each branch's
+// delay slot or E-bit pair (a branch's fall-through, a link register, the
+// next program). Every other pc a run starts at, a computed jump's target
+// among them, reaches the interpreter through the default case.
 @(private = "file")
-emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, unit: Unit, slow: ^map[string]int) {
+dispatch_targets :: proc(pairs: []Pair, mask: u32, entries: []u32) -> []bool {
+	target := make([]bool, len(pairs), context.temp_allocator)
+	for pc in entries {
+		if int(pc / 8) < len(pairs) {target[pc / 8] = true}
+	}
+	for p, i in pairs {
+		branch := !p.ibit && p.branch != .None
+		if !branch && !p.ebit {continue}
+		target[(i + 2) % len(pairs)] = true
+		if branch && p.branch != .Reg {
+			t := int(branch_target(p.lw, u32(i) * 8, mask) / 8)
+			if t < len(pairs) {target[t] = true}
+		}
+	}
+	return target
+}
+
+@(private = "file")
+emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, entries: []u32, unit: Unit, slow: ^map[string]int) {
 	mask := MASK[unit]
 	pairs := make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
 	mac_liveness(pairs, ext, mask)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
+	// A pair reached only by falling through from one whose known lanes
+	// are not KNOWN_NONE gets no case label, so the lanes carry into it.
+	// Without entries (emit_micro's default) every pair keeps its label.
+	known := KNOWN_NONE
+	k := VU_CLAMP_ELIDE && entries != nil ? &known : nil
+	target := dispatch_targets(pairs, mask, entries)
+	fell := false // the previous pair falls through, its fallthrough unwritten
 
 	fmt.sbprintfln(sb, "run_%d :: proc(pc: u32, budget: ^int) -> (u32, vu.Vu_Exit) {{", n)
 	fmt.sbprintfln(sb, "\tv := &vu.vu%d", int(unit))
@@ -742,16 +841,21 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, un
 		if !in_ext(ext, i) {continue}
 		pc := u32(i) * 8
 		next := i + 1 < len(pairs) ? pairs[i + 1] : Pair{}
-		fmt.sbprintfln(sb, "\t\tcase 0x%04x:", pc)
+		if !fell || k == nil || target[i] || known == KNOWN_NONE {
+			if fell {fmt.sbprintln(sb, "\t\t\tfallthrough")}
+			fmt.sbprintfln(sb, "\t\tcase 0x%04x:", pc)
+			known = KNOWN_NONE
+		}
+		fell = false
 		branch := !p.ibit && p.branch != .None
 		switch {
 		case branch && (p.ebit || i + 1 >= len(pairs) || !plain(next)),
 		     !branch && p.ebit && (i + 1 >= len(pairs) || !plain(next)):
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", pc)
 		case branch:
-			emit_pair(sb, p, pc, unit, slow)
+			emit_pair(sb, p, pc, unit, slow, k)
 			emit_branch(sb, p.lw, pc, mask)
-			emit_pair(sb, next, pc + 8, unit, slow)
+			emit_pair(sb, next, pc + 8, unit, slow, k)
 			fmt.sbprintln(sb, "\t\t\tif tk {")
 			fmt.sbprintln(sb, "\t\t\t\tbudget^ -= 1")
 			fmt.sbprintln(sb, "\t\t\t\tif budget^ <= 0 {return tg, .Leave}")
@@ -761,13 +865,13 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, un
 			fmt.sbprintln(sb, "\t\t\t}")
 			fmt.sbprintln(sb, "\t\t\tcontinue")
 		case p.ebit:
-			emit_pair(sb, p, pc, unit, slow)
-			emit_pair(sb, next, pc + 8, unit, slow)
+			emit_pair(sb, p, pc, unit, slow, k)
+			emit_pair(sb, next, pc + 8, unit, slow, k)
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .End", (pc + 16) & mask)
 		case:
-			emit_pair(sb, p, pc, unit, slow)
+			emit_pair(sb, p, pc, unit, slow, k)
 			if i + 1 < len(pairs) && in_ext(ext, i + 1) {
-				fmt.sbprintln(sb, "\t\t\tfallthrough")
+				fell = true
 			} else {
 				fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", (pc + 8) & mask)
 			}
@@ -783,10 +887,12 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, un
 // One microprogram for unit at micro address 0, compiled whole as run_<n>,
 // as generate compiles a .vutext program (tests/vu_micro). The caller writes
 // the package header and VU_HELPERS, and for VU0 MACRO_HELPERS. Counts the
-// pair halves that call the interpreter in slow, by opcode.
-emit_micro :: proc(n: int, words: []u32, unit: Unit, slow: ^map[string]int) -> string {
+// pair halves that call the interpreter in slow, by opcode. With entries, it
+// is compiled as a captured image entered only there, eliding clamps as
+// VU_CLAMP_ELIDE says.
+emit_micro :: proc(n: int, words: []u32, unit: Unit, slow: ^map[string]int, entries: []u32 = nil) -> string {
 	sb := strings.builder_make()
-	emit_program(&sb, n, words, nil, unit, slow)
+	emit_program(&sb, n, words, nil, entries, unit, slow)
 	return strings.to_string(sb)
 }
 
@@ -831,7 +937,7 @@ generate :: proc(img: mips.Image, out_dir, runtime, capture: string, unit: Unit,
 			emit_words(&sb, fmt.tprintf("code_%d_%d", n, k), p.words[r[0] * 2:r[1] * 2])
 			pairs += r[1] - r[0]
 		}
-		emit_program(&sb, n, p.words[:], p.ext, unit, slow)
+		emit_program(&sb, n, p.words[:], p.ext, p.entries, unit, slow)
 		free_all(context.temp_allocator)
 	}
 	dir, _ := filepath.join({out_dir, fmt.tprintf("vu%d", u)})
@@ -934,6 +1040,14 @@ load_capture :: proc(progs: ^[dynamic]Prog, path: string, unit: Unit) -> bool {
 	hashes := make([dynamic]u64, context.temp_allocator)
 	for h in images {append(&hashes, h)}
 	slice.sort(hashes[:])
+	// The runtime runs whichever program's ranges match the code at pc, so
+	// any captured entry can enter any program.
+	all: map[u32]bool
+	for key in seen {all[u32(key[1])] = true}
+	pcs_all := make([]u32, len(all))
+	n := 0
+	for pc in all {pcs_all[n] = pc; n += 1}
+	slice.sort(pcs_all)
 	keys: map[string]bool
 	for h in hashes {
 		pcs := entries[h][:]
@@ -952,7 +1066,7 @@ load_capture :: proc(progs: ^[dynamic]Prog, path: string, unit: Unit) -> bool {
 				continue
 			}
 			keys[strings.to_string(key)] = true
-			append(progs, Prog{words = words, ext = ext})
+			append(progs, Prog{words = words, ext = ext, entries = pcs_all})
 		}
 	}
 	return true

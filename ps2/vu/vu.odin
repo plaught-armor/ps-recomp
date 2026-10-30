@@ -676,8 +676,17 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 			last = prog
 			prog.runs += 1
 			exit: Vu_Exit
+			when cpu.FALLBACK_COUNT {entry, before := pc, budget}
 			pc, exit = prog.run(pc, &budget)
 			pc &= mask
+			// Left at once from where it was entered: no case label there.
+			when cpu.FALLBACK_COUNT {
+				if compiled && exit == .Leave && pc == entry && budget == before {
+					index := 0
+					for q, k in t.programs {if q == prog {index = k}}
+					cpu.fallback_vu_unlabelled[{v == &vu0 ? 0 : 1, u32(index), pc}] += 1
+				}
+			}
 			if exit == .End {return pc, true}
 			if budget <= 0 {break}
 		}
