@@ -329,7 +329,9 @@ cop0: struct {
 	epc:   u32,
 }
 
-mfc0 :: proc(r: u32) -> u32 {
+// COP0 register r. Recompiled code calls it with a constant r, and the
+// switch folds away.
+mfc0 :: #force_inline proc(r: u32) -> u32 {
 	switch r {
 	case COP0_SR:
 		return cop0.sr

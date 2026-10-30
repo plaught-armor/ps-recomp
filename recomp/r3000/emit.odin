@@ -141,7 +141,7 @@ emit_op :: proc(i: Insn) -> []string {
 	case op == 16:
 		switch {
 		case rs == 0:
-			return set_reg(rt, f("cpu.mfc0(%d)", rd), true)
+			return set_reg(rt, f("cpu.mfc0(%d)", rd))
 		case rs == 4:
 			return one("cpu.mtc0(%d, %s)", rd, R(rt))
 		case rs == 16 && i.fn == 16:

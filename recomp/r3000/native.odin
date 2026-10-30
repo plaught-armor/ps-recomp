@@ -615,7 +615,15 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 	case op == 16:
 		switch {
 		case rs == 0:
-			call_imm(a, "cpu.mfc0", rd)
+			// As cpu.mfc0: SR, Cause and EPC, PRId 2, the rest 0.
+			switch rd {
+			case 12 ..= 14:
+				native.imp_load(a, .A, "cpu.cop0", 4 * (rd - 12))
+			case 15:
+				native.mov_imm(a, .A, 2)
+			case:
+				native.mov_imm(a, .A, 0)
+			}
 			result(a, rt, ld)
 		case rs == 4:
 			native.mov_imm(a, .A, rd)

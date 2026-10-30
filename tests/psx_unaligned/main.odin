@@ -4,9 +4,9 @@
 // a page, at the end of RAM, in the scratchpad and across into I/O; a plain
 // word or half running past the scratchpad's end stays in it; and the
 // native backend's fused pair leaves what the composed pair does. Also the
-// native backend's inline div and divu against cpu.div and cpu.divu, and
-// its aligned loads and stores, lwc2 and swc2 too, against the bus and the
-// memory itself in and around the scratchpad.
+// native backend's inline div and divu against cpu.div and cpu.divu, mfc0
+// against cpu.mfc0, and its aligned loads and stores, lwc2 and swc2 too,
+// against the bus and the memory itself in and around the scratchpad.
 package main
 
 import "core:fmt"
@@ -37,6 +37,7 @@ ADDU_V1_V0 :: 0x00401821 // addu $v1, $v0, $0: the load delay slot
 JR_RA :: 0x03e00008
 DIV_A0_A1 :: 0x0085001a
 DIVU_A0_A1 :: 0x0085001b
+MFC0_V0 :: 0x40020000 // mfc0 $v0, $0, rd in bits 11-15
 
 @(private = "file")
 build :: proc(at: u32, words: []u32, labels: []u32 = nil) -> ^mips.Func {
@@ -246,6 +247,13 @@ check_native :: proc() {
 		{SWL_A1, SWR_A1, JR_RA, 0},
 		{DIV_A0_A1, JR_RA, 0, 0},
 		{DIVU_A0_A1, JR_RA, 0, 0},
+		{MFC0_V0 | 12 << 11, JR_RA, 0, 0},
+		{MFC0_V0 | 13 << 11, JR_RA, 0, 0},
+		{MFC0_V0 | 14 << 11, JR_RA, 0, 0},
+		{MFC0_V0 | 15 << 11, JR_RA, 0, 0},
+		{MFC0_V0 | 0 << 11, JR_RA, 0, 0},
+		{MFC0_V0 | 8 << 11, JR_RA, 0, 0},
+		{MFC0_V0 | 31 << 11, JR_RA, 0, 0},
 	}
 	funcs := FUNCS
 	arch := native.Arch(core.NATIVE_ARCH)
@@ -306,6 +314,15 @@ check_native :: proc() {
 			}
 		}
 	}
+	// mfc0 inline against cpu.mfc0, every COP0 field distinct.
+	for k in 5 ..< len(funcs) {
+		cpu.cop0.sr, cpu.cop0.cause, cpu.cop0.epc = 0x10400401, 0x8000a07c, 0x80012344
+		cpu.state.r[2] = 0x5a5a5a5a
+		run(code, k)
+		rd := funcs[k][0] >> 11 & 31
+		if want := cpu.mfc0(rd); cpu.state.r[2] != want {fail("native mfc0 %d: %08x, want %08x", rd, cpu.state.r[2], want)}
+	}
+	cpu.cop0 = {}
 }
 
 // Each aligned load and store, lwc2 and swc2 through GTE data register 0,

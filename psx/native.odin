@@ -24,6 +24,12 @@ import native "native"
 #assert(offset_of(cpu.Cpu, lo) == 132)
 #assert(offset_of(cpu.Cpu, cycles) == 136)
 
+// And cpu.cop0, SR, Cause and EPC, by these.
+#assert(offset_of(type_of(cpu.cop0), sr) == 0)
+#assert(offset_of(type_of(cpu.cop0), cause) == 4)
+#assert(offset_of(type_of(cpu.cop0), epc) == 8)
+#assert(cpu.COP0_SR == 12 && cpu.COP0_CAUSE == 13 && cpu.COP0_EPC == 14)
+
 // And gte.state by these.
 #assert(offset_of(gte.Gte, v) == 0)
 #assert(type_of(gte.state.v) == [3][3]i16)
