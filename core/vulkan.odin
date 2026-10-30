@@ -17,6 +17,7 @@ Vk_Buf :: struct {
 }
 
 vkc: struct {
+	lib:       dynlib.Library, // the loader (VK_LOADER)
 	instance:  vk.Instance,
 	phys:      vk.PhysicalDevice,
 	device:    vk.Device,
@@ -56,16 +57,19 @@ vk_check :: proc(r: vk.Result, what: string, loc := #caller_location) {
 }
 
 // Load the loader and create the instance with the surface extensions the
-// window system needs; false, reported, when there is no Vulkan.
+// window system needs; false, reported, when there is no Vulkan, with
+// nothing left made (vk_release).
 vk_instance :: proc(extensions: []cstring) -> bool {
-	lib, ok := dynlib.load_library(VK_LOADER)
+	ok: bool
+	vkc.lib, ok = dynlib.load_library(VK_LOADER)
 	if !ok {
 		fmt.eprintln("vulkan:", VK_LOADER, "not found")
 		return false
 	}
-	gipa, found := dynlib.symbol_address(lib, "vkGetInstanceProcAddr")
+	gipa, found := dynlib.symbol_address(vkc.lib, "vkGetInstanceProcAddr")
 	if !found {
 		fmt.eprintln("vulkan:", VK_LOADER, "lacks vkGetInstanceProcAddr")
+		vk_release()
 		return false
 	}
 	vk.load_proc_addresses_global(gipa)
@@ -81,6 +85,7 @@ vk_instance :: proc(extensions: []cstring) -> bool {
 		ppEnabledExtensionNames = raw_data(extensions),
 	}
 	if !vk_ok(vk.CreateInstance(&info, nil, &vkc.instance), "vkCreateInstance") {
+		vk_release()
 		return false
 	}
 	vk.load_proc_addresses_instance(vkc.instance)
@@ -94,13 +99,17 @@ vk_instance :: proc(extensions: []cstring) -> bool {
 // and 64-bit shader arithmetic too when the device has them
 // (vkc.local_read, vkc.wide), and with want_interlock pixel interlock and
 // extended storage image formats when it has both (vkc.interlock). False,
-// reported, when no device will do.
+// reported, when no device will do, with the instance and surface gone too
+// (vk_release).
 vk_device :: proc(pixel_interlock: bool, want_interlock := false) -> bool {
 	n: u32
-	vk.EnumeratePhysicalDevices(vkc.instance, &n, nil)
+	if !vk_ok(vk.EnumeratePhysicalDevices(vkc.instance, &n, nil), "vkEnumeratePhysicalDevices") {
+		vk_release()
+		return false
+	}
 	devs := make([]vk.PhysicalDevice, n, context.temp_allocator)
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, raw_data(devs))
-	for d in devs {
+	for d in devs[:n] {
 		// Vulkan 1.3's feature struct is only valid to ask a 1.3 device.
 		dp: vk.PhysicalDeviceProperties
 		vk.GetPhysicalDeviceProperties(d, &dp)
@@ -140,6 +149,7 @@ vk_device :: proc(pixel_interlock: bool, want_interlock := false) -> bool {
 			"vulkan: no Vulkan 1.3 device with a graphics and compute queue, synchronization2, demote to helper invocation%s",
 			pixel_interlock ? ", independent blend and fragment shader pixel interlock" : " and independent blend",
 		)
+		vk_release()
 		return false
 	}
 	props: vk.PhysicalDeviceProperties
@@ -231,6 +241,8 @@ vk_device :: proc(pixel_interlock: bool, want_interlock := false) -> bool {
 		ppEnabledExtensionNames = &exts[0],
 	}
 	if !vk_ok(vk.CreateDevice(vkc.phys, &info, nil, &vkc.device), "vkCreateDevice") {
+		vkc.device = nil
+		vk_release()
 		return false
 	}
 	vk.load_proc_addresses_device(vkc.device)
@@ -240,7 +252,32 @@ vk_device :: proc(pixel_interlock: bool, want_interlock := false) -> bool {
 		flags            = {.RESET_COMMAND_BUFFER},
 		queueFamilyIndex = vkc.family,
 	}
-	return vk_ok(vk.CreateCommandPool(vkc.device, &pool, nil, &vkc.pool), "vkCreateCommandPool")
+	if !vk_ok(vk.CreateCommandPool(vkc.device, &pool, nil, &vkc.pool), "vkCreateCommandPool") {
+		vkc.pool = 0
+		vk_release()
+		return false
+	}
+	return true
+}
+
+// Undo vk_instance and vk_device, or as much of them as was made: the
+// command pool, device, surface and instance destroyed and the loader
+// unloaded, so a caller whose device would not do starts again clean (or
+// draws without Vulkan). Only before anything else is made on the device.
+vk_release :: proc() {
+	if vkc.device != nil {
+		vk.DeviceWaitIdle(vkc.device)
+		if vkc.pool != 0 {vk.DestroyCommandPool(vkc.device, vkc.pool, nil)}
+		vk.DestroyDevice(vkc.device, nil)
+	}
+	if vkc.instance != nil {
+		if vkc.surface != 0 {vk.DestroySurfaceKHR(vkc.instance, vkc.surface, nil)}
+		vk.DestroyInstance(vkc.instance, nil)
+	}
+	if vkc.lib != nil {dynlib.unload_library(vkc.lib)}
+	delete(vkc.swap_imgs)
+	delete(vkc.swap_done)
+	vkc = {}
 }
 
 // The first memory type of `bits` with `want`. HOST_CACHED, which no device

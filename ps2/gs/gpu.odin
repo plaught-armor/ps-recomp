@@ -162,6 +162,7 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
 	if !core.vk_instance(exts[:]) {return false}
 	if win != nil && !sdl.Vulkan_CreateSurface(win, core.vkc.instance, &core.vkc.surface) {
 		fmt.eprintln("vulkan: SDL_Vulkan_CreateSurface:", sdl.GetError())
+		core.vk_release()
 		return false
 	}
 	if !core.vk_device(pixel_interlock = true) {return false}

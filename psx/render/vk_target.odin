@@ -145,8 +145,9 @@ HOST :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT}
 @(private = "file")
 CACHED :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT, .HOST_CACHED}
 
-// Make the instance, device and pipelines: false, reported, when there is
-// no device that will do; a later failure ends the game (core's helpers).
+// Make the instance, device and pipelines: false, reported, with nothing
+// left made, when there is no device that will do; a later failure ends
+// the game (core's helpers).
 @(private)
 vk_init :: proc() -> bool {
 	g := &gpu_vk
@@ -156,6 +157,7 @@ vk_init :: proc() -> bool {
 	}
 	if !core.vkc.local_read || !core.vkc.wide {
 		fmt.eprintln(core.ENV_PREFIX + "GPU=vk: the device lacks dynamic rendering local read or 64-bit shader arithmetic")
+		core.vk_release()
 		return false
 	}
 	g.interlock = core.vkc.interlock
