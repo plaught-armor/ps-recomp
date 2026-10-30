@@ -15,7 +15,6 @@ package psx_render
 
 import "core:fmt"
 import "core:mem"
-import "core:os"
 import vk "vendor:vulkan"
 import "ps:core"
 
@@ -76,16 +75,17 @@ HOST :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT}
 @(private = "file")
 CACHED :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT, .HOST_CACHED}
 
-// Make the instance, device and pipelines; a failure ends the game (core's
-// helpers).
+// Make the instance, device and pipelines: false, reported, when there is
+// no device that will do; a later failure ends the game (core's helpers).
 @(private)
-vk_init :: proc() {
+vk_init :: proc() -> bool {
 	g := &gpu_vk
-	core.vk_instance({})
-	core.vk_device(pixel_interlock = false)
+	if !core.vk_instance({}) || !core.vk_device(pixel_interlock = false) {
+		return false
+	}
 	if !core.vkc.local_read || !core.vkc.wide {
 		fmt.eprintln(core.ENV_PREFIX + "GPU=vk: the device lacks dynamic rendering local read or 64-bit shader arithmetic")
-		os.exit(1)
+		return false
 	}
 	dev := core.vkc.device
 	bind := vk.DescriptorSetLayoutBinding {
@@ -134,6 +134,7 @@ vk_init :: proc() {
 	g.uni = core.vk_buf_create(size_of(Vk_Draw_Uni), {.STORAGE_BUFFER}, HOST)
 	g.on = true
 	fmt.eprintln(core.ENV_PREFIX + "GPU: vk (hi-res target's walks drawn on Vulkan)")
+	return true
 }
 
 // A forked child leaves the parent's device and images alone, and draws

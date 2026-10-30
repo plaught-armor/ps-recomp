@@ -99,7 +99,7 @@ platform_init :: proc(title: cstring) -> bool {
 	win = sdl.CreateWindow(title, sdl.WINDOWPOS_CENTERED, sdl.WINDOWPOS_CENTERED,
 		gs.DISP_W * 2, 480 * 2, flags)
 	if hw {
-		gs.hw_init(core.headless ? nil : win, u32(scale))
+		if !gs.hw_init(core.headless ? nil : win, u32(scale)) {return false}
 	} else {
 		ren = sdl.CreateRenderer(win, -1, {.ACCELERATED})
 		tex = sdl.CreateTexture(ren, .ABGR8888, .STREAMING, gs.DISP_W, gs.DISP_H)

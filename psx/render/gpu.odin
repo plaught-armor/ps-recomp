@@ -8,6 +8,7 @@ package psx_render
 import "base:intrinsics"
 import "core:fmt"
 import "core:math"
+import "core:os"
 import "core:simd"
 import "core:slice"
 import sdl "vendor:sdl2"
@@ -300,7 +301,10 @@ gpu_init :: proc(window: ^sdl.Window, renderer: ^sdl.Renderer) {
 	case "gl":
 		gl_init(window, renderer)
 	case "vk":
-		vk_init()
+		// Asked for by name: no quiet fallback to software.
+		if !vk_init() {
+			os.exit(1)
+		}
 	case:
 		fmt.eprintln(core.ENV_PREFIX + "GPU: not sw, gl or vk (drawing in software):", backend)
 	}

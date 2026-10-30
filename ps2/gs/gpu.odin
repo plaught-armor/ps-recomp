@@ -13,7 +13,6 @@ import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:mem"
-import "core:os"
 import sdl "vendor:sdl2"
 import vk "vendor:vulkan"
 import "ps:core"
@@ -149,8 +148,10 @@ hw: struct {
 	},
 }
 
-hw_init :: proc(win: ^sdl.Window, scale: u32) {
-	hw_on, hw.scale, hw.window = true, scale, win != nil
+// Start the Vulkan GS: false, reported, when there is no device that will
+// do; a later failure ends the game (core's helpers).
+hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
+	hw.scale, hw.window = scale, win != nil
 	exts: [dynamic]cstring
 	if win != nil {
 		n: u32
@@ -158,12 +159,13 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) {
 		resize(&exts, int(n))
 		sdl.Vulkan_GetInstanceExtensions(win, &n, raw_data(exts))
 	}
-	core.vk_instance(exts[:])
+	if !core.vk_instance(exts[:]) {return false}
 	if win != nil && !sdl.Vulkan_CreateSurface(win, core.vkc.instance, &core.vkc.surface) {
 		fmt.eprintln("vulkan: SDL_Vulkan_CreateSurface:", sdl.GetError())
-		os.exit(1)
+		return false
 	}
-	core.vk_device(pixel_interlock = true)
+	if !core.vk_device(pixel_interlock = true) {return false}
+	hw_on = true
 	if win != nil {swap_create()}
 
 	layers := int(scale * scale)
@@ -200,6 +202,7 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) {
 	vk.CmdFillBuffer(hw.slots[0].cmd, hw.vram.buf, 0, vk.DeviceSize(vk.WHOLE_SIZE), 0)
 	vk.CmdFillBuffer(hw.slots[0].cmd, hw.clut_cur.buf, 0, vk.DeviceSize(vk.WHOLE_SIZE), 0)
 	fmt.eprintfln("gs: GPU renderer, scale %d", scale)
+	return true
 }
 
 // ------------------------------------------------------------- commands

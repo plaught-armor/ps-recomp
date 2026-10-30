@@ -36,23 +36,35 @@ vkc: struct {
 	wide:       bool,
 }
 
-vk_check :: proc(r: vk.Result, what: string, loc := #caller_location) {
+// Report a failed call; false when it failed.
+vk_ok :: proc(r: vk.Result, what: string, loc := #caller_location) -> bool {
 	if r != .SUCCESS {
 		fmt.eprintfln("vulkan: %s failed: %v (%v)", what, r, loc)
+	}
+	return r == .SUCCESS
+}
+
+// A failed call ends the game: for calls only a broken or exhausted device
+// fails, once vk_device has found one.
+vk_check :: proc(r: vk.Result, what: string, loc := #caller_location) {
+	if !vk_ok(r, what, loc) {
 		os.exit(1)
 	}
 }
 
 // Load the loader and create the instance with the surface extensions the
-// window system needs.
-vk_instance :: proc(extensions: []cstring) {
+// window system needs; false, reported, when there is no Vulkan.
+vk_instance :: proc(extensions: []cstring) -> bool {
 	lib, ok := dynlib.load_library(VK_LOADER)
 	if !ok {
 		fmt.eprintln("vulkan:", VK_LOADER, "not found")
-		os.exit(1)
+		return false
 	}
 	gipa, found := dynlib.symbol_address(lib, "vkGetInstanceProcAddr")
-	assert(found, "vkGetInstanceProcAddr")
+	if !found {
+		fmt.eprintln("vulkan:", VK_LOADER, "lacks vkGetInstanceProcAddr")
+		return false
+	}
 	vk.load_proc_addresses_global(gipa)
 	app := vk.ApplicationInfo {
 		sType            = .APPLICATION_INFO,
@@ -65,15 +77,19 @@ vk_instance :: proc(extensions: []cstring) {
 		enabledExtensionCount   = u32(len(extensions)),
 		ppEnabledExtensionNames = raw_data(extensions),
 	}
-	vk_check(vk.CreateInstance(&info, nil, &vkc.instance), "vkCreateInstance")
+	if !vk_ok(vk.CreateInstance(&info, nil, &vkc.instance), "vkCreateInstance") {
+		return false
+	}
 	vk.load_proc_addresses_instance(vkc.instance)
+	return true
 }
 
 // Pick the first device with a graphics and compute queue (and pixel
 // interlock when the caller's shaders need it), and create it with the
 // features the shaders use; dynamic rendering local read and 64-bit shader
-// arithmetic too when the device has them (vkc.local_read, vkc.wide).
-vk_device :: proc(pixel_interlock: bool) {
+// arithmetic too when the device has them (vkc.local_read, vkc.wide). False,
+// reported, when no device will do.
+vk_device :: proc(pixel_interlock: bool) -> bool {
 	n: u32
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, nil)
 	devs := make([]vk.PhysicalDevice, n, context.temp_allocator)
@@ -108,7 +124,7 @@ vk_device :: proc(pixel_interlock: bool) {
 		fmt.eprintln(
 			pixel_interlock ? "vulkan: no device with fragment shader pixel interlock" : "vulkan: no device with a graphics and compute queue",
 		)
-		os.exit(1)
+		return false
 	}
 	props: vk.PhysicalDeviceProperties
 	vk.GetPhysicalDeviceProperties(vkc.phys, &props)
@@ -178,7 +194,9 @@ vk_device :: proc(pixel_interlock: bool) {
 		enabledExtensionCount   = n_exts,
 		ppEnabledExtensionNames = &exts[0],
 	}
-	vk_check(vk.CreateDevice(vkc.phys, &info, nil, &vkc.device), "vkCreateDevice")
+	if !vk_ok(vk.CreateDevice(vkc.phys, &info, nil, &vkc.device), "vkCreateDevice") {
+		return false
+	}
 	vk.load_proc_addresses_device(vkc.device)
 	vk.GetDeviceQueue(vkc.device, vkc.family, 0, &vkc.queue)
 	pool := vk.CommandPoolCreateInfo {
@@ -186,15 +204,20 @@ vk_device :: proc(pixel_interlock: bool) {
 		flags            = {.RESET_COMMAND_BUFFER},
 		queueFamilyIndex = vkc.family,
 	}
-	vk_check(vk.CreateCommandPool(vkc.device, &pool, nil, &vkc.pool), "vkCreateCommandPool")
+	return vk_ok(vk.CreateCommandPool(vkc.device, &pool, nil, &vkc.pool), "vkCreateCommandPool")
 }
 
+// The first memory type of `bits` with `want`. HOST_CACHED, which no device
+// need have, is only preferred: without it reads back are slower, no
+// different. Every device has a device-local type, and a host-visible
+// coherent one for every buffer, so the rest is never missing.
 vk_mem_type :: proc(bits: u32, want: vk.MemoryPropertyFlags) -> u32 {
-	for i in 0 ..< vkc.mem_props.memoryTypeCount {
-		if bits & (1 << i) != 0 && want <= vkc.mem_props.memoryTypes[i].propertyFlags {return i}
+	for need in ([2]vk.MemoryPropertyFlags{want, want - {.HOST_CACHED}}) {
+		for i in 0 ..< vkc.mem_props.memoryTypeCount {
+			if bits & (1 << i) != 0 && need <= vkc.mem_props.memoryTypes[i].propertyFlags {return i}
+		}
 	}
-	fmt.eprintln("vulkan: no memory type with", want)
-	os.exit(1)
+	fmt.panicf("vulkan: no memory type with %v", want)
 }
 
 // A buffer with a device address; host-visible ones stay mapped.
