@@ -6,13 +6,16 @@
 // Malformed images and cue sheets fail cleanly: a truncated image, a record
 // past its sector or under 34 bytes, a name past its record, bytes after a
 // zero length, a directory past the volume, unknown cue lines, a TRACK with
-// no FILE, a missing file, overlapping tracks and a bad time.
+// no FILE, a missing file, overlapping tracks and a bad time. Disc ids hash
+// the volume descriptor, SYSTEM.CNF and the boot file, the same for each
+// image format.
 // The images are written to a directory under the OS temp directory,
 // removed at the end whether the test passes or fails.
 package main
 
 import "core:encoding/endian"
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -72,7 +75,7 @@ record :: proc(b: []u8, lba, size: int, dir: bool, name: string) -> int {
 }
 
 @(private = "file")
-make_iso :: proc(cnf: string) -> []u8 {
+make_iso :: proc(cnf: string, cnf_name := "SYSTEM.CNF;1", sub_name := "Sub.Txt;1") -> []u8 {
 	img := make([]u8, VOLUME * disc.DATA)
 	pvd := sector(img, 16)
 	pvd[0], pvd[6] = 1, 1
@@ -85,13 +88,13 @@ make_iso :: proc(cnf: string) -> []u8 {
 	root := sector(img, 20)
 	at := record(root, 20, disc.DATA, true, "\x00")
 	at += record(root[at:], 20, disc.DATA, true, "\x01")
-	at += record(root[at:], 22, len(cnf), false, "SYSTEM.CNF;1")
+	at += record(root[at:], 22, len(cnf), false, cnf_name)
 	at += record(root[at:], 21, disc.DATA, true, "DATA")
 	record(root[at:], 23, BIG, false, "Big.Bin;1")
 	sub := sector(img, 21)
 	at = record(sub, 21, disc.DATA, true, "\x00")
 	at += record(sub[at:], 20, disc.DATA, true, "\x01")
-	record(sub[at:], 26, len(SUB), false, "Sub.Txt;1")
+	record(sub[at:], 26, len(SUB), false, sub_name)
 	copy(sector(img, 22), cnf)
 	for i in 0 ..< BIG {
 		img[23 * disc.DATA + i] = big_byte(i)
@@ -304,6 +307,61 @@ test_dual_layer :: proc(iso: []u8) {
 	}
 }
 
+// The disc id of an image written as name; "" when id fails.
+@(private = "file")
+id_of :: proc(name: string, img: []u8) -> string {
+	d, ok := disc.open(write(name, img))
+	if !ok {
+		fail("%s does not open", name)
+		return ""
+	}
+	defer disc.close(&d)
+	id, _ := disc.id(&d, context.temp_allocator)
+	return id
+}
+
+// XXH3-64 of the volume descriptor, then each part after its length.
+@(private = "file")
+id_hash :: proc(img: []u8, parts: ..[]u8) -> string {
+	input: [dynamic]u8
+	defer delete(input)
+	append(&input, ..sector(img, 16))
+	for p in parts {
+		n: [4]u8
+		put32(n[:], len(p))
+		append(&input, ..n[:])
+		append(&input, ..p)
+	}
+	return fmt.tprintf("%016x", xxhash.XXH3_64_default(input[:]))
+}
+
+// Disc ids: the hash of the volume descriptor, SYSTEM.CNF and the boot
+// file, whatever the image format; the serial before it when the boot name
+// makes one; PSX.EXE with no SYSTEM.CNF; no id for a SYSTEM.CNF that does
+// not parse or a boot file that is missing.
+@(private = "file")
+test_id :: proc() {
+	iso := make_iso(CNF_PS1)
+	want := id_hash(iso, transmute([]u8)string(CNF_PS1), transmute([]u8)string(SUB))
+	check(id_of("id.iso", iso) == want, "id")
+	check(id_of("id.bin", make_raw(iso, 1)) == want, "id of a raw image")
+	other := make_iso(CNF_PS1)
+	other[23 * disc.DATA] ~= 1
+	check(id_of("id.iso", other) == want, "id with another file changed")
+	other = make_iso(CNF_PS1)
+	other[26 * disc.DATA] ~= 1
+	check(id_of("id.iso", other) != want, "id with the boot file changed")
+	cnf := "BOOT = cdrom:\\DATA\\SLUS_123.45;1\n"
+	iso = make_iso(cnf, sub_name = "SLUS_123.45;1")
+	want = id_hash(iso, transmute([]u8)cnf, transmute([]u8)string(SUB))
+	check(id_of("id.iso", iso) == fmt.tprintf("SLUS-12345.%s", want), "id with a serial")
+	exe := "an exe"
+	iso = make_iso(exe, cnf_name = "PSX.EXE;1")
+	check(id_of("id.iso", iso) == id_hash(iso, nil, transmute([]u8)exe), "id with no SYSTEM.CNF")
+	check(id_of("id.iso", make_iso("VER = 1.00\n")) == "", "id with no BOOT line")
+	check(id_of("id.iso", make_iso(CNF_PS2)) == "", "id with no boot file")
+}
+
 // Malformed images: open fails, or the file system calls do.
 @(private = "file")
 test_corrupt :: proc(iso: []u8) {
@@ -391,6 +449,7 @@ main :: proc() {
 	test_formats(iso, make_raw(make_iso(CNF_PS1), 1), make_raw(iso, 2), make_audio(AUDIO))
 	test_dual_layer(iso)
 	test_corrupt(iso)
+	test_id()
 	if os.remove_all(dir) != nil {
 		fail("cannot remove %s", dir)
 	}

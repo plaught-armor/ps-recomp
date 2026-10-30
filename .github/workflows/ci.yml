@@ -26,7 +26,7 @@ jobs:
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -51,8 +51,8 @@ jobs:
         with:
           release: dev-2026-10
           token: ${{ secrets.GITHUB_TOKEN }}
-      # SDL2 for the tests that open a host (tests/host_frames); Windows
-      # uses Odin's vendor SDL2.dll, put next to the test.
+      # SDL2 for the tests that call it (tests/host_frames, tests/data);
+      # Windows uses Odin's vendor SDL2.dll, put next to the tests.
       - name: install SDL2 (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
@@ -95,6 +95,7 @@ jobs:
           odin run tests/disc -collection:ps=. -out:disc_test${{ runner.os == 'Windows' && '.exe' || '' }}
           if [ "$RUNNER_OS" = Windows ]; then cp "$(odin root)/vendor/sdl2/SDL2.dll" .; fi
           odin run tests/host_frames -collection:ps=. -out:host_frames_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/data -collection:ps=. -out:data_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)
         if: ${{ matrix.rosetta }}
         run: |

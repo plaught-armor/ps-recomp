@@ -26,13 +26,14 @@ Native_Code :: struct {
 	ovls:  []Native_Ovl,
 }
 
-@(private = "file")
+@(private)
 NATIVE_MAGIC :: 0x4e525350 // "PSRN"
-@(private = "file")
+@(private)
 NATIVE_VERSION :: 1
 
-// The blob arch this build runs (recomp/native Arch).
+// The blob arch this build runs (recomp/native Arch), and its name there.
 NATIVE_ARCH :: 3 when ODIN_ARCH == .arm64 else (2 when ODIN_OS == .Windows else 1)
+NATIVE_ARCH_NAME :: "arm64" when ODIN_ARCH == .arm64 else ("x64_win" when ODIN_OS == .Windows else "x64_sysv")
 
 // Executable memory is mapped in 64K units, a page on every host.
 @(private)
