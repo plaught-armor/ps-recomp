@@ -50,6 +50,10 @@ levels: struct {
 	group:  bool,
 	// Cells holding ghosts since the last flush.
 	ghost_live: Cells,
+	// The backend orders a pixel's primitives itself (vk_target.odin's
+	// pixel interlock): a primitive takes the lowest level it may, levels
+	// split only where depth_on changes, and no cell is marked.
+	single: bool,
 }
 
 // How a primitive over the VRAM area x, y, w x h with flags f, fading
@@ -81,6 +85,16 @@ level_place :: proc(x, y, w, h: i32, ghosts, reader, acc, fade, depth_on, z_writ
 	l := &levels
 	if queued && l.depth[l.top] != depth_on {
 		l.floor = l.top + 1
+	}
+	if l.single {
+		lv := l.floor
+		l.top = lv
+		l.depth[lv] = depth_on
+		if z_write {l.z[lv] = true}
+		if ghosts {
+			cells_add(&l.ghost_live, x, y, w, h)
+		}
+		return lv
 	}
 	lv := level_need(x, y, w, h, reader, acc, fade, l.floor)
 	l.top = max(l.top, lv)

@@ -28,11 +28,17 @@ gpu_vk: struct {
 	on:          bool,
 	set_layout:  vk.DescriptorSetLayout,
 	pool:        vk.DescriptorPool,
-	// The main picture as draw.frag's input attachment.
+	// The main picture as draw.frag's input attachment, or with interlock
+	// the three pictures as its storage images.
 	set:         vk.DescriptorSet,
 	layout:      vk.PipelineLayout,
-	// By whether the level writes the tag (levels.depth).
+	// By whether the level writes the tag (levels.depth); with interlock
+	// one pipeline, the tag a push constant.
 	draw:        [2]vk.Pipeline,
+	// draw_lock.frag draws (the device has ordered pixel interlock, and
+	// the VK_INTERLOCK setting is 1; off by default): a queue is one level
+	// (levels.single).
+	interlock:   bool,
 	cmd:         vk.CommandBuffer,
 	fence:       vk.Fence,
 	// Host-visible: the queue, VRAM and the uniforms.
@@ -131,7 +137,7 @@ Vk_Frame_Push :: struct {
 Vk_Draw_Push :: struct {
 	prims, ports, order, vram:              vk.DeviceAddress,
 	ghost_rgb, ghost_a, ghost_z, zbuf, uni: vk.DeviceAddress,
-	zpass:                                  i32,
+	zpass, tags:                            i32,
 }
 
 @(private = "file")
@@ -144,29 +150,42 @@ CACHED :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT, .HOST_CACHED}
 @(private)
 vk_init :: proc() -> bool {
 	g := &gpu_vk
-	if !core.vk_instance({}) || !core.vk_device(pixel_interlock = false) {
+	want := core.env("VK_INTERLOCK") == "1"
+	if !core.vk_instance({}) || !core.vk_device(pixel_interlock = false, want_interlock = want) {
 		return false
 	}
 	if !core.vkc.local_read || !core.vkc.wide {
 		fmt.eprintln(core.ENV_PREFIX + "GPU=vk: the device lacks dynamic rendering local read or 64-bit shader arithmetic")
 		return false
 	}
+	g.interlock = core.vkc.interlock
+	for f in VK_FORMATS {
+		fp: vk.FormatProperties
+		vk.GetPhysicalDeviceFormatProperties(core.vkc.phys, f, &fp)
+		if .STORAGE_IMAGE not_in fp.optimalTilingFeatures {
+			g.interlock = false
+		}
+	}
+	levels.single = g.interlock
 	dev := core.vkc.device
-	bind := vk.DescriptorSetLayoutBinding {
-		binding         = 0,
-		descriptorType  = .INPUT_ATTACHMENT,
-		descriptorCount = 1,
-		stageFlags      = {.FRAGMENT},
+	binds: [len(VK_IMAGES)]vk.DescriptorSetLayoutBinding
+	for &b, i in binds {
+		b = {
+			binding         = u32(i),
+			descriptorType  = g.interlock ? .STORAGE_IMAGE : .INPUT_ATTACHMENT,
+			descriptorCount = 1,
+			stageFlags      = {.FRAGMENT},
+		}
 	}
 	linfo := vk.DescriptorSetLayoutCreateInfo {
 		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		bindingCount = 1,
-		pBindings    = &bind,
+		bindingCount = g.interlock ? len(binds) : 1,
+		pBindings    = &binds[0],
 	}
 	core.vk_check(vk.CreateDescriptorSetLayout(dev, &linfo, nil, &g.set_layout), "vkCreateDescriptorSetLayout")
 	size := vk.DescriptorPoolSize {
-		type            = .INPUT_ATTACHMENT,
-		descriptorCount = 1,
+		type            = binds[0].descriptorType,
+		descriptorCount = linfo.bindingCount,
 	}
 	pinfo := vk.DescriptorPoolCreateInfo {
 		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
@@ -187,6 +206,10 @@ vk_init :: proc() -> bool {
 	ALL :: vk.ColorComponentFlags{.R, .G, .B, .A}
 	formats := VK_FORMATS
 	for tag in 0 ..< 2 {
+		if g.interlock {
+			g.draw[tag] = core.vk_draw_pipeline(#load("shaders/draw.vert.spv"), #load("shaders/draw_lock.frag.spv"), g.layout)
+			continue
+		}
 		masks := [3]vk.ColorComponentFlags{ALL, tag == 1 ? ALL : {}, tag == 1 ? ALL : {}}
 		g.draw[tag] = core.vk_draw_pipeline(#load("shaders/draw.vert.spv"), #load("shaders/draw.frag.spv"), g.layout, formats[:], masks[:])
 	}
@@ -210,6 +233,7 @@ vk_init :: proc() -> bool {
 	mem.copy(g.vram.ptr, &vram[0], size_of(vram))
 	g.on = true
 	fmt.eprintln(core.ENV_PREFIX + "GPU: vk (hi-res target's walks drawn on Vulkan)")
+	fmt.eprintln(core.ENV_PREFIX + "GPU=vk:", g.interlock ? "pixel interlock, one level a queue" : "draw levels (no pixel interlock)")
 	return true
 }
 
@@ -296,7 +320,7 @@ vk_target_make :: proc(t: ^Target) {
 	w, h := u32(t.w), u32(t.h)
 	n := int(t.w * t.h)
 	for f, i in VK_FORMATS {
-		g.img[i], g.mem[i] = core.vk_image_create(w, h, f, USAGE)
+		g.img[i], g.mem[i] = core.vk_image_create(w, h, f, g.interlock ? USAGE + {.STORAGE} : USAGE)
 		g.view[i] = vk_view_create(g.img[i], f)
 	}
 	BUF :: vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
@@ -317,17 +341,17 @@ vk_target_make :: proc(t: ^Target) {
 	gh.alpha = vk_plane(u8, VK_BUFS[1].x, n)
 	gh.z = vk_plane(f32, VK_BUFS[2].x, n)
 	t.zbuf = vk_plane(u32, VK_BUFS[3].x, n)
-	img := vk.DescriptorImageInfo {
-		imageView   = g.view[0],
-		imageLayout = .GENERAL,
+	imgs: [len(VK_IMAGES)]vk.DescriptorImageInfo
+	for v, i in g.view {
+		imgs[i] = {imageView = v, imageLayout = .GENERAL}
 	}
 	write := vk.WriteDescriptorSet {
 		sType           = .WRITE_DESCRIPTOR_SET,
 		dstSet          = g.set,
 		dstBinding      = 0,
-		descriptorCount = 1,
-		descriptorType  = .INPUT_ATTACHMENT,
-		pImageInfo      = &img,
+		descriptorCount = g.interlock ? len(imgs) : 1,
+		descriptorType  = g.interlock ? .STORAGE_IMAGE : .INPUT_ATTACHMENT,
+		pImageInfo      = &imgs[0],
 	}
 	vk.UpdateDescriptorSets(core.vkc.device, 1, &write, 0, nil)
 	core.vk_begin(g.cmd, g.fence)
@@ -536,11 +560,12 @@ vk_target_submit :: proc() #no_bounds_check {
 			storeOp     = .STORE,
 		}
 	}
+	// With interlock the pictures are storage images: no attachments.
 	rinfo := vk.RenderingInfo {
 		sType                = .RENDERING_INFO,
 		renderArea           = area,
 		layerCount           = 1,
-		colorAttachmentCount = len(atts),
+		colorAttachmentCount = g.interlock ? 0 : len(atts),
 		pColorAttachments    = &atts[0],
 	}
 	vk.CmdBeginRendering(cmd, &rinfo)
@@ -570,6 +595,11 @@ vk_target_submit :: proc() #no_bounds_check {
 		}
 		vk.CmdPipelineBarrier2(cmd, &dep)
 		vk.CmdBindPipeline(cmd, .GRAPHICS, g.draw[levels.depth[lv] ? 1 : 0])
+		push.tags = i32(levels.depth[lv])
+		// With interlock depths are laid as drawn (hi_draw.glsl).
+		if levels.z[lv] && g.interlock {
+			levels.z[lv] = false
+		}
 		if levels.z[lv] {
 			levels.z[lv] = false
 			push.zpass = 1

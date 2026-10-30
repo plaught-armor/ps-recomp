@@ -34,6 +34,9 @@ vkc: struct {
 	local_read: bool,
 	// shaderInt64 and shaderFloat64 are on (the device has both).
 	wide:       bool,
+	// Fragment shader pixel interlock is on: needed, or wanted and the
+	// device has it with storage images of extended formats (on then too).
+	interlock:  bool,
 }
 
 // Report a failed call; false when it failed.
@@ -89,8 +92,10 @@ vk_instance :: proc(extensions: []cstring) -> bool {
 // invocation, independent blend; pixel interlock too when the caller's
 // shaders need it), and create it with them; dynamic rendering local read
 // and 64-bit shader arithmetic too when the device has them
-// (vkc.local_read, vkc.wide). False, reported, when no device will do.
-vk_device :: proc(pixel_interlock: bool) -> bool {
+// (vkc.local_read, vkc.wide), and with want_interlock pixel interlock and
+// extended storage image formats when it has both (vkc.interlock). False,
+// reported, when no device will do.
+vk_device :: proc(pixel_interlock: bool, want_interlock := false) -> bool {
 	n: u32
 	vk.EnumeratePhysicalDevices(vkc.instance, &n, nil)
 	devs := make([]vk.PhysicalDevice, n, context.temp_allocator)
@@ -161,6 +166,18 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 	have: vk.PhysicalDeviceFeatures
 	vk.GetPhysicalDeviceFeatures(vkc.phys, &have)
 	vkc.wide = bool(have.shaderInt64 && have.shaderFloat64)
+	vkc.interlock = pixel_interlock
+	if want_interlock && !pixel_interlock && have.shaderStorageImageExtendedFormats {
+		lock := vk.PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
+			sType = .PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+		}
+		f2 := vk.PhysicalDeviceFeatures2 {
+			sType = .PHYSICAL_DEVICE_FEATURES_2,
+			pNext = &lock,
+		}
+		vk.GetPhysicalDeviceFeatures2(vkc.phys, &f2)
+		vkc.interlock = bool(lock.fragmentShaderPixelInterlock)
+	}
 
 	lock := vk.PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
 		sType                        = .PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
@@ -168,7 +185,7 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 	}
 	v13 := vk.PhysicalDeviceVulkan13Features {
 		sType                          = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-		pNext                          = pixel_interlock ? &lock : nil,
+		pNext                          = vkc.interlock ? &lock : nil,
 		synchronization2               = true,
 		shaderDemoteToHelperInvocation = true,
 		dynamicRendering               = true,
@@ -190,6 +207,7 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 			fragmentStoresAndAtomics = true,
 			shaderInt64              = b32(vkc.wide),
 			shaderFloat64            = b32(vkc.wide),
+			shaderStorageImageExtendedFormats = b32(vkc.interlock && want_interlock),
 		},
 	}
 	prio: f32 = 1
@@ -201,7 +219,7 @@ vk_device :: proc(pixel_interlock: bool) -> bool {
 	}
 	exts: [3]cstring
 	n_exts: u32
-	if pixel_interlock {exts[n_exts] = "VK_EXT_fragment_shader_interlock"; n_exts += 1}
+	if vkc.interlock {exts[n_exts] = "VK_EXT_fragment_shader_interlock"; n_exts += 1}
 	if vkc.local_read {exts[n_exts] = vk.KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME; n_exts += 1}
 	if vkc.surface != 0 {exts[n_exts] = "VK_KHR_swapchain"; n_exts += 1}
 	info := vk.DeviceCreateInfo {

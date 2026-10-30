@@ -30,4 +30,8 @@ layout(push_constant) uniform Push {
 	Uni u;
 	// 1 while a level lays down its depths (vk_target_submit).
 	int zpass;
+#ifdef INTERLOCK
+	// 1 when the level writes walk and door (its depth_on).
+	int tags;
+#endif
 } pc;

@@ -361,6 +361,13 @@ void main() {
 		}
 		discard;
 	}
+#ifdef INTERLOCK
+	// In queue order (draw.frag's interlock): a solid pixel drawn in full
+	// lays its depth as it draws, as the software target's z_write.
+	if ((fl & (F_Z_WRITE | F_TEXTURED)) == F_Z_WRITE && alpha >= 1.0 && !semi && zw != 0u) {
+		z_min(xy, zw);
+	}
+#endif
 	if (!have && (alpha < 1.0 || semi)) {
 		dst = main_at(xy);
 	}
@@ -397,6 +404,11 @@ void main() {
 			}
 			discard;
 		}
+#ifdef INTERLOCK
+		if ((fl & F_Z_WRITE) != 0 && alpha >= 1.0 && !semi && zw != 0u) {
+			z_min(xy, zw);
+		}
+#endif
 		uint t8;
 		if (soft && (semi || (fl & F_SMOOTH_ALL) != 0)) {
 			int sk = int(P.e.w);

@@ -7,14 +7,34 @@
 // in place (dynamic rendering local read), walk and door as their own
 // pictures, and the ghost layer and depth buffer as buffers, a pixel at
 // y * w + x.
+//
+// With INTERLOCK (draw_lock.frag.spv, when the device has ordered pixel
+// interlock), the pictures are storage images read and written inside the
+// interlock, which orders overlapping primitives' pixels in queue order: a
+// queue is then one level, and depths are tested and laid as the software
+// target does (no pass laying them first). A discard demotes, so every
+// invocation reaches the interlock's end; a helper's writes do nothing.
+#ifdef INTERLOCK
+#extension GL_ARB_fragment_shader_interlock : require
+#extension GL_EXT_demote_to_helper_invocation : require
+layout(pixel_interlock_ordered) in;
+#define discard demote
+#endif
 #include "prim.glsl"
 #define READ
 #include "draw_pc.glsl"
-layout(input_attachment_index = 0, set = 0, binding = 0) uniform usubpassInput main_in;
 layout(location = 0) flat in int pid;
+#ifdef INTERLOCK
+layout(set = 0, binding = 0, r32ui) coherent uniform uimage2D main_img;
+layout(set = 0, binding = 1, r16ui) coherent uniform uimage2D walk_img;
+layout(set = 0, binding = 2, r8ui) coherent uniform uimage2D door_img;
+uint out_c, out_walk, out_door;
+#else
+layout(input_attachment_index = 0, set = 0, binding = 0) uniform usubpassInput main_in;
 layout(location = 0) out uint out_c;
 layout(location = 1) out uint out_walk;
 layout(location = 2) out uint out_door;
+#endif
 // hi_draw.glsl's walk << 8 | door, split by main.
 uint out_tag;
 
@@ -31,7 +51,11 @@ uint vfetch(int x, int y) {
 // The target's pictures as hi_draw.glsl reads them: only ever at the
 // fragment's own pixel, which subpassLoad takes as given.
 uint main_at(ivec2 p) {
+#ifdef INTERLOCK
+	return imageLoad(main_img, p).r;
+#else
 	return subpassLoad(main_in).r;
+#endif
 }
 
 uint z_at(ivec2 p) {
@@ -81,6 +105,25 @@ void ghost_flush() {
 	out_c = fade_mix(m, gv.x & 0xffffffu, float(ga) / 255.0) & 0xffffffu | m & HI_KEPT;
 }
 
+#ifdef INTERLOCK
+void draw_lock();
+
+void main() {
+	beginInvocationInterlockARB();
+	draw_lock();
+	endInvocationInterlockARB();
+}
+
+// main's body, inside the interlock: the pictures written as the
+// attachments would be (walk and door only with pc.tags).
+void draw_lock() {
+	ivec2 xy = ivec2(gl_FragCoord.xy);
+	if (prims[pid].h.x < 0) {
+		ghost_flush();
+		imageStore(main_img, xy, uvec4(out_c));
+		return;
+	}
+#else
 void main() {
 	if (prims[pid].h.x < 0) {
 		ghost_flush();
@@ -88,6 +131,7 @@ void main() {
 		out_door = 0u;
 		return;
 	}
+#endif
 	see0 = pc.u.see[0];
 	see1 = pc.u.see[1];
 	see2 = pc.u.see[2];
@@ -101,4 +145,11 @@ void main() {
 	draw_main();
 	out_walk = out_tag >> 8 & 0xffffu;
 	out_door = out_tag & 255u;
+#ifdef INTERLOCK
+	imageStore(main_img, xy, uvec4(out_c));
+	if (pc.tags != 0) {
+		imageStore(walk_img, xy, uvec4(out_walk));
+		imageStore(door_img, xy, uvec4(out_door));
+	}
+#endif
 }
