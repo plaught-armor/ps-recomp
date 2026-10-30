@@ -20,13 +20,13 @@ jobs:
         run: |
           set -e
           for t in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
-            for p in core psx ps2 ps2/host; do
+            for p in core core/disc psx ps2 ps2/host; do
               echo "== $t $p"
               odin check $p -no-entry-point -collection:ps=. -target:$t -vet -strict-style
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/psx_bios tests/psx_bios_libc; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/psx_bios tests/psx_bios_libc tests/disc; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -56,7 +56,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          for p in core psx ps2 ps2/host; do odin check $p -no-entry-point -collection:ps=. -vet -strict-style; done
+          for p in core core/disc psx ps2 ps2/host; do odin check $p -no-entry-point -collection:ps=. -vet -strict-style; done
           odin check recomp -collection:ps=. -vet -strict-style
       - name: test
         if: ${{ !matrix.rosetta }}
@@ -82,6 +82,7 @@ jobs:
           odin run tests/ps2_kernel -collection:ps=. -out:ps2_kernel_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios -collection:ps=. -out:psx_bios_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios_libc -collection:ps=. -out:psx_bios_libc_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/disc -collection:ps=. -out:disc_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)
         if: ${{ matrix.rosetta }}
         run: |
@@ -98,6 +99,8 @@ jobs:
           arch -x86_64 ./psx_gte_test
           odin build tests/psx_timer -collection:ps=. -target:darwin_amd64 -out:psx_timer_test
           arch -x86_64 ./psx_timer_test
+          odin build tests/disc -collection:ps=. -target:darwin_amd64 -out:disc_test
+          arch -x86_64 ./disc_test
           odin build tests/fpu -collection:ps=. -target:darwin_amd64 -out:fpu_test
           arch -x86_64 ./fpu_test
           odin build tests/vu -collection:ps=. -target:darwin_amd64 -out:vu_test
