@@ -35,7 +35,6 @@ Checkpoint :: struct {
 	ram_check:  [RAM_SIZE when RAM_KEEP_CHECK else 0]u8,
 	scratch:    [cpu.SCRATCH_SIZE]u8,
 	vram:       [render.VRAM_W * render.VRAM_H]u16,
-	vram_key:   u32,
 	// The hi-res target's saved picture, and the depth and world undo.
 	pass:       render.Pass,
 	// The pass this one runs inside (a room drawn for an in-between
@@ -140,7 +139,6 @@ checkpoint_save :: proc(cp: ^Checkpoint) -> bool {
 	}
 	cp.scratch = cpu.scratch
 	cp.vram = render.vram
-	cp.vram_key = render.vram_key
 	cp.pass.hi_tiles = 0
 	cp.pass.hi_swapped = false
 	if render.target_count == 2 {
@@ -197,7 +195,6 @@ checkpoint_restore :: proc(cp: ^Checkpoint) {
 	cpu.ram_armed = true
 	cpu.scratch = cp.scratch
 	render.vram = cp.vram
-	render.vram_world(cp.vram_key)
 	if cp.pass.hi_swapped && render.hi_saved(&cp.pass) {
 		render.targets[1].rgb, cp.pass.hi = cp.pass.hi, render.targets[1].rgb
 	}

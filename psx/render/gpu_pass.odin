@@ -109,12 +109,3 @@ hi_copy_tiles :: proc(dst, src: []u32, mask: u128) #no_bounds_check {
 		}
 	}
 }
-
-// Name the VRAM a pass has just put in place (a room's, from key 1; 0 is
-// the machine's own).
-vram_world :: proc(key: u32) {
-	vram_key = key
-}
-
-// The VRAM in place, as vram_world named it.
-vram_key: u32
