@@ -1996,6 +1996,70 @@ quad_halves_apart :: proc(va, vb, vc, vd: Vertex) -> bool {
 	return s0 > 0 && s3 < 0 || s0 < 0 && s3 > 0
 }
 
+// Whether the polygon round fan is convex, so that the triangles of a fan
+// over it cover distinct pixels: going round, leaving out repeated corners,
+// its edges all turn one way or run straight on, and their x and y
+// directions each reverse at most twice. One folded back on itself, winding
+// round twice, or with a corner rounded a sixteenth of a pixel inward is
+// not.
+@(private)
+fan_convex :: proc(fan: []Vertex) -> bool {
+	n := len(fan)
+	turn: i64
+	first, last: [2]i64
+	// The first and latest nonzero direction along x and y.
+	dir0, dir: [2]i64
+	flips: [2]int
+	// The edges, then the first again to close the turns.
+	for i in 0 ..= n {
+		e := first
+		if i < n {
+			a, b := fan[i], fan[(i + 1) % n]
+			e = {i64(b.sx) - i64(a.sx), i64(b.sy) - i64(a.sy)}
+		}
+		if e == {} {
+			continue
+		}
+		if last != {} {
+			cross := last.x * e.y - last.y * e.x
+			if cross == 0 && last.x * e.x + last.y * e.y < 0 {
+				return false
+			}
+			if cross != 0 {
+				if turn != 0 && (cross > 0) != (turn > 0) {
+					return false
+				}
+				turn = cross
+			}
+		}
+		if i == n {
+			break
+		}
+		if first == {} {
+			first = e
+		}
+		for k in 0 ..< 2 {
+			if e[k] == 0 {
+				continue
+			}
+			if dir[k] != 0 && (e[k] > 0) != (dir[k] > 0) {
+				flips[k] += 1
+			}
+			if dir0[k] == 0 {
+				dir0[k] = e[k]
+			}
+			dir[k] = e[k]
+		}
+		last = e
+	}
+	for k in 0 ..< 2 {
+		if dir[k] != 0 && (dir[k] > 0) != (dir0[k] > 0) {
+			flips[k] += 1
+		}
+	}
+	return flips.x <= 2 && flips.y <= 2
+}
+
 @(private)
 exec_polygon :: proc(words: []u32) {
 	op := words[0] >> 24
@@ -2109,8 +2173,9 @@ exec_polygon :: proc(words: []u32) {
 	for &t in drawn_targets() {
 		if shape.kind == .World {
 			// A fan over a convex polygon: its triangles cover distinct
-			// pixels.
-			level_group(t.vk && shape.n > 3)
+			// pixels. Over any other, two of them can cover one pixel,
+			// which must not read the other's write unordered.
+			level_group(t.vk && shape.n > 3 && fan_convex(shape.fan[:shape.n]))
 			for k in 2 ..< shape.n {
 				draw_triangle(&t, &e, &m, shape.fan[0], shape.fan[k - 1], shape.fan[k])
 			}
