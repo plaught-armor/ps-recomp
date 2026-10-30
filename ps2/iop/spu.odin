@@ -178,7 +178,8 @@ spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 
 // Add the voices to interleaved stereo at MIX_RATE, the SPU2 output rate.
 // Each core sums its voices and reverb return wide and saturates once, at its
-// output, so voices that cancel do not clip on the way.
+// output, so voices that cancel do not clip on the way. Core 1's sum takes
+// CRI ADX's streams too (adx_mix).
 spu_mix :: proc(out: []i32) {
 	acc := make([]i32, len(out), context.temp_allocator)
 	for &core, c in spu.voice {
@@ -206,6 +207,7 @@ spu_mix :: proc(out: []i32) {
 			}
 		}
 		if wet {reverb_mix(w, send, acc)}
+		if c == ADX_CORE {adx_mix(acc)}
 		// The master volume scales the core's whole output, reverb included
 		// (an assumption from PCSX2 practice, not checked on hardware); 24
 		// loud voices times a volume overflow 32 bits.

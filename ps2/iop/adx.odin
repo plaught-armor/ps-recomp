@@ -9,8 +9,8 @@ import mem "../mem"
 // and sends the PCM; the driver consumes it at the stream's sample rate, so
 // the EE's playback clock (ADXT time, which Sofdec movies sync to) advances
 // as on hardware. What a round trip consumes is copied into the stream's
-// ring before the chunk goes back, and adx_mix plays the rings into the
-// host mix.
+// ring before the chunk goes back, and adx_mix plays the rings into core
+// 1's mix (spu_mix).
 //
 // Function numbers: 2/3 create/destroy a DTX (the EE<->IOP transfer channel,
 // {id, EE work, IOP work, size} -> handle); 0x400 + n are remote calls
@@ -328,10 +328,19 @@ adx_ring_put :: proc(o: ^Adx_Out, ch: int, addr, size: u32) {
 	}
 }
 
+// The SPU2 core the driver plays through. Its PSM output starts
+// sceSdBlockTrans (AutoDMA into the core's sound data input) on one core, a
+// global the module argument spucore= sets; Berserk passes spucore=1. The
+// input volume (BVOL) the driver sets to 0x7fff is not modeled. A fixed
+// value until a port shows another core.
+ADX_CORE :: 1
+
 // Add the playing streams to interleaved stereo at MIX_RATE, resampled from
-// each stream's rate. A stream starts, and restarts after running dry, only
-// once it holds two vblanks of PCM, since round trips deliver it in bursts.
-// Not clamped here: the host saturates the sum of every source once.
+// each stream's rate, into ADX_CORE's sum ahead of its master volume and its
+// one saturate (spu_mix). A stream starts, and restarts after running dry,
+// only once it holds two vblanks of PCM, since round trips deliver it in
+// bursts.
+@(private)
 adx_mix :: proc(out: []i32) {
 	for &r, k in adx.rna {
 		if r.handle == 0 || !r.playing || r.rate == 0 || r.channels == 0 {continue}

@@ -38,7 +38,6 @@ audio_frame :: proc(push: bool) {
 mix_frame :: proc(out: []i16) {
 	acc := make([]i32, len(out), context.temp_allocator)
 	iop.fmod_mix(acc)
-	iop.spu_mix(acc)
-	iop.adx_mix(acc)
+	iop.spu_mix(acc) // CRI ADX streams play through an SPU2 core
 	for x, i in acc {out[i] = i16(clamp(x, -32768, 32767))}
 }

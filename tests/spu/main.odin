@@ -14,12 +14,17 @@
 // saturates once at its output, and the host sum is left unclamped for the
 // host. A voice at pitch 0 holds its sample while its envelope steps. A
 // core's master volume (spu_master) scales its output before it saturates.
+// CRI ADX streams, driven through the driver's RPC and DTX packets, play
+// through core 1: its master volume scales them and its one saturate takes
+// them with its voices; core 0's master leaves them alone.
 package main
 
 import "core:fmt"
 import "core:os"
 import "ps:core"
+import cpu "ps:ps2/cpu"
 import iop "ps:ps2/iop"
+import mem "ps:ps2/mem"
 
 LOOP :: 0x1000 // start, plain, end with repeat
 ONCE :: 0x2000 // plain, end without repeat
@@ -48,6 +53,15 @@ REVERB_HASH := [9]u64 {
 	0xe3c21c5196cc3ef4,
 	0xcb6373d5bfd50937,
 }
+
+// CRI ADX: a chunk of constant PCM in IOP memory, the two DTX work buffers
+// on each side, and the EE's DMA list after its work buffers.
+ADX_PCM :: 0x10000
+ADX_SAMPLES :: 4096
+ADX_LEVEL :: 10000
+ADX_IOP_WORK :: 0x20000
+ADX_EE_WORK :: 0x100000
+ADX_WORK_SIZE :: 0x800
 
 rev: iop.Reverb // a work area too big for the stack
 failed: bool
@@ -175,8 +189,7 @@ wide :: proc() {
 	out = mix_onto(28, 30000)
 	check(out[54] > 32767, "a core adds onto the host sum unclamped")
 	iop.fmod_mix(out)
-	iop.adx_mix(out)
-	check(out[54] > 32767, "silent FMOD and ADX leave the host sum")
+	check(out[54] > 32767, "silent FMOD leaves the host sum")
 
 	// Pitch 0, as a game pauses a voice: the voice holds its sample while
 	// its envelope still steps, so a key off releases it to silence.
@@ -322,6 +335,86 @@ effects :: proc() {
 	iop.spu_effect_enable(0, false)
 }
 
+// Call CRI ADX's RPC function fno: the reply's first word.
+adx_call :: proc(fno: u32, args: ..u32) -> u32 {
+	buf: [64]u8
+	w := ([^]u32)(&buf)
+	for a, i in args {w[i] = a}
+	iop.sif.servers[0x90000200](fno, buf[:], u32(len(args) * 4))
+	return w[0]
+}
+
+// DMA DTX `id` a packet of entries from its EE work buffer.
+adx_packet :: proc(id: u32, entries: ..[4]u32) {
+	ee := ADX_EE_WORK + id * ADX_WORK_SIZE
+	mem.wr32(ee, u32(len(entries)))
+	for e, n in entries {
+		for x, k in e {mem.wr32(ee + 16 + u32(n * 16 + k * 4), x)}
+	}
+	list := u32(ADX_EE_WORK + 2 * ADX_WORK_SIZE)
+	mem.wr32(list, ee)
+	mem.wr32(list + 4, ADX_IOP_WORK + id * ADX_WORK_SIZE)
+	mem.wr32(list + 8, ADX_WORK_SIZE)
+	iop.sif_set_dma(list, 1)
+}
+
+// Play the chunk from its start, through a round trip a second after the
+// stream starts: its first vblank, mixed. Each run interpolates at the same
+// phases, so runs compare sample by sample.
+adx_run :: proc(rna, sjx: u32) -> []i32 {
+	adx_packet(0) // hands back what the last run held
+	adx_packet(1, {2, rna, 1, 0})
+	adx_packet(0, {0, sjx, ADX_PCM, ADX_SAMPLES * 2})
+	cpu.state.cycles += cpu.EE_CLOCK
+	adx_packet(0)
+	out := mix(800)
+	adx_packet(1, {2, rna, 0, 0})
+	return out
+}
+
+// out is the stream of `inv`, a run at master 0x4000 (an exact inversion),
+// scaled by l and r.
+scaled :: proc(out, inv: []i32, l, r: i64) -> bool {
+	for x, i in out {
+		if i64(x) != -i64(inv[i]) * (i & 1 == 0 ? l : r) >> 14 {return false}
+	}
+	return true
+}
+
+adx :: proc() {
+	for n in 0 ..< ADX_SAMPLES {
+		iop.iop_ram[ADX_PCM + n * 2] = u8(ADX_LEVEL & 0xff)
+		iop.iop_ram[ADX_PCM + n * 2 + 1] = u8(ADX_LEVEL >> 8)
+	}
+	for id in u32(0) ..< 2 {
+		adx_call(2, id, ADX_EE_WORK + id * ADX_WORK_SIZE, ADX_IOP_WORK + id * ADX_WORK_SIZE, ADX_WORK_SIZE)
+	}
+	sjx := adx_call(0x400, 0, 0x111, 0, 0) // fed by IOP stream joint 0x111
+	rna := adx_call(0x408, 1, 0, 0x111) // one channel, played on both sides
+	adx_packet(1, {4, rna, 48000, 0})
+
+	iop.spu_master(1, 0x4000, 0x4000)
+	inv := adx_run(rna, sjx)
+	heard := true
+	for x in inv {if x > -ADX_LEVEL * 9 / 10 {heard = false}}
+	check(heard, "ADX heard through core 1's master")
+	iop.spu_master(0, 0x2000, 0x2000)
+	check(scaled(adx_run(rna, sjx), inv, -0x4000, -0x4000), "core 0's master leaves ADX alone") // still inverted
+	iop.spu_master(1, 0x2ccc, 0x1000)
+	check(scaled(adx_run(rna, sjx), inv, 0x2ccc, 0x1000), "core 1's master scales ADX exactly")
+
+	// With a loud voice of core 1, the core saturates the sum once.
+	iop.spu_master(1, 0x3fff, 0x3fff)
+	iop.spu_voice_on(1, 10, key(WIDE))
+	out := adx_run(rna, sjx)
+	check(out[1500] == 32767 && out[1501] == 32767, "core 1 saturates its voices and ADX together")
+	iop.spu_voice_off(1, 10)
+	mix(4)
+	silent := true
+	for x in mix(4) {if x != 0 {silent = false}}
+	check(silent, "a stopped stream is silent")
+}
+
 game :: proc(_: rawptr) {
 	voices()
 	wide()
@@ -329,6 +422,7 @@ game :: proc(_: rawptr) {
 	reverb_presets()
 	reverb_fmod()
 	effects()
+	adx()
 	for n in 0 ..< BLOCKS {
 		b: [16]u8
 		b[0] = u8(n) << 4 // filters 0..2
@@ -361,6 +455,8 @@ game :: proc(_: rawptr) {
 main :: proc() {
 	core.snap_init(1 << 20)
 	iop.spu_snap()
+	mem.mem_init()
+	iop.sif_init()
 	context.allocator = core.emu_allocator()
 	core.co_allocator = context.allocator
 	core.snap_run(core.co_create(game, nil))
