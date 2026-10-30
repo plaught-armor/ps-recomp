@@ -8,10 +8,11 @@
 //   emit    the function calls a cpu. or gte. procedure not declared
 //           #force_inline in FILES (read from the repository root, as CI
 //           runs the test); a called name declared in neither form fails.
-//   native  the function makes a host call through an import slot
-//           (x64 `call [rip+slot]`), counted on X64_SysV only: arm64 runs
-//           the same op() paths but is not scanned. Data imports and the
-//           shared load and store slow routines are not calls of the word.
+//   native  the function makes a host call through an import slot, for
+//           X64_SysV (`call [rip+slot]`) and Arm64 (the slot's adrp and
+//           ldr into x16, then `blr x16`), assembled only; both must call
+//           the same helpers. Data imports and the shared load and store
+//           slow routines are not calls of the word.
 //
 // Calls the function makes without the word ([nop, jr ra, nop]) are taken
 // out. Neither backend leaves a word to the interpreter: an unknown one is
@@ -56,9 +57,11 @@ FILES :: [?][2]string {
 
 Backend :: enum {
 	Emit,
-	Native,
+	X64,
+	Arm64,
 }
 Backends :: bit_set[Backend]
+NATIVE :: Backends{.X64, .Arm64}
 
 Allowed :: struct {
 	match:    proc(w: u32) -> bool,
@@ -69,22 +72,22 @@ Allowed :: struct {
 
 // The handoffs there are on purpose.
 ALLOWED := [?]Allowed {
-	{proc(w: u32) -> bool {return w >> 26 == 0 && w & 0x3f == 0x0c}, {.Emit, .Native}, "cpu.syscall", "SYSCALL: the HLE BIOS call"},
-	{proc(w: u32) -> bool {return w >> 26 == 0 && w & 0x3f == 0x0d}, {.Emit, .Native}, "cpu.brk", "BREAK: an HLE report"},
-	{proc(w: u32) -> bool {return w >> 21 == 0x204}, {.Emit, .Native}, "cpu.mtc0", "MTC0: an SR or Cause write can raise a pending interrupt"},
-	{proc(w: u32) -> bool {return w >> 21 == 0x210 && w & 0x3f == 0x10}, {.Emit, .Native}, "cpu.rfe", "RFE: the SR pop can unmask a pending interrupt"},
-	{proc(w: u32) -> bool {return w >> 26 == 0x22}, {.Emit, .Native}, "cpu.lwl", "LWL unfused: lower fuses the pairs, a lone one is cold"},
-	{proc(w: u32) -> bool {return w >> 26 == 0x26}, {.Emit, .Native}, "cpu.lwr", "LWR unfused: lower fuses the pairs, a lone one is cold"},
-	{proc(w: u32) -> bool {return w >> 26 == 0x2a}, {.Emit, .Native}, "cpu.swl", "SWL unfused: lower fuses the pairs, a lone one is cold"},
-	{proc(w: u32) -> bool {return w >> 26 == 0x2e}, {.Emit, .Native}, "cpu.swr", "SWR unfused: lower fuses the pairs, a lone one is cold"},
-	{proc(w: u32) -> bool {return gte_cmd(w, 0x01)}, {.Emit, .Native}, "gte.cmd_rtps", "RTPS: its own proc, given the command word"},
-	{proc(w: u32) -> bool {return gte_cmd(w, 0x30)}, {.Emit, .Native}, "gte.cmd_rtpt", "RTPT: its own proc, given the command word"},
-	{proc(w: u32) -> bool {return gte_cmd(w, 0x12)}, {.Emit, .Native}, "gte.cmd_mvmva", "MVMVA: its own proc, given the command word"},
+	{proc(w: u32) -> bool {return w >> 26 == 0 && w & 0x3f == 0x0c}, {.Emit} + NATIVE, "cpu.syscall", "SYSCALL: the HLE BIOS call"},
+	{proc(w: u32) -> bool {return w >> 26 == 0 && w & 0x3f == 0x0d}, {.Emit} + NATIVE, "cpu.brk", "BREAK: an HLE report"},
+	{proc(w: u32) -> bool {return w >> 21 == 0x204}, {.Emit} + NATIVE, "cpu.mtc0", "MTC0: an SR or Cause write can raise a pending interrupt"},
+	{proc(w: u32) -> bool {return w >> 21 == 0x210 && w & 0x3f == 0x10}, {.Emit} + NATIVE, "cpu.rfe", "RFE: the SR pop can unmask a pending interrupt"},
+	{proc(w: u32) -> bool {return w >> 26 == 0x22}, {.Emit} + NATIVE, "cpu.lwl", "LWL unfused: lower fuses the pairs, a lone one is cold"},
+	{proc(w: u32) -> bool {return w >> 26 == 0x26}, {.Emit} + NATIVE, "cpu.lwr", "LWR unfused: lower fuses the pairs, a lone one is cold"},
+	{proc(w: u32) -> bool {return w >> 26 == 0x2a}, {.Emit} + NATIVE, "cpu.swl", "SWL unfused: lower fuses the pairs, a lone one is cold"},
+	{proc(w: u32) -> bool {return w >> 26 == 0x2e}, {.Emit} + NATIVE, "cpu.swr", "SWR unfused: lower fuses the pairs, a lone one is cold"},
+	{proc(w: u32) -> bool {return gte_cmd(w, 0x01)}, {.Emit} + NATIVE, "gte.cmd_rtps", "RTPS: its own proc, given the command word"},
+	{proc(w: u32) -> bool {return gte_cmd(w, 0x30)}, {.Emit} + NATIVE, "gte.cmd_rtpt", "RTPT: its own proc, given the command word"},
+	{proc(w: u32) -> bool {return gte_cmd(w, 0x12)}, {.Emit} + NATIVE, "gte.cmd_mvmva", "MVMVA: its own proc, given the command word"},
 	{proc(w: u32) -> bool {
 			fn := w & 0x3f
 			return w >> 25 == 0x25 && fn != 0x01 && fn != 0x30 && fn != 0x12 && fn != 0x06 && fn != 0x2d && fn != 0x2e
-		}, {.Emit, .Native}, "gte.gte_cmd", "the other GTE commands: the generic command helper"},
-	{proc(w: u32) -> bool {return w >> 21 == 0x246 && w >> 11 & 31 <= 7}, {.Native}, "gte.gte_write", "CTC2 32-39: the matrix filter hook, called only when one is set"},
+		}, {.Emit} + NATIVE, "gte.gte_cmd", "the other GTE commands: the generic command helper"},
+	{proc(w: u32) -> bool {return w >> 21 == 0x246 && w >> 11 & 31 <= 7}, NATIVE, "gte.gte_write", "CTC2 32-39: the matrix filter hook, called only when one is set"},
 }
 
 @(private = "file")
@@ -189,13 +192,32 @@ emit_calls :: proc(code: string) -> [dynamic]string {
 	return calls
 }
 
-// The imports the native code calls, from import reference first on.
+// The imports the native code from offset from calls, its import
+// references from first on. On Arm64 every blr x16 must be such a call.
 @(private = "file")
-native_calls :: proc(a: ^native.Asm, first: int) -> [dynamic]string {
+native_calls :: proc(a: ^native.Asm, from, first: int) -> [dynamic]string {
 	calls: [dynamic]string
+	if a.arch == .Arm64 {
+		for at := from; at + 4 <= len(a.code); at += 4 {
+			if (^u32le)(&a.code[at])^ != 0xd63f0200 {continue}
+			found := false
+			for k in first ..< len(a.imp_refs) {
+				if a.imp_refs[k].at == at - 8 {found = true}
+			}
+			if !found {fail("arm64 blr x16 at %x without an import slot load before it", at)}
+		}
+	}
 	for k in first ..< len(a.imp_refs) {
 		at := a.imp_refs[k].at
-		if a.code[at - 2] == 0xff && a.code[at - 1] == 0x15 {append(&calls, a.imports[a.imp_refs[k].target])}
+		call: bool
+		switch a.arch {
+		case .X64_SysV, .X64_Win:
+			call = a.code[at - 2] == 0xff && a.code[at - 1] == 0x15
+		case .Arm64:
+			// at is the adrp; blr x16 follows the ldr
+			call = at + 12 <= len(a.code) && (^u32le)(&a.code[at + 8])^ == 0xd63f0200
+		}
+		if call {append(&calls, a.imports[a.imp_refs[k].target])}
 	}
 	return calls
 }
@@ -212,7 +234,11 @@ without :: proc(calls: [dynamic]string, base: []string) -> []string {
 
 main :: proc() {
 	decls := declarations()
-	na := native.make_asm(.X64_SysV, r3000.native_ram(), r3000.NATIVE_CACHED[:])
+	na := [Backend]native.Asm {
+		.Emit  = {},
+		.X64   = native.make_asm(.X64_SysV, r3000.native_ram(), r3000.NATIVE_CACHED[:]),
+		.Arm64 = native.make_asm(.Arm64, r3000.native_ram(), r3000.NATIVE_CACHED[:]),
+	}
 	at := u32(0x80002000)
 
 	gen :: proc(b: Backend, na: ^native.Asm, at: u32, w: u32) -> [dynamic]string {
@@ -222,12 +248,12 @@ main :: proc() {
 			r3000.emit_func(f, &sb, "f", nil, 1)
 			return emit_calls(strings.to_string(sb))
 		}
-		first := len(na.imp_refs)
+		from, first := len(na.code), len(na.imp_refs)
 		r3000.native_func(na, f, nil, 1)
-		return native_calls(na, first)
+		return native_calls(na, from, first)
 	}
 	base: [Backend][dynamic]string
-	for b in Backend {base[b] = gen(b, &na, at, 0)}
+	for b in Backend {base[b] = gen(b, &na[b], at, 0)}
 
 	used := make([]bool, len(ALLOWED))
 	cases, left: [Backend]int
@@ -238,15 +264,20 @@ main :: proc() {
 		calls: [Backend][]string
 		bad: [Backend]bool
 		for b in Backend {
-			calls[b] = without(gen(b, &na, at, w), base[b][:])
+			calls[b] = without(gen(b, &na[b], at, w), base[b][:])
 			bad[b] = slice.contains(calls[b], "cpu.bad_insn")
 		}
-		if bad[.Emit] != bad[.Native] {
-			fail("%08x: not an instruction to %v only", w, bad[.Emit] ? Backend.Emit : Backend.Native)
+		if bad[.Emit] != bad[.X64] || bad[.X64] != bad[.Arm64] {
+			fail("%08x: not an instruction to %v", w, bad)
 		}
-		if bad[.Emit] || bad[.Native] {
+		if bad[.Emit] || bad[.X64] || bad[.Arm64] {
 			not_insn += 1
 			continue
+		}
+		slice.sort(calls[.X64])
+		slice.sort(calls[.Arm64])
+		if !slice.equal(calls[.X64], calls[.Arm64]) {
+			fail("%08x: x64 calls %v, arm64 %v", w, calls[.X64], calls[.Arm64])
 		}
 		for b in Backend {
 			cases[b] += 1
@@ -278,7 +309,8 @@ main :: proc() {
 		if !used[k] {fail("ALLOWED %s (%s) never occurs", e.helper, e.reason)}
 	}
 	fmt.printfln("psx_cover emit: %d cases, %d left to a helper", cases[.Emit], left[.Emit])
-	fmt.printfln("psx_cover native: %d cases, %d left to a helper", cases[.Native], left[.Native])
+	fmt.printfln("psx_cover native x64: %d cases, %d left to a helper", cases[.X64], left[.X64])
+	fmt.printfln("psx_cover native arm64: %d cases, %d left to a helper", cases[.Arm64], left[.Arm64])
 	fmt.printfln("psx_cover: %d words not instructions", not_insn)
 	if failed > 0 {
 		fmt.eprintfln("psx_cover: %d failures", failed)
