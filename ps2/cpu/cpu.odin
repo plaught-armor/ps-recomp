@@ -128,6 +128,18 @@ brk :: proc(pc, w: u32) {
 	fatal("break %d at %08x", (w >> 6) & 0xfffff, pc)
 }
 
+// For tests only: with trap_hook set, a trap calls it in place of fatal and
+// the guest carries on past the trap.
+trap_hook: proc(pc: u32)
+
+trap :: proc(pc: u32) {
+	if trap_hook != nil {
+		trap_hook(pc)
+		return
+	}
+	fatal("trap at %08x", pc)
+}
+
 fatal :: proc(format: string, args: ..any) -> ! {
 	fmt.eprint("ee: ")
 	fmt.eprintfln(format, ..args)

@@ -162,8 +162,8 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.alu(a, .Sub if sub else .Add, .A, .C)
 		put(a, d, .A, high = true)
 	}
-	// d = s < (B, LD) as doublewords, signed or not
-	less64 :: proc(a: ^native.Asm, d, s: u8, signed: bool) {
+	// A = s < (B, LD) as doublewords, signed or not, 1 or 0
+	less64_cond :: proc(a: ^native.Asm, s: u8, signed: bool) {
 		get(a, .A, s, high = true)
 		native.mov(a, .C, .A)
 		native.set_cond(a, .Lt if signed else .Ltu, .C, .LD)
@@ -172,6 +172,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.set_cond(a, .Ltu, .LD, .B)
 		native.alu(a, .And, .A, .LD)
 		native.alu(a, .Or, .A, .C)
+	}
+	// d = s < (B, LD) as doublewords, signed or not
+	less64 :: proc(a: ^native.Asm, d, s: u8, signed: bool) {
+		less64_cond(a, s, signed)
 		put(a, d, .A)
 		native.state_store_imm(a, GPR * u32(d) + 4, 0)
 	}
@@ -882,9 +886,12 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		interp(a, i)
 		native.bind(a, done)
 	case .MFC0:
-		if rd == 15 {return false} // PRId stays in the interpreter
 		if rt == 0 {return true}
-		native.state_load(a, .A, CYCLES if rd == 9 else COP0 + 4 * u32(rd))
+		if rd == 15 {
+			native.mov_imm(a, .A, 0x2e20) // PRId, as the interpreter
+		} else {
+			native.state_load(a, .A, CYCLES if rd == 9 else COP0 + 4 * u32(rd))
+		}
 		put_sx(a, rt, .A)
 	case .DI:
 		native.state_load(a, .A, COP0 + 4 * 12)
@@ -930,7 +937,35 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.mov_imm(a, .A, i.pc)
 		native.mov_imm(a, .B, i.w)
 		native.call(a, "cpu.brk", .A, .B)
-	case .SYNC, .CACHE, .PREF:
+	case .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI:
+		cmp, negate, by_imm, ok := trap_test(i)
+		if !ok {return true}
+		// (B, LD) = rt or the immediate; A = cmp, then cpu.trap unless it
+		// says no. Nothing is written on the way.
+		if by_imm {
+			native.mov_imm(a, .B, simm)
+			native.mov_imm(a, .LD, simm_hi)
+		} else {
+			get(a, .B, rt)
+			get(a, .LD, rt, high = true)
+		}
+		if cmp == .Eq {
+			get(a, .A, rs)
+			native.alu(a, .Xor, .A, .B)
+			get(a, .C, rs, high = true)
+			native.alu(a, .Xor, .C, .LD)
+			native.alu(a, .Or, .A, .C)
+			native.set_cond_imm(a, .Eq, .A, 0)
+		} else {
+			less64_cond(a, rs, cmp == .Lt)
+		}
+		if negate {native.alu_imm(a, .Xor, .A, 1)}
+		skip := native.new_label(a)
+		native.br_zero(a, .A, skip)
+		call_imm(a, "cpu.trap", i.pc)
+		native.bind(a, skip)
+	// No TLB: nothing, as the interpreter.
+	case .SYNC, .CACHE, .PREF, .TLBR, .TLBWI, .TLBWR, .TLBP:
 	case:
 		return false
 	}

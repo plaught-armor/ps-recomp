@@ -60,6 +60,36 @@ addr_expr :: proc(i: Insn) -> string {
 
 F :: proc(n: u8) -> string {return fmt.tprintf("c.f[%d].f", n)}
 
+Trap_Cmp :: enum u8 {
+	Lt,
+	Ltu,
+	Eq,
+}
+
+// A trap's test, as the interpreter's: rs against rt, or for TRAPI the
+// sign-extended immediate, as doublewords; it traps when cmp holds, or with
+// negate when it does not. ok is false for the TRAPI form that never traps.
+trap_test :: proc(i: Insn) -> (cmp: Trap_Cmp, negate, by_imm, ok: bool) {
+	#partial switch i.op {
+	case .TGE:  return .Lt, true, false, true
+	case .TGEU: return .Ltu, true, false, true
+	case .TLT:  return .Lt, false, false, true
+	case .TLTU: return .Ltu, false, false, true
+	case .TEQ:  return .Eq, false, false, true
+	case .TNE:  return .Eq, true, false, true
+	case .TRAPI:
+		switch i.rt {
+		case 8:  return .Lt, true, true, true // TGEI
+		case 9:  return .Ltu, true, true, true // TGEIU
+		case 10: return .Lt, false, true, true // TLTI
+		case 11: return .Ltu, false, true, true // TLTIU
+		case 12: return .Eq, false, true, true // TEQI
+		case 14: return .Eq, true, true, true // TNEI
+		}
+	}
+	return
+}
+
 // Count i, a site that calls the interpreter, in slow: by op, or a VU0 macro
 // op by its function as recomp/vu counts a VU1 upper one. The keys outlive
 // the temp allocator, which each function frees.
@@ -200,7 +230,19 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 		if rt != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = mem.%v(%s, %s)", rt, i.op, addr_expr(i), R64(rt)))}
 	case .SWL, .SWR, .SDL, .SDR:
 		append(out, fmt.tprintf("mem.%v(%s, %s)", i.op, addr_expr(i), R64(rt)))
-	case .SYNC, .CACHE, .PREF:
+	// No TLB: nothing, as the interpreter.
+	case .SYNC, .CACHE, .PREF, .TLBR, .TLBWI, .TLBWR, .TLBP:
+	case .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI:
+		cmp, negate, by_imm, ok := trap_test(i)
+		if !ok {return}
+		x, y: string
+		if cmp == .Lt {
+			x, y = S64(rs), by_imm ? fmt.tprintf("i64(%d)", simm) : S64(rt)
+		} else {
+			x, y = R64(rs), by_imm ? fmt.tprintf("u64(0x%x)", u64(i64(simm))) : R64(rt)
+		}
+		op := cmp == .Eq ? (negate ? "!=" : "==") : (negate ? ">=" : "<")
+		append(out, fmt.tprintf("if %s %s %s {{cpu.trap(%s)}}", x, op, y, hexu(i.pc)))
 	case .MFC1: set64(out, rt, fmt.tprintf("sx32(c.f[%d].u)", fs))
 	case .MTC1: append(out, fmt.tprintf("c.f[%d].u = %s", fs, R32(rt)))
 	case .MOV_S: append(out, fmt.tprintf("c.f[%d] = c.f[%d]", fd, fs))
@@ -238,7 +280,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	     .BLTZ, .BGEZ, .BLTZL, .BGEZL, .BLTZAL, .BGEZAL, .BLTZALL, .BGEZALL,
 	     .BC0F, .BC0T, .BC0FL, .BC0TL, .BC1F, .BC1T, .BC1FL, .BC1TL, .BC2F, .BC2T, .BC2FL, .BC2TL:
 		panic("control transfer in emit_op")
-	case .MTSA, .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI, .MTSAB, .MTSAH,
+	case .MTSA, .MTSAB, .MTSAH,
 	     .PMFHL, .PMTHL,
 	     .PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW,
 	     .PADDW, .PSUBW, .PCGTW, .PMAXW, .PADDH, .PSUBH, .PCGTH, .PMAXH, .PADDB, .PSUBB, .PCGTB,
@@ -249,7 +291,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	     .PMADDW, .PSLLVW, .PSRLVW, .PMSUBW, .PMFHI, .PMFLO, .PINTH, .PMULTW, .PDIVW, .PCPYLD,
 	     .PMADDH, .PHMADH, .PAND, .PXOR, .PMSUBH, .PHMSBH, .PEXEH, .PREVH, .PMULTH, .PDIVBW, .PEXEW, .PROT3W,
 	     .PMADDUW, .PSRAVW, .PMTHI, .PMTLO, .PINTEH, .PMULTUW, .PDIVUW, .PCPYUD, .POR, .PNOR, .PEXCH, .PCPYH, .PEXCW,
-	     .MFC0, .TLBR, .TLBWI, .TLBWR, .TLBP, .EI, .DI:
+	     .MFC0, .EI, .DI:
 		append(out, fmt.tprintf("ps2.exec_insn({{pc = %s, w = %s, op = .%v, rs = %d, rt = %d, rd = %d, sa = %d, fn = %d, imm = %d}})",
 			hexu(i.pc), hexu(i.w), i.op, i.rs, i.rt, i.rd, i.sa, i.fn, i.imm))
 		return true
@@ -311,8 +353,7 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 		append(out, fmt.tprintf("c.sa = ((%s ~ %d) & 7) * 16", R32(i.rs), u32(i.imm) & 7))
 		return true
 	case .MFC0:
-		if i.rd == 15 {return false} // PRId stays in the interpreter
-		src := i.rd == 9 ? "u32(c.cycles)" : fmt.tprintf("c.cop0[%d]", i.rd)
+		src := i.rd == 9 ? "u32(c.cycles)" : i.rd == 15 ? "u32(0x2e20)" : fmt.tprintf("c.cop0[%d]", i.rd)
 		if i.rt != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = sx32(%s)", i.rt, src))}
 		return true
 	case .DI:

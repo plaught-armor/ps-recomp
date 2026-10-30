@@ -205,6 +205,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["cpu.jump_unknown"] = p(rawptr(cpu.jump_unknown))
 	m["cpu.bad_insn"] = p(rawptr(cpu.bad_insn))
 	m["cpu.brk"] = p(rawptr(cpu.brk))
+	m["cpu.trap"] = p(rawptr(cpu.trap))
 	m["cpu.div"] = p(rawptr(cpu.div))
 	m["cpu.divu"] = p(rawptr(cpu.divu))
 	m["cpu.plzcw"] = p(rawptr(cpu.plzcw))

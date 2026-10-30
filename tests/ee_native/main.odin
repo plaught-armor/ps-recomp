@@ -90,6 +90,49 @@ align :: proc(op: r5900.Op) -> u32 {
 // An access of rt at UNALIGNED_OFF(rs = 1); rt = 1 is rs.
 @(private = "file")
 unaligned :: proc(op, rt: u32) -> u32 {return op << 26 | 1 << 21 | rt << 16 | UNALIGNED_OFF}
+// A REGIMM trap of rs = 1 against the immediate, by its rt field.
+@(private = "file")
+trapi :: proc(rt, imm: u32) -> u32 {return 1 << 26 | 1 << 21 | rt << 16 | imm}
+
+// cpu.trap_hook here: whether a trap was called, and its pc.
+@(private = "file")
+trapped: bool
+@(private = "file")
+trapped_pc: u32
+@(private = "file")
+trap_hook :: proc(pc: u32) {trapped, trapped_pc = true, pc}
+
+// Whether trap word w (rs = 1) traps with x in r1 and y in r2, from the
+// encoding, apart from the backends.
+@(private = "file")
+trap_taken :: proc(w: u32, x, y: u64) -> bool {
+	s, imm := x, u64(i64(i16(w)))
+	t: u64
+	switch (w >> 16) & 31 {
+	case 1: t = x
+	case 2: t = y
+	}
+	if w >> 26 == 0 {
+		switch w & 63 {
+		case 0x30: return i64(s) >= i64(t)
+		case 0x31: return s >= t
+		case 0x32: return i64(s) < i64(t)
+		case 0x33: return s < t
+		case 0x34: return s == t
+		case 0x36: return s != t
+		}
+	} else if w >> 26 == 1 {
+		switch (w >> 16) & 31 {
+		case 8:  return i64(s) >= i64(imm)
+		case 9:  return s >= imm
+		case 10: return i64(s) < i64(imm)
+		case 11: return s < imm
+		case 12: return s == imm
+		case 14: return s != imm
+		}
+	}
+	return false
+}
 
 // The operation numbers native code passes to cpu.fpu_slow.
 #assert(int(r5900.Fpu_Op.Add) == int(cpu.Fpu_Op.Add))
@@ -513,7 +556,33 @@ main :: proc() {
 		{0x40036000, .MFC0}, // r3 = Status
 		{0x40037000, .MFC0}, // r3 = EPC
 		{0x40007000, .MFC0}, // to r0
-		{0x4003f000, .MFC0}, // PRId: the interpreter
+		{0x4003f000, .MFC0}, // PRId
+		// Traps: a taken one calls cpu.trap_hook, set here
+		{special(0x30), .TGE},
+		{special(0x31), .TGEU},
+		{special(0x32), .TLT},
+		{special(0x33), .TLTU},
+		{special(0x34), .TEQ},
+		{special(0x36), .TNE},
+		{special(0x34) &~ (31 << 16), .TEQ}, // rt = 0
+		{special(0x36) &~ (31 << 16) | 1 << 16, .TNE}, // rs = rt: never
+		{trapi(8, 0), .TRAPI}, // TGEI
+		{trapi(8, 0x8000), .TRAPI},
+		{trapi(9, 0xffff), .TRAPI}, // TGEIU
+		{trapi(9, 0x7fff), .TRAPI},
+		{trapi(10, 0), .TRAPI}, // TLTI
+		{trapi(10, 0x7fff), .TRAPI},
+		{trapi(11, 0x8000), .TRAPI}, // TLTIU
+		{trapi(11, 1), .TRAPI},
+		{trapi(12, 0x45), .TRAPI}, // TEQI
+		{trapi(12, 0xffff), .TRAPI},
+		{trapi(13, 0), .TRAPI}, // never traps
+		{trapi(14, 0), .TRAPI}, // TNEI
+		{trapi(14, 0x8000), .TRAPI},
+		{0x42000001, .TLBR},
+		{0x42000002, .TLBWI},
+		{0x42000006, .TLBWR},
+		{0x42000008, .TLBP},
 		{0x44811800, .MTC1}, // f3 = r1
 		{0x44030800, .MFC1}, // r3 = f1, sign-extended
 		{cop2(1, 3), .QMFC2},
@@ -942,6 +1011,8 @@ main :: proc() {
 		os.exit(1)
 	}
 	cpu.next_event = max(u64)
+	cpu.trap_hook = trap_hook
+	defer cpu.trap_hook = nil
 	failed, checks := 0, 0
 	// VU0 data memory as each check starts and as the native code leaves it.
 	vu_mem, native_mem: [vu.VU0_MEM]u8
@@ -990,12 +1061,25 @@ main :: proc() {
 				for &b, i in vu_mem {b = u8(u32(i) * 0x9d ~ u32(k) * 0x3b ~ u32(x) ~ u32(i >> 8))}
 				cpu.state, vu.vu0 = start, vu_start
 				copy(vu.vu0.mem, vu_mem[:])
+				trapped = false
 				run()
+				native_trapped, native_pc := trapped, trapped_pc
 				native_got, native_vu := cpu.state, vu.vu0
 				copy(native_mem[:], vu.vu0.mem)
 				cpu.state, vu.vu0 = start, vu_start
 				copy(vu.vu0.mem, vu_mem[:])
+				trapped = false
 				ps2.exec_insn(r5900.decode(funcs[k].addr, c.w))
+				// A trap calls cpu.trap at its pc in both, exactly when the
+				// encoding says; the state compare below shows nothing written.
+				if taken := trap_taken(c.w, x, y); taken || native_trapped || trapped {
+					checks += 1
+					if !taken || !native_trapped || !trapped || native_pc != funcs[k].addr || trapped_pc != funcs[k].addr {
+						failed += 1
+						fmt.eprintfln("FAIL %v %08x rs %016x rt %016x: trap %v, native %v at %08x, interp %v at %08x",
+							c.op, c.w, x, y, taken, native_trapped, native_pc, trapped, trapped_pc)
+					}
+				}
 				// The native function charges its cycles; the interpreter
 				// leaves that to its caller.
 				native_got.cycles = cpu.state.cycles

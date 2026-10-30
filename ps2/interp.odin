@@ -55,7 +55,7 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 			case 14: trap = s.sd[0] != v
 			}
 		}
-		if trap {cpu.fatal("trap at %08x", pc)}
+		if trap {cpu.trap(pc)}
 		return
 	case .MADD:   cpu.madd(i.rd, u32(s.d[0]), u32(t.d[0]), 0, true); return
 	case .MADDU:  cpu.madd(i.rd, u32(s.d[0]), u32(t.d[0]), 0, false); return
