@@ -288,6 +288,9 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 	view, expr: string
 	sh := i.sa & 15
 	#partial switch i.op {
+	case .MTSA:
+		append(out, fmt.tprintf("c.sa = %s & 127", R32(i.rs)))
+		return true
 	case .MTSAB:
 		append(out, fmt.tprintf("c.sa = ((%s ~ %d) & 15) * 8", R32(i.rs), u32(i.imm) & 15))
 		return true

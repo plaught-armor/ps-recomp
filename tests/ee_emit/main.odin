@@ -2,8 +2,8 @@
 // against the interpreter's exec_insn. Two steps in one command: this
 // program generates cases/main.odin, one proc per instruction word emit_op
 // inlines (every MMI word the decoder maps to a covered op, the MADD family,
-// SQRT.S, RSQRT.S, MUL.S, MULA.S, MADD.S, MTSAB and MTSAH, with rd 0, rs/rt
-// 0 and aliased registers, and every shift amount for the shifts by sa),
+// SQRT.S, RSQRT.S, MUL.S, MULA.S, MADD.S, MTSA, MTSAB and MTSAH, with rd 0,
+// rs/rt 0 and aliased registers, and every shift amount for the shifts by sa),
 // then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
 // leave the whole cpu.state as exec_insn leaves it. The seed is fixed, so a
@@ -33,7 +33,7 @@ COVERED :: Ops{
 	.PSLLH, .PSRLH, .PSRAH, .PAND, .POR, .PXOR, .PNOR, .PCPYLD, .PCPYUD, .PCPYH,
 	.PEXTLB, .PEXTUB, .PEXTLH, .PEXTUH, .PEXTLW, .PEXTUW, .PPACB, .PPACH,
 	.PADDSH, .PADDUW, .PSRAW, .PHMADH, .MADD, .MADDU, .MADD1, .MADDU1, .MTHI1, .MTLO1, .SQRT_S, .RSQRT_S,
-	.MUL_S, .MULA_S, .MADD_S, .MTSAB, .MTSAH,
+	.MUL_S, .MULA_S, .MADD_S, .MTSA, .MTSAB, .MTSAH,
 	.MTC0, .ERET, .CFC1, .CTC1,
 }
 // The shifts by sa: every amount gets a case.
@@ -61,7 +61,8 @@ main :: proc() {
 		for fn in ([?]u32{0x02, 0x1a, 0x1c}) {
 			append(&words, 0x11 << 26 | 0x10 << 21 | r[1] << 16 | r[0] << 11 | r[2] << 6 | fn)
 		}
-		// MTSAB and MTSAH from rs
+		// MTSA, MTSAB and MTSAH from rs
+		append(&words, r[0] << 21 | 0x29)
 		append(&words, 0x01 << 26 | r[0] << 21 | 0x18 << 16 | 0xfff5, 0x01 << 26 | r[0] << 21 | 0x19 << 16 | 0x0006)
 	}
 	// COP0 and COP1 moves: MTC0 Status, EPC and Wired (from r0), ERET,

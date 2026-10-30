@@ -624,6 +624,11 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		case .C_LT_S: fpu_compare(a, .Lt, fs, ft)
 		case .C_LE_S: fpu_compare(a, .Le, fs, ft)
 		}
+	case .MTSA:
+		// SA = rs, a bit count, masked as the interpreter does
+		get(a, .A, rs)
+		native.alu_imm(a, .And, .A, 127)
+		native.state_store(a, SA, .A)
 	case .MTSAB, .MTSAH:
 		// SA = (rs ^ imm) in bytes (MTSAB) or halfwords, as a bit count
 		get(a, .A, rs)

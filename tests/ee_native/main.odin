@@ -298,6 +298,7 @@ main :: proc() {
 		{special2(0x14, 15, 0), .VU0}, // VFTOI0 to vf0
 		{special2(0x1d), .VU0}, // VABS
 		{special2(0x1d, 0xa, 1), .VU0}, // VABS.xz in place
+		{0x00200029, .MTSA}, // r1 & 127
 		{0x04380005, .MTSAB}, // r1 ^ 5
 		{0x0439fffb, .MTSAH}, // r1 ^ 0xfffb
 		{cop1(0x00), .ADD_S},
