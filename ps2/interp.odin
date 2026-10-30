@@ -30,7 +30,8 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 	d: cpu.Gpr
 	write_rd := true
 	switch i.op {
-	case .MFSA: d.d[0] = u64(c.sa)
+	// The low doubleword of rd only; the high one stays, as for MFHI.
+	case .MFSA: if i.rd != 0 {c.r[i.rd].d[0] = u64(c.sa)}; write_rd = false
 	case .MTSA: c.sa = u32(s.d[0]) & 127; write_rd = false
 	case .MTSAB: c.sa = ((u32(s.d[0]) ~ u32(i.imm)) & 15) * 8; write_rd = false
 	case .MTSAH: c.sa = ((u32(s.d[0]) ~ u32(i.imm)) & 7) * 16; write_rd = false

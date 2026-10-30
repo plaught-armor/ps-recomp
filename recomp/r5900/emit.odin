@@ -110,6 +110,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 		if rd != 0 {append(out, fmt.tprintf("if %s != 0 {{c.r[%d].d[0] = %s}}", R64(rt), rd, R64(rs)))}
 	case .MFHI: set64(out, rd, "c.hi.d[0]")
 	case .MFLO: set64(out, rd, "c.lo.d[0]")
+	case .MFSA: set64(out, rd, "u64(c.sa)")
 	case .MTHI: append(out, fmt.tprintf("c.hi.d[0] = %s", R64(rs)))
 	case .MTLO: append(out, fmt.tprintf("c.lo.d[0] = %s", R64(rs)))
 	case .MTHI1: append(out, fmt.tprintf("c.hi.d[1] = %s", R64(rs)))
@@ -237,7 +238,7 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	     .BLTZ, .BGEZ, .BLTZL, .BGEZL, .BLTZAL, .BGEZAL, .BLTZALL, .BGEZALL,
 	     .BC0F, .BC0T, .BC0FL, .BC0TL, .BC1F, .BC1T, .BC1FL, .BC1TL, .BC2F, .BC2T, .BC2FL, .BC2TL:
 		panic("control transfer in emit_op")
-	case .MFSA, .MTSA, .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI, .MTSAB, .MTSAH,
+	case .MTSA, .TGE, .TGEU, .TLT, .TLTU, .TEQ, .TNE, .TRAPI, .MTSAB, .MTSAH,
 	     .PMFHL, .PMTHL,
 	     .PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW,
 	     .PADDW, .PSUBW, .PCGTW, .PMAXW, .PADDH, .PSUBH, .PCGTH, .PMAXH, .PADDB, .PSUBB, .PCGTB,

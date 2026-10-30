@@ -298,6 +298,7 @@ main :: proc() {
 		{special2(0x14, 15, 0), .VU0}, // VFTOI0 to vf0
 		{special2(0x1d), .VU0}, // VABS
 		{special2(0x1d, 0xa, 1), .VU0}, // VABS.xz in place
+		{0x00001828, .MFSA}, // r3 = SA
 		{0x00200029, .MTSA}, // r1 & 127
 		{0x04380005, .MTSAB}, // r1 ^ 5
 		{0x0439fffb, .MTSAH}, // r1 ^ 0xfffb
@@ -508,6 +509,7 @@ main :: proc() {
 				start.lo.d = {y ~ 0xaaaa, x}
 				start.cop0[12] = u32(x) | 0x10000
 				start.fcr31 = u32(y)
+				start.sa = u32(x) & 127
 				// VU0: the values' words as floats, NaNs, infinities and
 				// denormals among them.
 				vu_start := vu.vu0
@@ -539,10 +541,10 @@ main :: proc() {
 				checks += 1
 				// PLZCW writes the low doubleword of rd only, as PCSX2's
 				// MMI.cpp PLZCW does (UL[0] and UL[1]); rd's high one
-				// starts nonzero here.
-				if c.op == .PLZCW && cpu.state.r[3].d[1] != start.r[3].d[1] {
+				// starts nonzero here. MFSA too, as PCSX2's MFSA writes UD[0].
+				if (c.op == .PLZCW || c.op == .MFSA) && cpu.state.r[3].d[1] != start.r[3].d[1] {
 					failed += 1
-					fmt.eprintfln("FAIL PLZCW rd high %016x, want %016x", cpu.state.r[3].d[1], start.r[3].d[1])
+					fmt.eprintfln("FAIL %v rd high %016x, want %016x", c.op, cpu.state.r[3].d[1], start.r[3].d[1])
 				}
 				interp_vu := vu.vu0
 				vu_same := runtime.memory_equal(&native_vu, &interp_vu, size_of(vu.Vu))

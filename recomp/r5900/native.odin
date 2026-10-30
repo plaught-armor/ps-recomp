@@ -629,6 +629,12 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		get(a, .A, rs)
 		native.alu_imm(a, .And, .A, 127)
 		native.state_store(a, SA, .A)
+	case .MFSA:
+		// rd's low doubleword = SA; the high one stays
+		if rd == 0 {return true}
+		native.state_load(a, .A, SA)
+		native.state_store(a, GPR * u32(rd), .A)
+		native.state_store_imm(a, GPR * u32(rd) + 4, 0)
 	case .MTSAB, .MTSAH:
 		// SA = (rs ^ imm) in bytes (MTSAB) or halfwords, as a bit count
 		get(a, .A, rs)
