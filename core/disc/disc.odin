@@ -285,7 +285,8 @@ track_of :: proc(d: ^Disc, lba: u32) -> ^Track {
 	return nil
 }
 
-// MSF of lba, in BCD as a sector header holds it.
+// MSF of lba, in BCD as a sector header holds it. Minutes past 99, on a
+// DVD-sized image, do not fit; only CD images need raw sectors.
 msf :: proc(lba: u32) -> (m, s, f: u8) {
 	bcd :: proc(v: u32) -> u8 {return u8((v / 10) << 4 | (v % 10))}
 	a := lba + PREGAP

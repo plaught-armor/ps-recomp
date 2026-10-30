@@ -1,7 +1,10 @@
 // A PS2 program: an Emotion Engine ELF without symbols.
 //
 // Options:
-//   exe              the ELF
+//   exe              the ELF; with disc, its path on the disc, by default
+//                    the one SYSTEM.CNF names
+//   disc             optional: a disc image (a .cue sheet, or a
+//                    single-track .bin or .iso) to read exe from
 //   out              output directory (pNN/code.odin, vu0/code.odin,
 //                    vu1/code.odin, all.odin)
 //   runtime          import path of the ps2 runtime, relative to out
@@ -78,7 +81,7 @@ replace_words :: proc(img: ^mips.Image, path: string) {
 @(private = "file")
 code_ranges :: proc(o: mips.Options, img: mips.Image) -> (ranges: [][2]u32, explicit: bool) {
 	list: [dynamic][2]u32
-	exe := mips.option(o, "exe")
+	exe := img.name
 	if path := mips.option_or(o, "code_ranges", ""); path != "" {
 		t := mips.load_table(path, "lo", "hi")
 		for r in t.rows {
@@ -113,7 +116,7 @@ data_image :: proc(img: mips.Image, a, b: u32) -> mips.Image {
 }
 
 generate :: proc(o: mips.Options) {
-	img := mips.load_elf(mips.option(o, "exe"))
+	img := mips.load_elf(o)
 	if path := mips.option_or(o, "words", ""); path != "" {
 		replace_words(&img, path)
 	}
@@ -293,7 +296,7 @@ generate :: proc(o: mips.Options) {
 		capture := mips.option_or(o, unit == .VU0 ? "vu0_capture" : "vu1_capture", "")
 		programs[unit], ok = vu.generate(img, out, runtime, capture, unit, &slow_vu[unit])
 		if !ok {
-			mips.fail("%s: bad .vutext or %v capture", mips.option(o, "exe"), unit)
+			mips.fail("%s: bad .vutext or %v capture", img.name, unit)
 		}
 	}
 	if cover {

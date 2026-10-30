@@ -4,6 +4,7 @@ package psx
 
 import "core:fmt"
 
+import "ps:core/disc"
 import bios "bios"
 import cpu "cpu"
 import host "host"
@@ -12,9 +13,11 @@ import spu "spu"
 
 // What run needs from the port.
 Boot :: struct {
-	// The PS-X EXE's bytes and the path of the disc's CUE sheet.
+	// The path of the disc image (a .cue sheet, or a single-track .bin or
+	// .iso) and the PS-X EXE's bytes; left nil, the executable SYSTEM.CNF
+	// names is read from the disc.
+	disc:     string,
 	exe:      []u8,
-	cue:      string,
 	// The window's title.
 	title:    cstring,
 	// The generated package's executable functions (rec.EXE_FUNCS[:]) and,
@@ -40,12 +43,16 @@ Boot :: struct {
 // entry. False when a step fails, with the reason printed; true when the
 // entry returns.
 run :: proc(b: Boot) -> bool {
-	pc, gp, sp, ok := cpu.load_exe(b.exe)
+	spu.cdrom_open(b.disc) or_return
+	exe := b.exe
+	if exe == nil {
+		exe = disc_exe() or_return
+	}
+	pc, gp, sp, ok := cpu.load_exe(exe)
 	if !ok {
 		fmt.eprintln("not a PS-X EXE")
 		return false
 	}
-	spu.cdrom_open(b.cue) or_return
 	cpu.trace_init() or_return
 	if b.setup != nil {b.setup() or_return}
 	host.platform_init(b.title) or_return
@@ -79,4 +86,20 @@ run :: proc(b: Boot) -> bool {
 	cpu.cop0.sr = 0x40000401
 	cpu.call(pc)
 	return true
+}
+
+// The executable the open disc's SYSTEM.CNF names.
+@(private = "file")
+disc_exe :: proc() -> ([]u8, bool) {
+	d := spu.disc_image()
+	cnf, ok := disc.system_cnf(d, context.temp_allocator)
+	if !ok || cnf.ps2 {
+		fmt.eprintln("disc: no PS1 executable named in SYSTEM.CNF")
+		return nil, false
+	}
+	exe, read_ok := disc.read_file(d, cnf.boot)
+	if !read_ok {
+		fmt.eprintln("disc: cannot read", cnf.boot)
+	}
+	return exe, read_ok
 }

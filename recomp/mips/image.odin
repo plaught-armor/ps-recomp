@@ -1,6 +1,8 @@
 package mips
 
+import "core:fmt"
 import "core:strings"
+import "ps:core/disc"
 
 Section :: struct {
 	name:  string,
@@ -19,6 +21,9 @@ Image :: struct {
 	base:     u32,
 	data:     []u8,
 	entry:    u32,
+	// The executable's name in messages: its path, or on a disc image
+	// `image:path`; "" for an overlay.
+	name:     string,
 	// ELF sections; none for a PS-X EXE or an overlay, which do not tell
 	// code from data.
 	sections: []Section,
@@ -32,27 +37,59 @@ word :: proc(img: Image, addr: u32) -> (u32, bool) {
 	return u32le(img.data, int(o)), true
 }
 
+// The executable's bytes and its name: option `exe`, a file; or, with
+// option `disc` (a .cue sheet, or a single-track .bin or .iso), the file at
+// disc path `exe` on that image, by default the one SYSTEM.CNF names.
+@(private = "file")
+read_exe :: proc(o: Options) -> (raw: []u8, name: string) {
+	image := option_or(o, "disc", "")
+	if image == "" {
+		name = option(o, "exe")
+		return read_file(name), name
+	}
+	d, ok := disc.open(image)
+	if !ok {
+		fail("%s: not a disc image", image)
+	}
+	defer disc.close(&d)
+	path := option_or(o, "exe", "")
+	if path == "" {
+		cnf, found := disc.system_cnf(&d)
+		if !found {
+			fail("%s: no SYSTEM.CNF naming the executable", image)
+		}
+		path = cnf.boot
+	}
+	name = fmt.aprintf("%s:%s", image, path)
+	raw, ok = disc.read_file(&d, path)
+	if !ok {
+		fail("%s: not found", name)
+	}
+	return raw, name
+}
+
 // A PS-X EXE: the text segment, loaded at its address.
-load_psx_exe :: proc(path: string) -> Image {
-	raw := read_file(path)
+load_psx_exe :: proc(o: Options) -> Image {
+	raw, name := read_exe(o)
 	if len(raw) < 0x800 || string(raw[:8]) != "PS-X EXE" {
-		fail("%s: not a PS-X EXE", path)
+		fail("%s: not a PS-X EXE", name)
 	}
 	text, size := u32le(raw, 0x18), int(u32le(raw, 0x1c))
-	return {base = text, data = raw[0x800:min(0x800 + size, len(raw))], entry = u32le(raw, 0x10)}
+	return {base = text, data = raw[0x800:min(0x800 + size, len(raw))], entry = u32le(raw, 0x10), name = name}
 }
 
 // A 32-bit little-endian MIPS ELF: every allocated section in one flat view,
 // NOBITS reading as zero. Sections at 0x01000000 and up (the EE's .vudata,
 // in VU memory) stay out of it.
-load_elf :: proc(path: string) -> Image {
-	raw := read_file(path)
+load_elf :: proc(o: Options) -> Image {
+	raw, name := read_exe(o)
 	if len(raw) < 52 || string(raw[:4]) != "\x7fELF" {
-		fail("%s: not an ELF file", path)
+		fail("%s: not an ELF file", name)
 	}
 	u16le :: proc(b: []u8, o: int) -> u32 {return u32(b[o]) | u32(b[o + 1]) << 8}
 	img: Image
 	img.entry = u32le(raw, 24)
+	img.name = name
 	shoff := int(u32le(raw, 32))
 	shentsize := int(u16le(raw, 46))
 	shnum := int(u16le(raw, 48))

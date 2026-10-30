@@ -23,7 +23,7 @@ a `recomp` options file, and any per-game code.
 | `core/` | Console-independent runtime: coroutines, save states and rollback, netplay, input and rebinding, audio, recording and replay, Vulkan device, capture; `disc` (disc images, ISO9660 and disc ids); the user data directory |
 | `psx/` | PS1 runtime: `cpu`, `gte`, `gpu` and `render`, `spu`, `mdec`, `bios`, `io`, `native` (the names native code imports), `host` (SDL2 window, pacing, input), and the interpreter, checkpoints and hooks |
 | `ps2/` | PS2 runtime: `cpu`, `mem`, `dma`, `gif`, `gs` (Vulkan), `vu`, `ipu`, `iop` (HLE IOP modules, memory cards), `kernel`, `r5900` (EE instruction decoder), `host` (SDL2 window, audio, input, net), and the interpreter and bus |
-| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `vu_micro` (whole VU microprograms through the VU recompiler against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots), `ps2_kernel` (EE kernel threads), `ps2_interp` (whole EE functions in the interpreter), `psx_cover` (which R3000 encodings each PS1 backend does inline), `psx_fallback` (the PS1 ways out of recompiled code and their counts), `psx_unaligned` (fused PS1 unaligned words), `psx_gte` (GTE register moves as native code), `psx_timer` (root counter timing), `psx_bios` (BIOS events, counters and IRQs), `psx_bios_libc` (the BIOS C library), `disc` (disc images, cue sheets and ISO9660, malformed ones included; disc ids), `host_frames` (each host, headless, exits at FRAMES), `data` (the user data directory and its cached native code) |
+| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `vu_micro` (whole VU microprograms through the VU recompiler against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots), `ps2_kernel` (EE kernel threads), `ps2_interp` (whole EE functions in the interpreter), `psx_cover` (which R3000 encodings each PS1 backend does inline), `psx_fallback` (the PS1 ways out of recompiled code and their counts), `psx_unaligned` (fused PS1 unaligned words), `psx_gte` (GTE register moves as native code), `psx_timer` (root counter timing), `psx_bios` (BIOS events, counters and IRQs), `psx_bios_libc` (the BIOS C library), `disc` (disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image), `host_frames` (each host, headless, exits at FRAMES), `data` (the user data directory and its cached native code) |
 
 ## Requirements
 
@@ -43,7 +43,7 @@ odin build recomp -collection:ps=. -out:recomp-bin
 The options file is tab-separated: a `key<TAB>value` header row, then one
 option per row; lines starting with `#` are comments. `backend` (`r3000` or
 `r5900`) picks the console; the backend's header comment lists the rest of
-its options (`exe`, `out`, `runtime`, `code_lo`/`code_hi`,
+its options (`exe`, `disc`, `out`, `runtime`, `code_lo`/`code_hi`,
 `cycles_per_insn`, `native_arch`/`native_out`, ...). Numbers are hex where
 the header says so. File and directory paths in it are opened as given, so
 relative ones are relative to the directory recomp runs in.
@@ -129,6 +129,10 @@ code_hi	80080000
 cycles_per_insn	2
 ```
 
+With `disc`, the path of the user's disc image (a `.cue` sheet, or a
+single-track `.bin` or `.iso`), `exe` is read from the image: it is a path
+on the disc, and left out it is the executable `SYSTEM.CNF` names.
+
 For `r5900`, give `exe` (the ELF), `out`, `runtime` (`ps:ps2`),
 `cycles_per_insn` and `package_insns`; the code range defaults to the
 ELF's `.text`, or give `code_lo` and `code_hi`, or, for code split by data,
@@ -136,8 +140,10 @@ ELF's `.text`, or give `code_lo` and `code_hi`, or, for code split by data,
 row and one hex range per row, in ascending order. `overlays` (PS1) also
 needs `package_insns`.
 
-PS1 (imports `psx "ps:psx"`): read the EXE and pass its bytes, with the
-disc's CUE sheet and the generated functions, to `psx.run`. It sets up the
+PS1 (imports `psx "ps:psx"`): pass the path of the disc image (a `.cue`
+sheet, or a single-track `.bin` or `.iso`) and the generated functions to
+`psx.run`; it reads the EXE `SYSTEM.CNF` names, or takes the bytes given
+as `exe`. It sets up the
 runtime in order (CD, tracing, window, functions, native code, events, SPU
 and XA, timers, DMA, BIOS, memory cards), points `gp`, `sp` and `fp` at the
 EXE's values and calls its entry; it returns false when a step fails, with
@@ -158,21 +164,19 @@ import psx "ps:psx"
 import "rec"
 
 main :: proc() {
-	exe, err := os.read_entire_file("disc/SLUS_000.00", context.allocator)
-	if err != nil {
-		os.exit(1)
-	}
-	if !psx.run({exe = exe, cue = "game.cue", title = "Game", funcs = rec.EXE_FUNCS[:]}) {
+	if !psx.run({disc = "game.cue", title = "Game", funcs = rec.EXE_FUNCS[:]}) {
 		os.exit(1)
 	}
 }
 ```
 
 PS2 (imports `"ps:ps2"`, `cpu "ps:ps2/cpu"`, `host "ps:ps2/host"`,
-`iop "ps:ps2/iop"`, `mem "ps:ps2/mem"`): set `iop.disc_dir` to the
-directory of the disc's files (default `.`), `ps2.init()` (maps RAM, so it
+`iop "ps:ps2/iop"`, `mem "ps:ps2/mem"`): open the disc image with
+`iop.disc_image_open(path)` (or set `iop.disc_dir` to a directory of the
+disc's files, default `.`), `ps2.init()` (maps RAM, so it
 comes before anything that writes RAM), `rec.register_all()`, optionally
-`ps2.load_native(path)`. `mem.load_elf(data)` copies the ELF's `PT_LOAD`
+`ps2.load_native(path)`. `iop.disc_boot()` names the ELF `SYSTEM.CNF`
+boots and `iop.disc_file(name)` reads it. `mem.load_elf(data)` copies the ELF's `PT_LOAD`
 segments into RAM and returns `entry, ok`. Set
 `cpu.state.r[29].d[0] = mem.RAM_SIZE - 16` and call `ps2.run(entry)`,
 which never returns. `kernel.vblank_hook`, run every vblank, is where the
@@ -184,7 +188,6 @@ the hook, and `host.pad_hook` lets the game remap each player's input.
 package main
 
 import "core:os"
-import "core:path/filepath"
 import "ps:ps2"
 import cpu "ps:ps2/cpu"
 import host "ps:ps2/host"
@@ -193,15 +196,20 @@ import mem "ps:ps2/mem"
 import "rec"
 
 main :: proc() {
-	path := "disc/SLUS_000.00"
-	iop.disc_dir = filepath.dir(path)
+	if !iop.disc_image_open("game.iso") {
+		os.exit(1)
+	}
 	ps2.init()
 	if !host.platform_init("Game") {
 		os.exit(1)
 	}
 	rec.register_all()
-	data, err := os.read_entire_file(path, context.allocator)
-	if err != nil {
+	boot, found := iop.disc_boot()
+	if !found {
+		os.exit(1)
+	}
+	data, read := iop.disc_file(boot)
+	if !read {
 		os.exit(1)
 	}
 	entry, ok := mem.load_elf(data)

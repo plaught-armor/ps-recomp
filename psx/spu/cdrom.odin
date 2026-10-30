@@ -1,13 +1,11 @@
 // CD-ROM controller (0x1f801800-0x1f801803) reading raw 2352-byte sectors
-// from the BIN/CUE image.
+// from the disc image.
 package psx_spu
 
 import "core:fmt"
-import "core:os"
-import "core:path/filepath"
-import "core:strings"
 
 import "ps:core"
+import "ps:core/disc"
 import io "../io"
 import cpu "../cpu"
 
@@ -27,13 +25,6 @@ SEEK_DELAY :: 250_000
 READ_RETRY :: 2_000
 
 @(private)
-Track :: struct {
-	file:    ^os.File,
-	start:   u32, // first LBA
-	sectors: u32,
-}
-
-@(private)
 Cd_Int :: struct {
 	kind:  u8,
 	bytes: [dynamic]u8,
@@ -42,7 +33,7 @@ Cd_Int :: struct {
 
 @(private)
 cd: struct {
-	tracks:   [dynamic]Track,
+	disc:     disc.Disc,
 	index:    u32,
 	params:   [dynamic]u8,
 	response: [dynamic]u8,
@@ -72,43 +63,21 @@ cd: struct {
 	movie_frame: u32,
 }
 
-// Open the disc described by a CUE sheet with one BINARY file per track.
-cdrom_open :: proc(cue_path: string) -> bool {
+// Open the disc image: a .cue sheet, or a single-track .bin or .iso.
+cdrom_open :: proc(path: string) -> bool {
 	cd.int_en = 0x1f
-	text, err := os.read_entire_file(cue_path, context.allocator)
-	if err != nil {
-		fmt.eprintln("cdrom: cannot read", cue_path)
+	cd.disc = disc.open(path) or_return
+	if cd.disc.volume == 0 { // a MODE2/2336 data track, for one, is not read
+		fmt.eprintln("cdrom: no ISO9660 volume on", path)
+		disc.close(&cd.disc)
 		return false
 	}
-	dir := filepath.dir(cue_path)
-	lba: u32 = 0
-	s := string(text)
-	for line in strings.split_lines_iterator(&s) {
-		l := strings.trim_space(line)
-		if !strings.has_prefix(l, "FILE ") {
-			continue
-		}
-		q1 := strings.index_byte(l, '"')
-		q2 := strings.last_index_byte(l, '"')
-		if q1 < 0 || q2 <= q1 {
-			fmt.eprintln("cdrom: bad FILE line:", l)
-			return false
-		}
-		path, _ := filepath.join({dir, l[q1 + 1:q2]}, context.allocator)
-		f, ferr := os.open(path)
-		if ferr != nil {
-			fmt.eprintln("cdrom: cannot open", path)
-			return false
-		}
-		size, _ := os.file_size(f)
-		if len(cd.tracks) > 0 {
-			lba += PREGAP
-		}
-		n := u32(size / SECTOR_SIZE)
-		append(&cd.tracks, Track{f, lba, n})
-		lba += n
-	}
-	return len(cd.tracks) > 0
+	return true
+}
+
+// The open disc image, for reading its files (disc.read_file).
+disc_image :: proc() -> ^disc.Disc {
+	return &cd.disc
 }
 
 // User data of a Mode 2 Form 1 sector: 2048 bytes after the 24-byte header.
@@ -151,13 +120,7 @@ read_sector :: proc(lba: u32, buf: []u8) -> bool {
 			return true
 		}
 	}
-	for t in cd.tracks {
-		if lba >= t.start && lba < t.start + t.sectors {
-			n, err := os.read_at(t.file, buf, i64(lba - t.start) * SECTOR_SIZE)
-			return err == nil && n == SECTOR_SIZE
-		}
-	}
-	return false
+	return disc.read_raw(&cd.disc, lba, buf)
 }
 
 @(private)
@@ -349,7 +312,7 @@ cdrom_command :: proc(c: u8) {
 	case 0x11:
 		cdrom_getlocp()
 	case 0x13:
-		queue_int(3, ACK_DELAY, stat_byte(), 1, bcd(u32(len(cd.tracks))))
+		queue_int(3, ACK_DELAY, stat_byte(), 1, bcd(u32(len(cd.disc.tracks))))
 	case 0x14:
 		cdrom_gettd(len(p) > 0 ? unbcd(p[0]) : 0)
 	case 0x15, 0x16:
@@ -386,7 +349,7 @@ cdrom_getlocp :: proc() {
 	cur := cd.lba > 0 ? cd.lba - 1 : 0
 	track: u32 = 1
 	start: u32 = 0
-	for t, i in cd.tracks {
+	for t, i in cd.disc.tracks {
 		if cur >= t.start {
 			track = u32(i + 1)
 			start = t.start
@@ -402,10 +365,10 @@ cdrom_gettd :: proc(track: u32) {
 	lba: u32
 	switch {
 	case track == 0:
-		last := cd.tracks[len(cd.tracks) - 1]
+		last := cd.disc.tracks[len(cd.disc.tracks) - 1]
 		lba = last.start + last.sectors
-	case int(track) <= len(cd.tracks):
-		lba = cd.tracks[track - 1].start
+	case int(track) <= len(cd.disc.tracks):
+		lba = cd.disc.tracks[track - 1].start
 	case:
 		queue_int(5, ACK_DELAY, stat_byte() | 0x01, 0x10)
 		return

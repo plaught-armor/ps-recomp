@@ -11,6 +11,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "ps:core"
+import "ps:core/disc"
 import cpu "../cpu"
 import mem "../mem"
 
@@ -34,6 +35,7 @@ SIF_STAT_BOOTEND :: 0x40000
 iop_ram: []u8
 
 // Host directory holding the disc's files; `cdrom0:\X;1` opens disc_dir/X.
+// After disc_image_open, the disc image is read in its place.
 disc_dir := "."
 
 // An RPC server: gets the function number and the request in the server's
@@ -289,9 +291,8 @@ fileio: struct {
 
 @(private)
 Iop_File :: struct {
-	f:   ^os.File,
-	pos: i64,
-	size: i64,
+	using file: Disc_File,
+	pos:        i64,
 }
 
 @(private)
@@ -319,7 +320,7 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		// Through a host buffer: on macOS, rollback keeps RAM write-protected
 		// and a kernel write into it fails (rollback_darwin.odin).
 		tmp := make([]u8, n, context.temp_allocator)
-		got, _ := os.read_at(f.f, tmp, f.pos)
+		got := disc_file_read(f.file, f.pos, tmp)
 		copy(mem.ram_slice(w[4], u32(got)), tmp[:got])
 		f.pos += i64(got)
 		result = i32(got)
@@ -369,26 +370,118 @@ disc_open :: proc(path: string) -> (f: ^os.File, err: os.Error) {
 
 @(private)
 fileio_open :: proc(name: string, flags: u32) -> i32 {
-	path, ok := host_path(name)
+	file, path, ok := disc_find(name)
 	if !ok || flags & 3 != 1 { // O_RDONLY is 1 in the IOP's ioman
 		fmt.eprintfln("fileio: open \"%s\" flags %x failed", name, flags)
 		return -ENOENT
 	}
-	f, err := disc_open(path)
-	if err != nil {
-		fmt.eprintfln("fileio: open \"%s\" (%s) failed", name, path)
-		return -ENOENT
-	}
-	size, _ := os.file_size(f)
-	if cpu.debug >= 1 {fmt.eprintfln("fileio: open \"%s\" -> %s (%d bytes)", name, path, size)}
+	if cpu.debug >= 1 {fmt.eprintfln("fileio: open \"%s\" -> %s lba %d (%d bytes)", name, path, file.lba, file.size)}
 	for &e, i in fileio.files {
 		if e.f == nil {
-			e = {f, 0, size}
+			e = {file, 0}
 			return i32(i)
 		}
 	}
-	append(&fileio.files, Iop_File{f, 0, size})
+	append(&fileio.files, Iop_File{file, 0})
 	return i32(len(fileio.files) - 1)
+}
+
+// A file of the disc: the host file holding it, its first LBA on the disc
+// image (0 under disc_dir) and its size.
+@(private)
+Disc_File :: struct {
+	f:    ^os.File,
+	lba:  u32,
+	size: i64,
+}
+
+// The disc image disc_image_open opened (host state, like disc_files), and
+// its files found by the names the game passed: a game may open a file
+// every frame, and a lookup reads each directory on the way.
+@(private)
+image: disc.Disc
+@(private)
+image_found: map[string]disc.Entry
+
+// Read the disc's files and sectors from a disc image (a .iso, or a .cue
+// or .bin of 2048-byte data) in place of disc_dir. False, with the reason
+// printed, when it holds no ISO9660 volume. An image open before is closed.
+disc_image_open :: proc(path: string) -> bool {
+	disc_image_close()
+	d := disc.open(path, core.host_allocator) or_return
+	if d.volume == 0 {
+		fmt.eprintln("disc: no ISO9660 volume on", path)
+		disc.close(&d)
+		return false
+	}
+	image = d
+	return true
+}
+
+// Close the disc image disc_image_open opened; files are read from disc_dir
+// again.
+disc_image_close :: proc() {
+	context.allocator = core.host_allocator
+	for name in image_found {
+		delete(name)
+	}
+	delete(image_found)
+	image_found = nil
+	disc.close(&image)
+}
+
+// Find a disc file by its IOP name (`cdrom0:\DIR\FILE.EXT;1`); path is its
+// host path under disc_dir, "" on the image.
+@(private)
+disc_find :: proc(name: string) -> (file: Disc_File, path: string, ok: bool) {
+	if image.volume == 0 {
+		path = host_path(name) or_return
+		if os.is_dir(path) {return {}, "", false}
+		f, err := disc_open(path)
+		if err != nil {return {}, "", false}
+		size, _ := os.file_size(f)
+		return {f, 0, size}, path, true
+	}
+	context.allocator = core.host_allocator
+	e, cached := image_found[name]
+	if !cached {
+		e = disc.find(&image, name) or_return
+		image_found[strings.clone(name)] = e
+	}
+	t := disc.track_of(&image, e.lba)
+	if e.dir || t == nil {return {}, "", false}
+	return {t.file, e.lba, i64(e.size)}, "", true
+}
+
+// Read len(buf) bytes from byte pos of a disc file; the count read.
+@(private)
+disc_file_read :: proc(file: Disc_File, pos: i64, buf: []u8) -> int {
+	if image.volume != 0 {
+		return disc.read_at(&image, file.lba, pos, buf)
+	}
+	n, _ := os.read_at(file.f, buf, pos)
+	return max(n, 0)
+}
+
+// The bytes of a file of the disc, by its IOP or ISO9660 name: how a port
+// loads its executable (disc_boot) from the disc.
+disc_file :: proc(name: string, allocator := context.allocator) -> (data: []u8, ok: bool) {
+	file, _ := disc_find(name) or_return
+	data = make([]u8, file.size, allocator)
+	if disc_file_read(file, 0, data) != len(data) {
+		delete(data, allocator)
+		return nil, false
+	}
+	return data, true
+}
+
+// The PS2 executable the disc image's SYSTEM.CNF names (BOOT2), as a disc
+// path for disc_file. False with no image open or no BOOT2 line.
+disc_boot :: proc(allocator := context.allocator) -> (string, bool) {
+	if image.volume == 0 {return "", false}
+	cnf, ok := disc.system_cnf(&image, context.temp_allocator)
+	if !ok || !cnf.ps2 {return "", false}
+	return strings.clone(cnf.boot, allocator), true
 }
 
 // Map an IOP device path ("cdrom0:\DIR\FILE.EXT;1") to a file under
@@ -500,10 +593,11 @@ cdvd_ready_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	return true
 }
 
-// Sector reads over disc_dir, which has files but no LSNs: SearchFile places
-// each file it finds at the next free LSN, and a read maps back to its file.
-// A sector no search placed (a volume descriptor, a hard-coded LSN) reads as
-// zeros. Host state like disc_files: a path keeps its LSN across rollbacks.
+// Sector reads: from the disc image when one is open, else over disc_dir,
+// which has files but no LSNs: SearchFile places each file it finds at the
+// next free LSN, and a read maps back to its file. A sector no search
+// placed (a volume descriptor, a hard-coded LSN) reads as zeros. Host state
+// like disc_files: a path keeps its LSN across rollbacks.
 @(private)
 DISC_SECTOR :: 2048
 @(private)
@@ -536,6 +630,13 @@ disc_place :: proc(path: string, size: i64) -> u32 {
 @(private)
 disc_read :: proc(lsn, sectors, dest: u32) {
 	tmp := make([]u8, sectors * DISC_SECTOR, context.temp_allocator)
+	if image.volume != 0 {
+		if disc.read_at(&image, lsn, 0, tmp) != len(tmp) { // the rest stays zero
+			fmt.eprintfln("cdvd: read of lsn %x (%d sectors) past the image", lsn, sectors)
+		}
+		copy(mem.ram_slice(dest, u32(len(tmp))), tmp)
+		return
+	}
 	found := false
 	for e in disc_extents {
 		if lsn < e.lsn || lsn >= e.lsn + e.sectors {continue}
@@ -585,20 +686,15 @@ cdvd_search_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	if fno != 0 || len(buf) < 0x12c {return false}
 	name := strings.truncate_to_byte(string(buf[0x24:0x124]), 0)
 	w[0] = 0
-	path, ok := host_path(name)
-	if !ok || os.is_dir(path) {
+	found, path, ok := disc_find(name)
+	if !ok {
 		fmt.eprintfln("cdvd: search \"%s\" not found", name)
 		return true
 	}
-	f, err := disc_open(path)
-	if err != nil {
-		fmt.eprintfln("cdvd: search \"%s\" (%s) failed", name, path)
-		return true
-	}
-	size, _ := os.file_size(f)
+	size := found.size
 	file: [0x24]u8
 	fw := ([^]u32)(&file)
-	fw[0], fw[1] = disc_place(path, size), u32(size)
+	fw[0], fw[1] = image.volume != 0 ? found.lba : disc_place(path, size), u32(size)
 	// The ISO9660 name of the last component, version included.
 	base := name[strings.last_index_any(name, "\\/") + 1:]
 	copy(file[8:0x17], base)

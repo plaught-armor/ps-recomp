@@ -16,7 +16,6 @@ package ps2_iop
 
 import "core:fmt"
 import "core:math"
-import "core:os"
 import "core:strings"
 import "ps:core"
 import cpu "../cpu"
@@ -403,21 +402,17 @@ iop_string :: proc(a: u32) -> string {
 
 @(private = "file")
 file_data :: proc(name: string, offset, length: u32) -> ([]u8, bool) {
-	path, ok := host_path(name)
+	file, _, ok := disc_find(name)
 	if !ok {
 		fmt.eprintfln("fmod: \"%s\" not found", name)
 		return nil, false
 	}
-	f, err := os.open(path)
-	if err != nil {return nil, false}
-	defer os.close(f)
 	n := i64(length)
 	if n == 0 {
-		size, _ := os.file_size(f)
-		n = size - i64(offset)
+		n = file.size - i64(offset)
 	}
-	buf := make([]u8, n, context.temp_allocator)
-	got, _ := os.read_at(f, buf, i64(offset))
+	buf := make([]u8, max(n, 0), context.temp_allocator)
+	got := disc_file_read(file, i64(offset), buf)
 	return buf[:got], true
 }
 

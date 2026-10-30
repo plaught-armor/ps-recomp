@@ -8,7 +8,8 @@
 // zero length, a directory past the volume, unknown cue lines, a TRACK with
 // no FILE, a missing file, overlapping tracks and a bad time. Disc ids hash
 // the volume descriptor, SYSTEM.CNF and the boot file, the same for each
-// image format.
+// image format. The IOP finds files on an opened image by the paths games
+// pass it (cdrom0:\DIR\FILE.EXT;1), a second lookup from its cache.
 // The images are written to a directory under the OS temp directory,
 // removed at the end whether the test passes or fails.
 package main
@@ -20,6 +21,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "ps:core/disc"
+import iop "ps:ps2/iop"
 
 @(private = "file")
 failed: int
@@ -438,6 +440,34 @@ test_corrupt :: proc(iso: []u8) {
 	}
 }
 
+// The IOP's file lookups on an opened image, without the rest of the PS2.
+@(private = "file")
+test_iop :: proc(iso: []u8) {
+	if !iop.disc_image_open(write("iop.iso", iso)) {
+		fail("iop: image does not open")
+		return
+	}
+	defer iop.disc_image_close() // before the directory is removed
+	boot, ok := iop.disc_boot(context.temp_allocator)
+	check(ok && boot == "SLUS_123.45", "iop boot")
+	for _ in 0 ..< 2 { // the second time from the cache
+		data, read := iop.disc_file("cdrom0:\\DATA\\SUB.TXT;1", context.temp_allocator)
+		check(read && string(data) == SUB, "iop file")
+	}
+	data, read := iop.disc_file("cdrom0:\\data\\Sub.Txt", context.temp_allocator)
+	check(read && string(data) == SUB, "iop file case")
+	data, read = iop.disc_file("cdrom0:\\BIG.BIN;1", context.temp_allocator)
+	good := read && len(data) == BIG
+	for i in 0 ..< len(data) {
+		good &&= data[i] == big_byte(i)
+	}
+	check(good, "iop big")
+	for bad in ([]string{"cdrom0:\\DATA", "cdrom0:\\NOPE.BIN;1", "cdrom0:\\DATA\\..\\SYSTEM.CNF;1"}) {
+		_, read = iop.disc_file(bad, context.temp_allocator)
+		check(!read, bad)
+	}
+}
+
 main :: proc() {
 	err: os.Error
 	dir, err = os.make_directory_temp("", "ps_disc_test_*", context.allocator)
@@ -450,6 +480,7 @@ main :: proc() {
 	test_dual_layer(iso)
 	test_corrupt(iso)
 	test_id()
+	test_iop(iso)
 	if os.remove_all(dir) != nil {
 		fail("cannot remove %s", dir)
 	}

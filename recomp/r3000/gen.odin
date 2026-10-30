@@ -1,7 +1,11 @@
 // A PS1 program: a PS-X EXE and its overlays.
 //
 // Options:
-//   exe              the PS-X EXE
+//   exe              the PS-X EXE; with disc, its path on the disc, by
+//                    default the one SYSTEM.CNF names
+//   disc             optional: a disc image (a .cue sheet, or a
+//                    single-track .bin or .iso) to read exe from; overlays
+//                    stay files
 //   out              output directory (exe.odin, ovl_NN/funcs.odin,
 //                    overlays.odin)
 //   runtime          import path of the psx runtime package, relative to out
@@ -80,7 +84,7 @@ Program :: struct {
 
 generate :: proc(o: mips.Options) {
 	p: Program
-	p.exe = mips.load_psx_exe(mips.option(o, "exe"))
+	p.exe = mips.load_psx_exe(o)
 	p.out = mips.option(o, "out")
 	p.runtime = mips.option(o, "runtime")
 	p.cycles = mips.parse_int(mips.option(o, "cycles_per_insn"))
