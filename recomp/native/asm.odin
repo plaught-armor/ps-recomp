@@ -194,7 +194,8 @@ Cold :: struct {
 // by calling import slow with A, and B for a narrow store; finish places
 // them after the last function. A store one does the whole store, fast
 // path too. A B64 or B128 one is for guest register n, the state field at
-// off (zero: a store of 0), and calls slow with A and n.
+// off (zero: a store of 0), and calls slow with A and n. An unal one does
+// the whole unaligned access, fast path too.
 @(private)
 Slow :: struct {
 	at:     Label,
@@ -206,6 +207,7 @@ Slow :: struct {
 	n:      u32,
 	zero:   bool,
 	base:   string, // import: the address off counts from, else the state
+	unal:   Unal,
 }
 
 // Guest RAM that load and store reach in place, without calling the bus
@@ -243,6 +245,33 @@ Width :: enum u8 {
 	B32,
 	B64,
 	B128,
+}
+
+// The unaligned accesses of unaligned, as mem.LWL and the rest do them.
+Unal :: enum u8 {
+	None,
+	LWL,
+	LWR,
+	LDL,
+	LDR,
+	SWL,
+	SWR,
+	SDL,
+	SDR,
+}
+
+// How unaligned access op merges: over a doubleword (wide) or a word, the
+// source (the memory for a load, the register for a store) shifted left or
+// right by the shift count into the other, under a mask of ones shifted the
+// same way. The count is 8 times the address's low bits, or with from_top
+// 56 (24 for a word) less that.
+@(private)
+unal_shape :: proc(op: Unal) -> (wide, left, from_top, store: bool) {
+	assert(op != .None, "native: unaligned op")
+	wide = op == .LDL || op == .LDR || op == .SDL || op == .SDR
+	from_top = op == .LWL || op == .LDL || op == .SWL || op == .SDL
+	store = op >= .SWL
+	return wide, from_top != store, from_top, store
 }
 
 CACHE_MAX :: 4
@@ -908,6 +937,23 @@ store_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, zero := false,
 	call_label(a, slow_path(a, {slow = slow, store = true, w = w, off = off, n = n, zero = zero, base = base}))
 }
 
+// Guest register n, the 8-byte state field at off, and the word or
+// doubleword guest address A rounds down to merge as op does (mem.LWL and
+// the rest). Like store_state, a host call of a shared routine, one per op
+// and register: in place when the address is RAM (and, for a store, no
+// guard or page byte is set), else import `slow` called with A and n does
+// it. Loses A, B and C.
+unaligned :: proc(a: ^Asm, op: Unal, off, n: u32, slow: string) {
+	wide_check(a, .B64, off, "")
+	_, _, _, store := unal_shape(op)
+	if a.ram.base == "" {
+		mov_imm(a, .B, n)
+		call(a, slow, .A, .B)
+		return
+	}
+	call_label(a, slow_path(a, {slow = slow, store = store, w = .B64, off = off, n = n, unal = op}))
+}
+
 @(private = "file")
 wide_check :: proc(a: ^Asm, w: Width, off: u32, base: string) {
 	assert(w >= .B64, "native: wide width")
@@ -954,7 +1000,16 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 	align_code(a)
 	bind(a, s.at)
 	far, guarded := new_label(a), new_label(a)
-	if s.store {
+	if s.unal != .None {
+		switch a.arch {
+		case .X64_SysV, .X64_Win:
+			x64_unaligned(a, s, far, guarded)
+			x64_return(a)
+		case .Arm64:
+			a64_unaligned(a, s, far, guarded)
+			a64_return(a)
+		}
+	} else if s.store {
 		switch a.arch {
 		case .X64_SysV, .X64_Win:
 			x64_store(a, s, far, guarded)
@@ -967,14 +1022,14 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 	bind(a, far)
 	r := a.ram
 	if r.mirror_mask != 0 {
-		// A load reads the RAM address in place; a store starts over with
-		// it, so the checks of RAM decide.
+		// A load reads the RAM address in place; a store or an unaligned
+		// access starts over with it, so the checks of RAM decide.
 		next := new_label(a)
 		mov(a, .C, .A)
 		alu_imm(a, .And, .C, r.mirror_mask)
 		br_cmp_imm(a, .Ne, .C, r.mirror_bits, next)
 		alu_imm(a, .And, .A, r.size - 1)
-		if s.store {
+		if s.store || s.unal != .None {
 			jmp(a, s.at)
 		} else {
 			switch a.arch {

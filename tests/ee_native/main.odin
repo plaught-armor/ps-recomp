@@ -88,9 +88,9 @@ align :: proc(op: r5900.Op) -> u32 {
 	return 1
 }
 
-// An access of rt at UNALIGNED_OFF(rs = 1); rt = 1 is rs.
+// An access of rt at off(rs = 1); rt = 1 is rs.
 @(private = "file")
-unaligned :: proc(op, rt: u32) -> u32 {return op << 26 | 1 << 21 | rt << 16 | UNALIGNED_OFF}
+unaligned :: proc(op, rt: u32, off: i16 = UNALIGNED_OFF) -> u32 {return op << 26 | 1 << 21 | rt << 16 | u32(u16(off))}
 // A REGIMM trap of rs = 1 against the immediate, by its rt field.
 @(private = "file")
 trapi :: proc(rt, imm: u32) -> u32 {return 1 << 26 | 1 << 21 | rt << 16 | imm}
@@ -234,8 +234,9 @@ MEM_ADDRS := [?]u32{0x00001238, 0x01fffff0, 0x20004564, 0x30008000, 0x70000ff8, 
 MEM_BACK :: 12 // the offset field is -12
 
 // Addresses for the unaligned accesses: each of these plus 0 to 7, so
-// every alignment, and rs = that - UNALIGNED_OFF, so the add carries
-// across a 16-byte boundary for some. RAM, the last quadwords of RAM and
+// every alignment, and rs = that less the offset, UNALIGNED_OFF or its
+// negative, so the add carries or borrows across a 16-byte boundary for
+// some. RAM, the last quadwords of RAM and
 // of the scratchpad, both uncached mirrors, and kseg0.
 @(rodata)
 UNALIGNED_ADDRS := [?]u32{0x0000123c, 0x01ffffe8, 0x2000456c, 0x3000800c, 0x70003fe8, 0x8001000c}
@@ -791,27 +792,35 @@ main :: proc() {
 		{unaligned(34, 2), .LWL},
 		{unaligned(34, 1), .LWL}, // rt = rs
 		{unaligned(34, 0), .LWL},
+		{unaligned(34, 2, -UNALIGNED_OFF), .LWL},
 		{unaligned(38, 2), .LWR},
 		{unaligned(38, 1), .LWR},
 		{unaligned(38, 0), .LWR},
+		{unaligned(38, 2, -UNALIGNED_OFF), .LWR},
 		{unaligned(26, 2), .LDL},
 		{unaligned(26, 1), .LDL},
 		{unaligned(26, 0), .LDL},
+		{unaligned(26, 2, -UNALIGNED_OFF), .LDL},
 		{unaligned(27, 2), .LDR},
 		{unaligned(27, 1), .LDR},
 		{unaligned(27, 0), .LDR},
+		{unaligned(27, 2, -UNALIGNED_OFF), .LDR},
 		{unaligned(42, 2), .SWL},
 		{unaligned(42, 1), .SWL},
 		{unaligned(42, 0), .SWL},
+		{unaligned(42, 2, -UNALIGNED_OFF), .SWL},
 		{unaligned(46, 2), .SWR},
 		{unaligned(46, 1), .SWR},
 		{unaligned(46, 0), .SWR},
+		{unaligned(46, 2, -UNALIGNED_OFF), .SWR},
 		{unaligned(44, 2), .SDL},
 		{unaligned(44, 1), .SDL},
 		{unaligned(44, 0), .SDL},
+		{unaligned(44, 2, -UNALIGNED_OFF), .SDL},
 		{unaligned(45, 2), .SDR},
 		{unaligned(45, 1), .SDR},
 		{unaligned(45, 0), .SDR},
+		{unaligned(45, 2, -UNALIGNED_OFF), .SDR},
 		// the aligned ones
 		{unaligned(32, 2), .LB},
 		{unaligned(32, 1), .LB},
@@ -1261,7 +1270,7 @@ check_unaligned :: proc(c: Case, addr: u32, run: proc(), failed, checks: int) ->
 			for watch in ([?]u8{0, 1}) {
 				for v in ([?]u64{0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210}) {
 					start: cpu.Cpu
-					start.r[1].d = {0x5a5a_5a5a_0000_0000 | u64(at - UNALIGNED_OFF), ~v}
+					start.r[1].d = {0x5a5a_5a5a_0000_0000 | u64(at - u32(i32(i16(c.w)))), ~v}
 					start.r[2].d = {v, v ~ 0x5555}
 					for &f, n in start.f {f.u = 0x5a5a0000 | u32(n)}
 					start.f[2].u = u32(v >> 16)

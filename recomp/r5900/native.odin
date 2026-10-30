@@ -481,23 +481,22 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		case:     native.store_state(a, w, GPR * u32(rt), u32(rt), "ps2.sq", rt == 0)
 		}
 	case .LWL, .LWR, .LDL, .LDR, .SWL, .SWR, .SDL, .SDR:
-		// The runtime's mem procedure, as emit_op calls it: it reads the
-		// aligned word or doubleword and merges, so MMIO and the watch see
-		// what the Odin code does.
+		// The aligned word or doubleword, read and merged (and written) in
+		// place when it is RAM, else the runtime's mem procedure as emit_op
+		// calls it, so MMIO and the watch see what the Odin code does.
 		load := i.op == .LWL || i.op == .LWR || i.op == .LDL || i.op == .LDR
 		if rt == 0 && load {return true} // no access, as emit_op
 		get(a, .A, rs)
 		if simm != 0 {native.alu_imm(a, .Add, .A, simm)}
-		native.mov_imm(a, .B, u32(rt))
 		#partial switch i.op {
-		case .LWL: native.call(a, "ps2.lwl", .A, .B)
-		case .LWR: native.call(a, "ps2.lwr", .A, .B)
-		case .LDL: native.call(a, "ps2.ldl", .A, .B)
-		case .LDR: native.call(a, "ps2.ldr", .A, .B)
-		case .SWL: native.call(a, "ps2.swl", .A, .B)
-		case .SWR: native.call(a, "ps2.swr", .A, .B)
-		case .SDL: native.call(a, "ps2.sdl", .A, .B)
-		case:      native.call(a, "ps2.sdr", .A, .B)
+		case .LWL: native.unaligned(a, .LWL, GPR * u32(rt), u32(rt), "ps2.lwl")
+		case .LWR: native.unaligned(a, .LWR, GPR * u32(rt), u32(rt), "ps2.lwr")
+		case .LDL: native.unaligned(a, .LDL, GPR * u32(rt), u32(rt), "ps2.ldl")
+		case .LDR: native.unaligned(a, .LDR, GPR * u32(rt), u32(rt), "ps2.ldr")
+		case .SWL: native.unaligned(a, .SWL, GPR * u32(rt), u32(rt), "ps2.swl")
+		case .SWR: native.unaligned(a, .SWR, GPR * u32(rt), u32(rt), "ps2.swr")
+		case .SDL: native.unaligned(a, .SDL, GPR * u32(rt), u32(rt), "ps2.sdl")
+		case:      native.unaligned(a, .SDR, GPR * u32(rt), u32(rt), "ps2.sdr")
 		}
 	case .QMFC2:
 		if rt == 0 {return true}

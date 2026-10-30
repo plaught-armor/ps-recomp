@@ -764,6 +764,14 @@ load_at :: proc(a: ^Asm, s: Slow) {
 // The slow path needs A, so the offset goes in ecx. To guarded when a
 // guard is set, to far when the address is not RAM or its page byte is set.
 x64_store :: proc(a: ^Asm, s: Slow, far, guarded: Label) {
+	store_index(a, a.ram.size - 1, far, guarded)
+	store_at(a, s)
+}
+
+// ecx = the guest address in A masked; to guarded when a guard is set, to
+// far when the address is not RAM or its page byte is set.
+@(private = "file")
+store_index :: proc(a: ^Asm, mask: u32, far, guarded: Label) {
 	r := a.ram
 	for g in r.guards {
 		op_imp(a, true, 0x8b, RDX, imp(a, g.addr)) // mov rdx, [slot]
@@ -772,13 +780,77 @@ x64_store :: proc(a: ^Asm, s: Slow, far, guarded: Label) {
 	}
 	br_outside(a, far)
 	op_rr(a, false, 0x89, X64_REG[.A], RCX) // mov ecx, A
-	op_imm(a, 4, RCX, r.size - 1) // and
+	op_imm(a, 4, RCX, mask) // and
 	op_rr(a, false, 0x89, RCX, RDX) // mov edx, ecx
 	op_rr(a, false, 0xc1, 5, RDX) // shr edx, page_shift
 	emit8(a, u8(r.page_shift))
 	emit8(a, 0x80, 0x7c, 0x15, 0x00, 0x00) // cmp byte [rbp + rdx], 0
 	jump(a, 0x5, far) // jne
-	store_at(a, s)
+}
+
+// The unaligned access s at the guest address in A, of the word or
+// doubleword it rounds down to, at RAM index rcx: as store, to far off the
+// fast path and to guarded when a guard is set.
+x64_unaligned :: proc(a: ^Asm, s: Slow, far, guarded: Label) {
+	wide, _, _, store := unal_shape(s.unal)
+	mask := (a.ram.size - 1) &~ (7 if wide else 3)
+	if store {
+		store_index(a, mask, far, guarded)
+	} else {
+		br_outside(a, far)
+		op_rr(a, false, 0x89, X64_REG[.A], RCX) // mov ecx, A
+		op_imm(a, 4, RCX, mask) // and
+	}
+	merge_at(a, s)
+}
+
+// The merge of the unaligned access s with the word or doubleword at
+// [r15 + rcx], A the guest address: the count goes in cl and the index in
+// rax, the source shifts into place in rdx or r10 (the memory or B, the
+// register's field), and xor, and, xor keep the other's bytes outside a
+// mask of ones shifted as far in r11 (C), as mem.LWL and the rest do.
+@(private = "file")
+merge_at :: proc(a: ^Asm, s: Slow) {
+	wide, left, from_top, store := unal_shape(s.unal)
+	ra, rb, rc := X64_REG[.A], X64_REG[.B], X64_REG[.C]
+	assert(ra == 0, "native: xchg rax")
+	op_rr(a, false, 0xc1, 4, ra) // shl eax, 3
+	emit8(a, 3)
+	if from_top {
+		op_rr(a, false, 0xf7, 3, ra) // neg eax
+		op_imm(a, 0, ra, 56 if wide else 24) // add
+	}
+	emit8(a, 0x48, 0x91) // xchg rax, rcx
+	op_ram(a, 0x8b, RDX, ra, wide) // mov rdx, [r15 + rax]
+	op_state(a, true, 0x8b, rb, s.off) // mov r10, [rbx + off]
+	src, dst := u8(RDX), rb
+	if store {src, dst = rb, RDX}
+	sh := u8(4 if left else 5) // shl or shr by cl
+	op_rr(a, wide, 0xd3, sh, src)
+	op_rr(a, wide, 0x83, 1, rc) // or r11, -1
+	emit8(a, 0xff)
+	op_rr(a, wide, 0xd3, sh, rc)
+	op_rr(a, wide, 0x31, dst, src) // xor src, dst
+	op_rr(a, wide, 0x21, rc, src) // and src, r11
+	op_rr(a, wide, 0x31, dst, src)
+	if store {
+		op_ram(a, 0x89, src, ra, wide) // mov [r15 + rax], src
+		return
+	}
+	if s.unal == .LWR {
+		// The word's sign extends only with all four bytes loaded.
+		part := new_label(a)
+		emit8(a, 0xf6, 0xc1, 0x18) // test cl, 0x18
+		jump(a, 0x5, part) // jnz
+		op_rr(a, true, 0x63, src, src) // movsxd
+		op_state(a, true, 0x89, src, s.off)
+		x64_return(a)
+		bind(a, part)
+		op_state(a, false, 0x89, src, s.off)
+		return
+	}
+	if !wide {op_rr(a, true, 0x63, src, src)} // movsxd
+	op_state(a, true, 0x89, src, s.off)
 }
 
 // The store to [r15 + rcx]. B64 and B128 copy the field at s.off (or zero)
@@ -811,13 +883,20 @@ store_at :: proc(a: ^Asm, s: Slow) {
 }
 
 // The load or store s at byte C of the window: its address less r15 plus
-// C makes the index, rax for a load, rcx for a store.
+// C makes the index, rax for a load, rcx for a store or an unaligned
+// access, which rounds C down.
 x64_window :: proc(a: ^Asm, s: Slow) {
-	index := RCX if s.store else X64_REG[.A]
+	index := RCX if s.store || s.unal != .None else X64_REG[.A]
 	op_imp(a, true, 0x8b, index, imp(a, a.ram.window)) // mov index, [slot]
 	op_rr(a, true, 0x29, R15, index) // sub index, r15
+	if s.unal != .None {
+		wide, _, _, _ := unal_shape(s.unal)
+		op_imm(a, 4, X64_REG[.C], ~u32(7 if wide else 3)) // and r11d
+	}
 	op_rr(a, true, 0x01, X64_REG[.C], index) // add index, r11
-	if s.store {
+	if s.unal != .None {
+		merge_at(a, s)
+	} else if s.store {
 		store_at(a, s)
 	} else {
 		load_at(a, s)

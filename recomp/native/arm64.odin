@@ -568,13 +568,14 @@ logical :: proc(v: u32) -> u32 {
 	return (32 - lo) % 32 << 16 | (n - 1) << 10
 }
 
-// w12 = the RAM offset of the guest address in A; to far when it is not RAM.
+// w12 = the RAM offset of the guest address in A, rounded down to align;
+// to far when it is not RAM.
 @(private = "file")
-ram_index :: proc(a: ^Asm, far: Label) {
+ram_index :: proc(a: ^Asm, far: Label, align: u32 = 1) {
 	r := a.ram
 	emit32(a, 0x7200001f | logical(r.outside) | A64_REG[.A] << 5) // tst wA, #outside
 	branch(a, 0x54000000 | CC[.Ne], .A64_B19, far)
-	emit32(a, 0x12000000 | logical(r.size - 1) | A64_REG[.A] << 5 | T0) // and w12, wA, #size - 1
+	emit32(a, 0x12000000 | logical((r.size - 1) &~ (align - 1)) | A64_REG[.A] << 5 | T0) // and w12, wA, #mask
 }
 
 // B64 and B128 copy into the field at s.off, through x13 or q0.
@@ -609,6 +610,15 @@ load_at :: proc(a: ^Asm, s: Slow) {
 // To guarded when a guard is set, to far when the address is not RAM or
 // its page byte is set.
 a64_store :: proc(a: ^Asm, s: Slow, far, guarded: Label) {
+	store_index(a, 1, far, guarded)
+	store_at(a, s)
+}
+
+// w12 = the RAM offset of the guest address in A, rounded down to align;
+// to guarded when a guard is set, to far when the address is not RAM or
+// its page byte is set.
+@(private = "file")
+store_index :: proc(a: ^Asm, align: u32, far, guarded: Label) {
 	r := a.ram
 	for g in r.guards {
 		load_imp(a, T1, imp(a, g.addr))
@@ -616,11 +626,71 @@ a64_store :: proc(a: ^Asm, s: Slow, far, guarded: Label) {
 		emit32(a, 0x7200001f | logical(u32(g.mask)) | T1 << 5) // tst w13, #mask
 		branch(a, 0x54000000 | CC[.Ne], .A64_B19, guarded)
 	}
-	ram_index(a, far)
+	ram_index(a, far, align)
 	emit32(a, 0x53007c00 | r.page_shift << 16 | T0 << 5 | T1) // lsr w13, w12, #page_shift
 	rrr(a, 0x38606800, T1, PAGES, T1) // ldrb w13, [x24, x13]
 	branch(a, 0x35000000 | T1, .A64_B19, far) // cbnz
-	store_at(a, s)
+}
+
+// The unaligned access s at the guest address in A, of the word or
+// doubleword it rounds down to, at RAM offset x12: as a64_store, to far
+// off the fast path and to guarded when a guard is set.
+a64_unaligned :: proc(a: ^Asm, s: Slow, far, guarded: Label) {
+	wide, _, _, store := unal_shape(s.unal)
+	align := u32(8 if wide else 4)
+	if store {
+		store_index(a, align, far, guarded)
+	} else {
+		ram_index(a, far, align)
+	}
+	merge_at(a, s)
+}
+
+// The merge of the unaligned access s with the word or doubleword at
+// [x23, x12], A the guest address: the count goes in w11 (C), the source
+// shifts into place in x13 or x10 (the memory or B, the register's field),
+// and eor, and, eor keep the other's bytes outside a mask of ones shifted
+// as far in x16, as mem.LWL and the rest do.
+@(private = "file")
+merge_at :: proc(a: ^Asm, s: Slow) {
+	wide, left, from_top, store := unal_shape(s.unal)
+	ra, rb, rc := A64_REG[.A], A64_REG[.B], A64_REG[.C]
+	sf := u32(0x80000000) if wide else 0
+	size := u32(0x40000000) if wide else 0 // x for w in a load or store
+	emit32(a, 0x531d7000 | ra << 5 | rc) // lsl w11, wA, #3
+	if from_top {
+		rrr(a, 0x4b000000, rc, ZR, rc) // neg w11, w11
+		emit32(a, 0x11000000 | u32(56 if wide else 24) << 10 | rc << 5 | rc) // add w11, w11, #top
+	}
+	rrr(a, 0xb8606800 | size, T1, RAM, T0) // ldr x13, [x23, x12]
+	ldst(a, 0xf9400000, rb, S, s.off, 8) // ldr x10, [x19, off]
+	src, dst := u32(T1), rb
+	if store {src, dst = rb, T1}
+	sh := u32(0x1ac02000 if left else 0x1ac02400) | sf // lslv or lsrv
+	rrr(a, sh, src, src, rc)
+	emit32(a, 0x12800000 | sf | IP0) // movn x16, #0
+	rrr(a, sh, IP0, IP0, rc)
+	rrr(a, 0x4a000000 | sf, src, src, dst) // eor
+	rrr(a, 0x0a000000 | sf, src, src, IP0) // and
+	rrr(a, 0x4a000000 | sf, src, src, dst)
+	if store {
+		rrr(a, 0xb8206800 | size, src, RAM, T0) // str x, [x23, x12]
+		return
+	}
+	if s.unal == .LWR {
+		// The word's sign extends only with all four bytes loaded.
+		part := new_label(a)
+		emit32(a, 0x7200001f | logical(0x18) | rc << 5) // tst w11, #0x18
+		branch(a, 0x54000000 | CC[.Ne], .A64_B19, part)
+		emit32(a, 0x93407c00 | src << 5 | src) // sxtw
+		ldst(a, 0xf9000000, src, S, s.off, 8)
+		a64_return(a)
+		bind(a, part)
+		ldst(a, 0xb9000000, src, S, s.off, 4) // str w
+		return
+	}
+	if !wide {emit32(a, 0x93407c00 | src << 5 | src)} // sxtw
+	ldst(a, 0xf9000000, src, S, s.off, 8)
 }
 
 // The store to [x23, x12]. B64 and B128 copy the field at s.off (or zero)
@@ -660,8 +730,16 @@ store_at :: proc(a: ^Asm, s: Slow) {
 a64_window :: proc(a: ^Asm, s: Slow) {
 	load_imp(a, T0, imp(a, a.ram.window))
 	rrr(a, 0xcb000000, T0, T0, RAM) // sub x12, x12, x23
+	if s.unal != .None {
+		// An unaligned access rounds C down.
+		wide, _, _, _ := unal_shape(s.unal)
+		rc := A64_REG[.C]
+		emit32(a, 0x12000000 | logical(~u32(7 if wide else 3)) | rc << 5 | rc) // and w11, w11, #mask
+	}
 	rrr(a, 0x8b000000, T0, T0, A64_REG[.C]) // add x12, x12, x11
-	if s.store {
+	if s.unal != .None {
+		merge_at(a, s)
+	} else if s.store {
 		store_at(a, s)
 	} else {
 		load_at(a, s)
