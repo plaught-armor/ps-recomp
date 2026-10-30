@@ -697,15 +697,6 @@ gl_delete :: proc(tex: ^u32) {
 	}
 }
 
-// A forked child draws no hi-res target and leaves the parent's GL alone.
-@(private)
-gl_fork_child :: proc() {
-	if gpu_gl.on {
-		gpu_gl.on = false
-		target_count = 1
-	}
-}
-
 // Give target t (the hi-res one, just made) its textures, filled from VRAM.
 @(private)
 gl_target_make :: proc(t: ^Target) {

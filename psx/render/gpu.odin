@@ -345,21 +345,14 @@ gpu_init :: proc(window: ^sdl.Window, renderer: ^sdl.Renderer) {
 	}
 }
 
-// Before a fork: what the child needs of the parent's GPU backend, copied
-// out.
-gpu_fork_save :: proc() {
-	vk_fork_save()
-}
-
-// The parent, once forked (or the fork failed).
-gpu_fork_parent :: proc() {
-	vk_fork_parent()
-}
-
-// A forked child leaves the parent's GPU backend alone.
+// A forked child draws no hi-res target (it shows nothing) and leaves the
+// parent's GPU backend alone.
 gpu_fork_child :: proc() {
-	gl_fork_child()
-	vk_fork_child()
+	if gpu_gl.on || gpu_vk.on {
+		gpu_gl.on = false
+		gpu_vk = {}
+		target_count = 1
+	}
 }
 
 // Draw at `scale` times VRAM's resolution (1, 2 or 4): make or drop the

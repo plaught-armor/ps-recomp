@@ -18,7 +18,6 @@ package psx_render
 import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
-import "core:slice"
 import vk "vendor:vulkan"
 import "ps:core"
 
@@ -234,56 +233,9 @@ vk_init :: proc() -> bool {
 	g.shadow^ = vram
 	mem.copy(g.vram.ptr, &vram[0], size_of(vram))
 	g.on = true
-	fmt.eprintln(core.ENV_PREFIX + "GPU: vk (hi-res target's walks drawn on Vulkan)")
+	fmt.eprintln(core.ENV_PREFIX + "GPU: vk (hi-res target drawn and converted on Vulkan)")
 	fmt.eprintln(core.ENV_PREFIX + "GPU=vk:", g.interlock ? "pixel interlock, one level a queue" : "draw levels (no pixel interlock)")
 	return true
-}
-
-// The target with its planes copied out of the stage, made just before a
-// fork (vk_fork_save): the planes are mapped memory the parent shares, and
-// it goes on drawing into them while the child runs.
-@(private = "file")
-vk_fork_saved: Target
-
-// Copy the target's planes out for a child about to be forked.
-vk_fork_save :: proc() {
-	t := targets[1]
-	if !t.vk {
-		return
-	}
-	t.vk = false
-	t.rgb = slice.clone(t.rgb)
-	t.walk = slice.clone(t.walk)
-	t.door = slice.clone(t.door)
-	t.zbuf = slice.clone(t.zbuf)
-	gh := &t.ghost
-	gh.rgb, gh.alpha, gh.z = slice.clone(gh.rgb), slice.clone(gh.alpha), slice.clone(gh.z)
-	vk_fork_saved = t
-}
-
-// The parent, once forked: the copies are the child's alone.
-vk_fork_parent :: proc() {
-	t := &vk_fork_saved
-	if t.rgb == nil {
-		return
-	}
-	delete(t.rgb)
-	delete(t.walk)
-	delete(t.door)
-	delete(t.zbuf)
-	delete(t.ghost.rgb)
-	delete(t.ghost.alpha)
-	delete(t.ghost.z)
-	t^ = {}
-}
-
-// A forked child leaves the parent's device and images alone, and draws
-// the target in software, on the planes copied out before the fork.
-vk_fork_child :: proc() {
-	gpu_vk = {}
-	if vk_fork_saved.rgb != nil {
-		targets[1] = vk_fork_saved
-	}
 }
 
 @(private = "file")

@@ -27,11 +27,7 @@ preload_fork :: proc() -> (pid: i32, ok: bool) {
 	parent := linux.getpid()
 	// libc's fork, not the raw syscall: it runs the atfork handlers SDL and
 	// the C library's own locks rely on.
-	render.gpu_fork_save()
 	p := posix.fork()
-	if p != 0 {
-		render.gpu_fork_parent()
-	}
 	if p < 0 {
 		return 0, false
 	}
