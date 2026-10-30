@@ -103,6 +103,10 @@ bios_a :: proc(fn: u32) {
 	if .Bios in core.trace.active {
 		core.tracef(.Bios, "A(%02xh) a0=%x a1=%x a2=%x ra=%x", fn, arg(0), arg(1), arg(2), cpu.state.r[31])
 	}
+	if fn < len(a0_from_b0) && a0_from_b0[fn] != 0 {
+		bios_b(u32(a0_from_b0[fn]))
+		return
+	}
 	switch fn {
 	case 0x0c:
 		ret(libc.strtoul(arg(0), arg(1), arg(2)))
@@ -368,9 +372,65 @@ bios_syscall :: proc() {
 	deliver_event(0xf0000010, 0x4000)
 }
 
+// The A functions the retail kernel's C(1Ch) AdjustA0Table points at B
+// functions during boot: A 00-09 (open to putc) are B 32-3B, A 3B-3E
+// (getchar to puts) are B 3C-3F. 0 = not redirected.
+@(private, rodata)
+a0_from_b0 := [0x3f]u8 {
+	0x00 = 0x32,
+	0x01 = 0x33,
+	0x02 = 0x34,
+	0x03 = 0x35,
+	0x04 = 0x36,
+	0x05 = 0x37,
+	0x06 = 0x38,
+	0x07 = 0x39,
+	0x08 = 0x3a,
+	0x09 = 0x3b,
+	0x3b = 0x3c,
+	0x3c = 0x3d,
+	0x3d = 0x3e,
+	0x3e = 0x3f,
+}
+
+// Table entries that never return on the retail kernel: each is a stub that
+// loads its own number and jumps to its table's vector, which dispatches
+// straight back to the stub. Listed by the PS1 BIOS index (v4.5 retail
+// kernel):
+//   awk -F'\t' '$12 ~ /hangs:/ {print $1, $2}' bios-index/ps1/index.tsv
+@(private)
+A0_HANGS :: bit_set[0x3a ..= 0xa1; u128]{0x3a, 0x40, 0x4f, 0x50, 0x52, 0x53, 0x9a, 0x9b, 0xa1}
+@(private)
+B0_HANGS :: bit_set[0x1a ..= 0x5a; u128] {
+	0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x21, 0x22, 0x23, 0x2a, 0x2b, 0x52, 0x5a,
+}
+@(private)
+C0_HANGS :: bit_set[0x0b ..= 0x0b; u128]{0x0b}
+
+// Whether table(fn) is one of those stubs. fn comes from the guest and can
+// lie outside a set's range, where `in` alone is not defined; the range is
+// tested first.
+hangs_on_retail :: proc(table: string, fn: u32) -> bool {
+	switch table {
+	case "A":
+		return fn >= 0x3a && fn <= 0xa1 && int(fn) in A0_HANGS
+	case "B":
+		return fn >= 0x1a && fn <= 0x5a && int(fn) in B0_HANGS
+	case "C":
+		return fn == 0x0b && int(fn) in C0_HANGS
+	}
+	return false
+}
+
+// A call the HLE BIOS does not handle stops the game. One that hangs on the
+// retail kernel says so: the game was never meant to get there.
 @(private)
 bios_unknown :: proc(table: string, fn: u32) {
-	fmt.eprintfln("fatal: unimplemented BIOS %s(%02xh) (ra %#08x)", table, fn, cpu.state.r[31])
+	if hangs_on_retail(table, fn) {
+		fmt.eprintfln("fatal: BIOS %s(%02xh) hangs on retail (ra %#08x)", table, fn, cpu.state.r[31])
+	} else {
+		fmt.eprintfln("fatal: unimplemented BIOS %s(%02xh) (ra %#08x)", table, fn, cpu.state.r[31])
+	}
 	os.exit(1)
 }
 

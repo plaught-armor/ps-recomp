@@ -28,11 +28,16 @@
 //   The memory card calls: card status, firstfile/nextfile patterns and the
 //   DIRENTRY, and lseek and read on whole frames. The card images live in
 //   memory only: their paths name a directory that does not exist.
+//   A 00-09 and 3B-3E called through the A0 vector run the B functions
+//   AdjustA0Table puts there: A(03h) write and A(3Eh) puts.
+//   hangs_on_retail names the stubs that never return on retail, and no
+//   number below or above each table's set of them.
 package main
 
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "ps:core"
 import bios "ps:psx/bios"
 import cpu "ps:psx/cpu"
 import io "ps:psx/io"
@@ -599,10 +604,66 @@ main :: proc() {
 	check("position after the read", b(0x33, fd, 0, 1), 0x100)
 	b(0x33, fd, 0x2000, 0)
 	check("read at the end of the file", b(0x34, fd, CARD_BUF, 0x80), 0xffffffff)
+
+	// A(03h) write through the A0 vector is B(35h): the frame lands on the
+	// card; saving the image fails, so it returns -1. The CPU reaches the
+	// A0 vector through its bios_a hook, which psx/hooks.odin sets in a game.
+	cpu.bios_a = bios.bios_a
+	b(0x33, fd, 0x80, 0)
+	for k in u32(0) ..< 0x80 {
+		cpu.w8(CARD_BUF + k, 0xa5)
+	}
+	cpu.state.r[4], cpu.state.r[5], cpu.state.r[6], cpu.state.r[9] = fd, CARD_BUF, 0x80, 0x03
+	cpu.call(0xa0)
+	check("A(03h) write of a frame, image not saved", cpu.state.r[2], 0xffffffff)
+	check("position after A(03h) write", b(0x33, fd, 0, 1), 0x100)
+	b(0x33, fd, 0x80, 0)
+	b(0x34, fd, CARD_BUF, 0x80)
+	check("byte written by A(03h)", u32(cpu.r8(CARD_BUF + 0x7f)), 0xa5)
 	check("close", b(0x36, fd), fd)
+
+	// A(3Eh) puts through the A0 vector is B(3Fh), as the Bios trace shows.
+	clock: u64
+	core.trace.present, core.trace.cycles = &clock, &clock
+	core.trace.active = {.Bios}
+	cpu.state.r[4], cpu.state.r[9] = guest_string("A(3Eh) puts"), 0x3e
+	cpu.call(0xa0)
+	core.trace.active = {}
+	if !strings.contains(strings.to_string(core.trace.buf), "B(3fh)") {
+		fail("A(3Eh) did not reach B(3Fh); trace: %s", strings.to_string(core.trace.buf))
+	}
+
+	// Hang stubs, and numbers on either side of each table's range of them.
+	hang_cases := [?]struct {
+		table: string,
+		fn:    u32,
+		hangs: bool,
+	} {
+		{"A", 0x3a, true},
+		{"A", 0x40, true},
+		{"A", 0xa1, true},
+		{"A", 0x41, false},
+		{"A", 0x10, false},
+		{"A", 0xb5, false},
+		{"A", 0xffffffff, false},
+		{"B", 0x1a, true},
+		{"B", 0x5a, true},
+		{"B", 0x20, false},
+		{"B", 0x19, false},
+		{"B", 0x5b, false},
+		{"C", 0x0b, true},
+		{"C", 0x0a, false},
+		{"C", 0x0c, false},
+		{"D", 0x0b, false},
+	}
+	for h in hang_cases {
+		if bios.hangs_on_retail(h.table, h.fn) != h.hangs {
+			fail("hangs_on_retail(%s, %02xh) is %v", h.table, h.fn, !h.hangs)
+		}
+	}
 
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, hang stubs")
 }
