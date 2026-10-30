@@ -4,7 +4,9 @@
 // a page, at the end of RAM, in the scratchpad and across into I/O; a plain
 // word or half running past the scratchpad's end stays in it; and the
 // native backend's fused pair leaves what the composed pair does. Also the
-// native backend's inline div and divu against cpu.div and cpu.divu.
+// native backend's inline div and divu against cpu.div and cpu.divu, and
+// its aligned loads and stores, lwc2 and swc2 too, against the bus and the
+// memory itself in and around the scratchpad.
 package main
 
 import "core:fmt"
@@ -12,6 +14,7 @@ import "core:os"
 import "ps:core"
 import psx_native "ps:psx/native"
 import cpu "ps:psx/cpu"
+import "ps:psx/gte"
 import "ps:recomp/mips"
 import "ps:recomp/native"
 import "ps:recomp/r3000"
@@ -305,12 +308,136 @@ check_native :: proc() {
 	}
 }
 
+// Each aligned load and store, lwc2 and swc2 through GTE data register 0,
+// as native code in and around the scratchpad, in each segment: the bus
+// (psx/cpu/bus.odin) has it at physical 0x1f800000 in all of them, so
+// kseg1 too. The loads read what is there (nothing past the scratchpad
+// until I/O), and the stores leave what the cpu.sb, cpu.sh and cpu.sw ones
+// do, plain, with the cache isolated and while memory tracing watches.
+@(private = "file")
+check_scratch :: proc() {
+	Op :: struct {
+		w:      u32,
+		size:   u32,
+		signed: bool,
+		store:  bool,
+	}
+	OPS :: [?]Op {
+		{0x80820000, 1, true, false}, // lb $v0, 0($a0)
+		{0x84820000, 2, true, false}, // lh
+		{0x8c820000, 4, false, false}, // lw
+		{0x90820000, 1, false, false}, // lbu
+		{0x94820000, 2, false, false}, // lhu
+		{0xc8800000, 4, false, false}, // lwc2 $0, 0($a0)
+		{0xa0850000, 1, false, true}, // sb $a1, 0($a0)
+		{0xa4850000, 2, false, true}, // sh
+		{0xac850000, 4, false, true}, // sw
+		{0xe8800000, 4, false, true}, // swc2 $0, 0($a0)
+	}
+	ADDRS :: [?]u32 {
+		0x1f800000, 0x9f800000, 0xbf800000, 0x1f800022, 0x9f800001,
+		0x1f8003fc, 0x9f8003fc, 0xbf8003fc, 0x1f8003fe, 0x1f8003ff,
+		0x1f800400, IO_WORD, 0x9f801000,
+	}
+	ops := OPS
+	arch := native.Arch(core.NATIVE_ARCH)
+	na := native.make_asm(arch, r3000.native_ram(), r3000.NATIVE_CACHED[:])
+	blob_funcs: [len(OPS)]native.Blob_Func
+	for op, k in ops {
+		at := u32(0x80003000 + 0x20 * k)
+		words := [?]u32{op.w, JR_RA, 0, 0}
+		blob_funcs[k] = {at, r3000.native_func(&na, build(at, words[:]), nil, 1)}
+		free_all(context.temp_allocator)
+	}
+	code, err := core.native_load(native.make_blob(&na, blob_funcs[:], {}), psx_native.imports())
+	if err != "" {
+		fmt.eprintln("FAIL psx_unaligned: native_load:", err)
+		os.exit(1)
+	}
+	run :: proc(code: core.Native_Code, k: int) {(cast(proc())rawptr(code.base + uintptr(code.funcs[k].off)))()}
+	// What is at a, read straight from the memory, and whether anything is.
+	held :: proc(a, size: u32) -> (v: u32, mapped: bool) {
+		p := a & 0x1fffffff
+		switch {
+		case p - cpu.SCRATCH_BASE < cpu.SCRATCH_SIZE:
+			for j in 0 ..< size {v |= u32(cpu.scratch[p - cpu.SCRATCH_BASE + j]) << (8 * j)}
+			return v, true
+		case p == IO_WORD:
+			return memctrl[0] & (u32(0xffffffff) >> (32 - 8 * size)), true
+		}
+		return 0, false
+	}
+	cpu.next_event = max(u64)
+	want, got: ^Mem = new(Mem), new(Mem)
+	defer free(want)
+	defer free(got)
+	V :: 0xc3a59617
+	for a in ADDRS {
+		for op, k in ops {
+			if a % op.size != 0 {continue}
+			if !op.store {
+				fill()
+				v, _ := held(a, op.size)
+				if op.signed {v = u32(i32(v << (32 - 8 * op.size)) >> (32 - 8 * op.size))}
+				bus: u32
+				switch op.size {
+				case 1:
+					bus = cpu.lb(a) if op.signed else cpu.lbu(a)
+				case 2:
+					bus = cpu.lh(a) if op.signed else cpu.lhu(a)
+				case:
+					bus = cpu.lw(a)
+				}
+				if bus != v {fail("bus %08x at %08x: %08x, want %08x", op.w, a, bus, v)}
+				cpu.state.r[2], cpu.state.r[4] = 0x5a5a5a5a, a
+				gte.data_write(0, 0x5a5a5a5a)
+				run(code, k)
+				g := gte.data_read(0) if op.w >> 26 == 0x32 else cpu.state.r[2]
+				if g != v {fail("native %08x at %08x: %08x, want %08x", op.w, a, g, v)}
+				continue
+			}
+			for mode in 0 ..< 3 {
+				store :: proc(code: core.Native_Code, k: int, op: Op, mode: int, a: u32, natively: bool) {
+					fill()
+					cpu.cop0.sr = 0x10000 if mode == 1 else 0
+					core.trace.watching = mode == 2
+					if natively {
+						cpu.state.r[4], cpu.state.r[5] = a, V
+						gte.data_write(0, V)
+						run(code, k)
+					} else {
+						switch op.size {
+						case 1:
+							cpu.sb(a, V)
+						case 2:
+							cpu.sh(a, V)
+						case:
+							cpu.sw(a, V)
+						}
+					}
+					cpu.cop0.sr = 0
+					core.trace.watching = false
+				}
+				store(code, k, op, mode, a, false)
+				snap(want)
+				if v, mapped := held(a, op.size); mapped && mode != 1 && v != u32(V) & (u32(0xffffffff) >> (32 - 8 * op.size)) {
+					fail("bus %08x at %08x in mode %d left %08x", op.w, a, mode, v)
+				}
+				store(code, k, op, mode, a, true)
+				snap(got)
+				if !same_mem(want, got) {fail("native %08x at %08x in mode %d differs from the bus", op.w, a, mode)}
+			}
+		}
+	}
+}
+
 main :: proc() {
 	cpu.io_read, cpu.io_write = io_read, io_write
 	check_lower()
 	check_bus()
 	check_straddle()
 	check_native()
+	check_scratch()
 	if failed != 0 {
 		os.exit(1)
 	}

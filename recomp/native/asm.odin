@@ -219,11 +219,13 @@ Ram :: struct {
 	guards:     []Guard, // a store calls while any is set
 	// Off the fast path, before calling: an address with address &
 	// mirror_mask == mirror_bits is RAM too, at address & (size - 1) (mask
-	// 0: no mirror), and one in [window_at, window_at + window_size) is the
-	// byte that far into the memory at import window ("": none).
+	// 0: no mirror), and one whose access lies whole in [window_at,
+	// window_at + window_size) once masked with window_mask (0: unmasked)
+	// is the byte that far into the memory at import window ("": none).
 	mirror_mask: u32,
 	mirror_bits: u32,
 	window:      string,
+	window_mask: u32,
 	window_at:   u32,
 	window_size: u32,
 }
@@ -943,9 +945,11 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 		bind(a, next)
 	}
 	if r.window != "" {
+		// An access running past the end calls, so the bus decides it.
 		mov(a, .C, .A)
+		if r.window_mask != 0 {alu_imm(a, .And, .C, r.window_mask)}
 		alu_imm(a, .Sub, .C, r.window_at)
-		br_cmp_imm(a, .Geu, .C, r.window_size, guarded)
+		br_cmp_imm(a, .Geu, .C, r.window_size - (u32(1) << u32(s.w)) + 1, guarded)
 		switch a.arch {
 		case .X64_SysV, .X64_Win:
 			x64_window(a, s)

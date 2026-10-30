@@ -130,9 +130,20 @@ in_ram :: #force_inline proc(a: u32) -> (u32, bool) {
 	return p & (RAM_SIZE - 1), p < 0x800000
 }
 
+// The scratchpad, at physical 0x1f800000 in every segment. The loads and
+// stores take it inline after RAM, but for an unaligned one across its end,
+// which load_slow and store_slow see, as they do the rest.
+@(private)
+in_scratch :: #force_inline proc(a: u32) -> (u32, bool) {
+	return a & (SCRATCH_SIZE - 1), a & 0x1ffffc00 == SCRATCH_BASE
+}
+
 lw :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok {
 		return u32((^u32le)(&ram[o])^)
+	}
+	if o, ok := in_scratch(a); ok && o <= SCRATCH_SIZE - 4 {
+		return u32((^u32le)(&scratch[o])^)
 	}
 	return load_slow(a, 4)
 }
@@ -140,6 +151,9 @@ lw :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
 lhu :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok {
 		return u32((^u16le)(&ram[o])^)
+	}
+	if o, ok := in_scratch(a); ok && o <= SCRATCH_SIZE - 2 {
+		return u32((^u16le)(&scratch[o])^)
 	}
 	return load_slow(a, 2) & 0xffff
 }
@@ -151,6 +165,9 @@ lh :: #force_inline proc(a: u32) -> u32 {
 lbu :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok {
 		return u32(ram[o])
+	}
+	if o, ok := in_scratch(a); ok {
+		return u32(scratch[o])
 	}
 	return load_slow(a, 1) & 0xff
 }
@@ -166,6 +183,10 @@ sw :: #force_inline proc(a, v: u32) #no_bounds_check {
 		(^u32le)(&ram[o])^ = u32le(v)
 		return
 	}
+	if o, ok := in_scratch(a); ok && o <= SCRATCH_SIZE - 4 && cop0.sr & 0x10000 == 0 {
+		(^u32le)(&scratch[o])^ = u32le(v)
+		return
+	}
 	store_slow(a, v, 4)
 }
 
@@ -176,6 +197,10 @@ sh :: #force_inline proc(a, v: u32) #no_bounds_check {
 		(^u16le)(&ram[o])^ = u16le(v)
 		return
 	}
+	if o, ok := in_scratch(a); ok && o <= SCRATCH_SIZE - 2 && cop0.sr & 0x10000 == 0 {
+		(^u16le)(&scratch[o])^ = u16le(v)
+		return
+	}
 	store_slow(a, v & 0xffff, 2)
 }
 
@@ -184,6 +209,10 @@ sb :: #force_inline proc(a, v: u32) {
 	if o, ok := in_ram(a); ok && cop0.sr & 0x10000 == 0 {
 		ram_guard(o)
 		ram[o] = u8(v)
+		return
+	}
+	if o, ok := in_scratch(a); ok && cop0.sr & 0x10000 == 0 {
+		scratch[o] = u8(v)
 		return
 	}
 	store_slow(a, v & 0xff, 1)

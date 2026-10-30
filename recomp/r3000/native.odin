@@ -29,7 +29,9 @@ PAGE_SHIFT :: 12
 
 // PS1 main RAM as the bus decodes it (psx/cpu/bus.odin in_ram): 2 MiB
 // mirrored below physical 0x800000. A store into a page armed for a
-// checkpoint calls, so the runtime saves the page.
+// checkpoint calls, so the runtime saves the page. The 1K scratchpad is
+// the window, at physical 0x1f800000 in every segment as the bus has it
+// (load_slow, store_slow).
 native_ram :: proc() -> native.Ram {
 	return {
 		base = "cpu.ram",
@@ -38,6 +40,10 @@ native_ram :: proc() -> native.Ram {
 		pages = "cpu.ram_armed",
 		page_shift = PAGE_SHIFT,
 		guards = RAM_GUARDS[:],
+		window = "cpu.scratch",
+		window_mask = 0x1fffffff,
+		window_at = 0x1f800000,
+		window_size = 1024,
 	}
 }
 

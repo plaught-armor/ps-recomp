@@ -38,6 +38,7 @@ imports :: proc() -> map[string]u64 {
 	m["trace.watching"] = p(&core.trace.watching)
 	m["cpu.ram"] = p(&cpu.ram)
 	m["cpu.ram_armed"] = p(&cpu.ram_armed)
+	m["cpu.scratch"] = p(&cpu.scratch)
 	m["cpu.sr_isolate"] = p(&cpu.cop0.sr) + 2
 	m["cpu.lb"] = p(rawptr(lb))
 	m["cpu.lh"] = p(rawptr(lh))
