@@ -22,7 +22,9 @@ Boot :: struct {
 	funcs:    []cpu.Func_Entry,
 	overlays: proc(),
 	// A native blob to use in place of the Odin functions ("" none;
-	// load_native).
+	// load_native). With no funcs the blob is all the game's code: its
+	// functions are registered from it, and the boot stops if it cannot be
+	// loaded. With neither, the game is interpreted.
 	native:   string,
 	// The memory card images (bios.card_files); left empty, the runtime's.
 	cards:    [2]string,
@@ -50,8 +52,16 @@ run :: proc(b: Boot) -> bool {
 
 	cpu.register_funcs(b.funcs)
 	if b.overlays != nil {b.overlays()}
-	// On failure load_native prints why and the Odin functions stay.
-	if b.native != "" {load_native(b.native)}
+	// On failure load_native prints why and the Odin functions stay; a
+	// standalone blob has none behind it. With neither, every function is
+	// interpreted: a disc nobody has converted still runs, slowly.
+	standalone := len(b.funcs) == 0
+	if b.native != "" && !load_native(b.native, standalone) && standalone {
+		return false
+	}
+	if standalone && b.native == "" {
+		fmt.eprintln("psx: no native code, interpreting everything")
+	}
 	if b.hooks != nil {b.hooks() or_return}
 
 	io.events_init()

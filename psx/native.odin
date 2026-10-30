@@ -6,7 +6,9 @@
 // A game calls load_native after registering its recompiled functions and
 // before installing hooks, so hooks replace the native functions as they
 // would the Odin ones. Setting NATIVE=0 keeps the Odin functions, for
-// comparing the two.
+// comparing the two. A game built without Odin functions loads the blob
+// standalone instead: it registers every function the blob has, and code
+// the blob lacks is interpreted as it would be without the Odin ones.
 package psx
 
 import "core:fmt"
@@ -61,10 +63,14 @@ import native "native"
 #assert(offset_of(gte.Gte, flag) == 292)
 
 // Replace the registered functions with the native code in the file at
-// path. False, with the reason printed, when it cannot be used; the Odin
-// functions then stay.
-load_native :: proc(path: string) -> bool {
+// path, or with standalone, register its functions where none are. False,
+// with the reason printed, when it cannot be used; the Odin functions then
+// stay, and a standalone game has none to run.
+load_native :: proc(path: string, standalone := false) -> bool {
 	if core.env("NATIVE") == "0" {
+		if standalone {
+			fmt.eprintfln("native: %s: NATIVE=0, and the build has no Odin functions", path)
+		}
 		return false
 	}
 	blob, err := os.read_entire_file(path, context.allocator)
@@ -82,6 +88,22 @@ load_native :: proc(path: string) -> bool {
 	defer delete(code.ovls)
 	fn :: proc(code: core.Native_Code, off: u32) -> cpu.Func_Proc {
 		return cast(cpu.Func_Proc)rawptr(code.base + uintptr(off))
+	}
+	if standalone {
+		funcs := make([]cpu.Func_Entry, len(code.funcs))
+		defer delete(funcs)
+		for f, k in code.funcs {
+			funcs[k] = {f.addr, fn(code, f.off)}
+		}
+		cpu.register_funcs(funcs)
+		ovls := make([]cpu.Ovl_Entry, len(code.ovls))
+		defer delete(ovls)
+		for o, k in code.ovls {
+			ovls[k] = {o.addr, o.slot, o.id, o.sig, fn(code, o.off)}
+		}
+		cpu.register_overlay_funcs(ovls)
+		fmt.eprintfln("native: %d functions from %s, standalone", len(code.funcs) + len(code.ovls), path)
+		return true
 	}
 	// A function the build does not have means the blob is from other code:
 	// use none of it rather than a mix.
