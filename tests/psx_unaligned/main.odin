@@ -1,7 +1,8 @@
 // Fused unaligned words on the PS1 side, run on every target in CI: lower
 // fuses lwl/lwr and swl/swr pairs only under its guards; cpu.lw_u and
 // cpu.sw_u match the pair they stand for at every alignment, in RAM, across
-// a page, at the end of RAM, in the scratchpad and across into I/O; and the
+// a page, at the end of RAM, in the scratchpad and across into I/O; a plain
+// word or half running past the scratchpad's end stays in it; and the
 // native backend's fused pair leaves what the composed pair does. Also the
 // native backend's inline div and divu against cpu.div and cpu.divu.
 package main
@@ -200,6 +201,38 @@ check_bus :: proc() {
 	}
 }
 
+// cpu.lw, cpu.lhu, cpu.sw and cpu.sh across the scratchpad's end: the
+// bytes in it are the scratchpad's, the ones past it unmapped (read 0,
+// stores go nowhere), and nothing outside the scratchpad array is touched.
+@(private = "file")
+check_straddle :: proc() {
+	want, got: ^Mem = new(Mem), new(Mem)
+	defer free(want)
+	defer free(got)
+	for a in ([?]u32{0x1f8003fd, 0x1f8003fe, 0x1f8003ff, 0x9f8003fe}) {
+		for size in ([?]u32{2, 4}) {
+			if size == 2 && a & 1 == 0 {continue}
+			fill()
+			o := a & (cpu.SCRATCH_SIZE - 1)
+			v: u32
+			for j in 0 ..< size {
+				if o + j < cpu.SCRATCH_SIZE {v |= u32(cpu.scratch[o + j]) << (8 * j)}
+			}
+			g := cpu.lw(a) if size == 4 else cpu.lhu(a)
+			if g != v {fail("load%d at %08x: %08x, want %08x", size * 8, a, g, v)}
+			fill()
+			for j in 0 ..< size {
+				if o + j < cpu.SCRATCH_SIZE {cpu.scratch[o + j] = u8(u32(0xc3a59617) >> (8 * j))}
+			}
+			snap(want)
+			fill()
+			if size == 4 {cpu.sw(a, 0xc3a59617)} else {cpu.sh(a, 0x9617)}
+			snap(got)
+			if !same_mem(want, got) {fail("store%d at %08x differs", size * 8, a)}
+		}
+	}
+}
+
 // The fused pairs as native code: a load, a load whose delay slot reads the
 // old value, and a store.
 @(private = "file")
@@ -276,6 +309,7 @@ main :: proc() {
 	cpu.io_read, cpu.io_write = io_read, io_write
 	check_lower()
 	check_bus()
+	check_straddle()
 	check_native()
 	if failed != 0 {
 		os.exit(1)

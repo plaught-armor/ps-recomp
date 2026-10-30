@@ -274,6 +274,13 @@ load_slow :: proc(a: u32, size: u32) -> u32 {
 	switch {
 	case p & 0x1ffffc00 == SCRATCH_BASE:
 		o := p & (SCRATCH_SIZE - 1)
+		if o > SCRATCH_SIZE - size {
+			// Unaligned across the end: byte by byte, so the bytes past it
+			// read as the bus has them, not past the array.
+			v: u32
+			for j in 0 ..< size {v |= load_slow(a + j, 1) << (8 * j)}
+			return v
+		}
 		switch size {
 		case 4:
 			return u32((^u32le)(&scratch[o])^)
@@ -301,6 +308,11 @@ store_slow :: proc(a, v: u32, size: u32) {
 	switch {
 	case p & 0x1ffffc00 == SCRATCH_BASE:
 		o := p & (SCRATCH_SIZE - 1)
+		if o > SCRATCH_SIZE - size {
+			// As in load_slow: the bytes past the end go where the bus sends them.
+			for j in 0 ..< size {store_slow(a + j, v >> (8 * j) & 0xff, 1)}
+			return
+		}
 		switch size {
 		case 4:
 			(^u32le)(&scratch[o])^ = u32le(v)
