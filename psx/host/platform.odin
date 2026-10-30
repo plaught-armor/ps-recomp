@@ -224,8 +224,9 @@ run_poke_script :: proc() {
 
 platform_init :: proc(title: cstring) -> bool {
 	// HEADLESS=1: no window, controllers, audio device or pacing. FRAMES=<n>:
-	// exit at vblank n.
+	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	core.headless_init() or_return
+	core.compat_init("ps1", &cpu.state.cycles)
 	subsystems := sdl.InitFlags{.VIDEO, .EVENTS, .GAMECONTROLLER}
 	if core.headless {subsystems -= {.GAMECONTROLLER}}
 	if sdl.Init(subsystems) != 0 {
@@ -910,6 +911,7 @@ platform_frame :: proc() {
 	if host.quit || core.frames_done(cpu.presents) {
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
+		core.compat_report()
 		os.exit(0)
 	}
 	if vblank_hook != nil {

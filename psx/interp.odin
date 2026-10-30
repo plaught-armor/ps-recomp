@@ -7,9 +7,6 @@
 // dispatcher knows, in which case they become a tail call.
 package psx
 
-import "core:fmt"
-import "core:os"
-
 import "ps:core"
 import cpu "cpu"
 import io "io"
@@ -92,6 +89,7 @@ signed_imm :: #force_inline proc(w: u32) -> u32 {
 @(private)
 interp_exec :: proc(st: ^Interp, pc, w: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_interp_insns += 1}
+	when core.COMPAT_COUNT {core.compat.interp_insns += 1}
 	r := &cpu.state.r
 	rs := (w >> 21) & 31
 	rt := (w >> 16) & 31
@@ -297,7 +295,6 @@ interp_cop2 :: proc(pc, w: u32) {
 	case 0x06:
 		gte.gte_write(rd + 32, cpu.state.r[rt])
 	case:
-		fmt.eprintfln("fatal: bad cop2 %#08x at %#08x", w, pc)
-		os.exit(1)
+		cpu.fatal("bad cop2 %#08x at %#08x", w, pc)
 	}
 }

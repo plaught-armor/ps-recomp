@@ -27,6 +27,8 @@ import sdl "vendor:sdl2"
 headless: bool
 // FRAMES: the vblank the run exits at; 0 runs on.
 frames: u64
+// The last emulated vblank frames_done saw.
+vblank: u64
 
 @(private = "file")
 dump: struct {
@@ -72,6 +74,7 @@ headless_init :: proc() -> bool {
 
 // Whether the run is over at emulated vblank n (FRAMES), saying so.
 frames_done :: proc(n: u64) -> bool {
+	vblank = n
 	if frames == 0 || n < frames {
 		return false
 	}

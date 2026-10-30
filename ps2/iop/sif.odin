@@ -205,7 +205,10 @@ sif_command :: proc(a: u32) {
 		if !ok {
 			sd = IOP_SERVERS + u32(len(sif.bound)) * 0x10000
 			sif.bound[sid] = sd
-			if sid not_in sif.servers {fmt.eprintfln("sif: bind to unimplemented server %08x", sid)}
+			if sid not_in sif.servers {
+				core.compat_unknown(.Sif_Bind, sid)
+				fmt.eprintfln("sif: bind to unimplemented server %08x", sid)
+			}
 		}
 		iop_u32(sd)^ = sid
 		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_BIND, sd, sd + 0x100, sd + 0x100})
@@ -216,6 +219,7 @@ sif_command :: proc(a: u32) {
 		buf := iop_ram[(server + 0x100) & (IOP_RAM_SIZE - 1):][:0xff00]
 		handler, ok := sif.servers[sid]
 		if !ok || !handler(fno, buf, send_size) {
+			core.compat_unknown(.Sif_Rpc, sid, fno)
 			fmt.eprintfln("sif: unhandled rpc %08x fno %d send %d recv %d", sid, fno, send_size, recv_size)
 		}
 		if receive != 0 && recv_size != 0 {
@@ -232,6 +236,7 @@ sif_command :: proc(a: u32) {
 		if cid & 0x80000000 == 0 {
 			fmod_command(cid, opt, a)
 		} else {
+			core.compat_unknown(.Sif_Cmd, cid)
 			fmt.eprintfln("sif: unhandled command %08x", cid)
 		}
 	}

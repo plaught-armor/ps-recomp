@@ -3,6 +3,7 @@
 // mode, SA register moves and traps.
 package ps2
 
+import "ps:core"
 import cpu "cpu"
 import kernel "kernel"
 import mem "mem"
@@ -23,6 +24,7 @@ exec :: proc(pc, w: u32) {
 // Generated code passes the instruction already decoded.
 exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 	when cpu.FALLBACK_COUNT {cpu.fallback_ee[i.op] += 1}
+	when core.COMPAT_COUNT {core.compat.interp_insns += 1}
 	pc, w := i.pc, i.w
 	c := &cpu.state
 	s := c.r[i.rs]

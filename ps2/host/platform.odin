@@ -62,8 +62,9 @@ platform_init :: proc(title: cstring) -> bool {
 	sdl.SetHint(sdl.HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1")
 	sdl.SetHint(sdl.HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1")
 	// HEADLESS=1: no window, no 60 Hz pacing, no controllers. FRAMES=<n>:
-	// exit at vblank n.
+	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	if !core.headless_init() {return false}
+	core.compat_init("ps2", &cpu.state.cycles)
 	stats = core.env("STATS") == "1"
 	// PACE=<hz> paces a headless run too (netplay tests; a different
 	// rate on each peer stands in for clock drift).
@@ -145,6 +146,7 @@ platform_init :: proc(title: cstring) -> bool {
 quit :: proc(code: int) -> ! {
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
 	vu.vu_stats_print()
+	core.compat_report()
 	os.exit(code)
 }
 

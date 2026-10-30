@@ -6,8 +6,6 @@
 // (SDL) side.
 package psx_libc
 
-import "core:fmt"
-import "core:os"
 import cpu "../../cpu"
 
 // Lengths above this are negative to retail, which tests them signed.
@@ -488,8 +486,7 @@ malloc :: proc(size: u32) -> u32 {
 			heap.rover = next
 		}
 	}
-	fmt.eprintfln("fatal: BIOS heap at %#08x is corrupt, malloc found no end marker (ra %#08x)", heap.first, cpu.state.r[31])
-	os.exit(1)
+	cpu.fatal("BIOS heap at %#08x is corrupt, malloc found no end marker (ra %#08x)", heap.first, cpu.state.r[31])
 }
 
 // A(34h) free: sets bit 0 of the word before ptr, for any ptr. Retail does

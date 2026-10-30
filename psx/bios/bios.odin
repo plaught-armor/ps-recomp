@@ -3,7 +3,6 @@
 package psx_bios
 
 import "core:fmt"
-import "core:os"
 import "core:strings"
 
 import "ps:core"
@@ -422,16 +421,24 @@ hangs_on_retail :: proc(table: string, fn: u32) -> bool {
 	return false
 }
 
-// A call the HLE BIOS does not handle stops the game. One that hangs on the
-// retail kernel says so: the game was never meant to get there.
+// A call the HLE BIOS does not handle stops the game, except under COMPAT,
+// where it returns 0. One that hangs on the retail kernel says so: the game
+// was never meant to get there.
 @(private)
 bios_unknown :: proc(table: string, fn: u32) {
-	if hangs_on_retail(table, fn) {
-		fmt.eprintfln("fatal: BIOS %s(%02xh) hangs on retail (ra %#08x)", table, fn, cpu.state.r[31])
-	} else {
-		fmt.eprintfln("fatal: unimplemented BIOS %s(%02xh) (ra %#08x)", table, fn, cpu.state.r[31])
+	kind := core.Compat_Call.Bios_A
+	switch table {
+	case "B": kind = .Bios_B
+	case "C": kind = .Bios_C
 	}
-	os.exit(1)
+	if core.compat_unknown(kind, fn) {
+		ret(0)
+		return
+	}
+	if hangs_on_retail(table, fn) {
+		cpu.fatal("BIOS %s(%02xh) hangs on retail (ra %#08x)", table, fn, cpu.state.r[31])
+	}
+	cpu.fatal("unimplemented BIOS %s(%02xh) (ra %#08x)", table, fn, cpu.state.r[31])
 }
 
 @(private)
@@ -1032,8 +1039,7 @@ thread_entry :: proc(arg: rawptr) {
 	i := int(uintptr(arg))
 	reap_zombie()
 	cpu.call(threads[i].entry)
-	fmt.eprintfln("fatal: thread %d returned from its entry %#08x", i, threads[i].entry)
-	os.exit(1)
+	cpu.fatal("thread %d returned from its entry %#08x", i, threads[i].entry)
 }
 
 @(private)

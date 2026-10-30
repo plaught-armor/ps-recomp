@@ -220,6 +220,7 @@ call_slow :: proc(addr: u32) {
 @(private)
 interpret :: proc(addr: u32) {
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
+	when core.COMPAT_COUNT {core.compat_entry(addr)}
 	interp_run(addr)
 }
 
@@ -300,8 +301,16 @@ brk :: proc(pc, code: u32) {
 }
 
 bad_insn :: proc(pc, w: u32) {
-	fmt.eprintfln("fatal: reserved instruction %#08x at %#08x", w, pc)
+	fatal("reserved instruction %#08x at %#08x", w, pc)
+}
+
+// Stop the game on an error it cannot get past: say so, then save RAM
+// (RAMDUMP) and print the compat line (COMPAT).
+fatal :: proc(format: string, args: ..any) -> ! {
+	msg := fmt.tprintf(format, ..args)
+	fmt.eprintln("fatal:", msg)
 	ram_dump_env()
+	core.compat_report(msg)
 	os.exit(1)
 }
 

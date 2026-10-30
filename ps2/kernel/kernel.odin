@@ -286,7 +286,10 @@ syscall :: proc(pc: u32) {
 	case 0x7e: ret = 0 // MachineType
 	case 0x7f: ret = mem.RAM_SIZE // GetMemorySize
 	case:
-		if m := abs(n); m < len(ROM_ONLY_SYSCALLS) && ROM_ONLY_SYSCALLS[m] != "" {
+		// One the retail ROM has stops the game, except under COMPAT: it
+		// returns 0 like the rest.
+		stub := core.compat_unknown(.Syscall, u32(n))
+		if m := abs(n); m < len(ROM_ONLY_SYSCALLS) && ROM_ONLY_SYSCALLS[m] != "" && !stub {
 			cpu.fatal("unimplemented syscall %d %s (a0 %08x a1 %08x) at %08x", n, ROM_ONLY_SYSCALLS[m], a0, a1, pc)
 		}
 		fmt.eprintfln("kernel: undefined syscall %d (a0 %08x a1 %08x) at %08x ra %08x",
