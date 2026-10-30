@@ -695,7 +695,7 @@ vec_shift32 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 	}
 }
 
-// The 16-byte state field at dst = the 16 bytes from byte A (below 16) of
+// The 16-byte state field at dst = the 16 bytes from byte A (at most 16) of
 // the 32 bytes lo then hi, two 16-byte state fields: a funnel shift by
 // bytes. Import buf is 32 bytes of scratch to put them side by side. Uses
 // V0.

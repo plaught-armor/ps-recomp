@@ -1043,8 +1043,11 @@ main :: proc() {
 				start.fcr31 = u32(y)
 				start.sa = u32(x) & 127
 				// QFSRV: every SA, and the 128 to 255 only direct state can
-				// hold, which shift everything out.
-				if c.op == .QFSRV {start.sa = u32(x ~ y) & 255}
+				// hold: 128 gives rs, the others shift everything out.
+				if c.op == .QFSRV {
+					start.sa = u32(x ~ y) & 255
+					if x == y && x & 1 != 0 {start.sa = 128}
+				}
 				// VU0: the values' words as floats, NaNs, infinities and
 				// denormals among them.
 				vu_start := vu.vu0

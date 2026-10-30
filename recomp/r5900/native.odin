@@ -872,15 +872,15 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.call(a, "cpu.pdivbw", .A, .B)
 	case .QFSRV:
 		if rd == 0 {return true}
-		// rd = the 128 bits at bit SA of rs:rt, or 0 for SA >= 128, as the
-		// interpreter's u128 shifts give. A shift by whole bytes is a
-		// funnel. Any other, which only MTSA can set, takes for lane k
+		// rd = the 128 bits at bit SA of rs:rt, as the interpreter's u128
+		// shifts give: rs for SA = 128, 0 above. A shift by whole bytes,
+		// 128 too, is a funnel. Any other, which only MTSA can set, takes for lane k
 		// words q + k and q + k + 1 of rs:rt, from SA = 32q + r; the
 		// second is shifted by 1 then by ~r & 31 = 31 - r, so r = 0 moves
 		// nothing across without a branch.
 		bits, zero, done := native.new_label(a), native.new_label(a), native.new_label(a)
 		native.state_load(a, .A, SA)
-		native.br_cmp_imm(a, .Geu, .A, 128, zero)
+		native.br_cmp_imm(a, .Geu, .A, 129, zero)
 		native.mov(a, .C, .A)
 		native.alu_imm(a, .And, .C, 7)
 		native.br_zero(a, .C, bits, nonzero = true)
@@ -1456,7 +1456,7 @@ fclamp_gpr :: proc(a: ^native.Asm, r, t: native.Reg) {
 // magnitude and write the winner as it is, as ps2/vu vmax and vmin. ITOF,
 // FTOI, ABS, MAX and MINI set no flags. VMFIR, the quadword loads and
 // stores of vu0_lq_sq and, through vu0_lower, the integer ops and VCALLMS
-// too. Uses A, B, C and V0-V4.
+// too. Uses A, B, C, LD and V0-V4.
 @(private = "file")
 vu0_op :: proc(a: ^native.Asm, w: u32) -> bool {
 	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Max, Mini, Opmul, Opmsub, Move, Mr32, Nop, Itof, Ftoi, Abs}
