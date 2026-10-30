@@ -319,14 +319,31 @@ image_range :: proc(img: Image) -> (lo, hi: u32) {
 	return img.base, img.base + u32(len(img.data))
 }
 
+// The jal targets of the code in [lo, hi). A target whose first four words
+// in the image are zero is not a function: it is padding the executable
+// leaves for code loaded there later (a PS1 overlay slot), which the
+// runtime finds by other means.
 call_targets :: proc(img: Image, lo, hi: u32) -> Set {
 	out: Set
 	for a := lo; a < hi; a += 4 {
 		if w, ok := word(img, a); ok && w >> 26 == 3 {
-			out[(a + 4) & 0xf0000000 | (w & 0x3ffffff) << 2] = {}
+			t := (a + 4) & 0xf0000000 | (w & 0x3ffffff) << 2
+			if !zero_words(img, t) {
+				out[t] = {}
+			}
 		}
 	}
 	return out
+}
+
+@(private = "file")
+zero_words :: proc(img: Image, a: u32) -> bool {
+	for k in u32(0) ..< 4 {
+		if w, ok := word(img, a + 4 * k); !ok || w != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // True when the code before e (skipping up to four nop padding words) ends
