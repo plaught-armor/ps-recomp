@@ -58,6 +58,7 @@ COP1_OPS := [?]r5900.Op {
 	.MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .ADD_S, .SUB_S, .MUL_S, .DIV_S,
 	.ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S,
 	.MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S, .CVT_W_S, .SQRT_S, .RSQRT_S,
+	.MFC1,
 }
 
 // The unaligned loads and stores; check_unaligned checks them.
@@ -234,6 +235,33 @@ main :: proc() {
 		{0x44c1f800, .CTC1}, // fcr31 = r1
 		{0x44c10000, .CTC1}, // FCR0 stays
 		{mmi(0x04) &~ (31 << 16), .PLZCW},
+		{mmi(0x08, 0x04), .PADDH},
+		{mmi(0x08, 0x07), .PMAXH},
+		{mmi(0x28, 0x07), .PMINH},
+		{mmi(0x08, 0x1a), .PEXTLB},
+		{mmi(0x28, 0x1a), .PEXTUB},
+		{mmi(0x08, 0x1b), .PPACB},
+		{mmi(0x09, 0x0e), .PCPYLD},
+		{mmi(0x09, 0x0e) &~ (31 << 21) | 3 << 21, .PCPYLD}, // rs = rd
+		{mmi(0x29, 0x12), .POR},
+		{mmi(0x34, 0), .PSLLH},
+		{mmi(0x34, 15), .PSLLH},
+		{mmi(0x36, 1), .PSRLH},
+		{mmi(0x36, 9) &~ (31 << 16) | 3 << 16, .PSRLH}, // rt = rd
+		{mmi(0x37, 15), .PSRAH},
+		{mmi(0x37, 7) &~ (31 << 11), .PSRAH}, // rd = 0
+		// SA from the start state: whole bytes take the funnel, the rest
+		// the interpreter
+		{mmi(0x28, 0x1b), .QFSRV},
+		{mmi(0x28, 0x1b) &~ (31 << 16) | 3 << 16, .QFSRV}, // rt = rd
+		{mmi(0x28, 0x1b) &~ (31 << 21) | 3 << 21, .QFSRV}, // rs = rd
+		{mmi(0x28, 0x1b) &~ (31 << 11), .QFSRV}, // rd = 0
+		{0x40036000, .MFC0}, // r3 = Status
+		{0x40037000, .MFC0}, // r3 = EPC
+		{0x40007000, .MFC0}, // to r0
+		{0x4003f000, .MFC0}, // PRId: the interpreter
+		{0x44811800, .MTC1}, // f3 = r1
+		{0x44030800, .MFC1}, // r3 = f1, sign-extended
 		{cop2(1, 3), .QMFC2},
 		{cop2(1, 0), .QMFC2}, // vf0
 		{cop2(5, 3), .QMTC2},
