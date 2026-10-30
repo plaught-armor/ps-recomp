@@ -14,13 +14,13 @@
 // removed at the end whether the test passes or fails.
 package main
 
-import "core:encoding/endian"
 import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "ps:core/disc"
+import "ps:tests/discimg"
 import iop "ps:ps2/iop"
 
 @(private = "file")
@@ -38,108 +38,6 @@ check :: proc(ok: bool, what: string, loc := #caller_location) {
 	if !ok {
 		fail("%s (line %d)", what, loc.line)
 	}
-}
-
-// The volume: PVD at 16, its terminator at 17, the root at 20, DATA at 21,
-// SYSTEM.CNF at 22, Big.Bin at 23 .. 25, DATA/Sub.Txt at 26; 27 and 28 are
-// left out of every file, and 27 is Form 2 in the Mode 2 image.
-VOLUME :: 29
-BIG :: 5000
-SUB :: "sub file!\n"
-FORM2 :: 27
-AUDIO :: 160
-
-CNF_PS2 :: "BOOT2 = cdrom0:\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n"
-CNF_PS1 :: "BOOT = cdrom:\\DATA\\Sub.Txt;1\nTCB = 4\n"
-
-@(private = "file")
-sector :: proc(img: []u8, lba: int) -> []u8 {
-	return img[lba * disc.DATA:][:disc.DATA]
-}
-
-@(private = "file")
-put32 :: proc(b: []u8, v: int) {
-	endian.put_u32(b[:4], .Little, u32(v))
-}
-
-// A directory record at b; its length.
-@(private = "file")
-record :: proc(b: []u8, lba, size: int, dir: bool, name: string) -> int {
-	n := 33 + len(name)
-	n += n & 1
-	b[0] = u8(n)
-	put32(b[2:], lba)
-	put32(b[10:], size)
-	b[25] = dir ? 2 : 0
-	b[32] = u8(len(name))
-	copy(b[33:], name)
-	return n
-}
-
-@(private = "file")
-make_iso :: proc(cnf: string, cnf_name := "SYSTEM.CNF;1", sub_name := "Sub.Txt;1") -> []u8 {
-	img := make([]u8, VOLUME * disc.DATA)
-	pvd := sector(img, 16)
-	pvd[0], pvd[6] = 1, 1
-	copy(pvd[1:6], "CD001")
-	put32(pvd[80:], VOLUME)
-	record(pvd[156:190], 20, disc.DATA, true, "\x00")
-	term := sector(img, 17)
-	term[0] = 255
-	copy(term[1:6], "CD001")
-	root := sector(img, 20)
-	at := record(root, 20, disc.DATA, true, "\x00")
-	at += record(root[at:], 20, disc.DATA, true, "\x01")
-	at += record(root[at:], 22, len(cnf), false, cnf_name)
-	at += record(root[at:], 21, disc.DATA, true, "DATA")
-	record(root[at:], 23, BIG, false, "Big.Bin;1")
-	sub := sector(img, 21)
-	at = record(sub, 21, disc.DATA, true, "\x00")
-	at += record(sub[at:], 20, disc.DATA, true, "\x01")
-	record(sub[at:], 26, len(SUB), false, sub_name)
-	copy(sector(img, 22), cnf)
-	for i in 0 ..< BIG {
-		img[23 * disc.DATA + i] = big_byte(i)
-	}
-	copy(sector(img, 26), SUB)
-	return img
-}
-
-@(private = "file")
-big_byte :: proc(i: int) -> u8 {
-	return u8(i * 7 + 3)
-}
-
-// The ISO as raw sectors of mode 1 or 2 (Form 1, but FORM2 Form 2).
-@(private = "file")
-make_raw :: proc(iso: []u8, mode: u8) -> []u8 {
-	n := len(iso) / disc.DATA
-	out := make([]u8, n * disc.RAW)
-	for lba in 0 ..< n {
-		r := out[lba * disc.RAW:][:disc.RAW]
-		for &b in r[1:11] {
-			b = 0xff
-		}
-		r[12], r[13], r[14] = disc.msf(u32(lba))
-		r[15] = mode
-		if mode == 1 {
-			copy(r[16:], sector(iso, lba))
-			continue
-		}
-		form: u8 = lba == FORM2 ? 0x28 : 0x08
-		r[18], r[22] = form, form
-		copy(r[24:], sector(iso, lba))
-	}
-	return out
-}
-
-@(private = "file")
-make_audio :: proc(sectors: int) -> []u8 {
-	out := make([]u8, sectors * disc.RAW)
-	for &b, i in out {
-		b = u8(i * 13 + 1)
-	}
-	return out
 }
 
 @(private = "file")
@@ -162,28 +60,28 @@ write_text :: proc(name, text: string) -> string {
 // Everything the volume holds, read through d.
 @(private = "file")
 check_volume :: proc(d: ^disc.Disc, cnf: string, what: string) {
-	if d.volume != VOLUME || d.layer1 != 0 {
+	if d.volume != discimg.VOLUME || d.layer1 != 0 {
 		fail("%s: volume %d layer1 %d", what, d.volume, d.layer1)
 		return
 	}
 	data, ok := disc.read_file(d, "cdrom0:\\SYSTEM.CNF;1", context.temp_allocator)
 	check(ok && string(data) == cnf, what)
 	data, ok = disc.read_file(d, "big.bin", context.temp_allocator)
-	good := ok && len(data) == BIG
+	good := ok && len(data) == discimg.BIG
 	for i in 0 ..< len(data) {
-		good &&= data[i] == big_byte(i)
+		good &&= data[i] == discimg.big_byte(i)
 	}
 	check(good, what)
 	// Across a sector boundary, and short at the image's end.
 	part: [100]u8
 	e, found := disc.find(d, "/BIG.BIN", context.temp_allocator)
-	check(found && !e.dir && e.lba == 23 && e.size == BIG && e.name == "Big.Bin", what)
-	check(disc.read_at(d, 23, 2040, part[:]) == len(part) && part[0] == big_byte(2040) && part[99] == big_byte(2139), what)
-	check(disc.read_at(d, VOLUME - 1, disc.DATA - 50, part[:]) == 50, what)
+	check(found && !e.dir && e.lba == 23 && e.size == discimg.BIG && e.name == "Big.Bin", what)
+	check(disc.read_at(d, 23, 2040, part[:]) == len(part) && part[0] == discimg.big_byte(2040) && part[99] == discimg.big_byte(2139), what)
+	check(disc.read_at(d, discimg.VOLUME - 1, disc.DATA - 50, part[:]) == 50, what)
 	data, ok = disc.read_file(d, "/data/SUB.TXT", context.temp_allocator)
-	check(ok && string(data) == SUB, what)
+	check(ok && string(data) == discimg.SUB, what)
 	data, ok = disc.read_file(d, "cdrom:DATA\\sub.txt;1", context.temp_allocator)
-	check(ok && string(data) == SUB, what)
+	check(ok && string(data) == discimg.SUB, what)
 	_, ok = disc.read_file(d, "DATA", context.temp_allocator)
 	check(!ok, what)
 	_, ok = disc.find(d, "NOPE", context.temp_allocator)
@@ -196,11 +94,11 @@ check_volume :: proc(d: ^disc.Disc, cnf: string, what: string) {
 	root, rok := disc.list(d, "\\", context.temp_allocator)
 	check(rok && len(root) == 3 && root[0].name == "SYSTEM.CNF" && root[1].name == "DATA" && root[1].dir, what)
 	sub, sok := disc.list(d, "data", context.temp_allocator)
-	check(sok && len(sub) == 1 && sub[0].name == "Sub.Txt" && sub[0].size == len(SUB), what)
+	check(sok && len(sub) == 1 && sub[0].name == "Sub.Txt" && sub[0].size == len(discimg.SUB), what)
 	_, ok = disc.list(d, "BIG.BIN", context.temp_allocator)
 	check(!ok, what)
 	buf: [disc.DATA]u8
-	check(!disc.read(d, VOLUME, buf[:]), what)
+	check(!disc.read(d, discimg.VOLUME, buf[:]), what)
 }
 
 @(private = "file")
@@ -236,7 +134,7 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 	raw: [disc.RAW]u8
 	buf: [disc.DATA]u8
 	if d, ok := open(iso_path, "iso"); ok {
-		check_volume(&d, CNF_PS2, "iso")
+		check_volume(&d, discimg.CNF_PS2, "iso")
 		check_cnf(&d, "SLUS_123.45", true, "SLUS-12345", "NTSC", "iso")
 		// A 2048-byte sector as the Mode 2 Form 1 sector holding it.
 		check(disc.read_raw(&d, 16, raw[:]) && raw[12] == 0 && raw[13] == 2 && raw[14] == 0x16 && raw[15] == 2, "iso raw header")
@@ -244,15 +142,15 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 		disc.close(&d)
 	}
 	if d, ok := open(mode1_path, "mode 1"); ok {
-		check_volume(&d, CNF_PS1, "mode 1")
+		check_volume(&d, discimg.CNF_PS1, "mode 1")
 		check_cnf(&d, "DATA/Sub.Txt", false, "", "", "mode 1")
 		disc.close(&d)
 	}
 	if d, ok := open(mode2_path, "mode 2"); ok {
-		check_volume(&d, CNF_PS2, "mode 2")
-		check(!disc.read(&d, FORM2, buf[:]), "form 2 read")
-		check(disc.read_raw(&d, FORM2, raw[:]) && raw[18] == 0x28, "form 2 raw read")
-		check(disc.read(&d, FORM2 - 1, buf[:]) && string(buf[:len(SUB)]) == SUB, "form 1 read")
+		check_volume(&d, discimg.CNF_PS2, "mode 2")
+		check(!disc.read(&d, discimg.FORM2, buf[:]), "form 2 read")
+		check(disc.read_raw(&d, discimg.FORM2, raw[:]) && raw[18] == 0x28, "form 2 raw read")
+		check(disc.read(&d, discimg.FORM2 - 1, buf[:]) && string(buf[:len(discimg.SUB)]) == discimg.SUB, "form 1 read")
 		disc.close(&d)
 	}
 	// Two FILEs: the second two seconds on, after its PREGAP, or with its gap
@@ -262,9 +160,9 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 		start:   u32,
 		sectors: u32,
 	} {
-		{"FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\nFILE \"a.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n", VOLUME + 150, AUDIO},
-		{"FILE \"m2.bin\" BINARY\r\nTRACK 01 MODE2/2352\r\nINDEX 01 00:00:00\r\nFILE \"a.bin\" BINARY\r\nTRACK 02 AUDIO\r\nPREGAP 00:01:00\r\nINDEX 01 00:00:00\r\n", VOLUME + 75, AUDIO},
-		{"REM a comment\nFILE m2.bin BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\nFILE a.bin BINARY\nTRACK 02 AUDIO\nINDEX 00 00:00:00\nINDEX 01 00:02:00\n", VOLUME + 150, AUDIO - 150},
+		{"FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\nFILE \"a.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n", discimg.VOLUME + 150, discimg.AUDIO},
+		{"FILE \"m2.bin\" BINARY\r\nTRACK 01 MODE2/2352\r\nINDEX 01 00:00:00\r\nFILE \"a.bin\" BINARY\r\nTRACK 02 AUDIO\r\nPREGAP 00:01:00\r\nINDEX 01 00:00:00\r\n", discimg.VOLUME + 75, discimg.AUDIO},
+		{"REM a comment\nFILE m2.bin BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\nFILE a.bin BINARY\nTRACK 02 AUDIO\nINDEX 00 00:00:00\nINDEX 01 00:02:00\n", discimg.VOLUME + 150, discimg.AUDIO - 150},
 	}
 	for c, i in two {
 		what := fmt.tprintf("two-file cue %d", i)
@@ -273,11 +171,11 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 		if !ok {
 			continue
 		}
-		track_is(&d, 0, 0, VOLUME, what)
+		track_is(&d, 0, 0, discimg.VOLUME, what)
 		track_is(&d, 1, c.start, c.sectors, what)
-		check_volume(&d, CNF_PS2, what)
+		check_volume(&d, discimg.CNF_PS2, what)
 		check(!disc.read(&d, c.start, buf[:]), what)
-		check(disc.read_raw(&d, c.start, raw[:]) && raw[0] == audio[(AUDIO - c.sectors) * disc.RAW], what)
+		check(disc.read_raw(&d, c.start, raw[:]) && raw[0] == audio[(discimg.AUDIO - c.sectors) * disc.RAW], what)
 		disc.close(&d)
 	}
 	// One FILE of two tracks: data, two gap sectors (INDEX 00), then audio.
@@ -286,13 +184,13 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 	copy(one[len(mode2):], audio[:7 * disc.RAW])
 	write("one.bin", one)
 	one_cue := "FILE \"one.bin\" BINARY\n TRACK 01 MODE2/2352\n  INDEX 01 00:00:00\n TRACK 02 AUDIO\n  INDEX 00 00:00:%d\n  INDEX 01 00:00:%d\n"
-	path := write_text("one.cue", fmt.tprintf(one_cue, VOLUME, VOLUME + 2))
+	path := write_text("one.cue", fmt.tprintf(one_cue, discimg.VOLUME, discimg.VOLUME + 2))
 	if d, ok := open(path, "one-file cue"); ok {
-		track_is(&d, 0, 0, VOLUME, "one-file cue")
-		track_is(&d, 1, VOLUME + 2, 5, "one-file cue")
-		check_volume(&d, CNF_PS2, "one-file cue")
-		check(disc.read_raw(&d, VOLUME + 2, raw[:]) && raw[0] == audio[2 * disc.RAW], "one-file cue audio")
-		check(!disc.read_raw(&d, VOLUME, raw[:]), "one-file cue gap")
+		track_is(&d, 0, 0, discimg.VOLUME, "one-file cue")
+		track_is(&d, 1, discimg.VOLUME + 2, 5, "one-file cue")
+		check_volume(&d, discimg.CNF_PS2, "one-file cue")
+		check(disc.read_raw(&d, discimg.VOLUME + 2, raw[:]) && raw[0] == audio[2 * disc.RAW], "one-file cue audio")
+		check(!disc.read_raw(&d, discimg.VOLUME, raw[:]), "one-file cue gap")
 		disc.close(&d)
 	}
 }
@@ -300,11 +198,11 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 // A dual-layer image: a second volume descriptor at the first's end + 16.
 @(private = "file")
 test_dual_layer :: proc(iso: []u8) {
-	img := make([]u8, (VOLUME + 20) * disc.DATA, context.temp_allocator)
+	img := make([]u8, (discimg.VOLUME + 20) * disc.DATA, context.temp_allocator)
 	copy(img, iso)
-	copy(sector(img, VOLUME + 16), sector(iso, 16))
+	copy(discimg.sector(img, discimg.VOLUME + 16), discimg.sector(iso, 16))
 	if d, ok := open(write("dl.iso", img), "dual layer"); ok {
-		check(d.volume == VOLUME && d.layer1 == VOLUME, "dual layer")
+		check(d.volume == discimg.VOLUME && d.layer1 == discimg.VOLUME, "dual layer")
 		disc.close(&d)
 	}
 }
@@ -327,10 +225,10 @@ id_of :: proc(name: string, img: []u8) -> string {
 id_hash :: proc(img: []u8, parts: ..[]u8) -> string {
 	input: [dynamic]u8
 	defer delete(input)
-	append(&input, ..sector(img, 16))
+	append(&input, ..discimg.sector(img, 16))
 	for p in parts {
 		n: [4]u8
-		put32(n[:], len(p))
+		discimg.put32(n[:], len(p))
 		append(&input, ..n[:])
 		append(&input, ..p)
 	}
@@ -343,25 +241,25 @@ id_hash :: proc(img: []u8, parts: ..[]u8) -> string {
 // not parse or a boot file that is missing.
 @(private = "file")
 test_id :: proc() {
-	iso := make_iso(CNF_PS1)
-	want := id_hash(iso, transmute([]u8)string(CNF_PS1), transmute([]u8)string(SUB))
+	iso := discimg.make_iso(discimg.CNF_PS1)
+	want := id_hash(iso, transmute([]u8)string(discimg.CNF_PS1), transmute([]u8)string(discimg.SUB))
 	check(id_of("id.iso", iso) == want, "id")
-	check(id_of("id.bin", make_raw(iso, 1)) == want, "id of a raw image")
-	other := make_iso(CNF_PS1)
+	check(id_of("id.bin", discimg.make_raw(iso, 1)) == want, "id of a raw image")
+	other := discimg.make_iso(discimg.CNF_PS1)
 	other[23 * disc.DATA] ~= 1
 	check(id_of("id.iso", other) == want, "id with another file changed")
-	other = make_iso(CNF_PS1)
+	other = discimg.make_iso(discimg.CNF_PS1)
 	other[26 * disc.DATA] ~= 1
 	check(id_of("id.iso", other) != want, "id with the boot file changed")
 	cnf := "BOOT = cdrom:\\DATA\\SLUS_123.45;1\n"
-	iso = make_iso(cnf, sub_name = "SLUS_123.45;1")
-	want = id_hash(iso, transmute([]u8)cnf, transmute([]u8)string(SUB))
+	iso = discimg.make_iso(cnf, sub_name = "SLUS_123.45;1")
+	want = id_hash(iso, transmute([]u8)cnf, transmute([]u8)string(discimg.SUB))
 	check(id_of("id.iso", iso) == fmt.tprintf("SLUS-12345.%s", want), "id with a serial")
 	exe := "an exe"
-	iso = make_iso(exe, cnf_name = "PSX.EXE;1")
+	iso = discimg.make_iso(exe, cnf_name = "PSX.EXE;1")
 	check(id_of("id.iso", iso) == id_hash(iso, nil, transmute([]u8)exe), "id with no SYSTEM.CNF")
-	check(id_of("id.iso", make_iso("VER = 1.00\n")) == "", "id with no BOOT line")
-	check(id_of("id.iso", make_iso(CNF_PS2)) == "", "id with no boot file")
+	check(id_of("id.iso", discimg.make_iso("VER = 1.00\n")) == "", "id with no BOOT line")
+	check(id_of("id.iso", discimg.make_iso(discimg.CNF_PS2)) == "", "id with no boot file")
 }
 
 // Malformed images: open fails, or the file system calls do.
@@ -452,14 +350,14 @@ test_iop :: proc(iso: []u8) {
 	check(ok && boot == "SLUS_123.45", "iop boot")
 	for _ in 0 ..< 2 { // the second time from the cache
 		data, read := iop.disc_file("cdrom0:\\DATA\\SUB.TXT;1", context.temp_allocator)
-		check(read && string(data) == SUB, "iop file")
+		check(read && string(data) == discimg.SUB, "iop file")
 	}
 	data, read := iop.disc_file("cdrom0:\\data\\Sub.Txt", context.temp_allocator)
-	check(read && string(data) == SUB, "iop file case")
+	check(read && string(data) == discimg.SUB, "iop file case")
 	data, read = iop.disc_file("cdrom0:\\BIG.BIN;1", context.temp_allocator)
-	good := read && len(data) == BIG
+	good := read && len(data) == discimg.BIG
 	for i in 0 ..< len(data) {
-		good &&= data[i] == big_byte(i)
+		good &&= data[i] == discimg.big_byte(i)
 	}
 	check(good, "iop big")
 	for bad in ([]string{"cdrom0:\\DATA", "cdrom0:\\NOPE.BIN;1", "cdrom0:\\DATA\\..\\SYSTEM.CNF;1"}) {
@@ -475,8 +373,8 @@ main :: proc() {
 		fmt.eprintln("FAIL disc: no temp directory:", err)
 		os.exit(1)
 	}
-	iso := make_iso(CNF_PS2)
-	test_formats(iso, make_raw(make_iso(CNF_PS1), 1), make_raw(iso, 2), make_audio(AUDIO))
+	iso := discimg.make_iso(discimg.CNF_PS2)
+	test_formats(iso, discimg.make_raw(discimg.make_iso(discimg.CNF_PS1), 1), discimg.make_raw(iso, 2), discimg.make_audio(discimg.AUDIO))
 	test_dual_layer(iso)
 	test_corrupt(iso)
 	test_id()

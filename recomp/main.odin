@@ -9,9 +9,10 @@
 // in it are relative to the working directory.
 //
 // A disc image (a .cue sheet, or a single-track .bin or .iso) alone needs no
-// options: the executable SYSTEM.CNF names is compiled to machine code for
-// this host, and with a source directory to Odin source too. Code the
-// executable loads from other files (PS1 overlays) is not found.
+// options: the executable SYSTEM.CNF names (PSX.EXE on a PS1 disc without
+// one) is compiled to machine code for this host, and with a source
+// directory to Odin source too. Code the executable loads from other files
+// (PS1 overlays) is not found.
 package recomp
 
 import "core:fmt"

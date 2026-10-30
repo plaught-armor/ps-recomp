@@ -20,13 +20,15 @@ jobs:
         run: |
           set -e
           for t in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
-            for p in core core/disc psx ps2 ps2/host; do
+            for p in core core/disc psx ps2 ps2/host tests/discimg; do
               echo "== $t $p"
               odin check $p -no-entry-point -collection:ps=. -target:$t -vet -strict-style
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/compat; do
+            echo "== $t play"
+            odin check play -collection:ps=. -target:$t -vet -strict-style
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/compat tests/play; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -52,8 +54,8 @@ jobs:
           release: dev-2026-10
           token: ${{ secrets.GITHUB_TOKEN }}
       # SDL2 for the tests that call it (tests/host_frames, tests/data,
-      # tests/compat); Windows uses Odin's vendor SDL2.dll, put next to the
-      # tests.
+      # tests/compat, tests/play); Windows uses Odin's vendor SDL2.dll, put
+      # next to the tests.
       - name: install SDL2 (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
@@ -67,8 +69,9 @@ jobs:
         shell: bash
         run: |
           set -e
-          for p in core core/disc psx ps2 ps2/host; do odin check $p -no-entry-point -collection:ps=. -vet -strict-style; done
+          for p in core core/disc psx ps2 ps2/host tests/discimg; do odin check $p -no-entry-point -collection:ps=. -vet -strict-style; done
           odin check recomp -collection:ps=. -vet -strict-style
+          odin check play -collection:ps=. -vet -strict-style
       - name: test
         if: ${{ !matrix.rosetta }}
         shell: bash
@@ -103,6 +106,7 @@ jobs:
           odin run tests/host_frames -collection:ps=. -out:host_frames_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/data -collection:ps=. -out:data_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/compat -collection:ps=. -out:compat_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/play -collection:ps=. -define:COMMIT=test -out:play_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)
         if: ${{ matrix.rosetta }}
         run: |

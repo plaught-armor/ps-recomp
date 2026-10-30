@@ -108,14 +108,21 @@ blob_cached :: proc(dir: string, commit := COMMIT) -> bool {
 		return false
 	}
 	defer os.close(f)
-	head: [12]u8
-	if n, _ := os.read_full(f, head[:]); n != len(head) {
+	head: [NATIVE_HEADER]u8
+	n, _ := os.read_full(f, head[:])
+	return blob_valid(head[:n])
+}
+
+// Whether blob (or its first NATIVE_HEADER bytes) starts with a whole header
+// of this format and host arch; native_load checks the rest.
+blob_valid :: proc(blob: []u8) -> bool {
+	if len(blob) < NATIVE_HEADER {
 		return false
 	}
 	word :: proc(b: []u8) -> u32 {
 		return u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
 	}
-	return word(head[0:]) == NATIVE_MAGIC && word(head[4:]) == NATIVE_VERSION && word(head[8:]) == NATIVE_ARCH
+	return word(blob[0:]) == NATIVE_MAGIC && word(blob[4:]) == NATIVE_VERSION && word(blob[8:]) == NATIVE_ARCH
 }
 
 // Store a blob in the disc directory with its key. The old key goes first

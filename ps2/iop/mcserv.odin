@@ -1,7 +1,7 @@
 // HLE mcserv (sid 0x80000400, old MCSERV function numbers). Each memory card
-// port is a host directory, memcard0/ and memcard1/ in the working directory
-// (or in MC, so scripted runs can start from a blank card), holding the
-// card's save directories and files as plain host files.
+// port is a host directory, memcard0/ and memcard1/ in mc_root (or in MC,
+// so scripted runs can start from a blank card), holding the card's save
+// directories and files as plain host files.
 //
 // The card's contents are emulated state: read from the host directory at
 // init into `mc.card` (emulator heap), which every command works on, so
@@ -149,11 +149,15 @@ mc_guest_path :: proc(port: u32, name: string) -> string {
 	return strings.concatenate({"/", strings.join(parts[:], "/", context.temp_allocator)}, context.temp_allocator)
 }
 
+// The host directory holding the card directories, where MC is unset; set
+// before the game first uses a card.
+mc_root := "."
+
 // The host path of a normalized guest path.
 @(private = "file")
 mc_card_path :: proc(port: u32, guest: string) -> string {
 	root := core.env("MC")
-	return fmt.tprintf("%s/memcard%d%s", root if root != "" else ".", port, guest)
+	return fmt.tprintf("%s/memcard%d%s", root if root != "" else mc_root, port, guest)
 }
 
 // The port's card, read from the host on first use.

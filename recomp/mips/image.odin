@@ -38,7 +38,7 @@ word :: proc(img: Image, addr: u32) -> (u32, bool) {
 }
 
 // The options for a disc image alone: the backend SYSTEM.CNF's executable
-// needs, machine code for this host into <serial>.<arch>.bin (the executable's
+// needs (with no SYSTEM.CNF, PSX.EXE, as the PS1 BIOS boots it), machine code for this host into <serial>.<arch>.bin (the executable's
 // name when it has no serial) and, given source, Odin source there; the
 // backends default the rest.
 disc_options :: proc(image, source: string) -> Options {
@@ -47,12 +47,19 @@ disc_options :: proc(image, source: string) -> Options {
 		fail("%s: not a disc image", image)
 	}
 	defer disc.close(&d)
-	cnf, found := disc.system_cnf(&d)
-	if !found {
-		fail("%s: no SYSTEM.CNF naming the executable", image)
-	}
 	o := Options {
 		path = image,
+	}
+	cnf, found := disc.system_cnf(&d)
+	if !found {
+		if _, has_cnf := disc.find(&d, "SYSTEM.CNF", context.temp_allocator); has_cnf {
+			fail("%s: no SYSTEM.CNF naming the executable", image)
+		}
+		if _, has_exe := disc.find(&d, "PSX.EXE", context.temp_allocator); !has_exe {
+			fail("%s: no SYSTEM.CNF and no PSX.EXE", image)
+		}
+		cnf = {boot = "PSX.EXE"}
+		o.values["exe"] = cnf.boot
 	}
 	o.values["backend"] = cnf.ps2 ? "r5900" : "r3000"
 	o.values["disc"] = image

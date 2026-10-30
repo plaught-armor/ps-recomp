@@ -16,27 +16,30 @@ Boot :: struct {
 	// The path of the disc image (a .cue sheet, or a single-track .bin or
 	// .iso) and the PS-X EXE's bytes; left nil, the executable SYSTEM.CNF
 	// names is read from the disc.
-	disc:     string,
-	exe:      []u8,
+	disc:          string,
+	exe:           []u8,
 	// The window's title.
-	title:    cstring,
+	title:         cstring,
 	// The generated package's executable functions (rec.EXE_FUNCS[:]) and,
 	// generated only with the overlays option, rec.register_overlays.
-	funcs:    []cpu.Func_Entry,
-	overlays: proc(),
+	funcs:         []cpu.Func_Entry,
+	overlays:      proc(),
 	// A native blob to use in place of the Odin functions ("" none;
 	// load_native). With no funcs the blob is all the game's code: its
 	// functions are registered from it, and the boot stops if it cannot be
 	// loaded. With neither, the game is interpreted.
-	native:   string,
+	native:        string,
+	// Called when a standalone blob cannot be loaded, before run returns
+	// false; nil none.
+	native_failed: proc(),
 	// The memory card images (bios.card_files); left empty, the runtime's.
-	cards:    [2]string,
+	cards:         [2]string,
 	// The port's own steps, each stopping the boot on false: `setup` before
 	// the window opens, `hooks` once the game's functions (native ones
 	// included) are registered, where the port installs its replacements
 	// (cpu.hook, cpu.hook_overlay) and host hooks.
-	setup:    proc() -> bool,
-	hooks:    proc() -> bool,
+	setup:         proc() -> bool,
+	hooks:         proc() -> bool,
 }
 
 // Set up the runtime for the game b describes and call the executable's
@@ -64,6 +67,7 @@ run :: proc(b: Boot) -> bool {
 	// interpreted: a disc nobody has converted still runs, slowly.
 	standalone := len(b.funcs) == 0
 	if b.native != "" && !load_native(b.native, standalone) && standalone {
+		if b.native_failed != nil {b.native_failed()}
 		return false
 	}
 	if standalone && b.native == "" {
