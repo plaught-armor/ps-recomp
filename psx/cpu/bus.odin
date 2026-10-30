@@ -13,6 +13,10 @@ import "ps:core"
 RAM_SIZE :: 2 * 1024 * 1024
 SCRATCH_BASE :: 0x1f800000
 SCRATCH_SIZE :: 1024
+// An address is the scratchpad's when address & SCRATCH_MASK == SCRATCH_BASE:
+// kuseg 0x1f800000 and kseg0 0x9f800000 only. The scratchpad is the data
+// cache, which kseg1 (and kseg2) bypass to the bus.
+SCRATCH_MASK :: 0x7ffffc00
 
 ram: [RAM_SIZE]u8
 scratch: [SCRATCH_SIZE]u8
@@ -63,6 +67,9 @@ ram_touch :: proc(addr: u32, n: u32) {
 
 // ---------------------------------------------------------------- HLE view
 
+// The HLE view is lenient: the scratchpad at physical 0x1f800000 in every
+// segment, kseg1 too, where the bus has none (SCRATCH_MASK); masked to RAM
+// that would be RAM's first byte instead.
 @(private)
 byte_ptr :: #force_inline proc(addr: u32) -> ^u8 {
 	if addr & 0x1ffffc00 == SCRATCH_BASE {
@@ -130,12 +137,12 @@ in_ram :: #force_inline proc(a: u32) -> (u32, bool) {
 	return p & (RAM_SIZE - 1), p < 0x800000
 }
 
-// The scratchpad, at physical 0x1f800000 in every segment. The loads and
+// The scratchpad, at 0x1f800000 and 0x9f800000 (SCRATCH_MASK). The loads and
 // stores take it inline after RAM, but for an unaligned one across its end,
 // which load_slow and store_slow see, as they do the rest.
 @(private)
 in_scratch :: #force_inline proc(a: u32) -> (u32, bool) {
-	return a & (SCRATCH_SIZE - 1), a & 0x1ffffc00 == SCRATCH_BASE
+	return a & (SCRATCH_SIZE - 1), a & SCRATCH_MASK == SCRATCH_BASE
 }
 
 lw :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
@@ -301,8 +308,8 @@ sw_u :: proc(a, v: u32) #no_bounds_check {
 load_slow :: proc(a: u32, size: u32) -> u32 {
 	p := a & 0x1fffffff
 	switch {
-	case p & 0x1ffffc00 == SCRATCH_BASE:
-		o := p & (SCRATCH_SIZE - 1)
+	case a & SCRATCH_MASK == SCRATCH_BASE:
+		o := a & (SCRATCH_SIZE - 1)
 		if o > SCRATCH_SIZE - size {
 			// Unaligned across the end: byte by byte, so the bytes past it
 			// read as the bus has them, not past the array.
@@ -335,8 +342,8 @@ store_slow :: proc(a, v: u32, size: u32) {
 	}
 	p := a & 0x1fffffff
 	switch {
-	case p & 0x1ffffc00 == SCRATCH_BASE:
-		o := p & (SCRATCH_SIZE - 1)
+	case a & SCRATCH_MASK == SCRATCH_BASE:
+		o := a & (SCRATCH_SIZE - 1)
 		if o > SCRATCH_SIZE - size {
 			// As in load_slow: the bytes past the end go where the bus sends them.
 			for j in 0 ..< size {store_slow(a + j, v >> (8 * j) & 0xff, 1)}

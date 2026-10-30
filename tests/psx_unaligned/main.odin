@@ -327,8 +327,9 @@ check_native :: proc() {
 
 // Each aligned load and store, lwc2 and swc2 through GTE data register 0,
 // as native code in and around the scratchpad, in each segment: the bus
-// (psx/cpu/bus.odin) has it at physical 0x1f800000 in all of them, so
-// kseg1 too. The loads read what is there (nothing past the scratchpad
+// (psx/cpu/bus.odin SCRATCH_MASK) has it at 0x1f800000 and 0x9f800000
+// only, so kseg1 and kseg2 there reach nothing, while a kseg1 RAM word is
+// still RAM. The loads read what is there (nothing past the scratchpad
 // until I/O), and the stores leave what the cpu.sb, cpu.sh and cpu.sw ones
 // do, plain, with the cache isolated and while memory tracing watches.
 @(private = "file")
@@ -354,7 +355,7 @@ check_scratch :: proc() {
 	ADDRS :: [?]u32 {
 		0x1f800000, 0x9f800000, 0xbf800000, 0x1f800022, 0x9f800001,
 		0x1f8003fc, 0x9f8003fc, 0xbf8003fc, 0x1f8003fe, 0x1f8003ff,
-		0x1f800400, IO_WORD, 0x9f801000,
+		0x1f800400, IO_WORD, 0x9f801000, 0xff800000, 0xa0101230,
 	}
 	ops := OPS
 	arch := native.Arch(core.NATIVE_ARCH)
@@ -376,8 +377,11 @@ check_scratch :: proc() {
 	held :: proc(a, size: u32) -> (v: u32, mapped: bool) {
 		p := a & 0x1fffffff
 		switch {
-		case p - cpu.SCRATCH_BASE < cpu.SCRATCH_SIZE:
+		case a & cpu.SCRATCH_MASK == cpu.SCRATCH_BASE:
 			for j in 0 ..< size {v |= u32(cpu.scratch[p - cpu.SCRATCH_BASE + j]) << (8 * j)}
+			return v, true
+		case p < cpu.RAM_SIZE:
+			for j in 0 ..< size {v |= u32(cpu.ram[p + j]) << (8 * j)}
 			return v, true
 		case p == IO_WORD:
 			return memctrl[0] & (u32(0xffffffff) >> (32 - 8 * size)), true
