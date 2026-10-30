@@ -10,11 +10,12 @@
 // sa), then runs it with `odin run`. Each case runs
 // from random registers (edge bytes for saturation, special floats) and must
 // leave the whole cpu.state and VU0's registers as exec_insn leaves them.
-// First FAST_HELPERS' fadd, fsub, fmul, fpdiv, fsqrt and fcvtw must give
-// cpu.fpu_add, fpu_sub, fpu_mul, fpu_div, fpu_sqrt and cvt_w's bits on a grid
-// of floats and random ones near the ends of the exponent range. The seed is fixed, so a
-// run is reproducible. Words emit_op leaves to the interpreter are counted
-// and skipped. cases/ is generated, not checked in.
+// First FAST_HELPERS' fadd, fsub, fmul, fpdiv, fsqrt, fprsqrt and fcvtw must
+// give cpu.fpu_add, fpu_sub, fpu_mul, fpu_div, fpu_sqrt, fpu_rsqrt and cvt_w's
+// bits on a grid of floats and random ones near the ends of the exponent
+// range. The seed is fixed, so a run is reproducible. Words emit_op leaves
+// to the interpreter are counted and skipped. cases/ is generated, not
+// checked in.
 //
 //   odin run tests/ee_emit -collection:ps=.
 package main
@@ -281,6 +282,7 @@ drift :: proc() -> (fails: int) {
 			same("fsub", x, y, fsub(a, b), cpu.fpu_sub(a, b), &fails)
 			same("fmul", x, y, fmul(a, b), cpu.fpu_mul(a, b), &fails)
 			same("fpdiv", x, y, fpdiv(a, b), cpu.fpu_div(a, b), &fails)
+			same("fprsqrt", x, y, fprsqrt(a, b), cpu.fpu_rsqrt(a, b), &fails)
 		}
 	}
 	return

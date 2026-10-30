@@ -453,6 +453,14 @@ fpdiv :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	return fspecial(a) | fspecial(b) | fspecial(r) ? cpu.fpu_slow(.Div, a, b) : r
 }
 
+// cpu.fpu_rsqrt. Not frsqrt: vu.VU_HELPERS has one.
+fprsqrt :: #force_inline proc "contextless" (a, b: f32) -> f32 {
+	if transmute(u32)b & 0x7f800000 == 0 {
+		return transmute(f32)((transmute(u32)a & 0x80000000) | cpu.FMAX)
+	}
+	return fpdiv(a, fsqrt(b))
+}
+
 // cpu.cvt_w.
 fcvtw :: #force_inline proc "contextless" (x: f32) -> i32 {
 	u := transmute(u32)x
