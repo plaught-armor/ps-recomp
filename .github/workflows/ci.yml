@@ -32,7 +32,7 @@ jobs:
             done
           done
 
-  # Run the coroutine/snapshot/rollback, native code, EE native, EE FPU, lowering, PS1 fallback, PS1 unaligned-word, PS1 BIOS and PS2 kernel tests on each host.
+  # Run every test on each host; under Rosetta (darwin_amd64), a subset.
   test:
     strategy:
       fail-fast: false

@@ -4,9 +4,13 @@
 // and compare.
 //
 // The machine is 32-bit; a guest register is its low and high words. The
-// integer instructions, branches, links, calls, jumps and cycle charges are
-// inline, as are the common MMI ones; the rest call the runtime
-// interpreter (ps2.exec_op).
+// integer, MMI, FPU and COP0 instructions, the COP2 transfers, branches,
+// links, calls, jumps and cycle charges are inline, or call the cpu helper
+// that owns them: the MMI multiplies (PMULTW, PMULTUW, PMADDW, PMADDUW,
+// PMSUBW, PMULTH, PMADDH, PMSUBH, PHMSBH), PDIVBW, PMFHL, and FPU
+// arithmetic on special operands (cpu.fpu_slow). An instruction with no
+// code here calls the runtime interpreter (ps2.exec_op); a VU0 macro op
+// with none calls vu.macro.
 // Runtime procedures and variables are imports by name; ps2/native.odin
 // lists them.
 package r5900

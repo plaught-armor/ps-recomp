@@ -5,8 +5,13 @@
 // whose cases are basic-block labels; straight-line code falls through.
 // `jal` to a function in the same package is a direct host call, otherwise
 // `cpu.call(addr)` dispatches through the runtime's table. `jr $ra` is a host
-// return. Hot instructions are inlined; the rest call the runtime
-// interpreter (`ps2.exec`), which owns their semantics.
+// return. Instructions are inline, or call the runtime procedure that
+// owns them: `kernel.syscall`, `cpu.brk`, the MMI multiplies (PMULTW,
+// PMULTUW, PMADDW, PMADDUW, PMSUBW, PMULTH, PMADDH, PMSUBH, PHMSBH),
+// `cpu.pdivbw`, `cpu.pmfhl`, and `cpu.fpu_slow` for FPU arithmetic on
+// special operands. None goes to the EE interpreter. An invalid word calls
+// `cpu.bad_insn`, and a VU0 macro op that `vu.emit_macro` has no code for
+// calls `vu.vu0_macro`.
 package r5900
 
 import "core:fmt"

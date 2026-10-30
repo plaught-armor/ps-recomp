@@ -21,9 +21,9 @@ a `recomp` options file, and any per-game code.
 |---|---|
 | `recomp/` | The recompiler: `mips/` (shared decoding and function discovery), `r3000/`, `r5900/`, `vu/` backends, `native/` machine-code emitter |
 | `core/` | Console-independent runtime: coroutines, save states and rollback, netplay, input and rebinding, audio, recording and replay, Vulkan device, capture |
-| `psx/` | PS1 runtime: `cpu`, `gte`, `gpu` and `render`, `spu`, `mdec`, `bios`, `io`, `host` (SDL2 window, pacing, input), and the interpreter, checkpoints and hooks |
-| `ps2/` | PS2 runtime: `cpu`, `mem`, `dma`, `gif`, `gs` (Vulkan), `vu`, `ipu`, `iop` (HLE IOP modules, memory cards), `kernel`, `r5900` (EE instruction decoder), and the interpreter and bus |
-| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots) |
+| `psx/` | PS1 runtime: `cpu`, `gte`, `gpu` and `render`, `spu`, `mdec`, `bios`, `io`, `native` (the names native code imports), `host` (SDL2 window, pacing, input), and the interpreter, checkpoints and hooks |
+| `ps2/` | PS2 runtime: `cpu`, `mem`, `dma`, `gif`, `gs` (Vulkan), `vu`, `ipu`, `iop` (HLE IOP modules, memory cards), `kernel`, `r5900` (EE instruction decoder), `host` (SDL2 window, audio, input, net), and the interpreter and bus |
+| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `vu_micro` (whole VU microprograms through the VU recompiler against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots), `ps2_kernel` (EE kernel threads), `psx_cover` (which R3000 encodings each PS1 backend does inline), `psx_fallback` (the PS1 ways out of recompiled code and their counts), `psx_unaligned` (fused PS1 unaligned words), `psx_gte` (GTE register moves as native code), `psx_timer` (root counter timing), `psx_bios` (BIOS events, counters and IRQs), `psx_bios_libc` (the BIOS C library) |
 
 ## Requirements
 
@@ -51,8 +51,9 @@ relative ones are relative to the directory recomp runs in.
 A port imports the runtime through the `ps` collection, for example
 `odin build port -collection:ps=<path to ps-recomp> -use-separate-modules
 -o:speed`. `-use-separate-modules` lets a generated program of many packages
-build in parallel (about a minute for a PS2 game of 13 packages, much
-longer without it). Generated code is not vetted: check it without `-vet`.
+build in parallel (a few minutes for a PS2 game of about 20 packages,
+much longer without it). Generated code is not vetted: check it without
+`-vet`.
 
 ## Tests
 
@@ -66,13 +67,41 @@ odin run tests/fpu -collection:ps=.
 odin run tests/lower -collection:ps=.
 odin run tests/vu -collection:ps=.
 odin run tests/vu_macro -collection:ps=.
+odin run tests/vu_micro -collection:ps=.
 odin run tests/ee_emit -collection:ps=.
 odin run tests/spu -collection:ps=.
+odin run tests/psx_fallback -collection:ps=.
+odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true
+odin run tests/psx_unaligned -collection:ps=.
+odin run tests/psx_gte -collection:ps=.
+odin run tests/psx_cover -collection:ps=.
+odin run tests/psx_timer -collection:ps=.
+odin run tests/ps2_kernel -collection:ps=.
+odin run tests/psx_bios -collection:ps=.
+odin run tests/psx_bios_libc -collection:ps=.
 ```
 
-CI type-checks every package on linux and darwin (amd64 and arm64) and runs
-the tests on Linux (x86-64, arm64), macOS (arm64, and x86-64 under Rosetta)
-and Windows. Games have only been played on Linux.
+`.github/workflows/ci.yml` is the list CI runs; a new test goes there and
+here.
+
+CI type-checks every package on linux and darwin (amd64 and arm64) and on
+Windows, and runs the tests on Linux (x86-64, arm64), macOS (arm64; a
+subset as x86-64 under Rosetta) and Windows. Games have only been played on
+Linux.
+
+Before sending a change, check what it touches as CI does, with vet and
+strict style:
+
+```sh
+odin check psx -no-entry-point -collection:ps=. -vet -strict-style
+odin check recomp -collection:ps=. -vet -strict-style
+odin check tests/core -collection:ps=. -vet -strict-style
+```
+
+The runtime packages (`core`, `psx`, `ps2`, `ps2/host`) take
+`-no-entry-point`; `recomp` and the tests do not. Add `-target:` to check
+another platform, as CI does for `linux_arm64`, `darwin_amd64` and
+`darwin_arm64`.
 
 ## Making a port
 
@@ -134,8 +163,8 @@ main :: proc() {
 }
 ```
 
-PS2 (imports `"ps:ps2"`, `cpu "ps:ps2/cpu"`, `iop "ps:ps2/iop"`,
-`kernel "ps:ps2/kernel"`, `mem "ps:ps2/mem"`): set `iop.disc_dir` to the
+PS2 (imports `"ps:ps2"`, `cpu "ps:ps2/cpu"`, `host "ps:ps2/host"`,
+`iop "ps:ps2/iop"`, `mem "ps:ps2/mem"`): set `iop.disc_dir` to the
 directory of the disc's files (default `.`), `ps2.init()` (maps RAM, so it
 comes before anything that writes RAM), `rec.register_all()`, optionally
 `ps2.load_native(path)`. `mem.load_elf(data)` copies the ELF's `PT_LOAD`
