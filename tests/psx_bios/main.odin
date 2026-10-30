@@ -6,7 +6,8 @@
 //   DeliverEvent fires an enabled event only on an exact class and spec;
 //   mode 0x2000 marks it ready, mode 0x1000 calls its function if nonzero.
 //   WaitEvent returns 0 when disabled, takes a ready event at once, and
-//   otherwise runs time forward until the event is delivered.
+//   otherwise runs time forward until the event is delivered, through
+//   every device event on its due cycle.
 //   deliver_irq runs the chains, the kernel's root counter handlers at the
 //   tail of chain 1 and its IRQ event handler at the tail of chain 3;
 //   ChangeClearRCnt's flag and ReturnFromException end the walk early,
@@ -110,6 +111,11 @@ calls: struct {
 // Vblanks until the waited-for event is delivered.
 @(private = "file")
 deliver_in: int
+
+// Cycles at which the bystander and the delivering device events ran
+// during a WaitEvent.
+@(private = "file")
+ran_at: [2]u64
 
 @(private = "file")
 b :: proc(fn: u32, args: ..u32) -> u32 {
@@ -272,6 +278,23 @@ main :: proc() {
 		fail("WaitEvent returned after %d cycles, %d vblanks early", cpu.state.cycles - start, deliver_in)
 	}
 	check("TestEvent after the wait", test(ev), 0)
+
+	// The wait stops at every device event on its due cycle, runs the ones
+	// that ready nothing, and returns on the cycle the event is delivered.
+	io.event_handlers[.Dma] = proc() {ran_at[0] = cpu.state.cycles}
+	io.event_handlers[.Spu] = proc() {
+		ran_at[1] = cpu.state.cycles
+		bios.deliver_event(0xf4000001, 0x0004)
+	}
+	start = cpu.state.cycles
+	io.schedule(.Dma, 1000)
+	io.schedule(.Spu, 2500)
+	check("WaitEvent past another device event", b(0x0a, ev), 1)
+	if ran_at != {start + 1000, start + 2500} || cpu.state.cycles != start + 2500 {
+		fail("WaitEvent ran events at %v and returned at %d, from %d", ran_at, cpu.state.cycles, start)
+	}
+	io.event_handlers[.Dma] = nil
+	io.event_handlers[.Spu] = nil
 
 	// Root counters: vblank (counter 3) auto-acknowledges and ends the
 	// exception while its ChangeClearRCnt flag is set.
