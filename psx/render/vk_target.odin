@@ -14,6 +14,7 @@
 // y * w + x.
 package psx_render
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:slice"
@@ -39,6 +40,8 @@ gpu_vk: struct {
 	order:       core.Vk_Buf,
 	vram:        core.Vk_Buf,
 	uni:         core.Vk_Buf,
+	// VRAM as last uploaded to vram (vk_vram_sync).
+	shadow:      ^[VRAM_W * VRAM_H]u16,
 	// The target's pictures, made and dropped with it, as VK_IMAGES and
 	// VK_BUFS list them.
 	img:         [len(VK_IMAGES)]vk.Image,
@@ -150,6 +153,9 @@ vk_init :: proc() -> bool {
 	g.order = core.vk_buf_create(size_of(prim_queue.order), {.STORAGE_BUFFER}, HOST)
 	g.vram = core.vk_buf_create(size_of(vram), {.STORAGE_BUFFER}, HOST)
 	g.uni = core.vk_buf_create(size_of(Vk_Draw_Uni), {.STORAGE_BUFFER}, HOST)
+	g.shadow = new([VRAM_W * VRAM_H]u16)
+	g.shadow^ = vram
+	mem.copy(g.vram.ptr, &vram[0], size_of(vram))
 	g.on = true
 	fmt.eprintln(core.ENV_PREFIX + "GPU: vk (hi-res target's walks drawn on Vulkan)")
 	return true
@@ -374,6 +380,31 @@ vk_copy :: proc(t: ^Target, x0, y0, x1, y1: i32, to: bool) {
 	}
 }
 
+// Upload the VRAM cells the queued draws read (raster.reads) that changed
+// since last uploaded, as gl_vram_sync: the GPU's copy is idle between
+// submits (vk_target_submit waits for each), so they go straight into it.
+@(private = "file")
+vk_vram_sync :: proc() #no_bounds_check {
+	g := &gpu_vk
+	gpu := ([^]u16)(g.vram.ptr)
+	for cy in 0 ..< i32(len(Cells)) {
+		row := raster.reads[cy]
+		for row != 0 {
+			a := i32(intrinsics.count_trailing_zeros(row))
+			run := i32(intrinsics.count_trailing_zeros(~(row >> u32(a))))
+			row &~= (~u128(0) >> u32(128 - run)) << u32(a)
+			x, w := a * 8, run * 8
+			for y in cy * 8 ..< cy * 8 + 8 {
+				i := y * VRAM_W + x
+				if mem.compare_ptrs(&vram[i], &g.shadow[i], int(w) * 2) != 0 {
+					copy(g.shadow[i:][:w], vram[i:][:w])
+					mem.copy(&gpu[i], &vram[i], int(w) * 2)
+				}
+			}
+		}
+	}
+}
+
 // Draw the queue (raster_run, before its read cells are dropped) and wait
 // for it: the planes hold what it drew on return.
 @(private)
@@ -402,7 +433,7 @@ vk_target_submit :: proc() #no_bounds_check {
 	if q.portal_n > 0 {
 		mem.copy(g.ports.ptr, &q.portals[0], q.portal_n * size_of(Gpu_Portal))
 	}
-	mem.copy(g.vram.ptr, &vram[0], size_of(vram))
+	vk_vram_sync()
 	s, f := &see_through, &see_fade
 	(^Vk_Draw_Uni)(g.uni.ptr)^ = {
 		see = {
