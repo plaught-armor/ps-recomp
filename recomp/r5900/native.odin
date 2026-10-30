@@ -105,6 +105,17 @@ put_sx :: proc(a: ^native.Asm, n: u8, src: native.Reg) {
 	put(a, n, src, high = true)
 }
 
+// The low doublewords of LO and HI (unit 0) or the high ones (8) = their
+// low words sign-extended. Uses A.
+@(private = "file")
+sx_lohi :: proc(a: ^native.Asm, unit: u32) {
+	for at in ([2]u32{LO + unit, HI + unit}) {
+		native.state_load(a, .A, at)
+		native.alu_imm(a, .Sar, .A, 31)
+		native.state_store(a, at + 4, .A)
+	}
+}
+
 // The 64-bit state field at dst = the one at src. Uses A.
 @(private = "file")
 copy64 :: proc(a: ^native.Asm, dst, src: u32) {
@@ -392,11 +403,7 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		get(a, .A, rs)
 		get(a, .B, rt)
 		native.mul_wide(a, i.op == .MULT || i.op == .MULT1, LO + unit, HI + unit, .A, .B)
-		for at in ([2]u32{LO + unit, HI + unit}) {
-			native.state_load(a, .A, at)
-			native.alu_imm(a, .Sar, .A, 31)
-			native.state_store(a, at + 4, .A)
-		}
+		sx_lohi(a, unit)
 		if rd != 0 {copy64(a, GPR * u32(rd), LO + unit)}
 	case .MADD, .MADDU, .MADD1, .MADDU1:
 		// cpu.madd: hi:lo (low words) + the product, each half sign-extended.
@@ -414,24 +421,34 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.alu(a, .Add, .B, .LD)
 		native.alu(a, .Add, .B, .A)
 		native.state_store(a, HI + unit, .B)
-		for at in ([2]u32{LO + unit, HI + unit}) {
-			native.state_load(a, .A, at)
-			native.alu_imm(a, .Sar, .A, 31)
-			native.state_store(a, at + 4, .A)
-		}
+		sx_lohi(a, unit)
 		if rd != 0 {copy64(a, GPR * u32(rd), LO + unit)}
 	case .PLZCW:
-		// cpu.plzcw, as emit_op calls it
-		get(a, .A, rs)
-		get(a, .B, rs, high = true)
-		native.mov_imm(a, .C, u32(rd))
-		native.call(a, "cpu.plzcw", .A, .B, .C)
+		// As cpu.plzcw: each word of rs's low doubleword, inverted when
+		// negative, has its leading zeros less one; 0 and -1 give 31 as
+		// clz's 32 does. The high doubleword of rd stays.
+		if rd != 0 {
+			get(a, .A, rs)
+			get(a, .B, rs, high = true)
+			for k in u32(0) ..< 2 {
+				r: native.Reg = .A if k == 0 else .B
+				native.mov(a, .C, r)
+				native.alu_imm(a, .Sar, .C, 31)
+				native.alu(a, .Xor, r, .C)
+				native.clz(a, r)
+				native.alu_imm(a, .Sub, r, 1)
+			}
+			native.state_store(a, GPR * u32(rd), .A)
+			native.state_store(a, GPR * u32(rd) + 4, .B)
+		}
 	case .DIV, .DIVU, .DIV1, .DIVU1:
-		// cpu.div and cpu.divu, as emit_op calls them
+		// As cpu.div and cpu.divu; DIV1 and DIVU1 use the second pipeline's
+		// halves of LO and HI.
+		unit: u32 = 8 if i.op == .DIV1 || i.op == .DIVU1 else 0
 		get(a, .A, rs)
 		get(a, .B, rt)
-		native.mov_imm(a, .C, 1 if i.op == .DIV1 || i.op == .DIVU1 else 0)
-		native.call(a, "cpu.div" if i.op == .DIV || i.op == .DIV1 else "cpu.divu", .A, .B, .C)
+		native.divide(a, i.op == .DIV || i.op == .DIV1, LO + unit, HI + unit)
+		sx_lohi(a, unit)
 	case .LB, .LBU, .LH, .LHU, .LW, .LWU:
 		if rt == 0 {return true} // no access, as emit_op
 		get(a, .A, rs)
@@ -838,14 +855,14 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 			native.state_store(a, GPR * u32(rd) + 4 * k, .A)
 		}
 	case .PDIVW, .PDIVUW:
-		// cpu.div and cpu.divu on the low word of each doubleword, as
-		// emit_mmi calls them
+		// As cpu.div and cpu.divu on the low word of each doubleword, into
+		// that doubleword of LO and HI
 		for k in u32(0) ..< 2 {
 			for r in ([2]struct {dst: native.Reg, n: u8}{{.A, rs}, {.B, rt}}) {
 				if r.n == 0 {native.mov_imm(a, r.dst, 0)} else {native.state_load(a, r.dst, GPR * u32(r.n) + 8 * k)}
 			}
-			native.mov_imm(a, .C, k)
-			native.call(a, "cpu.div" if i.op == .PDIVW else "cpu.divu", .A, .B, .C)
+			native.divide(a, i.op == .PDIVW, LO + 8 * k, HI + 8 * k)
+			sx_lohi(a, 8 * k)
 		}
 	case .PMULTW, .PMULTUW, .PMADDW, .PMADDUW, .PMSUBW, .PMULTH, .PMADDH, .PMSUBH, .PHMSBH:
 		// the cpu helper, as emit_mmi calls it

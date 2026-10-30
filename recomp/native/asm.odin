@@ -834,6 +834,38 @@ div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 	}
 }
 
+// The state's words at lo and hi = A / B and A % B (signed or not), as a
+// MIPS DIV and DIVU leave them: by 0, hi is A and lo is -1 (signed: 1 when
+// A < 0). Signed by -1, lo is -A and hi 0, which gives the least i32 for
+// itself without the divide that traps on it. Uses A, B and C.
+divide :: proc(a: ^Asm, signed: bool, lo, hi: u32) {
+	zero, minus, done := new_label(a), new_label(a), new_label(a)
+	br_zero(a, .B, zero)
+	if signed {br_cmp_imm(a, .Eq, .B, 0xffffffff, minus)}
+	div_wide(a, signed, lo, hi, .A, .B)
+	jmp(a, done)
+	if signed {
+		bind(a, minus)
+		mov_imm(a, .C, 0)
+		alu(a, .Sub, .C, .A)
+		state_store(a, lo, .C)
+		state_store_imm(a, hi, 0)
+		jmp(a, done)
+	}
+	bind(a, zero)
+	state_store(a, hi, .A)
+	if signed {
+		// A >> 31 is 0 or -1; doubled and inverted, -1 or 1.
+		alu_imm(a, .Sar, .A, 31)
+		alu_imm(a, .Shl, .A, 1)
+		not(a, .A)
+		state_store(a, lo, .A)
+	} else {
+		state_store_imm(a, lo, 0xffffffff)
+	}
+	bind(a, done)
+}
+
 // Call the Odin procedure in import `name` with 32-bit arguments; a result
 // comes back in A. The cached fields go to the state for it and come back
 // after.
