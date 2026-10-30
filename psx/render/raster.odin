@@ -501,7 +501,7 @@ raster_draw :: #force_inline proc($P: typeid, ra: ^Raster, d: ^Draw) {
 }
 
 // Draw a triangle into target t (VRAM or the hi-res target, queued during
-// a walk).
+// a walk, and always on the host GPU).
 @(private)
 draw_triangle :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, va, vb, vc: Vertex) {
 	d: Draw = ---
@@ -513,7 +513,7 @@ draw_triangle :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, va, vb, vc: Verte
 		k := t.shift
 		hi_touch(tri.min_x >> k, tri.min_y >> k, (tri.max_x >> k) - (tri.min_x >> k) + 1, (tri.max_y >> k) - (tri.min_y >> k) + 1)
 	}
-	if raster.on || t.gl {
+	if raster.on || t.gl || t.vk {
 		d.kind, d.env, d.m = .Triangle, e^, m^
 		raster_queue(t, &d, tri.min_x, tri.min_y, tri.max_x, tri.max_y)
 		return
@@ -534,7 +534,7 @@ rect_issue :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, x, y, w, h, r, g, b,
 		x0, y0 := max(x, e.st.x1), max(y, e.st.y1)
 		hi_touch(x0, y0, min(x + w - 1, e.st.x2) - x0 + 1, min(y + h - 1, e.st.y2) - y0 + 1)
 	}
-	if raster.on || t.gl {
+	if raster.on || t.gl || t.vk {
 		x0, y0 := max(x, e.st.x1), max(y, e.st.y1)
 		x1, y1 := min(x + w - 1, e.st.x2), min(y + h - 1, e.st.y2)
 		if x0 > x1 || y0 > y1 {
@@ -565,7 +565,7 @@ line_issue :: proc(t: ^Target, e: ^Plot_Env, m: ^Prim_Mode, a, b: Vertex) {
 		x0, y0 := max(min(a.x, b.x), e.st.x1), max(min(a.y, b.y), e.st.y1)
 		hi_touch(x0, y0, min(max(a.x, b.x), e.st.x2) - x0 + 1, min(max(a.y, b.y), e.st.y2) - y0 + 1)
 	}
-	if raster.on || t.gl {
+	if raster.on || t.gl || t.vk {
 		x0, y0 := max(min(a.x, b.x), e.st.x1), max(min(a.y, b.y), e.st.y1)
 		x1, y1 := min(max(a.x, b.x), e.st.x2), min(max(a.y, b.y), e.st.y2)
 		if x0 > x1 || y0 > y1 {

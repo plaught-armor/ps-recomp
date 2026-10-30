@@ -75,6 +75,7 @@ z_walk_begin :: proc() -> u32 {
 	z_walk += 1
 	if z_walk > 0xffff {
 		z_walk = 1
+		raster_sync()
 		for &t in live_targets() {
 			if t.gl {
 				gl_zbuf_clear()

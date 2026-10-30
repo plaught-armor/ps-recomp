@@ -1,11 +1,12 @@
 // The hi-res target on Vulkan (GPU=vk), headless: no surface, the picture
-// reaches the window through present as the software target's does. A
-// walk's draws are queued (prim_queue.odin) and drawn here by the same
+// reaches the window through present as the software target's does. Its
+// draws are queued (prim_queue.odin) and drawn here by the same
 // shader body as the GL target's (shaders/hi_draw.glsl), synchronously: the
 // software target's planes are host-cached memory laid out as the GPU's
 // pictures, which the GPU copies over the box the queue covers and back
 // once drawn, so every other path (passes, pictures, the ghost flush,
-// present) reads and writes them in place, staying software.
+// present) reads and writes them in place after raster_sync, staying
+// software.
 //
 // Each level is one draw, behind a barrier, as gl_submit's: a reader of a
 // cell sits above that cell's writers in the same level, so the main

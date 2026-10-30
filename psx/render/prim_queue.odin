@@ -97,7 +97,7 @@ prim_queue: struct {
 // Queue draw d of target t (raster_queue).
 @(private)
 queue_draw :: proc(t: ^Target, d: ^Draw) {
-	assert(raster.on || t.gl, "the Vulkan target draws only on a walk's queue")
+	assert(raster.on || t.gl || t.vk, "a software target queues only a walk's draws")
 	gl_puts_apply()
 	switch d.kind {
 	case .Triangle:

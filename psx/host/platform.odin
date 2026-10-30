@@ -508,6 +508,7 @@ convert_area :: proc(x, y, w, h: i32, depth24: bool, dst: []u32, extra_step := -
 		render.gl_frame(slot, x << k, y << k, w << k, h << k)
 		return
 	}
+	render.raster_sync()
 	c.bloom = render.bloom_effects && !depth24 && render.bloom_prepare(x, y, w, h)
 	if !depth24 {
 		c.post = render.post_now()

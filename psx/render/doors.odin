@@ -118,6 +118,7 @@ picture_walk_begin :: proc() {
 	if depth_walk.on {
 		depth_walk.now += 1
 		if depth_walk.now == 0 {
+			raster_sync()
 			for &t in live_targets() {
 				if t.gl {
 					gl_walks_clear()

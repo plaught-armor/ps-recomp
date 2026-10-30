@@ -63,9 +63,9 @@ Target :: struct {
 	// scratch for pixels pulled from its textures, and the ghost layer
 	// lives there.
 	gl:    bool,
-	// Rasterized on Vulkan (vk_target.odin) during a walk; every other path
-	// stays software (raster_run), on planes in the Vulkan target's
-	// host-cached memory.
+	// Rasterized on Vulkan (vk_target.odin), every draw queued; every other
+	// path stays software, on planes in the Vulkan target's host-cached
+	// memory, after raster_sync.
 	vk:    bool,
 }
 
@@ -336,6 +336,7 @@ render_targets_set :: proc(scale: i32) {
 		return
 	}
 	if target_count == 2 {
+		raster_sync()
 		t := &targets[1]
 		if t.gl {
 			gl_target_drop(t)
