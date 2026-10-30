@@ -25,12 +25,14 @@
 // The clamp elision program is a chain of dependent ops on clamped
 // results, with a loop whose branch target is in the middle, compiled twice:
 // as a captured image entered at 0 and 0x48, which elides operand clamps and
-// the case labels between, and with every label and clamp. Each runs from
-// both entries and must match the interpreter, so the two match each other;
-// the second also from 0x50. The first, unlabelled at 0x08 and 0x50, must
-// leave there at once for the interpreter, changing nothing; no trial runs
-// from 0x08, which would skip setting the loop count. The pair at 0x38,
-// the loop's delay slot, is a hazard: its MOVE reads the ADD's dest.
+// the case labels between and clamps the rest once per case body (vf4, read
+// again after a MOVE over its clamped local, and vf10), and with every label
+// and clamp. Each runs from both entries and must match the interpreter, so
+// the two match each other; the second also from 0x50. The first,
+// unlabelled at 0x08 and 0x50, must leave there at once for the
+// interpreter, changing nothing; no trial runs from 0x08, which would skip
+// setting the loop count. The pair at 0x38, the loop's delay slot, is a
+// hazard: its MOVE reads the ADD's dest.
 //
 //   odin run tests/vu_micro -collection:ps=.
 package main
@@ -183,11 +185,11 @@ main :: proc() {
 		lower_op(IADDIU, 0, 1, 0, 3), upper(ADD, 3, 1, 2),
 		NOP_L, upper(MUL, 4, 3, 3),
 		NOP_L, upper(ADDx, 5, 4, 3), // 0x10, the loop
-		NOP_L, upper(MUL, 6, 5, 5),
+		lower_sp(MOVE, 0b0110, 4, 5), upper(MUL, 6, 5, 5),
 		lower_sp(MOVE, 0b1100, 6, 20), upper(MAX, 7, 5, 0),
 		lower_op(0x40, 0, 1, 1, 0x1f << 6 | IADDI), upper_sp(FTOI0, 15, 5, 7),
 		lower_op(IBNE, 0, 1, 0, 0x7fb), upper(MUL, 8, 7, 5),
-		lower_sp(MOVE, 15, 14, 9), upper(ADD, 9, 6, 7),
+		lower_sp(MOVE, 15, 14, 9), upper(ADD, 9, 6, 4),
 		NOP_L, upper_sp(ITOF0, 15, 10, 11),
 		NOP_L, upper(ADDw, 12, 10, 10), // 0x48, the second entry
 		NOP_L, upper_sp(OPMULA, XYZ, 10, 12),
@@ -240,6 +242,14 @@ main :: proc() {
 		if raw_data(p.words) != raw_data(ELIDE) {continue}
 		if p.entries != nil {
 			elided[p.unit] = code
+			// Clamped once into a local: vf4 and vf10, and vf5 in the
+			// branch pair. The delay slot's ADD reads vf4 after the MOVE
+			// over it, so not from the local.
+			for r in ([]int{4, 5, 10}) {
+				local := fmt.tprintf("\tc%d_", r)
+				if vu.VU_CLAMP_ELIDE && !strings.contains(code, local) {fail("program %d (%v) clamps vf%d into no local", n, p.unit, r)}
+			}
+			if strings.contains(code, "t := c4_") {fail("program %d (%v) reads vf4 from a stale local", n, p.unit)}
 			continue
 		}
 		if !vu.VU_CLAMP_ELIDE {continue}

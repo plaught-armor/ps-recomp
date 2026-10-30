@@ -81,16 +81,38 @@ Mode :: enum u8 {
 // -define:VU_CLAMP_ELIDE=false clamps every operand, as the interpreter.
 VU_CLAMP_ELIDE :: #config(VU_CLAMP_ELIDE, true)
 
-// The lanes of each VF register (dest bits: x 8, y 4, z 2, w 1) known to
-// hold a value clamp4 leaves alone, along straight-line code: an operand
-// read only from those lanes skips its clamp4.
+// What straight-line code knows of the VF registers. lanes: the lanes of
+// each (dest bits: x 8, y 4, z 2, w 1) holding a value clamp4 leaves alone;
+// an operand read only from those lanes skips its clamp4. clamped: the
+// local c<r>_<n> of the case body holding clamp4(vf[r].f), n, or 0; a
+// later operand vf[r] reads it instead of clamping again.
 @(private = "file")
-Known :: [32]u8
+Known :: struct {
+	lanes:   [32]u8,
+	clamped: [32]int,
+	n:       int, // the locals declared, for unique names
+	nested:  bool, // in a block, whose locals the case body cannot see
+}
 
-// What every pair entered from a jump, a call or a resume knows: vf0 is
-// always (0, 0, 0, 1).
+// The lanes every pair entered from a jump, a call or a resume knows: vf0
+// is always (0, 0, 0, 1).
 @(private = "file")
-KNOWN_NONE :: Known{0 = 15}
+KNOWN_NONE :: [32]u8{0 = 15}
+
+// Forget all but vf0 and the locals' names.
+@(private = "file")
+forget :: proc(known: ^Known) {
+	known.lanes = KNOWN_NONE
+	known.clamped = {}
+}
+
+// vf[r]'s dest lanes were written: no longer known, nor clamped in a local.
+@(private = "file")
+overwrite :: proc(known: ^Known, r, dest: u32) {
+	if known == nil {return}
+	known.lanes[r] &~= u8(dest)
+	known.clamped[r] = 0
+}
 
 @(private = "file")
 Prog :: struct {
@@ -277,17 +299,27 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags, known: ^Known) -
 	BC := [4]string{"sp(t.x)", "sp(t.y)", "sp(t.z)", "sp(t.w)"}
 	// Write r to fd (or ACC), with the flags asked for. The add and
 	// multiply family clamps its operands as the interpreter's vu_op does,
-	// except the lanes read (sl of fs, tl of ft) known clamped.
+	// except the lanes read (sl of fs, tl of ft) known clamped, and clamps
+	// each other operand once per case body.
 	arith :: proc(sb: ^strings.Builder, expr: string, dst: string, dest, fs, ft, sl, tl: u32, flags: Flags, known: ^Known) {
 		if dst == "" && flags == .None {return}
-		operand :: proc(known: ^Known, r, l: u32) -> string {
-			if known != nil && u32(known[r]) & l == l {return fmt.tprintf("vf[%d].f", r)}
-			return fmt.tprintf("clamp4(vf[%d].f)", r)
+		operand :: proc(sb: ^strings.Builder, known: ^Known, r, l: u32) -> string {
+			if known == nil {return fmt.tprintf("clamp4(vf[%d].f)", r)}
+			if u32(known.lanes[r]) & l == l {return fmt.tprintf("vf[%d].f", r)}
+			if known.clamped[r] == 0 {
+				if known.nested {return fmt.tprintf("clamp4(vf[%d].f)", r)}
+				known.n += 1
+				known.clamped[r] = known.n
+				fmt.sbprintfln(sb, "\t\t\tc%d_%d := clamp4(vf[%d].f)", r, known.n, r)
+			}
+			return fmt.tprintf("c%d_%d", r, known.clamped[r])
 		}
 		e, _ := strings.replace_all(expr, "v.q", "fclamp(v.q)", context.temp_allocator)
 		e, _ = strings.replace_all(e, "v.i", "fclamp(v.i)", context.temp_allocator)
-		fmt.sbprintf(sb, "\t\t\t{{s := %s; ", operand(known, fs, sl))
-		if strings.contains(expr, "t") {fmt.sbprintf(sb, "t := %s; ", operand(known, ft, tl))}
+		s := operand(sb, known, fs, sl)
+		t := strings.contains(expr, "t") ? operand(sb, known, ft, tl) : ""
+		fmt.sbprintf(sb, "\t\t\t{{s := %s; ", s)
+		if t != "" {fmt.sbprintf(sb, "t := %s; ", t)}
 		fmt.sbprintf(sb, "x := clamp4(%s); ", e)
 		if flags != .None {fmt.sbprintf(sb, "v.mac = mac4(x, 0x%x); ", dest)}
 		if flags == .Mac_Status {fmt.sbprintf(sb, "put_status(v); ")}
@@ -296,7 +328,9 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags, known: ^Known) -
 	}
 	// fd's dest lanes now hold a clamp4 result.
 	wrote :: proc(known: ^Known, fd, dest: u32) {
-		if known != nil && fd != 0 {known[fd] |= u8(dest)}
+		if known == nil || fd == 0 {return}
+		known.lanes[fd] |= u8(dest)
+		known.clamped[fd] = 0
 	}
 	vfd := fd == 0 ? "" : fmt.tprintf("vf[%d]", fd)
 	if fn < 0x3c {
@@ -338,8 +372,10 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags, known: ^Known) -
 			if vfd == "" {return}
 			if known != nil {
 				kt: u8 = 0 // v.i is never known
-				if b == "t" {kt = known[ft]} else if fn < 0x1c && known[ft] & (8 >> bc) != 0 {kt = 15}
-				known[fd] = known[fd] &~ u8(dest) | u8(dest) & known[fs] & kt
+				if b == "t" {kt = known.lanes[ft]} else if fn < 0x1c && known.lanes[ft] & (8 >> bc) != 0 {kt = 15}
+				k := u8(dest) & known.lanes[fs] & kt
+				overwrite(known, fd, dest)
+				known.lanes[fd] |= k
 			}
 			fmt.sbprintf(sb, "\t\t\t{{s := vf[%d].u; ", fs)
 			if b != "sp(v.i)" {fmt.sbprintf(sb, "t := vf[%d].u; ", ft)}
@@ -381,7 +417,7 @@ emit_upper :: proc(sb: ^strings.Builder, uw: u32, flags: Flags, known: ^Known) -
 			if on {fmt.sbprintf(sb, "vf[%d].i[%d] = cvt_w(s[%d] * %s); ", ft, k, k, SCALE[bc])}
 		}
 		end_block(sb)
-		if known != nil {known[ft] &~= u8(dest)}
+		overwrite(known, ft, dest)
 		return
 	case 0x18 ..= 0x1b: op, b = .Mul, BC[bc]
 	case 0x1c: op, b = .Mul, "sp(v.q)"
@@ -694,7 +730,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 		flags := Flags.Mac_Status
 		if unit == .VU1 {flags = p.mac_live ? .Mac : .None}
 		if !emit_upper(sb, p.uw, flags, known) {return}
-		if known != nil {known^ = KNOWN_NONE}
+		if known != nil {forget(known)}
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_upper(0x%08x)", int(unit), p.uw)
 		fn := p.uw & 63
 		if fn & 0x3c != 0x3c {
@@ -705,7 +741,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 	}
 	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, merge: bool, slow: ^map[string]int, known: ^Known) {
 		if !emit_lower(sb, p.lw, pc, MEM[unit]) {
-			if known != nil && lower_writes_vf(p.lw) {known[(p.lw >> 16) & 31] &~= u8((p.lw >> 21) & 15)}
+			if lower_writes_vf(p.lw) {overwrite(known, (p.lw >> 16) & 31, (p.lw >> 21) & 15)}
 			if !merge {return}
 			// DIV and RSQRT fs.fsf / ft.ftf, SQRT ft.ftf, as emit_macro
 			ft, fs := (p.lw >> 16) & 31, (p.lw >> 11) & 31
@@ -717,7 +753,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			fmt.sbprintln(sb, "\t\t\tif v.status == st0 {v.status = ust}")
 			return
 		}
-		if known != nil {known^ = KNOWN_NONE}
+		if known != nil {forget(known)}
 		fn := p.lw & 63
 		switch {
 		case p.lw >> 25 != 0x40:
@@ -735,6 +771,8 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 	}
 	if merge {fmt.sbprintln(sb, "\t\t\t{\n\t\t\tst0 := v.status")}
 	defer if merge {fmt.sbprintln(sb, "\t\t\t}")}
+	if known != nil && merge {known.nested = true}
+	defer if known != nil {known.nested = false}
 	switch p.mode {
 	case .Serial:
 		upper(sb, p, unit, merge, slow, known)
@@ -749,6 +787,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 		// share a case.
 		ud := upper_dest(p.uw)
 		fmt.sbprintln(sb, "\t\t\t{")
+		if known != nil {known.nested = true}
 		fmt.sbprintfln(sb, "\t\t\tsaved := vf[%d]", ud)
 		upper(sb, p, unit, merge, slow, known)
 		fmt.sbprintfln(sb, "\t\t\tresult := vf[%d]", ud)
@@ -760,11 +799,11 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			fmt.sbprintfln(sb, "\t\t\tvf[%d] = result", ud)
 		}
 		fmt.sbprintln(sb, "\t\t\t}")
-		if known != nil && ud != 0 {known[ud] = 0} // either half's value
+		if ud != 0 {overwrite(known, ud, 15)} // either half's value
 	case .Slow:
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_pair(0x%08x, 0x%08x, 0x%04x)", int(unit), p.uw, p.lw, pc)
 		count(slow, "pair")
-		if known != nil {known^ = KNOWN_NONE}
+		if known != nil {forget(known)}
 	}
 }
 
@@ -824,7 +863,7 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 	// A pair reached only by falling through from one whose known lanes
 	// are not KNOWN_NONE gets no case label, so the lanes carry into it.
 	// Without entries (emit_micro's default) every pair keeps its label.
-	known := KNOWN_NONE
+	known := Known{lanes = KNOWN_NONE}
 	k := VU_CLAMP_ELIDE && entries != nil ? &known : nil
 	target := dispatch_targets(pairs, mask, entries)
 	fell := false // the previous pair falls through, its fallthrough unwritten
@@ -841,10 +880,10 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 		if !in_ext(ext, i) {continue}
 		pc := u32(i) * 8
 		next := i + 1 < len(pairs) ? pairs[i + 1] : Pair{}
-		if !fell || k == nil || target[i] || known == KNOWN_NONE {
+		if !fell || k == nil || target[i] || known.lanes == KNOWN_NONE {
 			if fell {fmt.sbprintln(sb, "\t\t\tfallthrough")}
 			fmt.sbprintfln(sb, "\t\tcase 0x%04x:", pc)
-			known = KNOWN_NONE
+			forget(&known)
 		}
 		fell = false
 		branch := !p.ibit && p.branch != .None
