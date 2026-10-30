@@ -345,6 +345,22 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Add8     = 0x0ffc, // paddb
 		.Eq16     = 0x0f75, // pcmpeqw
 		.Zip_Hi16 = 0x0f69, // punpckhwd
+		.Adds8    = 0x0fec, // paddsb
+		.Subs8    = 0x0fe8, // psubsb
+		.Subs16   = 0x0fe9, // psubsw
+		.Addu16   = 0x0fdd, // paddusw
+		.Subu8    = 0x0fd8, // psubusb
+		.Subu16   = 0x0fd9, // psubusw
+		.Subu32   = 0x0ffa, // psubd, then pand with where dst is above src
+		.Adds32   = 0x0ffe, // paddd, then the saturated value where it overflowed
+		.Subs32   = 0x0ffa, // psubd, likewise
+		.Gt8      = 0x0f64, // pcmpgtb
+		.Eq8      = 0x0f74, // pcmpeqb
+		.Max32    = 0x0f66, // pcmpgtd, then a select
+		.Min32    = 0x0f66, // pcmpgtd, then a select
+		.Abs16    = 0x0fee, // pmaxsw of src and 0 - src, saturating
+		.Abs32    = 0x0ffa, // psubd of the sign mask from src ^ it, then paddd of where that is negative
+		.Even32   = 0x0fc6, // shufps 0x88
 	}
 	ops := OPS
 	sse :: proc(a: ^Asm, op: u32, dst, src: Vreg, ps := false) {
@@ -369,6 +385,77 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		emit8(a, 0, 0xf3)
 		op_rr(a, false, ops[op], u8(dst), u8(dst))
 		emit8(a, 0)
+		return
+	}
+	if op == .Subu32 {
+		// Unsigned above as signed after flipping the sign bits.
+		sse(a, 0x0f76, .V3, .V3) // pcmpeqd: all ones
+		emit8(a, 0x66, 0x0f, 0x72, 0xf0 | u8(Vreg.V3), 31) // pslld v3, 31
+		x64_vec_copy(a, .V2, .V3)
+		sse(a, 0x0fef, .V2, dst) // pxor
+		sse(a, 0x0fef, .V3, src)
+		sse(a, 0x0f66, .V2, .V3) // pcmpgtd
+		sse(a, ops[op], dst, src)
+		sse(a, 0x0fdb, dst, .V2) // pand
+		return
+	}
+	if op == .Adds32 || op == .Subs32 {
+		// Overflowed where the result's sign differs from dst's and src's
+		// (add) or from dst's where src's does (subtract); the saturated
+		// value is dst's sign mask ^ 0x7fffffff.
+		x64_vec_copy(a, .V2, dst)
+		sse(a, ops[op], dst, src)
+		if op == .Adds32 {sse(a, 0x0fef, src, dst)} else {sse(a, 0x0fef, src, .V2)} // pxor
+		x64_vec_copy(a, .V3, dst)
+		sse(a, 0x0fef, .V3, .V2) // pxor
+		sse(a, 0x0fdb, .V3, src) // pand
+		emit8(a, 0x66, 0x0f, 0x72, 0xe0 | u8(Vreg.V3), 31) // psrad v3, 31
+		emit8(a, 0x66, 0x0f, 0x72, 0xe0 | u8(Vreg.V2), 31) // psrad v2, 31
+		sse(a, 0x0f76, src, src) // pcmpeqd: all ones
+		emit8(a, 0x66, 0x0f, 0x72, 0xd0 | u8(src), 1) // psrld src, 1
+		sse(a, 0x0fef, .V2, src) // pxor
+		sse(a, 0x0fdb, .V2, .V3) // pand
+		sse(a, 0x0fdf, .V3, dst) // pandn
+		sse(a, 0x0feb, .V2, .V3) // por
+		x64_vec_copy(a, dst, .V2)
+		return
+	}
+	if op == .Max32 || op == .Min32 {
+		// The mask of where dst wins, then dst & it | src &~ it.
+		if op == .Max32 {
+			x64_vec_copy(a, .V2, dst)
+			sse(a, ops[op], .V2, src)
+		} else {
+			x64_vec_copy(a, .V2, src)
+			sse(a, ops[op], .V2, dst)
+		}
+		sse(a, 0x0fdb, dst, .V2) // pand
+		sse(a, 0x0fdf, .V2, src) // pandn
+		sse(a, 0x0feb, dst, .V2) // por
+		return
+	}
+	if op == .Abs16 {
+		sse(a, 0x0fef, dst, dst) // pxor: 0
+		sse(a, 0x0fe9, dst, src) // psubsw
+		sse(a, ops[op], dst, src)
+		return
+	}
+	if op == .Abs32 {
+		// 0x80000000 comes out as itself, negative, and the paddd of
+		// its sign mask makes it 0x7fffffff.
+		x64_vec_copy(a, .V2, src)
+		emit8(a, 0x66, 0x0f, 0x72, 0xe0 | u8(Vreg.V2), 31) // psrad v2, 31
+		if dst != src {x64_vec_copy(a, dst, src)}
+		sse(a, 0x0fef, dst, .V2) // pxor
+		sse(a, ops[op], dst, .V2)
+		x64_vec_copy(a, .V2, dst)
+		emit8(a, 0x66, 0x0f, 0x72, 0xe0 | u8(Vreg.V2), 31) // psrad v2, 31
+		sse(a, 0x0ffe, dst, .V2) // paddd
+		return
+	}
+	if op == .Even32 {
+		sse(a, ops[op], dst, src, ps = true)
+		emit8(a, 0x88)
 		return
 	}
 	if op == .Addu32 {
@@ -441,6 +528,15 @@ x64_vec_shuf32 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 	emit8(a, 0x66)
 	op_rr(a, false, 0x0f70, u8(dst), u8(src)) // pshufd
 	emit8(a, lanes[0] | lanes[1] << 2 | lanes[2] << 4 | lanes[3] << 6)
+}
+
+x64_vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
+	imm := lanes[0] | lanes[1] << 2 | lanes[2] << 4 | lanes[3] << 6
+	emit8(a, 0xf2)
+	op_rr(a, false, 0x0f70, u8(dst), u8(src)) // pshuflw
+	emit8(a, imm, 0xf3)
+	op_rr(a, false, 0x0f70, u8(dst), u8(dst)) // pshufhw
+	emit8(a, imm)
 }
 
 // Through rdx.

@@ -413,6 +413,50 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 	case .Even16:
 		for k in 0 ..< 4 {rh[k], rh[k + 4] = dh[2 * k], sh[2 * k]}
 		return transmute([4]u32)rh
+	case .Adds8, .Subs8:
+		for k in 0 ..< 16 {
+			v := i32(i8(db[k])) + (i32(i8(sb[k])) if op == .Adds8 else -i32(i8(sb[k])))
+			r[k] = u8(i8(clamp(v, -0x80, 0x7f)))
+		}
+	case .Subs16:
+		for k in 0 ..< 8 {rh[k] = i16(clamp(i32(dh[k]) - i32(sh[k]), -0x8000, 0x7fff))}
+		return transmute([4]u32)rh
+	case .Addu16, .Subu16:
+		dw, sw := transmute([8]u16)d, transmute([8]u16)s
+		for k in 0 ..< 8 {
+			v := i32(dw[k]) + (i32(sw[k]) if op == .Addu16 else -i32(sw[k]))
+			rh[k] = i16(u16(clamp(v, 0, 0xffff)))
+		}
+		return transmute([4]u32)rh
+	case .Subu8:
+		for k in 0 ..< 16 {r[k] = db[k] - sb[k] if db[k] > sb[k] else 0}
+	case .Subu32:
+		for k in 0 ..< 4 {r4[k] = d[k] - s[k] if d[k] > s[k] else 0}
+		return r4
+	case .Adds32, .Subs32:
+		for k in 0 ..< 4 {
+			v := i64(i32(d[k])) + (i64(i32(s[k])) if op == .Adds32 else -i64(i32(s[k])))
+			r4[k] = u32(i32(clamp(v, i64(min(i32)), i64(max(i32)))))
+		}
+		return r4
+	case .Gt8:
+		for k in 0 ..< 16 {r[k] = 0xff if i8(db[k]) > i8(sb[k]) else 0}
+	case .Eq8:
+		for k in 0 ..< 16 {r[k] = 0xff if db[k] == sb[k] else 0}
+	case .Max32:
+		for k in 0 ..< 4 {r4[k] = u32(max(i32(d[k]), i32(s[k])))}
+		return r4
+	case .Min32:
+		for k in 0 ..< 4 {r4[k] = u32(min(i32(d[k]), i32(s[k])))}
+		return r4
+	case .Abs16:
+		for k in 0 ..< 8 {rh[k] = max(i16) if sh[k] == min(i16) else abs(sh[k])}
+		return transmute([4]u32)rh
+	case .Abs32:
+		for k in 0 ..< 4 {r4[k] = u32(max(i32)) if s[k] == 0x80000000 else u32(abs(i32(s[k])))}
+		return r4
+	case .Even32:
+		return {d[0], d[2], s[0], s[2]}
 	}
 	return transmute([4]u32)r
 }

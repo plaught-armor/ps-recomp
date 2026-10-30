@@ -644,7 +644,8 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.state_store(a, SA, .A)
 	case .PADDH, .PSUBW, .PSUBB, .PMAXH, .PMINH, .PCGTH, .POR, .PNOR, .PAND, .PXOR, .PEXTLB, .PEXTUB,
 	     .PEXTLH, .PEXTLW, .PEXTUW, .PCPYLD, .PCPYUD, .PPACB, .PPACH, .PCPYH, .PADDSH, .PADDUB, .PADDW,
-	     .PADDUW, .PSUBH, .PADDB, .PCEQH, .PEXTUH:
+	     .PADDUW, .PSUBH, .PADDB, .PCEQH, .PEXTUH, .PADDSB, .PSUBSB, .PSUBSH, .PADDSW, .PSUBSW, .PADDUH,
+	     .PSUBUH, .PSUBUB, .PSUBUW, .PCGTB, .PCGTW, .PCEQB, .PCEQW, .PMAXW, .PMINW, .PPACW:
 		if rd == 0 {return true}
 		// rd = x op y, lane-wise, with the operands in the interpreter's order
 		v: native.Vop
@@ -678,6 +679,22 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		case .PADDB: v = .Add8
 		case .PCEQH: v = .Eq16
 		case .PEXTUH: v, x, y = .Zip_Hi16, rt, rs
+		case .PADDSB: v = .Adds8
+		case .PSUBSB: v = .Subs8
+		case .PSUBSH: v = .Subs16
+		case .PADDSW: v = .Adds32
+		case .PSUBSW: v = .Subs32
+		case .PADDUH: v = .Addu16
+		case .PSUBUH: v = .Subu16
+		case .PSUBUB: v = .Subu8
+		case .PSUBUW: v = .Subu32
+		case .PCGTB: v = .Gt8
+		case .PCGTW: v = .Gt32
+		case .PCEQB: v = .Eq8
+		case .PCEQW: v = .Eq32
+		case .PMAXW: v = .Max32
+		case .PMINW: v = .Min32
+		case .PPACW: v, x, y = .Even32, rt, rs
 		}
 		native.vec_load(a, .V0, GPR * u32(x))
 		native.vec_load(a, .V1, GPR * u32(y))
@@ -688,10 +705,45 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.vec_load(a, .V0, GPR * u32(rt))
 		native.vec_shift16(a, .Shl if i.op == .PSLLH else .Shr if i.op == .PSRLH else .Sar, .V0, sa & 15)
 		native.vec_store(a, GPR * u32(rd), .V0)
-	case .PSRAW:
+	case .PSLLW, .PSRLW, .PSRAW:
 		if rd == 0 {return true}
 		native.vec_load(a, .V0, GPR * u32(rt))
-		native.vec_shift32(a, .Sar, .V0, sa)
+		native.vec_shift32(a, .Shl if i.op == .PSLLW else .Shr if i.op == .PSRLW else .Sar, .V0, sa)
+		native.vec_store(a, GPR * u32(rd), .V0)
+	case .PABSH, .PABSW:
+		if rd == 0 {return true}
+		native.vec_load(a, .V1, GPR * u32(rt))
+		native.vec_op(a, .Abs16 if i.op == .PABSH else .Abs32, .V0, .V1)
+		native.vec_store(a, GPR * u32(rd), .V0)
+	case .PEXEH, .PREVH, .PEXCH, .PEXEW, .PROT3W, .PEXCW:
+		if rd == 0 {return true}
+		// rd's lanes = rt's in the order the interpreter lists them
+		native.vec_load(a, .V0, GPR * u32(rt))
+		#partial switch i.op {
+		case .PEXEH: native.vec_shuf16(a, .V1, .V0, {2, 1, 0, 3})
+		case .PREVH: native.vec_shuf16(a, .V1, .V0, {3, 2, 1, 0})
+		case .PEXCH: native.vec_shuf16(a, .V1, .V0, {0, 2, 1, 3})
+		case .PEXEW: native.vec_shuf32(a, .V1, .V0, {2, 1, 0, 3})
+		case .PROT3W: native.vec_shuf32(a, .V1, .V0, {1, 2, 0, 3})
+		case .PEXCW: native.vec_shuf32(a, .V1, .V0, {0, 2, 1, 3})
+		}
+		native.vec_store(a, GPR * u32(rd), .V1)
+	case .PINTH, .PINTEH:
+		if rd == 0 {return true}
+		// PINTH: rt's halfwords 0-3 interleaved with rs's 4-7, moved down
+		// by a doubleword zip. PINTEH: rt's even halfwords in the low half
+		// of each word, rs's in the high.
+		native.vec_load(a, .V0, GPR * u32(rt))
+		native.vec_load(a, .V1, GPR * u32(rs))
+		if i.op == .PINTH {
+			native.vec_op(a, .Zip_Hi64, .V1, .V1)
+			native.vec_op(a, .Zip_Lo16, .V0, .V1)
+		} else {
+			native.vec_shift32(a, .Shl, .V0, 16)
+			native.vec_shift32(a, .Shr, .V0, 16)
+			native.vec_shift32(a, .Shl, .V1, 16)
+			native.vec_op(a, .Or, .V0, .V1)
+		}
 		native.vec_store(a, GPR * u32(rd), .V0)
 	case .PHMADH:
 		// As the interpreter: the sums v in rd, and the product of the odd

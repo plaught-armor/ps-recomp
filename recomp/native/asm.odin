@@ -131,6 +131,22 @@ Vop :: enum u8 {
 	Add8,
 	Eq16, // all ones in each 16-bit lane where dst == src
 	Zip_Hi16, // halfwords 4-7 likewise
+	Adds8, // signed, saturating
+	Subs8, // signed, saturating
+	Subs16, // signed, saturating
+	Addu16, // unsigned, saturating
+	Subu8, // unsigned, saturating
+	Subu16, // unsigned, saturating
+	Subu32, // unsigned, saturating; uses V2 and V3 on x64
+	Adds32, // signed, saturating; uses V2 and V3 and loses src on x64
+	Subs32, // signed, saturating; uses V2 and V3 and loses src on x64
+	Gt8, // signed: all ones in each byte where dst > src
+	Eq8, // all ones in each byte where dst == src
+	Max32, // signed; uses V2 on x64
+	Min32, // signed; uses V2 on x64
+	Abs16, // dst = the halfwords of src, absolute and saturating; dst is not src
+	Abs32, // dst = the words of src, absolute and saturating; uses V2 on x64
+	Even32, // words 0 and 2 of dst, then of src
 }
 
 Label :: distinct i32
@@ -521,7 +537,9 @@ vec_check :: proc(a: ^Asm, off: u32) {
 vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 	assert(op != .Even8 || (dst != .V2 && src != .V2), "native: Even8 of V2")
 	SCRATCH :: bit_set[Vreg]{.V2, .V3}
-	assert((op != .Addu32 && op != .Madd16) || (dst not_in SCRATCH && src not_in SCRATCH), "native: vector op of V2 or V3")
+	USES_SCRATCH :: bit_set[Vop]{.Addu32, .Madd16, .Subu32, .Adds32, .Subs32, .Max32, .Min32, .Abs32}
+	assert(op not_in USES_SCRATCH || (dst not_in SCRATCH && src not_in SCRATCH), "native: vector op of V2 or V3")
+	assert(op != .Abs16 || dst != src, "native: Abs16 in place")
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_vec_op(a, op, dst, src)
@@ -592,6 +610,18 @@ vec_shuf32 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 		x64_vec_shuf32(a, dst, src, lanes)
 	case .Arm64:
 		a64_vec_shuf32(a, dst, src, lanes)
+	}
+}
+
+// dst's 16-bit lane k = src's lane lanes[k] and lane k + 4 = src's lane
+// lanes[k] + 4; dst is not src.
+vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
+	assert(dst != src, "native: shuffle in place")
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_vec_shuf16(a, dst, src, lanes)
+	case .Arm64:
+		a64_vec_shuf16(a, dst, src, lanes)
 	}
 }
 

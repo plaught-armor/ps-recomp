@@ -250,6 +250,110 @@ main :: proc() {
 		{mmi(0x28, 0x16) &~ (31 << 21) | 3 << 21, .PEXTUH}, // rs = rd
 		{mmi(0x28, 0x16) &~ (31 << 11), .PEXTUH}, // rd = 0
 		{0x46020830, .C_F_S},
+		{mmi(0x08, 0x18), .PADDSB},
+		{mmi(0x08, 0x18) &~ (31 << 16) | 3 << 16, .PADDSB}, // rt = rd
+		{mmi(0x08, 0x18) &~ (31 << 21) | 3 << 21, .PADDSB}, // rs = rd
+		{mmi(0x08, 0x18) &~ (31 << 11), .PADDSB}, // rd = 0
+		{mmi(0x08, 0x19), .PSUBSB},
+		{mmi(0x08, 0x19) &~ (31 << 16) | 3 << 16, .PSUBSB}, // rt = rd
+		{mmi(0x08, 0x19) &~ (31 << 21) | 3 << 21, .PSUBSB}, // rs = rd
+		{mmi(0x08, 0x19) &~ (31 << 11), .PSUBSB}, // rd = 0
+		{mmi(0x08, 0x15), .PSUBSH},
+		{mmi(0x08, 0x15) &~ (31 << 16) | 3 << 16, .PSUBSH}, // rt = rd
+		{mmi(0x08, 0x15) &~ (31 << 21) | 3 << 21, .PSUBSH}, // rs = rd
+		{mmi(0x08, 0x15) &~ (31 << 11), .PSUBSH}, // rd = 0
+		{mmi(0x08, 0x10), .PADDSW},
+		{mmi(0x08, 0x10) &~ (31 << 16) | 3 << 16, .PADDSW}, // rt = rd
+		{mmi(0x08, 0x10) &~ (31 << 21) | 3 << 21, .PADDSW}, // rs = rd
+		{mmi(0x08, 0x10) &~ (31 << 11), .PADDSW}, // rd = 0
+		{mmi(0x08, 0x11), .PSUBSW},
+		{mmi(0x08, 0x11) &~ (31 << 16) | 3 << 16, .PSUBSW}, // rt = rd
+		{mmi(0x08, 0x11) &~ (31 << 21) | 3 << 21, .PSUBSW}, // rs = rd
+		{mmi(0x08, 0x11) &~ (31 << 11), .PSUBSW}, // rd = 0
+		{mmi(0x28, 0x14), .PADDUH},
+		{mmi(0x28, 0x14) &~ (31 << 16) | 3 << 16, .PADDUH}, // rt = rd
+		{mmi(0x28, 0x14) &~ (31 << 21) | 3 << 21, .PADDUH}, // rs = rd
+		{mmi(0x28, 0x14) &~ (31 << 11), .PADDUH}, // rd = 0
+		{mmi(0x28, 0x15), .PSUBUH},
+		{mmi(0x28, 0x15) &~ (31 << 16) | 3 << 16, .PSUBUH}, // rt = rd
+		{mmi(0x28, 0x15) &~ (31 << 21) | 3 << 21, .PSUBUH}, // rs = rd
+		{mmi(0x28, 0x15) &~ (31 << 11), .PSUBUH}, // rd = 0
+		{mmi(0x28, 0x19), .PSUBUB},
+		{mmi(0x28, 0x19) &~ (31 << 16) | 3 << 16, .PSUBUB}, // rt = rd
+		{mmi(0x28, 0x19) &~ (31 << 21) | 3 << 21, .PSUBUB}, // rs = rd
+		{mmi(0x28, 0x19) &~ (31 << 11), .PSUBUB}, // rd = 0
+		{mmi(0x28, 0x11), .PSUBUW},
+		{mmi(0x28, 0x11) &~ (31 << 16) | 3 << 16, .PSUBUW}, // rt = rd
+		{mmi(0x28, 0x11) &~ (31 << 21) | 3 << 21, .PSUBUW}, // rs = rd
+		{mmi(0x28, 0x11) &~ (31 << 11), .PSUBUW}, // rd = 0
+		{mmi(0x08, 0x0a), .PCGTB},
+		{mmi(0x08, 0x0a) &~ (31 << 16) | 3 << 16, .PCGTB}, // rt = rd
+		{mmi(0x08, 0x0a) &~ (31 << 21) | 3 << 21, .PCGTB}, // rs = rd
+		{mmi(0x08, 0x0a) &~ (31 << 11), .PCGTB}, // rd = 0
+		{mmi(0x08, 0x02), .PCGTW},
+		{mmi(0x08, 0x02) &~ (31 << 16) | 3 << 16, .PCGTW}, // rt = rd
+		{mmi(0x08, 0x02) &~ (31 << 21) | 3 << 21, .PCGTW}, // rs = rd
+		{mmi(0x08, 0x02) &~ (31 << 11), .PCGTW}, // rd = 0
+		{mmi(0x28, 0x0a), .PCEQB},
+		{mmi(0x28, 0x0a) &~ (31 << 16) | 3 << 16, .PCEQB}, // rt = rd
+		{mmi(0x28, 0x0a) &~ (31 << 21) | 3 << 21, .PCEQB}, // rs = rd
+		{mmi(0x28, 0x0a) &~ (31 << 11), .PCEQB}, // rd = 0
+		{mmi(0x28, 0x02), .PCEQW},
+		{mmi(0x28, 0x02) &~ (31 << 16) | 3 << 16, .PCEQW}, // rt = rd
+		{mmi(0x28, 0x02) &~ (31 << 21) | 3 << 21, .PCEQW}, // rs = rd
+		{mmi(0x28, 0x02) &~ (31 << 11), .PCEQW}, // rd = 0
+		{mmi(0x08, 0x03), .PMAXW},
+		{mmi(0x08, 0x03) &~ (31 << 16) | 3 << 16, .PMAXW}, // rt = rd
+		{mmi(0x08, 0x03) &~ (31 << 21) | 3 << 21, .PMAXW}, // rs = rd
+		{mmi(0x08, 0x03) &~ (31 << 11), .PMAXW}, // rd = 0
+		{mmi(0x28, 0x03), .PMINW},
+		{mmi(0x28, 0x03) &~ (31 << 16) | 3 << 16, .PMINW}, // rt = rd
+		{mmi(0x28, 0x03) &~ (31 << 21) | 3 << 21, .PMINW}, // rs = rd
+		{mmi(0x28, 0x03) &~ (31 << 11), .PMINW}, // rd = 0
+		{mmi(0x28, 0x05) &~ (31 << 21), .PABSH},
+		{mmi(0x28, 0x05) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PABSH}, // rt = rd
+		{mmi(0x28, 0x05) &~ (31 << 21) &~ (31 << 11), .PABSH}, // rd = 0
+		{mmi(0x28, 0x01) &~ (31 << 21), .PABSW},
+		{mmi(0x28, 0x01) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PABSW}, // rt = rd
+		{mmi(0x28, 0x01) &~ (31 << 21) &~ (31 << 11), .PABSW}, // rd = 0
+		{mmi(0x08, 0x13), .PPACW},
+		{mmi(0x08, 0x13) &~ (31 << 16) | 3 << 16, .PPACW}, // rt = rd
+		{mmi(0x08, 0x13) &~ (31 << 21) | 3 << 21, .PPACW}, // rs = rd
+		{mmi(0x08, 0x13) &~ (31 << 11), .PPACW}, // rd = 0
+		{mmi(0x09, 0x0a), .PINTH},
+		{mmi(0x09, 0x0a) &~ (31 << 16) | 3 << 16, .PINTH}, // rt = rd
+		{mmi(0x09, 0x0a) &~ (31 << 21) | 3 << 21, .PINTH}, // rs = rd
+		{mmi(0x09, 0x0a) &~ (31 << 11), .PINTH}, // rd = 0
+		{mmi(0x29, 0x0a), .PINTEH},
+		{mmi(0x29, 0x0a) &~ (31 << 16) | 3 << 16, .PINTEH}, // rt = rd
+		{mmi(0x29, 0x0a) &~ (31 << 21) | 3 << 21, .PINTEH}, // rs = rd
+		{mmi(0x29, 0x0a) &~ (31 << 11), .PINTEH}, // rd = 0
+		{mmi(0x09, 0x1a) &~ (31 << 21), .PEXEH},
+		{mmi(0x09, 0x1a) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PEXEH}, // rt = rd
+		{mmi(0x09, 0x1a) &~ (31 << 21) &~ (31 << 11), .PEXEH}, // rd = 0
+		{mmi(0x09, 0x1b) &~ (31 << 21), .PREVH},
+		{mmi(0x09, 0x1b) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PREVH}, // rt = rd
+		{mmi(0x09, 0x1b) &~ (31 << 21) &~ (31 << 11), .PREVH}, // rd = 0
+		{mmi(0x29, 0x1a) &~ (31 << 21), .PEXCH},
+		{mmi(0x29, 0x1a) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PEXCH}, // rt = rd
+		{mmi(0x29, 0x1a) &~ (31 << 21) &~ (31 << 11), .PEXCH}, // rd = 0
+		{mmi(0x09, 0x1e) &~ (31 << 21), .PEXEW},
+		{mmi(0x09, 0x1e) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PEXEW}, // rt = rd
+		{mmi(0x09, 0x1e) &~ (31 << 21) &~ (31 << 11), .PEXEW}, // rd = 0
+		{mmi(0x09, 0x1f) &~ (31 << 21), .PROT3W},
+		{mmi(0x09, 0x1f) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PROT3W}, // rt = rd
+		{mmi(0x09, 0x1f) &~ (31 << 21) &~ (31 << 11), .PROT3W}, // rd = 0
+		{mmi(0x29, 0x1e) &~ (31 << 21), .PEXCW},
+		{mmi(0x29, 0x1e) &~ (31 << 21) &~ (31 << 16) | 3 << 16, .PEXCW}, // rt = rd
+		{mmi(0x29, 0x1e) &~ (31 << 21) &~ (31 << 11), .PEXCW}, // rd = 0
+		{mmi(0x3c, 0) &~ (31 << 21), .PSLLW},
+		{mmi(0x3c, 1) &~ (31 << 21), .PSLLW},
+		{mmi(0x3c, 31) &~ (31 << 21 | 31 << 16) | 3 << 16, .PSLLW}, // rt = rd
+		{mmi(0x3c, 16) &~ (31 << 21 | 31 << 11), .PSLLW}, // rd = 0
+		{mmi(0x3e, 0) &~ (31 << 21), .PSRLW},
+		{mmi(0x3e, 1) &~ (31 << 21), .PSRLW},
+		{mmi(0x3e, 31) &~ (31 << 21 | 31 << 16) | 3 << 16, .PSRLW}, // rt = rd
+		{mmi(0x3e, 16) &~ (31 << 21 | 31 << 11), .PSRLW}, // rd = 0
 		{mmi(0x08, 0x07), .PMAXH},
 		{mmi(0x28, 0x07), .PMINH},
 		{mmi(0x08, 0x1a), .PEXTLB},

@@ -273,9 +273,25 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Add8     = 0x4e208400, // add .16b
 		.Eq16     = 0x6e608c00, // cmeq .8h
 		.Zip_Hi16 = 0x4e407800, // zip2 .8h
+		.Adds8    = 0x4e200c00, // sqadd .16b
+		.Subs8    = 0x4e202c00, // sqsub .16b
+		.Subs16   = 0x4e602c00, // sqsub .8h
+		.Addu16   = 0x6e600c00, // uqadd .8h
+		.Subu8    = 0x6e202c00, // uqsub .16b
+		.Subu16   = 0x6e602c00, // uqsub .8h
+		.Subu32   = 0x6ea02c00, // uqsub .4s
+		.Adds32   = 0x4ea00c00, // sqadd .4s
+		.Subs32   = 0x4ea02c00, // sqsub .4s
+		.Gt8      = 0x4e203400, // cmgt .16b
+		.Eq8      = 0x6e208c00, // cmeq .16b
+		.Max32    = 0x4ea06400, // smax .4s
+		.Min32    = 0x4ea06c00, // smin .4s
+		.Abs16    = 0x4e607800, // sqabs .8h
+		.Abs32    = 0x4ea07800, // sqabs .4s
+		.Even32   = 0x4e801800, // uzp1 .4s
 	}
 	ops := OPS
-	if op == .Itof || op == .Ftoi {
+	if op == .Itof || op == .Ftoi || op == .Abs16 || op == .Abs32 {
 		rrr(a, ops[op], u32(dst), u32(src), 0)
 		return
 	}
@@ -350,6 +366,16 @@ a64_vec_shuf32 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 	}
 	for l, k in lanes {
 		emit32(a, 0x6e000400 | (u32(k) << 3 | 4) << 16 | u32(l) << 13 | n << 5 | d) // ins .s
+	}
+}
+
+a64_vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
+	d, n := u32(dst), u32(src)
+	for h in 0 ..< 2 {
+		for l, k in lanes {
+			i, j := u32(4 * h + k), u32(4 * h) + u32(l)
+			emit32(a, 0x6e000400 | (i << 2 | 2) << 16 | j << 12 | n << 5 | d) // ins .h
+		}
 	}
 }
 
