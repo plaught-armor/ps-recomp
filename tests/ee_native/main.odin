@@ -376,6 +376,90 @@ main :: proc() {
 		{mmi(0x28, 0x04) &~ (31 << 21), .PADSBH}, // rs = 0
 		{mmi(0x28, 0x04) &~ (31 << 16), .PADSBH}, // rt = 0
 		{mmi(0x28, 0x04) &~ (31 << 11), .PADSBH}, // rd = 0
+		{mmi(0x09, 0x0c), .PMULTW},
+		{mmi(0x09, 0x0c) &~ (31 << 16) | 3 << 16, .PMULTW}, // rt = rd
+		{mmi(0x09, 0x0c) &~ (31 << 21) | 3 << 21, .PMULTW}, // rs = rd
+		{mmi(0x09, 0x0c) &~ (31 << 21), .PMULTW}, // rs = 0
+		{mmi(0x09, 0x0c) &~ (31 << 16), .PMULTW}, // rt = 0
+		{mmi(0x09, 0x0c) &~ (31 << 11), .PMULTW}, // rd = 0: LO and HI only
+		{mmi(0x29, 0x0c), .PMULTUW},
+		{mmi(0x29, 0x0c) &~ (31 << 16) | 3 << 16, .PMULTUW}, // rt = rd
+		{mmi(0x29, 0x0c) &~ (31 << 21) | 3 << 21, .PMULTUW}, // rs = rd
+		{mmi(0x29, 0x0c) &~ (31 << 21), .PMULTUW}, // rs = 0
+		{mmi(0x29, 0x0c) &~ (31 << 16), .PMULTUW}, // rt = 0
+		{mmi(0x29, 0x0c) &~ (31 << 11), .PMULTUW}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x00), .PMADDW},
+		{mmi(0x09, 0x00) &~ (31 << 16) | 3 << 16, .PMADDW}, // rt = rd
+		{mmi(0x09, 0x00) &~ (31 << 21) | 3 << 21, .PMADDW}, // rs = rd
+		{mmi(0x09, 0x00) &~ (31 << 21), .PMADDW}, // rs = 0
+		{mmi(0x09, 0x00) &~ (31 << 16), .PMADDW}, // rt = 0
+		{mmi(0x09, 0x00) &~ (31 << 11), .PMADDW}, // rd = 0: LO and HI only
+		{mmi(0x29, 0x00), .PMADDUW},
+		{mmi(0x29, 0x00) &~ (31 << 16) | 3 << 16, .PMADDUW}, // rt = rd
+		{mmi(0x29, 0x00) &~ (31 << 21) | 3 << 21, .PMADDUW}, // rs = rd
+		{mmi(0x29, 0x00) &~ (31 << 21), .PMADDUW}, // rs = 0
+		{mmi(0x29, 0x00) &~ (31 << 16), .PMADDUW}, // rt = 0
+		{mmi(0x29, 0x00) &~ (31 << 11), .PMADDUW}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x04), .PMSUBW},
+		{mmi(0x09, 0x04) &~ (31 << 16) | 3 << 16, .PMSUBW}, // rt = rd
+		{mmi(0x09, 0x04) &~ (31 << 21) | 3 << 21, .PMSUBW}, // rs = rd
+		{mmi(0x09, 0x04) &~ (31 << 21), .PMSUBW}, // rs = 0
+		{mmi(0x09, 0x04) &~ (31 << 16), .PMSUBW}, // rt = 0
+		{mmi(0x09, 0x04) &~ (31 << 11), .PMSUBW}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x1c), .PMULTH},
+		{mmi(0x09, 0x1c) &~ (31 << 16) | 3 << 16, .PMULTH}, // rt = rd
+		{mmi(0x09, 0x1c) &~ (31 << 21) | 3 << 21, .PMULTH}, // rs = rd
+		{mmi(0x09, 0x1c) &~ (31 << 21), .PMULTH}, // rs = 0
+		{mmi(0x09, 0x1c) &~ (31 << 16), .PMULTH}, // rt = 0
+		{mmi(0x09, 0x1c) &~ (31 << 11), .PMULTH}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x10), .PMADDH},
+		{mmi(0x09, 0x10) &~ (31 << 16) | 3 << 16, .PMADDH}, // rt = rd
+		{mmi(0x09, 0x10) &~ (31 << 21) | 3 << 21, .PMADDH}, // rs = rd
+		{mmi(0x09, 0x10) &~ (31 << 21), .PMADDH}, // rs = 0
+		{mmi(0x09, 0x10) &~ (31 << 16), .PMADDH}, // rt = 0
+		{mmi(0x09, 0x10) &~ (31 << 11), .PMADDH}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x14), .PMSUBH},
+		{mmi(0x09, 0x14) &~ (31 << 16) | 3 << 16, .PMSUBH}, // rt = rd
+		{mmi(0x09, 0x14) &~ (31 << 21) | 3 << 21, .PMSUBH}, // rs = rd
+		{mmi(0x09, 0x14) &~ (31 << 21), .PMSUBH}, // rs = 0
+		{mmi(0x09, 0x14) &~ (31 << 16), .PMSUBH}, // rt = 0
+		{mmi(0x09, 0x14) &~ (31 << 11), .PMSUBH}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x15), .PHMSBH},
+		{mmi(0x09, 0x15) &~ (31 << 16) | 3 << 16, .PHMSBH}, // rt = rd
+		{mmi(0x09, 0x15) &~ (31 << 21) | 3 << 21, .PHMSBH}, // rs = rd
+		{mmi(0x09, 0x15) &~ (31 << 21), .PHMSBH}, // rs = 0
+		{mmi(0x09, 0x15) &~ (31 << 16), .PHMSBH}, // rt = 0
+		{mmi(0x09, 0x15) &~ (31 << 11), .PHMSBH}, // rd = 0: LO and HI only
+		{mmi(0x09, 0x0d) &~ (31 << 11), .PDIVW},
+		{mmi(0x09, 0x0d) &~ (31 << 11) &~ (31 << 16), .PDIVW}, // by zero
+		{mmi(0x09, 0x0d) &~ (31 << 11) &~ (31 << 21), .PDIVW}, // rs = 0
+		{mmi(0x09, 0x0d) &~ (31 << 11) &~ (31 << 16) | 1 << 16, .PDIVW}, // rs = rt
+		{mmi(0x29, 0x0d) &~ (31 << 11), .PDIVUW},
+		{mmi(0x29, 0x0d) &~ (31 << 11) &~ (31 << 16), .PDIVUW}, // by zero
+		{mmi(0x29, 0x0d) &~ (31 << 11) &~ (31 << 21), .PDIVUW}, // rs = 0
+		{mmi(0x29, 0x0d) &~ (31 << 11) &~ (31 << 16) | 1 << 16, .PDIVUW}, // rs = rt
+		{mmi(0x09, 0x1d) &~ (31 << 11), .PDIVBW},
+		{mmi(0x09, 0x1d) &~ (31 << 11) &~ (31 << 16), .PDIVBW}, // by zero
+		{mmi(0x09, 0x1d) &~ (31 << 11) &~ (31 << 21), .PDIVBW}, // rs = 0
+		{mmi(0x09, 0x1d) &~ (31 << 11) &~ (31 << 16) | 1 << 16, .PDIVBW}, // rs = rt
+		{mmi(0x09, 0x08) &~ (31 << 21 | 31 << 16), .PMFHI},
+		{mmi(0x09, 0x08) &~ (31 << 21 | 31 << 16) &~ (31 << 11), .PMFHI}, // rd = 0
+		{mmi(0x09, 0x09) &~ (31 << 21 | 31 << 16), .PMFLO},
+		{mmi(0x09, 0x09) &~ (31 << 21 | 31 << 16) &~ (31 << 11), .PMFLO}, // rd = 0
+		{mmi(0x29, 0x08) &~ (31 << 16 | 31 << 11), .PMTHI},
+		{mmi(0x29, 0x08) &~ (31 << 16 | 31 << 11) &~ (31 << 21), .PMTHI}, // from r0
+		{mmi(0x29, 0x09) &~ (31 << 16 | 31 << 11), .PMTLO},
+		{mmi(0x29, 0x09) &~ (31 << 16 | 31 << 11) &~ (31 << 21), .PMTLO}, // from r0
+		{mmi(0x31, 0x00) &~ (31 << 16 | 31 << 11), .PMTHL},
+		{mmi(0x31, 0x00) &~ (31 << 16 | 31 << 11) &~ (31 << 21), .PMTHL}, // from r0
+		{mmi(0x30, 0) &~ (31 << 21 | 31 << 16), .PMFHL},
+		{mmi(0x30, 1) &~ (31 << 21 | 31 << 16), .PMFHL},
+		{mmi(0x30, 2) &~ (31 << 21 | 31 << 16), .PMFHL},
+		{mmi(0x30, 3) &~ (31 << 21 | 31 << 16), .PMFHL},
+		{mmi(0x30, 4) &~ (31 << 21 | 31 << 16), .PMFHL},
+		{mmi(0x30, 5) &~ (31 << 21 | 31 << 16), .PMFHL}, // no such variant: zero
+		{mmi(0x30, 2) &~ (31 << 21 | 31 << 16 | 31 << 11), .PMFHL}, // rd = 0
+		{mmi(0x30, 0) &~ (31 << 21 | 31 << 16 | 31 << 11), .PMFHL}, // rd = 0
 		{mmi(0x3c, 0) &~ (31 << 21), .PSLLW},
 		{mmi(0x3c, 1) &~ (31 << 21), .PSLLW},
 		{mmi(0x3c, 31) &~ (31 << 21 | 31 << 16) | 3 << 16, .PSLLW}, // rt = rd
@@ -615,6 +699,39 @@ main :: proc() {
 	for v in CVT_W {
 		if got := u32(cpu.cvt_w(transmute(f32)v[0])); got != v[1] {
 			fmt.eprintfln("FAIL cpu.cvt_w(%08x) = %08x, want %08x", v[0], got, v[1])
+			os.exit(1)
+		}
+	}
+	// The MMI multiplies' arithmetic, which native and interpreter share in
+	// cpu, against hand-computed results: from r1, r2, LO and HI, r3, LO and
+	// HI after ps2.exec. Words low first.
+	Fixed :: struct {w: u32, r1, r2, lo, hi, want_r3, want_lo, want_hi: [4]u32}
+	fixed := [?]Fixed {
+		// PMULTW: -2 * 5 and 3 * min(i32), each half sign-extended
+		{mmi(0x09, 0x0c), {0xfffffffe, 0, 3, 0}, {5, 0, 0x80000000, 0}, {}, {},
+		 {0xfffffff6, 0xffffffff, 0x80000000, 0xfffffffe},
+		 {0xfffffff6, 0xffffffff, 0x80000000, 0xffffffff}, {0xffffffff, 0xffffffff, 0xfffffffe, 0xffffffff}},
+		// PMADDW: 0xffffffff + 2 * 3 carries into HI; min(i64) + -1 * 1 wraps
+		{mmi(0x09, 0x00), {2, 0, 0xffffffff, 0}, {3, 0, 1, 0}, {0xffffffff, 0, 0, 0}, {0, 0, 0x80000000, 0},
+		 {5, 1, 0xffffffff, 0x7fffffff}, {5, 0, 0xffffffff, 0xffffffff}, {1, 0, 0x7fffffff, 0}},
+		// PDIVW: 7 / 0 and min(i32) / -1; rd stays
+		{mmi(0x09, 0x0d), {7, 0, 0x80000000, 0}, {0, 0, 0xffffffff, 0}, {}, {},
+		 {}, {0xffffffff, 0xffffffff, 0x80000000, 0xffffffff}, {7, 0, 0, 0}},
+		// PMFHL.SLW: 2^31 and -2^32 + max(i32) saturate
+		{mmi(0x30, 2), {}, {}, {0x80000000, 0, 0x7fffffff, 0}, {0, 0, 0xffffffff, 0},
+		 {0x7fffffff, 0, 0x80000000, 0xffffffff}, {0x80000000, 0, 0x7fffffff, 0}, {0, 0, 0xffffffff, 0}},
+		// PHMSBH: 3 * 11 - 2 * 7, 5 * 1 - 4 * 1, -0x8000 * 1 - -0x8000 * -0x8000, 1 * 1 - 1 * 2
+		{mmi(0x09, 0x15), {0x00030002, 0x00050004, 0x80008000, 0x00010001}, {0x000b0007, 0x00010001, 0x00018000, 0x00010002}, {}, {},
+		 {19, 1, 0xbfff8000, 0xffffffff}, {19, 33, 0xbfff8000, 0xffff8000}, {1, 5, 0xffffffff, 1}},
+	}
+	for v in fixed {
+		cpu.state = {}
+		cpu.state.r[1].w, cpu.state.r[2].w, cpu.state.lo.w, cpu.state.hi.w = v.r1, v.r2, v.lo, v.hi
+		ps2.exec(0, v.w)
+		got := [3][4]u32{cpu.state.r[3].w, cpu.state.lo.w, cpu.state.hi.w}
+		want := [3][4]u32{v.want_r3, v.want_lo, v.want_hi}
+		if got != want {
+			fmt.eprintfln("FAIL %08x: r3 lo hi %x, want %x", v.w, got, want)
 			os.exit(1)
 		}
 	}

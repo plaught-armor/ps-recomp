@@ -64,19 +64,7 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 	case .MTHI1: c.hi.d[1] = s.d[0]; return
 	case .MTLO1: c.lo.d[1] = s.d[0]; return
 	case .PLZCW: cpu.plzcw(s.w[0], s.w[1], i.rd); return
-	case .PMFHL:
-		lo, hi := c.lo, c.hi
-		switch i.sa {
-		case 0: d.w = {lo.w[0], hi.w[0], lo.w[2], hi.w[2]}
-		case 1: d.w = {lo.w[1], hi.w[1], lo.w[3], hi.w[3]}
-		case 2:
-			d.d[0] = cpu.sx32(sat32(i64(u64(hi.w[0]) << 32 | u64(lo.w[0]))))
-			d.d[1] = cpu.sx32(sat32(i64(u64(hi.w[2]) << 32 | u64(lo.w[2]))))
-		case 3: d.h = {lo.h[0], lo.h[2], hi.h[0], hi.h[2], lo.h[4], lo.h[6], hi.h[4], hi.h[6]}
-		case 4:
-			d.h = {sat16(lo.sw[0]), sat16(lo.sw[1]), sat16(hi.sw[0]), sat16(hi.sw[1]),
-			       sat16(lo.sw[2]), sat16(lo.sw[3]), sat16(hi.sw[2]), sat16(hi.sw[3])}
-		}
+	case .PMFHL: cpu.pmfhl(i.rd, i.sa); return
 	case .PMTHL:
 		c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2] = s.w[0], s.w[1], s.w[2], s.w[3]
 		return
@@ -147,23 +135,11 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 			d.q = (t.q >> c.sa) | (s.q << (128 - c.sa))
 		}
 	// MMI2
-	case .PMADDW, .PMSUBW, .PMULTW, .PMADDUW, .PMULTUW:
-		for k in 0 ..< 2 {
-			p: i64
-			if i.op == .PMADDUW || i.op == .PMULTUW {
-				p = i64(u64(s.w[2 * k]) * u64(t.w[2 * k]))
-			} else {
-				p = i64(s.sw[2 * k]) * i64(t.sw[2 * k])
-			}
-			acc := i64(u64(c.hi.w[2 * k]) << 32 | u64(c.lo.w[2 * k]))
-			#partial switch i.op {
-			case .PMADDW, .PMADDUW: p = acc + p
-			case .PMSUBW:           p = acc - p
-			}
-			c.lo.d[k] = cpu.sx32(u32(p))
-			c.hi.d[k] = cpu.sx32(u32(u64(p) >> 32))
-			d.sd[k] = p
-		}
+	case .PMADDW:  cpu.pmaddw(i.rd, i.rs, i.rt); return
+	case .PMSUBW:  cpu.pmsubw(i.rd, i.rs, i.rt); return
+	case .PMULTW:  cpu.pmultw(i.rd, i.rs, i.rt); return
+	case .PMADDUW: cpu.pmadduw(i.rd, i.rs, i.rt); return
+	case .PMULTUW: cpu.pmultuw(i.rd, i.rs, i.rt); return
 	case .PSLLVW: for k in 0 ..< 2 {d.d[k] = cpu.sx32(t.w[2 * k] << (s.w[2 * k] & 31))}
 	case .PSRLVW: for k in 0 ..< 2 {d.d[k] = cpu.sx32(t.w[2 * k] >> (s.w[2 * k] & 31))}
 	case .PSRAVW: for k in 0 ..< 2 {d.d[k] = cpu.sx32(u32(t.sw[2 * k] >> (s.w[2 * k] & 31)))}
@@ -177,51 +153,16 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 		}
 		return
 	case .PCPYLD: d.d = {t.d[0], s.d[0]}
-	case .PMADDH, .PMSUBH, .PMULTH:
-		// products land in LO/HI words in the order
-		// lo0 lo1 hi0 hi1 lo2 lo3 hi2 hi3
-		for k in 0 ..< 8 {
-			p := i32(s.sh[k]) * i32(t.sh[k])
-			dst := (k & 2) != 0 ? &c.hi : &c.lo
-			lane := (k & 1) | ((k >> 1) & 2)
-			#partial switch i.op {
-			case .PMADDH: dst.sw[lane] += p
-			case .PMSUBH: dst.sw[lane] -= p
-			case:         dst.sw[lane] = p
-			}
-		}
-		d.w = {c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2]}
-	case .PHMADH, .PHMSBH:
-		for k in 0 ..< 4 {
-			a := i32(s.sh[2 * k + 1]) * i32(t.sh[2 * k + 1])
-			b := i32(s.sh[2 * k]) * i32(t.sh[2 * k])
-			v := i.op == .PHMADH ? a + b : a - b
-			dst := (k & 1) != 0 ? &c.hi : &c.lo
-			dst.sw[(k >> 1) * 2] = v
-			dst.sw[(k >> 1) * 2 + 1] = a
-		}
-		d.w = {c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2]}
+	case .PMADDH: cpu.pmaddh(i.rd, i.rs, i.rt); return
+	case .PMSUBH: cpu.pmsubh(i.rd, i.rs, i.rt); return
+	case .PMULTH: cpu.pmulth(i.rd, i.rs, i.rt); return
+	case .PHMADH: cpu.phmadh(i.rd, i.rs, i.rt); return
+	case .PHMSBH: cpu.phmsbh(i.rd, i.rs, i.rt); return
 	case .PAND: d.q = s.q & t.q
 	case .PXOR: d.q = s.q ~ t.q
 	case .PEXEH: d.h = {t.h[2], t.h[1], t.h[0], t.h[3], t.h[6], t.h[5], t.h[4], t.h[7]}
 	case .PREVH: d.h = {t.h[3], t.h[2], t.h[1], t.h[0], t.h[7], t.h[6], t.h[5], t.h[4]}
-	case .PDIVBW:
-		dv := i32(t.sh[0])
-		for k in 0 ..< 4 {
-			n := s.sw[k]
-			switch {
-			case dv == 0:
-				c.lo.sw[k] = n < 0 ? 1 : -1
-				c.hi.sw[k] = n
-			case n == min(i32) && dv == -1:
-				c.lo.sw[k] = min(i32)
-				c.hi.sw[k] = 0
-			case:
-				c.lo.sw[k] = n / dv
-				c.hi.sw[k] = n % dv
-			}
-		}
-		return
+	case .PDIVBW: cpu.pdivbw(i.rs, i.rt); return
 	case .PEXEW:  d.w = {t.w[2], t.w[1], t.w[0], t.w[3]}
 	case .PROT3W: d.w = {t.w[1], t.w[2], t.w[0], t.w[3]}
 	// MMI3

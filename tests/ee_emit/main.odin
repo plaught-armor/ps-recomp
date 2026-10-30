@@ -40,9 +40,11 @@ COVERED :: Ops{
 	.PCGTB, .PCGTW, .PCEQB, .PCEQW, .PMAXW, .PMINW, .PABSH, .PABSW, .PSLLW, .PSRLW,
 	.PPACW, .PINTH, .PINTEH, .PEXEH, .PEXEW, .PREVH, .PROT3W, .PEXCH, .PEXCW,
 	.PSLLVW, .PSRLVW, .PSRAVW, .PEXT5, .PPAC5, .PADSBH,
+	.PMFHI, .PMFLO, .PMTHI, .PMTLO, .PMFHL, .PMTHL, .PMULTW, .PMULTUW, .PMADDW, .PMADDUW, .PMSUBW,
+	.PMULTH, .PMADDH, .PMSUBH, .PHMSBH, .PDIVW, .PDIVUW, .PDIVBW,
 }
-// The shifts by sa: every amount gets a case.
-BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW}
+// The shifts by sa and PMFHL's variants: every sa gets a case.
+BY_SA :: Ops{.PSLLH, .PSRLH, .PSRAH, .PSLLW, .PSRLW, .PSRAW, .PMFHL}
 
 main :: proc() {
 	REGS := [?][3]u32{{1, 2, 3}, {1, 2, 0}, {0, 2, 3}, {1, 0, 3}, {4, 4, 4}, {5, 6, 5}, {5, 6, 6}} // rs, rt, rd

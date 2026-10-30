@@ -378,6 +378,37 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 		rd := i.rd == 0 ? "" : fmt.tprintf("; c.r[%d].w = {{c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2]}}", i.rd)
 		append(out, fmt.tprintf("{{s, t := c.r[%d], c.r[%d]; for k in 0 ..< 4 {{a := i32(s.sh[2 * k + 1]) * i32(t.sh[2 * k + 1]); v := a + i32(s.sh[2 * k]) * i32(t.sh[2 * k]); h := (k & 1) != 0 ? &c.hi : &c.lo; h.sw[k &~ 1], h.sw[k | 1] = v, a}}%s}}", i.rs, i.rt, rd))
 		return true
+	// HI and LO moves; PMTHL and PMFHL's LW and UW move words, the rest
+	// of PMFHL is cpu.pmfhl
+	case .PMFHI, .PMFLO:
+		if i.rd != 0 {append(out, fmt.tprintf("c.r[%d] = c.%s", i.rd, i.op == .PMFHI ? "hi" : "lo"))}
+		return true
+	case .PMTHI, .PMTLO:
+		append(out, fmt.tprintf("c.%s = c.r[%d]", i.op == .PMTHI ? "hi" : "lo", i.rs))
+		return true
+	case .PMTHL:
+		append(out, fmt.tprintf("{{s := c.r[%d]; c.lo.w[0], c.hi.w[0], c.lo.w[2], c.hi.w[2] = s.w[0], s.w[1], s.w[2], s.w[3]}}", i.rs))
+		return true
+	case .PMFHL:
+		switch {
+		case i.rd == 0:
+		case i.sa <= 1:
+			append(out, fmt.tprintf("c.r[%d].w = {{c.lo.w[%d], c.hi.w[%d], c.lo.w[%d], c.hi.w[%d]}}", i.rd, i.sa, i.sa, i.sa + 2, i.sa + 2))
+		case:
+			append(out, fmt.tprintf("cpu.pmfhl(%d, %d)", i.rd, i.sa))
+		}
+		return true
+	// The multiplies and divides: LO and HI are written when rd is 0 too.
+	case .PDIVW, .PDIVUW:
+		f := i.op == .PDIVW ? "div" : "divu"
+		append(out, fmt.tprintf("{{s, t := c.r[%d], c.r[%d]; cpu.%s(s.w[0], t.w[0], 0); cpu.%s(s.w[2], t.w[2], 1)}}", i.rs, i.rt, f, f))
+		return true
+	case .PDIVBW:
+		append(out, fmt.tprintf("cpu.pdivbw(%d, %d)", i.rs, i.rt))
+		return true
+	case .PMULTW, .PMULTUW, .PMADDW, .PMADDUW, .PMSUBW, .PMULTH, .PMADDH, .PMSUBH, .PHMSBH:
+		append(out, fmt.tprintf("cpu.%s(%d, %d, %d)", strings.to_lower(fmt.tprint(i.op), context.temp_allocator), i.rd, i.rs, i.rt))
+		return true
 	case .PAND:  view, expr = "q", bin("q", "&")
 	case .POR:   view, expr = "q", bin("q", "|")
 	case .PXOR:  view, expr = "q", bin("q", "~")

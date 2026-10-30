@@ -807,6 +807,65 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.vec_op(a, .Zip_Hi64, .V1, .V0)
 		native.vec_store(a, LO, .V4)
 		native.vec_store(a, HI, .V1)
+	case .PMFHI, .PMFLO:
+		if rd == 0 {return true}
+		native.vec_load(a, .V0, HI if i.op == .PMFHI else LO)
+		native.vec_store(a, GPR * u32(rd), .V0)
+	case .PMTHI, .PMTLO:
+		native.vec_load(a, .V0, GPR * u32(rs))
+		native.vec_store(a, HI if i.op == .PMTHI else LO, .V0)
+	case .PMTHL:
+		// rs's words to LO's and HI's even words, alternately
+		for k in u32(0) ..< 4 {
+			native.state_load(a, .A, GPR * u32(rs) + 4 * k)
+			native.state_store(a, (HI if k & 1 != 0 else LO) + 8 * (k >> 1), .A)
+		}
+	case .PMFHL:
+		if rd == 0 {return true}
+		if sa > 1 {
+			// SLW, LH, SH and the zero of any other sa: cpu.pmfhl
+			native.mov_imm(a, .A, u32(rd))
+			native.mov_imm(a, .B, sa)
+			native.call(a, "cpu.pmfhl", .A, .B)
+			return true
+		}
+		// LW and UW: LO's and HI's even (or odd) words, alternately
+		for k in u32(0) ..< 4 {
+			native.state_load(a, .A, (HI if k & 1 != 0 else LO) + 8 * (k >> 1) + 4 * sa)
+			native.state_store(a, GPR * u32(rd) + 4 * k, .A)
+		}
+	case .PDIVW, .PDIVUW:
+		// cpu.div and cpu.divu on the low word of each doubleword, as
+		// emit_mmi calls them
+		for k in u32(0) ..< 2 {
+			for r in ([2]struct {dst: native.Reg, n: u8}{{.A, rs}, {.B, rt}}) {
+				if r.n == 0 {native.mov_imm(a, r.dst, 0)} else {native.state_load(a, r.dst, GPR * u32(r.n) + 8 * k)}
+			}
+			native.mov_imm(a, .C, k)
+			native.call(a, "cpu.div" if i.op == .PDIVW else "cpu.divu", .A, .B, .C)
+		}
+	case .PMULTW, .PMULTUW, .PMADDW, .PMADDUW, .PMSUBW, .PMULTH, .PMADDH, .PMSUBH, .PHMSBH:
+		// the cpu helper, as emit_mmi calls it
+		name: string
+		#partial switch i.op {
+		case .PMULTW:  name = "cpu.pmultw"
+		case .PMULTUW: name = "cpu.pmultuw"
+		case .PMADDW:  name = "cpu.pmaddw"
+		case .PMADDUW: name = "cpu.pmadduw"
+		case .PMSUBW:  name = "cpu.pmsubw"
+		case .PMULTH:  name = "cpu.pmulth"
+		case .PMADDH:  name = "cpu.pmaddh"
+		case .PMSUBH:  name = "cpu.pmsubh"
+		case:          name = "cpu.phmsbh"
+		}
+		native.mov_imm(a, .A, u32(rd))
+		native.mov_imm(a, .B, u32(rs))
+		native.mov_imm(a, .C, u32(rt))
+		native.call(a, name, .A, .B, .C)
+	case .PDIVBW:
+		native.mov_imm(a, .A, u32(rs))
+		native.mov_imm(a, .B, u32(rt))
+		native.call(a, "cpu.pdivbw", .A, .B)
 	case .QFSRV:
 		if rd == 0 {return true}
 		// A shift by whole bytes below 16 is a funnel; any other SA, which
