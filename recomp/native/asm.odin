@@ -127,6 +127,10 @@ Vop :: enum u8 {
 	// dword k = the signed products of halfwords 2k and 2k + 1 added,
 	// wrapping; uses V2 and V3 on arm64
 	Madd16,
+	Sub16,
+	Add8,
+	Eq16, // all ones in each 16-bit lane where dst == src
+	Zip_Hi16, // halfwords 4-7 likewise
 }
 
 Label :: distinct i32

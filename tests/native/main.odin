@@ -372,9 +372,18 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 		return {d[0], d[1], s[0], s[1]}
 	case .Zip_Hi64:
 		return {d[2], d[3], s[2], s[3]}
-	case .Zip_Lo16:
-		for k in 0 ..< 4 {rh[2 * k], rh[2 * k + 1] = dh[k], sh[k]}
+	case .Zip_Lo16, .Zip_Hi16:
+		h := 4 if op == .Zip_Hi16 else 0
+		for k in 0 ..< 4 {rh[2 * k], rh[2 * k + 1] = dh[h + k], sh[h + k]}
 		return transmute([4]u32)rh
+	case .Sub16:
+		for k in 0 ..< 8 {rh[k] = dh[k] - sh[k]}
+		return transmute([4]u32)rh
+	case .Eq16:
+		for k in 0 ..< 8 {rh[k] = -1 if dh[k] == sh[k] else 0}
+		return transmute([4]u32)rh
+	case .Add8:
+		for k in 0 ..< 16 {r[k] = db[k] + sb[k]}
 	case .Sub32:
 		return d - s
 	case .Sub8:

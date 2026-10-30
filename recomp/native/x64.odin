@@ -341,6 +341,10 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Add32    = 0x0ffe, // paddd
 		.Addu32   = 0x0ffe, // paddd, then por of where the sum is below dst
 		.Madd16   = 0x0ff5, // pmaddwd
+		.Sub16    = 0x0ff9, // psubw
+		.Add8     = 0x0ffc, // paddb
+		.Eq16     = 0x0f75, // pcmpeqw
+		.Zip_Hi16 = 0x0f69, // punpckhwd
 	}
 	ops := OPS
 	sse :: proc(a: ^Asm, op: u32, dst, src: Vreg, ps := false) {

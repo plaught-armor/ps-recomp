@@ -269,6 +269,10 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Add32    = 0x4ea08400, // add .4s
 		.Addu32   = 0x6ea00c00, // uqadd .4s
 		.Madd16   = 0x4ea0bc00, // addp .4s, of smull and smull2
+		.Sub16    = 0x6e608400, // sub .8h
+		.Add8     = 0x4e208400, // add .16b
+		.Eq16     = 0x6e608c00, // cmeq .8h
+		.Zip_Hi16 = 0x4e407800, // zip2 .8h
 	}
 	ops := OPS
 	if op == .Itof || op == .Ftoi {

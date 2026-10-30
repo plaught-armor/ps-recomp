@@ -58,7 +58,7 @@ COP1_OPS := [?]r5900.Op {
 	.MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .ADD_S, .SUB_S, .MUL_S, .DIV_S,
 	.ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S,
 	.MAX_S, .MIN_S, .C_EQ_S, .C_LT_S, .C_LE_S, .CVT_W_S, .SQRT_S, .RSQRT_S,
-	.MFC1,
+	.MFC1, .C_F_S,
 }
 
 // The unaligned loads and stores; check_unaligned checks them.
@@ -236,6 +236,20 @@ main :: proc() {
 		{0x44c10000, .CTC1}, // FCR0 stays
 		{mmi(0x04) &~ (31 << 16), .PLZCW},
 		{mmi(0x08, 0x04), .PADDH},
+		{mmi(0x08, 0x05), .PSUBH},
+		{mmi(0x08, 0x05) &~ (31 << 16) | 3 << 16, .PSUBH}, // rt = rd
+		{mmi(0x08, 0x05) &~ (31 << 11), .PSUBH}, // rd = 0
+		{mmi(0x08, 0x08), .PADDB},
+		{mmi(0x08, 0x08) &~ (31 << 21) | 3 << 21, .PADDB}, // rs = rd
+		{mmi(0x08, 0x08) &~ (31 << 11), .PADDB}, // rd = 0
+		{mmi(0x28, 0x06), .PCEQH},
+		{mmi(0x28, 0x06) &~ (31 << 21 | 31 << 16) | 3 << 21 | 3 << 16, .PCEQH}, // rs = rt = rd
+		{mmi(0x28, 0x06) &~ (31 << 11), .PCEQH}, // rd = 0
+		{mmi(0x28, 0x16), .PEXTUH},
+		{mmi(0x28, 0x16) &~ (31 << 16) | 3 << 16, .PEXTUH}, // rt = rd
+		{mmi(0x28, 0x16) &~ (31 << 21) | 3 << 21, .PEXTUH}, // rs = rd
+		{mmi(0x28, 0x16) &~ (31 << 11), .PEXTUH}, // rd = 0
+		{0x46020830, .C_F_S},
 		{mmi(0x08, 0x07), .PMAXH},
 		{mmi(0x28, 0x07), .PMINH},
 		{mmi(0x08, 0x1a), .PEXTLB},

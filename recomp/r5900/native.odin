@@ -644,7 +644,7 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.state_store(a, SA, .A)
 	case .PADDH, .PSUBW, .PSUBB, .PMAXH, .PMINH, .PCGTH, .POR, .PNOR, .PAND, .PXOR, .PEXTLB, .PEXTUB,
 	     .PEXTLH, .PEXTLW, .PEXTUW, .PCPYLD, .PCPYUD, .PPACB, .PPACH, .PCPYH, .PADDSH, .PADDUB, .PADDW,
-	     .PADDUW:
+	     .PADDUW, .PSUBH, .PADDB, .PCEQH, .PEXTUH:
 		if rd == 0 {return true}
 		// rd = x op y, lane-wise, with the operands in the interpreter's order
 		v: native.Vop
@@ -674,6 +674,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		case .PADDUB: v = .Addu8
 		case .PADDW: v = .Add32
 		case .PADDUW: v = .Addu32
+		case .PSUBH: v = .Sub16
+		case .PADDB: v = .Add8
+		case .PCEQH: v = .Eq16
+		case .PEXTUH: v, x, y = .Zip_Hi16, rt, rs
 		}
 		native.vec_load(a, .V0, GPR * u32(x))
 		native.vec_load(a, .V1, GPR * u32(y))
@@ -761,6 +765,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 	case .CTC1:
 		if rd != 31 {return true}
 		get(a, .A, rt)
+		native.state_store(a, FCR31, .A)
+	case .C_F_S:
+		native.state_load(a, .A, FCR31)
+		native.alu_imm(a, .And, .A, ~u32(0x800000)) // FCR31_C
 		native.state_store(a, FCR31, .A)
 	case .EI:
 		native.call(a, "kernel.ei")
