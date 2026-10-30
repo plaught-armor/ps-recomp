@@ -5,6 +5,9 @@
 // also opens no audio device (audio_init with `device` false) and runs
 // unpaced.
 //
+// FRAMES=<n>: the run exits (status 0) at emulated vblank n, window or not,
+// so a headless run has a fixed length without SHOT.
+//
 // DUMP=<dir>: the game writes pictures and memory into dir as
 // <kind>_<frame>.<ext>, from frame DUMP_FROM (default 1) every DUMP_EVERY
 // frames (default 1). With DUMP_HASH=1 each dump is instead a line
@@ -22,6 +25,8 @@ import "core:strconv"
 import sdl "vendor:sdl2"
 
 headless: bool
+// FRAMES: the vblank the run exits at; 0 runs on.
+frames: u64
 
 @(private = "file")
 dump: struct {
@@ -32,13 +37,46 @@ dump: struct {
 	stream: ^os.File,
 }
 
-// Read HEADLESS and set SDL up for it. Call before SDL_Init.
-headless_init :: proc() {
+// Read HEADLESS and FRAMES and set SDL up for a headless run; false (after
+// a message) for a bad FRAMES. Call before SDL_Init.
+headless_init :: proc() -> bool {
 	headless = env("HEADLESS") == "1"
 	if headless {
-		sdl.SetHint("SDL_VIDEODRIVER", "offscreen")
+		// SDL's dummy video driver, else its offscreen one; a build with
+		// neither (the Windows SDL2.dll) keeps the default one, and the
+		// host's window stays hidden. Dummy first: on macOS SDL gives
+		// every other driver's window OpenGL, which offscreen can only
+		// get through EGL, so the window fails there.
+		drivers := sdl.GetNumVideoDrivers()
+		pick: for want in ([]cstring{"dummy", "offscreen"}) {
+			for i in 0 ..< drivers {
+				if sdl.GetVideoDriver(i) == want {
+					sdl.SetHint("SDL_VIDEODRIVER", want)
+					break pick
+				}
+			}
+		}
 		sdl.SetHint(sdl.HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0x0000/0x0000")
 	}
+	frames = 0
+	if v := env("FRAMES"); v != "" {
+		n, ok := strconv.parse_u64(v, 10)
+		if !ok {
+			fmt.eprintln(env_name("FRAMES"), "is not a vblank count:", v)
+			return false
+		}
+		frames = n
+	}
+	return true
+}
+
+// Whether the run is over at emulated vblank n (FRAMES), saying so.
+frames_done :: proc(n: u64) -> bool {
+	if frames == 0 || n < frames {
+		return false
+	}
+	fmt.eprintfln("frames: %d reached", n)
+	return true
 }
 
 // Read the DUMP settings; false (after a message) for a bad one or a

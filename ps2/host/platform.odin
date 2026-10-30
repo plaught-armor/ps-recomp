@@ -61,8 +61,9 @@ platform_init :: proc(title: cstring) -> bool {
 	sdl.SetHint(sdl.HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0")
 	sdl.SetHint(sdl.HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1")
 	sdl.SetHint(sdl.HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1")
-	// HEADLESS=1: no window, no 60 Hz pacing, no controllers.
-	core.headless_init()
+	// HEADLESS=1: no window, no 60 Hz pacing, no controllers. FRAMES=<n>:
+	// exit at vblank n.
+	if !core.headless_init() {return false}
 	stats = core.env("STATS") == "1"
 	// PACE=<hz> paces a headless run too (netplay tests; a different
 	// rate on each peer stands in for clock drift).
@@ -81,9 +82,10 @@ platform_init :: proc(title: cstring) -> bool {
 	core.snap_add(&frame)
 	core.snap_add(&next_shot)
 	core.snap_add(&vblank)
-	// Headless runs take input from PRESS only, so they replay exactly.
+	// Headless runs take input from PRESS only, so they replay exactly, and
+	// open no audio device (a runner may have none).
 	subsystems := sdl.InitFlags{.VIDEO, .AUDIO, .GAMECONTROLLER}
-	if core.headless {subsystems -= {.GAMECONTROLLER}}
+	if core.headless {subsystems -= {.GAMECONTROLLER, .AUDIO}}
 	if sdl.Init(subsystems) != 0 {
 		fmt.eprintln("sdl:", sdl.GetError())
 		return false
@@ -96,8 +98,13 @@ platform_init :: proc(title: cstring) -> bool {
 	if v, ok := strconv.parse_int(core.env("SCALE")); ok && v >= 1 && v <= 8 {scale = v}
 	flags := sdl.WindowFlags{.RESIZABLE}
 	if hw && !core.headless {flags += {.VULKAN}}
+	if core.headless {flags += {.HIDDEN}}
 	win = sdl.CreateWindow(title, sdl.WINDOWPOS_CENTERED, sdl.WINDOWPOS_CENTERED,
 		gs.DISP_W * 2, 480 * 2, flags)
+	if win == nil {
+		fmt.eprintln("SDL_CreateWindow:", sdl.GetError())
+		return false
+	}
 	if hw {
 		if !gs.hw_init(core.headless ? nil : win, u32(scale)) {return false}
 	} else {
@@ -210,6 +217,7 @@ vblank_frame :: proc() {
 		print_net()
 		quit(0)
 	}
+	if core.frames_done(u64(vblank)) {quit(0)}
 	if pace == 0 || rerun {return}
 	// Netplay time sync stretches the frame while this host is ahead.
 	length := time.Second / time.Duration(pace)

@@ -223,7 +223,12 @@ run_poke_script :: proc() {
 }
 
 platform_init :: proc(title: cstring) -> bool {
-	if sdl.Init({.VIDEO, .EVENTS, .GAMECONTROLLER}) != 0 {
+	// HEADLESS=1: no window, controllers, audio device or pacing. FRAMES=<n>:
+	// exit at vblank n.
+	core.headless_init() or_return
+	subsystems := sdl.InitFlags{.VIDEO, .EVENTS, .GAMECONTROLLER}
+	if core.headless {subsystems -= {.GAMECONTROLLER}}
+	if sdl.Init(subsystems) != 0 {
 		fmt.eprintln("SDL_Init:", sdl.GetError())
 		return false
 	}
@@ -234,7 +239,7 @@ platform_init :: proc(title: cstring) -> bool {
 		sdl.WINDOWPOS_CENTERED,
 		WINDOW_W * 2,
 		WINDOW_H * 2,
-		{.RESIZABLE},
+		core.headless ? {.RESIZABLE, .HIDDEN} : {.RESIZABLE},
 	)
 	if host.window == nil {
 		fmt.eprintln("SDL_CreateWindow:", sdl.GetError())
@@ -243,7 +248,7 @@ platform_init :: proc(title: cstring) -> bool {
 	// Focus that arrived before the first event poll; later changes come as
 	// window events.
 	mouse.focused = .INPUT_FOCUS in sdl.GetWindowFlags(host.window)
-	host.renderer = sdl.CreateRenderer(host.window, -1, {.ACCELERATED})
+	host.renderer = sdl.CreateRenderer(host.window, -1, core.headless ? {.SOFTWARE} : {.ACCELERATED})
 	if host.renderer == nil {
 		fmt.eprintln("SDL_CreateRenderer:", sdl.GetError())
 		return false
@@ -259,7 +264,7 @@ platform_init :: proc(title: cstring) -> bool {
 	host.start = time.tick_now()
 	host.speed = 1
 	host.perf_mark = host.start
-	host.unpaced = core.env("FAST") == "1"
+	host.unpaced = core.headless || core.env("FAST") == "1"
 	host.ram_every = env_period("DUMP_RAM", 1500) or_return
 	core.dump_init() or_return
 	core.capture_init()
@@ -286,7 +291,7 @@ platform_init :: proc(title: cstring) -> bool {
 	if spec := core.env("POINT"); spec != "" {
 		parse_point_script(spec)
 	}
-	return record_init() && core.audio_init(AUDIO_HZ, core.env("AUDIO_DUMP"))
+	return record_init() && core.audio_init(AUDIO_HZ, core.env("AUDIO_DUMP"), !core.headless)
 }
 
 // A batch of mixed SPU output.
@@ -902,7 +907,7 @@ platform_frame :: proc() {
 		}
 	}
 	pause_wait()
-	if host.quit {
+	if host.quit || core.frames_done(cpu.presents) {
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
 		os.exit(0)
