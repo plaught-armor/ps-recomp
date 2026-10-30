@@ -49,6 +49,7 @@ init :: proc() {
 	mem.hw_write128 = hw_write128
 	mem.vu_mem_addr = vu.vu_mem_addr
 	mem.trace_store = kernel.trace_store
+	cpu.interp_hook = interp_call
 	mem.mem_init()
 	vu.vu_init()
 	iop.sif_init()

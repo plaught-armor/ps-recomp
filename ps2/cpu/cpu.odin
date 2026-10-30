@@ -100,9 +100,18 @@ lookup :: proc(addr: u32) -> Func_Proc #no_bounds_check {
 	return fn_table[i]
 }
 
+// Runs the guest code at an address no function is registered at, as a
+// call that returns at its `jr $ra`: ps2 sets the EE interpreter here. Nil
+// makes such a call fatal.
+interp_hook: proc(addr: u32)
+
 call :: proc(addr: u32) {
 	if fn := lookup(addr); fn != nil {
 		fn()
+		return
+	}
+	if interp_hook != nil {
+		interp_hook(addr)
 		return
 	}
 	fatal("call to unknown function %08x (ra %08x)", addr, u32(state.r[31].d[0]))
@@ -115,6 +124,10 @@ call :: proc(addr: u32) {
 jump_unknown :: proc(fn, pc: u32) {
 	if f := lookup(pc); f != nil {
 		f()
+		return
+	}
+	if interp_hook != nil {
+		interp_hook(pc)
 		return
 	}
 	fatal("function %08x: jump to %08x which is not a label", fn, pc)

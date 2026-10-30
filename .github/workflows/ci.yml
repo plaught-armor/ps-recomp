@@ -26,7 +26,7 @@ jobs:
             done
             echo "== $t recomp"
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/ee_emit tests/spu tests/psx_fallback tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -90,6 +90,8 @@ jobs:
           odin run tests/psx_cover -collection:ps=. -out:psx_cover_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_timer -collection:ps=. -out:psx_timer_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ps2_kernel -collection:ps=. -out:ps2_kernel_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ps2_interp -collection:ps=. -out:ps2_interp_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true -out:ps2_interp_count_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios -collection:ps=. -out:psx_bios_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios_libc -collection:ps=. -out:psx_bios_libc_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/disc -collection:ps=. -out:disc_test${{ runner.os == 'Windows' && '.exe' || '' }}

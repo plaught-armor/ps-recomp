@@ -32,6 +32,9 @@ fallback_vu1_micro_at: [(16 << 10) / 8]u64
 fallback_vu_unlabelled: map[[3]u32]u64
 // fpu_slow calls, by op: not the interpreter, so outside the calls total.
 fallback_fpu_slow: [Fpu_Op]u64
+// Calls to addresses with no registered function, which the EE interpreter
+// ran, by address (host state, in the heap allocator).
+fallback_ee_calls: map[u32]u64
 
 cop2_key :: #force_inline proc "contextless" (w: u32) -> u32 {
 	fn := w & 63
@@ -86,6 +89,7 @@ fallback_print :: proc() {
 	for n in fallback_fpu_slow {slow += n}
 	fmt.eprintfln("fallback: %d fpu_slow calls", slow)
 	for n, op in fallback_fpu_slow {if n != 0 {fmt.eprintfln("fallback: %d\tfpu_slow %v", n, op)}}
+	for addr, n in fallback_ee_calls {fmt.eprintfln("fallback: %d\tee interpreted call to %08x", n, addr)}
 }
 
 // The MICRO_AT_TOP entry pairs of one VU's interpreted micro-mode pairs, most

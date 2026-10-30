@@ -5,7 +5,8 @@
 //
 // A game calls load_native after registering its recompiled functions, so
 // the native ones replace them. Setting NATIVE=0 keeps the Odin functions,
-// for comparing the two.
+// for comparing the two. A host with no recompiled functions calls it with
+// none registered: the blob then stands alone and sizes the call table.
 package ps2
 
 import "base:intrinsics"
@@ -264,10 +265,12 @@ native_imports :: proc() -> map[string]u64 {
 }
 
 // Replace the registered functions with the native code in the file at
-// path. False, with the reason printed, when it cannot be used; the Odin
+// path, or with no call table yet, register the blob's functions alone.
+// False, with the reason printed, when it cannot be used; the Odin
 // functions then stay.
 load_native :: proc(path: string) -> bool {
 	if core.env("NATIVE") == "0" {
+		if cpu.text_hi == 0 {fmt.eprintln("native: NATIVE=0, and there are no recompiled functions to keep")}
 		return false
 	}
 	if mem.ram_base == nil {
@@ -287,6 +290,24 @@ load_native :: proc(path: string) -> bool {
 	}
 	defer delete(code.funcs)
 	defer delete(code.ovls)
+	if cpu.text_hi == 0 {
+		// Standalone: the table spans the blob's functions.
+		if len(code.funcs) == 0 {
+			fmt.eprintfln("native: %s: no functions", path)
+			core.native_free(&code)
+			return false
+		}
+		lo, hi := max(u32), u32(0)
+		for f in code.funcs {
+			lo, hi = min(lo, f.addr), max(hi, f.addr)
+		}
+		cpu.text_range(lo, hi + 4)
+		for f in code.funcs {
+			cpu.register(f.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(f.off)))
+		}
+		fmt.eprintfln("native: %d functions from %s, standalone (%08x-%08x)", len(code.funcs), path, lo, hi + 4)
+		return true
+	}
 	// A function the build does not have means the blob is from other code:
 	// use none of it rather than a mix.
 	missing := 0
