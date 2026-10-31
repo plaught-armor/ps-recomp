@@ -21,8 +21,8 @@ import "ps:core"
 import cpu "../cpu"
 import mem "../mem"
 
-FMOD_HEAP_START :: 0x00400000
-FMOD_HEAP_END :: IOP_RAM_SIZE
+FMOD_HEAP_START :: 0x00400000 // in the HLE area (iop_hle)
+FMOD_HEAP_END :: IOP_SPACE
 MIX_RATE :: 48000
 
 @(private = "file")
@@ -30,7 +30,8 @@ Block :: struct {
 	addr, size: u32,
 }
 
-// FMOD's IOP memory pool (ops 0x7d/0x7e): first fit over the top of IOP RAM.
+// FMOD's IOP memory pool (ops 0x7d/0x7e): first fit over the top of the
+// IOP address space, which the EE DMAs samples and streams into.
 @(private = "file")
 heap: [dynamic]Block // used blocks, sorted by address
 
@@ -170,7 +171,7 @@ fmod_command :: proc(cid, opt, a: u32) {
 	FMOD_INIT :: 0xfffffffe
 	FMOD_VERSION :: 0x03730004 // FMOD 3.73.04; the EE library checks it
 	op, wait := iop_u32(a + 0x14)^, iop_u32(a + 0x18)^
-	p := ([^]u32)(&iop_ram[a + 0x20]) // payload
+	p := ([^]u32)(raw_data(iop_mem(a + 0x20, IOP_SPACE))) // payload
 	fmod_log(op, wait, p)
 	reply: [20]u32 // packet bytes 0x10..0x60
 	info := reply[6:] // 0x30 bytes at +0x28
@@ -389,15 +390,14 @@ sample_free :: proc(h: u32) {
 @(private = "file")
 source_data :: proc(src, mode, offset, length: u32) -> ([]u8, bool) {
 	if mode & FSOUND_LOADMEMORY != 0 {
-		s := src & (IOP_RAM_SIZE - 1)
-		return iop_ram[s:][:min(length, IOP_RAM_SIZE - s)], true
+		return iop_mem(src, length), true
 	}
 	return file_data(iop_string(src), offset, length)
 }
 
 @(private = "file")
 iop_string :: proc(a: u32) -> string {
-	return string(cstring(&iop_ram[a & (IOP_RAM_SIZE - 1)]))
+	return string(cstring(raw_data(iop_mem(a, IOP_SPACE))))
 }
 
 @(private = "file")
@@ -481,8 +481,7 @@ song_free :: proc(h: u32) {
 @(private = "file")
 stream_read :: proc(st: ^Stream, offset, length: u32) -> ([]u8, bool) {
 	if st.name == "" {
-		s := (st.mem + offset) & (IOP_RAM_SIZE - 1)
-		return iop_ram[s:][:min(length, IOP_RAM_SIZE - s)], true
+		return iop_mem(st.mem + offset, length), true
 	}
 	return file_data(st.name, st.offset + offset, length)
 }
@@ -718,10 +717,10 @@ vag_decode :: proc(src: []u8, frames: int, channels := 1) -> []i16 {
 // op 0x1b after writing a byte per channel the EE reads as "is playing".
 @(private = "file")
 fmod_update :: proc(cid, opt: u32, p: [^]u32) {
-	blk := p[0] & (IOP_RAM_SIZE - 1)
+	blk := p[0] & (IOP_SPACE - 1)
 	CH :: 0xd0 // first channel; 0x70 bytes each
 	for i in 0 ..< num_voices {
-		c := iop_ram[blk + CH + u32(i) * 0x70:][:0x70]
+		c := iop_mem(blk + CH + u32(i) * 0x70, 0x70)
 		w := ([^]u32)(raw_data(c))
 		flags, state := w[3], w[0x13]
 		v := &voices[i]
@@ -769,7 +768,7 @@ fmod_update :: proc(cid, opt: u32, p: [^]u32) {
 // so pan stays the channel's.
 @(private = "file")
 gain_3d :: proc(blk: u32, w: [^]u32) -> f32 {
-	l := ([^]u32)(raw_data(iop_ram[blk:]))
+	l := ([^]u32)(raw_data(iop_mem(blk, 0x1c)))
 	d: f32 = 0
 	for k in 0 ..< 3 {
 		x := f32(i32(w[4 + k]) - i32(l[4 + k])) / 256

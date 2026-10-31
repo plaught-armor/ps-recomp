@@ -1,9 +1,10 @@
 // The SIF link to the IOP, emulated at the sifcmd packet level.
 //
-// There is no IOP processor: DMA the EE sends to the IOP lands in an 8 MB
-// buffer, command packets addressed to the IOP's command buffer are handled
-// here, and replies are written into the EE's receive buffer followed by a
-// SIF0 DMAC interrupt, exactly as the real IOP's sifcmd would deliver them.
+// There is no IOP processor: DMA the EE sends to the IOP lands in IOP
+// memory (iop_mem), command packets addressed to the IOP's command buffer
+// are handled here, and replies are written into the EE's receive buffer
+// followed by a SIF0 DMAC interrupt, exactly as the real IOP's sifcmd would
+// deliver them.
 // RPC servers (loadfile, file I/O, CD, pad, ...) are implemented in Odin.
 package ps2_iop
 
@@ -15,9 +16,10 @@ import "ps:core/disc"
 import cpu "../cpu"
 import mem "../mem"
 
-IOP_RAM_SIZE :: 8 << 20
+IOP_RAM_SIZE :: 2 << 20 // the IOP's RAM, what IOP code sees
+IOP_SPACE :: 8 << 20 // IOP addresses the SIF reaches: RAM, then the HLE's own area
 IOP_CMDBUF :: 0x0001f000 // where the IOP receives command packets
-IOP_SERVERS :: 0x00100000 // fake server descriptors and receive buffers
+IOP_SERVERS :: IOP_RAM_SIZE // fake server descriptors and receive buffers, 0x10000 each
 
 SIF_CMD_CHANGE_SADDR :: 0x80000000
 SIF_CMD_SET_SREG :: 0x80000001
@@ -34,6 +36,14 @@ SIF_STAT_CMDINIT :: 0x20000
 SIF_STAT_BOOTEND :: 0x40000
 
 iop_ram: []u8
+
+// IOP addresses IOP_RAM_SIZE up to IOP_SPACE are a mirror of RAM on retail.
+// Here they hold the HLE's own memory instead: fake server descriptors and
+// their receive buffers, and fmod's heap. The EE DMAs into them like into
+// RAM. IOP code that read a mirror address through iop_mem would get this
+// HLE data, not RAM, so no IOP code may be handed one, and an IOP CPU must
+// wrap its own loads and stores to IOP_RAM_SIZE rather than use iop_mem.
+iop_hle: []u8
 
 // Host directory holding the disc's files; `cdrom0:\X;1` opens disc_dir/X.
 // After disc_image_open, the disc image is read in its place.
@@ -60,6 +70,7 @@ sif: struct {
 
 sif_init :: proc() {
 	iop_ram = core.snap_area(IOP_RAM_SIZE)
+	iop_hle = core.snap_area(IOP_SPACE - IOP_RAM_SIZE)
 	sif.smflg = SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND
 	sif.sreg[0] = IOP_CMDBUF // SIF_SYSREG_SUBADDR
 	sif.next_dma = 1
@@ -82,8 +93,16 @@ sif_init :: proc() {
 	sif.servers[0x90000200] = adx_server
 }
 
+// The bytes at IOP address a, wrapped to IOP_SPACE: at most n of them, cut
+// at the end of RAM or of the HLE area, whichever holds a.
+iop_mem :: #force_inline proc(a, n: u32) -> []u8 {
+	w := a & (IOP_SPACE - 1)
+	if w < IOP_RAM_SIZE {return iop_ram[w:][:min(n, IOP_RAM_SIZE - w)]}
+	return iop_hle[w - IOP_RAM_SIZE:][:min(n, IOP_SPACE - w)]
+}
+
 iop_u32 :: #force_inline proc(a: u32) -> ^u32 {
-	return (^u32)(&iop_ram[a & (IOP_RAM_SIZE - 4)])
+	return (^u32)(raw_data(iop_mem(a &~ 3, 4)))
 }
 
 sif_reg_read :: proc(o: u32) -> u32 {
@@ -156,9 +175,10 @@ sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 	for n in 0 ..< count {
 		e := list + n * 16
 		src, dest, size := mem.rd32(e), mem.rd32(e + 4), mem.rd32(e + 8)
-		d := dest & (IOP_RAM_SIZE - 1)
-		size = min(size, IOP_RAM_SIZE - d)
-		copy(iop_ram[d:][:size], mem.ram_slice(src, size))
+		d := dest & (IOP_SPACE - 1)
+		to := iop_mem(d, size)
+		size = u32(len(to))
+		copy(to, mem.ram_slice(src, size))
 		bytes += u64(size)
 		if cpu.debug == 2 {fmt.eprintfln("sif: dma %08x -> %08x size %x (%d/%d)", src, dest, size, n, count)}
 		if d == IOP_CMDBUF {sif_command(d, pc)}
@@ -224,7 +244,7 @@ sif_command :: proc(a, pc: u32) {
 		// SIF_SREG_RPCINIT (0), which the IOP sets with a SET_SREG packet.
 		sif_reply(SIF_CMD_SET_SREG, 0, {0, 1})
 	case SIF_CMD_RESET:
-		path := cstring(&iop_ram[a + 24])
+		path := cstring(raw_data(iop_mem(a + 24, IOP_SPACE)))
 		fmt.eprintfln("sif: IOP reset \"%s\"", path)
 		sif.loadfile_version = loadfile_version(string(path))
 		clear(&sif.bound)
@@ -251,7 +271,7 @@ sif_command :: proc(a, pc: u32) {
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		fno, send_size, receive, recv_size, server := arg(a, 4), arg(a, 5), arg(a, 6), arg(a, 7), arg(a, 9)
 		sid := iop_u32(server)^
-		buf := iop_ram[(server + 0x100) & (IOP_RAM_SIZE - 1):][:0xff00]
+		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
 		if !ok || !handler(fno, buf, send_size) {
 			sif_unknown(pc, .Sif_Rpc, sid, fno, client = client)
@@ -264,8 +284,7 @@ sif_command :: proc(a, pc: u32) {
 	case SIF_CMD_RPC_RDATA:
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		src, dest, size := arg(a, 4), arg(a, 5), arg(a, 6)
-		s := src & (IOP_RAM_SIZE - 1)
-		copy(mem.ram_slice(dest, size), iop_ram[s:][:min(size, IOP_RAM_SIZE - s)])
+		copy(mem.ram_slice(dest, size), iop_mem(src, size))
 		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_RDATA, 0, 0, 0})
 	case:
 		if cid & 0x80000000 == 0 {
@@ -375,7 +394,7 @@ romdir_file :: proc(img: []u8, name: string) -> (file: []u8, ok: bool) {
 @(private)
 irx_name :: proc(a: u32) -> string {
 	PT_SCE_IOPMOD :: 0x70000080
-	img := iop_ram[a & (IOP_RAM_SIZE - 1):]
+	img := iop_mem(a, IOP_SPACE)
 	if len(img) < 0x34 || string(img[:4]) != "\x7fELF" {return ""}
 	ph := (^u32)(&img[0x1c])^
 	if ph > u32(len(img)) - 8 || (^u32)(&img[ph])^ != PT_SCE_IOPMOD {return ""}
@@ -644,7 +663,7 @@ zero_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 // covers the alloc, copy, LoadModuleBuffer, free pattern of module loading;
 // other frees are ignored.
 IOP_HEAP_START :: 0x00040000
-IOP_HEAP_END :: IOP_SERVERS
+IOP_HEAP_END :: 0x00100000
 
 @(private = "file")
 iop_heap_top: u32 = IOP_HEAP_START

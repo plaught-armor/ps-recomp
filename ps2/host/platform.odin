@@ -170,7 +170,7 @@ vblank_frame :: proc() {
 	// heard, and unpaced.
 	rerun := core.net_resimulating()
 	if core.net_hash_due() {
-		core.net_hash(xxhash.XXH3_64_with_seed(iop.iop_ram, xxhash.XXH3_64_default(mem.ram)))
+		core.net_hash(xxhash.XXH3_64_with_seed(iop.iop_hle, xxhash.XXH3_64_with_seed(iop.iop_ram, xxhash.XXH3_64_default(mem.ram))))
 	}
 	audio_frame(!rerun)
 	gs.skip_present = rerun
@@ -216,6 +216,7 @@ vblank_frame :: proc() {
 			core.dump_put("cyc", "bin", u64(frame), ([^]u8)(&cyc)[:size_of(cyc)])
 			core.dump_put("ram", "bin", u64(frame), mem.ram)
 			core.dump_put("iop", "bin", u64(frame), iop.iop_ram)
+			core.dump_put("iophle", "bin", u64(frame), iop.iop_hle)
 		}
 	}
 	if net_on && vblank % 600 == 0 {print_net()}

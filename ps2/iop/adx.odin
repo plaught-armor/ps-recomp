@@ -144,7 +144,7 @@ adx_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		adx.handles += 1
 		for &t in adx.dtx {
 			if t.handle != 0 {continue}
-			t = {adx.handles, w[0], w[1], w[2] & (IOP_RAM_SIZE - 1), w[3]}
+			t = {adx.handles, w[0], w[1], w[2] & (IOP_SPACE - 1), w[3]}
 			break
 		}
 		w[0] = adx.handles
@@ -322,8 +322,8 @@ adx_rna_stop :: proc(i: int) {
 @(private)
 adx_ring_put :: proc(o: ^Adx_Out, ch: int, addr, size: u32) {
 	for n in 0 ..< size / 2 {
-		a := (addr + n * 2) & (IOP_RAM_SIZE - 2)
-		o.ring[ch][o.wr[ch] & (ADX_RING - 1)] = i16(u16(iop_ram[a]) | u16(iop_ram[a + 1]) << 8)
+		b := iop_mem((addr + n * 2) &~ 1, 2)
+		o.ring[ch][o.wr[ch] & (ADX_RING - 1)] = i16(u16(b[0]) | u16(b[1]) << 8)
 		o.wr[ch] += 1
 	}
 }

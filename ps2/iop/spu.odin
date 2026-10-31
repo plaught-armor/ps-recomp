@@ -399,12 +399,12 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		case SD_VA_NAX & 0xff00: r = v.nax
 		}
 	case 0x80d0: // sceSdVoiceTrans {channel, mode, IOP address, SPU address, size}
-		src, dst, size := w[3] & (IOP_RAM_SIZE - 1), w[4] & (SPU_RAM_SIZE - 1), w[5]
-		size = min(size, IOP_RAM_SIZE - src, SPU_RAM_SIZE - dst)
+		dst := w[4] & (SPU_RAM_SIZE - 1)
+		src := iop_mem(w[3], min(w[5], SPU_RAM_SIZE - dst))
 		if w[2] & 1 == 0 {
-			r = spu_write(dst, iop_ram[src:][:size])
+			r = spu_write(dst, src)
 		} else {
-			r = u32(copy(iop_ram[src:][:size], spu.ram[dst:][:size]))
+			r = u32(copy(src, spu.ram[dst:][:len(src)]))
 		}
 	case 0x80e0: // sceSdBlockTrans {channel, mode, IOP address, size, start address}
 		b := &spu.block[w[1] & 1]
