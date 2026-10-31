@@ -383,6 +383,12 @@ rfe :: proc() {
 	cop0.sr = (cop0.sr & ~u32(0xf)) | ((cop0.sr >> 2) & 0xf)
 }
 
+// ExitCriticalSection: interrupts on, and any pending one taken.
+exit_critical :: #force_inline proc() {
+	cop0.sr |= 0x401
+	irq_check()
+}
+
 // `syscall`: EnterCriticalSection (a0=1) and ExitCriticalSection (a0=2),
 // which the BIOS implements by editing SR, are done here; the BIOS does
 // the rest.
@@ -394,8 +400,7 @@ syscall :: proc(pc: u32) {
 		state.r[2] = (cop0.sr & 0x401) == 0x401 ? 1 : 0
 		cop0.sr &= ~u32(0x401)
 	case 2:
-		cop0.sr |= 0x401
-		irq_check()
+		exit_critical()
 	case 0:
 		// NoFunction
 	case:

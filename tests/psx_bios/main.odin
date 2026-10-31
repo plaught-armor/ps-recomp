@@ -28,6 +28,10 @@
 //   The memory card calls: card status, firstfile/nextfile patterns and the
 //   DIRENTRY, and lseek and read on whole frames. The card images live in
 //   memory only: their paths name a directory that does not exist.
+//   LoadTest and Load copy an executable's header off the disc, Load its
+//   text too, and give 0 for a short, missing or memory card file; Exec
+//   clears the BSS in whole words, runs the program on its stack and gp,
+//   and puts the caller's registers back from the save area.
 //   A 00-09 and 3B-3E called through the A0 vector run the B functions
 //   AdjustA0Table puts there: A(03h) write and A(3Eh) puts.
 //   hangs_on_retail names the stubs that never return on retail, and no
@@ -72,6 +76,8 @@ FN_SECOND_RFE :: 0x80001300 // second(): ReturnFromException
 FN_FIRST_LATE :: 0x80001400 // first() of a later chain: counts, returns 0
 @(private = "file")
 FN_HOOK :: 0x80001500 // the HookEntryInt handler: counts
+@(private = "file")
+FN_EXEC :: 0x80001600 // an executable's pc0: records its registers, returns 7
 
 // HookEntryInt jump buffer, and the setjmp return site it holds: a jal to
 // FN_HOOK.
@@ -100,6 +106,14 @@ PAD_BUF :: 0x2110
 @(private = "file")
 CONF_BUF :: 0x2200
 
+// An executable's exec header, and its text and BSS.
+@(private = "file")
+EXEC_HDR :: 0x6400
+@(private = "file")
+EXEC_TEXT :: 0x80007000
+@(private = "file")
+EXEC_BSS :: 0x80007100
+
 // Card file name, DIRENTRY and read buffer.
 @(private = "file")
 CARD_NAME :: 0x6000
@@ -111,6 +125,26 @@ CARD_BUF :: 0x6200
 @(private = "file")
 calls: struct {
 	callback, second, late, hook: int,
+}
+
+// FN_EXEC's a0, a1, sp, fp and gp.
+@(private = "file")
+exec_regs: [5]u32
+
+// An executable for the loaders: pc0 FN_EXEC, 16 bytes of text and a BSS of 6
+// bytes, and a word in each of the save area's slots.
+@(private = "file")
+exec_file :: proc(allocator := context.allocator) -> []u8 {
+	f := make([]u8, 0x810, allocator)
+	copy(f, "PS-X EXE")
+	words := [?]u32{FN_EXEC, 0x80009000, EXEC_TEXT, 0x10, 0, 0, EXEC_BSS, 6, 0x80007f00, 0x80, 1, 2, 3, 4, 5}
+	for w, k in words {
+		(^u32le)(&f[0x10 + 4 * k])^ = u32le(w)
+	}
+	for k in 0 ..< 0x10 {
+		f[0x800 + k] = u8(0xa0 + k)
+	}
+	return f
 }
 
 // Vblanks until the waited-for event is delivered.
@@ -223,6 +257,12 @@ main :: proc() {
 					cpu.state.r[2] = 0
 				}},
 			{FN_HOOK, proc() {calls.hook += 1}},
+			{FN_EXEC, proc() {
+					r := &cpu.state.r
+					exec_regs = {r[4], r[5], r[29], r[30], r[28]}
+					r[16], r[28], r[29], r[30], r[31] = 0, 0, 0, 0, 0
+					r[2] = 7
+				}},
 		},
 	)
 	io.deliver_irq = bios.deliver_irq
@@ -633,6 +673,55 @@ main :: proc() {
 		fail("A(3Eh) did not reach B(3Fh); trace: %s", strings.to_string(core.trace.buf))
 	}
 
+	// LoadTest and Load read the disc only: the header's 0x3c bytes (the
+	// save area's slots too), and with Load the text; a file shorter than its
+	// 0x800-byte header, a missing one or another device's is 0.
+	bios.disc_file = proc(path: string, allocator := context.allocator) -> ([]u8, bool) {
+		switch path {
+		case "cdrom:\\GOOD.EXE;1", "GOOD.EXE":
+			return exec_file(allocator), true
+		case "cdrom:\\SHORT.EXE;1":
+			f := exec_file(allocator)
+			return f[:0x7ff], true
+		}
+		return nil, false
+	}
+	for k in u32(0) ..< 0x10 {
+		cpu.w8(EXEC_TEXT + k, 0xff)
+		cpu.w8(EXEC_BSS + k, 0xff)
+	}
+	check("LoadTest", a(0x41, guest_string("cdrom:\\GOOD.EXE;1"), EXEC_HDR), 1)
+	want_hdr := [?]u32{FN_EXEC, 0x80009000, EXEC_TEXT, 0x10, 0, 0, EXEC_BSS, 6, 0x80007f00, 0x80, 1, 2, 3, 4, 5}
+	for w, k in want_hdr {
+		check(fmt.tprintf("LoadTest header word %d", k), cpu.r32(EXEC_HDR + 4 * u32(k)), w)
+	}
+	check("text after LoadTest", cpu.r32(EXEC_TEXT), 0xffffffff)
+	check("Load", a(0x42, guest_string("GOOD.EXE"), EXEC_HDR), 1)
+	check("text after Load", cpu.r32(EXEC_TEXT + 0xc), 0xafaeadac)
+	check("LoadTest of a short file", a(0x41, guest_string("cdrom:\\SHORT.EXE;1"), EXEC_HDR), 0)
+	check("Load of a missing file", a(0x42, guest_string("cdrom:\\NONE.EXE;1"), EXEC_HDR), 0)
+	check("Load from a memory card", a(0x42, guest_string("bu00:GOOD.EXE"), EXEC_HDR), 0)
+
+	// Exec clears the BSS in whole words (6 bytes clear 8), sets sp and fp
+	// from s_addr and s_size and gp from gp0, calls pc0 with argc and argv,
+	// and returns 1 with sp, fp, gp, ra and s0 back from the save area.
+	r := &cpu.state.r
+	r[16], r[28], r[29], r[30], r[31] = 0x16, 0x28, 0x801ffe00, 0x30, 0x31
+	check("Exec", a(0x43, EXEC_HDR, 2, 0x80006000), 1)
+	check("argc", exec_regs[0], 2)
+	check("argv", exec_regs[1], 0x80006000)
+	check("sp in the program", exec_regs[2], 0x80007f80)
+	check("fp in the program", exec_regs[3], 0x80007f80)
+	check("gp in the program", exec_regs[4], 0x80009000)
+	check("s0 after Exec", r[16], 0x16)
+	check("gp after Exec", r[28], 0x28)
+	check("sp after Exec", r[29], 0x801ffe00)
+	check("fp after Exec", r[30], 0x30)
+	check("ra after Exec", r[31], 0x31)
+	check("BSS words", cpu.r32(EXEC_BSS) | cpu.r32(EXEC_BSS + 4), 0)
+	check("past the BSS", cpu.r32(EXEC_BSS + 8), 0xffffffff)
+	check("Exec depth after the return", u32(bios.exec_state.depth), 0)
+
 	// Hang stubs, and numbers on either side of each table's range of them.
 	hang_cases := [?]struct {
 		table: string,
@@ -665,5 +754,5 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, hang stubs")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, hang stubs")
 }

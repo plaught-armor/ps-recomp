@@ -162,12 +162,18 @@ bios_a :: proc(fn: u32) {
 		ret(libc.realloc(arg(0), arg(1)))
 	case 0x39:
 		libc.init_heap(arg(0), arg(1))
+	case 0x41, 0x42:
+		ret(exec_load(cpu.mem_cstring(arg(0)), arg(1), fn == 0x42))
+	case 0x43:
+		exec(arg(0), arg(1), arg(2))
 	case 0x44, 0x72:
 	// FlushCache, CdRemove: nothing to do.
 	case 0x3f:
 		fmt.eprint("[printf] ", bios_format(cpu.mem_cstring(arg(0)), 1), sep = "")
 	case 0x49:
 		gp0_write(arg(0))
+	case 0x51:
+		load_exec(cpu.mem_cstring(arg(0)), arg(1), arg(2))
 	case 0x70:
 		ret(1) // _bu_init
 	case 0x9c:

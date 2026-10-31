@@ -82,6 +82,7 @@ run :: proc(b: Boot) -> bool {
 	io.timers_init()
 	io.dma_init()
 	bios.bios_init()
+	bios.exec_boot(exe)
 	if b.cards != {} {bios.card_files = b.cards}
 	bios.memcard_init() or_return
 

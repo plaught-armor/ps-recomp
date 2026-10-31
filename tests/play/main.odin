@@ -18,7 +18,12 @@
 //   not a disc gives one compat.tsv row per disc (ok, ok with the call
 //   stubbed, fatal) and skips the file; the looping PS1 disc run again
 //   with a vblank count it cannot reach in COMPAT_WAIT is a hang, and once
-//   more to FRAMES ok, each time in place.
+//   more to FRAMES ok, each time in place. Three PS1 discs load a second
+//   executable no native code covers: LoadExec of it, over the boot
+//   executable, checks its argc, stack and BSS; LoadExec of a missing file
+//   runs the boot executable again; Load and Exec of it return to the boot
+//   executable with its registers. The second executable's entry is in the
+//   row's entries.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -89,15 +94,43 @@ main :: proc() {
 // the code given.
 @(private = "file")
 exe :: proc(code: ..u32) -> []u8 {
-	e := make([]u8, 0x1000, context.temp_allocator)
+	return exe_at({code = code})
+}
+
+// A PS-X EXE's layout: the header fields, the code at pc and a string at
+// text + EXE_DATA.
+@(private = "file")
+Exe :: struct {
+	pc, text, size: u32,
+	bss:            [2]u32, // address, size
+	code:           []u32,
+	data:           string,
+}
+
+@(private = "file")
+EXE_DATA :: 0x400
+
+@(private = "file")
+exe_at :: proc(x: Exe) -> []u8 {
+	x := x
+	if x.text == 0 {
+		x.text, x.pc, x.size = 0x80010000, 0x80010000, 0x800
+	}
+	e := make([]u8, 0x800 + x.size, context.temp_allocator)
 	copy(e, "PS-X EXE")
-	endian.put_u32(e[0x10:], .Little, 0x80010000) // pc
-	endian.put_u32(e[0x18:], .Little, 0x80010000) // text address
-	endian.put_u32(e[0x1c:], .Little, 0x800) // text size
+	endian.put_u32(e[0x10:], .Little, x.pc)
+	endian.put_u32(e[0x18:], .Little, x.text)
+	endian.put_u32(e[0x1c:], .Little, x.size)
+	endian.put_u32(e[0x28:], .Little, x.bss[0])
+	endian.put_u32(e[0x2c:], .Little, x.bss[1])
 	endian.put_u32(e[0x30:], .Little, 0x801ffff0) // sp
-	endian.put_u32(e[0x800:], .Little, 0x1000ffff)
-	for w, k in code {
-		endian.put_u32(e[0x800 + 4 * k:], .Little, w)
+	at := int(0x800 + x.pc - x.text)
+	endian.put_u32(e[at:], .Little, 0x1000ffff)
+	for w, k in x.code {
+		endian.put_u32(e[at + 4 * k:], .Little, w)
+	}
+	if x.data != "" {
+		copy(e[0x800 + EXE_DATA:], x.data)
 	}
 	return e
 }
@@ -107,6 +140,92 @@ exe :: proc(code: ..u32) -> []u8 {
 cnf_disc :: proc(extra := "", code: ..u32) -> []u8 {
 	cnf := strings.concatenate({"BOOT = cdrom:\\DATA\\PSX.EXE;1\n", extra}, context.temp_allocator)
 	return discimg.make_iso(cnf, sub_name = "PSX.EXE;1", sub = string(exe(..code)))
+}
+
+// A disc whose boot executable is boot and, with code, DATA/SECOND.EXE second.
+@(private = "file")
+exec_disc :: proc(boot: Exe, second: Exe = {}) -> []u8 {
+	sub2 := len(second.code) > 0 ? string(exe_at(second)) : ""
+	cnf :: "BOOT = cdrom:\\DATA\\PSX.EXE;1\n"
+	return discimg.make_iso(cnf, sub_name = "PSX.EXE;1", sub = string(exe_at(boot)), sub2_name = sub2 != "" ? "SECOND.EXE;1" : "", sub2 = sub2)
+}
+
+@(private = "file")
+SECOND :: "cdrom:\\DATA\\SECOND.EXE;1"
+@(private = "file")
+BOOT_DATA :: 0x80010000 + EXE_DATA
+
+// LoadExec(SECOND, 0x801ff000, 0x100) after a pattern in the words at 0x704
+// and 0x708 past the text. SECOND loads over the boot text and starts at
+// 0x80010100, which no native code covers; its BSS of 0x106 bytes at 0x600
+// clears whole words, 0x108 bytes. It checks argc, the stack and the BSS's
+// last word cleared and the next one not, then loops; any check failing runs
+// a reserved instruction.
+@(private = "file")
+loadexec_disc :: proc() -> []u8 {
+	pat := la(T0, 0x80010704)
+	path := la(A0, BOOT_DATA)
+	stack := la(A1, 0x801ff000)
+	fill := la(S0, 0x5a5a5a5a)
+	boot := [?]u32 {
+		pat[0], pat[1], fill[0], fill[1], sw(S0, 0, T0), sw(S0, 4, T0),
+		path[0], path[1], stack[0], stack[1], li(A2, 0x100),
+		li(T1, 0x51), JAL_A0, NOP,
+		LOOP, NOP,
+	}
+	sp := la(T0, 0x801ff100)
+	second := [?]u32 {
+		li(T0, 1), bne(A0, T0, 17), NOP, // 0
+		sp[0], sp[1], bne(SP, T0, 13), NOP, // 3
+		pat[0], pat[1], lw(T1, 0, T0), NOP, bne(T1, 0, 7), NOP, // 7
+		lw(T1, 4, T0), NOP, beq(T1, 0, 3), NOP, // 13
+		LOOP, NOP, // 17
+		RESERVED, // 19
+	}
+	return exec_disc(
+		{code = boot[:], data = SECOND},
+		{pc = 0x80010100, text = 0x80010000, size = 0x600, bss = {0x80010600, 0x106}, code = second[:]},
+	)
+}
+
+// The word at 0x80100000 0: it is set to 1 and LoadExec of a missing file
+// runs the boot executable again, which finds it 1 and loops. The word is
+// outside the boot executable's text and BSS, which the run again copies and
+// clears.
+@(private = "file")
+loadexec_missing_disc :: proc() -> []u8 {
+	path := la(A0, BOOT_DATA)
+	boot := [?]u32 {
+		lui(T0, 0x8010), lw(T1, 0, T0), NOP, bne(T1, 0, 10), NOP, // 0
+		li(S0, 1), sw(S0, 0, T0), path[0], path[1], li(A1, 0), li(A2, 0), // 5
+		li(T1, 0x51), JAL_A0, NOP, // 11
+		LOOP, NOP, // 14
+	}
+	return exec_disc({code = boot[:], data = "cdrom:\\DATA\\NONE.EXE"})
+}
+
+// Load(SECOND, hdr) and Exec(hdr, 1, 0) each return 1, and s0, sp and gp are
+// what they were before; SECOND, at 0x80020000 clear of the boot text, checks
+// argc and returns 7. Any check failing runs a reserved instruction.
+@(private = "file")
+load_exec_disc :: proc() -> []u8 {
+	s0 := la(S0, 0x12345678)
+	path := la(A0, BOOT_DATA)
+	hdr := la(A1, BOOT_DATA + 0x100)
+	hdr0 := la(A0, BOOT_DATA + 0x100)
+	t0 := la(T0, 0x12345678)
+	boot := [?]u32 {
+		s0[0], s0[1], move(S1, SP), move(S2, GP), // 0
+		path[0], path[1], hdr[0], hdr[1], li(T1, 0x42), JAL_A0, NOP, // 4
+		li(T0, 1), bne(V0, T0, 21), NOP, // 11
+		hdr0[0], hdr0[1], li(A1, 1), li(A2, 0), li(T1, 0x43), JAL_A0, NOP, // 14
+		li(T0, 1), bne(V0, T0, 11), NOP, // 21
+		t0[0], t0[1], bne(S0, T0, 7), NOP, bne(SP, S1, 5), NOP, bne(GP, S2, 3), NOP, // 24
+		LOOP, NOP, // 32
+		RESERVED, // 34
+	}
+	second := [?]u32{li(T0, 1), bne(A0, T0, 3), NOP, JR_RA, li(V0, 7), RESERVED}
+	return exec_disc({code = boot[:], data = SECOND}, {pc = 0x80020000, text = 0x80020000, size = 0x100, code = second[:]})
 }
 
 // A PS2 ELF: one segment, and one .text section for the recompiler, of
@@ -313,19 +432,24 @@ test_compat :: proc() {
 		result: string,
 		status: string,
 		unimpl: string,
+		entry:  string, // in the row's entries, with interp_insns > 0
+		log:    string, // in compat.log
 	}
 	fixtures := [?]Fixture {
-		{"loop.iso", cnf_disc(), "ps1", "ok", "0", ""},
+		{"loop.iso", cnf_disc(), "ps1", "ok", "0", "", "", ""},
 		// li t1, 0xff; jal 0xa0; nop; b .; nop: BIOS A(ffh), then loop.
-		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ps1", "ok", "0", "BIOS A(ffh)=1"},
+		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ps1", "ok", "0", "BIOS A(ffh)=1", "", ""},
 		// Opcode 0x3f is reserved.
-		{"fatal.iso", cnf_disc("", 0xfc000000), "ps1", "fatal", "1", ""},
-		{"ps2_loop.iso", ps2_disc(), "ps2", "ok", "0", ""},
+		{"fatal.iso", cnf_disc("", 0xfc000000), "ps1", "fatal", "1", "", "", ""},
+		{"ps2_loop.iso", ps2_disc(), "ps2", "ok", "0", "", "", ""},
 		// li v1, 1; syscall; b .; nop: ResetEE, which only the retail ROM
 		// has (checked below), then loop.
-		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "ok", "0", "syscall 1=1"},
+		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "ok", "0", "syscall 1=1", "", ""},
 		// Opcode 0x3b is not an EE instruction.
-		{"ps2_fatal.iso", ps2_disc(0xec000000), "ps2", "fatal", "1", ""},
+		{"ps2_fatal.iso", ps2_disc(0xec000000), "ps2", "fatal", "1", "", "", ""},
+		{"loadexec.iso", loadexec_disc(), "ps1", "ok", "0", "", "80010100:", ""},
+		{"loadexec_missing.iso", loadexec_missing_disc(), "ps1", "ok", "0", "", "", "running the boot executable again"},
+		{"load_exec.iso", load_exec_disc(), "ps1", "ok", "0", "", "80020000:", ""},
 	}
 	// ps2_stub needs a syscall the HLE lacks that stops a run outside
 	// COMPAT; one the kernel implements stubs nothing.
@@ -364,6 +488,9 @@ test_compat :: proc() {
 		check(name, row[.System] == f.system && row[.Frames_Wanted] == fmt.tprint(FRAMES), what)
 		check(name, row[.Vmode] == (f.system == "ps2" ? "NTSC" : ""), what)
 		check(name, row[.Native] == "yes" && row[.Build] == "test", what)
+		if f.entry != "" {
+			check(name, strings.contains(row[.Entries], f.entry) && row[.Interp_Insns] != "0", what)
+		}
 		if f.result == "ok" {
 			check(name, row[.Frames] == fmt.tprint(FRAMES), what)
 		} else {
@@ -372,6 +499,7 @@ test_compat :: proc() {
 		if ddir, has := core.disc_dir(ids[k], context.temp_allocator); has {
 			log, err := os.read_entire_file(core.disc_path(ddir, .Compat_Log, context.temp_allocator), context.temp_allocator)
 			check(name, err == nil && len(log) > 0, fmt.tprintf("%s: the child's output is not in compat.log (%v)", f.file, err))
+			check(name, strings.contains(string(log), f.log), fmt.tprintf("%s: %q not in compat.log", f.file, f.log))
 		}
 		if k == 0 {
 			first_when = row[.When]
@@ -474,3 +602,58 @@ compat_row :: proc(rows: []play.Row, id: string) -> (play.Row, bool) {
 	}
 	return {}, false
 }
+
+// MIPS encodings for the hand-built executables.
+@(private = "file")
+V0 :: 2
+@(private = "file")
+A0 :: 4
+@(private = "file")
+A1 :: 5
+@(private = "file")
+A2 :: 6
+@(private = "file")
+T0 :: 8
+@(private = "file")
+T1 :: 9
+@(private = "file")
+S0 :: 16
+@(private = "file")
+S1 :: 17
+@(private = "file")
+S2 :: 18
+@(private = "file")
+GP :: 28
+@(private = "file")
+SP :: 29
+@(private = "file")
+NOP :: 0
+@(private = "file")
+LOOP :: 0x1000ffff // b .
+@(private = "file")
+RESERVED :: 0xfc000000 // opcode 0x3f
+@(private = "file")
+JAL_A0 :: 0x0c000028
+@(private = "file")
+JR_RA :: 0x03e00008
+
+@(private = "file")
+lui :: proc(rt, imm: u32) -> u32 {return 0x3c000000 | rt << 16 | imm}
+@(private = "file")
+ori :: proc(rt, rs, imm: u32) -> u32 {return 0x34000000 | rs << 21 | rt << 16 | imm}
+@(private = "file")
+li :: proc(rt, imm: u32) -> u32 {return 0x24000000 | rt << 16 | imm}
+@(private = "file")
+lw :: proc(rt, off, base: u32) -> u32 {return 0x8c000000 | base << 21 | rt << 16 | off}
+@(private = "file")
+sw :: proc(rt, off, base: u32) -> u32 {return 0xac000000 | base << 21 | rt << 16 | off}
+@(private = "file")
+move :: proc(rd, rs: u32) -> u32 {return rs << 21 | rd << 11 | 0x21}
+// Branches to the instruction `to` words after the one after the branch.
+@(private = "file")
+beq :: proc(rs, rt, to: u32) -> u32 {return 0x10000000 | rs << 21 | rt << 16 | to}
+@(private = "file")
+bne :: proc(rs, rt, to: u32) -> u32 {return 0x14000000 | rs << 21 | rt << 16 | to}
+// rt = the 32-bit value.
+@(private = "file")
+la :: proc(rt, v: u32) -> [2]u32 {return {lui(rt, v >> 16), ori(rt, rt, v & 0xffff)}}

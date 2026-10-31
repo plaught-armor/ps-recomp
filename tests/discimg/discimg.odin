@@ -10,7 +10,8 @@ import "ps:core/disc"
 // The volume: PVD at 16, its terminator at 17, the root at 20, DATA at 21,
 // SYSTEM.CNF at 22, Big.Bin at 23 .. 25, DATA/Sub.Txt at 26; 27 and 28 are
 // left out of every file, and 27 is Form 2 in the Mode 2 image. A sub file
-// (make_iso's sub) over one sector runs on into 27 and 28.
+// (make_iso's sub) over one sector runs on into 27 and 28. A second file in
+// DATA (make_iso's sub2) starts at VOLUME and makes the volume longer.
 VOLUME :: 29
 BIG :: 5000
 SUB :: "sub file!\n"
@@ -41,13 +42,21 @@ record :: proc(b: []u8, lba, size: int, dir: bool, name: string) -> int {
 	return n
 }
 
-make_iso :: proc(cnf: string, cnf_name := "SYSTEM.CNF;1", sub_name := "Sub.Txt;1", sub := SUB) -> []u8 {
+make_iso :: proc(
+	cnf: string,
+	cnf_name := "SYSTEM.CNF;1",
+	sub_name := "Sub.Txt;1",
+	sub := SUB,
+	sub2_name := "",
+	sub2 := "",
+) -> []u8 {
 	assert(len(sub) <= (VOLUME - 26) * disc.DATA)
-	img := make([]u8, VOLUME * disc.DATA)
+	volume := VOLUME + (len(sub2) + disc.DATA - 1) / disc.DATA
+	img := make([]u8, volume * disc.DATA)
 	pvd := sector(img, 16)
 	pvd[0], pvd[6] = 1, 1
 	copy(pvd[1:6], "CD001")
-	put32(pvd[80:], VOLUME)
+	put32(pvd[80:], volume)
 	record(pvd[156:190], 20, disc.DATA, true, "\x00")
 	term := sector(img, 17)
 	term[0] = 255
@@ -61,7 +70,11 @@ make_iso :: proc(cnf: string, cnf_name := "SYSTEM.CNF;1", sub_name := "Sub.Txt;1
 	sub_dir := sector(img, 21)
 	at = record(sub_dir, 21, disc.DATA, true, "\x00")
 	at += record(sub_dir[at:], 20, disc.DATA, true, "\x01")
-	record(sub_dir[at:], 26, len(sub), false, sub_name)
+	at += record(sub_dir[at:], 26, len(sub), false, sub_name)
+	if sub2_name != "" {
+		record(sub_dir[at:], VOLUME, len(sub2), false, sub2_name)
+		copy(img[VOLUME * disc.DATA:], sub2)
+	}
 	copy(sector(img, 22), cnf)
 	for i in 0 ..< BIG {
 		img[23 * disc.DATA + i] = big_byte(i)

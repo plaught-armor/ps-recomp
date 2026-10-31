@@ -2,6 +2,7 @@
 // variables; this sets them all before anything runs.
 package psx
 
+import "ps:core/disc"
 import bios "bios"
 import cpu "cpu"
 import gpu "gpu"
@@ -32,6 +33,9 @@ hooks_init :: proc "contextless" () {
 	}
 	bios.pad_rumble = host.pad_rumble
 	bios.gp0_write = gpu.gp0_write
+	bios.disc_file = proc(path: string, allocator := context.allocator) -> ([]u8, bool) {
+		return disc.read_file(spu.disc_image(), path, allocator)
+	}
 	io.event_handlers = event_handler_table
 	io.dma_channels = dma_channel_table
 	spu.platform_audio = host.platform_audio
