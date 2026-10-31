@@ -359,66 +359,112 @@ spu_voice_status :: proc(core, voice: int) -> Spu_Status {
 	return {on = v.on, endx = v.endx, envx = u16(v.level), nax = v.nax, lsax = v.lsa}
 }
 
+// libsd's calls on the voices, as both of its front ends take them: sdrdrv
+// over RPC (sdr_server) and libsd as an IOP module imports it (libsd.odin).
+// The id names core and voice in its low bits. Those that return a bool say
+// whether they decoded the id; one they do not changes nothing.
+
+// sceSdInit: every voice off and cleared.
+sd_init :: proc() {
+	for &core in spu.voice {for &v in core {v = {}}}
+}
+
+// sceSdSetParam(id, value) for a voice's VOLL, VOLR, PITCH, ADSR1, ADSR2.
+sd_set_param :: proc(id, value: u32) -> bool {
+	v := spu_voice(id)
+	switch id & 0xff00 {
+	case SD_VP_VOLL: v.voll = spu_volume(value)
+	case SD_VP_VOLR: v.volr = spu_volume(value)
+	case SD_VP_PITCH: v.pitch = spu_pitch(value)
+	case SD_VP_ADSR1: v.adsr1 = value & 0xffff
+	case SD_VP_ADSR2: v.adsr2 = value & 0xffff
+	case: return false
+	}
+	return true
+}
+
+// sceSdSetSwitch(id, voice mask) for KON and KOFF.
+sd_set_switch :: proc(id, mask: u32) -> bool {
+	switch id & 0xff00 {
+	case SD_S_KON, SD_S_KOFF:
+	case: return false
+	}
+	core := &spu.voice[id & 1]
+	for i in 0 ..< 24 {
+		if mask & (1 << u32(i)) == 0 {continue}
+		switch id & 0xff00 {
+		case SD_S_KON: spu_start(&core[i])
+		case SD_S_KOFF: core[i].phase = .Release
+		}
+	}
+	return true
+}
+
+// sceSdSetAddr(id, address) for a voice's SSA and LSAX.
+sd_set_addr :: proc(id, addr: u32) -> bool {
+	v := spu_voice(id)
+	switch id & 0xff00 {
+	case SD_VA_SSA & 0xff00: v.ssa = addr & (SPU_RAM_SIZE - 16)
+	case SD_VA_LSAX & 0xff00: v.lsa = addr & (SPU_RAM_SIZE - 16)
+	case: return false
+	}
+	return true
+}
+
+// sceSdGetAddr(id) for a voice's SSA, LSAX and NAX.
+sd_get_addr :: proc(id: u32) -> (u32, bool) {
+	v := spu_voice(id)
+	switch id & 0xff00 {
+	case SD_VA_SSA & 0xff00: return v.ssa, true
+	case SD_VA_LSAX & 0xff00: return v.lsa, true
+	case SD_VA_NAX & 0xff00: return v.nax, true
+	}
+	return 0, false
+}
+
+// sceSdVoiceTrans(channel, mode, IOP address, SPU address, size), done at
+// once: bit 0 of mode reads sound RAM back. The bytes moved.
+sd_voice_trans :: proc(mode, iop_addr, spu_addr, size: u32) -> u32 {
+	dst := spu_addr & (SPU_RAM_SIZE - 1)
+	src := iop_mem(iop_addr, min(size, SPU_RAM_SIZE - dst))
+	if mode & 1 == 0 {return spu_write(dst, src)}
+	return u32(copy(src, spu.ram[dst:][:len(src)]))
+}
+
+// sceSdBlockTrans(channel, mode, IOP address, size, start address). A stop
+// returns where it read; a start returns 0.
+sd_block_trans :: proc(channel, mode, addr, size, start: u32) -> u32 {
+	b := &spu.block[channel & 1]
+	if mode & 3 == SD_TRANS_STOP {
+		r := sdr_block_pos(b)
+		b.start, b.on = r - b.base, false
+		return r
+	}
+	b^ = {base = addr, size = size, cycles = cpu.state.cycles, loop = mode & SD_BLOCK_LOOP != 0, on = true}
+	if mode & 3 == SD_TRANS_START_AT && start - addr < size {b.start = start - addr}
+	return 0
+}
+
+// sceSdBlockTransStatus(channel, flag): where it reads now, 24 bits.
+sd_block_status :: proc(channel: u32) -> u32 {
+	return sdr_block_pos(&spu.block[channel & 1]) & 0xffffff
+}
+
 // sdrdrv: {?, args...} in, the result in the first word out.
 @(private)
 sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	r: u32 = 0
 	switch fno {
-	case 0x8000: // sceSdInit
-		for &core in spu.voice {for &v in core {v = {}}}
-	case 0x8010: // sceSdSetParam {id, value}
-		v := spu_voice(w[1])
-		switch w[1] & 0xff00 {
-		case SD_VP_VOLL: v.voll = spu_volume(w[2])
-		case SD_VP_VOLR: v.volr = spu_volume(w[2])
-		case SD_VP_PITCH: v.pitch = spu_pitch(w[2])
-		case SD_VP_ADSR1: v.adsr1 = w[2] & 0xffff
-		case SD_VP_ADSR2: v.adsr2 = w[2] & 0xffff
-		}
-	case 0x8030: // sceSdSetSwitch {id, voice mask}
-		core := &spu.voice[w[1] & 1]
-		for i in 0 ..< 24 {
-			if w[2] & (1 << u32(i)) == 0 {continue}
-			switch w[1] & 0xff00 {
-			case SD_S_KON: spu_start(&core[i])
-			case SD_S_KOFF: core[i].phase = .Release
-			}
-		}
-	case 0x8050: // sceSdSetAddr {id, address}
-		v := spu_voice(w[1])
-		switch w[1] & 0xff00 {
-		case SD_VA_SSA & 0xff00: v.ssa = w[2] & (SPU_RAM_SIZE - 16)
-		case SD_VA_LSAX & 0xff00: v.lsa = w[2] & (SPU_RAM_SIZE - 16)
-		}
-	case 0x8060: // sceSdGetAddr {id}
-		v := spu_voice(w[1])
-		switch w[1] & 0xff00 {
-		case SD_VA_SSA & 0xff00: r = v.ssa
-		case SD_VA_LSAX & 0xff00: r = v.lsa
-		case SD_VA_NAX & 0xff00: r = v.nax
-		}
-	case 0x80d0: // sceSdVoiceTrans {channel, mode, IOP address, SPU address, size}
-		dst := w[4] & (SPU_RAM_SIZE - 1)
-		src := iop_mem(w[3], min(w[5], SPU_RAM_SIZE - dst))
-		if w[2] & 1 == 0 {
-			r = spu_write(dst, src)
-		} else {
-			r = u32(copy(src, spu.ram[dst:][:len(src)]))
-		}
-	case 0x80e0: // sceSdBlockTrans {channel, mode, IOP address, size, start address}
-		b := &spu.block[w[1] & 1]
-		if w[2] & 3 == SD_TRANS_STOP {
-			r = sdr_block_pos(b)
-			b.start, b.on = r - b.base, false
-			break
-		}
-		b^ = {base = w[3], size = w[4], cycles = cpu.state.cycles, loop = w[2] & SD_BLOCK_LOOP != 0, on = true}
-		if w[2] & 3 == SD_TRANS_START_AT && w[5] - w[3] < w[4] {b.start = w[5] - w[3]}
-	case 0x80f0: // sceSdVoiceTransStatus {channel, flag}: always complete
-		r = 1
-	case 0x8100: // sceSdBlockTransStatus {channel, flag}: where it reads now
-		r = sdr_block_pos(&spu.block[w[1] & 1]) & 0xffffff
+	case 0x8000: sd_init()
+	case 0x8010: sd_set_param(w[1], w[2])
+	case 0x8030: sd_set_switch(w[1], w[2])
+	case 0x8050: sd_set_addr(w[1], w[2])
+	case 0x8060: r, _ = sd_get_addr(w[1])
+	case 0x80d0: r = sd_voice_trans(w[2], w[3], w[4], w[5])
+	case 0x80e0: r = sd_block_trans(w[1], w[2], w[3], w[4], w[5])
+	case 0x80f0: r = 1 // sceSdVoiceTransStatus {channel, flag}: always complete
+	case 0x8100: r = sd_block_status(w[1])
 	case:
 		if cpu.debug >= 1 {fmt.eprintfln("sdr: unhandled fno %x", fno)}
 	}
