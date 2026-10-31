@@ -902,6 +902,7 @@ call_handler :: proc(fn, gp, a0, a1, a2: u32) -> u32 {
 update_next_event :: proc() {
 	n := min(k.vblank_start, k.vblank_end)
 	for a in k.alarms {n = min(n, a.deadline)}
+	for t in mem.timer_next {n = min(n, t)}
 	cpu.next_event = n
 }
 
@@ -945,6 +946,7 @@ run_events :: proc() {
 			n += 1
 		}
 	}
+	mem.timer_events(now)
 	deliver_interrupts()
 
 	cpu.in_interrupt = false

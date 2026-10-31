@@ -54,6 +54,11 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 		o := a & 0xffff
 		w := u32(v)
 		switch o &~ 3 {
+		case 0x0000 ..= 0x183c:
+			if o & 0x7cf == 0 { // T_COUNT, T_MODE, T_COMP, T_HOLD
+				mem.timer_write(o >> 11, o & 0x30, w)
+				return
+			}
 		case 0xe010:
 			mem.dmac_stat &~= w & 0xffff
 			mem.dmac_stat ~= w & 0xffff0000

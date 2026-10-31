@@ -13,7 +13,10 @@
 // size's worth of cycles after SifSetDma, then done, and an older id or a
 // failed set's 0 as done. LOADFILE's version handshake answers with the
 // version in the LOADFILE of the IOPRP image an IOP reset loads, and "3000"
-// with no image or no version in it.
+// with no image or no version in it. The EE timers fire their compare and
+// overflow events at the cycle the count gets there, raising their INTC only
+// when the flag was clear; a flag clears where T_MODE is written 1, and
+// T_ZRET resets the count at compare.
 package main
 
 import "core:fmt"
@@ -184,6 +187,72 @@ loadelf_call :: proc(path, section: string) -> [4]u32 {
 untouched :: proc(a, n: u32) -> bool {
 	for b in mem.ram[a:][:n] {if b != FILL {return false}}
 	return true
+}
+
+timer_test :: proc() {
+	CUE :: mem.T_CUE
+	CMPE :: mem.T_CMPE
+	OVFE :: mem.T_OVFE
+	ZRET :: mem.T_ZRET
+	mode :: proc(n: u32) -> u32 {return mem.hw_reg(0x800 * n + 0x10)^}
+	at :: proc(c: u64) {
+		cpu.state.cycles = c
+		mem.timer_events(c)
+	}
+	c0 := cpu.state.cycles
+	mem.intc_stat = 0
+
+	// Timer 0, bus clock (2 cycles a tick): compare at count 100.
+	mem.timer_write(0, 0x00, 0)
+	mem.timer_write(0, 0x20, 100)
+	mem.timer_write(0, 0x10, CUE | CMPE)
+	if mem.timer_next[0] != c0 + 200 {fail("fail: timer 0 compare at %d, want %d", mem.timer_next[0], c0 + 200)}
+	if cpu.next_event > c0 + 200 {fail("fail: next_event %d past the timer's compare", cpu.next_event)}
+	kernel.update_next_event()
+	if cpu.next_event > c0 + 200 {fail("fail: update_next_event %d misses the timer", cpu.next_event)}
+	at(c0 + 199)
+	if mode(0) & mem.T_EQUF != 0 || mem.intc_stat != 0 {fail("fail: timer 0 compared a cycle early")}
+	at(c0 + 200)
+	if mode(0) & mem.T_EQUF == 0 {fail("fail: timer 0 compare set no flag")}
+	if mem.intc_stat != 1 << 9 {fail("fail: timer 0 compare raised INTC %x", mem.intc_stat)}
+	if mem.timer_count(0) != 100 {fail("fail: timer 0 count %d without ZRET, want 100", mem.timer_count(0))}
+	// Written 0 the flag stays, written 1 it clears; the count carries on.
+	mem.timer_write(0, 0x10, CUE | CMPE)
+	if mode(0) & mem.T_EQUF == 0 {fail("fail: writing 0 cleared timer 0's flag")}
+	mem.timer_write(0, 0x10, CUE | CMPE | mem.T_EQUF)
+	if mode(0) & mem.T_EQUF != 0 {fail("fail: writing 1 left timer 0's flag")}
+	if mem.timer_count(0) != 100 {fail("fail: a T_MODE write moved the count to %d", mem.timer_count(0))}
+
+	// Timer 1, bus/16 (32 cycles a tick): overflow 16 ticks after 0xfff0.
+	c1 := c0 + 200
+	mem.intc_stat = 0
+	mem.timer_write(1, 0x00, 0xfff0)
+	mem.timer_write(1, 0x10, 1 | CUE | OVFE)
+	if mem.timer_next[1] != c1 + 16 * 32 {fail("fail: timer 1 overflow at %d, want %d", mem.timer_next[1], c1 + 16 * 32)}
+	at(c1 + 16 * 32)
+	if mode(1) & mem.T_OVFF == 0 || mem.intc_stat != 1 << 10 {fail("fail: timer 1 overflow: mode %x INTC %x", mode(1), mem.intc_stat)}
+	if mem.timer_count(1) != 0 {fail("fail: timer 1 count %d after overflow", mem.timer_count(1))}
+
+	// Timer 2: ZRET at count 10 starts over from 0, and its second compare,
+	// with the flag still set, raises no INTC.
+	c2 := c1 + 16 * 32
+	mem.intc_stat = 0
+	mem.timer_write(2, 0x00, 0)
+	mem.timer_write(2, 0x20, 10)
+	mem.timer_write(2, 0x10, CUE | CMPE | ZRET)
+	at(c2 + 20)
+	if mode(2) & mem.T_EQUF == 0 || mem.intc_stat != 1 << 11 {fail("fail: timer 2 compare: mode %x INTC %x", mode(2), mem.intc_stat)}
+	if mem.timer_count(2) != 0 {fail("fail: timer 2 count %d after ZRET, want 0", mem.timer_count(2))}
+	if mem.timer_next[2] != c2 + 40 {fail("fail: timer 2 next compare at %d, want %d", mem.timer_next[2], c2 + 40)}
+	mem.intc_stat = 0
+	at(c2 + 40)
+	if mem.intc_stat != 0 {fail("fail: timer 2 raised INTC with its flag set")}
+
+	// Off again, flags cleared, for the tests after.
+	for n in u32(0) ..< 3 {mem.timer_write(n, 0x10, mem.T_EQUF | mem.T_OVFF)}
+	for t in mem.timer_next {if t != max(u64) {fail("fail: a stopped timer still has an event")}}
+	mem.intc_stat, mem.intc_pending = 0, 0
+	fmt.println("ok EE timers")
 }
 
 loadelf_test :: proc() {
@@ -429,6 +498,7 @@ main :: proc() {
 	sys(0x75, 0x0f000000) // a format past RAM prints `?`
 	fmt.println("ok _print")
 
+	timer_test()
 	loadelf_test()
 	setup_test()
 	dma_stat_test()
