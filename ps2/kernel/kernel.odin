@@ -277,7 +277,7 @@ syscall :: proc(pc: u32) {
 	case 0x74: // SetSyscall(index, fn)
 		mem.wr32(SYSCALL_TABLE + (a0 & 0xff) * 4, a1)
 	case 0x76: ret = iop.sif_dma_stat(i32(a0))
-	case 0x77: ret = i64(iop.sif_set_dma(a0, a1))
+	case 0x77: ret = i64(iop.sif_set_dma(a0, a1, pc))
 	case 0x78: // SifSetDChain
 	case 0x79: iop.sif_reg_set(a0, a1)
 	case 0x7a: ret = i64(iop.sif_reg_get(a0))
@@ -290,7 +290,8 @@ syscall :: proc(pc: u32) {
 	case:
 		// One the retail ROM has stops the game, except under COMPAT: it
 		// returns 0 like the rest.
-		stub := core.compat_unknown(.Syscall, u32(n))
+		// pc is in the library's stub, a leaf: ra is its caller.
+		stub := core.compat_unknown(.Syscall, u32(n), pc = pc, ra = u32(cpu.state.r[31].d[0]))
 		if m := abs(n); m < len(ROM_ONLY_SYSCALLS) && ROM_ONLY_SYSCALLS[m] != "" && !stub {
 			cpu.fatal("unimplemented syscall %d %s (a0 %08x a1 %08x) at %08x", n, ROM_ONLY_SYSCALLS[m], a0, a1, pc)
 		}

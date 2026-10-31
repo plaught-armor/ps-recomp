@@ -494,7 +494,8 @@ bios_unknown :: proc(table: string, fn: u32) {
 	case "B": kind = .Bios_B
 	case "C": kind = .Bios_C
 	}
-	if core.compat_unknown(kind, fn) {
+	// ra is the game's call: the library stub that jumps here leaves it.
+	if core.compat_unknown(kind, fn, ra = cpu.state.r[31]) {
 		ret(0)
 		return
 	}

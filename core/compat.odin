@@ -3,7 +3,8 @@
 // paths of the HLE BIOS, kernel and SIF), never in recompiled code:
 // - interpreter instructions, and interpreter entries by pc (the hottest
 //   COMPAT_TOP reported);
-// - calls the HLE does not implement, by name.
+// - calls the HLE does not implement, by name, with where the first was
+//   made.
 // Built with -define:COMPAT_COUNT=false the counters compile away.
 //
 // COMPAT=1 makes a run a compatibility run: a call the HLE does not
@@ -41,6 +42,13 @@ Compat_Key :: struct {
 	id, sub: u32,
 }
 
+// A call's count, and where the first was made (0: not known): the guest's
+// pc and ra, and for a SIF bind or RPC the client data it was made with.
+Compat_Hit :: struct {
+	n:              u64,
+	pc, ra, client: u32,
+}
+
 // Entry pcs in a table of fixed size, so counting never allocates: each pc
 // probes a few slots from its hash, and one that finds none free counts in
 // entries_other.
@@ -65,7 +73,7 @@ compat: struct {
 	interp_insns:  u64,
 	entries:       [ENTRY_SLOTS]Entry_Slot,
 	entries_other: u64,
-	calls:         map[Compat_Key]u64,
+	calls:         map[Compat_Key]Compat_Hit,
 	reported:      bool,
 }
 
@@ -94,14 +102,22 @@ compat_entry :: proc(pc: u32) {
 	}
 }
 
-// Count a call the HLE does not implement. True under COMPAT: the caller
-// returns 0 to the game and goes on. The first of each says so on stderr.
-compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0) -> (stub: bool) {
+// Count a call the HLE does not implement, made at pc with ra (and, for a
+// SIF bind or RPC, client), which the first of each keeps. True under
+// COMPAT: the caller returns 0 to the game and goes on. The first of each
+// says so on stderr.
+compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0, pc: u32 = 0, ra: u32 = 0, client: u32 = 0) -> (stub: bool) {
 	when COMPAT_COUNT {
-		n := compat.calls[{kind, id, sub}] + 1
-		compat.calls[{kind, id, sub}] = n
-		if compat.on && n == 1 {
-			fmt.eprintln("compat stub:", compat_call_name({kind, id, sub}))
+		key := Compat_Key{kind, id, sub}
+		h := compat.calls[key]
+		if h.n == 0 {
+			h.pc, h.ra, h.client = pc, ra, client
+		}
+		h.n += 1
+		compat.calls[key] = h
+		if compat.on && h.n == 1 {
+			c := client != 0 ? fmt.tprintf(" client %08x", client) : ""
+			fmt.eprintfln("compat stub: %s (pc %08x ra %08x%s)", compat_call_name(key), pc, ra, c)
 		}
 	}
 	return compat.on
@@ -126,9 +142,14 @@ Compat_Pc :: struct {
 	n:  u64,
 }
 
+// A call and its count, with where the first was made: 8 hex digits, ""
+// when not known (client only for a SIF bind or RPC).
 Compat_Name :: struct {
-	name: string,
-	n:    u64,
+	name:   string,
+	n:      u64,
+	pc:     string,
+	ra:     string,
+	client: string `json:"client,omitempty"`,
 }
 
 // The compat line's fields. result: "frames" (FRAMES reached), "fatal" or
@@ -186,8 +207,9 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 	l.interp_entries = top
 	calls := make([]Compat_Name, len(compat.calls), context.temp_allocator)
 	i := 0
-	for k, n in compat.calls {
-		calls[i] = {compat_call_name(k), n}
+	hex :: proc(v: u32) -> string {return v != 0 ? fmt.tprintf("%08x", v) : ""}
+	for k, h in compat.calls {
+		calls[i] = {compat_call_name(k), h.n, hex(h.pc), hex(h.ra), hex(h.client)}
 		i += 1
 	}
 	slice.sort_by(calls, proc(a, b: Compat_Name) -> bool {

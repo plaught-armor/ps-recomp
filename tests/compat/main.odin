@@ -6,8 +6,11 @@
 // - psx_fatal: a fatal error ends the run with status 1 and a fatal line;
 // - psx_off: without COMPAT the unknown BIOS call stops the game, and no
 //   line is printed;
-// - ps2: under COMPAT a syscall only the retail ROM has returns 0, a
-//   function is interpreted twice, and the run ends at FRAMES.
+// - ps2: under COMPAT a syscall only the retail ROM has returns 0, a bind to
+//   a SIF server the HLE lacks goes on, a function is interpreted twice,
+//   and the run ends at FRAMES.
+// Each unimplemented call is named with where the first was made: ra, the
+// pc of a syscall, and the client data of a SIF bind.
 package main
 
 import "core:encoding/json"
@@ -18,6 +21,7 @@ import "ps:core"
 import "ps:ps2"
 import ps2_cpu "ps:ps2/cpu"
 import ps2_host "ps:ps2/host"
+import "ps:ps2/iop"
 import "ps:ps2/kernel"
 import "ps:ps2/mem"
 import _ "ps:psx"
@@ -44,6 +48,16 @@ PSX_FUNC :: 0x80001000
 // A function: MTSA $zero, return.
 @(private = "file")
 PS2_FUNC :: 0x00100000
+// The ra each unimplemented call is made with.
+@(private = "file")
+PSX_RA :: 0x80002000
+@(private = "file")
+PS2_RA :: 0x00100100
+// The SifSetDma syscall that sends the bind, and the bind's client data.
+@(private = "file")
+SIF_PC :: 0x00100008
+@(private = "file")
+SIF_CLIENT :: 0x00200000
 
 main :: proc() {
 	if len(os.args) == 2 {
@@ -52,7 +66,7 @@ main :: proc() {
 	if l, ok := run("psx", true, 0); ok {
 		check("psx", l.system == "ps1" && l.result == "frames" && l.frames == FRAMES, "result")
 		check("psx", l.fatal == "" && l.cycles > 0 && l.cycles_per_insn == 2 && l.build == core.COMMIT, "fields")
-		check("psx", len(l.unimplemented) == 1 && l.unimplemented[0] == {"BIOS A(ffh)", 1}, "unimplemented")
+		check("psx", len(l.unimplemented) == 1 && l.unimplemented[0] == {"BIOS A(ffh)", 1, "", "80002000", ""}, "unimplemented")
 		check("psx", len(l.interp_entries) == 1 && l.interp_entries[0] == {"80001000", 2}, "entries")
 		check("psx", l.interp_insns >= 4 && l.interp_entries_other == 0, "interpreter work")
 	}
@@ -62,7 +76,11 @@ main :: proc() {
 	run("psx_off", false, 1)
 	if l, ok := run("ps2", true, 0); ok {
 		check("ps2", l.system == "ps2" && l.result == "frames" && l.frames == FRAMES && l.cycles_per_insn == 1, "result")
-		check("ps2", len(l.unimplemented) == 1 && l.unimplemented[0] == {"syscall 1", 1}, "unimplemented")
+		check("ps2", len(l.unimplemented) == 2, "unimplemented")
+		if len(l.unimplemented) == 2 {
+			check("ps2", l.unimplemented[0] == {"SIF server 0badc0de", 1, "00100008", "00100100", "00200000"}, "SIF bind")
+			check("ps2", l.unimplemented[1] == {"syscall 1", 1, "00100000", "00100100", ""}, "syscall")
+		}
 		check("ps2", len(l.interp_entries) == 1 && l.interp_entries[0] == {"00100000", 2}, "entries")
 		check("ps2", l.interp_insns == 4 && l.interp_entries_other == 0, "interpreter work")
 	}
@@ -127,6 +145,7 @@ child :: proc(name: string) -> ! {
 		}
 		psx_cpu.state.r[2] = 1
 		psx_cpu.state.r[9] = 0xff
+		psx_cpu.state.r[31] = PSX_RA
 		psx_cpu.call(0xa0)
 		if psx_cpu.state.r[2] != 0 {os.exit(3)}
 		for w, i in ([]u32{0x24020007, 0x03e00008, 0}) {
@@ -143,10 +162,26 @@ child :: proc(name: string) -> ! {
 		vblank = kernel.vblank_hook
 		mem.mem_init()
 		kernel.kernel_init()
+		iop.sif_init()
+		ps2_cpu.state.r[31].d[0] = PS2_RA
 		ps2_cpu.state.r[2].d[0] = 1
 		ps2_cpu.state.r[3].d[0] = 1 // ResetEE
 		kernel.syscall(PS2_FUNC)
 		if ps2_cpu.state.r[2].d[0] != 0 {os.exit(3)}
+		// SifSetDma of an RPC bind packet {header, rec_id, pkt, rpc_id,
+		// client, sid} to the IOP's command buffer.
+		PKT :: 0x00200100
+		LIST :: 0x00200200
+		for w, i in ([]u32{0x40, 0, iop.SIF_CMD_RPC_BIND, 0, 0, PKT, 1, SIF_CLIENT, 0x0badc0de}) {
+			mem.wr32(PKT + 4 * u32(i), w)
+		}
+		for w, i in ([]u32{PKT, iop.IOP_CMDBUF, 0x40, 0}) {
+			mem.wr32(LIST + 4 * u32(i), w)
+		}
+		ps2_cpu.state.r[3].d[0] = 0x77
+		ps2_cpu.state.r[4].d[0] = LIST
+		ps2_cpu.state.r[5].d[0] = 1
+		kernel.syscall(SIF_PC)
 		for w, i in ([]u32{0x00000029, 0x03e00008, 0}) {
 			mem.wr32(PS2_FUNC + 4 * u32(i), w)
 		}

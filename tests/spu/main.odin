@@ -355,7 +355,7 @@ adx_packet :: proc(id: u32, entries: ..[4]u32) {
 	mem.wr32(list, ee)
 	mem.wr32(list + 4, ADX_IOP_WORK + id * ADX_WORK_SIZE)
 	mem.wr32(list + 8, ADX_WORK_SIZE)
-	iop.sif_set_dma(list, 1)
+	iop.sif_set_dma(list, 1, 0)
 }
 
 // Play the chunk from its start, through a round trip a second after the

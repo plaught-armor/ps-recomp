@@ -521,8 +521,8 @@ test_compat :: proc() {
 		{"fatal.iso", cnf_disc("", 0xfc000000), "ps1", "fatal", "1", "", "", ""},
 		{"ps2_loop.iso", ps2_disc(), "ps2", "ok", "0", "", "", ""},
 		// li v1, 1; syscall; b .; nop: ResetEE, which only the retail ROM
-		// has (checked below), then loop.
-		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "ok", "0", "syscall 1=1", "", ""},
+		// has (checked below), then loop. compat.log says where it was made.
+		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "ok", "0", "syscall 1=1", "", "\"pc\":\"00100004\",\"ra\":\""},
 		// Opcode 0x3b is not an EE instruction.
 		{"ps2_fatal.iso", ps2_disc(0xec000000), "ps2", "fatal", "1", "", "", ""},
 		{"loadexec.iso", loadexec_disc(), "ps1", "ok", "0", "", "80010100:", ""},

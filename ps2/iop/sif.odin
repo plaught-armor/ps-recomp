@@ -132,9 +132,9 @@ sif_dma_stat :: proc(id: i32) -> i64 {
 	return -1 // every transfer completes immediately
 }
 
-// SifSetDma(list, count): copy each {src, dest, size, attr} to IOP memory and
-// act on command packets.
-sif_set_dma :: proc(list, count: u32) -> u32 {
+// SifSetDma(list, count), the syscall at pc: copy each {src, dest, size,
+// attr} to IOP memory and act on command packets.
+sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 	for n in 0 ..< count {
 		e := list + n * 16
 		src, dest, size := mem.rd32(e), mem.rd32(e + 4), mem.rd32(e + 8)
@@ -142,7 +142,7 @@ sif_set_dma :: proc(list, count: u32) -> u32 {
 		size = min(size, IOP_RAM_SIZE - d)
 		copy(iop_ram[d:][:size], mem.ram_slice(src, size))
 		if cpu.debug == 2 {fmt.eprintfln("sif: dma %08x -> %08x size %x (%d/%d)", src, dest, size, n, count)}
-		if d == IOP_CMDBUF {sif_command(d)}
+		if d == IOP_CMDBUF {sif_command(d, pc)}
 		adx_dma(d, size)
 	}
 	id := sif.next_dma
@@ -174,8 +174,17 @@ sif_pump :: proc() {
 	mem.dmac_stat |= 1 << mem.DMA_SIF0
 }
 
+// An unimplemented call (core.compat_unknown) in a packet that the
+// SifSetDma syscall at pc sent: pc and ra are the SifSetDma stub's and its
+// caller's for every RPC, so the client data a bind or RPC was made with is
+// what tells them apart.
 @(private)
-sif_command :: proc(a: u32) {
+sif_unknown :: proc(pc: u32, kind: core.Compat_Call, id: u32, sub: u32 = 0, client: u32 = 0) {
+	core.compat_unknown(kind, id, sub, pc = pc, ra = u32(cpu.state.r[31].d[0]), client = client)
+}
+
+@(private)
+sif_command :: proc(a, pc: u32) {
 	cid := iop_u32(a + 8)^
 	if cpu.debug == 2 {fmt.eprintfln("sif: cmd %08x opt %x a0 %08x ee_buf %08x", cid, iop_u32(a + 12)^, iop_u32(a + 16)^, sif.ee_buf)}
 	opt := iop_u32(a + 12)^
@@ -206,7 +215,7 @@ sif_command :: proc(a: u32) {
 			sd = IOP_SERVERS + u32(len(sif.bound)) * 0x10000
 			sif.bound[sid] = sd
 			if sid not_in sif.servers {
-				core.compat_unknown(.Sif_Bind, sid)
+				sif_unknown(pc, .Sif_Bind, sid, client = client)
 				fmt.eprintfln("sif: bind to unimplemented server %08x", sid)
 			}
 		}
@@ -219,7 +228,7 @@ sif_command :: proc(a: u32) {
 		buf := iop_ram[(server + 0x100) & (IOP_RAM_SIZE - 1):][:0xff00]
 		handler, ok := sif.servers[sid]
 		if !ok || !handler(fno, buf, send_size) {
-			core.compat_unknown(.Sif_Rpc, sid, fno)
+			sif_unknown(pc, .Sif_Rpc, sid, fno, client = client)
 			fmt.eprintfln("sif: unhandled rpc %08x fno %d send %d recv %d", sid, fno, send_size, recv_size)
 		}
 		if receive != 0 && recv_size != 0 {
@@ -236,7 +245,7 @@ sif_command :: proc(a: u32) {
 		if cid & 0x80000000 == 0 {
 			fmod_command(cid, opt, a)
 		} else {
-			core.compat_unknown(.Sif_Cmd, cid)
+			sif_unknown(pc, .Sif_Cmd, cid)
 			fmt.eprintfln("sif: unhandled command %08x", cid)
 		}
 	}
