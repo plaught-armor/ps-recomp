@@ -496,6 +496,10 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return sifman_fn(fno)
 	case "libsd":
 		return libsd_fn(fno)
+	case "cdvdman":
+		return cdvdman_fn(fno)
+	case "ioman":
+		return ioman_fn(fno)
 	}
 	return 0, false
 }

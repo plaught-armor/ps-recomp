@@ -41,8 +41,10 @@ COMPAT_TOP :: 10
 // after its start returned; Iop_Intr the command id whose IOP handler
 // waited or ran out of its budget; Iop_Sd the id an IOP libsd call did not
 // decode and its function number; Iop_Sd_Intr the address of a libsd
-// interrupt handler that waited or ran out of its budget; Irx_Reloc the
-// relocation type.
+// interrupt handler that waited or ran out of its budget; Iop_Cd the data
+// pattern of an IOP sceCdRead, which reads only 2048-byte sectors; Iop_Io
+// the first 4 bytes of a path an IOP ioman open names on a device other than
+// the disc; Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -59,6 +61,8 @@ Compat_Call :: enum u8 {
 	Iop_Intr,
 	Iop_Sd,
 	Iop_Sd_Intr,
+	Iop_Cd,
+	Iop_Io,
 	Irx_Reloc,
 }
 
@@ -214,6 +218,10 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Intr: return fmt.tprintf("IOP command handler %08x blocked", k.id)
 	case .Iop_Sd: return fmt.tprintf("IOP libsd fno %d id %04x", k.sub, k.id)
 	case .Iop_Sd_Intr: return fmt.tprintf("IOP libsd handler %08x blocked", k.id)
+	case .Iop_Cd: return fmt.tprintf("IOP cdvdman read pattern %d", k.id)
+	case .Iop_Io:
+		dev := transmute([4]u8)k.id
+		return fmt.tprintf("IOP ioman device %q", strings.truncate_to_byte(string(dev[:]), 0))
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

@@ -57,6 +57,14 @@
 // core with its IRQ enabled runs the SPU2 handler once, a0 the core's bit,
 // for either core; a voice transfer runs its channel's handler. Undecoded ids
 // are compat rows; the loader's reset clears the handlers.
+//
+// cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
+// record and a miss leaves it; sceCdRead copies whole sectors from the lsn
+// to the buffer, zeros past the volume, and a data pattern reads nothing
+// with a compat row. ioman's open, read, lseek and close share fileio's fd
+// table: a read over sectors gets the file's bytes, a closed fd is bad and
+// then reused, fileio's reset closes ioman's files, a write open fails as
+// fileio's, and another device is a compat row.
 package main
 
 import "core:encoding/endian"
@@ -68,6 +76,7 @@ import cpu "ps:ps2/cpu"
 import kernel "ps:ps2/kernel"
 import mem "ps:ps2/mem"
 import r3000 "ps:psx/cpu"
+import "ps:tests/discimg"
 
 CODE :: 0x1000
 GROW :: 0x2000 // loads from SPU2, one per new device address
@@ -150,6 +159,7 @@ game :: proc(_: rawptr) {
 	test_sifcmd()
 	test_cmd_deliver()
 	test_libsd()
+	test_cdvdman()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -1342,6 +1352,113 @@ test_libsd :: proc() {
 
 	fresh()
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
+}
+
+CDVDMAN_FNOS := [?]u32{6, 8, 10, 11, 13}
+IOMAN_FNOS := [?]u32{4, 5, 6, 8}
+
+// Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
+lib_call :: proc(stubs: u32, fnos: []u32, fno: u32, args: ..u32) -> u32 {
+	for v, i in args {r3000.state.r[4 + i] = v}
+	for f, i in fnos {
+		if f == fno {return iop_call(stubs + 8 * u32(i))}
+	}
+	return 0xdeadbeef
+}
+
+cd_call :: proc(stubs, fno: u32, args: ..u32) -> u32 {return lib_call(stubs, CDVDMAN_FNOS[:], fno, ..args)}
+io_call :: proc(stubs, fno: u32, args: ..u32) -> u32 {return lib_call(stubs, IOMAN_FNOS[:], fno, ..args)}
+
+neg :: proc(e: i32) -> u32 {return u32(-e)}
+
+SECTOR :: 2048
+
+test_cdvdman :: proc() {
+	dir, err := os.make_directory_temp("", "ps_iop_cd_test_*", context.allocator)
+	if err != nil {
+		check(false, "cdvdman: no temp directory")
+		return
+	}
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s/cd.iso", dir)
+	_ = os.write_entire_file(path, discimg.make_iso(discimg.CNF_PS2))
+	if !iop.disc_image_open(path) {
+		check(false, "cdvdman: the image opens")
+		return
+	}
+	defer iop.disc_image_close() // before the directory is removed
+	iop.fileio_reset()
+
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	// "modc": imports of cdvdman and ioman, names, a file record, a read
+	// mode and a buffer of three sectors.
+	a: Asm
+	cdo := imports(&a, "cdvdman", ..CDVDMAN_FNOS[:])
+	ioo := imports(&a, "ioman", ..IOMAN_FNOS[:])
+	big := str_words(&a, "\\BIG.BIN;1")
+	nope := str_words(&a, "\\NOPE.BIN;1")
+	sub := str_words(&a, "cdrom0:\\DATA\\SUB.TXT;1")
+	bigf := str_words(&a, "cdrom0:\\BIG.BIN;1")
+	host := str_words(&a, "host:x")
+	file := at(&a)
+	for _ in 0 ..< iop.CD_FILE / 4 {put(&a, 0)}
+	mode := at(&a)
+	put(&a, 0)
+	buf := at(&a)
+	for _ in 0 ..< 3 * SECTOR / 4 {put(&a, 0)}
+	entry := at(&a)
+	prologue(&a)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, res := iop.iop_load(build_mod("modc", &a, entry), "modc", nil)
+	b := module_base(id)
+	check(id > 0 && res == 0, "cdvdman: the module loads")
+	cd, io := b + cdo, b + ioo
+
+	check(cd_call(cd, 13, 0) == 2 && cd_call(cd, 8) == 0 && cd_call(cd, 11, 0) == 0, "cdvdman: DiskReady 2, no error, Sync done")
+	check(cd_call(cd, 10, b + file, b + big) == 1, "cdvdman: SearchFile finds the file")
+	rec := iop.iop_mem(b + file, iop.CD_FILE)
+	check(endian.unchecked_get_u32le(rec) == 23 && endian.unchecked_get_u32le(rec[4:]) == discimg.BIG && string(rec[8:17]) == "BIG.BIN;1", "cdvdman: the record's lsn, size and name")
+	check(cd_call(cd, 10, b + file, b + nope) == 0 && endian.unchecked_get_u32le(rec) == 23, "cdvdman: a miss returns 0 and leaves the record")
+
+	// Three sectors from the file's lsn, at the buffer; past the volume, zeros.
+	data := iop.iop_mem(b + buf, 3 * SECTOR)
+	check(cd_call(cd, 6, 23, 3, b + buf, b + mode) == 1, "cdvdman: sceCdRead returns 1")
+	good := true
+	for i in 0 ..< len(data) {good &&= data[i] == (i < discimg.BIG ? discimg.big_byte(i) : 0)}
+	check(good, "cdvdman: the sectors read are the file's")
+	for &x in data {x = 0xff}
+	cd_call(cd, 6, discimg.VOLUME, 1, b + buf + SECTOR, 0)
+	good = true
+	for i in 0 ..< len(data) {good &&= data[i] == (i / SECTOR == 1 ? 0 : 0xff)}
+	check(good, "cdvdman: a sector past the volume reads as zeros, nothing else written")
+	iop.iop_u32(b + mode)^ = 0x00010000 // datapattern 1
+	check(cd_call(cd, 6, 23, 1, b + buf, b + mode) == 0 && data[0] == 0xff, "cdvdman: a data pattern reads nothing")
+	check(core.compat.calls[core.Compat_Key{.Iop_Cd, 1, 0}].n == 1, "cdvdman: the data pattern is a compat row")
+
+	// ioman, over fileio's files.
+	fd := io_call(io, 4, b + sub, 1)
+	check(fd == 0, "ioman: open gets the first fd")
+	check(io_call(io, 6, fd, b + buf, 4) == 4 && string(data[:4]) == "sub ", "ioman: read")
+	check(io_call(io, 8, fd, 0, 1) == 4 && io_call(io, 8, fd, neg(3), 2) == 7, "ioman: lseek from the position and the end")
+	check(io_call(io, 6, fd, b + buf, 10) == 3 && string(data[:3]) == "e!\n", "ioman: a read stops at the end")
+	check(io_call(io, 8, fd, 2, 0) == 2 && io_call(io, 8, fd, 0, 3) == neg(22), "ioman: lseek from the start; a bad whence")
+	fd2 := io_call(io, 4, b + bigf, 1)
+	check(fd2 == 1 && io_call(io, 8, fd2, 100, 0) == 100, "ioman: a second file gets the next fd")
+	check(io_call(io, 6, fd2, b + buf, 3 * SECTOR) == discimg.BIG - 100, "ioman: a read over sectors gets the rest of the file")
+	good = true
+	for i in 0 ..< discimg.BIG - 100 {good &&= data[i] == discimg.big_byte(100 + i)}
+	check(good, "ioman: the bytes read over sectors are the file's")
+	check(io_call(io, 5, fd) == 0 && io_call(io, 5, fd) == neg(9) && io_call(io, 6, fd, b + buf, 1) == neg(9), "ioman: close; a closed fd is bad")
+	check(io_call(io, 4, b + sub, 1) == fd, "ioman: a closed fd is reused")
+	iop.fileio_reset() // the EE's files
+	check(io_call(io, 6, fd2, b + buf, 1) == neg(9), "ioman: fileio's table is the same")
+	check(io_call(io, 4, b + sub, 2) == neg(2), "ioman: a write open fails as fileio's")
+	check(io_call(io, 4, b + host, 1) == neg(19), "ioman: another device is not here")
+	dev := [4]u8{'h', 'o', 's', 't'}
+	check(core.compat.calls[core.Compat_Key{.Iop_Io, transmute(u32)dev, 0}].n == 1, "ioman: another device is a compat row")
 }
 
 mem_eq :: proc(x, y, n: u32) -> bool {

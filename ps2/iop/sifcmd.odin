@@ -92,7 +92,7 @@ sifcmd_dma_id :: proc() -> u32 {
 
 // `n` bytes of IOP RAM from `a`, wrapped to RAM as IOP code addresses it,
 // fewer where RAM ends.
-@(private = "file")
+@(private)
 iop_ram_at :: proc(a, n: u32) -> []u8 {
 	return iop_mem(a & (IOP_RAM_SIZE - 1), n)
 }

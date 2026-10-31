@@ -15,7 +15,7 @@ ram :: proc(a, n: u32) -> []u8 {
 }
 
 // The NUL-terminated string at `a`, cut where RAM ends.
-@(private = "file")
+@(private)
 cstr :: proc(a: u32) -> string {
 	return strings.truncate_to_byte(string(ram(a, IOP_RAM_SIZE)), 0)
 }
