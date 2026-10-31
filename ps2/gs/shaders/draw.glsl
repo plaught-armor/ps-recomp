@@ -26,7 +26,8 @@ struct State {
 	uint clut;  // word offset of this primitive's CLUT copy
 	uint mip;   // LCM | MXL << 1 | MMIN << 4 | L << 7 | K << 16
 	uint mtb[6]; // levels 1..6: TBP | TBW << 16
-	uint pad0, pad1;
+	uint dec;    // word offset of the decoded texture in pc.dec, 0 for none
+	uint dec_ls; // its words per layer
 };
 
 #define F_TME (1u << 0)
@@ -52,11 +53,17 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer Verts {
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly restrict buffer States {
 	State s[];
 };
+// Decoded textures: written only by decode.comp, before the barrier ahead of
+// the draws that read them, so they need no coherent loads.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly restrict buffer Plain {
+	uint w[];
+};
 
 layout(push_constant) uniform PC {
 	Words vram;
 	States states;
 	Words cluts;
 	Verts verts;
+	Plain dec;
 	uint scale;
 } pc;

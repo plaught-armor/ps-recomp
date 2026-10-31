@@ -107,3 +107,25 @@ void store(Pixel p, uint v) {
 uint read_raw(uint psm, uint bp, uint bw, uint x, uint y) { return load(pixel(psm, bp, bw, x, y)); }
 
 void write_raw(uint psm, uint bp, uint bw, uint x, uint y, uint v) { store(pixel(psm, bp, bw, x, y), v); }
+
+// A 16-bit texel or CLUT entry as RGBA8888 (R in the low byte): TA0 | TA1 << 8
+// supplies alpha, AEM makes black transparent.
+uint texel16(uint c, uint ta, bool aem) {
+	uint rgb = (c & 0x1fu) << 3 | (c & 0x3e0u) << 6 | (c & 0x7c00u) << 9;
+	uint a = 0u;
+	if ((c & 0x8000u) != 0u) {
+		a = ta >> 8;
+	} else if (!aem || (c & 0x7fffu) != 0u) {
+		a = ta & 0xffu;
+	}
+	return rgb | a << 24;
+}
+
+// A texel of a direct-colour format, `raw` as read_raw returns it, as RGBA8888.
+uint texel_direct(uint psm, uint raw, uint ta, bool aem) {
+	switch (psm) {
+	case PSMCT24: return raw | ((aem && raw == 0u) ? 0u : (ta & 0xffu)) << 24;
+	case PSMCT16: case PSMCT16S: return texel16(raw, ta, aem);
+	}
+	return raw;
+}

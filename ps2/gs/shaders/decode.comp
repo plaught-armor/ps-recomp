@@ -1,0 +1,31 @@
+#version 460
+// Texture decode (../gpu.odin `hw_dec`): every level of a direct-colour
+// texture as RGBA8888 rows, level after level, one copy per layer, for
+// prim.frag to read in place of local memory.
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+	Words vram, outp;
+	uint psm, ta, aem, tw, th, nlev, stride; // stride: words per layer
+	uint tb[7]; // level n: TBP | TBW << 16
+} pc;
+
+void main() {
+	uint i = gl_GlobalInvocationID.x;
+	if (i >= pc.stride) return;
+	VR = pc.vram;
+	uint layer = gl_WorkGroupID.y;
+	LB = layer * VRAM_WORDS;
+	uint n = 0u, off = i;
+	for (;;) {
+		uint size = max(pc.tw >> n, 1u) * max(pc.th >> n, 1u);
+		if (off < size || n + 1u >= pc.nlev) break;
+		off -= size;
+		n++;
+	}
+	uint w = max(pc.tw >> n, 1u);
+	uint raw = read_raw(pc.psm, pc.tb[n] & 0xffffu, pc.tb[n] >> 16, off % w, off / w);
+	pc.outp.w[layer * pc.stride + i] = texel_direct(pc.psm, raw, pc.ta, pc.aem != 0u);
+}

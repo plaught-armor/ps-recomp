@@ -24,6 +24,7 @@ layout(location = 6) flat in vec4 i_st_range; // see prim.vert
 
 State S;
 uint TBP, TBW; // the mipmap level being sampled
+uint DEC, DW;  // its decoded rows in pc.dec and their width, DEC 0 for none
 
 uint wrap_coord(int i, uint mode, uint size, uint lo, uint hi) {
 	switch (mode) {
@@ -34,28 +35,15 @@ uint wrap_coord(int i, uint mode, uint size, uint lo, uint hi) {
 	return (uint(i) & lo) | hi; // region repeat: MINU is the mask, MAXU the fix
 }
 
-uint expand16(uint c) {
-	uint rgb = (c & 0x1fu) << 3 | (c & 0x3e0u) << 6 | (c & 0x7c00u) << 9;
-	uint a = 0u;
-	bool aem = (S.flags & F_AEM) != 0u;
-	if ((c & 0x8000u) != 0u) {
-		a = S.ta >> 8;
-	} else if (!aem || (c & 0x7fffu) != 0u) {
-		a = S.ta & 0xffu;
-	}
-	return rgb | a << 24;
-}
+uint expand16(uint c) { return texel16(c, S.ta, (S.flags & F_AEM) != 0u); }
 
 // Texel as RGBA8888 (R in the low byte).
 uint fetch(uint x, uint y) {
+	if (DEC != 0u) return pc.dec.w[DEC + y * DW + x];
 	uint raw = read_raw(S.tpsm, TBP, TBW, x, y);
 	switch (S.tpsm) {
-	case PSMCT32: return raw;
-	case PSMCT24: {
-		uint a = ((S.flags & F_AEM) != 0u && raw == 0u) ? 0u : (S.ta & 0xffu);
-		return raw | a << 24;
-	}
-	case PSMCT16: case PSMCT16S: return expand16(raw);
+	case PSMCT32: case PSMCT24: case PSMCT16: case PSMCT16S:
+		return texel_direct(S.tpsm, raw, S.ta, (S.flags & F_AEM) != 0u);
 	}
 	uint e = pc.cluts.w[S.clut + ((S.csa * 16u + raw) & 511u)];
 	if (S.cpsm == PSMCT32) return e;
@@ -77,6 +65,12 @@ ivec4 sample_level(uint n, float u, float v, bool bilinear) {
 	u /= float(1u << n);
 	v /= float(1u << n);
 	uint w = max(S.tw >> n, 1u), h = max(S.th >> n, 1u);
+	DEC = S.dec;
+	DW = w;
+	if (DEC != 0u) {
+		DEC += (LB / VRAM_WORDS) * S.dec_ls;
+		for (uint k = 0u; k < n; k++) DEC += max(S.tw >> k, 1u) * max(S.th >> k, 1u);
+	}
 	uint wms = S.wrap & 3u, wmt = (S.wrap >> 2) & 3u;
 	uint minu = S.umm & 0xffffu, maxu = S.umm >> 16;
 	uint minv = S.vmm & 0xffffu, maxv = S.vmm >> 16;

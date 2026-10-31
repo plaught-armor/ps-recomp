@@ -32,6 +32,10 @@ UP_CAP :: 1 << 22 // transfer words per slot (16 MiB)
 PAGES :: 512 // 8 KiB pages of local memory
 @(private)
 CONST_Z :: 0x8000_0000 // Hw_Vert.state: z is the same at every vertex
+@(private)
+DEC_WORDS :: 1 << 24 // decoded texture words, all layers (64 MiB)
+@(private)
+DEC_FIRST :: 16 // offset 0 means no decoded texture
 
 // Layouts of Vert and State in shaders/draw.glsl.
 @(private)
@@ -58,7 +62,7 @@ Hw_State :: struct {
 	wrap, umm, vmm, ta, clut:                u32,
 	mip:                                     u32, // LCM | MXL << 1 | MMIN << 4 | L << 7 | K << 16
 	mtb:                                     [6]u32, // levels 1..6: TBP | TBW << 16
-	_:                                       [2]u32,
+	dec, dec_ls:                             u32, // see hw_dec: offset in hw.dec (0: none), words per layer
 }
 #assert(size_of(Hw_State) == 160)
 
@@ -68,8 +72,8 @@ Hw_Flag :: enum u32 {TME, FGE, ABE, FST, ATE, DATE, DATM, ZTE, ZMSK, PABE, FBA, 
 // Push constants, as declared by each shader.
 @(private)
 Draw_PC :: struct {
-	vram, states, cluts, verts: vk.DeviceAddress,
-	scale:                      u32,
+	vram, states, cluts, verts, dec: vk.DeviceAddress,
+	scale:                           u32,
 }
 @(private)
 Upload_PC :: struct {
@@ -85,6 +89,12 @@ Copy_PC :: struct {
 Clut_PC :: struct {
 	vram, cur, outp:                            vk.DeviceAddress,
 	cpsm, cbp, cbw, cou, cov, csm2, n, base: u32,
+}
+@(private)
+Decode_PC :: struct {
+	vram, outp:                             vk.DeviceAddress,
+	psm, ta, aem, tw, th, nlev, stride: u32,
+	tb:                                     [7]u32,
 }
 @(private)
 Scan_PC :: struct {
@@ -105,6 +115,18 @@ Slot :: struct {
 @(private)
 Page_Set :: [PAGES / 64]u64
 
+// A decoded texture: the texels decode.comp writes, Decode_PC's fields.
+@(private)
+Dec_Key :: struct {
+	psm, ta, aem, tw, th, nlev: u32,
+	tb:                         [7]u32,
+}
+@(private)
+Dec_Entry :: struct {
+	off, stride: u32,
+	seq:         u64, // hw.seq when decoded
+}
+
 @(private)
 hw: struct {
 	scale:               u32,
@@ -116,7 +138,7 @@ hw: struct {
 	draw_layout:         vk.PipelineLayout,
 	comp_layout:         vk.PipelineLayout,
 	prim, upload, copy:  vk.Pipeline,
-	scan, clut:          vk.Pipeline,
+	scan, clut, decode:  vk.Pipeline,
 	clut_cur:            core.Vk_Buf, // the CLUT as the last load left it
 	out_img:             vk.Image,
 	out_mem:             vk.DeviceMemory,
@@ -143,6 +165,18 @@ hw: struct {
 	tex_ok:              bool, // the current state's texture misses dirty
 	fb_pages, z_pages:   [2]u32, // first page, count
 	tex_pages:           [2]u32,
+	// Writes to local memory in command order: seq counts them and page_seq
+	// holds the last to write each page. A decoded texture is valid while no
+	// page of its span has been written since it was decoded.
+	seq:                 u64,
+	page_seq:            [PAGES]u64,
+	// Decoded textures, allocated upward from DEC_FIRST in dec and all
+	// dropped when it fills. Writes to them are ordered by the same barriers
+	// as local memory, so an entry is rewritten in place.
+	dec:                 core.Vk_Buf,
+	dec_map:             map[Dec_Key]Dec_Entry,
+	dec_top:             u32,
+	dec_seq:             u64, // seq when the current state's texture was looked up
 	// The transfer being gathered into one dispatch.
 	up:                  struct {
 		active:                                bool,
@@ -175,6 +209,8 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
 	layers := int(scale * scale)
 	hw.vram = core.vk_buf_create(layers * VRAM_WORDS * 4, {.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}, {.DEVICE_LOCAL})
 	hw.clut_cur = core.vk_buf_create(512 * 4, {.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}, {.DEVICE_LOCAL})
+	hw.dec = core.vk_buf_create(DEC_WORDS * 4, {.STORAGE_BUFFER}, {.DEVICE_LOCAL})
+	hw.dec_top = DEC_FIRST
 	RING :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT}
 	READBACK :: vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT, .HOST_CACHED}
 	scan_size := DISP_W * DISP_H * layers * 4
@@ -201,6 +237,7 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
 	hw.copy = core.vk_compute_pipeline(#load("shaders/copy.comp.spv"), hw.comp_layout)
 	hw.scan = core.vk_compute_pipeline(#load("shaders/scanout.comp.spv"), hw.comp_layout)
 	hw.clut = core.vk_compute_pipeline(#load("shaders/clut.comp.spv"), hw.comp_layout)
+	hw.decode = core.vk_compute_pipeline(#load("shaders/decode.comp.spv"), hw.comp_layout)
 
 	hw_begin_slot()
 	vk.CmdFillBuffer(hw.slots[0].cmd, hw.vram.buf, 0, vk.DeviceSize(vk.WHOLE_SIZE), 0)
@@ -259,7 +296,7 @@ hw_flush_draws :: proc() {
 		vk.CmdBindPipeline(s.cmd, .GRAPHICS, hw.prim)
 		vp := vk.Viewport{0, 0, f32(size), f32(size), 0, 1}
 		vk.CmdSetViewport(s.cmd, 0, 1, &vp)
-		pc := Draw_PC{hw.vram.addr, s.states.addr, s.cluts.addr, s.verts.addr, hw.scale}
+		pc := Draw_PC{hw.vram.addr, s.states.addr, s.cluts.addr, s.verts.addr, hw.dec.addr, hw.scale}
 		vk.CmdPushConstants(s.cmd, hw.draw_layout, {.VERTEX, .FRAGMENT}, 0, size_of(pc), &pc)
 		hw.rendering = true
 	}
@@ -326,6 +363,7 @@ hw_flush_upload :: proc() {
 		count  = u.count,
 		layers = hw.scale * hw.scale,
 	}
+	pages_write(rect_pages(u.psm, u.bp, u.bw, u.x0, u.y0 + u.start / u.w, u.w, (u.start + u.count - 1) / u.w - u.start / u.w + 1))
 	hw_dispatch(hw.upload, &pc, (u.count + 63) / 64, 1)
 }
 
@@ -398,6 +436,7 @@ hw_copy :: proc(sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h: u32) {
 	if w == 0 || h == 0 {return}
 	hw_flush_upload()
 	pc := Copy_PC{hw.vram.addr, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h, hw.scale * hw.scale}
+	pages_write(rect_pages(dpsm, dbp, dbw, dx, dy, w, h))
 	hw_dispatch(hw.copy, &pc, (w + 7) / 8, (h + 7) / 8)
 }
 
@@ -461,6 +500,28 @@ tex_span :: proc(t: ^Tex) -> [2]u32 {
 	return {lo, min(hi - lo, PAGES)}
 }
 
+// Pages a transfer of h rows from (x0, y0), w wide, writes; every page when
+// it wraps past the buffer's width or local memory's last row.
+@(private)
+rect_pages :: proc(psm, bp, bw, x0, y0, w, h: u32) -> [2]u32 {
+	if x0 + w > bw * 64 || y0 + h > 2048 {return {0, PAGES}}
+	return page_span(psm, bp, bw, y0, y0 + h - 1)
+}
+
+// Record a write to the pages of span (see hw.seq).
+@(private)
+pages_write :: proc(span: [2]u32) {
+	hw.seq += 1
+	for i in 0 ..< span[1] {hw.page_seq[(span[0] + i) % PAGES] = hw.seq}
+}
+
+// The last write to a page of span.
+@(private)
+pages_seq :: proc(span: [2]u32) -> (seq: u64) {
+	for i in 0 ..< span[1] {seq = max(seq, hw.page_seq[(span[0] + i) % PAGES])}
+	return
+}
+
 @(private)
 pages_mark :: proc(set: ^Page_Set, span: [2]u32) {
 	for i in 0 ..< span[1] {
@@ -500,6 +561,64 @@ pages_hit :: proc(set: ^Page_Set, span: [2]u32) -> bool {
 		if set[p / 64] & (1 << (p % 64)) != 0 {return true}
 	}
 	return false
+}
+
+// The decoded copy of a state's texture, decoding it now when there is no
+// valid one: its offset in hw.dec and words per layer, or offset 0 to read
+// local memory. Only direct-colour textures that repeat or clamp, whose
+// sampled texels all lie inside each level's w x h. A texture sharing a page
+// with the state's frame or depth buffer may read the state's own writes
+// and is never decoded.
+@(private)
+hw_dec :: proc(t: ^Tex, st: ^Hw_State, fb, z, tex: [2]u32) -> (off, stride: u32) {
+	switch t.psm {
+	case PSMCT32, PSMCT24, PSMCT16, PSMCT16S: // the formats fetch converts directly
+	case: return
+	}
+	if t.wms >= 2 || t.wmt >= 2 {return}
+	if spans_meet(tex, fb) || spans_meet(tex, z) {return}
+	k := Dec_Key{psm = t.psm, ta = st.ta, aem = u32(t.aem), tw = t.w, th = t.h, nlev = 1}
+	if t.mmin >= 2 && t.mmin <= 5 {k.nlev = t.mxl + 1}
+	if k.nlev > 7 {return}
+	k.tb[0] = t.tbp | t.tbw << 16
+	for n in 1 ..< k.nlev {k.tb[n] = st.mtb[n - 1]}
+	size: u32
+	for n in 0 ..< k.nlev {size += max(t.w >> n, 1) * max(t.h >> n, 1)}
+	layers := hw.scale * hw.scale
+	if size * layers > DEC_WORDS / 4 {return}
+	e, ok := hw.dec_map[k]
+	if ok && pages_seq(tex) <= e.seq {return e.off, e.stride}
+	if !ok {
+		if hw.dec_top + size * layers > DEC_WORDS {
+			clear(&hw.dec_map)
+			hw.dec_top = DEC_FIRST
+		}
+		e = {off = hw.dec_top, stride = size}
+		hw.dec_top += size * layers
+	}
+	e.seq = hw.seq
+	hw.dec_map[k] = e
+	pc := Decode_PC {
+		vram   = hw.vram.addr,
+		outp   = hw.dec.addr + vk.DeviceAddress(e.off * 4),
+		psm    = k.psm,
+		ta     = k.ta,
+		aem    = k.aem,
+		tw     = k.tw,
+		th     = k.th,
+		nlev   = k.nlev,
+		stride = size,
+		tb     = k.tb,
+	}
+	hw_dispatch(hw.decode, &pc, (size + 63) / 64, layers)
+	return e.off, e.stride
+}
+
+@(private)
+spans_meet :: proc(a, b: [2]u32) -> bool {
+	set: Page_Set
+	pages_mark(&set, b)
+	return pages_hit(&set, a)
 }
 
 // The primitive's state index, appending the state if it changed.
@@ -557,14 +676,22 @@ hw_state :: proc(c: ^Ctx) -> u32 {
 		}
 	}
 	st.flags = transmute(u32)f
-	if hw.state_ok && st == hw.state {return hw.state_idx}
+	// The texture's decoded copy stands until a page is written.
+	if c.tme {st.dec, st.dec_ls = hw.state.dec, hw.state.dec_ls}
+	if hw.state_ok && st == hw.state && (!c.tme || hw.dec_seq == hw.seq) {return hw.state_idx}
+	fb := page_span(c.fpsm, c.fbp, c.fbw, st.sy0, st.sy1)
+	z := c.zte && !c.zmsk ? page_span(c.zpsm, c.zbp, c.fbw, st.sy0, st.sy1) : {}
+	tex := c.tme ? tex_span(t) : {}
+	if c.tme {
+		st.dec, st.dec_ls = hw_dec(t, &st, fb, z, tex)
+		hw.dec_seq = hw.seq
+		if hw.state_ok && st == hw.state {return hw.state_idx}
+	}
 	hw.state, hw.state_ok = st, true
 	hw.state_idx = u32(s.nstates)
 	([^]Hw_State)(s.states.ptr)[s.nstates] = st
 	s.nstates += 1
-	hw.fb_pages = page_span(c.fpsm, c.fbp, c.fbw, st.sy0, st.sy1)
-	hw.z_pages = c.zte && !c.zmsk ? page_span(c.zpsm, c.zbp, c.fbw, st.sy0, st.sy1) : {}
-	hw.tex_pages = c.tme ? tex_span(t) : {}
+	hw.fb_pages, hw.z_pages, hw.tex_pages = fb, z, tex
 	hw.fb_key, hw.z_key = layout_key(c.fpsm, c.fbp, c.fbw), layout_key(c.zpsm, c.zbp, c.fbw)
 	hw.fb_marked, hw.tex_ok = false, false
 	return hw.state_idx
@@ -661,6 +788,8 @@ hw_draw :: proc(c: ^Ctx, kind: u64) {
 	if !hw.fb_marked {
 		pages_mark_owner(hw.fb_pages, hw.fb_key)
 		pages_mark_owner(hw.z_pages, hw.z_key)
+		pages_write(hw.fb_pages)
+		pages_write(hw.z_pages)
 		hw.fb_marked, hw.tex_ok = true, false
 	}
 
@@ -878,4 +1007,5 @@ hw_snap_copy :: proc(b: core.Vk_Buf, save: bool) {
 	}
 	hw.barrier_due = true
 	hw.clut_ok = false // the slot's ring copy is of the CLUT before
+	if !save {pages_write({0, PAGES})}
 }
