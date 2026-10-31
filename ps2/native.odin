@@ -33,8 +33,16 @@ import vu "vu"
 #assert(offset_of(cpu.Cpu, fcr31) == 680)
 #assert(offset_of(cpu.Cpu, cop0) == 684)
 #assert(offset_of(cpu.Cpu, cycles) == 816)
-// And VU0's VI registers by this offset from import vu.vf.
+// And a VU's VI and other registers by these offsets from import vu.vf or
+// vu1.vf; acc at a multiple of 16 for arm64's scaled ldr q.
 #assert(offset_of(vu.Vu, vi) - offset_of(vu.Vu, vf) == 512)
+#assert(offset_of(vu.Vu, acc) - offset_of(vu.Vu, vf) == 544 && offset_of(vu.Vu, acc) % 16 == 0)
+#assert(offset_of(vu.Vu, q) - offset_of(vu.Vu, vf) == 560)
+#assert(offset_of(vu.Vu, p) - offset_of(vu.Vu, vf) == 564)
+#assert(offset_of(vu.Vu, i) - offset_of(vu.Vu, vf) == 568)
+#assert(offset_of(vu.Vu, clip) - offset_of(vu.Vu, vf) == 576)
+#assert(offset_of(vu.Vu, status) - offset_of(vu.Vu, vf) == 580)
+#assert(offset_of(vu.Vu, mac) - offset_of(vu.Vu, vf) == 584)
 
 // bc_cond for native code, which reads a 32-bit result.
 @(private = "file")
@@ -258,6 +266,9 @@ native_imports :: proc() -> map[string]u64 {
 	m["ps2.sdl"] = p(rawptr(sdl))
 	m["ps2.sdr"] = p(rawptr(sdr))
 	m["vu.vf"] = p(&vu.vu0.vf)
+	// vu.acc is an old microprogram import, reached through vu.vf now; the
+	// rest below are still CFC2/CTC2's. Kept so older blobs still load; drop
+	// at the next NATIVE_VERSION.
 	m["vu.acc"] = p(&vu.vu0.acc)
 	m["vu.q"] = p(&vu.vu0.q)
 	m["vu.i"] = p(&vu.vu0.i)
@@ -276,6 +287,8 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.ctrl_read"] = p(rawptr(vu.vu0_ctrl_read))
 	m["vu.ctrl_write"] = p(rawptr(vu.vu0_ctrl_write))
 	// The microprograms' (recomp/vu/native.odin): VU0's vu.*, VU1's vu1.*.
+	// vu.p is an old microprogram import, reached through vu.vf now. Kept so
+	// older blobs still load; drop at the next NATIVE_VERSION.
 	m["vu.p"] = p(&vu.vu0.p)
 	m["vu.upper"] = p(rawptr(vu.vu0_upper))
 	m["vu.lower"] = p(rawptr(vu.vu0_lower))
@@ -285,6 +298,8 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.run_budget"] = p(&vu.native_run[0].budget)
 	m["vu.scratch"] = p(&vu.native_run[0].scratch)
 	m["vu1.vf"] = p(&vu.vu1.vf)
+	// Old microprogram imports: they reach these through vu1.vf
+	// now. Kept so older blobs still load; drop at the next NATIVE_VERSION.
 	m["vu1.acc"] = p(&vu.vu1.acc)
 	m["vu1.q"] = p(&vu.vu1.q)
 	m["vu1.i"] = p(&vu.vu1.i)

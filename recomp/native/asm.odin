@@ -690,13 +690,14 @@ vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 	}
 }
 
-// Every 32-bit lane of dst = the 4 bytes at the address in import base.
-vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string) {
+// Every 32-bit lane of dst = the 4 bytes at off from the address in import
+// base.
+vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string, off: u32) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_vec_splat_load(a, dst, base)
+		x64_vec_splat_load(a, dst, base, off)
 	case .Arm64:
-		a64_vec_splat_load(a, dst, base)
+		a64_vec_splat_load(a, dst, base, off)
 	}
 }
 

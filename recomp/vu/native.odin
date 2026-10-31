@@ -24,14 +24,7 @@ import "../native"
 // The imports a unit's code uses.
 @(private)
 Imp :: enum u8 {
-	Vf, // vf, then vi at VU_VI
-	Acc,
-	Q,
-	I,
-	P,
-	Mac,
-	Status,
-	Clip,
+	Vf, // vf, then vi and the other registers at VU_VI and on
 	Mem, // data memory
 	Upper, // the interpreter: proc(uw: u32)
 	Lower, // proc(lw, pc: u32)
@@ -50,13 +43,6 @@ Imp :: enum u8 {
 IMPORTS := [Unit][Imp]string {
 	.VU0 = {
 		.Vf = "vu.vf",
-		.Acc = "vu.acc",
-		.Q = "vu.q",
-		.I = "vu.i",
-		.P = "vu.p",
-		.Mac = "vu.mac",
-		.Status = "vu.status",
-		.Clip = "vu.clip",
 		.Mem = "vu.mem",
 		.Upper = "vu.upper",
 		.Lower = "vu.lower",
@@ -72,13 +58,6 @@ IMPORTS := [Unit][Imp]string {
 	},
 	.VU1 = {
 		.Vf = "vu1.vf",
-		.Acc = "vu1.acc",
-		.Q = "vu1.q",
-		.I = "vu1.i",
-		.P = "vu1.p",
-		.Mac = "vu1.mac",
-		.Status = "vu1.status",
-		.Clip = "vu1.clip",
 		.Mem = "vu1.mem",
 		.Upper = "vu1.upper",
 		.Lower = "vu1.lower",
@@ -108,9 +87,12 @@ VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
 @(private = "file")
 VU_NORM :: 448
 
-// The offset of vi from vf in vu.Vu, which ps2/native.odin asserts: the VI
-// registers are reached through import vf.
+// The offsets of vi and the other registers from vf in vu.Vu, which
+// ps2/native.odin asserts: they are reached through import vf, which a
+// microprogram's code keeps in a register.
 VU_VI :: 512
+@(private = "file")
+VU_ACC, VU_Q, VU_P, VU_I, VU_CLIP, VU_STATUS, VU_MAC :: 544, 560, 564, 568, 576, 580, 584
 
 // The bytes of import scratch, and what they hold: a VF register before and
 // after a hazard pair's upper op, a quadword of data memory for ILW and ISW,
@@ -161,11 +143,11 @@ clip :: proc(a: ^native.Asm, u: Unit, w: u32) -> bool {
 	}
 	native.bind(a, done)
 	// v.clip = ((v.clip << 6) | f) & 0xffffff
-	native.imp_load(a, .A, IMPORTS[u][.Clip])
+	native.imp_load(a, .A, IMPORTS[u][.Vf], VU_CLIP)
 	native.alu_imm(a, .Shl, .A, 6)
 	native.alu(a, .Or, .A, .LD)
 	native.alu_imm(a, .And, .A, 0xffffff)
-	native.imp_store(a, IMPORTS[u][.Clip], .A)
+	native.imp_store(a, IMPORTS[u][.Vf], .A, VU_CLIP)
 	return true
 }
 
@@ -210,15 +192,15 @@ div :: proc(a: ^native.Asm, u: Unit, w, key: u32, status: bool) -> bool {
 		}
 		native.bind(a, flags)
 		// v.status = (v.status &~ 0x30) | f | f << 6
-		native.imp_load(a, .C, IMPORTS[u][.Status])
+		native.imp_load(a, .C, IMPORTS[u][.Vf], VU_STATUS)
 		native.alu_imm(a, .And, .C, ~u32(0x30))
 		native.alu(a, .Or, .C, .LD)
 		native.alu_imm(a, .Shl, .LD, 6)
 		native.alu(a, .Or, .C, .LD)
-		native.imp_store(a, IMPORTS[u][.Status], .C)
+		native.imp_store(a, IMPORTS[u][.Vf], .C, VU_STATUS)
 	}
 	quotient(a, key)
-	native.imp_store(a, IMPORTS[u][.Q], .A)
+	native.imp_store(a, IMPORTS[u][.Vf], .A, VU_Q)
 	return true
 }
 
@@ -437,7 +419,7 @@ efu :: proc(a: ^native.Asm, u: Unit, lw, key: u32) {
 		native.mov_imm(a, .A, key)
 		native.call(a, EFU, .A, .B)
 	}
-	native.imp_store(a, IMPORTS[u][.P], .A)
+	native.imp_store(a, IMPORTS[u][.Vf], .A, VU_P)
 }
 
 // r = cpu.fclamp of the f32 bits in r: exponent 255 to +-FMAX, exponent 0
@@ -486,7 +468,7 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 	upper := fn < 0x3c
 	key := upper ? fn : ((w >> 4) & 0x7c) | bc
 	if upper && fn >= 0x30 {return int_op(a, u, w)}
-	vf, acc := IMPORTS[u][.Vf], IMPORTS[u][.Acc]
+	vf := IMPORTS[u][.Vf]
 	kind: Kind
 	src := Src.Vec
 	switch key {
@@ -631,9 +613,9 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 			native.vec_load(a, .V2, 16 * ft, vf)
 			native.vec_shuf32(a, .V1, .V2, u8(bc))
 		case .Q:
-			native.vec_splat_load(a, .V1, IMPORTS[u][.Q])
+			native.vec_splat_load(a, .V1, IMPORTS[u][.Vf], VU_Q)
 		case .I:
-			native.vec_splat_load(a, .V1, IMPORTS[u][.I])
+			native.vec_splat_load(a, .V1, IMPORTS[u][.Vf], VU_I)
 		}
 		// The order key of each word: x ^ 0x7fffffff where x < 0, so
 		// signed lanes compare as sign and magnitude.
@@ -700,9 +682,9 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 			native.vec_load(a, .V2, 16 * ft, vf)
 			native.vec_shuf32(a, .V1, .V2, u8(bc))
 		case .Q:
-			native.vec_splat_load(a, .V1, IMPORTS[u][.Q])
+			native.vec_splat_load(a, .V1, IMPORTS[u][.Vf], VU_Q)
 		case .I:
-			native.vec_splat_load(a, .V1, IMPORTS[u][.I])
+			native.vec_splat_load(a, .V1, IMPORTS[u][.Vf], VU_I)
 		}
 		// The lanes read: dest of fs, and of ft, or its bc lane; Q and I are
 		// never known.
@@ -716,7 +698,7 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 	}
 	if kind == .Madd || kind == .Msub || kind == .Opmsub {
 		// acc + or - the product, rounded on its own first
-		native.vec_load(a, .V1, 0, acc)
+		native.vec_load(a, .V1, VU_ACC, vf)
 		native.vec_op(a, .Fadd if kind == .Madd else .Fsub, .V1, .V0)
 		native.vec_copy(a, .V0, .V1)
 	}
@@ -735,13 +717,13 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 	}
 	if kind == .Add || kind == .Sub || kind == .Mul || kind == .Madd || kind == .Msub {
 		if !upper {
-			put(a, 0, acc, dest)
+			put(a, VU_ACC, vf, dest)
 		} else if fd != 0 {
 			put(a, 16 * fd, vf, dest)
 			wrote(known, fd, dest, true)
 		}
 	} else if kind == .Opmul {
-		put(a, 0, acc, dest)
+		put(a, VU_ACC, vf, dest)
 	} else if fd != 0 {
 		put(a, 16 * fd, vf, dest)
 		wrote(known, fd, dest, true)
@@ -750,7 +732,7 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 	native.mov(a, .C, .A)
 	native.alu_imm(a, .Shl, .C, 4)
 	native.alu(a, .Or, .C, .B)
-	native.imp_store(a, IMPORTS[u][.Mac], .C)
+	native.imp_store(a, IMPORTS[u][.Vf], .C, VU_MAC)
 	if flags == .Mac {return true}
 	// status: Z and S in bits 0-1, sticky in 6-7
 	native.set_cond_imm(a, .Ne, .A, 0)
@@ -760,10 +742,10 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 	native.mov(a, .A, .B)
 	native.alu_imm(a, .Shl, .A, 6)
 	native.alu(a, .Or, .B, .A)
-	native.imp_load(a, .A, IMPORTS[u][.Status])
+	native.imp_load(a, .A, IMPORTS[u][.Vf], VU_STATUS)
 	native.alu_imm(a, .And, .A, ~u32(0xf))
 	native.alu(a, .Or, .A, .B)
-	native.imp_store(a, IMPORTS[u][.Status], .A)
+	native.imp_store(a, IMPORTS[u][.Vf], .A, VU_STATUS)
 	return true
 }
 
@@ -839,7 +821,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		native.mov_imm(a, .B, pc)
 		native.call(a, IMPORTS[u][.Lower], .A, .B)
 	}
-	vf, clip, mac := IMPORTS[u][.Vf], IMPORTS[u][.Clip], IMPORTS[u][.Mac]
+	vf := IMPORTS[u][.Vf]
 	if known != nil && ft != 0 && lower_writes_vf(lw) {known[ft] &~= u8(dest)}
 	switch lw >> 25 {
 	case 0x00: // LQ
@@ -860,31 +842,31 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		native.alu_imm(a, native.Alu.Add if lw >> 25 == 0x08 else native.Alu.Sub, .A, imm15)
 		vi_put(a, u, it)
 	case 0x10: // FCEQ
-		native.imp_load(a, .A, clip)
+		native.imp_load(a, .A, vf, VU_CLIP)
 		native.alu_imm(a, .And, .A, 0xffffff)
 		vi_test(a, u, 1, .Eq, imm24)
 	case 0x11: // FCSET
 		native.mov_imm(a, .A, imm24)
-		native.imp_store(a, clip, .A)
+		native.imp_store(a, vf, .A, VU_CLIP)
 	case 0x12: // FCAND
-		native.imp_load(a, .A, clip)
+		native.imp_load(a, .A, vf, VU_CLIP)
 		native.alu_imm(a, .And, .A, imm24)
 		vi_test(a, u, 1, .Ne, 0)
 	case 0x13: // FCOR
-		native.imp_load(a, .A, clip)
+		native.imp_load(a, .A, vf, VU_CLIP)
 		native.alu_imm(a, .Or, .A, imm24)
 		native.alu_imm(a, .And, .A, 0xffffff)
 		vi_test(a, u, 1, .Eq, 0xffffff)
 	case 0x18: // FMEQ
 		if it == 0 {return}
-		native.imp_load(a, .A, mac)
+		native.imp_load(a, .A, vf, VU_MAC)
 		native.alu_imm(a, .And, .A, 0xffff)
 		vi_get(a, u, .B, is)
 		native.set_cond(a, .Eq, .A, .B)
 		vi_put(a, u, it)
 	case 0x1a, 0x1b: // FMAND, FMOR
 		if it == 0 {return}
-		native.imp_load(a, .A, mac)
+		native.imp_load(a, .A, vf, VU_MAC)
 		vi_get(a, u, .B, is)
 		if lw >> 25 == 0x1a {
 			native.alu(a, .And, .A, .B)
@@ -896,7 +878,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		}
 	case 0x1c: // FCGET
 		if it == 0 {return}
-		native.imp_load(a, .A, clip)
+		native.imp_load(a, .A, vf, VU_CLIP)
 		native.alu_imm(a, .And, .A, 0xfff)
 		vi_put(a, u, it)
 	case 0x40:
@@ -922,7 +904,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 			ilw_isw(a, u, key == 0x3f, dest, it)
 		case 0x64: // MFP: no flags, clamped
 			if ft == 0 || dest == 0 {return}
-			native.imp_load(a, .A, IMPORTS[u][.P])
+			native.imp_load(a, .A, vf, VU_P)
 			fclamp_gpr(a, .A, .C)
 			for k in u32(0) ..< 4 {
 				if dest & (8 >> k) != 0 {native.imp_store(a, vf, .A, 16 * ft + 4 * k)}
@@ -976,11 +958,11 @@ micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair, slow: ^map[string]int, kno
 // clamped lanes past it, as emit_pair's.
 @(private = "file")
 micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]int, known: ^[32]u8) {
-	vf, scratch, status := IMPORTS[u][.Vf], IMPORTS[u][.Scratch], IMPORTS[u][.Status]
+	vf, scratch := IMPORTS[u][.Vf], IMPORTS[u][.Scratch]
 	if p.ibit { // the upper still reads the old I
 		micro_upper(a, u, p, slow, known)
 		native.mov_imm(a, .A, p.lw)
-		native.imp_store(a, IMPORTS[u][.I], .A)
+		native.imp_store(a, vf, .A, VU_I)
 		return
 	}
 	if p.mode == .Slow {
@@ -998,29 +980,29 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]
 	key := ((p.lw >> 4) & 0x7c) | (p.lw & 3)
 	merge := u == .VU0 && p.lw >> 25 == 0x40 && p.lw & 0x3c == 0x3c && key >= 0x38 && key <= 0x3a
 	if merge {
-		native.imp_load(a, .A, status)
+		native.imp_load(a, .A, vf, VU_STATUS)
 		native.imp_store(a, scratch, .A, SCR_ST0)
 	}
 	upper :: proc(a: ^native.Asm, u: Unit, p: Pair, merge: bool, slow: ^map[string]int, known: ^[32]u8) {
 		micro_upper(a, u, p, slow, known)
 		if !merge {return}
-		status, scratch := IMPORTS[u][.Status], IMPORTS[u][.Scratch]
-		native.imp_load(a, .A, status)
+		vf, scratch := IMPORTS[u][.Vf], IMPORTS[u][.Scratch]
+		native.imp_load(a, .A, vf, VU_STATUS)
 		native.imp_store(a, scratch, .A, SCR_UST)
 		native.imp_load(a, .A, scratch, SCR_ST0)
-		native.imp_store(a, status, .A)
+		native.imp_store(a, vf, .A, VU_STATUS)
 	}
 	lower :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, merge: bool, slow: ^map[string]int, known: ^[32]u8) {
 		micro_lower(a, u, p.lw, pc, merge, slow, known)
 		if !merge {return}
-		status, scratch := IMPORTS[u][.Status], IMPORTS[u][.Scratch]
+		vf, scratch := IMPORTS[u][.Vf], IMPORTS[u][.Scratch]
 		same := native.new_label(a)
-		native.imp_load(a, .A, status)
+		native.imp_load(a, .A, vf, VU_STATUS)
 		native.imp_load(a, .B, scratch, SCR_ST0)
 		native.alu(a, .Xor, .A, .B)
 		native.br_zero(a, .A, same, nonzero = true)
 		native.imp_load(a, .A, scratch, SCR_UST)
-		native.imp_store(a, status, .A)
+		native.imp_store(a, vf, .A, VU_STATUS)
 		native.bind(a, same)
 	}
 	switch p.mode {

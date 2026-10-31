@@ -562,11 +562,15 @@ x64_vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 	emit8(a, imm)
 }
 
-// Through rdx.
-x64_vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string) {
-	op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
+// Through r15 when base is the pinned import, else rdx.
+x64_vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string, off: u32) {
+	reg: u8 = R15
+	if base != a.pin {
+		op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
+		reg = RDX
+	}
 	emit8(a, 0x66)
-	op_state(a, false, 0x0f6e, u8(dst), 0, RDX) // movd
+	op_state(a, false, 0x0f6e, u8(dst), off, reg) // movd
 	x64_vec_shuf32(a, dst, dst, {0, 0, 0, 0})
 }
 

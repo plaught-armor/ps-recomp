@@ -207,7 +207,7 @@ a64_alu_imm :: proc(a: ^Asm, op: Alu, dst: Reg, v: u32) {
 // ldr/str q of the field at off: in the state, or, through x16, from the
 // address in import base.
 a64_vec_ldst :: proc(a: ^Asm, v: Vreg, off: u32, store: bool, base := "") {
-	assert(off / 16 < 4096, "native: state offset")
+	assert(off % 16 == 0 && off / 16 < 4096, "native: state offset")
 	n: u32 = S
 	if base != "" {
 		load_imp(a, IP0, imp(a, base))
@@ -380,9 +380,13 @@ a64_vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 	}
 }
 
-// Through x16.
-a64_vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string) {
+// Through x16. ld1r takes no offset, so a nonzero off costs an add.
+a64_vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string, off: u32) {
 	load_imp(a, IP0, imp(a, base))
+	if off != 0 {
+		assert(off < 4096, "native: import offset")
+		emit32(a, 0x91000000 | off << 10 | IP0 << 5 | IP0) // add x16, x16, #off
+	}
 	emit32(a, 0x4d40c800 | IP0 << 5 | u32(dst)) // ld1r .4s
 }
 
