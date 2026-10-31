@@ -13,9 +13,10 @@ void main() {
 	uvec2 p = gl_GlobalInvocationID.xy;
 	if (p.x >= pc.w || p.y >= pc.h) return;
 	VR = pc.vram;
+	Pixel s = pixel(pc.spsm, pc.sbp, pc.sbw, (pc.sx + p.x) & 2047u, (pc.sy + p.y) & 2047u);
+	Pixel d = pixel(pc.dpsm, pc.dbp, pc.dbw, (pc.dx + p.x) & 2047u, (pc.dy + p.y) & 2047u);
 	for (uint l = 0u; l < pc.layers; l++) {
 		LB = l * VRAM_WORDS;
-		uint v = read_raw(pc.spsm, pc.sbp, pc.sbw, (pc.sx + p.x) & 2047u, (pc.sy + p.y) & 2047u);
-		write_raw(pc.dpsm, pc.dbp, pc.dbw, (pc.dx + p.x) & 2047u, (pc.dy + p.y) & 2047u, v);
+		store(d, load(s));
 	}
 }

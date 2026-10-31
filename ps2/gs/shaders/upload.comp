@@ -19,8 +19,9 @@ void main() {
 	uint x = (pc.x0 + p % pc.w) & 2047u;
 	uint y = (pc.y0 + p / pc.w) & 2047u;
 	uint v = pc.data.w[i];
+	Pixel q = pixel(pc.psm, pc.bp, pc.bw, x, y);
 	for (uint l = 0u; l < pc.layers; l++) {
 		LB = l * VRAM_WORDS;
-		write_raw(pc.psm, pc.bp, pc.bw, x, y, v);
+		store(q, v);
 	}
 }

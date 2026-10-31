@@ -61,28 +61,35 @@ uint addr4(uint bp, uint bw, uint x, uint y) {
 
 uint word(uint i) { return VR.w[LB + i]; }
 
-uint read_raw(uint psm, uint bp, uint bw, uint x, uint y) {
+// Where a pixel lives: bits (w >> sh) & m of word i in each layer. Layers share
+// the layout, so a caller touching every layer computes this once. m is 0 for a
+// format with no pixels.
+struct Pixel { uint i; uint sh; uint m; };
+
+Pixel pixel(uint psm, uint bp, uint bw, uint x, uint y) {
 	switch (psm) {
-	case PSMCT32: case PSMZ32: return word(addr32(psm, bp, bw, x, y));
-	case PSMCT24: case PSMZ24: return word(addr32(psm, bp, bw, x, y)) & 0xffffffu;
+	case PSMCT32: case PSMZ32: return Pixel(addr32(psm, bp, bw, x, y), 0u, 0xffffffffu);
+	case PSMCT24: case PSMZ24: return Pixel(addr32(psm, bp, bw, x, y), 0u, 0xffffffu);
 	case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: {
 		uint a = addr16(psm, bp, bw, x, y);
-		return (word(a >> 1) >> ((a & 1u) * 16u)) & 0xffffu;
+		return Pixel(a >> 1, (a & 1u) * 16u, 0xffffu);
 	}
 	case PSMT8: {
 		uint a = addr8(bp, bw, x, y);
-		return (word(a >> 2) >> ((a & 3u) * 8u)) & 0xffu;
+		return Pixel(a >> 2, (a & 3u) * 8u, 0xffu);
 	}
 	case PSMT4: {
 		uint n = addr4(bp, bw, x, y);
-		return (word(n >> 3) >> ((n & 7u) * 4u)) & 15u;
+		return Pixel(n >> 3, (n & 7u) * 4u, 15u);
 	}
-	case PSMT8H: return word(addr32(PSMCT32, bp, bw, x, y)) >> 24;
-	case PSMT4HL: return (word(addr32(PSMCT32, bp, bw, x, y)) >> 24) & 15u;
-	case PSMT4HH: return word(addr32(PSMCT32, bp, bw, x, y)) >> 28;
+	case PSMT8H: return Pixel(addr32(PSMCT32, bp, bw, x, y), 24u, 0xffu);
+	case PSMT4HL: return Pixel(addr32(PSMCT32, bp, bw, x, y), 24u, 15u);
+	case PSMT4HH: return Pixel(addr32(PSMCT32, bp, bw, x, y), 28u, 15u);
 	}
-	return 0u;
+	return Pixel(0u, 0u, 0u);
 }
+
+uint load(Pixel p) { return (word(p.i) >> p.sh) & p.m; }
 
 // Store `v` in the bits `m` of word i. Neighbouring pixels of a sub-word
 // format share words, and different fragments run concurrently, so partial
@@ -92,30 +99,11 @@ void store_bits(uint i, uint m, uint v) {
 	atomicOr(VR.w[LB + i], v & m);
 }
 
-void write_raw(uint psm, uint bp, uint bw, uint x, uint y, uint v) {
-	switch (psm) {
-	case PSMCT32: case PSMZ32: VR.w[LB + addr32(psm, bp, bw, x, y)] = v; break;
-	case PSMCT24: case PSMZ24: store_bits(addr32(psm, bp, bw, x, y), 0xffffffu, v); break;
-	case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: {
-		uint a = addr16(psm, bp, bw, x, y);
-		uint sh = (a & 1u) * 16u;
-		store_bits(a >> 1, 0xffffu << sh, v << sh);
-		break;
-	}
-	case PSMT8: {
-		uint a = addr8(bp, bw, x, y);
-		uint sh = (a & 3u) * 8u;
-		store_bits(a >> 2, 0xffu << sh, v << sh);
-		break;
-	}
-	case PSMT4: {
-		uint n = addr4(bp, bw, x, y);
-		uint sh = (n & 7u) * 4u;
-		store_bits(n >> 3, 15u << sh, v << sh);
-		break;
-	}
-	case PSMT8H: store_bits(addr32(PSMCT32, bp, bw, x, y), 0xff000000u, v << 24); break;
-	case PSMT4HL: store_bits(addr32(PSMCT32, bp, bw, x, y), 0x0f000000u, v << 24); break;
-	case PSMT4HH: store_bits(addr32(PSMCT32, bp, bw, x, y), 0xf0000000u, v << 28); break;
-	}
+void store(Pixel p, uint v) {
+	if (p.m == 0xffffffffu) VR.w[LB + p.i] = v;
+	else if (p.m != 0u) store_bits(p.i, p.m << p.sh, v << p.sh);
 }
+
+uint read_raw(uint psm, uint bp, uint bw, uint x, uint y) { return load(pixel(psm, bp, bw, x, y)); }
+
+void write_raw(uint psm, uint bp, uint bw, uint x, uint y, uint v) { store(pixel(psm, bp, bw, x, y), v); }
