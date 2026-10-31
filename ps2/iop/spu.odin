@@ -9,7 +9,9 @@
 // spu2.cpp, MIT, Samir Nuri). Volume sweeps are taken at full scale.
 //
 // Voices advance by the samples spu_mix renders, the same clock the FMOD
-// voices run on.
+// voices run on. A block transfer (a PCM stream into a core) only keeps the
+// time: the game polls where it reads to refill its ring, and that address
+// moves with EE time.
 //
 // A port whose sound driver is its own HLE code, not sdrdrv, drives the same
 // voices through spu_write, spu_voice_on, spu_voice_set, spu_voice_off and
@@ -61,6 +63,41 @@ spu: struct {
 	// unity (x * 0x4000 >> 14 == x) that spu_volume never returns, where its
 	// 0x3fff loses a step on loud samples.
 	master: [2][2]i32,
+	block:  [2]Sdr_Block, // sdrdrv's block transfers, per channel
+}
+
+// A block transfer (sceSdBlockTrans) as a clock only: its samples are not
+// played. It reads its buffer from `start` on, at a modelled 48 kHz of
+// 16-bit stereo (4 bytes a sample), unverified against retail; a looping
+// one wraps to `base`, a one-shot one stops at its end.
+@(private = "file")
+Sdr_Block :: struct {
+	base, size: u32, // its buffer, IOP addresses
+	start:      u32, // the offset it started at
+	cycles:     u64, // the EE cycle it started at
+	loop:       bool,
+	on:         bool,
+}
+
+// sceSdBlockTrans mode bits, from what the EE side sends: 2 stops, 3
+// starts at the address after the size; SD_BLOCK_LOOP repeats the buffer.
+@(private = "file")
+SD_TRANS_STOP :: 2
+@(private = "file")
+SD_TRANS_START_AT :: 3
+@(private = "file")
+SD_BLOCK_LOOP :: 0x10
+@(private = "file")
+SD_BLOCK_RATE :: 48000 * 4
+
+// Where block transfer b reads now: an IOP address.
+@(private = "file")
+sdr_block_pos :: proc(b: ^Sdr_Block) -> u32 {
+	if !b.on || b.size == 0 {return b.base + b.start}
+	moved := (cpu.state.cycles - b.cycles) * SD_BLOCK_RATE / cpu.EE_CLOCK
+	off := u64(b.start) + moved
+	off = b.loop ? off % u64(b.size) : min(off, u64(b.size))
+	return b.base + u32(off)
 }
 
 // libsd parameter and address ids; the low bits name core and voice.
@@ -369,8 +406,19 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		} else {
 			r = u32(copy(iop_ram[src:][:size], spu.ram[dst:][:size]))
 		}
+	case 0x80e0: // sceSdBlockTrans {channel, mode, IOP address, size, start address}
+		b := &spu.block[w[1] & 1]
+		if w[2] & 3 == SD_TRANS_STOP {
+			r = sdr_block_pos(b)
+			b.start, b.on = r - b.base, false
+			break
+		}
+		b^ = {base = w[3], size = w[4], cycles = cpu.state.cycles, loop = w[2] & SD_BLOCK_LOOP != 0, on = true}
+		if w[2] & 3 == SD_TRANS_START_AT && w[5] - w[3] < w[4] {b.start = w[5] - w[3]}
 	case 0x80f0: // sceSdVoiceTransStatus {channel, flag}: always complete
 		r = 1
+	case 0x8100: // sceSdBlockTransStatus {channel, flag}: where it reads now
+		r = sdr_block_pos(&spu.block[w[1] & 1]) & 0xffffff
 	case:
 		if cpu.debug >= 1 {fmt.eprintfln("sdr: unhandled fno %x", fno)}
 	}

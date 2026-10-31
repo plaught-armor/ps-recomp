@@ -17,6 +17,9 @@
 // CRI ADX streams, driven through the driver's RPC and DTX packets, play
 // through core 1: its master volume scales them and its one saturate takes
 // them with its voices; core 0's master leaves them alone.
+// sdrdrv's block transfer keeps time: its status address moves with EE
+// cycles, wraps a looping buffer, stops a one-shot one at its end, and a
+// stop answers where it was and resumes from there.
 package main
 
 import "core:fmt"
@@ -415,6 +418,39 @@ adx :: proc() {
 	check(silent, "a stopped stream is silent")
 }
 
+// Call sdrdrv's RPC function fno: the reply's first word. The EE side sends
+// the function code, then its arguments.
+sdr_call :: proc(fno: u32, args: ..u32) -> u32 {
+	buf: [64]u8
+	w := ([^]u32)(&buf)
+	w[0] = fno
+	for a, i in args {w[i + 1] = a}
+	iop.sif.servers[0x80000701](fno, buf[:], u32(len(args) * 4 + 4))
+	return w[0]
+}
+
+BLOCK_BASE :: 0x30000
+BLOCK_SIZE :: 0x4000
+
+block_trans :: proc() {
+	SECOND :: u64(cpu.EE_CLOCK)
+	sdr_call(0x80e0, 1, 0x13, BLOCK_BASE, BLOCK_SIZE, BLOCK_BASE + 0x400) // loop, from 0x400
+	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + 0x400, "a block transfer starts where it is told")
+	cpu.state.cycles += SECOND / 100 // 1920 bytes
+	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + 0x400 + 1920, "a block transfer moves at 48 kHz, 4 bytes a sample")
+	check(sdr_call(0x8100, 0, 0) == 0, "the other channel stays still")
+	cpu.state.cycles += SECOND / 10 // 19200 more
+	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + (0x400 + 1920 + 19200) % BLOCK_SIZE, "a looping block transfer wraps")
+	at := sdr_call(0x80e0, 1, 2)
+	check(at == BLOCK_BASE + (0x400 + 1920 + 19200) % BLOCK_SIZE, "a stop answers where it was")
+	cpu.state.cycles += SECOND
+	check(sdr_call(0x8100, 1, 0) == at, "a stopped block transfer stays still")
+	sdr_call(0x80e0, 1, 0x03, BLOCK_BASE, BLOCK_SIZE, at) // one-shot, from there
+	cpu.state.cycles += SECOND
+	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + BLOCK_SIZE, "a one-shot block transfer stops at its end")
+	sdr_call(0x80e0, 1, 2)
+}
+
 game :: proc(_: rawptr) {
 	voices()
 	wide()
@@ -423,6 +459,7 @@ game :: proc(_: rawptr) {
 	reverb_fmod()
 	effects()
 	adx()
+	block_trans()
 	for n in 0 ..< BLOCKS {
 		b: [16]u8
 		b[0] = u8(n) << 4 // filters 0..2
