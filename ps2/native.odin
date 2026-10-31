@@ -184,9 +184,10 @@ exec_op :: proc(pc, w, op: u32) {
 // Lane masks for inline VU0 ops, at the offsets r5900's native code uses:
 // the exponent, the sign, the largest finite value, the magnitude, zero,
 // then the lanes of each dest field, the ITOF4/12/15 and FTOI4/12/15
-// scales, and the bits of the largest f32 below 2^31.
+// scales, the bits of the largest f32 below 2^31, and those of the
+// smallest normal f32.
 @(private = "file")
-vu_k: [5 + 16 + 7][4]u32
+vu_k: [5 + 16 + 8][4]u32
 
 // The runtime procedures and variables native code imports, by name.
 native_imports :: proc() -> map[string]u64 {
@@ -201,6 +202,7 @@ native_imports :: proc() -> map[string]u64 {
 		vu_k[21 + n] = {u, u, u, u}
 	}
 	vu_k[27] = {0x4effffff, 0x4effffff, 0x4effffff, 0x4effffff}
+	vu_k[28] = {0x00800000, 0x00800000, 0x00800000, 0x00800000}
 	m["mem.ram"] = p(mem.ram_base)
 	m["ps2.no_pages"] = p(&no_pages)
 	m["mem.spr"] = p(&mem.spr)

@@ -63,6 +63,7 @@ Kind :: enum u8 {
 	Vec, // word imm of v over the vectors vec_in gives, or (flag) of P with itself
 	Vec_Shift, // word imm of Q's halfwords (words with flag) shifted by op and n
 	Funnel, // word imm of the 16 bytes from byte n of P then Q
+	Min32p, // word imm of Min32p over min32p_in's vectors n, or (flag) of src with itself
 	Any, // not checked
 }
 
@@ -300,6 +301,9 @@ expect :: proc(c: Case, x, y: u32) -> u32 {
 			}
 		}
 		return (transmute([4]u32)h)[c.imm]
+	case .Min32p:
+		p, q := min32p_in(x, y, c.n)
+		return vec_ref(.Min32p, q if c.flag else p, q)[c.imm]
 	case .Funnel:
 		p, q := vec_in(x, y)
 		pq := transmute([32]u8)[8]u32{p[0], p[1], p[2], p[3], q[0], q[1], q[2], q[3]}
@@ -315,6 +319,20 @@ expect :: proc(c: Case, x, y: u32) -> u32 {
 vec_in :: proc(x, y: u32) -> (p, q: [4]u32) {
 	return {x, y, x ~ 0x80008000, y + 0x7fff7fff}, {y, x, ~y, (x << 7) ~ y}
 }
+
+// Min32p's dst and src lanes, which meet its precondition: for n 0, P's
+// lanes and 0x7fffffff and Q's and 0x7f7fffff; for n 1, MIN32P_DST and
+// MIN32P_SRC.
+min32p_in :: proc(x, y, n: u32) -> (p, q: [4]u32) {
+	if n == 1 {return MIN32P_DST, MIN32P_SRC}
+	p, q = vec_in(x, y)
+	return p & 0x7fffffff, q & 0x7f7fffff
+}
+
+// Infinity, a quiet and a signalling NaN and a denormal against the
+// largest finite value and the smallest normal.
+MIN32P_DST := [4]u32{0x7f800000, 0x7fc00000, 0x7f800001, 0x00000001}
+MIN32P_SRC := [4]u32{0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x00800000}
 
 vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 	db, sb := transmute([16]u8)d, transmute([16]u8)s
@@ -458,6 +476,9 @@ vec_ref :: proc(op: native.Vop, d, s: [4]u32) -> [4]u32 {
 		return r4
 	case .Even32:
 		return {d[0], d[2], s[0], s[2]}
+	case .Min32p:
+		for k in 0 ..< 4 {r4[k] = u32(min(i32(d[k]), i32(s[k])))}
+		return r4
 	}
 	return transmute([4]u32)r
 }
@@ -1002,8 +1023,35 @@ build_vec :: proc() {
 		native.vec_store(&a, add_vec({kind = .Vec, v = op, flag = d == s}), d)
 	}
 	for op in native.Vop {
+		if op == .Min32p {continue}
 		run(op, .V0, .V1, p, q)
 		run(op, .V1, .V0, p, q)
+	}
+	// Min32p, of the vectors min32p_in gives, src with itself too.
+	for n in u32(0) ..< 2 {
+		mp := add_vec({kind = .Any})
+		mq := add_vec({kind = .Any})
+		for k in u32(0) ..< 4 {
+			if n == 1 {
+				native.state_store_imm(&a, mp + 4 * k, MIN32P_DST[k])
+				native.state_store_imm(&a, mq + 4 * k, MIN32P_SRC[k])
+				continue
+			}
+			native.state_load(&a, .C, p + 4 * k)
+			native.alu_imm(&a, .And, .C, 0x7fffffff)
+			native.state_store(&a, mp + 4 * k, .C)
+			native.state_load(&a, .C, q + 4 * k)
+			native.alu_imm(&a, .And, .C, 0x7f7fffff)
+			native.state_store(&a, mq + 4 * k, .C)
+		}
+		for same in ([2]bool{false, true}) {
+			d, s := native.Vreg.V1, native.Vreg.V0
+			if same {d = s}
+			native.vec_load(&a, s, mq)
+			if !same {native.vec_load(&a, d, mp)}
+			native.vec_op(&a, .Min32p, d, s)
+			native.vec_store(&a, add_vec({kind = .Min32p, n = n, flag = same}), d)
+		}
 	}
 	for d in native.Vreg {
 		for s in native.Vreg {

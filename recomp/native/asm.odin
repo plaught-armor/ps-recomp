@@ -147,6 +147,10 @@ Vop :: enum u8 {
 	Abs16, // dst = the halfwords of src, absolute and saturating; dst is not src
 	Abs32, // dst = the words of src, absolute and saturating; uses V2 on x64
 	Even32, // words 0 and 2 of dst, then of src
+	// signed, for dst lanes in 0 ..= 0x7fffffff and src lanes that are not
+	// NaN as f32: x64's minps then orders the words as smin does, and a NaN
+	// dst lane gives src's
+	Min32p,
 }
 
 Label :: distinct i32

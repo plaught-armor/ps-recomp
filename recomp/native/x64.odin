@@ -383,6 +383,7 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Abs16    = 0x0fee, // pmaxsw of src and 0 - src, saturating
 		.Abs32    = 0x0ffa, // psubd of the sign mask from src ^ it, then paddd of where that is negative
 		.Even32   = 0x0fc6, // shufps 0x88
+		.Min32p   = 0x0f5d, // minps
 	}
 	ops := OPS
 	sse :: proc(a: ^Asm, op: u32, dst, src: Vreg, ps := false) {
@@ -493,7 +494,7 @@ x64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		return
 	}
 	if op == .Ftoi {emit8(a, 0xf3)}
-	sse(a, ops[op], dst, src, op == .Fadd || op == .Fsub || op == .Fmul || op == .Fdiv || op == .Itof || op == .Ftoi)
+	sse(a, ops[op], dst, src, op == .Fadd || op == .Fsub || op == .Fmul || op == .Fdiv || op == .Itof || op == .Ftoi || op == .Min32p)
 	if op == .Nor {
 		sse(a, 0x0f76, .V2, .V2) // pcmpeqd: all ones
 		sse(a, 0x0fef, dst, .V2) // pxor

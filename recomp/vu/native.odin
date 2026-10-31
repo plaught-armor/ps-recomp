@@ -105,6 +105,8 @@ K :: "vu.k"
 VU_EXP, VU_SIGN, VU_MAX, VU_ABS, VU_ZERO, VU_DEST :: 0, 16, 32, 48, 64, 80
 @(private = "file")
 VU_ITOF, VU_FTOI, VU_BIG :: 336, 384, 432 // ITOF and FTOI rows for bc 1-3
+@(private = "file")
+VU_NORM :: 448
 
 // The offset of vi from vf in vu.Vu, which ps2/native.odin asserts: the VI
 // registers are reached through import vf.
@@ -562,24 +564,20 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 		native.vec_store(a, off, .V0, base)
 	}
 	// vclamp of x: an infinite or NaN lane to the largest finite value of
-	// its sign, a denormal one to zero of its sign. Loses t1, t2 and t3.
+	// its sign, a denormal one to zero of its sign. Works on the magnitude:
+	// exponent 0 is a magnitude below the smallest normal, and Min32p takes
+	// exponent 255 to the largest finite value. Loses t1, t2 and t3.
 	clamp :: proc(a: ^native.Asm, x, t1, t2, t3: native.Vreg) {
-		native.vec_load(a, t1, VU_EXP, K)
+		native.vec_load(a, t1, VU_SIGN, K)
 		native.vec_op(a, .And, t1, x)
-		native.vec_load(a, t2, VU_EXP, K)
-		native.vec_op(a, .Eq32, t2, t1) // exponent all ones
-		native.vec_load(a, t3, VU_ZERO, K)
-		native.vec_op(a, .Eq32, t3, t1) // exponent zero
-		native.vec_op(a, .Or, t3, t2)
-		native.vec_load(a, t1, VU_MAX, K)
-		native.vec_op(a, .And, t1, t2)
-		native.vec_load(a, t2, VU_SIGN, K)
+		native.vec_op(a, .Xor, x, t1) // the magnitude
+		native.vec_load(a, t2, VU_NORM, K)
+		native.vec_op(a, .Gt32, t2, x) // exponent zero
+		native.vec_load(a, t3, VU_MAX, K)
+		native.vec_op(a, .Min32p, x, t3)
 		native.vec_op(a, .And, t2, x)
-		native.vec_op(a, .Or, t1, t2)
-		native.vec_op(a, .And, t1, t3)
-		native.vec_op(a, .Andn, t3, x)
-		native.vec_op(a, .Or, t3, t1)
-		native.vec_copy(a, x, t3)
+		native.vec_op(a, .Xor, x, t2)
+		native.vec_op(a, .Or, x, t1)
 	}
 	// Whether lanes l of vf[r] are known clamped.
 	sure :: proc(known: ^[32]u8, r, l: u32) -> bool {return known != nil && u32(known[r]) & l == l}

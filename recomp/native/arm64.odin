@@ -289,6 +289,7 @@ a64_vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		.Abs16    = 0x4e607800, // sqabs .8h
 		.Abs32    = 0x4ea07800, // sqabs .4s
 		.Even32   = 0x4e801800, // uzp1 .4s
+		.Min32p   = 0x4ea06c00, // smin .4s
 	}
 	ops := OPS
 	if op == .Itof || op == .Ftoi || op == .Abs16 || op == .Abs32 {
