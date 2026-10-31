@@ -331,6 +331,8 @@ load_slow :: proc(a: u32, size: u32) -> u32 {
 		return 0
 	case a == 0xfffe0130:
 		return 0
+	case io_far_read != nil:
+		return io_far_read(p, size)
 	}
 	fmt.eprintfln("bus: read%d from unmapped %#08x (present %d, ra %#08x)", size * 8, a, presents, state.r[31])
 	return 0
@@ -361,6 +363,8 @@ store_slow :: proc(a, v: u32, size: u32) {
 	case p >= 0x1f801000 && p < 0x1f803000:
 		io_write(p, v, size)
 	case a == 0xfffe0130:
+	case io_far_write != nil:
+		io_far_write(p, v, size)
 	case:
 		fmt.eprintfln("bus: write%d %#x to unmapped %#08x (present %d, ra %#08x)", size * 8, v, a, presents, state.r[31])
 	}

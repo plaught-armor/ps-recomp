@@ -110,7 +110,7 @@ main :: proc() {
 	if cpu.registered(0x80010000) || cpu.registered(0x80010100) {
 		fail("F's page still in the fixed table after a store to it")
 	}
-	// The interpreter's branch test (psx goto_target) reads the fixed table
+	// The interpreter's branch test (psx_cpu goto_target) reads the fixed table
 	// only: a branch into F, its slot empty, interprets.
 	if cpu.dispatch.fixed[cpu.fn_index(0x80010000)] != nil {
 		fail("an interpreted branch into F would run its old native code")

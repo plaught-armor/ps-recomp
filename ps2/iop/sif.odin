@@ -10,11 +10,13 @@ package ps2_iop
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "ps:core"
 import "ps:core/disc"
 import cpu "../cpu"
 import mem "../mem"
+import r3000 "ps:psx/cpu"
 
 IOP_RAM_SIZE :: 2 << 20 // the IOP's RAM, what IOP code sees
 IOP_SPACE :: 8 << 20 // IOP addresses the SIF reaches: RAM, then the HLE's own area
@@ -35,7 +37,7 @@ SIF_STAT_SIFINIT :: 0x10000
 SIF_STAT_CMDINIT :: 0x20000
 SIF_STAT_BOOTEND :: 0x40000
 
-iop_ram: []u8
+iop_ram: []u8 // the IOP CPU's RAM (iop_cpu.odin)
 
 // IOP addresses IOP_RAM_SIZE up to IOP_SPACE are a mirror of RAM on retail.
 // Here they hold the HLE's own memory instead: fake server descriptors and
@@ -69,7 +71,10 @@ sif: struct {
 }
 
 sif_init :: proc() {
-	iop_ram = core.snap_area(IOP_RAM_SIZE)
+	#assert(IOP_RAM_SIZE == r3000.RAM_SIZE)
+	iop_ram = r3000.ram[:]
+	slice.zero(iop_ram)
+	iop_cpu_init()
 	iop_hle = core.snap_area(IOP_SPACE - IOP_RAM_SIZE)
 	sif.smflg = SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND
 	sif.sreg[0] = IOP_CMDBUF // SIF_SYSREG_SUBADDR
@@ -848,5 +853,6 @@ sif_snap :: proc() {
 	core.snap_add(&fileio)
 	core.snap_add(&iop_heap_top)
 	core.snap_add(&iop_heap_last)
+	iop_cpu_snap()
 	adx_snap()
 }

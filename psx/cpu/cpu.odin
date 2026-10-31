@@ -8,6 +8,10 @@
 // vector or table entry, recompiled overlay function whose overlay is
 // resident (or executable function demoted by a write to its page, whose code
 // is still the same: watch.odin), interpreter.
+//
+// The package's globals are one R3000's: the PS1's CPU in a psx binary, and
+// the IOP's in a ps2 binary, which owns them as the IOP (ps2/iop). No binary
+// runs both machines.
 package psx_cpu
 
 import "core:fmt"
@@ -15,7 +19,8 @@ import "core:os"
 
 import "ps:core"
 
-// Handlers in the packages above this one, set by package psx at init.
+// Handlers in the packages above this one, set by package psx at init, or
+// by ps2/iop for the IOP.
 bios_a, bios_b, bios_c: proc(fn: u32)
 bios_syscall: proc()
 // Runs a call to one of the BIOS's B0 and C0 table entries, or with run
@@ -24,8 +29,20 @@ bios_syscall: proc()
 bios_entry: proc(addr: u32, run: bool) -> bool
 irq_check: proc()
 interp_run: proc(start: u32)
+// Runs the machine's due events; interp_loop calls it.
+run_events: proc()
+// The GTE (COP2), for interp_loop; nil on the IOP, which has none, so a
+// COP2 instruction is bad_insn there. Recompiled PS1 code calls psx/gte
+// directly.
+gte_cmd: proc(cmd: u32)
+gte_read: proc(r: u32) -> u32
+gte_write: proc(r, v: u32)
 io_read: proc(p: u32, size: u32) -> u32
 io_write: proc(p, v: u32, size: u32)
+// Loads and stores the bus has no device for (load_slow and store_slow's
+// default case), when set: the IOP's devices outside the PS1's I/O window.
+io_far_read: proc(p: u32, size: u32) -> u32
+io_far_write: proc(p, v: u32, size: u32)
 ram_keep: proc(p: u32)
 
 Cpu :: struct {

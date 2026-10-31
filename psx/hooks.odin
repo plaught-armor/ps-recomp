@@ -20,7 +20,11 @@ hooks_init :: proc "contextless" () {
 	cpu.bios_syscall = bios.bios_syscall
 	cpu.bios_entry = bios.bios_entry
 	cpu.irq_check = io.irq_check
-	cpu.interp_run = interp_run
+	cpu.interp_run = cpu.interp_loop
+	cpu.run_events = io.run_events
+	cpu.gte_cmd = gte.gte_cmd
+	cpu.gte_read = gte.gte_read
+	cpu.gte_write = gte.gte_write
 	cpu.io_read = io_read
 	cpu.io_write = io_write
 	cpu.ram_keep = ram_keep
@@ -40,3 +44,8 @@ hooks_init :: proc "contextless" () {
 	io.dma_channels = dma_channel_table
 	spu.platform_audio = host.platform_audio
 }
+
+// cpu.CYCLES_PER_INSN, where the host reads it too. Native rewrites use it
+// for the cycles they charge under MAPCHECK and old replays
+// (psx.charge_native).
+CYCLES_PER_INSN :: cpu.CYCLES_PER_INSN

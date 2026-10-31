@@ -2,15 +2,13 @@
 // recompiled, unlabelled jump targets).
 //
 // It follows the same calling convention as recompiled code: `jal`/`jalr`
-// become host calls through `call`, and `jr $ra` returns from interp_run.
+// become host calls through `call`, and `jr $ra` returns from interp_loop,
+// which is what the PS1 and the IOP both set interp_run to.
 // Plain jumps stay inside the interpreter unless they land on a function the
 // dispatcher knows, in which case they become a tail call.
-package psx
+package psx_cpu
 
 import "ps:core"
-import cpu "cpu"
-import io "io"
-import gte "gte"
 
 @(private)
 INTERP_EVENT_STRIDE :: 64
@@ -24,48 +22,43 @@ Interp :: struct {
 	done:   bool,
 }
 
-interp_run :: proc(start: u32) {
+interp_loop :: proc(start: u32) {
 	st := Interp {
 		pc = start,
 	}
 	budget := 0
 	for !st.done {
-		w := cpu.lw(st.pc)
+		w := lw(st.pc)
 		pc := st.pc
 		st.pc += 4
 		if .Interp in core.trace.active && core.trace_pc_ok(pc) {
 			core.tracef(.Interp, "%08x %08x", pc, w)
 		}
 		interp_exec(&st, pc, w)
-		cpu.state.r[0] = 0
-		cpu.state.cycles += CYCLES_PER_INSN
+		state.r[0] = 0
+		state.cycles += CYCLES_PER_INSN
 		budget += 1
 		if budget >= INTERP_EVENT_STRIDE {
 			budget = 0
-			if cpu.state.cycles >= cpu.next_event {
-				io.run_events()
+			if state.cycles >= next_event {
+				run_events()
 			}
 		}
 	}
 }
 
-// cpu.CYCLES_PER_INSN, where the host reads it too. Native rewrites use it
-// for the cycles they charge under MAPCHECK and old replays
-// (psx.charge_native).
-CYCLES_PER_INSN :: cpu.CYCLES_PER_INSN
-
 // Execute the delay slot at st.pc, then follow a taken branch to target.
 @(private)
 branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	slot := st.pc
-	w := cpu.lw(slot)
+	w := lw(slot)
 	st.pc += 4
 	if .Interp in core.trace.active && core.trace_pc_ok(slot) {
 		core.tracef(.Interp, "%08x %08x (delay)", slot, w)
 	}
 	interp_exec(st, slot, w)
-	cpu.state.r[0] = 0
-	cpu.state.cycles += CYCLES_PER_INSN
+	state.r[0] = 0
+	state.cycles += CYCLES_PER_INSN
 	if taken {
 		goto_target(st, target)
 	}
@@ -75,9 +68,9 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 // there to step), is a tail call: call it, and its return is this code's.
 @(private)
 goto_target :: proc(st: ^Interp, target: u32) {
-	fixed := cpu.is_ram_addr(target) && cpu.dispatch.fixed[cpu.fn_index(target)] != nil
-	if fixed || cpu.host_call(target, false) {
-		cpu.call(target)
+	fixed := is_ram_addr(target) && dispatch.fixed[fn_index(target)] != nil
+	if fixed || host_call(target, false) {
+		call(target)
 		st.done = true
 		return
 	}
@@ -91,9 +84,9 @@ signed_imm :: #force_inline proc(w: u32) -> u32 {
 
 @(private)
 interp_exec :: proc(st: ^Interp, pc, w: u32) {
-	when cpu.FALLBACK_COUNT {cpu.fallback_interp_insns += 1}
+	when FALLBACK_COUNT {fallback_interp_insns += 1}
 	when core.COMPAT_COUNT {core.compat.interp_insns += 1}
-	r := &cpu.state.r
+	r := &state.r
 	rs := (w >> 21) & 31
 	rt := (w >> 16) & 31
 	imm := signed_imm(w)
@@ -108,7 +101,7 @@ interp_exec :: proc(st: ^Interp, pc, w: u32) {
 	case 0x03:
 		r[31] = pc + 8
 		branch(st, false, 0)
-		cpu.call((pc & 0xf0000000) | ((w & 0x3ffffff) << 2))
+		call((pc & 0xf0000000) | ((w & 0x3ffffff) << 2))
 	case 0x04:
 		branch(st, r[rs] == r[rt], pc + 4 + (imm << 2))
 	case 0x05:
@@ -136,41 +129,43 @@ interp_exec :: proc(st: ^Interp, pc, w: u32) {
 	case 0x12:
 		interp_cop2(pc, w)
 	case 0x20:
-		r[rt] = cpu.lb(addr)
+		r[rt] = lb(addr)
 	case 0x21:
-		r[rt] = cpu.lh(addr)
+		r[rt] = lh(addr)
 	case 0x22:
-		r[rt] = cpu.lwl(addr, r[rt])
+		r[rt] = lwl(addr, r[rt])
 	case 0x23:
-		r[rt] = cpu.lw(addr)
+		r[rt] = lw(addr)
 	case 0x24:
-		r[rt] = cpu.lbu(addr)
+		r[rt] = lbu(addr)
 	case 0x25:
-		r[rt] = cpu.lhu(addr)
+		r[rt] = lhu(addr)
 	case 0x26:
-		r[rt] = cpu.lwr(addr, r[rt])
+		r[rt] = lwr(addr, r[rt])
 	case 0x28:
-		cpu.sb(addr, r[rt])
+		sb(addr, r[rt])
 	case 0x29:
-		cpu.sh(addr, r[rt])
+		sh(addr, r[rt])
 	case 0x2a:
-		cpu.swl(addr, r[rt])
+		swl(addr, r[rt])
 	case 0x2b:
-		cpu.sw(addr, r[rt])
+		sw(addr, r[rt])
 	case 0x2e:
-		cpu.swr(addr, r[rt])
+		swr(addr, r[rt])
 	case 0x32:
-		gte.gte_write(rt, cpu.lw(addr))
+		if gte_write == nil {bad_insn(pc, w); return}
+		gte_write(rt, lw(addr))
 	case 0x3a:
-		cpu.sw(addr, gte.gte_read(rt))
+		if gte_read == nil {bad_insn(pc, w); return}
+		sw(addr, gte_read(rt))
 	case:
-		cpu.bad_insn(pc, w)
+		bad_insn(pc, w)
 	}
 }
 
 @(private)
 interp_special :: proc(st: ^Interp, pc, w: u32) {
-	r := &cpu.state.r
+	r := &state.r
 	rs := (w >> 21) & 31
 	rt := (w >> 16) & 31
 	rd := (w >> 11) & 31
@@ -191,7 +186,7 @@ interp_special :: proc(st: ^Interp, pc, w: u32) {
 	case 0x08:
 		t := r[rs]
 		branch(st, false, 0)
-		if rs == 31 || t == cpu.frame_ret {
+		if rs == 31 || t == frame_ret {
 			st.done = true
 		} else {
 			goto_target(st, t)
@@ -200,27 +195,27 @@ interp_special :: proc(st: ^Interp, pc, w: u32) {
 		t := r[rs]
 		r[rd] = pc + 8
 		branch(st, false, 0)
-		cpu.call(t)
+		call(t)
 	case 0x0c:
-		cpu.syscall(pc)
+		syscall(pc)
 	case 0x0d:
-		cpu.brk(pc, (w >> 6) & 0xfffff)
+		brk(pc, (w >> 6) & 0xfffff)
 	case 0x10:
-		r[rd] = cpu.state.hi
+		r[rd] = state.hi
 	case 0x11:
-		cpu.state.hi = r[rs]
+		state.hi = r[rs]
 	case 0x12:
-		r[rd] = cpu.state.lo
+		r[rd] = state.lo
 	case 0x13:
-		cpu.state.lo = r[rs]
+		state.lo = r[rs]
 	case 0x18:
-		cpu.mult(r[rs], r[rt])
+		mult(r[rs], r[rt])
 	case 0x19:
-		cpu.multu(r[rs], r[rt])
+		multu(r[rs], r[rt])
 	case 0x1a:
-		cpu.div(r[rs], r[rt])
+		div(r[rs], r[rt])
 	case 0x1b:
-		cpu.divu(r[rs], r[rt])
+		divu(r[rs], r[rt])
 	case 0x20, 0x21:
 		r[rd] = r[rs] + r[rt]
 	case 0x22, 0x23:
@@ -238,13 +233,13 @@ interp_special :: proc(st: ^Interp, pc, w: u32) {
 	case 0x2b:
 		r[rd] = r[rs] < r[rt] ? 1 : 0
 	case:
-		cpu.bad_insn(pc, w)
+		bad_insn(pc, w)
 	}
 }
 
 @(private)
 interp_regimm :: proc(st: ^Interp, pc, w: u32) {
-	r := &cpu.state.r
+	r := &state.r
 	rs := (w >> 21) & 31
 	rt := (w >> 16) & 31
 	target := pc + 4 + (signed_imm(w) << 2)
@@ -253,7 +248,7 @@ interp_regimm :: proc(st: ^Interp, pc, w: u32) {
 		r[31] = pc + 8
 		branch(st, false, 0)
 		if taken {
-			cpu.call(target)
+			call(target)
 		}
 		return
 	}
@@ -266,17 +261,17 @@ interp_cop0 :: proc(pc, w: u32) {
 	rd := (w >> 11) & 31
 	switch (w >> 21) & 31 {
 	case 0x00:
-		cpu.state.r[rt] = cpu.mfc0(rd)
+		state.r[rt] = mfc0(rd)
 	case 0x04:
-		cpu.mtc0(rd, cpu.state.r[rt])
+		mtc0(rd, state.r[rt])
 	case 0x10:
 		if w & 0x3f == 0x10 {
-			cpu.rfe()
+			rfe()
 			return
 		}
-		cpu.bad_insn(pc, w)
+		bad_insn(pc, w)
 	case:
-		cpu.bad_insn(pc, w)
+		bad_insn(pc, w)
 	}
 }
 
@@ -284,20 +279,24 @@ interp_cop0 :: proc(pc, w: u32) {
 interp_cop2 :: proc(pc, w: u32) {
 	rt := (w >> 16) & 31
 	rd := (w >> 11) & 31
+	if gte_cmd == nil {
+		bad_insn(pc, w) // no GTE: the IOP
+		return
+	}
 	if w & 0x02000000 != 0 {
-		gte.gte_cmd(w & 0x1ffffff)
+		gte_cmd(w & 0x1ffffff)
 		return
 	}
 	switch (w >> 21) & 31 {
 	case 0x00:
-		cpu.state.r[rt] = gte.gte_read(rd)
+		state.r[rt] = gte_read(rd)
 	case 0x02:
-		cpu.state.r[rt] = gte.gte_read(rd + 32)
+		state.r[rt] = gte_read(rd + 32)
 	case 0x04:
-		gte.gte_write(rd, cpu.state.r[rt])
+		gte_write(rd, state.r[rt])
 	case 0x06:
-		gte.gte_write(rd + 32, cpu.state.r[rt])
+		gte_write(rd + 32, state.r[rt])
 	case:
-		cpu.fatal("bad cop2 %#08x at %#08x", w, pc)
+		fatal("bad cop2 %#08x at %#08x", w, pc)
 	}
 }
