@@ -353,6 +353,14 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	return true
 }
 
+// Close every IOP file and forget the reply buffer, which was in the old
+// program's memory, as the IOP reboot of _LoadExecPS2 does. The host files
+// stay open: see disc_open.
+fileio_reset :: proc() {
+	for &f in fileio.files {f = {}}
+	fileio.reply_buf = 0
+}
+
 @(private)
 fileio_file :: proc(fd: u32) -> ^Iop_File {
 	if int(fd) >= len(fileio.files) || fileio.files[fd].f == nil {return nil}

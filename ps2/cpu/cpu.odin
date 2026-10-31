@@ -92,7 +92,24 @@ text_range :: proc(lo, hi: u32) {
 }
 
 register :: proc(addr: u32, fn: Func_Proc) {
-	fn_table[(addr - text_lo) >> 2] = fn
+	t := fn_held != nil ? fn_held : fn_table
+	t[(addr - text_lo) >> 2] = fn
+}
+
+// The table while dispatch_set has it off, nil while it is on.
+@(private)
+fn_held: []Func_Proc
+
+// Turn the whole table on or off: off, lookup finds no function, so every
+// call is interpreted. The kernel turns it off when a program switch
+// (ExecPS2) leaves other code over the recompiled range: a native function
+// calls the others it knew directly, so only the whole table can go.
+dispatch_set :: proc(on: bool) {
+	if on && fn_held != nil {
+		fn_table, fn_held = fn_held, nil
+	} else if !on && fn_held == nil {
+		fn_table, fn_held = nil, fn_table
+	}
 }
 
 // Unchecked: the slot is tested against len(fn_table) first.

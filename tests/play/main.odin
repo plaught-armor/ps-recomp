@@ -23,7 +23,11 @@
 //   executable, checks its argc, stack and BSS; LoadExec of a missing file
 //   runs the boot executable again; Load and Exec of it return to the boot
 //   executable with its registers. The second executable's entry is in the
-//   row's entries.
+//   row's entries. Three PS2 discs switch programs: LoadExecPS2 of an ELF
+//   over the boot text, which runs interpreted and checks its argc and the
+//   memory cleared; LoadExecPS2 of a missing file, fatal; and a program that
+//   changes a word of its recompiled text and ExecPS2s into itself, which
+//   turns the function table off.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -228,22 +232,37 @@ load_exec_disc :: proc() -> []u8 {
 	return exec_disc({code = boot[:], data = SECOND}, {pc = 0x80020000, text = 0x80020000, size = 0x100, code = second[:]})
 }
 
-// A PS2 ELF: one segment, and one .text section for the recompiler, of
-// `b .` and its delay slot at 0x00100000, or the code given.
+// A PS2 ELF: code at text (32 words at most, `b .` and its delay slot when
+// none), the recompiler's .text section, and data at text + ELF_DATA, all in
+// one segment; it starts at entry, or text when that is 0.
+@(private = "file")
+Elf :: struct {
+	text:  u32,
+	entry: u32,
+	code:  []u32,
+	data:  string,
+}
+@(private = "file")
+ELF_DATA :: 0x80
+
 @(private = "file")
 elf :: proc(code: ..u32) -> []u8 {
-	TEXT :: 0x00100000
+	return elf_at({text = 0x00100000, code = code})
+}
+
+@(private = "file")
+elf_at :: proc(x: Elf) -> []u8 {
 	CODE :: 0x100 // file offset of the code
-	CODE_SIZE :: 0x40
+	SEGMENT_SIZE :: 0x100
 	SHSTRTAB :: "\x00.text\x00.shstrtab\x00"
-	SH :: 0x180 // file offset of the section headers
-	assert(len(code) * 4 <= CODE_SIZE)
-	e := make([]u8, 0x200, context.temp_allocator)
+	SH :: CODE + SEGMENT_SIZE // file offset of the section headers
+	assert(len(x.code) * 4 <= ELF_DATA && len(x.data) <= SEGMENT_SIZE - ELF_DATA)
+	e := make([]u8, SH + 3 * 40, context.temp_allocator)
 	copy(e, "\x7fELF\x01\x01\x01")
 	endian.put_u16(e[16:], .Little, 2) // executable
 	endian.put_u16(e[18:], .Little, 8) // MIPS
 	endian.put_u32(e[20:], .Little, 1)
-	endian.put_u32(e[24:], .Little, TEXT) // entry
+	endian.put_u32(e[24:], .Little, x.entry != 0 ? x.entry : x.text)
 	endian.put_u32(e[28:], .Little, 52) // program headers
 	endian.put_u32(e[32:], .Little, SH)
 	endian.put_u16(e[40:], .Little, 52)
@@ -255,10 +274,10 @@ elf :: proc(code: ..u32) -> []u8 {
 	ph := e[52:]
 	endian.put_u32(ph[0:], .Little, 1) // PT_LOAD
 	endian.put_u32(ph[4:], .Little, CODE)
-	endian.put_u32(ph[8:], .Little, TEXT)
-	endian.put_u32(ph[12:], .Little, TEXT)
-	endian.put_u32(ph[16:], .Little, CODE_SIZE)
-	endian.put_u32(ph[20:], .Little, CODE_SIZE)
+	endian.put_u32(ph[8:], .Little, x.text)
+	endian.put_u32(ph[12:], .Little, x.text)
+	endian.put_u32(ph[16:], .Little, SEGMENT_SIZE)
+	endian.put_u32(ph[20:], .Little, SEGMENT_SIZE)
 	endian.put_u32(ph[24:], .Little, 5) // read, execute
 	endian.put_u32(ph[28:], .Little, 16)
 	copy(e[0x80:], SHSTRTAB)
@@ -266,27 +285,86 @@ elf :: proc(code: ..u32) -> []u8 {
 	endian.put_u32(text[0:], .Little, 1) // ".text"
 	endian.put_u32(text[4:], .Little, 1) // PROGBITS
 	endian.put_u32(text[8:], .Little, 6) // alloc, execute
-	endian.put_u32(text[12:], .Little, TEXT)
+	endian.put_u32(text[12:], .Little, x.text)
 	endian.put_u32(text[16:], .Little, CODE)
-	endian.put_u32(text[20:], .Little, CODE_SIZE)
+	endian.put_u32(text[20:], .Little, ELF_DATA)
 	endian.put_u32(text[32:], .Little, 4)
 	strtab := e[SH + 80:]
 	endian.put_u32(strtab[0:], .Little, 7) // ".shstrtab"
 	endian.put_u32(strtab[4:], .Little, 3) // STRTAB
 	endian.put_u32(strtab[16:], .Little, 0x80)
 	endian.put_u32(strtab[20:], .Little, len(SHSTRTAB))
-	endian.put_u32(e[CODE:], .Little, 0x1000ffff)
-	for w, k in code {
+	endian.put_u32(e[CODE:], .Little, LOOP)
+	for w, k in x.code {
 		endian.put_u32(e[CODE + 4 * k:], .Little, w)
 	}
+	copy(e[CODE + ELF_DATA:], x.data)
 	return e
 }
+
+@(private = "file")
+PS2_CNF :: "BOOT2 = cdrom0:\\DATA\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n"
 
 // A PS2 disc with SYSTEM.CNF naming DATA/SLUS_123.45, the ELF of code.
 @(private = "file")
 ps2_disc :: proc(code: ..u32) -> []u8 {
-	cnf :: "BOOT2 = cdrom0:\\DATA\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n"
-	return discimg.make_iso(cnf, sub_name = "SLUS_123.45;1", sub = string(elf(..code)))
+	return discimg.make_iso(PS2_CNF, sub_name = "SLUS_123.45;1", sub = string(elf(..code)))
+}
+
+// A PS2 disc booting boot, with DATA/SECOND.ELF second when it has code.
+@(private = "file")
+ps2_exec_disc :: proc(boot: Elf, second: Elf = {}) -> []u8 {
+	sub2 := len(second.code) > 0 ? string(elf_at(second)) : ""
+	return discimg.make_iso(
+		PS2_CNF,
+		sub_name = "SLUS_123.45;1",
+		sub = string(elf_at(boot)),
+		sub2_name = sub2 != "" ? "SECOND.ELF;1" : "",
+		sub2 = sub2,
+	)
+}
+
+// LoadExecPS2(name, 0, 0) after a 1 in the word at 0x00300000. SECOND.ELF
+// loads over the boot text and starts at 0x00100040, which differs from the
+// recompiled code; through SetupThread it checks argc 1 (the file), and the
+// word cleared, then loops. Any check failing, or LoadExecPS2 returning, runs
+// an instruction the EE lacks.
+@(private = "file")
+ps2_loadexec_disc :: proc(name := "cdrom0:\\DATA\\SECOND.ELF;1") -> []u8 {
+	path := la(A0, 0x00100000 + ELF_DATA)
+	boot := [?]u32 {
+		lui(T0, 0x0030), li(T1, 1), sw(T1, 0, T0), // 0
+		path[0], path[1], li(A1, 0), li(A2, 0), li(V1, 6), SYSCALL, // 3
+		EE_BAD, // 9
+	}
+	second := [?]u32 {
+		lui(A3, 0x0020), li(A1, 0xffff), li(A2, 0), li(A0, 0), li(V1, 0x3c), SYSCALL, // 0: SetupThread(0, -1, 0, args)
+		lw(T0, 0, A3), li(T1, 1), bne(T0, T1, 7), NOP, // 6
+		lui(T2, 0x0030), lw(T2, 0, T2), bne(T2, 0, 3), NOP, // 10
+		LOOP, NOP, // 14
+		EE_BAD, // 16
+	}
+	return ps2_exec_disc(
+		{text = 0x00100000, code = boot[:], data = strings.concatenate({name, "\x00"}, context.temp_allocator)},
+		{text = 0x00100040, code = second[:]},
+	)
+}
+
+// The first run sets the word at 0x00200000, changes a word of its own text
+// inside the recompiled range and ExecPS2s into itself; the second, now
+// interpreted, finds the word set, calls the function at the range's end and
+// loops.
+@(private = "file")
+ps2_execps2_disc :: proc() -> []u8 {
+	code := [?]u32 {
+		lui(T0, 0x0020), lw(T1, 0, T0), bne(T1, 0, 9), li(T1, 1), // 0
+		sw(T1, 0, T0), lui(T2, 0x0010), sw(T1, 0x40, T2), // 4: the word at 16
+		lui(A0, 0x0010), li(A2, 0), li(V1, 7), SYSCALL, // 7: ExecPS2(0x00100000, gp, 0)
+		EE_BAD, // 11
+		jal(0x00100048), NOP, LOOP, NOP, // 12
+		NOP, NOP, JR_RA, NOP, // 16
+	}
+	return ps2_exec_disc({text = 0x00100000, code = code[:]})
 }
 
 // A disc with PSX.EXE in the root, where make_iso puts SYSTEM.CNF, and no
@@ -450,6 +528,9 @@ test_compat :: proc() {
 		{"loadexec.iso", loadexec_disc(), "ps1", "ok", "0", "", "80010100:", ""},
 		{"loadexec_missing.iso", loadexec_missing_disc(), "ps1", "ok", "0", "", "", "running the boot executable again"},
 		{"load_exec.iso", load_exec_disc(), "ps1", "ok", "0", "", "80020000:", ""},
+		{"ps2_loadexec.iso", ps2_loadexec_disc(), "ps2", "ok", "0", "", "00100040:", "kernel: LoadExecPS2"},
+		{"ps2_loadexec_missing.iso", ps2_loadexec_disc("cdrom0:\\DATA\\NONE.ELF;1"), "ps2", "fatal", "1", "", "", "LoadExecPS2: no ELF"},
+		{"ps2_execps2.iso", ps2_execps2_disc(), "ps2", "ok", "0", "", "00100000:", "differs from the recompiled program; interpreting"},
 	}
 	// ps2_stub needs a syscall the HLE lacks that stops a run outside
 	// COMPAT; one the kernel implements stubs nothing.
@@ -607,15 +688,21 @@ compat_row :: proc(rows: []play.Row, id: string) -> (play.Row, bool) {
 @(private = "file")
 V0 :: 2
 @(private = "file")
+V1 :: 3
+@(private = "file")
 A0 :: 4
 @(private = "file")
 A1 :: 5
 @(private = "file")
 A2 :: 6
 @(private = "file")
+A3 :: 7
+@(private = "file")
 T0 :: 8
 @(private = "file")
 T1 :: 9
+@(private = "file")
+T2 :: 10
 @(private = "file")
 S0 :: 16
 @(private = "file")
@@ -636,6 +723,10 @@ RESERVED :: 0xfc000000 // opcode 0x3f
 JAL_A0 :: 0x0c000028
 @(private = "file")
 JR_RA :: 0x03e00008
+@(private = "file")
+SYSCALL :: 0x0000000c
+@(private = "file")
+EE_BAD :: 0xec000000 // opcode 0x3b, no EE instruction
 
 @(private = "file")
 lui :: proc(rt, imm: u32) -> u32 {return 0x3c000000 | rt << 16 | imm}
@@ -654,6 +745,8 @@ move :: proc(rd, rs: u32) -> u32 {return rs << 21 | rd << 11 | 0x21}
 beq :: proc(rs, rt, to: u32) -> u32 {return 0x10000000 | rs << 21 | rt << 16 | to}
 @(private = "file")
 bne :: proc(rs, rt, to: u32) -> u32 {return 0x14000000 | rs << 21 | rt << 16 | to}
+@(private = "file")
+jal :: proc(to: u32) -> u32 {return 0x0c000000 | (to >> 2) & 0x3ffffff}
 // rt = the 32-bit value.
 @(private = "file")
 la :: proc(rt, v: u32) -> [2]u32 {return {lui(rt, v >> 16), ori(rt, rt, v & 0xffff)}}

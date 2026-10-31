@@ -1,5 +1,6 @@
 // High-level emulation of the EE kernel: syscalls, threads, semaphores,
-// interrupt handlers, alarms and the event schedule that drives vblank.
+// interrupt handlers, alarms, the event schedule that drives vblank, and the
+// program switches (exec.odin).
 //
 // Each kernel thread runs on its own coroutine; switching threads saves the
 // CPU registers into the thread and loads the next one's. Interrupt
@@ -96,6 +97,7 @@ k: struct {
 	vblank_start: u64, // next vblank start
 	vblank_end:   u64,
 	frame:        u64,
+	exec:         Exec_State, // exec.odin
 }
 
 KE_OK :: 0
@@ -145,8 +147,6 @@ kernel_init :: proc() {
 ROM_ONLY_SYSCALLS := [0x83]string {
 	0x01 = "ResetEE",
 	0x05 = "ResumeIntrDispatch",
-	0x06 = "_LoadExecPS2",
-	0x07 = "_ExecPS2",
 	0x09 = "RFU009",
 	0x0a = "AddSbusIntcHandler",
 	0x0b = "RemoveSbusIntcHandler",
@@ -210,6 +210,8 @@ syscall :: proc(pc: u32) {
 	switch abs(n) {
 	case 0x02: // SetGsCrt(interlace, mode, field)
 		fmt.eprintfln("kernel: SetGsCrt(%d, %d, %d)", a0, a1, a2)
+	case 0x06: load_exec(a0, a1, a2)
+	case 0x07: exec_ps2(a0, a2, a3)
 	case 0x04: // Exit
 		cpu.fatal("program exited with %d", i32(a0))
 	case 0x10: ret = add_handler(&k.intc, a0, a1, a3)
@@ -423,11 +425,15 @@ thread :: proc(id: i32) -> ^Thread {
 	return k.threads[id]
 }
 
+// SetupThread(gp, stack, size, args, root): with args, the program's
+// arguments (exec.odin) are written there. Retail's stack differs: for -1
+// its top is the memory size less 0x1000, and it returns top - 0x2a0.
 setup_thread :: proc(gp, stack, size, args: u32) -> u32 {
 	cpu.state.r[28].d[0] = cpu.sx32(gp)
 	top := stack == 0xffffffff ? mem.RAM_SIZE : stack + size
 	t := k.current
 	t.gp, t.stack, t.stack_size = gp, top - size, size
+	if args != 0 {args_write(args)}
 	return top - 16
 }
 
@@ -520,6 +526,10 @@ exit_delete_thread :: proc() {
 // Free the thread exit_delete_thread left behind, once off its coroutine.
 @(private)
 reap :: proc() {
+	if co := k.exec.dead_co; co != nil && co != k.current.co {
+		k.exec.dead_co = nil
+		core.co_kill(co)
+	}
 	t := k.dead
 	if t == nil || t == k.current {return}
 	k.dead = nil
@@ -1008,4 +1018,6 @@ dump_threads :: proc() {
 kernel_snap :: proc() {
 	core.snap_add(&k)
 	core.snap_add(&idle_cycles)
+	// The table follows the state an exec left (exec.odin).
+	append(&core.snap_hooks, core.Snap_Hook{save = proc(_: int) {}, load = proc(_: int) {cpu.dispatch_set(!k.exec.text_off)}})
 }

@@ -2,7 +2,11 @@
 // slot, so a create/start/exit-delete loop runs for longer than there are
 // thread ids and keeps getting the same id back. It is freed also when it
 // was the last runnable thread, and the kernel idles on its coroutine until
-// an alarm wakes another. Last, _print formats its arguments from registers.
+// an alarm wakes another. _print formats its arguments from registers. Last,
+// a program patches one word of its own text and ExecPS2s into itself: every
+// other thread, semaphore, handler and alarm is gone, the function table is
+// off, and SetupThread hands it the arguments; with the word back, ExecPS2
+// runs the native function again.
 package main
 
 import "core:fmt"
@@ -15,16 +19,22 @@ import "ps:core"
 ENTRY :: 0x00100000
 IDLER :: ENTRY + 4 // a thread that blocks nobody but exits as the last one runnable
 ALARM :: ENTRY + 8 // its alarm handler, which wakes the main thread
+EXEC :: ENTRY + 12 // the program that ExecPS2s into itself
+PATCH :: ENTRY + 0x80 // the word of its text it changes
 PARAM :: 0x00200000
 STACK :: 0x00300000
 LOOPS :: 1000 // well past the 256 thread ids
 
 ran: int
+execs: int // runs of EXEC, native or interpreted
+other: i64 // a thread ExecPS2 ends
 
-sys :: proc(n: u32, a0: u32 = 0, a1: u32 = 0) -> i64 {
+sys :: proc(n: u32, a0: u32 = 0, a1: u32 = 0, a2: u32 = 0, a3: u32 = 0) -> i64 {
 	cpu.state.r[3].d[0] = u64(n)
 	cpu.state.r[4].d[0] = u64(a0)
 	cpu.state.r[5].d[0] = u64(a1)
+	cpu.state.r[6].d[0] = u64(a2)
+	cpu.state.r[7].d[0] = u64(a3)
 	kernel.syscall(ENTRY)
 	return i64(cpu.state.r[2].d[0])
 }
@@ -49,6 +59,61 @@ alarm :: proc() {
 	sys(transmute(u32)i32(-0x34), 1) // iWakeupThread(main)
 }
 
+// Native, the first run: leave a thread, a semaphore, an alarm and a handler
+// behind, change a word of the text and ExecPS2 into itself with two
+// arguments. The second run is native again once the word is back.
+exec_prog :: proc() {
+	execs += 1
+	if execs == 3 {
+		if kernel.k.exec.text_off || cpu.lookup(EXEC) == nil {fail("fail: the table is off with the text back")}
+		fmt.println("ok ExecPS2")
+		os.exit(0)
+	}
+	if execs != 1 {fail("fail: native EXEC on run %d", execs)}
+	mem.wr32(PARAM + 4, ENTRY)
+	mem.wr32(PARAM + 20, 100) // ready, but below the main thread
+	other = sys(0x20, PARAM)
+	sys(0x22, u32(other))
+	mem.wr32(PARAM + 4, 1) // max_count
+	if sys(0x40, PARAM) <= 0 {fail("fail: CreateSema")}
+	sys(0x18, 1000, ALARM)
+	sys(0x10, 2, ALARM)
+	kernel.k.current.wakeups = 3
+	kernel.k.current.prio = 10
+	ARGV :: PARAM + 0x300
+	mem.wr32(ARGV, ARGV + 0x40)
+	mem.wr32(ARGV + 4, ARGV + 0x42)
+	copy(mem.ram_slice(ARGV + 0x40, 5), "a\x00bc\x00")
+	mem.wr32(PATCH, 1)
+	sys(7, EXEC, 0, 2, ARGV)
+	fail("fail: ExecPS2 returned")
+}
+
+// The interpreter, which the second run of EXEC lands in with the table off.
+exec_interp :: proc(addr: u32) {
+	execs += 1
+	if execs != 2 || addr != EXEC {fail("fail: interpreted %08x on run %d", addr, execs)}
+	k := &kernel.k
+	if !k.exec.text_off || cpu.lookup(EXEC) != nil {fail("fail: the table is on with the text changed")}
+	if cpu.state.r[2].d[0] != EXEC {fail("fail: v0 %x, want the entry", cpu.state.r[2].d[0])}
+	t := k.current
+	if t != k.threads[1] || t.prio != 0 || t.wakeups != 0 {fail("fail: thread %d prio %d wakeups %d", t.id, t.prio, t.wakeups)}
+	if k.threads[other] != nil || k.thread_end != 2 {fail("fail: thread %d still allocated", other)}
+	for s in k.semas {if s != nil {fail("fail: semaphore %d left", s.id)}}
+	if len(k.intc) != 0 || len(k.alarms) != 0 {fail("fail: %d handlers, %d alarms left", len(k.intc), len(k.alarms))}
+	if k.exec.dead_co != nil {fail("fail: the old program's coroutine not freed")}
+	ARGS :: PARAM + 0x400
+	sys(0x3c, 0, STACK, 0x1000, ARGS) // SetupThread
+	if mem.rd32(ARGS) != 2 {fail("fail: argc %d", mem.rd32(ARGS))}
+	for want, n in ([2]string{"a", "bc"}) {
+		s, _ := kernel.guest_string(mem.rd32(ARGS + 4 + u32(n) * 4), 16)
+		if s != want {fail("fail: argv[%d] %q, want %q", n, s, want)}
+	}
+	mem.wr32(PATCH, 0)
+	sys(7, EXEC)
+	fail("fail: ExecPS2 returned")
+}
+
 fail :: proc(format: string, args: ..any) -> ! {
 	fmt.eprintfln(format, ..args)
 	os.exit(1)
@@ -64,6 +129,9 @@ main :: proc() {
 	cpu.register(ENTRY, worker)
 	cpu.register(IDLER, idler)
 	cpu.register(ALARM, alarm)
+	cpu.register(EXEC, exec_prog)
+	cpu.interp_hook = exec_interp
+	kernel.exec_boot()
 
 	mem.wr32(PARAM + 4, ENTRY)
 	mem.wr32(PARAM + 8, STACK)
@@ -119,4 +187,9 @@ main :: proc() {
 	sys(0x75, FMT) // must print, not stop the run
 	sys(0x75, 0x0f000000) // a format past RAM prints `?`
 	fmt.println("ok _print")
+
+	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.
+	main_t.co = core.co_create(proc(_: rawptr) {exec_prog()}, nil)
+	core.co_switch(main_t.co)
+	fail("fail: the program's coroutine returned")
 }

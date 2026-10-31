@@ -60,6 +60,7 @@ init :: proc() {
 // Host main thread: run the game from `entry` on thread 1's coroutine,
 // serving snapshot requests. Never returns.
 run :: proc(entry: u32) -> ! {
+	kernel.exec_boot()
 	t := kernel.k.threads[1]
 	t.co = core.co_create(proc(arg: rawptr) {
 		cpu.call(u32(uintptr(arg)))
