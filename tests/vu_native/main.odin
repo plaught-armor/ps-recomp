@@ -5,7 +5,8 @@
 // random state, the native function and the interpreter must leave the same
 // vf, vi, ACC, Q, P, I, R, CLIP, MAC, memory and stopping pc; on VU0 status
 // too, as VU0 code computes it. Every native run must end the program, and
-// no program may call the interpreter for an instruction. A second pass
+// no program may call the interpreter for an instruction, and a run from
+// one of a program's leaves must leave at once. A second pass
 // registers the functions as the runtime does (unless VUNATIVE=0) and runs the
 // same trials through vu0_call_micro and vu1_start, which must leave what a
 // direct call leaves; after a write into a program's micro memory, they
@@ -149,6 +150,21 @@ main :: proc() {
 					}
 					break
 				}
+			}
+		}
+		// A pair the clamp elision left unlabelled: the run leaves at once,
+		// with nothing changed.
+		for pc in p.leaves {
+			cases += 1
+			init := v^
+			random_state(&init, mem_init)
+			v^ = init
+			copy(mem, mem_init)
+			nr.pc, nr.budget = i32(pc), BUDGET
+			run()
+			if u32(nr.pc) != pc || !same_regs(v, &init, vu0) || !slice.equal(mem, mem_init) {
+				fails += 1
+				fmt.eprintfln("FAIL vu_native program %d (vu%d, from %04x): got pc %08x, want a leave at once", k, vu0 ? 0 : 1, pc, u32(nr.pc))
 			}
 		}
 	}

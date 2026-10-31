@@ -65,8 +65,8 @@ Known :: struct {
 }
 
 // The lanes every pair entered from a jump, a call or a resume knows: vf0
-// is always (0, 0, 0, 1).
-@(private = "file")
+// is always (0, 0, 0, 1). native.odin's lanes start from it too.
+@(private)
 KNOWN_NONE :: [32]u8{0 = 15}
 
 // Forget all but vf0 and the locals' names.
@@ -521,7 +521,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 
 // Whether lower op lw can write a VF register (its ft). Lists the ops that
 // cannot, so an op not listed counts as a writer.
-@(private = "file")
+@(private)
 lower_writes_vf :: proc(lw: u32) -> bool {
 	switch lw >> 25 {
 	case 0x01, 0x04, 0x05, 0x08, 0x09, 0x10 ..= 0x18, 0x1a ..= 0x1c, 0x20 ..= 0x2f: return false
