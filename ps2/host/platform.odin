@@ -140,12 +140,14 @@ platform_init :: proc(title: cstring) -> bool {
 	return true
 }
 
-// Exit, after printing the fallback counters when built with them, and
-// the VU1 program counters when VU1_STATS is set.
+// Exit, after printing the fallback counters when built with them, the
+// VU1 program counters when VU1_STATS is set, and the unmapped access
+// counts when some went unlogged.
 @(private)
 quit :: proc(code: int) -> ! {
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
 	vu.vu_stats_print()
+	cpu.unmapped_print()
 	core.compat_report()
 	os.exit(code)
 }

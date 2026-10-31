@@ -180,8 +180,44 @@ fatal :: proc(format: string, args: ..any) -> ! {
 	msg := fmt.tprintf(format, ..args)
 	fmt.eprintln("ee:", msg)
 	dump_regs()
+	unmapped_print()
 	core.compat_report(msg)
 	os.exit(1)
+}
+
+// The distinct addresses logged per kind of unmapped access (read, write);
+// past them a game sweeping unmapped memory is counted, not logged.
+UNMAPPED_LOG :: 64
+
+// Unmapped accesses: the addresses logged (a snap region, ps2 snap.odin),
+// and per kind how many were logged and how many there were. The counts
+// are diagnostics, not in snapshots.
+unmapped_seen: map[u32]bool
+@(private = "file")
+unmapped_logged: [2]int
+@(private = "file")
+unmapped_count: [2]u64
+
+// An access to an unmapped address (from the bus), said once per address
+// up to UNMAPPED_LOG per kind.
+unmapped :: proc(a: u32, write: bool) {
+	k := int(write)
+	what := write ? "write" : "read"
+	unmapped_count[k] += 1
+	if unmapped_logged[k] == UNMAPPED_LOG || a in unmapped_seen {return}
+	unmapped_seen[a] = true
+	unmapped_logged[k] += 1
+	fmt.eprintfln("ee: unmapped %s at %08x", what, a)
+	if unmapped_logged[k] == UNMAPPED_LOG {
+		fmt.eprintfln("ee: unmapped %ss: %d addresses logged, more only counted", what, UNMAPPED_LOG)
+	}
+}
+
+// Where a run ends: the counts, when any access went unlogged.
+unmapped_print :: proc() {
+	logged := unmapped_logged[0] + unmapped_logged[1]
+	if unmapped_count[0] + unmapped_count[1] == u64(logged) {return}
+	fmt.eprintfln("ee: unmapped accesses: %d reads, %d writes, %d logged", unmapped_count[0], unmapped_count[1], logged)
 }
 
 GPR_NAMES := [32]string {

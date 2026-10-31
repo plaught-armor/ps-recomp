@@ -43,7 +43,7 @@ hw_read :: proc(addr: u32, size: int) -> u64 {
 		}
 		return (^u64)(&mem.gsregs[o &~ 7])^
 	}
-	unmapped(a, "read")
+	cpu.unmapped(a, false)
 	return 0
 }
 
@@ -101,7 +101,7 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 		(^u64)(&mem.gsregs[o &~ 7])^ = v
 		return
 	}
-	unmapped(a, "write")
+	cpu.unmapped(a, true)
 }
 
 hw_read128 :: proc(a: u32) -> u128 {
@@ -120,15 +120,6 @@ hw_write128 :: proc(addr: u32, v: u128) {
 	hw_write(a + 8, u64(v >> 64), 8)
 }
 
-unmapped_seen: map[u32]bool
-
-@(private)
-unmapped :: proc(a: u32, what: string) {
-	if !unmapped_seen[a] {
-		unmapped_seen[a] = true
-		fmt.eprintfln("ee: unmapped %s at %08x", what, a)
-	}
-}
 
 // Start a DMA transfer. Channels without an implementation complete at once.
 dma_start :: proc(ch: u32) {

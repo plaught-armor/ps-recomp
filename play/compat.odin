@@ -15,6 +15,8 @@
 package play
 
 import "base:runtime"
+import "core:bufio"
+import "core:bytes"
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
@@ -35,6 +37,10 @@ COMPAT_FRAMES :: 3600
 @(private = "file")
 COMPAT_WAIT :: 600
 
+// The longest line of a child's output read, in bytes.
+@(private = "file")
+LOG_LINE_MAX :: 16 << 20
+
 // The most of a fatal message a row keeps, in bytes.
 @(private = "file")
 FATAL_MAX :: 200
@@ -49,8 +55,8 @@ FATAL_MAX :: 200
 // cycles_per_insn / cycles, at most 1; entries: the hottest interpreter
 // entries, pc:count, comma separated; unimplemented: name=count, semicolon
 // separated; fatal: the fatal message, else why a run stalled, else a
-// crash's or hang's last output line; when: UTC; shown: the vblanks that
-// showed a picture.
+// crash's last output line ("" for a hang); when: UTC; shown: the vblanks
+// that showed a picture.
 Column :: enum {
 	Id,
 	Serial,
@@ -261,14 +267,15 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	// was interpreted.
 	row[.Native] = "yes" if native && core.blob_cached(dir) else "no"
 
-	text, _ := os.read_entire_file(log_path, context.temp_allocator)
-	line, last := log_lines(string(text))
+	line, last := log_lines(log_path)
 	l: core.Compat_Line
 	if line != "" && json.unmarshal_string(line, &l) == nil {
 		line_row(&row, l)
+	} else if hang {
+		// Its last line is wherever the kill caught it, not a cause.
+		row[.Result] = "hang"
 	} else {
-		row[.Result] = "hang" if hang else "crash"
-		row[.Fatal] = last
+		row[.Result], row[.Fatal] = "crash", last
 	}
 	return
 }
@@ -308,21 +315,34 @@ child_env :: proc(dir: string, frames: u64, native: bool) -> []string {
 }
 
 // The last compat line's JSON in the child's output, "" for none, and its
-// last non-empty line.
+// last non-empty line, temp allocated. Read a line at a time: a game that
+// floods its output leaves gigabytes. A line past LOG_LINE_MAX ends the
+// read there.
 @(private = "file")
-log_lines :: proc(text: string) -> (line, last: string) {
-	rest := text
-	for l in strings.split_lines_iterator(&rest) {
-		s := strings.trim_right(l, "\r")
-		if s == "" {
+log_lines :: proc(path: string) -> (line, last: string) {
+	f, err := os.open(path)
+	if err != nil {
+		return
+	}
+	defer os.close(f)
+	s: bufio.Scanner
+	bufio.scanner_init(&s, os.to_stream(f), context.temp_allocator)
+	s.max_token_size = LOG_LINE_MAX
+	l := make([dynamic]u8, context.temp_allocator)
+	t := make([dynamic]u8, context.temp_allocator)
+	for bufio.scan(&s) {
+		b := bufio.scanner_bytes(&s)
+		if len(b) == 0 {
 			continue
 		}
-		last = s
-		if strings.has_prefix(s, "compat: ") {
-			line = s[len("compat: "):]
+		resize(&t, len(b))
+		copy(t[:], b)
+		if bytes.has_prefix(b, transmute([]u8)string("compat: ")) {
+			resize(&l, len(b) - len("compat: "))
+			copy(l[:], b[len("compat: "):])
 		}
 	}
-	return
+	return string(l[:]), string(t[:])
 }
 
 // Fill the row from the child's compat line.

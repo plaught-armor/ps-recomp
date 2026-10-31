@@ -40,7 +40,7 @@ init :: proc() {
 	iop.mcserv_snap()
 	iop.pad_snap()
 	iop.spu_snap()
-	core.snap_add(&unmapped_seen)
+	core.snap_add(&cpu.unmapped_seen)
 	context.allocator = core.emu_allocator()
 	core.co_allocator = core.emu_allocator()
 	mem.hw_read = hw_read

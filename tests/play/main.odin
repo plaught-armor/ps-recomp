@@ -643,7 +643,7 @@ test_compat :: proc() {
 	rows = compat_rows(name)
 	check(name, ok && len(rows) == len(fixtures) + 1, fmt.tprintf("hang run: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
 	if row, found := compat_row(rows, ids[0]); found {
-		check(name, row[.Result] == "hang" && row[.Status] == "", fmt.tprintf("hang: %v", row))
+		check(name, row[.Result] == "hang" && row[.Status] == "" && row[.Fatal] == "", fmt.tprintf("hang: %v", row))
 	} else {
 		check(name, false, "hang: no row")
 	}
