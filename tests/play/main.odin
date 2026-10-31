@@ -12,19 +12,21 @@
 // - interpreted: a converter that cannot write its output (a directory in
 //   the way) fails; play says it has no native code, stores nothing, and
 //   runs the game to FRAMES interpreted;
-// - compat: play --compat on a directory of discs, PS1 and PS2 (one of
-//   each that loops, one that makes a BIOS call or an EE syscall the HLE
-//   lacks, one that starts on an invalid instruction), and a file that is
-//   not a disc gives one compat.tsv row per disc (stalled with no picture,
-//   stalled with the call stubbed, fatal) and skips the file, keeping the
-//   row of a compat.tsv from before the shown column; a disc of each that
-//   turns the display on and counts in RAM is ok, and a PS1 one that turns
-//   it on and loops is stalled with main RAM unchanged, as is a PS2 one
-//   that turns it on and sleeps its only thread (the idle_share of every
-//   PS2 row past 0.95 only there). The looping PS1 disc run again
-//   with a vblank count it cannot reach in COMPAT_WAIT is a hang, and once
-//   more to FRAMES stalled, each time in place. Three PS1 discs load a second
-//   executable no native code covers: LoadExec of it, over the boot
+// - compat: play --compat on a directory of discs, PS1 and PS2 (one of each
+//   that loops, one that makes a BIOS call or an EE syscall the HLE lacks,
+//   one that starts on an invalid instruction), and a file that is not a disc
+//   gives one compat.tsv row per disc (stalled with no picture, stalled with
+//   the call stubbed, fatal) and skips the file, keeping the row of a
+//   compat.tsv from before the shown column; a PS1 disc that turns the
+//   display on and counts in RAM, and a PS2 one that draws, turns it on and
+//   counts, are ok (lit counted on PS2 rows only, 0 on none that is ok); a
+//   PS1 one that turns it on and loops is stalled with main RAM unchanged;
+//   PS2 ones that turn it on and count with nothing drawn, or sleep their
+//   only thread, are stalled with nothing drawn (the idle_share of every PS2
+//   row past 0.95 only for the one that sleeps). The looping PS1 disc run
+//   again with a vblank count it cannot reach in COMPAT_WAIT is a hang, and
+//   once more to FRAMES stalled, each time in place. Three PS1 discs load a
+//   second executable no native code covers: LoadExec of it, over the boot
 //   executable, checks its argc, stack and BSS; LoadExec of a missing file
 //   runs the boot executable again; Load and Exec of it return to the boot
 //   executable with its registers. The second executable's entry is in the
@@ -321,10 +323,33 @@ elf_at :: proc(x: Elf) -> []u8 {
 PS2_CNF :: "BOOT2 = cdrom0:\\DATA\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n"
 
 // lui t0, 0x1200; li t1, 1; sd t1, 0(t0): PMODE 1, read circuit 1 on (its
-// DISPLAY 0 is 1x1); then the word at 0x00300000 counts up as PS1_COUNT's.
+// DISPLAY 0 is 1x1 at frame buffer 0); then the word at 0x00300000 counts up
+// as PS1_COUNT's.
 @(private = "file")
-PS2_SHOW := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x3c0a0030, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0}
-// The display on as PS2_SHOW turns it on, then li v1, 0x32; syscall; b .;
+PS2_DARK := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x3c0a0030, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0}
+// The display on as PS2_DARK turns it on, then the 7 quadwords of
+// PS2_PACKET at text + ELF_DATA stored to the GIF FIFO at 0x10006000 (lq,
+// sq in a loop), then the count as PS2_DARK's.
+@(private = "file")
+PS2_SHOW := [?]u32 {
+	0x3c081200, 0x24090001, 0xfd090000, 0x3c0a1000, 0x354a6000, 0x3c0b0010, 0x356b0080, 0x240c0007,
+	0x796d0000, 0x256b0010, 0x258cffff, 0x7d4d0000, 0x1580fffb, 0,
+	0x3c0a0030, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0,
+}
+// A GIF packet that writes 4 white pixels at the start of frame buffer 0
+// (width 64, 32-bit): an A+D tag of BITBLTBUF, TRXPOS, TRXREG (4x1) and
+// TRXDIR (host to local), then an IMAGE tag and the pixels.
+@(private = "file")
+PS2_PACKET := [7][2]u64 {
+	{0x1000000000000004, 0xe},
+	{0x0001000000000000, 0x50},
+	{0, 0x51},
+	{0x0000000100000004, 0x52},
+	{0, 0x53},
+	{0x0800000000008001, 0},
+	{0xffffffffffffffff, 0xffffffffffffffff},
+}
+// The display on as PS2_DARK turns it on, then li v1, 0x32; syscall; b .;
 // nop: SleepThread, and with no thread left to run the kernel idles.
 @(private = "file")
 PS2_SLEEP := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x24030032, 0x0000000c, 0x1000ffff, 0}
@@ -565,9 +590,12 @@ test_compat :: proc() {
 		{"show.iso", cnf_disc("", ..PS1_SHOW[:]), "ps1", "ok", "0", "", "", "", ""},
 		// The display on, then b .: a picture, and RAM still.
 		{"still.iso", cnf_disc("", ..PS1_STILL[:]), "ps1", "stalled", "1", "", "", "", fmt.tprintf("stalled: main RAM unchanged f%d-f%d", FRAMES / 2, FRAMES)},
-		// PMODE 1 turns read circuit 1 on, then a word in RAM counts up.
-		{"ps2_show.iso", ps2_disc(..PS2_SHOW[:]), "ps2", "ok", "0", "", "", "", ""},
-		{"ps2_sleep.iso", ps2_disc(..PS2_SLEEP[:]), "ps2", "stalled", "1", "", "", "", fmt.tprintf("stalled: main RAM unchanged f%d-f%d", FRAMES / 2, FRAMES)},
+		// A picture drawn, PMODE 1 turns read circuit 1 on, then a word in
+		// RAM counts up.
+		{"ps2_show.iso", discimg.make_iso(PS2_CNF, sub_name = "SLUS_123.45;1", sub = string(elf_at({text = 0x00100000, code = PS2_SHOW[:], data = string(slice.to_bytes(PS2_PACKET[:]))}))), "ps2", "ok", "0", "", "", "", ""},
+		// The same with nothing drawn.
+		{"ps2_dark.iso", ps2_disc(..PS2_DARK[:]), "ps2", "stalled", "1", "", "", "", "stalled: nothing drawn"},
+		{"ps2_sleep.iso", ps2_disc(..PS2_SLEEP[:]), "ps2", "stalled", "1", "", "", "", "stalled: nothing drawn"},
 	}
 	// ps2_stub needs a syscall the HLE lacks that stops a run outside
 	// COMPAT; one the kernel implements stubs nothing.
@@ -603,7 +631,7 @@ test_compat :: proc() {
 	out, errs, ok := run_compat(name, {dir, fmt.tprint(FRAMES)})
 	rows := compat_rows(name)
 	if row, found := compat_row(rows, "OLD"); found {
-		check(name, row[.When] == "x" && row[.Shown] == "" && row[.Idle_Share] == "", fmt.tprintf("old row: %v", row))
+		check(name, row[.When] == "x" && row[.Shown] == "" && row[.Idle_Share] == "" && row[.Lit] == "", fmt.tprintf("old row: %v", row))
 	} else {
 		check(name, false, "the old compat.tsv's row is gone")
 	}
@@ -629,15 +657,18 @@ test_compat :: proc() {
 		switch f.result {
 		case "ok":
 			check(name, row[.Frames] == fmt.tprint(FRAMES) && row[.Fatal] == "" && row[.Shown] != "0", what)
+			check(name, row[.Lit] != "0", what)
 		case "stalled":
 			check(name, row[.Frames] == fmt.tprint(FRAMES) && row[.Fatal] == f.fatal, what)
 			check(name, (row[.Shown] == "0") == (f.fatal == "stalled: no picture shown"), what)
+			check(name, f.fatal != "stalled: nothing drawn" || row[.Lit] == "0", what)
 		case:
 			check(name, row[.Fatal] != "", what)
 		}
 		if f.result != "fatal" {
 			idle, has_idle := strconv.parse_f64(row[.Idle_Share])
 			check(name, has_idle && (idle > 0.95) == (f.file == "ps2_sleep.iso") && (f.system == "ps2" || idle == 0), what)
+			check(name, (row[.Lit] != "") == (f.system == "ps2"), what)
 		}
 		if ddir, has := core.disc_dir(ids[k], context.temp_allocator); has {
 			log, err := os.read_entire_file(core.disc_path(ddir, .Compat_Log, context.temp_allocator), context.temp_allocator)

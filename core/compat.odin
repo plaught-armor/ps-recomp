@@ -5,9 +5,10 @@
 //   COMPAT_TOP reported);
 // - calls the HLE does not implement, by name, with where the first was
 //   made;
-// - and, once a vblank, whether the display showed a picture and, under
-//   COMPAT, a hash of main RAM halfway to FRAMES, so the line can say a run
-//   made no progress.
+// - once a vblank, whether the display was on and, under COMPAT, a hash of
+//   main RAM halfway to FRAMES, so the line can say a run made no progress;
+// - and under COMPAT, from the host, how much of the last frame of a run to
+//   FRAMES was drawn.
 // Built with -define:COMPAT_COUNT=false the counters compile away.
 //
 // COMPAT=1 makes a run a compatibility run: a call the HLE does not
@@ -80,12 +81,15 @@ compat: struct {
 	entries:       [ENTRY_SLOTS]Entry_Slot,
 	entries_other: u64,
 	calls:         map[Compat_Key]Compat_Hit,
-	// Vblanks that showed a picture; main RAM as of the last vblank, and its
+	// Vblanks with the display on; main RAM as of the last vblank, and its
 	// hash at vblank ram_at (FRAMES/2; 0 before it).
 	shown:         u64,
 	ram:           []u8,
 	ram_at:        u64,
 	ram_hash:      u64,
+	// The non-black pixels of the picture at vblank FRAMES, which the host
+	// sets; -1 until it does.
+	lit:           i64,
 	reported:      bool,
 }
 
@@ -97,6 +101,7 @@ compat_init :: proc(system: string, cycles: ^u64, cycles_per_insn: u64, idle: ^u
 	compat.system = system
 	compat.cycles = cycles
 	compat.idle = idle
+	compat.lit = -1
 	compat.cpi = cycles_per_insn
 }
 
@@ -137,7 +142,7 @@ compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0, pc: u32 = 0, ra
 	return compat.on
 }
 
-// Count vblank n, which showed a picture or not, with main RAM as it
+// Count vblank n, with the display on or not, with main RAM as it
 // stands. Under COMPAT, vblank FRAMES/2 hashes RAM. Call once a vblank.
 compat_vblank :: proc(n: u64, shown: bool, ram: []u8) {
 	when COMPAT_COUNT {
@@ -183,13 +188,15 @@ Compat_Name :: struct {
 // The compat line's fields. result: "frames" (FRAMES reached), "fatal" or
 // "exit" (any other exit); frames: the last vblank the host counted;
 // idle_cycles: the cycles skipped with every guest thread waiting (0 where
-// the kernel skips none), so idle_cycles / cycles is the share of the run
-// the game sat idle; cycles_per_insn: what the interpreter charges an
-// instruction, so interp_insns * cycles_per_insn / cycles is about the
-// share of the run interpreted (the cycles also hold stalls and skipped
-// idle loops, so it errs low); shown: the vblanks that showed a picture;
-// ram_still_since: the vblank from which main RAM was the same at the end,
-// else 0 (also when not checked: no FRAMES, or the run ended before
+// the kernel skips none), so idle_cycles / cycles is the share of the run the
+// game sat idle; cycles_per_insn: what the interpreter charges an
+// instruction, so interp_insns * cycles_per_insn / cycles is about the share
+// of the run interpreted (the cycles also hold stalls and skipped idle loops,
+// so it errs low); shown: the vblanks with the display on, whether anything
+// was drawn or not; lit: the non-black pixels of the picture at vblank
+// FRAMES, -1 when not counted (a run that ended before it, a host that does
+// not count); ram_still_since: the vblank from which main RAM was the same at
+// the end, else 0 (also when not checked: no FRAMES, or the run ended before
 // FRAMES/2); build: the ps-recomp commit (COMMIT).
 Compat_Line :: struct {
 	system:               string,
@@ -204,6 +211,7 @@ Compat_Line :: struct {
 	unimplemented:        []Compat_Name,
 	fatal:                string,
 	shown:                u64,
+	lit:                  i64,
 	ram_still_since:      u64,
 	build:                string,
 }
@@ -218,6 +226,7 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 		interp_entries_other = compat.entries_other,
 		fatal                = fatal,
 		shown                = compat.shown,
+		lit                  = compat.lit,
 		build                = COMMIT,
 	}
 	if compat.ram_at != 0 && xxhash.XXH3_64_default(compat.ram) == compat.ram_hash {

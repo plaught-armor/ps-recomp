@@ -45,21 +45,22 @@ LOG_LINE_MAX :: 16 << 20
 @(private = "file")
 FATAL_MAX :: 200
 
-// compat.tsv's columns. result: ok (FRAMES reached), stalled (FRAMES
-// reached with no progress: no picture shown, or main RAM unchanged from
-// FRAMES/2), exit (the game ended), fatal,
-// crash (no compat line), hang (stopped at COMPAT_WAIT), spawn (no child);
-// status: the child's exit status (the signal of a crash on POSIX), 1 for
-// stalled as for fatal though the child exits 0, "" for hang and spawn;
-// native: whether the run had the disc's native code; interp_share:
-// interp_insns * cycles_per_insn / cycles, at most 1; entries: the hottest
-// interpreter entries, pc:count, comma separated; unimplemented:
-// name=count, semicolon separated; fatal: the fatal message, else why a run
-// stalled, else a crash's last output line ("" for a hang); when: UTC;
-// shown: the vblanks that showed a picture; idle_share: idle_cycles /
+// compat.tsv's columns. result: ok (FRAMES reached), stalled (FRAMES reached
+// with no progress: the display never on, nothing drawn on the last frame, or
+// main RAM unchanged from FRAMES/2), exit (the game ended), fatal, crash (no
+// compat line), hang (stopped at COMPAT_WAIT), spawn (no child); status: the
+// child's exit status (the signal of a crash on POSIX), 1 for stalled as for
+// fatal though the child exits 0, "" for hang and spawn; native: whether the
+// run had the disc's native code; interp_share: interp_insns *
+// cycles_per_insn / cycles, at most 1; entries: the hottest interpreter
+// entries, pc:count, comma separated; unimplemented: name=count, semicolon
+// separated; fatal: the fatal message, else why a run stalled, else a crash's
+// last output line ("" for a hang); when: UTC; shown: the vblanks with the
+// display on, whether anything was drawn or not; idle_share: idle_cycles /
 // cycles, the share of the run with every guest thread waiting (0 for a
 // console whose kernel skips no idle time); information only, as a game
-// waiting on vsync on a light screen idles nearly all the time too.
+// waiting on vsync on a light screen idles nearly all the time too; lit: the
+// non-black pixels on the last frame of a run to FRAMES, "" when not counted.
 Column :: enum {
 	Id,
 	Serial,
@@ -83,6 +84,7 @@ Column :: enum {
 	When,
 	Shown,
 	Idle_Share,
+	Lit,
 }
 
 COLUMNS :: [Column]string {
@@ -108,6 +110,7 @@ COLUMNS :: [Column]string {
 	.When          = "when",
 	.Shown         = "shown",
 	.Idle_Share    = "idle_share",
+	.Lit           = "lit",
 }
 
 Row :: [Column]string
@@ -366,6 +369,7 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 		stalled := true
 		switch {
 		case l.shown == 0: row[.Fatal] = "stalled: no picture shown"
+		case l.lit == 0: row[.Fatal] = "stalled: nothing drawn"
 		case l.ram_still_since != 0: row[.Fatal] = fmt.tprintf("stalled: main RAM unchanged f%d-f%d", l.ram_still_since, l.frames)
 		case: stalled = false
 		}
@@ -394,6 +398,9 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 	}
 	row[.Unimplemented] = strings.to_string(b)
 	row[.Shown] = fmt.tprint(l.shown)
+	if l.lit >= 0 {
+		row[.Lit] = fmt.tprint(l.lit)
+	}
 	row[.Build] = l.build
 }
 

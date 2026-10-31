@@ -158,6 +158,7 @@ vblank_frame :: proc() {
 	// with every DMA transfer gathered into it.
 	free_all(context.temp_allocator)
 	vblank += 1
+	if core.compat.on && u64(vblank) + SHOT_WARMUP == core.frames {shot_skip_update()}
 	ev: sdl.Event
 	for sdl.PollEvent(&ev) {
 		if ev.type == .QUIT {quit(0)}
@@ -222,6 +223,7 @@ vblank_frame :: proc() {
 		print_net()
 		quit(0)
 	}
+	if core.compat.on && u64(vblank) == core.frames {core.compat.lit = i64(lit_pixels(w, h))}
 	if core.frames_done(u64(vblank)) {quit(0)}
 	if pace == 0 || rerun {return}
 	// Netplay time sync stretches the frame while this host is ahead.
@@ -316,10 +318,30 @@ rbtest_frame :: proc() {
 	}
 }
 
-// Headless runs skip rasterizing until shortly before the next shot.
+// Headless runs skip rasterizing until shortly before the next shot, and
+// under COMPAT before the last frame, which lit_pixels counts.
 @(private)
 shot_skip_update :: proc() {
-	gs.skip_draw = core.headless && (next_shot >= len(shots) || frame < shots[next_shot] - SHOT_WARMUP)
+	last := core.compat.on && core.frames > 0 && u64(vblank) + SHOT_WARMUP >= core.frames
+	gs.skip_draw = core.headless && !last && (next_shot >= len(shots) || frame < shots[next_shot] - SHOT_WARMUP)
+}
+
+// The non-black pixels of the picture on screen, w x h when drawn in
+// software.
+@(private)
+lit_pixels :: proc(w, h: int) -> int {
+	px, pw, ph, stride := gs.screen[:], w, h, gs.DISP_W
+	if hw {
+		px, pw, ph = gs.hw_screen()
+		stride = pw
+	}
+	n := 0
+	for y in 0 ..< ph {
+		for c in px[y * stride:][:pw] {
+			if c & 0xffffff != 0 {n += 1}
+		}
+	}
+	return n
 }
 
 @(private)
