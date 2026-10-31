@@ -452,6 +452,11 @@ Vu_Exit :: enum u8 {End, Leave}
 // budget.
 Vu_Run :: #type proc(pc: u32, budget: ^int) -> (u32, Vu_Exit)
 
+// A microprogram compiled to native code (recomp/vu/native.odin): it
+// starts at native_run's pc with its budget and leaves the pc it stopped
+// at, bit 31 set when it ended, and the budget left there.
+Vu_Native :: #type proc()
+
 // Micro memory a compiled program was compiled from: code at pc.
 Vu_Range :: struct {
 	pc:   u32,
@@ -462,6 +467,7 @@ Vu_Range :: struct {
 Vu_Program :: struct {
 	ranges:   []Vu_Range,
 	run:      Vu_Run,
+	native:   Vu_Native, // run instead when set
 	size:     int, // pairs, over all ranges
 	ok_gen:   u32, // the micro generation when ok was checked
 	ok:       bool, // micro memory holds ranges
@@ -531,12 +537,24 @@ vu1_register_ranges :: proc(ranges: []Vu_Range, run: Vu_Run) {
 	micro_register(&vu1_table, ranges, run)
 }
 
+// A program in native code (ps2/native.odin load_native, VUNATIVE=1),
+// from the given runs of unit's micro memory.
+vu_register_native :: proc(unit: int, ranges: []Vu_Range, native: Vu_Native) {
+	if unit == 0 {
+		micro_register(&vu0_table, ranges, nil, native)
+	} else {
+		micro_register(&vu1_table, ranges, nil, native)
+	}
+}
+
+// Candidates are longest first; of the same size, native code before Odin.
 @(private)
-micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run) {
+micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run, native: Vu_Native = nil) {
 	context.allocator = runtime.heap_allocator()
 	p := new(Vu_Program)
 	p.ranges = slice.clone(ranges)
 	p.run = run
+	p.native = native
 	for r in ranges {p.size += len(r.code) / 2}
 	append(&t.programs, p)
 	for r in ranges {
@@ -545,7 +563,7 @@ micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run) {
 			c := &t.candidates[i]
 			if c.allocator.procedure == nil {c^ = make([dynamic]^Vu_Program)}
 			at := len(c)
-			for at > 0 && c[at - 1].size < p.size {at -= 1}
+			for at > 0 && (c[at - 1].size < p.size || (c[at - 1].size == p.size && native != nil && c[at - 1].native == nil)) {at -= 1}
 			inject_at(c, at, p)
 			t.compiled[i] = true
 			t.pick_gen[i] = ~u32(0)
@@ -630,8 +648,8 @@ vu_stats_print :: proc() {
 micro_stats_print :: proc(unit: int, programs: []^Vu_Program) {
 	for p, k in programs {
 		if p.runs == 0 && p.checks == 0 {continue}
-		fmt.eprintfln("vu%d program %d at %04x, %d pairs: %d runs, %d checks, %d misses",
-			unit, k, p.ranges[0].pc, p.size, p.runs, p.checks, p.misses)
+		fmt.eprintfln("vu%d program %d at %04x, %d pairs%s: %d runs, %d checks, %d misses",
+			unit, k, p.ranges[0].pc, p.size, p.native != nil ? ", native" : "", p.runs, p.checks, p.misses)
 	}
 }
 
@@ -685,7 +703,16 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 			prog.runs += 1
 			exit: Vu_Exit
 			when cpu.FALLBACK_COUNT {entry, before := pc, budget}
-			pc, exit = prog.run(pc, &budget)
+			if prog.native != nil {
+				nr := &native_run[v == &vu0 ? 0 : 1]
+				nr.pc, nr.budget = i32(pc), i32(budget)
+				prog.native()
+				budget = int(nr.budget)
+				exit = nr.pc < 0 ? .End : .Leave // bit 31
+				pc = u32(nr.pc)
+			} else {
+				pc, exit = prog.run(pc, &budget)
+			}
 			pc &= mask
 			// Left at once from where it was entered: no case label there.
 			when cpu.FALLBACK_COUNT {

@@ -348,6 +348,7 @@ load_native :: proc(path: string) -> bool {
 			cpu.register(f.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(f.off)))
 		}
 		fmt.eprintfln("native: %d functions from %s, standalone (%08x-%08x)", len(code.funcs), path, lo, hi + 4)
+		register_vus(&code)
 		return true
 	}
 	// A function the build does not have means the blob is from other code:
@@ -365,5 +366,23 @@ load_native :: proc(path: string) -> bool {
 		cpu.register(f.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(f.off)))
 	}
 	fmt.eprintfln("native: %d functions from %s", len(code.funcs), path)
+	register_vus(&code)
 	return true
+}
+
+// With VUNATIVE=1, register the blob's VU microprograms beside the Odin
+// ones; same-size candidates then run native. Their ranges keep the pool,
+// so it is never freed.
+@(private = "file")
+register_vus :: proc(code: ^core.Native_Code) {
+	if len(code.vus) == 0 || core.env("VUNATIVE") == "" {return}
+	for v in code.vus {
+		ranges := make([]vu.Vu_Range, v.n_ranges, context.temp_allocator)
+		for &r, k in ranges {
+			nr := code.ranges[int(v.range_first) + k]
+			r = {nr.pc, code.pool[nr.at:][:nr.n_words]}
+		}
+		vu.vu_register_native(int(v.unit), ranges, cast(vu.Vu_Native)rawptr(code.base + uintptr(v.off)))
+	}
+	fmt.eprintfln("native: %d VU microprograms (VUNATIVE)", len(code.vus))
 }

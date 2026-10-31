@@ -5,7 +5,11 @@
 // random state, the native function and the interpreter must leave the same
 // vf, vi, ACC, Q, P, I, R, CLIP, MAC, memory and stopping pc; on VU0 status
 // too, as VU0 code computes it. Every native run must end the program, and
-// no program may call the interpreter for an instruction.
+// no program may call the interpreter for an instruction. A second pass
+// registers the functions as the runtime does with VUNATIVE=1 and runs the
+// same trials through vu0_call_micro and vu1_start, which must leave what a
+// direct call leaves; after a write into a program's micro memory, they
+// must interpret it instead.
 // The seed is fixed, so a run is reproducible.
 //
 //   odin run tests/vu_native -collection:ps=.
@@ -37,6 +41,35 @@ rnd :: proc() -> u32 {
 	case 1: return transmute(u32)(rand.float32_range(-4, 4))
 	}
 	return rand.uint32()
+}
+
+// A random VU state to start from, with I and D clear in status, so the
+// merge counts the program's.
+@(private = "file")
+random_state :: proc(init: ^vu.Vu, mem: []u32) {
+	init.vf[0].f = {0, 0, 0, 1}
+	for r in 1 ..< 32 {for l in 0 ..< 4 {init.vf[r].u[l] = rnd()}}
+	for l in 0 ..< 4 {init.acc.u[l] = rnd()}
+	init.vi[0] = 0
+	for r in 1 ..< 16 {init.vi[r] = u16(rand.uint32())}
+	init.vi[2] = 0xffff
+	init.i = transmute(f32)rnd()
+	init.q = transmute(f32)rnd()
+	init.p = transmute(f32)rnd()
+	init.mac = rand.uint32() & 0xffff
+	init.clip = rand.uint32() & 0xffffff
+	init.status = rand.uint32() & 0xfcf
+	for &w in mem {w = rnd()}
+}
+
+// Whether got and want hold the same registers, but for the pc.
+@(private = "file")
+same_regs :: proc(got, want: ^vu.Vu, vu0: bool) -> bool {
+	same := got.vi == want.vi && got.acc.u == want.acc.u
+	for r in 0 ..< 32 {same &&= got.vf[r].u == want.vf[r].u}
+	same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p
+	same &&= transmute(u32)got.i == transmute(u32)want.i && got.r == want.r && got.clip == want.clip && got.mac == want.mac
+	return same && (!vu0 || got.status == want.status)
 }
 
 main :: proc() {
@@ -85,19 +118,7 @@ main :: proc() {
 			cases += 1
 			for _ in 0 ..< TRIALS {
 				init := v^
-				init.vf[0].f = {0, 0, 0, 1}
-				for r in 1 ..< 32 {for l in 0 ..< 4 {init.vf[r].u[l] = rnd()}}
-				for l in 0 ..< 4 {init.acc.u[l] = rnd()}
-				init.vi[0] = 0
-				for r in 1 ..< 16 {init.vi[r] = u16(rand.uint32())}
-				init.vi[2] = 0xffff
-				init.i = transmute(f32)rnd()
-				init.q = transmute(f32)rnd()
-				init.p = transmute(f32)rnd()
-				init.mac = rand.uint32() & 0xffff
-				init.clip = rand.uint32() & 0xffffff
-				init.status = rand.uint32() & 0xfcf // I and D clear, so the merge counts the program's
-				for &w in mem_init {w = rnd()}
+				random_state(&init, mem_init)
 
 				v^ = init
 				copy(mem, mem_init)
@@ -114,13 +135,7 @@ main :: proc() {
 
 				if want.mac != init.mac {flagged += 1}
 				if vu0 && want.status & 0x30 != 0 {status_set += 1}
-				vf_same := true
-				for r in 0 ..< 32 {vf_same &&= got.vf[r].u == want.vf[r].u}
-				same := vf_same && got_pc == want.tpc | END_BIT && got.vi == want.vi && got.acc.u == want.acc.u
-				same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p
-				same &&= transmute(u32)got.i == transmute(u32)want.i && got.r == want.r && got.clip == want.clip && got.mac == want.mac
-				same &&= !vu0 || got.status == want.status
-				same &&= slice.equal(mem, mem_want)
+				same := got_pc == want.tpc | END_BIT && same_regs(&got, &want, vu0) && slice.equal(mem, mem_want)
 				if !same {
 					fails += 1
 					if fails < 10 {
@@ -137,8 +152,94 @@ main :: proc() {
 			}
 		}
 	}
-	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, MAC changed in %d, VU0 I or D set in %d", arch, cases, TRIALS, fails, flagged, status_set)
+
+	// The runtime's dispatch: the same trials, the micro generation moved
+	// for each program's micro memory.
+	for p, k in progs {
+		vu.vu_register_native(p.unit == .VU0 ? 0 : 1, {{0, p.words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.vus[k].off)))
+	}
+	rand.reset(SEED)
+	dispatch_fails := 0
+	for p, k in progs {
+		run := cast(proc())rawptr(code.base + uintptr(code.vus[k].off))
+		vu0 := p.unit == .VU0
+		v := vu0 ? &vu.vu0 : &vu.vu1
+		nr := &vu.native_run[vu0 ? 0 : 1]
+		mem := ([^]u32)(raw_data(v.mem))[:len(v.mem) / 4]
+		mem_init := make([]u32, len(mem))
+		mem_want := make([]u32, len(mem))
+		defer delete(mem_init)
+		defer delete(mem_want)
+		for &b in v.micro {b = 0}
+		copy(([^]u32)(&v.micro[0])[:len(p.words)], p.words)
+		if vu0 {vu.vu0_micro_touch()} else {vu.vu1_micro_touch()}
+		for pc in p.pcs {
+			for _ in 0 ..< TRIALS {
+				init := v^
+				random_state(&init, mem_init)
+
+				v^ = init
+				copy(mem, mem_init)
+				nr.pc, nr.budget = i32(pc), BUDGET
+				run()
+				want := v^
+				want_pc := u32(nr.pc) &~ END_BIT
+				copy(mem_want, mem)
+
+				v^ = init
+				copy(mem, mem_init)
+				if vu0 {vu.vu0_call_micro(pc)} else {vu.vu1_start(pc)}
+				got := v^
+				if got.tpc != want_pc || !same_regs(&got, &want, vu0) || !slice.equal(mem, mem_want) {
+					dispatch_fails += 1
+					if dispatch_fails < 10 {
+						fmt.eprintfln("FAIL vu_native dispatch program %d (vu%d, from %04x): got pc %04x, want %04x; same registers %v, memory %v",
+							k, vu0 ? 0 : 1, pc, got.tpc, want_pc, same_regs(&got, &want, vu0), slice.equal(mem, mem_want))
+					}
+					break
+				}
+			}
+		}
+	}
+	// A write into a registered program's range, which moves the micro
+	// generation as every write path does, demotes it: the next call
+	// interprets. The probe is run_pc, which only native code writes. The
+	// write turns an upper NOP into one with dest bits, still a NOP.
+	probed := false
+	probe: for p in progs {
+		for w, j in p.words {
+			if j % 2 == 0 || w != vu_programs.NOP_U {continue}
+			vu0 := p.unit == .VU0
+			v := vu0 ? &vu.vu0 : &vu.vu1
+			nr := &vu.native_run[vu0 ? 0 : 1]
+			micro := ([^]u32)(&v.micro[0])[:len(v.micro) / 4]
+			call := proc(vu0: bool, nr: ^vu.Native_Run, pc: u32) -> bool {
+				if vu0 {vu.vu0_micro_touch()} else {vu.vu1_micro_touch()}
+				nr.pc = -1
+				if vu0 {vu.vu0_call_micro(pc)} else {vu.vu1_start(pc)}
+				return nr.pc != -1
+			}
+			for &m in micro {m = 0}
+			copy(micro, p.words)
+			if !call(vu0, nr, p.pcs[0]) {
+				fmt.eprintln("FAIL vu_native: the probe's program does not run native")
+				dispatch_fails += 1
+			}
+			micro[j] = vu_programs.NOP_U | 15 << 21
+			if call(vu0, nr, p.pcs[0]) {
+				fmt.eprintfln("FAIL vu_native: program still runs native after a write at %04x", 4 * j)
+				dispatch_fails += 1
+			}
+			probed = true
+			break probe
+		}
+	}
+	if !probed {
+		fmt.eprintln("FAIL vu_native: no program to probe")
+		dispatch_fails += 1
+	}
+	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, %d failing dispatched, MAC changed in %d, VU0 I or D set in %d", arch, cases, TRIALS, fails, dispatch_fails, flagged, status_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
-	if fails > 0 || slow_fails > 0 {os.exit(1)}
+	if fails > 0 || slow_fails > 0 || dispatch_fails > 0 {os.exit(1)}
 }
