@@ -6,6 +6,7 @@ import "core:fmt"
 import "ps:core"
 import cpu "../cpu"
 import gif "../gif"
+import mem "../mem"
 
 Vif :: struct {
 	id:          int,
@@ -17,8 +18,19 @@ Vif :: struct {
 	tops, top:   u32,
 	itops, itop: u32,
 	dbf:         bool,
-	pending:     [dynamic]u8, // a command split across transfers
+	// Stalled by a code's i-bit until FBRST.STC (vif_fbrst).
+	stalled:     bool,
+	pending:     [dynamic]u8, // a command split across transfers, or what waits out a stall
 }
+
+// The VIFs' registers, VIF1's 0x400 after VIF0's.
+VIF0_STAT :: 0x3800
+VIF0_ERR :: 0x3820
+VIF_FBRST :: 0x10 // from STAT
+VIF_STAT_VIS :: 0x400 // stalled by an i-bit
+VIF_STAT_INT :: 0x800 // an i-bit's interrupt
+VIF_STAT_STALL :: 0x3f00 // VSS, VFS, VIS, INT, ER0, ER1: what STC clears
+VIF_ERR_MII :: 1 // i-bits raise no interrupt and stall nothing
 
 vifs: [2]Vif
 
@@ -31,8 +43,14 @@ vif_init :: proc() {
 vif_warned: map[u32]bool
 
 // Feed a transfer's words to a VIF; an incomplete trailing command waits
-// for the next transfer.
+// for the next transfer, and while the VIF is stalled every word waits.
+// DMA has already gathered the whole chain and finished the channel, so a
+// stall holds the chain's rest here instead of in the channel.
 vif_feed :: proc(v: ^Vif, data: []u8) {
+	if v.stalled {
+		append(&v.pending, ..data)
+		return
+	}
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VIF, t)
 	buf := data
@@ -105,8 +123,28 @@ vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 			}
 		}
 		i += need
+		// The i-bit: retail interrupts once the code is done, data and all,
+		// and stalls before the next code.
+		if code & 0x80000000 != 0 && mem.hw_reg(VIF0_ERR + 0x400 * u32(v.id))^ & VIF_ERR_MII == 0 {
+			mem.hw_reg(VIF0_STAT + 0x400 * u32(v.id))^ |= VIF_STAT_VIS | VIF_STAT_INT
+			v.stalled = true
+			mem.intc_raise(mem.INTC_VIF0 + u32(v.id))
+			return i
+		}
 	}
 	return i
+}
+
+// A write to VIF id's FBRST: STC clears the stall and its STAT bits, and
+// the codes that waited run on. RST, FBK and STP are ignored, and the write
+// is not stored: FBRST reads back 0.
+vif_fbrst :: proc(id: int, w: u32) {
+	if w & 8 == 0 {return}
+	v := &vifs[id]
+	mem.hw_reg(VIF0_STAT + 0x400 * u32(id))^ &~= VIF_STAT_STALL
+	if !v.stalled {return}
+	v.stalled = false
+	vif_feed(v, nil)
 }
 
 @(private)

@@ -19,11 +19,16 @@
 // write that changes the compiled code makes the next start miss it and
 // interpret.
 //
+// Then VIF i-bits: a code with bit 31 runs, raises its VIF's INTC once and
+// stalls the VIF; what follows, in that transfer or later ones, waits until
+// FBRST.STC, then runs. With VIF_ERR.MII set an i-bit does nothing.
+//
 //   odin run tests/vu -collection:ps=.
 package main
 
 import "core:fmt"
 import "core:os"
+import "ps:ps2/mem"
 import "ps:ps2/vu"
 
 @(private = "file")
@@ -287,6 +292,45 @@ all_vi :: proc() {
 	if v.vi[0] != 0 {fail("IADDIU vi0: vi0 = %d", v.vi[0])}
 }
 
+@(private = "file")
+feed :: proc(vif: ^vu.Vif, code: ..u32) {
+	w := code
+	vu.vif_feed(vif, ([^]u8)(raw_data(w))[:len(w) * 4])
+}
+
+@(private = "file")
+ibit :: proc() {
+	v := &vu.vifs[1]
+	stat := mem.hw_reg(vu.VIF0_STAT + 0x400)
+	mem.intc_stat = 0
+	// STCYCL with the i-bit, then BASE 5, ITOPS 7.
+	feed(v, 0x81000404, 0x03000005, 0x04000007)
+	if v.cl != 4 || v.wl != 4 {fail("i-bit STCYCL did not run: cl %d wl %d", v.cl, v.wl)}
+	if v.base != 0 || v.itops != 0 {fail("VIF1 ran past its i-bit: base %d itops %d", v.base, v.itops)}
+	if !v.stalled || stat^ & (vu.VIF_STAT_VIS | vu.VIF_STAT_INT) != vu.VIF_STAT_VIS | vu.VIF_STAT_INT {fail("i-bit: stalled %v STAT %x", v.stalled, stat^)}
+	if mem.intc_stat != 1 << 5 {fail("i-bit raised INTC %x, want VIF1's", mem.intc_stat)}
+	// A later transfer waits too; MODE 1.
+	mem.intc_stat = 0
+	feed(v, 0x05000001)
+	if v.mode != 0 || mem.intc_stat != 0 {fail("a stalled VIF1 ran a transfer: mode %d INTC %x", v.mode, mem.intc_stat)}
+	vu.vif_fbrst(1, 8)
+	if v.stalled || stat^ & vu.VIF_STAT_STALL != 0 {fail("STC: stalled %v STAT %x", v.stalled, stat^)}
+	if v.base != 5 || v.itops != 7 || v.mode != 1 {fail("STC: base %d itops %d mode %d, want 5 7 1", v.base, v.itops, v.mode)}
+	if mem.intc_stat != 0 || len(v.pending) != 0 {fail("STC: INTC %x, %d bytes left", mem.intc_stat, len(v.pending))}
+
+	// VIF0 raises its own INTC; with MII it neither raises nor stalls.
+	feed(&vu.vifs[0], 0x80000000)
+	if !vu.vifs[0].stalled || mem.intc_stat != 1 << 4 {fail("VIF0 i-bit: stalled %v INTC %x", vu.vifs[0].stalled, mem.intc_stat)}
+	vu.vif_fbrst(0, 8)
+	mem.intc_stat = 0
+	mem.hw_reg(vu.VIF0_ERR + 0x400)^ = vu.VIF_ERR_MII
+	feed(v, 0x83000009, 0x05000000)
+	if v.stalled || mem.intc_stat != 0 || v.base != 9 || v.mode != 0 {fail("MII i-bit: stalled %v INTC %x base %d mode %d", v.stalled, mem.intc_stat, v.base, v.mode)}
+	mem.hw_reg(vu.VIF0_ERR + 0x400)^ = 0
+	v.cl, v.wl, v.base, v.itops = 1, 1, 0, 0
+	mem.intc_stat, mem.intc_pending = 0, 0
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -306,5 +350,6 @@ main :: proc() {
 	minmax()
 	vu0_compiled()
 	micro_writes()
+	ibit()
 	fmt.println("vu: ok")
 }
