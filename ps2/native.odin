@@ -370,12 +370,12 @@ load_native :: proc(path: string) -> bool {
 	return true
 }
 
-// With VUNATIVE=1, register the blob's VU microprograms beside the Odin
-// ones; same-size candidates then run native. Their ranges keep the pool,
-// so it is never freed.
+// Register the blob's VU microprograms beside the Odin ones, unless
+// VUNATIVE=0; same-size candidates then run native. Their ranges keep the
+// pool, so it is never freed.
 @(private = "file")
 register_vus :: proc(code: ^core.Native_Code) {
-	if len(code.vus) == 0 || core.env("VUNATIVE") == "" {return}
+	if len(code.vus) == 0 || core.env("VUNATIVE") == "0" {return}
 	for v in code.vus {
 		ranges := make([]vu.Vu_Range, v.n_ranges, context.temp_allocator)
 		for &r, k in ranges {
@@ -384,5 +384,5 @@ register_vus :: proc(code: ^core.Native_Code) {
 		}
 		vu.vu_register_native(int(v.unit), ranges, cast(vu.Vu_Native)rawptr(code.base + uintptr(v.off)))
 	}
-	fmt.eprintfln("native: %d VU microprograms (VUNATIVE)", len(code.vus))
+	fmt.eprintfln("native: %d VU microprograms", len(code.vus))
 }

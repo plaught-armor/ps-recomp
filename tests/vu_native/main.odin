@@ -6,7 +6,7 @@
 // vf, vi, ACC, Q, P, I, R, CLIP, MAC, memory and stopping pc; on VU0 status
 // too, as VU0 code computes it. Every native run must end the program, and
 // no program may call the interpreter for an instruction. A second pass
-// registers the functions as the runtime does with VUNATIVE=1 and runs the
+// registers the functions as the runtime does (unless VUNATIVE=0) and runs the
 // same trials through vu0_call_micro and vu1_start, which must leave what a
 // direct call leaves; after a write into a program's micro memory, they
 // must interpret it instead.

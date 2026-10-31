@@ -537,7 +537,7 @@ vu1_register_ranges :: proc(ranges: []Vu_Range, run: Vu_Run) {
 	micro_register(&vu1_table, ranges, run)
 }
 
-// A program in native code (ps2/native.odin load_native, VUNATIVE=1),
+// A program in native code (ps2/native.odin load_native, unless VUNATIVE=0),
 // from the given runs of unit's micro memory.
 vu_register_native :: proc(unit: int, ranges: []Vu_Range, native: Vu_Native) {
 	if unit == 0 {
