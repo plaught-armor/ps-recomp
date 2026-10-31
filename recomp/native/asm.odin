@@ -179,6 +179,7 @@ Asm :: struct {
 	cold:      [dynamic]Cold, // of the function being emitted
 	slow:      [dynamic]Slow,
 	cached:    []u32, // state field offsets, at most CACHE_MAX
+	state:     string, // import: the state of the function being emitted
 }
 
 // The out-of-line end of a load that left RAM's fast path at far: a host
@@ -351,11 +352,13 @@ get32 :: proc(a: ^Asm, at: int) -> u32 {
 
 // Start a function; returns its code offset. `state` names the import
 // holding the address of the guest register file, kept in a fixed host
-// register for the state_* operations.
+// register for the state_* operations. A vec_load or vec_store through
+// import state uses that register too, rather than reading the slot.
 func_begin :: proc(a: ^Asm, state: string) -> int {
 	align_code(a)
 	at := len(a.code)
 	a.epilogue = new_label(a)
+	a.state = state
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_prologue(a, imp(a, state))
@@ -375,6 +378,7 @@ bind_at :: proc(a: ^Asm, l: Label, off: int) {
 // Another entry into the function being emitted, which shares its
 // epilogue: its body jumps into the function's code. Returns its offset.
 func_entry :: proc(a: ^Asm, state: string) -> int {
+	assert(state == a.state, "native: an entry with another state")
 	align_code(a)
 	at := len(a.code)
 	switch a.arch {
@@ -554,6 +558,8 @@ set_cond_imm :: proc(a: ^Asm, c: Cond, dst: Reg, v: u32) {
 // dst = the 16-byte state field at off, a multiple of 16 and no cached one;
 // with base, the field at off from the address in import `base`.
 vec_load :: proc(a: ^Asm, dst: Vreg, off: u32, base := "") {
+	base := base
+	if base == a.state {base = ""}
 	if base == "" {vec_check(a, off)}
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
@@ -564,6 +570,8 @@ vec_load :: proc(a: ^Asm, dst: Vreg, off: u32, base := "") {
 }
 
 vec_store :: proc(a: ^Asm, off: u32, src: Vreg, base := "") {
+	base := base
+	if base == a.state {base = ""}
 	if base == "" {vec_check(a, off)}
 	switch a.arch {
 	case .X64_SysV, .X64_Win:

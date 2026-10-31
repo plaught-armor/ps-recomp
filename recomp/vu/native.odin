@@ -94,7 +94,9 @@ IMPORTS := [Unit][Imp]string {
 	},
 }
 
-// The import of the runtime's lane masks, shared by both units.
+// The import of the runtime's lane masks, shared by both units. A
+// microprogram's function takes it as its state, so the masks are reached
+// through the state register; the macro ops reach them through the slot.
 @(private = "file")
 K :: "vu.k"
 
@@ -1091,11 +1093,12 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 	pairs, _ := analyze(words, ext, entries, u)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
 	run_pc := IMPORTS[u][.Run_Pc]
-	// No EE fields are cached here: the code reaches no EE state.
+	// No EE fields are cached here: the code reaches no EE state, and its
+	// state register holds K instead.
 	cached := a.cached
 	a.cached = nil
 	defer a.cached = cached
-	at := native.func_begin(a, "cpu.state")
+	at := native.func_begin(a, K)
 	labels := make(map[u32]native.Label, context.temp_allocator)
 	pcs := make([dynamic]u32, context.temp_allocator)
 	for i in 0 ..< len(pairs) {
