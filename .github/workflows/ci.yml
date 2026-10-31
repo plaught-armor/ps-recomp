@@ -28,7 +28,7 @@ jobs:
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
             echo "== $t play"
             odin check play -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/compat tests/play; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/psx_interp tests/compat tests/play; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -54,8 +54,8 @@ jobs:
           release: dev-2026-10
           token: ${{ secrets.GITHUB_TOKEN }}
       # SDL2 for the tests that call it (tests/host_frames, tests/data,
-      # tests/compat, tests/play); Windows uses Odin's vendor SDL2.dll, put
-      # next to the tests.
+      # tests/psx_interp, tests/compat, tests/play); Windows uses Odin's
+      # vendor SDL2.dll, put next to the tests.
       - name: install SDL2 (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
@@ -105,6 +105,7 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then cp "$(odin root)/vendor/sdl2/SDL2.dll" .; fi
           odin run tests/host_frames -collection:ps=. -out:host_frames_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/data -collection:ps=. -out:data_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_interp -collection:ps=. -out:psx_interp_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/compat -collection:ps=. -out:compat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/play -collection:ps=. -define:COMMIT=test -out:play_test${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: test (x86-64 under Rosetta)

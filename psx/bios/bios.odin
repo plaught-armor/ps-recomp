@@ -369,11 +369,14 @@ bios_c :: proc(fn: u32) {
 }
 
 // A call to a table entry's stub (TABLE_STUBS): the function it names, with
-// t1 set as the stub sets it.
-bios_entry :: proc(addr: u32) -> bool {
+// t1 set as the stub sets it. Without run, only whether addr is a stub.
+bios_entry :: proc(addr: u32, run: bool) -> bool {
 	off := (addr & 0x1fffffff) - TABLE_STUBS
 	if off >= 8 * (B0_ENTRIES + C0_ENTRIES) || off & 7 != 0 {
 		return false
+	}
+	if !run {
+		return true
 	}
 	n := off / 8
 	if n < B0_ENTRIES {

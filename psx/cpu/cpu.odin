@@ -18,9 +18,10 @@ import "ps:core"
 // Handlers in the packages above this one, set by package psx at init.
 bios_a, bios_b, bios_c: proc(fn: u32)
 bios_syscall: proc()
-// Runs a call to one of the BIOS's B0 and C0 table entries; false for any
-// other address. May be nil.
-bios_entry: proc(addr: u32) -> bool
+// Runs a call to one of the BIOS's B0 and C0 table entries, or with run
+// false only reports that addr is one; false for any other address. May be
+// nil.
+bios_entry: proc(addr: u32, run: bool) -> bool
 irq_check: proc()
 interp_run: proc(start: u32)
 io_read: proc(p: u32, size: u32) -> u32
@@ -200,20 +201,28 @@ resolve_overlay :: proc(addr: u32) -> ^Ovl_Entry {
 	return nil
 }
 
-@(private)
-call_slow :: proc(addr: u32) {
+// Whether the cpu runs a call to addr without guest code: the A0, B0 and C0
+// vectors and the table entries' stubs (bios_entry). With run, the call
+// runs too. call_slow runs these; the interpreter asks without run before
+// following a jump into one, as the vectors' RAM holds no code to step.
+host_call :: proc(addr: u32, run: bool) -> bool {
 	switch addr & 0x1fffffff {
 	case 0xa0:
-		bios_a(state.r[9])
-		return
+		if run {bios_a(state.r[9])}
+		return true
 	case 0xb0:
-		bios_b(state.r[9])
-		return
+		if run {bios_b(state.r[9])}
+		return true
 	case 0xc0:
-		bios_c(state.r[9])
-		return
+		if run {bios_c(state.r[9])}
+		return true
 	}
-	if bios_entry != nil && bios_entry(addr) {
+	return bios_entry != nil && bios_entry(addr, run)
+}
+
+@(private)
+call_slow :: proc(addr: u32) {
+	if host_call(addr, true) {
 		return
 	}
 	if e := resolve_overlay(addr); e != nil {

@@ -71,9 +71,12 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	}
 }
 
+// A jump to a function, or to a BIOS vector or table stub (no guest code
+// there to step), is a tail call: call it, and its return is this code's.
 @(private)
 goto_target :: proc(st: ^Interp, target: u32) {
-	if cpu.is_ram_addr(target) && cpu.dispatch.fixed[cpu.fn_index(target)] != nil {
+	fixed := cpu.is_ram_addr(target) && cpu.dispatch.fixed[cpu.fn_index(target)] != nil
+	if fixed || cpu.host_call(target, false) {
 		cpu.call(target)
 		st.done = true
 		return
