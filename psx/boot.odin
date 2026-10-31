@@ -70,6 +70,7 @@ run :: proc(b: Boot) -> bool {
 		fmt.eprintln("psx: no native code, interpreting everything")
 	}
 	if b.hooks != nil {b.hooks() or_return}
+	cpu.watch_code()
 
 	io.events_init()
 	spu.spu_init()

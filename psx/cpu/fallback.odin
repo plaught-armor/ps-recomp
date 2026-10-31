@@ -40,6 +40,13 @@ fallback_jump: map[Jump_Key]u64
 // Dispatch, not fallback: call_slow targets resolved to a resident overlay
 // function.
 dispatch_overlay: map[u32]u64
+// Code demotion (watch.odin): the page demotions, the promotions back into
+// the fixed table, and call_slow targets resolved to a demoted function, by
+// function (every demoted one, called or not). Their calls are dispatch too,
+// apart from dispatch_overlay.
+demoted_pages: u64
+promoted_pages: u64
+dispatch_demoted: map[u32]u64
 
 // Odin procedures that do one instruction's work for recompiled code.
 Helper :: enum u8 {
@@ -62,16 +69,19 @@ Row :: struct {
 	n:        u64,
 }
 
-// Totals on stderr, three lines: "fallback:" counts interpreter work only,
+// Totals on stderr, four lines: "fallback:" counts interpreter work only,
 // "dispatch:" the ways out of a function that reach recompiled code (or a
-// BIOS vector) without the interpreter, "helper:" the helper calls. With a
+// BIOS vector) without the interpreter, "demote:" the executable code moved
+// out of the fixed table and the calls that reached it, "helper:" the helper
+// calls. With a
 // DUMP directory, every counter as rows too (fallback_tsv, helper_tsv).
 fallback_dump :: proc() {
 	jumps: [Jump_Outcome]u64
-	interp, overlay: u64
+	interp, overlay, demoted: u64
 	for _, n in fallback_interp {interp += n}
 	for k, n in fallback_jump {jumps[k.outcome] += n}
 	for _, n in dispatch_overlay {overlay += n}
+	for _, n in dispatch_demoted {demoted += n}
 	fmt.eprintfln(
 		"fallback: %d interp entries (%d instructions), %d unlabelled jumps interpreted",
 		interp,
@@ -83,6 +93,13 @@ fallback_dump :: proc() {
 		jumps[.Return],
 		jumps[.Call],
 		overlay,
+	)
+	fmt.eprintfln(
+		"demote: %d pages, %d funcs, %d calls, %d pages promoted",
+		demoted_pages,
+		len(dispatch_demoted),
+		demoted,
+		promoted_pages,
 	)
 	helpers: [Helper]u64
 	for counts, h in helper_calls {
@@ -111,7 +128,7 @@ fallback_dump :: proc() {
 // The counters as two tables (temp allocator), columns kind, pc, from (the
 // jumping function), count; rows by kind, then count down, pc, from.
 // fallback: interp_insns, then interp and jump_interp rows. dispatch:
-// jump_call, jump_return and overlay rows.
+// demoted, jump_call, jump_return and overlay rows.
 fallback_tsv :: proc() -> (fallback, dispatch: string) {
 	fb := make([dynamic]Row, context.temp_allocator)
 	dp := make([dynamic]Row, context.temp_allocator)
@@ -123,6 +140,9 @@ fallback_tsv :: proc() -> (fallback, dispatch: string) {
 	}
 	for pc, n in dispatch_overlay {
 		append(&dp, Row{"overlay", pc, 0, n})
+	}
+	for pc, n in dispatch_demoted {
+		append(&dp, Row{"demoted", pc, 0, n})
 	}
 	return tsv(fb[:], fmt.tprintf("interp_insns\t-\t-\t%d\n", fallback_interp_insns)), tsv(dp[:], "")
 }

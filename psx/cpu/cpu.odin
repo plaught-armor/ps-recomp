@@ -6,7 +6,8 @@
 // address only matters to code that inspects it. `call` resolves a target in
 // this order: hand-written override, recompiled executable function, BIOS
 // vector or table entry, recompiled overlay function whose overlay is
-// resident, interpreter.
+// resident (or executable function demoted by a write to its page, whose code
+// is still the same: watch.odin), interpreter.
 package psx_cpu
 
 import "core:fmt"
@@ -120,12 +121,13 @@ vblanks :: proc() -> u64 {
 	return presents
 }
 
-// Replace the executable's function at addr with a hand-written procedure.
-// Returns the recompiled one so the replacement can fall back to it; ok is
-// false when no function was recompiled at addr.
+// Replace the executable's function at addr with a hand-written procedure,
+// demoted or not (watch.odin). Returns the recompiled one so the
+// replacement can fall back to it; ok is false when no function was
+// recompiled at addr.
 hook :: proc(addr: u32, fn: Func_Proc) -> (original: Func_Proc, ok: bool) {
 	if !registered(addr) {
-		return nil, false
+		return demoted_hook(addr, fn)
 	}
 	slot := &dispatch.fixed[fn_index(addr)]
 	original, slot^ = slot^, fn
@@ -144,6 +146,9 @@ hook_overlay :: proc(addr, slot, id: u32, fn: Func_Proc) -> (original: Func_Proc
 	list := dispatch.overlay[addr] or_return
 	for &e in list {
 		if e.slot == slot && e.id == id {
+			if e.slot == e.addr {
+				return demoted_hook(addr, fn)
+			}
 			original, e.fn = e.fn, fn
 			return original, true
 		}
@@ -174,7 +179,7 @@ call :: proc(addr: u32) {
 }
 
 @(private)
-resolve_overlay :: proc(addr: u32) -> Func_Proc {
+resolve_overlay :: proc(addr: u32) -> ^Ovl_Entry {
 	list, ok := dispatch.overlay[addr]
 	if !ok {
 		return nil
@@ -184,9 +189,8 @@ resolve_overlay :: proc(addr: u32) -> Func_Proc {
 			if k != 0 {
 				// Keep the resident variant first for the next lookup.
 				list[0], list[k] = list[k], list[0]
-				return list[0].fn
 			}
-			return e.fn
+			return &list[0]
 		}
 	}
 	return nil
@@ -208,9 +212,16 @@ call_slow :: proc(addr: u32) {
 	if bios_entry != nil && bios_entry(addr) {
 		return
 	}
-	if fn := resolve_overlay(addr); fn != nil {
-		when FALLBACK_COUNT {dispatch_overlay[addr] += 1}
-		fn()
+	if e := resolve_overlay(addr); e != nil {
+		when FALLBACK_COUNT {
+			if addr in dispatch_demoted {
+				dispatch_demoted[addr] += 1
+			} else {
+				dispatch_overlay[addr] += 1
+			}
+		}
+		if e.slot == e.addr {code_promote(e)}
+		e.fn()
 		return
 	}
 	report_once(addr, "interpreting")
@@ -249,7 +260,7 @@ jump_unknown :: proc(func, pc: u32) {
 		call(pc)
 		return
 	}
-	if is_ram_addr(pc) && dispatch.fixed[fn_index(pc)] != nil || resolve_overlay(pc) != nil {
+	if has_func(pc) {
 		when FALLBACK_COUNT {fallback_jump[{func, pc, .Call}] += 1}
 		call(pc)
 		return

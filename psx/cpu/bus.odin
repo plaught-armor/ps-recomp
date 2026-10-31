@@ -26,9 +26,10 @@ RAM_PAGE_SHIFT :: 12
 RAM_PAGE :: 1 << RAM_PAGE_SHIFT
 RAM_PAGES :: RAM_SIZE / RAM_PAGE
 
-// Pages whose next write calls ram_keep (checkpoint.odin): it saves the page
-// into the running pass's checkpoint, and gives it a new version. Every RAM
-// writer goes through ram_guard or ram_touch.
+// Pages whose next write calls ram_armed_write (watch.odin): it demotes the
+// page's recompiled code, and ram_keep (checkpoint.odin) saves the page into
+// the running pass's checkpoint and gives it a new version. Every RAM writer
+// goes through ram_guard or ram_touch.
 ram_armed: [RAM_PAGES]bool
 
 // Each page's version: a number naming its bytes, changed by ram_keep on
@@ -43,7 +44,7 @@ ram_ver_last: u32
 // Save RAM offset o's page before a write to it. o is below RAM_SIZE.
 ram_guard :: #force_inline proc(o: u32) #no_bounds_check {
 	if ram_armed[o >> RAM_PAGE_SHIFT] {
-		ram_keep(o >> RAM_PAGE_SHIFT)
+		ram_armed_write(o >> RAM_PAGE_SHIFT)
 	}
 }
 
