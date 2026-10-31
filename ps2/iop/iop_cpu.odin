@@ -40,6 +40,9 @@ iop_cpu_init :: proc() {
 }
 
 // The PS1's A0, B0 and C0 vectors are not the IOP's: no IOP code calls them.
+// host_call matches them before bios_entry, so a jump to IOP address 0xa0,
+// 0xb0 or 0xc0 lands here; those are exception vectors and kernel data,
+// far below any module.
 @(private = "file")
 iop_no_bios :: proc(fn: u32) {
 	r3000.fatal("iop: call to a PS1 BIOS vector, function %#x", fn)

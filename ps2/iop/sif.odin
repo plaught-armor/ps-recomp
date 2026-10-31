@@ -75,6 +75,8 @@ sif_init :: proc() {
 	iop_ram = r3000.ram[:]
 	slice.zero(iop_ram)
 	iop_cpu_init()
+	sys_init()
+	iop_heap_last = 0
 	iop_hle = core.snap_area(IOP_SPACE - IOP_RAM_SIZE)
 	sif.smflg = SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND
 	sif.sreg[0] = IOP_CMDBUF // SIF_SYSREG_SUBADDR
@@ -663,38 +665,36 @@ zero_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	return true
 }
 
-// IOP heap (sceSifAllocIopHeap, sceSifFreeIopHeap): a bump allocator over
-// IOP RAM no HLE module uses. Freeing the newest block returns it, which
-// covers the alloc, copy, LoadModuleBuffer, free pattern of module loading;
-// other frees are ignored.
-IOP_HEAP_START :: 0x00040000
-IOP_HEAP_END :: 0x00100000
-
-@(private = "file")
-iop_heap_top: u32 = IOP_HEAP_START
-
+// IOP heap (sceSifAllocIopHeap, sceSifFreeIopHeap): low blocks of sysmem.
+// With no frees, or only frees of the newest block, first-fit returns what
+// the bump allocator that served this before did. The debug line names a
+// free that allocator ignored, after which addresses can differ from it.
 @(private = "file")
 iop_heap_last: u32 // start of the newest block, 0 once it is freed
+
+iop_heap_alloc :: proc(req: u32) -> u32 {
+	a := sys_alloc(.Low, req)
+	if a != 0 {iop_heap_last = a}
+	if cpu.debug >= 1 {fmt.eprintfln("sif: iop heap alloc %x -> %x", (req + SYS_ALIGN - 1) &~ (SYS_ALIGN - 1), a)}
+	return a
+}
+
+iop_heap_free :: proc(a: u32) {
+	newest := a == iop_heap_last && a != 0
+	if newest {iop_heap_last = 0}
+	freed := sys_free(a)
+	if cpu.debug >= 1 {fmt.eprintfln("sif: iop heap free %x", a)}
+	if freed && !newest && cpu.debug >= 1 {fmt.eprintfln("sif: iop heap free %x not newest", a)}
+}
 
 @(private)
 iop_heap_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	switch fno {
 	case 1: // alloc {size} -> address, 0 when full
-		size := (w[0] + 0xff) &~ 0xff
-		if iop_heap_top + size > IOP_HEAP_END {
-			w[0] = 0
-		} else {
-			w[0] = iop_heap_top
-			iop_heap_last = iop_heap_top
-			iop_heap_top += size
-		}
-		if cpu.debug >= 1 {fmt.eprintfln("sif: iop heap alloc %x -> %x", size, w[0])}
+		w[0] = iop_heap_alloc(w[0])
 	case 2: // free {address} -> 0
-		if w[0] == iop_heap_last && iop_heap_last != 0 {
-			iop_heap_top = iop_heap_last
-			iop_heap_last = 0
-		}
+		iop_heap_free(w[0])
 		w[0] = 0
 	case:
 		return false
@@ -851,8 +851,8 @@ cdvd_search_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 sif_snap :: proc() {
 	core.snap_add(&sif)
 	core.snap_add(&fileio)
-	core.snap_add(&iop_heap_top)
 	core.snap_add(&iop_heap_last)
+	core.snap_add(&sys_blocks)
 	iop_cpu_snap()
 	adx_snap()
 }

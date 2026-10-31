@@ -41,6 +41,10 @@ io_read: proc(p: u32, size: u32) -> u32
 io_write: proc(p, v: u32, size: u32)
 // Loads and stores the bus has no device for (load_slow and store_slow's
 // default case), when set: the IOP's devices outside the PS1's I/O window.
+// The bus's own cases come first and mean the same on the IOP: the
+// scratchpad, 0x1f801000..0x1f802fff to io_read/io_write, the ROM reading
+// 0, and the cache control word. SIF, SIO2, SPU2 and expansion 1 reach
+// these.
 io_far_read: proc(p: u32, size: u32) -> u32
 io_far_write: proc(p, v: u32, size: u32)
 ram_keep: proc(p: u32)
