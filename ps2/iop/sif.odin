@@ -253,7 +253,8 @@ sif_command :: proc(a, pc: u32) {
 
 // ------------------------------------------------------------- servers
 
-// loadfile: modules are native here, so loading one only reports success.
+// loadfile: modules are native here, so loading one only reports success;
+// an ELF is loaded into EE RAM (loadelf).
 @(private)
 loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
@@ -262,6 +263,17 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		fmt.eprintfln("sif: load module \"%s\"", cstring(&buf[8]))
 		w[0] = 2
 		w[1] = 0
+		return true
+	case 1: // LoadElf {unused, unused, path[252], section[252]}, reply
+		// {entry, gp, result}: gp is always 0 and result 0, even on an error,
+		// which says entry 0 (loadelf.odin). Retail replies from a buffer of
+		// its own, which keeps words 1-2 of the last reply on an error; the
+		// reply here overwrites the request, so they are 0. Word 3 retail
+		// never writes.
+		path := strings.truncate_to_byte(string(buf[8:][:252]), 0)
+		section := strings.truncate_to_byte(string(buf[0x104:][:252]), 0)
+		w[0] = loadelf(path, section)
+		w[1], w[2], w[3] = 0, 0, 0
 		return true
 	case 6: // LoadModuleBuffer {IOP address, arg length, unused[252], args[252]}:
 		// the EE copied the IRX image to IOP RAM first

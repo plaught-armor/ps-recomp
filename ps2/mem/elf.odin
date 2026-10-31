@@ -11,14 +11,45 @@ ELF_MAGIC :: 0x464c457f // "\x7fELF"
 @(private = "file")
 PT_LOAD :: 1
 
+// The ELF header fields the loaders read (this one and the IOP's loadelf).
+Elf_Header :: struct {
+	class, encoding:            u8, // e_ident: 1 = 32-bit, 1 = little-endian
+	type, machine:              u32,
+	entry, phoff, shoff:        u32,
+	ehsize, phentsize, phnum:   u32,
+	shentsize, shnum, shstrndx: u32,
+}
+
+// The header of `data`, or false when it is shorter than one or no ELF.
+// Nothing else is checked: each loader checks what it relies on.
+elf_header :: proc(data: []u8) -> (h: Elf_Header, ok: bool) {
+	if len(data) < 52 || le32(data, 0) != ELF_MAGIC {return}
+	h = {
+		class     = data[4],
+		encoding  = data[5],
+		type      = le16(data, 16),
+		machine   = le16(data, 18),
+		entry     = le32(data, 24),
+		phoff     = le32(data, 28),
+		shoff     = le32(data, 32),
+		ehsize    = le16(data, 40),
+		phentsize = le16(data, 42),
+		phnum     = le16(data, 44),
+		shentsize = le16(data, 46),
+		shnum     = le16(data, 48),
+		shstrndx  = le16(data, 50),
+	}
+	return h, true
+}
+
 // Load `data` into RAM; mem_init must have run. Returns the entry point.
 load_elf :: proc(data: []u8) -> (entry: u32, ok: bool) {
 	Segment :: struct {
 		dst:          []u8,
 		off, filesz: u32,
 	}
-	if len(data) < 52 || le32(data, 0) != ELF_MAGIC {return}
-	phoff, phentsize, phnum := u64(le32(data, 28)), u64(le16(data, 42)), u64(le16(data, 44))
+	h := elf_header(data) or_return
+	phoff, phentsize, phnum := u64(h.phoff), u64(h.phentsize), u64(h.phnum)
 	if phnum > 0 && (phentsize < 24 || phoff + phnum * phentsize > u64(len(data))) {return}
 	segs := make([dynamic]Segment, 0, phnum, context.temp_allocator)
 	for i in 0 ..< phnum {
@@ -38,7 +69,7 @@ load_elf :: proc(data: []u8) -> (entry: u32, ok: bool) {
 		copy(s.dst, data[s.off:][:s.filesz])
 		for &b in s.dst[s.filesz:] {b = 0}
 	}
-	return le32(data, 24), true
+	return h.entry, true
 }
 
 // The host bytes of guest [a, a+n) in RAM or the scratchpad, as ram_slice

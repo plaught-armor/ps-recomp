@@ -6,12 +6,15 @@
 // a program patches one word of its own text and ExecPS2s into itself: every
 // other thread, semaphore, handler and alarm is gone, the function table is
 // off, and SetupThread hands it the arguments; with the word back, ExecPS2
-// runs the native function again.
+// runs the native function again. Before that, LOADFILE's loadelf (an IOP
+// RPC, the EE's SifLoadElf) loads ELFs from a disc directory: the segments'
+// file bytes or one section, and nothing for a bad ELF or one out of range.
 package main
 
 import "core:fmt"
 import "core:os"
 import cpu "ps:ps2/cpu"
+import iop "ps:ps2/iop"
 import kernel "ps:ps2/kernel"
 import mem "ps:ps2/mem"
 import "ps:core"
@@ -114,6 +117,126 @@ exec_interp :: proc(addr: u32) {
 	fail("fail: ExecPS2 returned")
 }
 
+LOAD :: 0x00400000 // the test ELF's segment
+LOAD_ENTRY :: LOAD + 0x40
+SECT :: 0x00410000 // its section outside the segment
+FILL :: 0xaa
+
+// An ELF of one PT_LOAD segment (16 file bytes at LOAD, memsz 32) and the
+// sections .text (the segment's bytes) and .extra (8 bytes at SECT).
+test_elf :: proc() -> []u8 {
+	e := make([]u8, 0x140 + 4 * 40)
+	w32 := proc(e: []u8, o: int, v: u32) {for i in 0 ..< 4 {e[o + i] = u8(v >> (8 * uint(i)))}}
+	w16 := proc(e: []u8, o: int, v: u32) {e[o], e[o + 1] = u8(v), u8(v >> 8)}
+	copy(e, "\x7fELF\x01\x01\x01")
+	w16(e, 16, 2) // ET_EXEC
+	w16(e, 18, 8) // EM_MIPS
+	w32(e, 20, 1)
+	w32(e, 24, LOAD_ENTRY)
+	w32(e, 28, 0x34) // phoff
+	w32(e, 32, 0x140) // shoff
+	w16(e, 40, 52)
+	w16(e, 42, 32)
+	w16(e, 44, 1)
+	w16(e, 46, 40)
+	w16(e, 48, 4)
+	w16(e, 50, 3) // .shstrtab
+	w32(e, 0x34, 1) // PT_LOAD
+	w32(e, 0x38, 0x100)
+	w32(e, 0x3c, LOAD)
+	w32(e, 0x44, 16)
+	w32(e, 0x48, 32)
+	for i in 0 ..< 24 {e[0x100 + i] = u8(i + 1)}
+	names := "\x00.text\x00.extra\x00.shstrtab\x00"
+	copy(e[0x120:], names)
+	Sh :: struct {name, addr, off, size: u32}
+	for sh, n in ([3]Sh{{1, LOAD, 0x100, 16}, {7, SECT, 0x110, 8}, {14, 0, 0x120, u32(len(names))}}) {
+		o := 0x140 + (n + 1) * 40
+		w32(e, o, sh.name)
+		w32(e, o + 12, sh.addr)
+		w32(e, o + 16, sh.off)
+		w32(e, o + 20, sh.size)
+	}
+	return e
+}
+
+// One loadelf call; the reply's 4 words, over a buffer that held others.
+loadelf_call :: proc(path, section: string) -> [4]u32 {
+	buf: [0x200]u8
+	w := ([^]u32)(&buf[0])
+	for i in 0 ..< 4 {w[i] = 0xdeadbeef}
+	copy(buf[8:], path)
+	copy(buf[0x104:], section)
+	if !iop.sif.servers[0x80000006](1, buf[:], len(buf)) {fail("fail: loadelf unhandled")}
+	return {w[0], w[1], w[2], w[3]}
+}
+
+// RAM [a, a+n) all FILL: nothing was loaded there.
+untouched :: proc(a, n: u32) -> bool {
+	for b in mem.ram[a:][:n] {if b != FILL {return false}}
+	return true
+}
+
+loadelf_test :: proc() {
+	core.host_allocator = context.allocator // no snap_init here; the loader reads the file with it
+	iop.sif_init()
+	dir, err := os.make_directory_temp("", "ps_loadelf_test_*", context.allocator)
+	if err != nil {fail("fail: temp dir: %v", err)}
+	defer if os.remove_all(dir) != nil {fmt.eprintln("loadelf: temp dir left:", dir)}
+	iop.disc_dir = dir
+	put :: proc(dir, name: string, e: []u8) {
+		if os.write_entire_file(fmt.tprintf("%s/%s", dir, name), e) != nil {fail("fail: write %s", name)}
+	}
+	le32_put :: proc(e: []u8, o: int, v: u32) {for i in 0 ..< 4 {e[o + i] = u8(v >> (8 * uint(i)))}}
+	good := test_elf()
+	put(dir, "GOOD.ELF", good)
+	// Each bad one is the good one with a field changed.
+	Bad :: struct {name: string, at: int, v: u32}
+	bads := [?]Bad {
+		{"NOELF.ELF", 0, 0}, // no magic
+		{"MACHINE.ELF", 18, 3}, // e_machine EM_386
+		{"LOW.ELF", 0x3c, 0x1000}, // below the kernel's 0x80000
+		{"PASTRAM.ELF", 0x3c, mem.RAM_SIZE - 8}, // ends past main RAM
+		{"PHOFF.ELF", 28, 0x10000}, // program headers past the file
+	}
+	for b in bads {
+		e := make([]u8, len(good), context.temp_allocator)
+		copy(e, good)
+		le32_put(e, b.at, b.v)
+		put(dir, b.name, e)
+	}
+
+	ram_fill :: proc() {
+		for a in ([?]u32{0x1000, LOAD, SECT, mem.RAM_SIZE - 32}) {for &b in mem.ram[a:][:32] {b = FILL}}
+	}
+	ram_fill()
+	r := loadelf_call("cdrom0:\\GOOD.ELF;1", "all")
+	if r != ([4]u32{LOAD_ENTRY, 0, 0, 0}) {fail("fail: loadelf all replied %x", r)}
+	for i in 0 ..< 16 {if mem.ram[LOAD + u32(i)] != u8(i + 1) {fail("fail: loadelf all: byte %d", i)}}
+	if !untouched(LOAD + 16, 16) {fail("fail: loadelf all zeroed the memsz tail")}
+	if !untouched(SECT, 32) {fail("fail: loadelf all loaded a section outside its segments")}
+
+	ram_fill()
+	r = loadelf_call("cdrom0:\\GOOD.ELF;1", ".extra")
+	if r != ([4]u32{}) {fail("fail: loadelf .extra replied %x", r)}
+	for i in 0 ..< 8 {if mem.ram[SECT + u32(i)] != u8(0x11 + i) {fail("fail: loadelf .extra: byte %d", i)}}
+	if !untouched(SECT + 8, 24) || !untouched(LOAD, 32) {fail("fail: loadelf .extra loaded more than its section")}
+
+	ram_fill()
+	for b in bads {
+		r = loadelf_call(fmt.tprintf("cdrom0:\\%s;1", b.name), "all")
+		if r != ([4]u32{}) {fail("fail: loadelf %s replied %x", b.name, r)}
+	}
+	for c in ([?][2]string{{"cdrom0:\\NONE.ELF;1", "all"}, {"host:GOOD.ELF", "all"}, {"cdrom0:\\GOOD.ELF;1", ".nope"}}) {
+		r = loadelf_call(c[0], c[1])
+		if r != ([4]u32{}) {fail("fail: loadelf %s %s replied %x", c[0], c[1], r)}
+	}
+	if !untouched(0x1000, 32) || !untouched(LOAD, 32) || !untouched(SECT, 32) || !untouched(mem.RAM_SIZE - 32, 32) {
+		fail("fail: a failed loadelf wrote RAM")
+	}
+	fmt.println("ok loadelf")
+}
+
 fail :: proc(format: string, args: ..any) -> ! {
 	fmt.eprintfln(format, ..args)
 	os.exit(1)
@@ -187,6 +310,8 @@ main :: proc() {
 	sys(0x75, FMT) // must print, not stop the run
 	sys(0x75, 0x0f000000) // a format past RAM prints `?`
 	fmt.println("ok _print")
+
+	loadelf_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.
 	main_t.co = core.co_create(proc(_: rawptr) {exec_prog()}, nil)
