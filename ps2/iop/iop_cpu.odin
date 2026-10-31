@@ -3,8 +3,9 @@
 // physical 0..8 MiB onto that 2 MiB, as the retail mirror does, so IOP code
 // never reaches iop_hle.
 //
-// Nothing runs on it yet: no IRX is loaded and nothing schedules it. Its
-// devices are a stub that logs each address once and reads 0.
+// It runs only module starts (loadcore.odin, PS_IRX=1), synchronously;
+// nothing schedules it. Its devices are a stub that logs each address once
+// and reads 0.
 package ps2_iop
 
 import "core:fmt"
@@ -24,7 +25,7 @@ iop_cpu_init :: proc() {
 	r3000.bios_b = iop_no_bios
 	r3000.bios_c = iop_no_bios
 	r3000.bios_syscall = proc() {r3000.fatal("iop: syscall %d", r3000.state.r[4])}
-	r3000.bios_entry = nil
+	r3000.bios_entry = iop_hle_entry
 	r3000.irq_check = proc() {}
 	r3000.interp_run = r3000.interp_loop
 	r3000.run_events = proc() {}
@@ -37,6 +38,7 @@ iop_cpu_init :: proc() {
 	r3000.io_far_write = iop_io_write
 	r3000.ram_keep = nil
 	clear(&iop_io_seen)
+	iop_dispatch_init()
 }
 
 // The PS1's A0, B0 and C0 vectors are not the IOP's: no IOP code calls them.
@@ -81,4 +83,5 @@ iop_cpu_snap :: proc() {
 	core.snap_add(&r3000.scratch)
 	core.snap_add_bytes(r3000.ram[:])
 	core.snap_add(&iop_io_seen)
+	core.snap_add(&r3000.dispatch.reported) // report_once grows it
 }

@@ -77,6 +77,7 @@ sif_init :: proc() {
 	iop_cpu_init()
 	sys_init()
 	iop_heap_last = 0
+	iop_loader_init()
 	iop_hle = core.snap_area(IOP_SPACE - IOP_RAM_SIZE)
 	sif.smflg = SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND
 	sif.sreg[0] = IOP_CMDBUF // SIF_SYSREG_SUBADDR
@@ -306,15 +307,25 @@ sif_command :: proc(a, pc: u32) {
 // ------------------------------------------------------------- servers
 
 // loadfile: modules are native here, so loading one only reports success;
-// an ELF is loaded into EE RAM (loadelf).
+// an ELF is loaded into EE RAM (loadelf). With PS_IRX=1 a module that is no
+// Sony one is loaded and started on the IOP (loadcore.odin).
 @(private)
 loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	switch fno {
-	case 0: // LoadModule {result, modres, path[252], args[252]}
+	case 0: // LoadModule {arg length, unused, path[252], args[252]}, reply
+		// {id or error, what its start returned}
 		fmt.eprintfln("sif: load module \"%s\"", cstring(&buf[8]))
+		path := strings.truncate_to_byte(string(buf[8:][:252]), 0)
+		args := buf[0x104:][:min(w[0], 252)]
 		w[0] = 2
 		w[1] = 0
+		if iop_irx && !strings.has_prefix(path, "rom0:") {
+			if data, ok := disc_file(path, context.temp_allocator); ok && iop_runs(data) {
+				id, result := iop_load(data, path, args)
+				w[0], w[1] = u32(id), result
+			}
+		}
 		return true
 	case 1: // LoadElf {unused, unused, path[252], section[252]}, reply
 		// {entry, gp, result}: gp is always 0 and result 0, even on an error,
@@ -329,9 +340,16 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		return true
 	case 6: // LoadModuleBuffer {IOP address, arg length, unused[252], args[252]}:
 		// the EE copied the IRX image to IOP RAM first
-		if cpu.debug >= 1 {fmt.eprintfln("sif: load module buffer %x \"%s\"", w[0], irx_name(w[0]))}
+		name := irx_name(w[0])
+		if cpu.debug >= 1 {fmt.eprintfln("sif: load module buffer %x \"%s\"", w[0], name)}
+		data := iop_mem(w[0], IOP_RAM_SIZE)
+		args := buf[0x104:][:min(w[1], 252)]
 		w[0] = 2
 		w[1] = 0
+		if iop_irx && iop_runs(data) {
+			id, result := iop_load(data, name, args)
+			w[0], w[1] = u32(id), result
+		}
 		return true
 	case 255: // version handshake: the EE library refuses to load modules
 		// through a LOADFILE whose version it does not know
@@ -853,6 +871,7 @@ sif_snap :: proc() {
 	core.snap_add(&fileio)
 	core.snap_add(&iop_heap_last)
 	core.snap_add(&sys_blocks)
+	core.snap_add(&iop_loader)
 	iop_cpu_snap()
 	adx_snap()
 }

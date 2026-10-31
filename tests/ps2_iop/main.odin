@@ -13,6 +13,16 @@
 // (each type, HI16/LO16 pairing with and without a carry, two HI16 to one
 // LO16) and scanned for its library tables, with magic words outside a
 // table rejected; a bad type and an orphan HI16 are refused.
+//
+// loadcore: synthetic modules are loaded and started. An import of a
+// registered export is patched to jump to it; a pending one is patched when
+// a later module registers its library, and a call before that is a compat
+// row; a module allocates through its sysmem stub; an unknown function
+// returns -1 with one compat row and fails the load; a failed load undoes
+// what it registered, mapped, patched in another module and allocated; a
+// NO_RESIDENT_END start frees the module; a spinning start runs out of its
+// budget; a snapshot restores the loader, and a load after it lands where
+// the first did.
 package main
 
 import "core:encoding/endian"
@@ -42,7 +52,8 @@ check :: proc(ok: bool, what: string, loc := #caller_location) {
 game :: proc(_: rawptr) {
 	check(raw_data(iop.iop_ram) == &r3000.ram[0], "iop_ram is the R3000's RAM")
 	check(r3000.gte_cmd == nil && r3000.gte_read == nil && r3000.gte_write == nil, "no GTE")
-	check(r3000.bios_entry == nil && r3000.ram_keep == nil, "no PS1 BIOS entry or RAM watch")
+	check(r3000.bios_entry == iop.iop_hle_entry && r3000.ram_keep == nil, "the IOP's stubs, no RAM watch")
+	check(len(r3000.dispatch.fixed) == r3000.RAM_SIZE / 4, "an empty dispatch table, mapped read-only")
 	r3000.io_far_write = proc(a, v: u32, size: u32) {append(&far, [3]u32{a, v, size})}
 
 	hle := (^u32)(raw_data(iop.iop_mem(0x200010, 4)))
@@ -93,6 +104,8 @@ game :: proc(_: rawptr) {
 	test_heap()
 	test_sysmem()
 	test_irx()
+	test_loader_snap()
+	test_loader()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -203,11 +216,17 @@ Rel :: struct {
 
 irx_rels := [?]Rel{{0x00, 2}, {0x04, 4}, {0x08, 5}, {0x0c, 5}, {0x10, 6}, {0x14, 5}, {0x18, 6}, {0x1c, 7}, {0x20, 0}, {0x64, 2}, {0x68, 2}}
 
-// An IRX file: ELF header, the IOPMOD and PT_LOAD headers, the module info,
-// the text at 0x100, then one SHT_REL section of `rels`.
+// The synthetic module's IRX file with relocations `rels`.
 build_irx :: proc(rels: []Rel) -> []u8 {
+	return build_file("testmod", irx_text[:], rels, 0x10)
+}
+
+// An IRX file of module `name`: ELF header, the IOPMOD and PT_LOAD headers,
+// the module info, `text` at 0x100 and 0x40 bytes of bss, then one SHT_REL
+// section of `rels`.
+build_file :: proc(name: string, text: []u32, rels: []Rel, entry: u32) -> []u8 {
 	TEXT :: 0x100
-	text_size := u32(len(irx_text) * 4)
+	text_size := u32(len(text) * 4)
 	rel := TEXT + text_size
 	sh := rel + u32(len(rels) * 8)
 	f := make([]u8, sh + 80, context.temp_allocator)
@@ -231,10 +250,10 @@ build_irx :: proc(rels: []Rel) -> []u8 {
 	w32(f, 0x64, text_size)
 	w32(f, 0x68, text_size + 0x40)
 	// module info: entry, gp, text, data, bss, version, name
-	for v, i in ([?]u32{0, 0x10, 0x8010, text_size, 0, 0x40}) {w32(f, 0x74 + u32(i) * 4, v)}
+	for v, i in ([?]u32{0, entry, 0x8010, text_size, 0, 0x40}) {w32(f, 0x74 + u32(i) * 4, v)}
 	w16(f, 0x74 + 24, 0x0102)
-	copy(f[0x74 + 26:], "testmod")
-	for v, i in irx_text {w32(f, TEXT + u32(i) * 4, v)}
+	copy(f[0x74 + 26:][:8], name)
+	for v, i in text {w32(f, TEXT + u32(i) * 4, v)}
 	for r, i in rels {
 		w32(f, rel + u32(i) * 8, r.off)
 		w32(f, rel + u32(i) * 8 + 4, r.type)
@@ -303,4 +322,286 @@ test_irx :: proc() {
 	endian.put_u16(f[16:], .Little, 2)
 	_, ok := iop.irx_parse(f)
 	check(!ok, "irx: an executable ELF is no IRX")
+}
+
+// A module's text as it is assembled: words, and their relocations.
+Asm :: struct {
+	w:    [dynamic]u32,
+	rels: [dynamic]Rel,
+}
+
+at :: proc(a: ^Asm) -> u32 {return u32(len(a.w)) * 4}
+put :: proc(a: ^Asm, words: ..u32) {append(&a.w, ..words)}
+put_rel :: proc(a: ^Asm, w, type: u32) {
+	append(&a.rels, Rel{at(a), type})
+	put(a, w)
+}
+
+name_words :: proc(s: string) -> (n: [2]u32) {
+	copy((^[8]u8)(&n)[:], s)
+	return
+}
+
+// An import table of `lib` 1.1; the offset of its first stub.
+imports :: proc(a: ^Asm, lib: string, fnos: ..u32) -> u32 {
+	n := name_words(lib)
+	put(a, IMPORT, 0, 0x0101, n[0], n[1])
+	stubs := at(a)
+	for f in fnos {put(a, JR_RA, 0x24000000 | f)}
+	put(a, 0, 0)
+	return stubs
+}
+
+// An export table of `lib` 1.1 with one function, which the caller fills in
+// at word `ptr`; the table's offset.
+exports :: proc(a: ^Asm, lib: string) -> (table: u32, ptr: int) {
+	n := name_words(lib)
+	table = at(a)
+	put(a, EXPORT, 0, 0x0101, n[0], n[1])
+	ptr = len(a.w)
+	put_rel(a, 0, 2)
+	put(a, 0)
+	return
+}
+
+T0 :: 8
+A0 :: 4
+A1 :: 5
+A2 :: 6
+
+la :: proc(a: ^Asm, rt, off: u32) {
+	put_rel(a, 0x3c000000 | rt << 16, 5) // lui rt, 0
+	put_rel(a, 0x24000000 | rt << 21 | rt << 16 | off, 6) // addiu rt, rt, off
+}
+jal :: proc(a: ^Asm, off: u32) {
+	put_rel(a, 0x0c000000 | off >> 2, 4)
+	put(a, 0)
+}
+li :: proc(a: ^Asm, rt, imm: u32) {put(a, 0x24000000 | rt << 16 | imm)} // addiu rt, zero, imm
+store_v0 :: proc(a: ^Asm, off: u32) {
+	la(a, T0, off)
+	put(a, 0xad020000) // sw v0, 0(t0)
+}
+prologue :: proc(a: ^Asm) {put(a, 0x27bdfff0, 0xafbf0000)} // addiu sp, sp, -16; sw ra, 0(sp)
+// Returns v0 as it stands.
+epilogue :: proc(a: ^Asm) {put(a, 0x8fbf0000, JR_RA, 0x27bd0010)} // lw ra, 0(sp); jr ra; addiu sp, sp, 16
+
+// An IRX file of module `name` with text `a`, its start at `entry`.
+build_mod :: proc(name: string, a: ^Asm, entry: u32) -> []u8 {
+	return build_file(name, a.w[:], a.rels[:], entry)
+}
+
+fresh :: proc() {
+	iop.sys_init()
+	iop.iop_loader_init()
+}
+
+// "moda": registers "liba", whose function 0 returns 0x700.
+mod_a :: proc() -> (f: []u8, f0: u32) {
+	a: Asm
+	lc := imports(&a, "loadcore", 6)
+	tbl, ptr := exports(&a, "liba")
+	f0 = at(&a)
+	put(&a, JR_RA, 0x24020700) // jr ra; li v0, 0x700
+	a.w[ptr] = f0
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, tbl)
+	jal(&a, lc)
+	epilogue(&a)
+	return build_mod("moda", &a, entry), f0
+}
+
+// "modb": imports liba's function 0; with `call` its start returns what
+// that returns, else 0.
+mod_b :: proc(call: bool) -> (f: []u8, stub: u32) {
+	a: Asm
+	stub = imports(&a, "liba", 0)
+	entry := at(&a)
+	if call {
+		prologue(&a)
+		jal(&a, stub)
+		epilogue(&a)
+	} else {
+		put(&a, JR_RA, 0x24020000)
+	}
+	return build_mod("modb", &a, entry), stub
+}
+
+// Calls `addr` from the host as a module would.
+iop_call :: proc(addr: u32) -> u32 {
+	r3000.state.r[31] = 0
+	r3000.call(addr)
+	return r3000.state.r[2]
+}
+
+module_base :: proc(id: i32) -> u32 {
+	for m in iop.iop_loader.modules {
+		if i32(m.id) == id {return m.base}
+	}
+	return 0
+}
+
+snap2: core.Snapshot
+snap2_loaded: bool // not emulated state
+snap2_base: u32
+
+test_loader_snap :: proc() {
+	fresh()
+	core.snap_op, core.snap_target = .Save, &snap2
+	core.snap_yield()
+	if !snap2_loaded {
+		fa, _ := mod_a()
+		ida, _ := iop.iop_load(fa, "moda", nil)
+		fb, _ := mod_b(true)
+		idb, rb := iop.iop_load(fb, "modb", nil)
+		check(ida > 0 && idb > 0 && rb == 0x700, "loader snapshot: both load")
+		snap2_base = module_base(ida)
+		snap2_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap2
+		core.snap_yield()
+	}
+	l := &iop.iop_loader
+	check(len(l.libs) == 0 && len(l.stubs) == 0 && len(l.modules) == 0 && len(l.pending) == 0, "loader snapshot: loader restored")
+	check(len(iop.sys_blocks) == 0, "loader snapshot: sysmem restored")
+	fa, _ := mod_a()
+	ida, _ := iop.iop_load(fa, "moda", nil)
+	check(ida > 0 && module_base(ida) == snap2_base, "loader snapshot: a load after it lands where the first did")
+}
+
+test_loader :: proc() {
+	l := &iop.iop_loader
+
+	// An import of a registered export.
+	fresh()
+	fa, f0 := mod_a()
+	ida, ra := iop.iop_load(fa, "moda", nil)
+	check(ida > 0 && ra == 0, "loader: moda starts resident")
+	check(len(l.libs) == 1 && string(l.libs[0].name[:4]) == "liba" && l.libs[0].count == 1, "loader: liba registered")
+	fb, stub := mod_b(true)
+	idb, rb := iop.iop_load(fb, "modb", nil)
+	check(idb > 0 && rb == 0x700, "loader: modb's start calls liba through its stub")
+	bb := module_base(idb)
+	fa0 := module_base(ida) + f0
+	check(iop.iop_u32(bb + stub)^ == 0x08000000 | fa0 >> 2 && iop.iop_u32(bb + stub + 4)^ == 0, "loader: stub patched to j export; nop")
+
+	// A pending import, called before and after its library is registered.
+	fresh()
+	fb2, stub2 := mod_b(false)
+	idb2, _ := iop.iop_load(fb2, "modb", nil)
+	b2 := module_base(idb2)
+	check(idb2 > 0 && len(l.pending) == 1 && (b2 + stub2) in l.stubs, "loader: import of an unregistered library pends")
+	key := core.Compat_Key{.Iop_Import, core.compat_name("liba"), 0}
+	check(iop_call(b2 + stub2) == 0xffffffff && core.compat.calls[key].n == 1, "loader: a pending stub returns -1 with a compat row")
+	ida2, _ := iop.iop_load(fa, "moda", nil)
+	check(ida2 > 0 && len(l.pending) == 0 && (b2 + stub2) not_in l.stubs, "loader: registering resolves the pending import")
+	check(iop_call(b2 + stub2) == 0x700, "loader: the patched stub reaches the export")
+
+	// Allocation through sysmem, and an unknown function.
+	fresh()
+	c: Asm
+	sm := imports(&c, "sysmem", 4, 99)
+	d := at(&c)
+	put(&c, 0, 0, 0)
+	entry := at(&c)
+	prologue(&c)
+	for k in u32(0) ..< 2 {
+		li(&c, A0, 0)
+		li(&c, A1, 0x100)
+		li(&c, A2, 0)
+		jal(&c, sm)
+		store_v0(&c, d + 4 * k)
+	}
+	epilogue(&c)
+	idc, rc := iop.iop_load(build_mod("modc", &c, entry), "modc", nil)
+	cb := module_base(idc)
+	x, y := iop.iop_u32(cb + d)^, iop.iop_u32(cb + d + 4)^
+	check(idc > 0 && rc & 3 == 0, "loader: modc starts")
+	check(x != 0 && y >= x + 0x100 && x >= cb + 0x100, fmt.tprintf("loader: AllocSysMemory blocks %x %x apart from the module at %x", x, y, cb))
+
+	e: Asm
+	sm = imports(&e, "sysmem", 4, 99)
+	d = at(&e)
+	put(&e, 0x5a5a5a5a)
+	entry = at(&e)
+	prologue(&e)
+	jal(&e, sm + 8)
+	store_v0(&e, d)
+	epilogue(&e)
+	before := slice_clone(iop.sys_blocks[:])
+	fe := build_mod("mode", &e, entry)
+	base_e := iop.sys_alloc(.Low, 0x100) // where the module will land
+	iop.sys_free(base_e)
+	ide, _ := iop.iop_load(fe, "mode", nil)
+	key = core.Compat_Key{.Iop_Call, core.compat_name("sysmem"), 99}
+	check(ide == -1 && core.compat.calls[key].n == 1, "loader: unknown fno fails the load with a compat row")
+	check(iop.iop_u32(base_e + d)^ == 0xffffffff, "loader: the unknown fno returned -1 (the write stays)")
+	check(blocks_equal(before, iop.sys_blocks[:]), "loader: the failed module's memory freed")
+
+	// A failed load undoes what it did, in another module too.
+	fresh()
+	p: Asm
+	ps := imports(&p, "libf", 0)
+	put(&p, JR_RA, 0x24020000)
+	idp, _ := iop.iop_load(build_mod("modp", &p, ps + 16), "modp", nil)
+	pb := module_base(idp)
+	f: Asm
+	lc := imports(&f, "loadcore", 6)
+	fs := imports(&f, "sysmem", 4, 99)
+	imports(&f, "libz", 0)
+	tbl, ptr := exports(&f, "libf")
+	f.w[ptr] = at(&f)
+	put(&f, JR_RA, 0)
+	entry = at(&f)
+	prologue(&f)
+	la(&f, A0, tbl)
+	jal(&f, lc)
+	li(&f, A0, 1)
+	li(&f, A1, 0x100)
+	jal(&f, fs)
+	jal(&f, fs + 8)
+	epilogue(&f)
+	libs, pending, stubs := len(l.libs), len(l.pending), len(l.stubs)
+	before = slice_clone(iop.sys_blocks[:])
+	idf, _ := iop.iop_load(build_mod("modf", &f, entry), "modf", nil)
+	check(idf == -1, "loader: modf fails")
+	check(len(l.libs) == libs && len(l.pending) == pending && len(l.stubs) == stubs, "loader: registrations, pending imports and stubs undone")
+	check(blocks_equal(before, iop.sys_blocks[:]), "loader: image and AllocSysMemory blocks freed")
+	check(iop.iop_u32(pb + ps)^ == JR_RA && iop.iop_u32(pb + ps + 4)^ == 0x24000000, "loader: the stub patched in modp restored")
+	check((pb + ps) in l.stubs && l.stubs[pb + ps].pending, "loader: modp's import pends again")
+
+	// NO_RESIDENT_END frees the module and its stubs.
+	g: Asm
+	imports(&g, "sysmem", 4)
+	entry = at(&g)
+	put(&g, JR_RA, 0x24020001)
+	stubs = len(l.stubs)
+	before = slice_clone(iop.sys_blocks[:])
+	idg, rg := iop.iop_load(build_mod("modg", &g, entry), "modg", nil)
+	check(idg > 0 && rg == 1 && module_base(idg) == 0, "loader: NO_RESIDENT_END is not kept")
+	check(len(l.stubs) == stubs && blocks_equal(before, iop.sys_blocks[:]), "loader: NO_RESIDENT_END frees memory and stubs")
+
+	// A start that spins.
+	sp: Asm
+	entry = at(&sp)
+	put_rel(&sp, 0x08000000 | entry >> 2, 4) // j .
+	put(&sp, 0)
+	before = slice_clone(iop.sys_blocks[:])
+	ids, _ := iop.iop_load(build_mod("spin", &sp, entry), "spin", nil)
+	key = core.Compat_Key{.Iop_Start, core.compat_name("spin"), 0}
+	check(ids == -1 && core.compat.calls[key].n == 1, "loader: a spinning start runs out of its budget")
+	check(blocks_equal(before, iop.sys_blocks[:]), "loader: the spinning module freed")
+	check(r3000.next_event == iop.IOP_EVENT_OFF, "loader: the budget is off after a start")
+}
+
+slice_clone :: proc(b: []iop.Sys_Block) -> []iop.Sys_Block {
+	c := make([]iop.Sys_Block, len(b), context.temp_allocator)
+	copy(c, b)
+	return c
+}
+
+blocks_equal :: proc(a, b: []iop.Sys_Block) -> bool {
+	if len(a) != len(b) {return false}
+	for x, i in a {if x != b[i] {return false}}
+	return true
 }

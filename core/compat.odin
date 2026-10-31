@@ -18,10 +18,12 @@
 // crashed.
 package core
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:hash/xxhash"
 import "core:slice"
+import "core:strings"
 
 COMPAT_COUNT :: #config(COMPAT_COUNT, true)
 
@@ -31,7 +33,10 @@ COMPAT_TOP :: 10
 // The kinds of call the HLE may not implement. Id and sub per kind:
 // Bios_A/B/C the function number; Syscall the syscall number (as an i32);
 // Sif_Bind the server id; Sif_Rpc the server id and function number;
-// Sif_Cmd the command id.
+// Sif_Cmd the command id; Iop_Call an IOP library's name (compat_name) and
+// function number; Iop_Import a library's name no module registered;
+// Iop_Start a module's name, whose start ran out of its budget; Irx_Reloc
+// the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -40,6 +45,30 @@ Compat_Call :: enum u8 {
 	Sif_Bind,
 	Sif_Rpc,
 	Sif_Cmd,
+	Iop_Call,
+	Iop_Import,
+	Iop_Start,
+	Irx_Reloc,
+}
+
+// The names the IOP's rows carry, by the id compat_name gives them, so a key
+// stays three words. Host data, never freed: a name is the same whatever
+// state a snapshot restores.
+@(private = "file")
+compat_names: [dynamic]string
+
+// The id of name s, interned on first use.
+compat_name :: proc(s: string) -> u32 {
+	for n, i in compat_names {
+		if n == s {
+			return u32(i)
+		}
+	}
+	if compat_names.allocator.procedure == nil {
+		compat_names.allocator = runtime.heap_allocator()
+	}
+	append(&compat_names, strings.clone(s, runtime.heap_allocator()))
+	return u32(len(compat_names) - 1)
 }
 
 Compat_Key :: struct {
@@ -166,6 +195,10 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Sif_Bind: return fmt.tprintf("SIF server %08x", k.id)
 	case .Sif_Rpc: return fmt.tprintf("SIF server %08x fno %d", k.id, k.sub)
 	case .Sif_Cmd: return fmt.tprintf("SIF command %08x", k.id)
+	case .Iop_Call: return fmt.tprintf("IOP %s fno %d", compat_names[k.id], k.sub)
+	case .Iop_Import: return fmt.tprintf("IOP import %s", compat_names[k.id])
+	case .Iop_Start: return fmt.tprintf("IOP start %s budget", compat_names[k.id])
+	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""
 }
