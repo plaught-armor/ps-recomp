@@ -873,6 +873,7 @@ sif_snap :: proc() {
 	core.snap_add(&sys_blocks)
 	core.snap_add(&iop_loader)
 	core.snap_add(&iop_sched)
+	core.snap_add(&iop_sifcmd)
 	iop_cpu_snap()
 	adx_snap()
 }

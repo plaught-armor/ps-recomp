@@ -130,6 +130,7 @@ iop_loader_init :: proc() {
 	iop_loader.failed = false
 	failed_paths_clear()
 	th_init()
+	iop_sifcmd = {}
 }
 
 @(private = "file")
@@ -487,6 +488,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return stdio_fn(fno)
 	case "sysclib":
 		return sysclib_fn(fno)
+	case "sifcmd":
+		return sifcmd_fn(fno)
 	}
 	return 0, false
 }

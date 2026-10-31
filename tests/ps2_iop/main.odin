@@ -123,6 +123,7 @@ game :: proc(_: rawptr) {
 	test_thread_budget()
 	test_libc()
 	test_thread_snap()
+	test_sifcmd()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -942,4 +943,56 @@ test_thread_snap :: proc() {
 	check(log_equal(base, logp, {}), "thread snapshot: H waits again after the load")
 	ids, _ := iop.iop_load(mod_s(), "mods", nil)
 	check(ids > 0 && log_equal(base, logp, {7}), "thread snapshot: the restored H wakes where it waited")
+}
+
+// sceSifSetCmdBuffer and sceSifAddCmdHandler fill the module's table and the
+// system one; a cid past either table is refused, with nothing written.
+test_sifcmd :: proc() {
+	fresh()
+	a: Asm
+	sc := imports(&a, "sifcmd", 4, 8, 10)
+	out := at(&a)
+	put(&a, 1, 1, 1, 1, 1, 1, 1)
+	tab := at(&a)
+	put(&a, 0, 0, 0, 0, 0x77777777)
+	tab2 := at(&a)
+	put(&a, 0, 0)
+	add :: proc(a: ^Asm, stub: u32, cid_hi, cid_lo, h, harg: u32, out: u32) {
+		put(a, 0x3c040000 | cid_hi, 0x34840000 | cid_lo) // lui a0, hi; ori a0, a0, lo
+		li(a, A1, h)
+		li(a, A2, harg)
+		jal(a, stub)
+		store_v0(a, out)
+	}
+	entry := at(&a)
+	prologue(&a)
+	jal(&a, sc)
+	store_v0(&a, out)
+	la(&a, A0, tab)
+	li(&a, A1, 2)
+	jal(&a, sc + 8)
+	store_v0(&a, out + 4)
+	add(&a, sc + 16, 0, 1, 0x1234, 0x99, out + 8)
+	add(&a, sc + 16, 0, 2, 0x1111, 0x22, out + 12)
+	add(&a, sc + 16, 0x8000, 5, 0x4444, 0x55, out + 16)
+	add(&a, sc + 16, 0x8000, 32, 0x3333, 0x66, out + 20)
+	la(&a, A0, tab2)
+	li(&a, A1, 1)
+	jal(&a, sc + 8)
+	store_v0(&a, out + 24)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modc", &a, entry), "modc", nil)
+	b := module_base(id)
+	u := proc(b, o: u32) -> u32 {return iop.iop_u32(b + o)^}
+	s := &iop.iop_sifcmd
+	check(id > 0, "sifcmd: modc loads")
+	check(u(b, out) == 0 && u(b, out + 4) == 0, "sifcmd: sceSifInitCmd returns, the first table replaces none")
+	check(u(b, out + 8) == 0 && u(b, tab + 8) == 0x1234 && u(b, tab + 12) == 0x99, "sifcmd: a user handler lands in the module's table")
+	check(u(b, out + 12) == 0xffffffff && u(b, tab + 16) == 0x77777777, "sifcmd: a cid past the table is refused, nothing written")
+	check(u(b, out + 16) == 0 && s.sys[5].handler == 0x4444 && s.sys[5].harg == 0x55, "sifcmd: a system handler lands in the system table")
+	check(u(b, out + 20) == 0xffffffff, "sifcmd: a system cid past 31 is refused")
+	check(u(b, out + 24) == b + tab && s.user_tab == b + tab2 && s.user_size == 1, "sifcmd: a second table returns the first")
+	iop.iop_loader_init()
+	check(s^ == {}, "sifcmd: the loader's reset clears the tables")
 }
