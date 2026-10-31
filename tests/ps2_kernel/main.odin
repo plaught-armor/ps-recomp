@@ -11,11 +11,14 @@
 // directory: the segments' file bytes or one section, and nothing for a bad
 // ELF or one out of range. SifDmaStat reports a transfer running for its
 // size's worth of cycles after SifSetDma, then done, and an older id or a
-// failed set's 0 as done.
+// failed set's 0 as done. LOADFILE's version handshake answers with the
+// version in the LOADFILE of the IOPRP image an IOP reset loads, and "3000"
+// with no image or no version in it.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import cpu "ps:ps2/cpu"
 import iop "ps:ps2/iop"
 import kernel "ps:ps2/kernel"
@@ -288,6 +291,70 @@ dma_stat_test :: proc() {
 	fmt.println("ok SifDmaStat")
 }
 
+// An IOP reset to `path`, a packet SifSetDma (0x77) sends to the IOP's
+// command buffer, then LOADFILE's version handshake (fno 255).
+reset_version :: proc(path: string) -> string {
+	LIST :: PARAM + 0x300
+	PKT :: PARAM + 0x400
+	for &b in mem.ram_slice(PKT, 0x100) {b = 0}
+	mem.wr32(PKT + 8, iop.SIF_CMD_RESET)
+	copy(mem.ram_slice(PKT + 24, 0x100 - 24), path)
+	for v, n in ([4]u32{PKT, iop.IOP_CMDBUF, 0x100, 0}) {mem.wr32(LIST + u32(n) * 4, v)}
+	if sys(0x77, LIST, 1) <= 0 {fail("fail: SifSetDma of the reset failed")}
+	buf: [16]u8
+	if !iop.sif.servers[0x80000006](255, buf[:], 4) {fail("fail: loadfile fno 255 unhandled")}
+	return strings.clone(string(buf[:4]), context.temp_allocator)
+}
+
+// IOPRP images built here: a ROMDIR table of RESET, ROMDIR, a placeholder
+// module and LOADFILE, whose bytes are placeholders around the version.
+loadfile_version_test :: proc() {
+	dir, err := os.make_directory_temp("", "ps_ioprp_test_*", context.allocator)
+	if err != nil {fail("fail: temp dir: %v", err)}
+	defer if os.remove_all(dir) != nil {fmt.eprintln("ioprp: temp dir left:", dir)}
+	iop.disc_dir = dir
+	image :: proc(dir, name: string, loadfile: []u8) {
+		Entry :: struct {name: string, size: int}
+		entries := [?]Entry{{"RESET", 0}, {"ROMDIR", 5 * 16}, {"OTHER", 0x23}, {"LOADFILE", len(loadfile)}}
+		img: [dynamic]u8
+		defer delete(img)
+		for e in entries {
+			row: [16]u8
+			copy(row[:10], e.name)
+			(^u32)(&row[12])^ = u32(e.size)
+			append(&img, ..row[:])
+		}
+		append(&img, ..make([]u8, 16, context.temp_allocator)) // the zero name ending the table
+		other := make([]u8, 0x30, context.temp_allocator) // 0x23 bytes, aligned
+		for &b in other[:0x23] {b = 0xee}
+		append(&img, ..other)
+		append(&img, ..loadfile)
+		if os.write_entire_file(fmt.tprintf("%s/%s", dir, name), img[:]) != nil {fail("fail: write %s", name)}
+	}
+	with: [dynamic]u8
+	defer delete(with)
+	append(&with, ..make([]u8, 0x40, context.temp_allocator))
+	append(&with, "PsIIloadfile3210")
+	append(&with, ..make([]u8, 0x10, context.temp_allocator))
+	image(dir, "NEW.IMG", with[:])
+	without := make([]u8, 0x50, context.temp_allocator)
+	copy(without[0x40:], "PsIIloadfileXY")
+	image(dir, "OLD.IMG", without)
+
+	Case :: struct {path, want: string}
+	cases := [?]Case {
+		{"rom0:UDNL cdrom0:\\NEW.IMG;1", "3210"},
+		{"", "3000"}, // no image: rom0's modules again
+		{"rom0:UDNL cdrom0:\\NEW.IMG;1", "3210"},
+		{"rom0:UDNL cdrom0:\\OLD.IMG;1", "3000"}, // no version after the marker
+		{"rom0:UDNL cdrom0:\\NONE.IMG;1", "3000"},
+	}
+	for c in cases {
+		if got := reset_version(c.path); got != c.want {fail("fail: version after reset %q is %q, want %q", c.path, got, c.want)}
+	}
+	fmt.println("ok LOADFILE version")
+}
+
 fail :: proc(format: string, args: ..any) -> ! {
 	fmt.eprintfln(format, ..args)
 	os.exit(1)
@@ -365,6 +432,7 @@ main :: proc() {
 	loadelf_test()
 	setup_test()
 	dma_stat_test()
+	loadfile_version_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.
 	main_t.co = core.co_create(proc(_: rawptr) {exec_prog()}, nil)

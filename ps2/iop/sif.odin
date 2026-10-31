@@ -54,6 +54,8 @@ sif: struct {
 	// The last transfer SifSetDma started and the EE cycle it ends at.
 	last_dma:  i32,
 	dma_done:  u64,
+	// What LOADFILE answers its version handshake with (loadfile_version).
+	loadfile_version: [4]u8,
 }
 
 sif_init :: proc() {
@@ -61,6 +63,7 @@ sif_init :: proc() {
 	sif.smflg = SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND
 	sif.sreg[0] = IOP_CMDBUF // SIF_SYSREG_SUBADDR
 	sif.next_dma = 1
+	sif.loadfile_version = loadfile_version("")
 	pad_init()
 	sif.servers[0x80000006] = loadfile_server
 	sif.servers[0x80000001] = fileio_server
@@ -223,6 +226,7 @@ sif_command :: proc(a, pc: u32) {
 	case SIF_CMD_RESET:
 		path := cstring(&iop_ram[a + 24])
 		fmt.eprintfln("sif: IOP reset \"%s\"", path)
+		sif.loadfile_version = loadfile_version(string(path))
 		clear(&sif.bound)
 		sif.ee_buf = 0
 		clear(&sif.replies)
@@ -303,11 +307,68 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		w[0] = 2
 		w[1] = 0
 		return true
-	case 255: // version handshake: the EE library checks for "3000"
-		copy(buf, "3000")
+	case 255: // version handshake: the EE library refuses to load modules
+		// through a LOADFILE whose version it does not know
+		copy(buf, sif.loadfile_version[:])
 		return true
 	}
 	return false
+}
+
+// The version LOADFILE replies to its handshake after an IOP reset to
+// `path`, "rom0:UDNL <image>" when the reset loads an IOPRP image's modules
+// from the disc. Retail answers from the LOADFILE module the reset loaded.
+// IOPRP 3.1's keeps the 4 digits after the marker "PsIIloadfile" in its
+// data, so that is looked for in the image's LOADFILE: a heuristic, as not
+// every LOADFILE has the marker (rom0's has none). With no image, no
+// LOADFILE in it, or no marker, this is "3000", what rom0's is taken to be.
+@(private)
+loadfile_version :: proc(path: string) -> (v: [4]u8) {
+	MARKER :: "PsIIloadfile"
+	copy(v[:], "3000")
+	_, _, image := strings.partition(path, " ")
+	image, _, _ = strings.partition(strings.trim_left_space(image), " ")
+	if image == "" {return}
+	data, found := disc_file(image, context.temp_allocator)
+	if !found {
+		fmt.eprintfln("sif: IOP reset: no image %s", image)
+		return
+	}
+	lf, ok := romdir_file(data, "LOADFILE")
+	if !ok {return}
+	i := strings.index(string(lf), MARKER)
+	if i < 0 || len(lf) - i < len(MARKER) + 4 {return}
+	digits := lf[i + len(MARKER):][:4]
+	for b in digits {if b < '0' || b > '9' {return}}
+	copy(v[:], digits)
+	return
+}
+
+// A file of a ROMDIR archive (an IOPRP image, the IOP boot ROM): a table of
+// 16-byte entries {name[10], extinfo size u16, size u32}, the first named
+// RESET and the last followed by a zero name. The files follow each other
+// from the archive's start in table order, each 16-byte aligned.
+@(private)
+romdir_file :: proc(img: []u8, name: string) -> (file: []u8, ok: bool) {
+	t := -1
+	for o := 0; o + 16 <= len(img); o += 16 {
+		if string(img[o:][:6]) == "RESET\x00" {
+			t = o
+			break
+		}
+	}
+	if t < 0 {return}
+	pos := 0
+	for o := t; o + 16 <= len(img) && img[o] != 0; o += 16 {
+		size := int((^u32)(&img[o + 12])^)
+		if strings.truncate_to_byte(string(img[o:][:10]), 0) == name {
+			if size > len(img) - pos {return}
+			return img[pos:][:size], true
+		}
+		pos += (size + 15) &~ 15
+		if pos >= len(img) {return}
+	}
+	return
 }
 
 // The name in an IRX image's .iopmod header, or "" if `a` holds no IRX.
@@ -397,11 +458,13 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 }
 
 // Close every IOP file and forget the reply buffer, which was in the old
-// program's memory, as the IOP reboot of _LoadExecPS2 does. The host files
-// stay open: see disc_open.
+// program's memory, as the IOP reboot of _LoadExecPS2 does; that reboot is
+// to rom0's modules, so LOADFILE is rom0's again. The host files stay open:
+// see disc_open.
 fileio_reset :: proc() {
 	for &f in fileio.files {f = {}}
 	fileio.reply_buf = 0
+	sif.loadfile_version = loadfile_version("")
 }
 
 @(private)
