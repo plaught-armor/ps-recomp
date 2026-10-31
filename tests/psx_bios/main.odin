@@ -32,6 +32,8 @@
 //   text too, and give 0 for a short, missing or memory card file; Exec
 //   clears the BSS in whole words, runs the program on its stack and gp,
 //   and puts the caller's registers back from the save area.
+//   The C library slots from A(0Ah) todigit to A(35h) lsearch reach their
+//   procedures through bios_a, aliases and stack arguments included.
 //   A 00-09 and 3B-3E called through the A0 vector run the B functions
 //   AdjustA0Table puts there: A(03h) write and A(3Eh) puts.
 //   hangs_on_retail names the stubs that never return on retail, and no
@@ -121,6 +123,12 @@ CARD_NAME :: 0x6000
 CARD_DIR :: 0x6100
 @(private = "file")
 CARD_BUF :: 0x6200
+
+// Strings for the C library slots.
+@(private = "file")
+STR_S :: 0x80006800
+@(private = "file")
+STR_T :: 0x80006900
 
 @(private = "file")
 calls: struct {
@@ -722,6 +730,41 @@ main :: proc() {
 	check("past the BSS", cpu.r32(EXEC_BSS + 8), 0xffffffff)
 	check("Exec depth after the return", u32(bios.exec_state.depth), 0)
 
+	// The C library slots added with strncpy to lsearch, one call each
+	// through bios_a: the aliases and lsearch's fifth argument, on the stack.
+	str :: proc(addr: u32, s: string) -> u32 {
+		for k in 0 ..< len(s) {
+			cpu.w8(addr + u32(k), s[k])
+		}
+		cpu.w8(addr + u32(len(s)), 0)
+		return addr
+	}
+	check("A(0Ah) todigit", a(0x0a, '7'), 7)
+	check("A(12h) atob", a(0x12, str(STR_S, "0x1f"), STR_T), STR_S + 4)
+	check("A(12h) atob value", cpu.r32(STR_T), 31)
+	check("A(16h) strncat", a(0x16, str(STR_S, "x"), str(STR_T, "abc"), 2), STR_S)
+	check("A(16h) strncat length", a(0x1b, STR_S), 3)
+	check("A(1Ah) strncpy", a(0x1a, STR_S, str(STR_T, "ab"), 5), STR_S)
+	check("A(1Ah) strncpy pads", cpu.r32(STR_S), 0x6261)
+	for fn in ([?]u32{0x1c, 0x1e}) {
+		check(fmt.tprintf("A(%02Xh) strchr", fn), a(fn, str(STR_S, "abc"), 'c'), STR_S + 2)
+	}
+	for fn in ([?]u32{0x1d, 0x1f}) {
+		check(fmt.tprintf("A(%02Xh) strrchr", fn), a(fn, str(STR_S, "abca"), 'a'), STR_S + 3)
+	}
+	check("A(20h) strpbrk miss", a(0x20, str(STR_S, "abc"), str(STR_T, "x")), STR_S)
+	check("A(21h) strspn", a(0x21, str(STR_S, "aab"), str(STR_T, "a")), 2)
+	check("A(22h) strcspn", a(0x22, str(STR_S, "abc"), str(STR_T, "c")), 2)
+	check("A(23h) strtok", a(0x23, str(STR_S, "ab,cd"), str(STR_T, ",")), 0xa0009030)
+	check("A(24h) strstr", a(0x24, str(STR_S, "aab"), str(STR_T, "ab")), 0)
+	check("A(27h) bcopy", a(0x27, str(STR_S, "abcd"), STR_S + 1, 3), STR_S)
+	check("A(27h) bcopy forward", cpu.r32(STR_S), 0x61616161)
+	r[29] = 0x801ffe00
+	cpu.w32(r[29] + 16, FN_FIRST_LATE)
+	searched := calls.late
+	check("A(35h) lsearch", a(0x35, STR_T, STR_S, 1, 4), STR_S)
+	check("A(35h) lsearch comparisons", u32(calls.late - searched), 1)
+
 	// Hang stubs, and numbers on either side of each table's range of them.
 	hang_cases := [?]struct {
 		table: string,
@@ -754,5 +797,5 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, hang stubs")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs")
 }

@@ -113,20 +113,42 @@ bios_a :: proc(fn: u32) {
 		ret(libc.strtol(arg(0), arg(1), arg(2)))
 	case 0x0e, 0x0f:
 		ret(libc.abs(arg(0)))
+	case 0x0a:
+		ret(libc.todigit(arg(0)))
 	case 0x10, 0x11:
 		ret(libc.atoi(arg(0)))
+	case 0x12:
+		ret(libc.atob(arg(0), arg(1)))
 	case 0x13:
 		bios_setjmp(arg(0))
 	case 0x15:
 		ret(libc.strcat(arg(0), arg(1)))
+	case 0x16:
+		ret(libc.strncat(arg(0), arg(1), arg(2)))
 	case 0x17:
 		ret(libc.strcmp(arg(0), arg(1)))
 	case 0x18:
 		ret(libc.strncmp(arg(0), arg(1), arg(2)))
 	case 0x19:
 		ret(libc.strcpy(arg(0), arg(1)))
+	case 0x1a:
+		ret(libc.strncpy(arg(0), arg(1), arg(2)))
 	case 0x1b:
 		ret(libc.strlen(arg(0)))
+	case 0x1c, 0x1e:
+		ret(libc.strchr(arg(0), arg(1)))
+	case 0x1d, 0x1f:
+		ret(libc.strrchr(arg(0), arg(1)))
+	case 0x20:
+		ret(libc.strpbrk(arg(0), arg(1)))
+	case 0x21:
+		ret(libc.strspn(arg(0), arg(1)))
+	case 0x22:
+		ret(libc.strcspn(arg(0), arg(1)))
+	case 0x23:
+		ret(libc.strtok(arg(0), arg(1)))
+	case 0x24:
+		ret(libc.strstr(arg(0), arg(1)))
 	case 0x25:
 		ret(libc.toupper(arg(0)))
 	case 0x26:
@@ -135,6 +157,8 @@ bios_a :: proc(fn: u32) {
 		ret(libc.memset(arg(0), 0, arg(1)))
 	case 0x29, 0x2d:
 		ret(libc.memcmp(arg(0), arg(1), arg(2)))
+	case 0x27:
+		ret(libc.bcopy(arg(0), arg(1), arg(2)))
 	case 0x2a:
 		ret(libc.memcpy(arg(0), arg(1), arg(2)))
 	case 0x2b:
@@ -154,6 +178,8 @@ bios_a :: proc(fn: u32) {
 		ret(libc.malloc(arg(0)))
 	case 0x34:
 		libc.free(arg(0))
+	case 0x35:
+		ret(libc.lsearch(arg(0), arg(1), arg(2), arg(3), arg(4)))
 	case 0x36:
 		ret(libc.bsearch(arg(0), arg(1), arg(2), arg(3), arg(4)))
 	case 0x37:
@@ -444,6 +470,14 @@ bios_unknown :: proc(table: string, fn: u32) {
 	if hangs_on_retail(table, fn) {
 		cpu.fatal("BIOS %s(%02xh) hangs on retail (ra %#08x)", table, fn, cpu.state.r[31])
 	}
+	if table == "A" {
+		switch fn {
+		case 0x0b, 0x32:
+			cpu.fatal("unimplemented BIOS A(%02xh): it uses the FPU the console lacks, so it faults on retail too (ra %#08x)", fn, cpu.state.r[31])
+		case 0x14:
+			cpu.fatal("unimplemented BIOS A(14h) longjmp: a jump back across host frames is not supported (ra %#08x)", cpu.state.r[31])
+		}
+	}
 	cpu.fatal("unimplemented BIOS %s(%02xh) (ra %#08x)", table, fn, cpu.state.r[31])
 }
 
@@ -563,6 +597,10 @@ STACK_TOP :: 0x801fff00
 // runs such a call without interpreting the stub.
 @(private)
 TABLE_STUBS :: FAKE_DCB_TABLE + 0x100
+
+// Kernel RAM the HLE BIOS fixes, from 0x3000: the DCB table and the stubs
+// to 0x34f0, KERNEL_EXEC (exec.odin) at 0x3800, PAD_DRIVER at 0x4000 to
+// about 0x48a0, and strtok's buffer and pointer (libc) at 0x9030-0x9133.
 
 bios_init :: proc() {
 	vector := EXC_VECTOR

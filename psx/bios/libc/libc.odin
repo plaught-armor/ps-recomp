@@ -141,9 +141,219 @@ strcat :: proc(dst, src: u32) -> u32 {
 	return dst
 }
 
+// A(1Ah) strncpy: 0 when either is NULL; n is signed, and a negative n copies
+// nothing. Pads with zeros to n bytes after the terminator, as C does.
+strncpy :: proc(dst, src, n: u32) -> u32 {
+	if dst == 0 || src == 0 {
+		return 0
+	}
+	if n > LEN_MAX {
+		return dst
+	}
+	i: u32 = 0
+	for ; i < n; i += 1 {
+		c := cpu.r8(src + i)
+		cpu.w8(dst + i, c)
+		if c == 0 {
+			break
+		}
+	}
+	for i += 1; i < n; i += 1 {
+		cpu.w8(dst + i, 0)
+	}
+	return dst
+}
+
+// A(16h) strncat: 0 when either is NULL; n is signed, and a negative n
+// appends nothing (C would append the whole of src).
+strncat :: proc(dst, src, n: u32) -> u32 {
+	if dst == 0 || src == 0 {
+		return 0
+	}
+	end := dst + strlen(dst)
+	i: u32 = 0
+	for ; n <= LEN_MAX && i < n; i += 1 {
+		c := cpu.r8(src + i)
+		cpu.w8(end + i, c)
+		if c == 0 {
+			return dst
+		}
+	}
+	cpu.w8(end + i, 0)
+	return dst
+}
+
+// A(1Eh) strchr, A(1Ch) index: the first byte equal to c's low byte, the
+// terminator for c 0, or 0; 0 for a NULL s.
+strchr :: proc(s, c: u32) -> u32 {
+	if s == 0 {
+		return 0
+	}
+	for p := s; ; p += 1 {
+		b := cpu.r8(p)
+		if b == u8(c) {
+			return p
+		}
+		if b == 0 {
+			return 0
+		}
+	}
+}
+
+// A(1Fh) strrchr, A(1Dh) rindex: the last byte equal to c's low byte, the
+// terminator for c 0, or 0; 0 for a NULL s.
+strrchr :: proc(s, c: u32) -> u32 {
+	if s == 0 {
+		return 0
+	}
+	for p := s + strlen(s); ; p -= 1 {
+		if cpu.r8(p) == u8(c) {
+			return p
+		}
+		if p == s {
+			return 0
+		}
+	}
+}
+
+// Whether b is one of set's bytes.
+@(private = "file")
+in_set :: proc(b: u8, set: u32) -> bool {
+	for p := set; cpu.r8(p) != 0; p += 1 {
+		if cpu.r8(p) == b {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether b equals every byte of set.
+@(private = "file")
+all_of :: proc(b: u8, set: u32) -> bool {
+	for p := set; cpu.r8(p) != 0; p += 1 {
+		if cpu.r8(p) != b {
+			return false
+		}
+	}
+	return true
+}
+
+// A(20h) strpbrk: the first byte of s in set. Retail's bug: with none, it
+// returns s itself, and 0 only for an empty s.
+strpbrk :: proc(s, set: u32) -> u32 {
+	if cpu.r8(s) == 0 {
+		return 0
+	}
+	for p := s; cpu.r8(p) != 0; p += 1 {
+		if in_set(cpu.r8(p), set) {
+			return p
+		}
+	}
+	return s
+}
+
+// A(21h) strspn, A(22h) strcspn: the length of s's first run of bytes in set
+// (strspn) or not in it (strcspn).
+strspn :: proc(s, set: u32) -> u32 {
+	n: u32 = 0
+	for b := cpu.r8(s); b != 0 && in_set(b, set); b = cpu.r8(s + n) {
+		n += 1
+	}
+	return n
+}
+
+strcspn :: proc(s, set: u32) -> u32 {
+	n: u32 = 0
+	for b := cpu.r8(s); b != 0 && !in_set(b, set); b = cpu.r8(s + n) {
+		n += 1
+	}
+	return n
+}
+
+// A(24h) strstr, retail's: 0 for an empty s or sub. On a mismatch it starts
+// sub again from the next byte of s without testing the mismatching byte
+// against sub's first, so "aab" holds no "ab". It notes where a match began
+// only once the match passes sub's first byte, so a one-byte sub that is
+// found returns the start of the last longer partial match, or s.
+strstr :: proc(s, sub: u32) -> u32 {
+	start := s
+	q := sub
+	matching := false
+	for p := s; cpu.r8(p) != 0; p += 1 {
+		if cpu.r8(q) != cpu.r8(p) {
+			q = sub
+			matching = false
+			continue
+		}
+		q += 1
+		if cpu.r8(q) == 0 {
+			return start
+		}
+		if !matching {
+			start = p
+			matching = true
+		}
+	}
+	return 0
+}
+
+// strtok's buffer and its next-token pointer, at the retail kernel's
+// addresses (uncached, as retail returns them).
+@(private = "file")
+STRTOK_BUF :: 0xa0009030
+@(private = "file")
+STRTOK_NEXT :: 0xa0009130
+
+// A(23h) strtok, retail's: a non-NULL s is copied into the kernel's buffer
+// (unbounded: a string over 255 bytes runs over the next-token pointer) and
+// the tokens are pointers into the copy. Leading delimiters are not skipped:
+// a token ends at the first byte in delim. From there it zeroes the bytes
+// equal to every byte of delim (a run of the delimiter when delim has one
+// distinct byte, none otherwise) and then one more, which with a one-byte
+// delim is the next token's first. After the last token the next pointer is
+// past the terminator, so a further call reads what an earlier, longer
+// string left in the buffer.
+strtok :: proc(s, delim: u32) -> u32 {
+	if s != 0 {
+		strcpy(STRTOK_BUF, s)
+		cpu.w32(STRTOK_NEXT, STRTOK_BUF)
+	}
+	start := cpu.r32(STRTOK_NEXT)
+	p := start
+	for cpu.r8(p) != 0 && !in_set(cpu.r8(p), delim) {
+		p += 1
+	}
+	if p == start && cpu.r8(p) == 0 {
+		return 0
+	}
+	for b := cpu.r8(p); b != 0 && all_of(b, delim); b = cpu.r8(p) {
+		cpu.w8(p, 0)
+		p += 1
+	}
+	cpu.w8(p, 0)
+	cpu.w32(STRTOK_NEXT, p + 1)
+	return start
+}
+
+// A(27h) bcopy(src, dst, n): 0 for a NULL src (dst is not checked); n is
+// signed. Copies forward a byte at a time, so with dst just above src it
+// repeats src's first bytes (BSD's bcopy moves them). Returns src.
+bcopy :: proc(src, dst, n: u32) -> u32 {
+	if src == 0 {
+		return 0
+	}
+	if n <= LEN_MAX {
+		for i in u32(0) ..< n {
+			cpu.w8(dst + i, cpu.r8(src + i))
+		}
+	}
+	return src
+}
+
 // Retail's character table has entries for 00h-7Fh only; bytes from 80h up
 // index past it into whatever ROM data follows, so some of them count as
-// blanks or letters. These are the bytes that do, on the v4.5 kernel.
+// blanks, digits or letters. These are the bytes that do, on the v4.5
+// kernel.
 @(private = "file")
 High :: bit_set[0x80 ..= 0xff;u128]
 @(private = "file")
@@ -152,6 +362,8 @@ HIGH_BLANK :: High{0x92, 0x9f, 0xa3, 0xa4, 0xa7, 0xa9, 0xab, 0xac, 0xb0, 0xb4, 0
 HIGH_LOWER :: High{0x92, 0x9f, 0xa3, 0xa4, 0xaa, 0xb0, 0xb6, 0xbf, 0xc0, 0xc1, 0xc4, 0xca, 0xcb, 0xcc, 0xcf, 0xd0, 0xd2, 0xd3, 0xd4, 0xd7, 0xdd, 0xe2, 0xe6, 0xea, 0xee, 0xf2, 0xf6, 0xfa, 0xfb, 0xfe}
 @(private = "file")
 HIGH_UPPER :: High{0x92, 0x9f, 0xa0, 0xa4, 0xa6, 0xa8, 0xa9, 0xab, 0xad, 0xaf, 0xb3, 0xb5, 0xb6, 0xb7, 0xb9, 0xbd, 0xc0, 0xc1, 0xc5, 0xc7, 0xc9, 0xca, 0xd0, 0xd3, 0xd4, 0xd8, 0xda, 0xdc, 0xe2, 0xe6, 0xea, 0xee, 0xf2, 0xf6, 0xfa, 0xfb, 0xfd, 0xfe}
+@(private = "file")
+HIGH_DIGIT :: High{0x92, 0xa3, 0xa4, 0xa6, 0xa8, 0xa9, 0xaa, 0xac, 0xad, 0xb3, 0xb5, 0xb7, 0xb8, 0xb9, 0xbb, 0xbd, 0xc0, 0xc1, 0xc2, 0xc4, 0xc6, 0xc7, 0xc9, 0xcb, 0xcf, 0xd0, 0xd3, 0xd4, 0xd5, 0xd7, 0xd9, 0xda, 0xe2, 0xe3, 0xe6, 0xea, 0xeb, 0xee, 0xf2, 0xf6, 0xf7, 0xfa, 0xfb, 0xfd, 0xfe, 0xff}
 
 @(private = "file")
 is_blank :: proc(c: u8) -> bool {
@@ -175,6 +387,22 @@ tolower :: proc(c: u32) -> u32 {
 		b += 0x20
 	}
 	return u32(i32(i8(b)))
+}
+
+// A(0Ah) todigit: the low byte's value as a digit of any base up to 36,
+// from the character table (bytes from 80h up included): c - '0' for a
+// digit, with c sign-extended, tolower(c) - 'a' + 10 for a letter, and
+// 9999999 for anything else.
+todigit :: proc(c: u32) -> u32 {
+	b := u8(c)
+	v := u32(i32(i8(b)))
+	if b >= 0x80 ? int(b) in HIGH_DIGIT : b >= '0' && b <= '9' {
+		return v - '0'
+	}
+	if b >= 0x80 ? int(b) in HIGH_LOWER || int(b) in HIGH_UPPER : (b | 0x20) >= 'a' && (b | 0x20) <= 'z' {
+		return tolower(v) - 'a' + 10
+	}
+	return 9999999
 }
 
 // A(0Eh) abs, A(0Fh) labs.
@@ -211,6 +439,19 @@ atoi :: proc(s: u32) -> u32 {
 	}
 	v, _ := parse(s, 10, true, true)
 	return v
+}
+
+// A(12h) atob(s, p): stores strtol(s, &end, 10) at p and returns end. For a
+// NULL s retail stores 0 and returns a stack word strtol never set; this
+// returns 0.
+atob :: proc(s, p: u32) -> u32 {
+	if s == 0 {
+		cpu.w32(p, 0)
+		return 0
+	}
+	v, end := parse(s, 10, true, false)
+	cpu.w32(p, v)
+	return end
 }
 
 // Retail's number parser: blanks (09h-0Dh, 20h and some bytes from 80h up),
@@ -354,6 +595,19 @@ bsearch :: proc(key, base, n, size, cmp: u32) -> u32 {
 	}
 	e := base + u32(lo) * size
 	return e if guest_cmp(cmp, e, key) == 0 else 0
+}
+
+// A(35h) lsearch(key, base, n, size, cmp): the first element where
+// cmp(key, element) is 0, else 0. n is a count, not POSIX's pointer, and
+// nothing is appended; retail's bug: it tests n + 1 elements, 0 through n.
+lsearch :: proc(key, base, n, size, cmp: u32) -> u32 {
+	for i in 0 ..= i32(n) {
+		e := base + u32(i) * size
+		if guest_cmp(cmp, key, e) == 0 {
+			return e
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------- heap

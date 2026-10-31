@@ -2,9 +2,12 @@
 // pin the retail kernel's behaviour, bugs included: NULL arguments, n = 0 and
 // negative lengths, memmove and memcmp, bytes at and above 0x80, strtol's
 // prefixes, signs and end pointer, qsort's order of equal elements and
-// bsearch's misses through a guest comparison function (a host proc in the
-// dispatch table at CMP) that must leave the caller's registers alone, and
-// the InitHeap heap's headers, next fit, growth and realloc in place.
+// bsearch's misses and lsearch's extra element through a guest comparison
+// function (a host proc in the dispatch table at CMP) that must leave the
+// caller's registers alone, strpbrk's and strstr's misses, strtok's kernel
+// buffer and its stale pointer after the end, bcopy's forward copy,
+// todigit's high bytes, and the InitHeap heap's headers, next fit, growth
+// and realloc in place.
 package main
 
 import "core:fmt"
@@ -269,6 +272,156 @@ sort_test :: proc() {
 	check_tags("qsort ties", {4, 2, 0, 3, 5, 1})
 }
 
+// Fills n bytes at addr with 0xee, so a write past the end shows.
+@(private = "file")
+fill :: proc(addr: u32, n: u32) {
+	for i in u32(0) ..< n {
+		cpu.w8(addr + i, 0xee)
+	}
+}
+
+@(private = "file")
+check_bytes :: proc(what: string, addr: u32, want: []u8) {
+	for w, i in want {
+		check(fmt.tprintf("%s [%d]", what, i), u32(cpu.r8(addr + u32(i))), u32(w))
+	}
+}
+
+// strtok's buffer in the kernel area, and its next-token pointer.
+TOK :: 0xa0009030
+TOK_NEXT :: 0xa0009130
+
+search_test :: proc() {
+	fill(B, 16)
+	check("strncpy pads", libc.strncpy(B, put(A, "ab"), 5), B)
+	check_bytes("strncpy pads", B, {'a', 'b', 0, 0, 0, 0xee})
+	fill(B, 16)
+	check("strncpy cuts", libc.strncpy(B, put(A, "abcdef"), 3), B)
+	check_bytes("strncpy cuts, no NUL", B, {'a', 'b', 'c', 0xee})
+	fill(B, 16)
+	check("strncpy n=0", libc.strncpy(B, put(A, "ab"), 0), B)
+	check("strncpy n<0", libc.strncpy(B, A, NEG), B)
+	check_bytes("strncpy n<=0 writes nothing", B, {0xee})
+	check("strncpy NULL dst", libc.strncpy(0, A, 3), 0)
+	check("strncpy NULL src", libc.strncpy(B, 0, 3), 0)
+
+	check("strncat 2", libc.strncat(put(B, "x"), put(A, "abc"), 2), B)
+	check_str("strncat 2", B, "xab")
+	check("strncat short", libc.strncat(put(B, "x"), put(A, "a"), 5), B)
+	check_str("strncat short", B, "xa")
+	check("strncat n=0", libc.strncat(put(B, "x"), put(A, "abc"), 0), B)
+	check_str("strncat n=0", B, "x")
+	check("strncat n<0", libc.strncat(B, A, NEG), B)
+	check_str("strncat n<0 appends nothing", B, "x")
+	check("strncat NULL dst", libc.strncat(0, A, 1), 0)
+	check("strncat NULL src", libc.strncat(B, 0, 1), 0)
+
+	put(A, "abc")
+	check("strchr c", libc.strchr(A, 'c'), A + 2)
+	check("strchr NUL", libc.strchr(A, 0), A + 3)
+	check("strchr low byte", libc.strchr(A, 0x163), A + 2)
+	check("strchr miss", libc.strchr(A, 'x'), 0)
+	check("strchr NULL", libc.strchr(0, 'a'), 0)
+	check("strchr high", libc.strchr(put(A, "a\xe9"), 0xffffffe9), A + 1)
+	put(A, "abca")
+	check("strrchr a", libc.strrchr(A, 'a'), A + 3)
+	check("strrchr NUL", libc.strrchr(A, 0), A + 4)
+	check("strrchr miss", libc.strrchr(A, 'x'), 0)
+	check("strrchr NULL", libc.strrchr(0, 'a'), 0)
+
+	put(A, "abc")
+	check("strpbrk", libc.strpbrk(A, put(B, "xc")), A + 2)
+	check("strpbrk miss returns s", libc.strpbrk(A, put(B, "x")), A)
+	check("strpbrk empty set returns s", libc.strpbrk(A, put(B, "")), A)
+	check("strpbrk empty s", libc.strpbrk(put(A, ""), put(B, "x")), 0)
+	check("strspn", libc.strspn(put(A, "aab"), put(B, "a")), 2)
+	check("strspn empty set", libc.strspn(put(A, "abc"), put(B, "")), 0)
+	check("strspn empty s", libc.strspn(put(A, ""), put(B, "a")), 0)
+	check("strcspn", libc.strcspn(put(A, "abc"), put(B, "c")), 2)
+	check("strcspn empty set", libc.strcspn(put(A, "abc"), put(B, "")), 3)
+	check("strcspn empty s", libc.strcspn(put(A, ""), put(B, "x")), 0)
+
+	check("strstr", libc.strstr(put(A, "abcd"), put(B, "cd")), A + 2)
+	check("strstr aab/ab", libc.strstr(put(A, "aab"), put(B, "ab")), 0)
+	check("strstr aabab/ab", libc.strstr(put(A, "aabab"), put(B, "ab")), A + 3)
+	check("strstr one byte returns s", libc.strstr(put(A, "xyb"), put(B, "b")), A)
+	check("strstr empty sub", libc.strstr(put(A, "abc"), put(B, "")), 0)
+	check("strstr longer sub", libc.strstr(put(A, "ab"), put(B, "abc")), 0)
+	check("strstr miss", libc.strstr(put(A, "abc"), put(B, "x")), 0)
+
+	for i in u32(0) ..< 0x104 {
+		cpu.w8(TOK + i, 0)
+	}
+	check("strtok 1", libc.strtok(put(A, "ab,cd"), put(B, ",")), TOK)
+	check_str("strtok 1", TOK, "ab")
+	check_str("strtok leaves the caller's string", A, "ab,cd")
+	check("strtok 2 eats a byte", libc.strtok(0, B), TOK + 4)
+	check_str("strtok 2", TOK + 4, "d")
+	check("strtok 3", libc.strtok(0, B), 0)
+	check("strtok 4", libc.strtok(put(A, "a, b"), put(B, ", ")), TOK)
+	check_str("strtok 4", TOK, "a")
+	check("strtok 5", libc.strtok(0, B), TOK + 2)
+	check_str("strtok 5", TOK + 2, "")
+	check("strtok 6", libc.strtok(0, B), TOK + 3)
+	check_str("strtok 6", TOK + 3, "b")
+	check("strtok 7", libc.strtok(0, B), 0)
+	check("strtok 8 no leading skip", libc.strtok(put(A, ",a"), put(B, ",")), TOK)
+	check_str("strtok 8", TOK, "")
+	check("strtok 9", libc.strtok(0, B), 0)
+	check("strtok 10", libc.strtok(put(A, "abcdefgh"), put(B, "-")), TOK)
+	check_str("strtok 10", TOK, "abcdefgh")
+	check("strtok 11", libc.strtok(put(A, "ab"), B), TOK)
+	check_str("strtok 11", TOK, "ab")
+	check("strtok 12 stale after the end", libc.strtok(0, B), TOK + 3)
+	check_str("strtok 12", TOK + 3, "defgh")
+	check("strtok 13 empty", libc.strtok(put(A, ""), put(B, ",")), 0)
+	check("strtok 13 next", cpu.r32(TOK_NEXT), TOK)
+
+	fill(B, 16)
+	check("bcopy forward", libc.bcopy(put(A, "abcd"), A + 1, 3), A)
+	check_str("bcopy forward", A, "aaaa")
+	check("bcopy n=0", libc.bcopy(A, B, 0), A)
+	check("bcopy n<0", libc.bcopy(A, B, NEG), A)
+	check("bcopy NULL", libc.bcopy(0, B, 2), 0)
+	check_bytes("bcopy leaves dst", B, {0xee})
+
+	check("todigit 7", libc.todigit('7'), 7)
+	check("todigit a", libc.todigit('a'), 10)
+	check("todigit Z", libc.todigit('Z'), 35)
+	check("todigit z", libc.todigit('z'), 35)
+	check("todigit !", libc.todigit('!'), 9999999)
+	check("todigit 0x80", libc.todigit(0x80), 9999999)
+	check("todigit 0x141", libc.todigit(0x141), 10)
+	check("todigit 0x92 digit", libc.todigit(0x92), 0xffffff62)
+	check("todigit 0x9f letter", libc.todigit(0x9f), 0xffffff68)
+	check("todigit 0xa0 letter", libc.todigit(0xa0), 0xffffff69)
+
+	check("atob", libc.atob(put(A, "  -12x"), B), A + 5)
+	check("atob value", cpu.r32(B), neg(12))
+	check("atob 0x1f", libc.atob(put(A, "0x1f"), B), A + 4)
+	check("atob 0x1f value", cpu.r32(B), 31)
+	check("atob none", libc.atob(put(A, "z"), B), A)
+	check("atob none value", cpu.r32(B), 0)
+
+	for w, i in ([?]u32{5, 7, 9, 11}) {
+		cpu.w32(A + u32(i) * 4, w)
+	}
+	searches := [?]struct {
+		key, n, ret: u32,
+		calls:       int,
+	}{{9, 2, A + 8, 3}, {11, 3, A + 12, 4}, {11, 2, 0, 3}, {5, 0, A, 1}, {5, NEG, 0, 0}}
+	cpu.state.r[4], cpu.state.r[29], cpu.state.r[31] = 0x1234, 0x801fff00, 0x80005678
+	for s in searches {
+		cmp_calls = 0
+		cpu.w32(B, s.key)
+		check(fmt.tprintf("lsearch %d n=%d", s.key, i32(s.n)), libc.lsearch(B, A, s.n, 4, CMP), s.ret)
+		check(fmt.tprintf("lsearch %d n=%d calls", s.key, i32(s.n)), u32(cmp_calls), u32(s.calls))
+	}
+	check("lsearch keeps a0", cpu.state.r[4], 0x1234)
+	check("lsearch keeps sp", cpu.state.r[29], 0x801fff00)
+	check("lsearch keeps ra", cpu.state.r[31], 0x80005678)
+}
+
 heap_test :: proc() {
 	cpu.w32(HEAP, 0xaaaaaaaa)
 	libc.init_heap(HEAP, 0x102)
@@ -365,6 +518,7 @@ main :: proc() {
 	strings_test()
 	memory_test()
 	sort_test()
+	search_test()
 	heap_test()
-	fmt.println("ok psx_bios_libc: strings, memory, strtol, qsort/bsearch through guest calls, heap")
+	fmt.println("ok psx_bios_libc: strings, memory, strtol, qsort/bsearch through guest calls, strncpy to strtok, bcopy, todigit, atob, lsearch, heap")
 }
