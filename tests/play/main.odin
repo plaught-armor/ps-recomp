@@ -341,10 +341,11 @@ ps2_exec_disc :: proc(boot: Elf, second: Elf = {}) -> []u8 {
 	)
 }
 
-// LoadExecPS2(name, 0, 0) after a 1 in the word at 0x00300000 and in the
-// scratchpad's last word. SECOND.ELF loads over the boot text and starts at
-// 0x00100040, which differs from the recompiled code; through SetupThread it
-// checks argc 1 (the file), and both words cleared, then loops. Any check
+// LoadExecPS2(name, 0, 0) after a 1 in the word at 0x00300000, in the
+// scratchpad's last word and in the word at 0x00081ffc. SECOND.ELF loads over
+// the boot text and starts at 0x00100040, which differs from the recompiled
+// code; through SetupThread it checks argc 1 (the file), the first two words
+// cleared and the last kept (below the clear), then loops. Any check
 // failing, or LoadExecPS2 returning, runs an instruction the EE lacks.
 @(private = "file")
 ps2_loadexec_disc :: proc(name := "cdrom0:\\DATA\\SECOND.ELF;1") -> []u8 {
@@ -352,16 +353,18 @@ ps2_loadexec_disc :: proc(name := "cdrom0:\\DATA\\SECOND.ELF;1") -> []u8 {
 	boot := [?]u32 {
 		lui(T0, 0x0030), li(T1, 1), sw(T1, 0, T0), // 0
 		lui(T0, 0x7000), sw(T1, 0x3ffc, T0), // 3
-		path[0], path[1], li(A1, 0), li(A2, 0), li(V1, 6), SYSCALL, // 5
-		EE_BAD, // 11
+		lui(T0, 0x0008), sw(T1, 0x1ffc, T0), // 5
+		path[0], path[1], li(A1, 0), li(A2, 0), li(V1, 6), SYSCALL, // 7
+		EE_BAD, // 13
 	}
 	second := [?]u32 {
 		lui(A3, 0x0020), li(A1, 0xffff), li(A2, 0), li(A0, 0), li(V1, 0x3c), SYSCALL, // 0: SetupThread(0, -1, 0, args)
-		lw(T0, 0, A3), li(T1, 1), bne(T0, T1, 11), NOP, // 6
-		lui(T2, 0x0030), lw(T2, 0, T2), bne(T2, 0, 7), NOP, // 10
-		lui(T2, 0x7000), lw(T2, 0x3ffc, T2), bne(T2, 0, 3), NOP, // 14
-		LOOP, NOP, // 18
-		EE_BAD, // 20
+		lw(T0, 0, A3), li(T1, 1), bne(T0, T1, 15), NOP, // 6
+		lui(T2, 0x0030), lw(T2, 0, T2), bne(T2, 0, 11), NOP, // 10
+		lui(T2, 0x7000), lw(T2, 0x3ffc, T2), bne(T2, 0, 7), NOP, // 14
+		lui(T2, 0x0008), lw(T2, 0x1ffc, T2), bne(T2, T1, 3), NOP, // 18
+		LOOP, NOP, // 22
+		EE_BAD, // 24
 	}
 	return ps2_exec_disc(
 		{text = 0x00100000, code = boot[:], data = strings.concatenate({name, "\x00"}, context.temp_allocator)},

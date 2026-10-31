@@ -23,8 +23,10 @@ import mem "../mem"
 ARGV_MAX :: 16
 ARGV_BYTES :: 256
 
-// User memory, which LoadExecPS2 clears: the kernel owns what is below.
-USER_MEMORY :: 0x00080000
+// Where LoadExecPS2's clear of user memory starts, up to the end of RAM.
+// User memory starts at 0x80000, below is the kernel's; retail's restart
+// leaves the first 8 KiB of it as they were.
+LOAD_EXEC_CLEAR :: 0x00082000
 
 Exec_State :: struct {
 	// The arguments, NUL-terminated strings packed.
@@ -207,7 +209,7 @@ load_exec :: proc(filename, argc, argv: u32) -> ! {
 	found := colon < 0 || strings.has_prefix(name, "cdrom")
 	if found {data, found = iop.disc_file(name, core.host_allocator)}
 	if !found {cpu.fatal("LoadExecPS2: no ELF %s (the console would boot its browser)", name)}
-	user := mem.ram[USER_MEMORY:]
+	user := mem.ram[LOAD_EXEC_CLEAR:]
 	intrinsics.mem_zero(raw_data(user), len(user))
 	entry, loaded := mem.load_elf(data)
 	delete(data, core.host_allocator)
