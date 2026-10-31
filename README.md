@@ -88,9 +88,10 @@ slowly.
 directory, headless and unpaced to a vblank count (`FRAMES`, else 3600),
 each in its own child with unknown BIOS calls and syscalls stubbed
 (`COMPAT`). Each disc gets one row, its latest run, in `compat.tsv` in the
-user data directory: how the run ended (`ok`, `exit`, `fatal`, `crash`, or
-`hang` after `COMPAT_WAIT` seconds, default 600), how much of it the
-interpreter ran, and the calls it stubbed. The child's output goes to the
+user data directory: how the run ended (`ok`, `stalled` when it got there
+with no picture shown or main RAM unchanged over the second half, `exit`,
+`fatal`, `crash`, or `hang` after `COMPAT_WAIT` seconds, default 600), how
+much of it the interpreter ran, and the calls it stubbed. The child's output goes to the
 disc's `compat.log`; a `press.txt` there is its `PRESS` input script.
 
 ## Tests

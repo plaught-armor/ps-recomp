@@ -39,14 +39,18 @@ COMPAT_WAIT :: 600
 @(private = "file")
 FATAL_MAX :: 200
 
-// compat.tsv's columns. result: ok (FRAMES reached), exit (the game
-// ended), fatal, crash (no compat line), hang (stopped at COMPAT_WAIT),
-// spawn (no child); status: the child's exit status (the signal of a
-// crash on POSIX), "" for hang and spawn; native: whether the run had the
-// disc's native code; interp_share: interp_insns * cycles_per_insn /
-// cycles, at most 1; entries: the hottest interpreter entries, pc:count,
-// comma separated; unimplemented: name=count, semicolon separated; fatal:
-// the fatal message, else a crash's or hang's last output line; when: UTC.
+// compat.tsv's columns. result: ok (FRAMES reached), stalled (FRAMES
+// reached with no progress: no picture shown, or main RAM unchanged from
+// FRAMES/2), exit (the game ended), fatal, crash (no compat line), hang
+// (stopped at COMPAT_WAIT), spawn (no child); status: the child's exit
+// status (the signal of a crash on POSIX), 1 for stalled as for fatal
+// though the child exits 0, "" for hang and spawn; native: whether the
+// run had the disc's native code; interp_share: interp_insns *
+// cycles_per_insn / cycles, at most 1; entries: the hottest interpreter
+// entries, pc:count, comma separated; unimplemented: name=count, semicolon
+// separated; fatal: the fatal message, else why a run stalled, else a
+// crash's or hang's last output line; when: UTC; shown: the vblanks that
+// showed a picture.
 Column :: enum {
 	Id,
 	Serial,
@@ -68,6 +72,7 @@ Column :: enum {
 	User_S,
 	Build,
 	When,
+	Shown,
 }
 
 COLUMNS :: [Column]string {
@@ -91,6 +96,7 @@ COLUMNS :: [Column]string {
 	.User_S        = "user_s",
 	.Build         = "build",
 	.When          = "when",
+	.Shown         = "shown",
 }
 
 Row :: [Column]string
@@ -326,6 +332,15 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 	case "frames": row[.Result] = "ok"
 	case: row[.Result] = l.result
 	}
+	row[.Fatal] = l.fatal
+	if l.result == "frames" && (l.shown == 0 || l.ram_still_since != 0) {
+		row[.Result], row[.Status] = "stalled", "1"
+		if l.shown == 0 {
+			row[.Fatal] = "stalled: no picture shown"
+		} else {
+			row[.Fatal] = fmt.tprintf("stalled: main RAM unchanged f%d-f%d", l.ram_still_since, l.frames)
+		}
+	}
 	if l.system != "" {
 		row[.System] = l.system
 	}
@@ -346,7 +361,7 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 		fmt.sbprintf(&b, "%s%s=%d", ";" if i > 0 else "", u.name, u.n)
 	}
 	row[.Unimplemented] = strings.to_string(b)
-	row[.Fatal] = l.fatal
+	row[.Shown] = fmt.tprint(l.shown)
 	row[.Build] = l.build
 }
 
@@ -364,17 +379,27 @@ tsv_put :: proc(path: string, row: Row) -> bool {
 	if text, err := os.read_entire_file(path, context.allocator); err == nil {
 		rest := string(text)
 		first, _ := strings.split_lines_iterator(&rest)
+		// A file from before columns were added at the end keeps its rows,
+		// the new columns empty.
+		missing := 0
 		if first != header {
-			fmt.eprintln("play:", path, "has other columns; it starts again")
-			rest = ""
+			if first != "" && strings.has_prefix(header, first) && header[len(first)] == '\t' {
+				missing = strings.count(header[len(first):], "\t")
+			} else {
+				fmt.eprintln("play:", path, "has other columns; it starts again")
+				rest = ""
+			}
 		}
 		for line in strings.split_lines_iterator(&rest) {
 			fields := strings.split(line, "\t")
-			if len(fields) != len(Column) {
+			if len(fields) != len(Column) - missing {
 				continue
 			}
 			if fields[0] != row[.Id] {
 				strings.write_string(&b, line)
+				for _ in 0 ..< missing {
+					strings.write_byte(&b, '\t')
+				}
 				strings.write_byte(&b, '\n')
 			} else if !put {
 				row_write(&b, row)

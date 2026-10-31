@@ -172,6 +172,7 @@ vblank_frame :: proc() {
 	audio_frame(!rerun)
 	gs.skip_present = rerun
 	w, h := gs.scanout()
+	core.compat_vblank(u64(vblank), w > 0 && h > 0, mem.ram)
 	if w > 0 && h > 0 {
 		if !core.headless && !hw && !rerun {
 			sdl.UpdateTexture(tex, nil, &gs.screen, gs.DISP_W * 4)

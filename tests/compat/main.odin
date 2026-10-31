@@ -10,7 +10,8 @@
 //   a SIF server the HLE lacks goes on, a function is interpreted twice,
 //   and the run ends at FRAMES.
 // Each unimplemented call is named with where the first was made: ra, the
-// pc of a syscall, and the client data of a SIF bind.
+// pc of a syscall, and the client data of a SIF bind. Neither run shows a
+// picture, and main RAM is the same at the end as at FRAMES/2.
 package main
 
 import "core:encoding/json"
@@ -65,6 +66,8 @@ main :: proc() {
 	}
 	if l, ok := run("psx", true, 0); ok {
 		check("psx", l.system == "ps1" && l.result == "frames" && l.frames == FRAMES, "result")
+		// No picture, and nothing in RAM moved after the call.
+		check("psx", l.shown == 0 && l.ram_still_since == FRAMES / 2, "progress")
 		check("psx", l.fatal == "" && l.cycles > 0 && l.cycles_per_insn == 2 && l.build == core.COMMIT, "fields")
 		check("psx", len(l.unimplemented) == 1 && l.unimplemented[0] == {"BIOS A(ffh)", 1, "", "80002000", ""}, "unimplemented")
 		check("psx", len(l.interp_entries) == 1 && l.interp_entries[0] == {"80001000", 2}, "entries")
@@ -76,6 +79,8 @@ main :: proc() {
 	run("psx_off", false, 1)
 	if l, ok := run("ps2", true, 0); ok {
 		check("ps2", l.system == "ps2" && l.result == "frames" && l.frames == FRAMES && l.cycles_per_insn == 1, "result")
+		// No picture, and nothing in RAM moved after the call.
+		check("ps2", l.shown == 0 && l.ram_still_since == FRAMES / 2, "progress")
 		check("ps2", len(l.unimplemented) == 2, "unimplemented")
 		if len(l.unimplemented) == 2 {
 			check("ps2", l.unimplemented[0] == {"SIF server 0badc0de", 1, "00100008", "00100100", "00200000"}, "SIF bind")

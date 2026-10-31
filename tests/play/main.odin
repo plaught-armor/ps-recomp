@@ -15,10 +15,13 @@
 // - compat: play --compat on a directory of discs, PS1 and PS2 (one of
 //   each that loops, one that makes a BIOS call or an EE syscall the HLE
 //   lacks, one that starts on an invalid instruction), and a file that is
-//   not a disc gives one compat.tsv row per disc (ok, ok with the call
-//   stubbed, fatal) and skips the file; the looping PS1 disc run again
-//   with a vblank count it cannot reach in COMPAT_WAIT is a hang, and once
-//   more to FRAMES ok, each time in place. Three PS1 discs load a second
+//   not a disc gives one compat.tsv row per disc (stalled with no picture,
+//   stalled with the call stubbed, fatal) and skips the file, keeping the
+//   row of a compat.tsv from before the shown column; a disc of each that
+//   turns the display on and counts in RAM is ok, and a PS1 one that turns
+//   it on and loops is stalled with main RAM unchanged. The looping PS1
+//   disc run again with a vblank count it cannot reach in COMPAT_WAIT is a
+//   hang, and once more to FRAMES stalled, each time in place. Three PS1 discs load a second
 //   executable no native code covers: LoadExec of it, over the boot
 //   executable, checks its argc, stack and BSS; LoadExec of a missing file
 //   runs the boot executable again; Load and Exec of it return to the boot
@@ -138,6 +141,15 @@ exe_at :: proc(x: Exe) -> []u8 {
 	}
 	return e
 }
+
+// lui t0, 0x1f80; lui t1, 0x0300; sw t1, 0x1814(t0): GP1(03000000), the
+// display on; then lui t2, 0x8002; 1: lw t3, 0(t2); nop; addiu t3, 1;
+// sw t3, 0(t2); b 1b; nop: the word at 0x80020000 counts up.
+@(private = "file")
+PS1_SHOW := [?]u32{0x3c081f80, 0x3c090300, 0xad091814, 0x3c0a8002, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0}
+// The display on as PS1_SHOW turns it on, then b .; nop.
+@(private = "file")
+PS1_STILL := [?]u32{0x3c081f80, 0x3c090300, 0xad091814, 0x1000ffff, 0}
 
 // A disc with SYSTEM.CNF naming DATA/PSX.EXE; extra goes in SYSTEM.CNF.
 @(private = "file")
@@ -304,6 +316,11 @@ elf_at :: proc(x: Elf) -> []u8 {
 
 @(private = "file")
 PS2_CNF :: "BOOT2 = cdrom0:\\DATA\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n"
+
+// lui t0, 0x1200; li t1, 1; sd t1, 0(t0): PMODE 1, read circuit 1 on (its
+// DISPLAY 0 is 1x1); then the word at 0x00300000 counts up as PS1_COUNT's.
+@(private = "file")
+PS2_SHOW := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x3c0a0030, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0}
 
 // A PS2 disc with SYSTEM.CNF naming DATA/SLUS_123.45, the ELF of code.
 @(private = "file")
@@ -512,25 +529,32 @@ test_compat :: proc() {
 		unimpl: string,
 		entry:  string, // in the row's entries, with interp_insns > 0
 		log:    string, // in compat.log
+		fatal:  string, // the fatal column of a stalled row
 	}
 	fixtures := [?]Fixture {
-		{"loop.iso", cnf_disc(), "ps1", "ok", "0", "", "", ""},
+		{"loop.iso", cnf_disc(), "ps1", "stalled", "1", "", "", "", "stalled: no picture shown"},
 		// li t1, 0xff; jal 0xa0; nop; b .; nop: BIOS A(ffh), then loop.
-		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ps1", "ok", "0", "BIOS A(ffh)=1", "", ""},
+		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ps1", "stalled", "1", "BIOS A(ffh)=1", "", "", "stalled: no picture shown"},
 		// Opcode 0x3f is reserved.
-		{"fatal.iso", cnf_disc("", 0xfc000000), "ps1", "fatal", "1", "", "", ""},
-		{"ps2_loop.iso", ps2_disc(), "ps2", "ok", "0", "", "", ""},
+		{"fatal.iso", cnf_disc("", 0xfc000000), "ps1", "fatal", "1", "", "", "", ""},
+		{"ps2_loop.iso", ps2_disc(), "ps2", "stalled", "1", "", "", "", "stalled: no picture shown"},
 		// li v1, 1; syscall; b .; nop: ResetEE, which only the retail ROM
 		// has (checked below), then loop. compat.log says where it was made.
-		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "ok", "0", "syscall 1=1", "", "\"pc\":\"00100004\",\"ra\":\""},
+		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "stalled", "1", "syscall 1=1", "", "\"pc\":\"00100004\",\"ra\":\"", "stalled: no picture shown"},
 		// Opcode 0x3b is not an EE instruction.
-		{"ps2_fatal.iso", ps2_disc(0xec000000), "ps2", "fatal", "1", "", "", ""},
-		{"loadexec.iso", loadexec_disc(), "ps1", "ok", "0", "", "80010100:", ""},
-		{"loadexec_missing.iso", loadexec_missing_disc(), "ps1", "ok", "0", "", "", "running the boot executable again"},
-		{"load_exec.iso", load_exec_disc(), "ps1", "ok", "0", "", "80020000:", ""},
-		{"ps2_loadexec.iso", ps2_loadexec_disc(), "ps2", "ok", "0", "", "00100040:", "kernel: LoadExecPS2"},
-		{"ps2_loadexec_missing.iso", ps2_loadexec_disc("cdrom0:\\DATA\\NONE.ELF;1"), "ps2", "fatal", "1", "", "", "LoadExecPS2: no ELF"},
-		{"ps2_execps2.iso", ps2_execps2_disc(), "ps2", "ok", "0", "", "00100000:", "differs from the recompiled program; interpreting"},
+		{"ps2_fatal.iso", ps2_disc(0xec000000), "ps2", "fatal", "1", "", "", "", ""},
+		{"loadexec.iso", loadexec_disc(), "ps1", "stalled", "1", "", "80010100:", "", "stalled: no picture shown"},
+		{"loadexec_missing.iso", loadexec_missing_disc(), "ps1", "stalled", "1", "", "", "running the boot executable again", "stalled: no picture shown"},
+		{"load_exec.iso", load_exec_disc(), "ps1", "stalled", "1", "", "80020000:", "", "stalled: no picture shown"},
+		{"ps2_loadexec.iso", ps2_loadexec_disc(), "ps2", "stalled", "1", "", "00100040:", "kernel: LoadExecPS2", "stalled: no picture shown"},
+		{"ps2_loadexec_missing.iso", ps2_loadexec_disc("cdrom0:\\DATA\\NONE.ELF;1"), "ps2", "fatal", "1", "", "", "LoadExecPS2: no ELF", ""},
+		{"ps2_execps2.iso", ps2_execps2_disc(), "ps2", "stalled", "1", "", "00100000:", "differs from the recompiled program; interpreting", "stalled: no picture shown"},
+		// GP1(03000000) turns the display on, then a word in RAM counts up.
+		{"show.iso", cnf_disc("", ..PS1_SHOW[:]), "ps1", "ok", "0", "", "", "", ""},
+		// The display on, then b .: a picture, and RAM still.
+		{"still.iso", cnf_disc("", ..PS1_STILL[:]), "ps1", "stalled", "1", "", "", "", fmt.tprintf("stalled: main RAM unchanged f%d-f%d", FRAMES / 2, FRAMES)},
+		// PMODE 1 turns read circuit 1 on, then a word in RAM counts up.
+		{"ps2_show.iso", ps2_disc(..PS2_SHOW[:]), "ps2", "ok", "0", "", "", "", ""},
 	}
 	// ps2_stub needs a syscall the HLE lacks that stops a run outside
 	// COMPAT; one the kernel implements stubs nothing.
@@ -551,11 +575,28 @@ test_compat :: proc() {
 		return
 	}
 
+	// A compat.tsv from before the shown column keeps its rows.
+	cols := play.COLUMNS
+	old := slice.enumerated_array(&cols)[:len(play.Column) - 1]
+	data, _ := core.data_dir()
+	tsv, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
+	old_row := strings.repeat("\tx", len(old) - 1, context.temp_allocator)
+	old_text := strings.concatenate({strings.join(old, "\t", context.temp_allocator), "\nOLD", old_row, "\n"}, context.temp_allocator)
+	if os.write_entire_file(tsv, transmute([]u8)old_text) != nil {
+		check(name, false, fmt.tprintf("cannot write %s", tsv))
+		return
+	}
+
 	out, errs, ok := run_compat(name, {dir, fmt.tprint(FRAMES)})
 	rows := compat_rows(name)
+	if row, found := compat_row(rows, "OLD"); found {
+		check(name, row[.When] == "x" && row[.Shown] == "", fmt.tprintf("old row: %v", row))
+	} else {
+		check(name, false, "the old compat.tsv's row is gone")
+	}
 	check(name, ok, fmt.tprintf("status, stdout:\n%s\nstderr:\n%s", out, errs))
 	check(name, strings.count(out, "\n") == len(fixtures), fmt.tprintf("stdout:\n%s", out))
-	check(name, len(rows) == len(fixtures), fmt.tprintf("%d rows, want %d", len(rows), len(fixtures)))
+	check(name, len(rows) == len(fixtures) + 1, fmt.tprintf("%d rows, want %d", len(rows), len(fixtures) + 1))
 	first_when: string
 	for f, k in fixtures {
 		row, found := compat_row(rows, ids[k])
@@ -572,9 +613,13 @@ test_compat :: proc() {
 		if f.entry != "" {
 			check(name, strings.contains(row[.Entries], f.entry) && row[.Interp_Insns] != "0", what)
 		}
-		if f.result == "ok" {
-			check(name, row[.Frames] == fmt.tprint(FRAMES), what)
-		} else {
+		switch f.result {
+		case "ok":
+			check(name, row[.Frames] == fmt.tprint(FRAMES) && row[.Fatal] == "" && row[.Shown] != "0", what)
+		case "stalled":
+			check(name, row[.Frames] == fmt.tprint(FRAMES) && row[.Fatal] == f.fatal, what)
+			check(name, (row[.Shown] == "0") == (f.fatal == "stalled: no picture shown"), what)
+		case:
 			check(name, row[.Fatal] != "", what)
 		}
 		if ddir, has := core.disc_dir(ids[k], context.temp_allocator); has {
@@ -591,7 +636,7 @@ test_compat :: proc() {
 	out, errs, ok = run_compat(name, {loop, "1000000000"})
 	os.unset_env(core.env_name("COMPAT_WAIT"))
 	rows = compat_rows(name)
-	check(name, ok && len(rows) == len(fixtures), fmt.tprintf("hang run: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
+	check(name, ok && len(rows) == len(fixtures) + 1, fmt.tprintf("hang run: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
 	if row, found := compat_row(rows, ids[0]); found {
 		check(name, row[.Result] == "hang" && row[.Status] == "", fmt.tprintf("hang: %v", row))
 	} else {
@@ -600,9 +645,9 @@ test_compat :: proc() {
 
 	out, errs, ok = run_compat(name, {loop, fmt.tprint(FRAMES)})
 	rows = compat_rows(name)
-	check(name, ok && len(rows) == len(fixtures), fmt.tprintf("rerun: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
+	check(name, ok && len(rows) == len(fixtures) + 1, fmt.tprintf("rerun: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
 	if row, found := compat_row(rows, ids[0]); found {
-		check(name, row[.Result] == "ok" && row[.When] != first_when, fmt.tprintf("rerun: %v", row))
+		check(name, row[.Result] == "stalled" && row[.When] != first_when, fmt.tprintf("rerun: %v", row))
 	} else {
 		check(name, false, "rerun: no row")
 	}

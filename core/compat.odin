@@ -4,7 +4,10 @@
 // - interpreter instructions, and interpreter entries by pc (the hottest
 //   COMPAT_TOP reported);
 // - calls the HLE does not implement, by name, with where the first was
-//   made.
+//   made;
+// - and, once a vblank, whether the display showed a picture and, under
+//   COMPAT, a hash of main RAM halfway to FRAMES, so the line can say a run
+//   made no progress.
 // Built with -define:COMPAT_COUNT=false the counters compile away.
 //
 // COMPAT=1 makes a run a compatibility run: a call the HLE does not
@@ -16,6 +19,7 @@ package core
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:slice"
 
 COMPAT_COUNT :: #config(COMPAT_COUNT, true)
@@ -74,6 +78,12 @@ compat: struct {
 	entries:       [ENTRY_SLOTS]Entry_Slot,
 	entries_other: u64,
 	calls:         map[Compat_Key]Compat_Hit,
+	// Vblanks that showed a picture; main RAM as of the last vblank, and its
+	// hash at vblank ram_at (FRAMES/2; 0 before it).
+	shown:         u64,
+	ram:           []u8,
+	ram_at:        u64,
+	ram_hash:      u64,
 	reported:      bool,
 }
 
@@ -123,6 +133,20 @@ compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0, pc: u32 = 0, ra
 	return compat.on
 }
 
+// Count vblank n, which showed a picture or not, with main RAM as it
+// stands. Under COMPAT, vblank FRAMES/2 hashes RAM. Call once a vblank.
+compat_vblank :: proc(n: u64, shown: bool, ram: []u8) {
+	when COMPAT_COUNT {
+		if shown {
+			compat.shown += 1
+		}
+		compat.ram = ram
+		if compat.on && frames >= 2 && n == frames / 2 {
+			compat.ram_at, compat.ram_hash = n, xxhash.XXH3_64_default(ram)
+		}
+	}
+}
+
 // The name a call has in the line, temp allocated.
 compat_call_name :: proc(k: Compat_Key) -> string {
 	switch k.kind {
@@ -157,7 +181,10 @@ Compat_Name :: struct {
 // cycles_per_insn: what the interpreter charges an instruction, so
 // interp_insns * cycles_per_insn / cycles is about the share of the run
 // interpreted (the cycles also hold stalls and skipped idle loops, so it
-// errs low); build: the ps-recomp commit (COMMIT).
+// errs low); shown: the vblanks that showed a picture; ram_still_since:
+// the vblank from which main RAM was the same at the end, else 0 (also when
+// not checked: no FRAMES, or the run ended before FRAMES/2); build: the
+// ps-recomp commit (COMMIT).
 Compat_Line :: struct {
 	system:               string,
 	result:               string,
@@ -169,6 +196,8 @@ Compat_Line :: struct {
 	interp_entries_other: u64,
 	unimplemented:        []Compat_Name,
 	fatal:                string,
+	shown:                u64,
+	ram_still_since:      u64,
 	build:                string,
 }
 
@@ -181,7 +210,11 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 		interp_insns         = compat.interp_insns,
 		interp_entries_other = compat.entries_other,
 		fatal                = fatal,
+		shown                = compat.shown,
 		build                = COMMIT,
+	}
+	if compat.ram_at != 0 && xxhash.XXH3_64_default(compat.ram) == compat.ram_hash {
+		l.ram_still_since = compat.ram_at
 	}
 	switch {
 	case fatal != "": l.result = "fatal"

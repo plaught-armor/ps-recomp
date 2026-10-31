@@ -908,6 +908,7 @@ platform_frame :: proc() {
 		}
 	}
 	pause_wait()
+	core.compat_vblank(cpu.presents, gpu.display.enabled && gpu.display.w > 0 && gpu.display.h > 0, cpu.ram[:])
 	if host.quit || core.frames_done(cpu.presents) {
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
