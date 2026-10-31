@@ -113,7 +113,7 @@ iop_cmd_deliver :: proc(cid: u32) -> bool {
 	}
 	if h == 0 {return false}
 	iop_sync(cpu.state.cycles)
-	switch th_intr(h, harg) {
+	switch th_intr(h, IOP_CMDBUF, harg) {
 	case .None:
 	case .Blocked:
 		core.compat_unknown(.Iop_Intr, cid, pc = h)

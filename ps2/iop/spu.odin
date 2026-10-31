@@ -9,9 +9,18 @@
 // spu2.cpp, MIT, Samir Nuri). Volume sweeps are taken at full scale.
 //
 // Voices advance by the samples spu_mix renders, the same clock the FMOD
-// voices run on. A block transfer (a PCM stream into a core) only keeps the
-// time: the game polls where it reads to refill its ring, and that address
-// moves with EE time.
+// voices run on. A block transfer (a PCM stream into a core) through sdrdrv
+// only keeps the time: the game polls where it reads to refill its ring, and
+// that address moves with EE time.
+//
+// libsd as an IOP module imports it (libsd.odin, PS_IRX=1) takes the same
+// voice calls and more: core volumes, effect, IRQA and the cores' IRQ, and
+// interrupt handlers. Its block transfers play: 16-bit stereo in the ADMA
+// layout, 512 bytes of left then 512 of right in each 1024, read from where
+// the transfer is in EE time, dry into its core. Each raises its transfer
+// interrupt at every half of its buffer, and a voice that enters the block
+// at IRQA of a core with its IRQ enabled raises that core's. The layout and
+// the half-buffer interrupt are PCSX2 practice, unverified on hardware.
 //
 // A port whose sound driver is its own HLE code, not sdrdrv, drives the same
 // voices through spu_write, spu_voice_on, spu_voice_set, spu_voice_off and
@@ -25,6 +34,7 @@ import "core:fmt"
 import "core:mem"
 import "ps:core"
 import cpu "../cpu"
+import r3000 "ps:psx/cpu"
 
 SPU_RAM_SIZE :: 2 << 20
 
@@ -63,7 +73,9 @@ spu: struct {
 	// unity (x * 0x4000 >> 14 == x) that spu_volume never returns, where its
 	// 0x3fff loses a step on loud samples.
 	master: [2][2]i32,
-	block:  [2]Sdr_Block, // sdrdrv's block transfers, per channel
+	block:  [2]Sdr_Block, // the block transfers, per channel
+	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
+	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
 }
 
 // A block transfer (sceSdBlockTrans) as a clock only: its samples are not
@@ -77,6 +89,8 @@ Sdr_Block :: struct {
 	cycles:     u64, // the EE cycle it started at
 	loop:       bool,
 	on:         bool,
+	play:       bool, // libsd's: its samples play and it raises its interrupt (sd_block_arm)
+	next:       u64, // the bytes moved since `cycles` at its next half-buffer crossing
 }
 
 // sceSdBlockTrans mode bits, from what the EE side sends: 2 stops, 3
@@ -144,6 +158,16 @@ spu_block :: proc(v: ^Spu_Voice) {
 		v.hist[1], v.hist[0] = v.hist[0], s
 		v.pcm[n] = i16(s)
 	}
+	if spu.irq_watch != 0 {sd_irq_check(v)}
+}
+
+// Raises the voice's core's IRQ if it is enabled and v.nax is the block at
+// its IRQA: once each time a voice enters that block.
+@(private = "file")
+sd_irq_check :: proc(v: ^Spu_Voice) {
+	c := u32(1 if uintptr(v) >= uintptr(&spu.voice[1][0]) else 0)
+	if spu.irq_watch & (1 << c) == 0 || v.nax &~ 15 != spu.irqa[c] &~ 15 {return}
+	iop_sd.pending |= SD_PENDING_SPU2 << c
 }
 
 @(private = "file")
@@ -243,6 +267,7 @@ spu_mix :: proc(out: []i32) {
 				}
 			}
 		}
+		if b := &spu.block[c]; b.on && b.play {sd_block_mix(b, acc)}
 		if wet {reverb_mix(w, send, acc)}
 		if c == ADX_CORE {adx_mix(acc)}
 		// The master volume scales the core's whole output, reverb included
@@ -250,6 +275,28 @@ spu_mix :: proc(out: []i32) {
 		// loud voices times a volume overflow 32 bits.
 		m := spu.master[c]
 		for x, i in acc {out[i] += i32(clamp(i64(x) * i64(m[i & 1]) >> 14, -32768, 32767))}
+	}
+	if iop_sd.pending != 0 {iop_wake_set()}
+}
+
+// Adds block transfer b's samples to the interleaved stereo acc, from where
+// it reads now on; a one-shot one is silent past its end.
+@(private = "file")
+sd_block_mix :: proc(b: ^Sdr_Block, acc: []i32) {
+	off := sdr_block_pos(b) - b.base
+	s16 :: #force_inline proc(a: u32) -> i32 {
+		p := iop_mem(a &~ 1, 2)
+		return len(p) < 2 ? 0 : i32(i16(u16(p[0]) | u16(p[1]) << 8))
+	}
+	for n := 0; n + 1 < len(acc); n += 2 {
+		if off >= b.size {
+			if !b.loop {return}
+			off = 0
+		}
+		l := b.base + (off &~ 1023) + (off & 1023) / 4 * 2
+		acc[n] += s16(l)
+		acc[n + 1] += s16(l + 512)
+		off += 4
 	}
 }
 
@@ -448,6 +495,191 @@ sd_block_trans :: proc(channel, mode, addr, size, start: u32) -> u32 {
 // sceSdBlockTransStatus(channel, flag): where it reads now, 24 bits.
 sd_block_status :: proc(channel: u32) -> u32 {
 	return sdr_block_pos(&spu.block[channel & 1]) & 0xffffff
+}
+
+// libsd's calls past sdrdrv's, which only libsd.odin makes, after the shared
+// ones above did not decode the id.
+
+@(private = "file")
+SD_VP_ENVX :: 0x0500
+@(private = "file")
+SD_VP_VOLXL :: 0x0600
+@(private = "file")
+SD_VP_VOLXR :: 0x0700
+@(private = "file")
+SD_P_MMIX :: 0x0800
+@(private = "file")
+SD_P_MVOLL :: 0x0900
+@(private = "file")
+SD_P_MVOLR :: 0x0a00
+@(private = "file")
+SD_P_EVOLL :: 0x0b00
+@(private = "file")
+SD_P_EVOLR :: 0x0c00
+@(private = "file")
+SD_P_AVOLL :: 0x0d00
+@(private = "file")
+SD_P_MVOLXR :: 0x1200
+@(private = "file")
+SD_S_PMON :: 0x1300
+@(private = "file")
+SD_S_NON :: 0x1400
+@(private = "file")
+SD_S_VMIXL :: 0x1800
+@(private = "file")
+SD_S_VMIXEL :: 0x1900
+@(private = "file")
+SD_S_VMIXR :: 0x1a00
+@(private = "file")
+SD_S_VMIXER :: 0x1b00
+@(private = "file")
+SD_A_ESA :: 0x1c00
+@(private = "file")
+SD_A_EEA :: 0x1d00
+@(private = "file")
+SD_A_TSA :: 0x1e00
+@(private = "file")
+SD_A_IRQA :: 0x1f00
+@(private = "file")
+SD_C_EFFECT_ENABLE :: 0x2
+@(private = "file")
+SD_C_IRQ_ENABLE :: 0x4
+@(private = "file")
+SD_C_MUTE :: 0x6
+@(private = "file")
+SD_C_NOISE_CLK :: 0x8
+@(private = "file")
+SD_C_SPDIF :: 0xa
+
+// sceSdGetParam(id) for a voice's VOLL, VOLR (as set, a sweep's bit lost),
+// PITCH, ADSR1, ADSR2, ENVX and VOLXL, VOLXR (its volume through its
+// envelope).
+sd_get_param :: proc(id: u32) -> (u32, bool) {
+	v := spu_voice(id)
+	switch id & 0xff00 {
+	case SD_VP_VOLL: return u32(u16(v.voll)) & 0x7fff, true
+	case SD_VP_VOLR: return u32(u16(v.volr)) & 0x7fff, true
+	case SD_VP_PITCH: return v.pitch, true
+	case SD_VP_ADSR1: return v.adsr1, true
+	case SD_VP_ADSR2: return v.adsr2, true
+	case SD_VP_ENVX: return u32(v.level), true
+	case SD_VP_VOLXL: return u32(u16(v.level * v.voll >> 15)), true
+	case SD_VP_VOLXR: return u32(u16(v.level * v.volr >> 15)), true
+	}
+	return 0, false
+}
+
+// sceSdSetParam(id, value) for a core's: MVOLL, MVOLR and EVOLL, EVOLR set;
+// MMIX, the input volumes AVOL and BVOL and the read-only MVOLX are taken
+// and change nothing.
+sd_core_param :: proc(id, value: u32) -> bool {
+	c := id & 1
+	switch id & 0xff00 {
+	case SD_P_MVOLL: spu.master[c][0] = spu_volume(value)
+	case SD_P_MVOLR: spu.master[c][1] = spu_volume(value)
+	case SD_P_EVOLL: spu.reverb[c].evol[0] = i32(i16(u16(value)))
+	case SD_P_EVOLR: spu.reverb[c].evol[1] = i32(i16(u16(value)))
+	case SD_P_MMIX, SD_P_AVOLL ..= SD_P_MVOLXR:
+	case: return false
+	}
+	return true
+}
+
+// sceSdSetSwitch(id, voice mask) for VMIXEL and VMIXER, a voice in the
+// effect send with its bit set (both share the one send here); PMON, NON
+// and the dry mixes VMIXL, VMIXR are taken and change nothing.
+sd_switch_extra :: proc(id, mask: u32) -> bool {
+	switch id & 0xff00 {
+	case SD_S_VMIXEL, SD_S_VMIXER:
+		for &v, i in spu.voice[id & 1] {v.dry = mask & (1 << u32(i)) == 0}
+	case SD_S_PMON, SD_S_NON, SD_S_VMIXL, SD_S_VMIXR:
+	case: return false
+	}
+	return true
+}
+
+// sceSdSetAddr(id, address) for a core's IRQA; ESA, EEA and TSA are taken
+// and change nothing (the effect's work area is not in sound RAM here).
+sd_addr_extra :: proc(id, addr: u32) -> bool {
+	switch id & 0xff00 {
+	case SD_A_IRQA: spu.irqa[id & 1] = addr & (SPU_RAM_SIZE - 1)
+	case SD_A_ESA, SD_A_EEA, SD_A_TSA:
+	case: return false
+	}
+	return true
+}
+
+// sceSdGetAddr(id) for a core's IRQA.
+sd_get_addr_extra :: proc(id: u32) -> (u32, bool) {
+	if id & 0xff00 != SD_A_IRQA {return 0, false}
+	return spu.irqa[id & 1], true
+}
+
+// sceSdSetCoreAttr(entry, value) for EFFECT_ENABLE and IRQ_ENABLE; MUTE,
+// NOISE_CLK and SPDIF are taken and change nothing.
+sd_core_attr :: proc(entry, value: u32) -> bool {
+	c := entry & 1
+	switch entry &~ 1 {
+	case SD_C_EFFECT_ENABLE: spu_effect_enable(int(c), value != 0)
+	case SD_C_IRQ_ENABLE:
+		spu.irq_watch &~= 1 << c
+		if value != 0 {spu.irq_watch |= 1 << c}
+	case SD_C_MUTE, SD_C_NOISE_CLK, SD_C_SPDIF:
+	case: return false
+	}
+	return true
+}
+
+// sceSdClearEffectWorkArea(core, ...): the work area zeroed, mode and
+// return volume kept.
+sd_clear_effect :: proc(core: u32) {
+	w := &spu.reverb[core & 1]
+	reverb_set(w, w.mode, w.evol[0], w.evol[1], true)
+}
+
+// sceSdInit's part past sd_init: the cores' IRQs off, every block transfer
+// stopped.
+sd_lib_init :: proc() {
+	spu.irqa, spu.irq_watch = {}, 0
+	spu.block = {}
+}
+
+// Makes channel's block transfer, just started by sd_block_trans, libsd's:
+// it plays, and its first half-buffer crossing is set.
+sd_block_arm :: proc(channel: u32) {
+	b := &spu.block[channel & 1]
+	b.play = true
+	half := u64(b.size / 2)
+	b.next = half == 0 ? max(u64) : (u64(b.start) / half + 1) * half - u64(b.start)
+}
+
+// The EE cycle of b's next half-buffer crossing, or max(u64): it has none
+// while stopped, and a one-shot one none past its end.
+@(private = "file")
+sd_block_due :: proc(b: ^Sdr_Block) -> u64 {
+	if !b.on || !b.play || b.next == max(u64) {return max(u64)}
+	if !b.loop && u64(b.start) + b.next > u64(b.size) {return max(u64)}
+	return b.cycles + (b.next * cpu.EE_CLOCK + SD_BLOCK_RATE - 1) / SD_BLOCK_RATE
+}
+
+// Takes channel's next half-buffer crossing if it is due by EE cycle now.
+sd_block_cross :: proc(channel: u32, now: u64) -> bool {
+	b := &spu.block[channel & 1]
+	if sd_block_due(b) > now {return false}
+	b.next += u64(b.size / 2)
+	return true
+}
+
+// When, in EE cycles, libsd's interrupts are due: at once (the IOP's clock)
+// while one is raised, else at the first half-buffer crossing of a block
+// transfer with a transfer handler; max(u64) when none is.
+sd_next_ee :: proc() -> u64 {
+	if iop_sd.pending != 0 {return r3000.state.cycles * IOP_EE_RATIO}
+	t := max(u64)
+	for &b, c in spu.block {
+		if iop_sd.trans[c].func != 0 {t = min(t, sd_block_due(&b))}
+	}
+	return t
 }
 
 // sdrdrv: {?, args...} in, the result in the first word out.

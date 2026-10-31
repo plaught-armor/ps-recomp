@@ -44,6 +44,19 @@
 // return. One coroutine serves every handler; one that waits is stopped
 // with a compat row and its coroutine killed, and the next delivery makes
 // another. The loader's reset kills it.
+//
+// libsd: a block transfer libsd starts plays its buffer de-interleaved from
+// the ADMA layout, wrapping when it loops, silent once stopped. Its transfer
+// handler runs at each half of the buffer (and a one-shot's end, not past
+// it), with a0 the channel, the EE's wake set to the crossing and the thread
+// it signals running after it; one started inside its buffer crosses at the
+// next half, and with no handler a block adds no wake and runs nothing. A
+// snapshot before the first crossing restores the handler and drops the
+// coroutine made since. Voice transfers write and read sound RAM, a keyed
+// voice plays with ENVX at full, and a voice entering the block at IRQA of a
+// core with its IRQ enabled runs the SPU2 handler once, a0 the core's bit,
+// for either core; a voice transfer runs its channel's handler. Undecoded ids
+// are compat rows; the loader's reset clears the handlers.
 package main
 
 import "core:encoding/endian"
@@ -136,6 +149,7 @@ game :: proc(_: rawptr) {
 	test_thread_snap()
 	test_sifcmd()
 	test_cmd_deliver()
+	test_libsd()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -145,6 +159,7 @@ game :: proc(_: rawptr) {
 main :: proc() {
 	core.snap_init(1 << 20)
 	iop.sif_snap()
+	iop.spu_snap()
 	mem.mem_init()
 	iop.sif_init()
 	context.allocator = core.emu_allocator()
@@ -1119,4 +1134,219 @@ test_cmd_deliver :: proc() {
 
 	fresh()
 	check(coroutines() == base && iop.iop_wake_ee == max(u64), "deliver: the loader's reset kills it")
+}
+
+// libsd's functions, in the order "modl" imports them.
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 17, 18, 19, 23, 25, 26, 27}
+
+// "modl" as loaded: its base, the offsets of its libsd stubs, its data
+// (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
+// stack for calls with arguments past a3.
+sdm: struct {
+	b, lsd, d, sp: u32,
+}
+
+// Calls libsd function fno through modl's stub, with args from a0 on.
+sd_call :: proc(fno: u32, args: ..u32) -> u32 {
+	r := &r3000.state.r
+	sp := sdm.b + sdm.sp
+	for v, i in args {
+		if i < 4 {r[4 + i] = v} else {iop.iop_u32(sp + 16 + 4 * u32(i - 4))^ = v}
+	}
+	r[29] = sp
+	for f, i in LIBSD_FNOS {
+		if f == fno {return iop_call(sdm.b + sdm.lsd + 8 * u32(i))}
+	}
+	return 0xdeadbeef
+}
+
+// modl's data word i: 0 handler calls, 1 and 2 its last a0 and a1, 3 the
+// thread's passes.
+sd_word :: proc(i: u32) -> u32 {return iop.iop_u32(sdm.b + sdm.d + 4 * i)^}
+
+snap4: core.Snapshot
+snap4_loaded: bool // not emulated state
+
+SD_HALF :: 0x1000 * cpu.EE_CLOCK / (48000 * 4) // EE cycles to move half of a 0x2000-byte buffer
+
+test_libsd :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	// "modl": a thread that waits on sem and counts its passes; a handler
+	// that records a0, a1, counts its calls and signals sem.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	ts := imports(&a, "thsemap", 4, 6, 8)
+	lsd := imports(&a, "libsd", ..LIBSD_FNOS[:])
+	d := at(&a)
+	put(&a, 0, 0, 0, 0, 0, 0)
+	sp := at(&a)
+	for _ in 0 ..< 16 {put(&a, 0)}
+	adp := at(&a) // two ADPCM blocks of 0x7000s, the second end and repeat
+	put(&a, 0x77770000, 0x77777777, 0x77777777, 0x77777777, 0x77770300, 0x77777777, 0x77777777, 0x77777777)
+	rd := at(&a)
+	for _ in 0 ..< 8 {put(&a, 0)}
+	semp := sema_param(&a, 0, 0)
+	h := at(&a)
+	prologue(&a)
+	la(&a, T0, d)
+	put(&a, 0xad040004, 0xad050008) // sw a0, 4(t0); sw a1, 8(t0)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0x8d040010, 0) // lw a0, 16(t0); nop
+	jal(&a, ts + 8)
+	epilogue(&a)
+	w := at(&a)
+	call_word(&a, ts + 16, d + 16)
+	la(&a, T0, d)
+	put(&a, 0x8d09000c, 0, 0x25290001, 0xad09000c) // lw t1, 12(t0); nop; addiu t1, t1, 1; sw t1, 12(t0)
+	put_rel(&a, 0x08000000 | w >> 2, 4) // j w
+	put(&a, 0)
+	tp := thread_param(&a, w, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, semp, d + 16)
+	call_addr(&a, tb, tp, d + 20)
+	call_word(&a, tb + 8, d + 20)
+	li(&a, V0, 0)
+	epilogue(&a)
+	buf := at(&a) // 0x2000 bytes for block transfers
+	for _ in 0 ..< 0x800 {put(&a, 0)}
+	base := coroutines()
+	id, res := iop.iop_load(build_mod("modl", &a, entry), "modl", nil)
+	sdm = {module_base(id), lsd, d, sp}
+	b := sdm.b
+	check(id > 0 && res == 0 && sd_word(3) == 0 && coroutines() == base + 1, "libsd: the module loads, its thread waits")
+	check(sd_call(4, 0) == 0, "libsd: sceSdInit")
+
+	// A block transfer plays its buffer in the ADMA layout: per 1024 bytes,
+	// 256 left samples then 256 right. Looping, it wraps to the start.
+	pcm := iop.iop_mem(b + buf, 2048)
+	for k in 0 ..< 2 {
+		for j in 0 ..< 256 {
+			v := u16(k * 256 + j + 1)
+			endian.put_u16(pcm[k * 1024 + j * 2:], .Little, v)
+			endian.put_u16(pcm[k * 1024 + 512 + j * 2:], .Little, ~v + 1)
+		}
+	}
+	cpu.state.cycles = 1000
+	check(sd_call(18, 0, 0x10, b + buf, 2048, 0) == 0, "libsd: a looping block transfer starts")
+	check(iop.iop_wake_ee == max(u64), "libsd: a block transfer with no handler adds no wake")
+	out := make([]i32, 2 * 600, context.temp_allocator)
+	iop.spu_mix(out)
+	played := true
+	for n in 0 ..< 600 {
+		v := i32(n % 512 + 1)
+		played &&= out[2 * n] == v && out[2 * n + 1] == -v
+	}
+	check(played, "libsd: the block plays de-interleaved, wrapping")
+	iop.iop_tick(1000 + 4 * SD_HALF)
+	check(sd_word(0) == 0, "libsd: a block's crossings run no handler while it has none")
+	sd_call(18, 0, 2)
+	for &x in out {x = 0}
+	iop.spu_mix(out)
+	check(out[0] == 0, "libsd: a stopped block is silent")
+
+	// A transfer handler runs at each half of a block transfer's buffer,
+	// with a0 the channel and a1 its argument, and the thread it signals
+	// runs after it. Taken after a snapshot, whose load drops the handler
+	// coroutine made since.
+	check(sd_call(26, 1, b + h, 7) == 0, "libsd: SetTransIntrHandler returns the previous handler, none")
+	C0 :: 5000
+	cpu.state.cycles = C0
+	sd_call(18, 1, 0x10, b + buf, 0x2000, 0)
+	check(iop.iop_wake_ee == C0 + SD_HALF, "libsd: the wake is the first half-buffer crossing")
+	saved := coroutines()
+	core.snap_op, core.snap_target = .Save, &snap4
+	core.snap_yield()
+	if !snap4_loaded {
+		iop.iop_tick(C0 + SD_HALF - 1)
+		check(sd_word(0) == 0, "libsd: no handler before the crossing")
+		iop.iop_tick(C0 + SD_HALF)
+		check(sd_word(0) == 1 && coroutines() == saved + 1, "libsd: the handler runs at the crossing, on a coroutine made for it")
+		snap4_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap4
+		core.snap_yield()
+	}
+	check(sd_word(0) == 0 && coroutines() == saved && iop.iop_sd.trans[1] == {b + h, 7}, "libsd: the load restores the handler and drops the coroutine")
+	iop.iop_tick(C0 + SD_HALF)
+	check(sd_word(0) == 1 && sd_word(1) == 1 && sd_word(2) == 7 && sd_word(3) == 1, "libsd: the handler gets channel and argument, the thread runs after")
+	check(iop.iop_wake_ee == C0 + 2 * SD_HALF, "libsd: the next wake is the second half")
+	iop.iop_tick(C0 + 2 * SD_HALF)
+	check(sd_word(0) == 2 && iop.iop_wake_ee == C0 + 3 * SD_HALF, "libsd: a looping block crosses every half")
+	C1 :: C0 + 3 * SD_HALF
+	cpu.state.cycles = C1
+	sd_call(18, 1, 0, b + buf, 0x2000, 0)
+	iop.iop_tick(C1 + SD_HALF)
+	check(sd_word(0) == 3 && iop.iop_wake_ee == C1 + 2 * SD_HALF, "libsd: a one-shot block crosses at its half")
+	iop.iop_tick(C1 + 2 * SD_HALF)
+	check(sd_word(0) == 4 && iop.iop_wake_ee == max(u64), "libsd: and at its end, then no more")
+	C2 :: C1 + 3 * SD_HALF
+	cpu.state.cycles = C2
+	sd_call(18, 1, 0x13, b + buf, 0x2000, b + buf + 0x17fc)
+	check(iop.iop_wake_ee == C2 + 0x804 * SD_HALF / 0x1000, "libsd: one started inside its buffer crosses at the next half")
+	sd_call(18, 1, 2)
+	check(iop.iop_wake_ee == max(u64), "libsd: a stopped block has no wake")
+
+	// Voices: a voice transfer, the voice's parameters, key on, ENVX.
+	check(sd_call(17, 0, 0, b + adp, 0x5000, 32) == 32, "libsd: VoiceTrans writes")
+	check(sd_call(17, 0, 1, b + rd, 0x5000, 32) == 32 && mem_eq(b + rd, b + adp, 32), "libsd: VoiceTrans reads it back")
+	sd_call(9, 0x2040, 0x5000)
+	sd_call(5, 0x0200, 0x1000)
+	sd_call(5, 0x0000, 0x3fff)
+	sd_call(5, 0x0100, 0x3fff)
+	sd_call(5, 0x0300, 0x000f)
+	sd_call(5, 0x0400, 0)
+	check(sd_call(6, 0x0200) == 0x1000 && sd_call(6, 0x0000) == 0x3fff && sd_call(6, 0x0300) == 0x000f, "libsd: GetParam returns what SetParam set")
+	sd_call(7, 0x1500, 1)
+	out = make([]i32, 2 * 800, context.temp_allocator)
+	iop.spu_mix(out)
+	st := iop.spu_voice_status(0, 0)
+	check(st.on && sd_call(6, 0x0500) == 0x7fff && sd_call(10, 0x2240) &~ 15 == st.nax, "libsd: the keyed voice plays, ENVX at full, NAX")
+	check(iop.iop_sd.pending == 0, "libsd: no IRQ while it is off")
+
+	// The SPU2 handler runs once a voice enters the block at IRQA, with a0
+	// the core's bit.
+	check(sd_call(27, b + h, 9) == 0, "libsd: SetSpu2IntrHandler returns the previous handler, none")
+	sd_call(9, 0x1f00, 0x5010)
+	check(sd_call(10, 0x1f00) == 0x5010, "libsd: GetAddr returns IRQA")
+	sd_call(11, 0x4, 1)
+	iop.spu_mix(out)
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2 && iop.iop_wake_ee == r3000.state.cycles * 8, "libsd: the voice at IRQA raises core 0's IRQ, the wake at once")
+	n0 := sd_word(0)
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n0 + 1 && sd_word(1) == 1 && sd_word(2) == 9 && iop.iop_sd.pending == 0, "libsd: the SPU2 handler runs once, a0 the core's bit")
+	sd_call(11, 0x4, 0)
+	iop.spu_mix(out)
+	check(iop.iop_sd.pending == 0, "libsd: no IRQ once it is disabled")
+	sd_call(9, 0x2041, 0x5000)
+	sd_call(5, 0x0201, 0x1000)
+	sd_call(7, 0x1501, 1)
+	sd_call(9, 0x1f01, 0x5010)
+	sd_call(11, 0x5, 1)
+	iop.spu_mix(out)
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n0 + 2 && sd_word(1) == 2, "libsd: core 1's IRQ, a0 its bit")
+	sd_call(11, 0x5, 0)
+
+	// A voice transfer on a channel with a handler raises it, done at once.
+	sd_call(26, 0, b + h, 5)
+	sd_call(17, 0, 0, b + adp, 0x5000, 32)
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n0 + 3 && sd_word(1) == 0 && sd_word(2) == 5, "libsd: the transfer handler runs, a0 the channel")
+
+	// An id libsd_fn does not decode raises a compat row.
+	sd_call(5, 0x3f00, 0)
+	sd_call(11, 0xc, 1)
+	check(core.compat.calls[core.Compat_Key{.Iop_Sd, 0x3f00, 5}].n == 1 && core.compat.calls[core.Compat_Key{.Iop_Sd, 0xc, 11}].n == 1, "libsd: undecoded ids are compat rows")
+
+	fresh()
+	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
+}
+
+mem_eq :: proc(x, y, n: u32) -> bool {
+	for i: u32 = 0; i < n; i += 4 {
+		if iop.iop_u32(x + i)^ != iop.iop_u32(y + i)^ {return false}
+	}
+	return true
 }

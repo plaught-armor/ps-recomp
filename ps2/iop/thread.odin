@@ -18,11 +18,13 @@
 // before each run. A DelayThread waits until a cycle count; a tick or a
 // delivery that finds no thread ready moves the clock to the first such
 // wake within its slice. iop_wake_ee is when, in EE cycles, the EE's events
-// tick the IOP next: at a thread's wake, or at once while one is ready.
+// tick the IOP next: at a thread's wake, at once while one is ready, or at
+// a libsd interrupt (libsd.odin).
 //
-// A command handler runs on a coroutine of its own, not a thread's: retail
-// runs it in sifcmd's interrupt handler, where it may not wait. One that
-// waits, or spins past its budget, is stopped there (th_intr_stop).
+// A command handler, and a libsd interrupt handler, runs on a coroutine of
+// its own, not a thread's: retail runs it in an interrupt handler, where it
+// may not wait. One that waits, or spins past its budget, is stopped there
+// (th_intr_stop).
 //
 // A thread's context: the R3000's r[0..31], hi and lo, cop0's sr, cause and
 // epc, and frame_ret, saved when it leaves the CPU and restored when it gets
@@ -125,11 +127,11 @@ iop_sched: struct {
 	budget:               bool, // the load's budget is spent
 	start_done:           bool, // the start returned, its v0 in start_result
 	start_result:         u32,
-	intr:                 bool, // a command handler runs, on intr_co
+	intr:                 bool, // a handler runs, on intr_co
 	intr_stop:            Intr_Stop, // why it was stopped
-	intr_handler:         u32, // what it runs and its argument
-	intr_harg:            u32,
-	intr_co:              ^core.Coroutine, // made at the first delivery
+	intr_handler:         u32, // what it runs and its arguments
+	intr_a0, intr_a1:     u32,
+	intr_co:              ^core.Coroutine, // made at the first handler
 }
 
 Intr_Stop :: enum u8 {
@@ -287,20 +289,22 @@ iop_sync :: proc(now: u64) {
 	r3000.state.cycles = max(r3000.state.cycles, now / IOP_EE_RATIO)
 }
 
-// Sets iop_wake_ee from the threads: at once while one is ready, else at the
-// first wake. The EE's next event moves up to it, unless the EE is handling
-// events, which ends with update_next_event.
+// Sets iop_wake_ee from the threads, at once while one is ready, else at the
+// first wake, and from libsd's interrupts (sd_next_ee). The EE's next event
+// moves up to it, unless the EE is handling events, which ends with
+// update_next_event.
 iop_wake_set :: proc() {
 	w := th_next_wake()
 	if th_pick() != nil {w = r3000.state.cycles}
-	iop_wake_ee = w if w == max(u64) else w * IOP_EE_RATIO
+	iop_wake_ee = min(w if w == max(u64) else w * IOP_EE_RATIO, sd_next_ee())
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, iop_wake_ee)}
 }
 
-// The EE's events at EE cycle `now`, the IOP's wake due: runs its threads
-// for a slice.
+// The EE's events at EE cycle `now`, the IOP's wake due: runs libsd's due
+// interrupt handlers, then its threads for a slice.
 iop_tick :: proc(now: u64) {
 	iop_sync(now)
+	sd_intr_run(now)
 	iop_sched.start_done = false
 	th_schedule(r3000.state.cycles + IOP_SLICE, idle = true)
 	iop_wake_set()
@@ -447,16 +451,17 @@ th_call_failed :: proc() {
 	th_exit()
 }
 
-// Runs command handler `handler` with a0 the packet, a1 `harg`, on the
-// handler coroutine, for at most IOP_INTR_BUDGET cycles; why it stopped
-// early, if it did. The context it ran in is put back: no thread's is lost.
-th_intr :: proc(handler, harg: u32) -> Intr_Stop {
+// Runs handler `handler` (a command's or an interrupt's) with arguments a0
+// and a1, on the handler coroutine, for at most IOP_INTR_BUDGET cycles; why
+// it stopped early, if it did. The context it ran in is put back: no
+// thread's is lost.
+th_intr :: proc(handler, a0, a1: u32) -> Intr_Stop {
 	s := &iop_sched
-	assert(th_loader == nil && s.cur == 0, "iop: a command delivered while the IOP runs")
+	assert(th_loader == nil && s.cur == 0, "iop: a handler run while the IOP runs")
 	saved := Th_Context{r3000.state.r, r3000.state.hi, r3000.state.lo, r3000.cop0, r3000.frame_ret}
 	if s.intr_co == nil {s.intr_co = core.co_create(th_intr_main, nil)}
 	s.intr, s.intr_stop = true, .None
-	s.intr_handler, s.intr_harg = handler, harg
+	s.intr_handler, s.intr_a0, s.intr_a1 = handler, a0, a1
 	th_loader = core.co_current
 	r3000.next_event = r3000.state.cycles + IOP_INTR_BUDGET
 	r3000.run_events = th_budget
@@ -474,15 +479,14 @@ th_intr :: proc(handler, harg: u32) -> Intr_Stop {
 	return s.intr_stop
 }
 
-// The handler coroutine: each delivery's handler, then back to its sender.
-// It never returns, so one coroutine serves every delivery until a handler
-// is stopped on it.
+// The handler coroutine: each handler, then back to th_intr. It never
+// returns, so one coroutine serves every handler until one is stopped on it.
 @(private = "file")
 th_intr_main :: proc(_: rawptr) {
 	s := &iop_sched
 	for {
 		r := &r3000.state.r
-		r[4], r[5] = IOP_CMDBUF, s.intr_harg
+		r[4], r[5] = s.intr_a0, s.intr_a1
 		r[29] = IOP_INTR_STACK - 16
 		r3000.call(s.intr_handler)
 		core.co_switch(th_loader)
