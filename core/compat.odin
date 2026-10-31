@@ -35,8 +35,10 @@ COMPAT_TOP :: 10
 // Sif_Bind the server id; Sif_Rpc the server id and function number;
 // Sif_Cmd the command id; Iop_Call an IOP library's name (compat_name) and
 // function number; Iop_Import a library's name no module registered;
-// Iop_Start a module's name, whose start ran out of its budget; Irx_Reloc
-// the relocation type.
+// Iop_Start a module's name, whose start ran out of its budget;
+// Iop_Blocked a module's name, whose start waited with no thread ready;
+// Iop_Threads a module's name, whose threads ran out of the load's budget
+// after its start returned; Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -48,6 +50,8 @@ Compat_Call :: enum u8 {
 	Iop_Call,
 	Iop_Import,
 	Iop_Start,
+	Iop_Blocked,
+	Iop_Threads,
 	Irx_Reloc,
 }
 
@@ -198,6 +202,8 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Call: return fmt.tprintf("IOP %s fno %d", compat_names[k.id], k.sub)
 	case .Iop_Import: return fmt.tprintf("IOP import %s", compat_names[k.id])
 	case .Iop_Start: return fmt.tprintf("IOP start %s budget", compat_names[k.id])
+	case .Iop_Blocked: return fmt.tprintf("IOP start %s blocked", compat_names[k.id])
+	case .Iop_Threads: return fmt.tprintf("IOP threads budget %s", compat_names[k.id])
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

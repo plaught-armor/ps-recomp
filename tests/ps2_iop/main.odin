@@ -23,6 +23,18 @@
 // NO_RESIDENT_END start frees the module; a spinning start runs out of its
 // budget; a snapshot restores the loader, and a load after it lands where
 // the first did.
+//
+// IOP threads: a start makes a semaphore and two threads, which run after it
+// returns, best priority first; a signal that wakes a better thread yields to
+// it at once. A start that waits with no thread ready fails with one compat
+// row, and the undo deletes its threads, semaphores and coroutines. A path
+// whose load failed is not run again until a library registers or a load
+// succeeds. A thread spinning on DelayThread after its start returned spends
+// the budget: the load still succeeds, with one compat row, and the thread
+// stays ready with its context saved. intrman, printf, strtol, memset and
+// memcpy answer as the C library does. A snapshot taken while a thread waits
+// restores it, coroutine stack included, so a signal after the load wakes it
+// where it waited.
 package main
 
 import "core:encoding/endian"
@@ -106,6 +118,11 @@ game :: proc(_: rawptr) {
 	test_irx()
 	test_loader_snap()
 	test_loader()
+	test_threads()
+	test_failed_paths()
+	test_thread_budget()
+	test_libc()
+	test_thread_snap()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -604,4 +621,325 @@ blocks_equal :: proc(a, b: []iop.Sys_Block) -> bool {
 	if len(a) != len(b) {return false}
 	for x, i in a {if x != b[i] {return false}}
 	return true
+}
+
+// ------------------------------------------------------------- threads
+
+V0 :: 2
+
+// rt = the word at `off`, then the load delay slot.
+lw_at :: proc(a: ^Asm, rt, off: u32) {
+	la(a, T0, off)
+	put(a, 0x8d000000 | rt << 16, 0) // lw rt, 0(t0); nop
+}
+
+// A log in the module's data: a pointer to its next free word, then `n`
+// words. The offset of the pointer; the log's words follow it.
+log_words :: proc(a: ^Asm, n: int) -> u32 {
+	p := at(a)
+	put_rel(a, p + 4, 2)
+	for _ in 0 ..< n {put(a, 0)}
+	return p
+}
+
+// Appends `v` to the log at `logp`.
+log_v :: proc(a: ^Asm, logp, v: u32) {
+	la(a, T0, logp)
+	put(a, 0x8d090000, 0) // lw t1, 0(t0); nop
+	put(a, 0x240a0000 | v, 0xad2a0000, 0x25290004, 0xad090000) // li t2, v; sw t2, 0(t1); addiu t1, t1, 4; sw t1, 0(t0)
+}
+
+log_equal :: proc(base, logp: u32, want: []u32) -> bool {
+	for v, i in want {
+		if iop.iop_u32(base + logp + 4 + 4 * u32(i))^ != v {return false}
+	}
+	return iop.iop_u32(base + logp + 4 + 4 * u32(len(want)))^ == 0
+}
+
+// An iop_thread_t: attr, option, entry, stack size, priority.
+thread_param :: proc(a: ^Asm, entry, prio: u32) -> u32 {
+	p := at(a)
+	put(a, 0, 0)
+	put_rel(a, entry, 2)
+	put(a, 0x400, prio)
+	return p
+}
+
+// An iop_sema_t: attr, option, initial, max.
+sema_param :: proc(a: ^Asm, attr, initial: u32) -> u32 {
+	p := at(a)
+	put(a, attr, 0, initial, 1)
+	return p
+}
+
+// Calls `stub` with a0 the word at `arg` and a1 `a1`.
+call_word :: proc(a: ^Asm, stub, arg: u32, a1: u32 = 0) {
+	lw_at(a, A0, arg)
+	li(a, A1, a1)
+	jal(a, stub)
+}
+
+// Calls `stub` with a0 the address of `off`; v0 to `out`.
+call_addr :: proc(a: ^Asm, stub, off, out: u32) {
+	la(a, A0, off)
+	jal(a, stub)
+	store_v0(a, out)
+}
+
+coroutines :: proc() -> (n: int) {
+	for co in core.co_stack_owner {
+		if co != nil {n += 1}
+	}
+	return
+}
+
+test_threads :: proc() {
+	s := &iop.iop_sched
+
+	// "modt": the start (priority 8) makes semaphore sem and threads H
+	// (10) and L (20), starts L then H, and logs 1. H logs 2 and waits on
+	// sem; L logs 3 and signals it, which hands the CPU to H at once: H logs
+	// 4 and ends; L logs 5.
+	fresh()
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	ts := imports(&a, "thsemap", 4, 6, 8)
+	logp := log_words(&a, 8)
+	sem, thh, thl := at(&a), at(&a) + 4, at(&a) + 8
+	put(&a, 0, 0, 0)
+	semp := sema_param(&a, 1, 0)
+	eh := at(&a)
+	prologue(&a)
+	log_v(&a, logp, 2)
+	call_word(&a, ts + 16, sem)
+	log_v(&a, logp, 4)
+	epilogue(&a)
+	el := at(&a)
+	prologue(&a)
+	log_v(&a, logp, 3)
+	call_word(&a, ts + 8, sem)
+	log_v(&a, logp, 5)
+	epilogue(&a)
+	ph, pl := thread_param(&a, eh, 10), thread_param(&a, el, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, semp, sem)
+	call_addr(&a, tb, ph, thh)
+	call_addr(&a, tb, pl, thl)
+	call_word(&a, tb + 8, thl)
+	call_word(&a, tb + 8, thh)
+	log_v(&a, logp, 1)
+	li(&a, V0, 0)
+	epilogue(&a)
+	cos := coroutines()
+	id, r := iop.iop_load(build_mod("modt", &a, entry), "modt", nil)
+	base := module_base(id)
+	check(id > 0 && r == 0, "threads: modt loads")
+	check(log_equal(base, logp, {1, 2, 3, 4, 5}), "threads: start, then by priority, a signal yields to the thread it wakes")
+	check(len(s.threads) == 2 && len(s.semas) == 1, "threads: the start thread is gone, H, L and sem stay")
+	for t in s.threads {check(t.status == .Dormant && t.co == nil, "threads: an ended thread is dormant, its coroutine dropped")}
+	check(coroutines() == cos, "threads: no coroutine left")
+	check(r3000.next_event == iop.IOP_EVENT_OFF && s.cur == 0, "threads: the budget is off after a load")
+
+	// "modw": the start makes sem and thread L, starts it and waits on sem;
+	// L waits on sem too, so nothing is ready.
+	w: Asm
+	tb = imports(&w, "thbase", 4, 6)
+	ts = imports(&w, "thsemap", 4, 6, 8)
+	sem, thl = at(&w), at(&w) + 4
+	put(&w, 0, 0)
+	semp = sema_param(&w, 0, 0)
+	el = at(&w)
+	prologue(&w)
+	call_word(&w, ts + 16, sem)
+	epilogue(&w)
+	pl = thread_param(&w, el, 20)
+	entry = at(&w)
+	prologue(&w)
+	call_addr(&w, ts, semp, sem)
+	call_addr(&w, tb, pl, thl)
+	call_word(&w, tb + 8, thl)
+	call_word(&w, ts + 16, sem)
+	epilogue(&w)
+	threads, semas := len(s.threads), len(s.semas)
+	before := slice_clone(iop.sys_blocks[:])
+	idw, _ := iop.iop_load(build_mod("modw", &w, entry), "modw", nil)
+	key := core.Compat_Key{.Iop_Blocked, core.compat_name("modw"), 0}
+	check(idw == -1 && core.compat.calls[key].n == 1, "threads: a start waiting with nothing ready fails with a compat row")
+	check(len(s.threads) == threads && len(s.semas) == semas, "threads: the failed load's threads and semaphores deleted")
+	check(coroutines() == cos, "threads: the failed load's coroutines killed")
+	check(blocks_equal(before, iop.sys_blocks[:]), "threads: the failed load's stacks freed")
+}
+
+// Condition: a failed path is not rerun until a library registers or a load
+// succeeds.
+test_failed_paths :: proc() {
+	fresh()
+	key := core.Compat_Key{.Iop_Import, core.compat_name("liba"), 0}
+	runs := core.compat.calls[key].n
+	fb, _ := mod_b(true) // calls liba, which nobody registered
+	idb, _ := iop.iop_load(fb, "modb", nil)
+	check(idb == -1 && core.compat.calls[key].n == runs + 1, "failed paths: modb fails on liba")
+	idb, _ = iop.iop_load(fb, "modb", nil)
+	check(idb == -1 && core.compat.calls[key].n == runs + 1, "failed paths: a retry is refused without running")
+	g: Asm
+	put(&g, JR_RA, 0x24020000)
+	idg, _ := iop.iop_load(build_mod("modg", &g, 0), "modg", nil)
+	idb, _ = iop.iop_load(fb, "modb", nil)
+	check(idg > 0 && idb == -1 && core.compat.calls[key].n == runs + 2, "failed paths: a load that succeeds lets it run again")
+	fa, _ := mod_a()
+	ida, _ := iop.iop_load(fa, "moda", nil)
+	idb2, rb := iop.iop_load(fb, "modb", nil)
+	check(ida > 0 && idb2 > 0 && rb == 0x700, "failed paths: once liba registers, the retry runs and links")
+}
+
+// Condition: a budget spent after the start returned still loads.
+test_thread_budget :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6, 33)
+	th := at(&a)
+	put(&a, 0)
+	el := at(&a)
+	li(&a, A0, 100)
+	jal(&a, tb + 16) // DelayThread(100)
+	put_rel(&a, 0x08000000 | el >> 2, 4) // j el
+	put(&a, 0)
+	pl := thread_param(&a, el, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, pl, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, r := iop.iop_load(build_mod("modd", &a, entry), "modd", nil)
+	key := core.Compat_Key{.Iop_Threads, core.compat_name("modd"), 0}
+	check(id > 0 && r == 0 && core.compat.calls[key].n == 1, "budget: threads spinning after the start: the load succeeds with a compat row")
+	t := iop.th_find(iop.iop_u32(module_base(id) + th)^)
+	check(t != nil && t.status == .Ready && t.co != nil, "budget: the spinning thread stays ready with its coroutine")
+	check(t != nil && t.ctx.r[29] > t.stack && t.ctx.r[29] < t.stack + t.stacksize, "budget: its context saved")
+	check(r3000.next_event == iop.IOP_EVENT_OFF && s.cur == 0, "budget: off after the load")
+}
+
+// Bytes of `s` and a NUL, padded to words; their offset.
+str_words :: proc(a: ^Asm, s: string) -> u32 {
+	p := at(a)
+	b := make([]u8, (len(s) + 4) &~ 3, context.temp_allocator)
+	copy(b, s)
+	for i := 0; i < len(b); i += 4 {put(a, endian.unchecked_get_u32le(b[i:]))}
+	return p
+}
+
+test_libc :: proc() {
+	fresh()
+	a: Asm
+	intr := imports(&a, "intrman", 17)
+	pf := imports(&a, "stdio", 4)
+	lc := imports(&a, "sysclib", 12, 14, 36)
+	state := at(&a)
+	put(&a, 0x55)
+	out := at(&a)
+	put(&a, 0, 0, 0)
+	endp := at(&a)
+	put(&a, 0)
+	buf := at(&a)
+	put(&a, 0x11111111, 0x11111111)
+	f := str_words(&a, "x=%d %s")
+	str := str_words(&a, "ab")
+	num := str_words(&a, "  -0x1fZ")
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, intr, state, out)
+	la(&a, A0, f)
+	li(&a, A1, 5)
+	la(&a, A2, str)
+	jal(&a, pf)
+	store_v0(&a, out + 4)
+	la(&a, A0, num)
+	la(&a, A1, endp)
+	li(&a, A2, 0)
+	jal(&a, lc + 16)
+	store_v0(&a, out + 8)
+	la(&a, A0, buf)
+	li(&a, A1, 0x5a)
+	li(&a, A2, 3)
+	jal(&a, lc + 8)
+	la(&a, A0, buf + 4)
+	la(&a, A1, str)
+	li(&a, A2, 2)
+	jal(&a, lc)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modl", &a, entry), "modl", nil)
+	b := module_base(id)
+	u := proc(b, o: u32) -> u32 {return iop.iop_u32(b + o)^}
+	check(id > 0, "libc: modl loads")
+	check(u(b, state) == 0 && u(b, out) == 0, "libc: CpuSuspendIntr writes its state and returns 0")
+	check(u(b, out + 4) == 6, "libc: printf returns what it wrote")
+	check(u(b, out + 8) == 0xffffffe1 && u(b, endp) == b + num + 7, "libc: strtol base 0 reads -0x1f, ends before Z")
+	check(u(b, buf) == 0x115a5a5a && u(b, buf + 4) == 0x11116261, "libc: memset and memcpy")
+	r := &r3000.state.r
+	r[5], r[6], r[7], r[29] = 0xffffffff, 0xff, 0xab, 0x1f000
+	iop.iop_u32(0x1f010)^, iop.iop_u32(0x1f014)^ = 'z', 7
+	got := iop.iop_format("%5d|%-3x|%08X|%c|%u%%|%ld")
+	check(got == "   -1|ff |000000AB|z|7%|0", fmt.tprintf("libc: printf conversions, arguments past a3 from the stack: %q", got))
+}
+
+snap3: core.Snapshot
+snap3_loaded: bool // not emulated state
+
+// "mods": its start signals semaphore 1 and returns.
+mod_s :: proc() -> []u8 {
+	a: Asm
+	ts := imports(&a, "thsemap", 6)
+	entry := at(&a)
+	prologue(&a)
+	li(&a, A0, 1)
+	jal(&a, ts)
+	li(&a, V0, 1) // NO_RESIDENT_END
+	epilogue(&a)
+	return build_mod("mods", &a, entry)
+}
+
+test_thread_snap :: proc() {
+	fresh()
+	// "modh": semaphore 1, and thread H, which waits on it and then logs 7.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	ts := imports(&a, "thsemap", 4, 8)
+	logp := log_words(&a, 4)
+	th := at(&a)
+	put(&a, 0)
+	semp := sema_param(&a, 0, 0)
+	eh := at(&a)
+	prologue(&a)
+	li(&a, A0, 1)
+	jal(&a, ts + 8)
+	log_v(&a, logp, 7)
+	epilogue(&a)
+	ph := thread_param(&a, eh, 10)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, semp)
+	jal(&a, ts)
+	call_addr(&a, tb, ph, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modh", &a, entry), "modh", nil)
+	base := module_base(id)
+	check(id > 0 && log_equal(base, logp, {}), "thread snapshot: H waits")
+	core.snap_op, core.snap_target = .Save, &snap3
+	core.snap_yield()
+	if !snap3_loaded {
+		ids, _ := iop.iop_load(mod_s(), "mods", nil)
+		check(ids > 0 && log_equal(base, logp, {7}), "thread snapshot: a signal wakes H")
+		snap3_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap3
+		core.snap_yield()
+	}
+	check(log_equal(base, logp, {}), "thread snapshot: H waits again after the load")
+	ids, _ := iop.iop_load(mod_s(), "mods", nil)
+	check(ids > 0 && log_equal(base, logp, {7}), "thread snapshot: the restored H wakes where it waited")
 }

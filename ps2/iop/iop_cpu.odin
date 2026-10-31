@@ -3,8 +3,8 @@
 // physical 0..8 MiB onto that 2 MiB, as the retail mirror does, so IOP code
 // never reaches iop_hle.
 //
-// It runs only module starts (loadcore.odin, PS_IRX=1), synchronously;
-// nothing schedules it. Its devices are a stub that logs each address once
+// It runs only during a module's load (loadcore.odin, PS_IRX=1): its start
+// and the threads ready then (thread.odin), synchronously. Its devices are a stub that logs each address once
 // and reads 0.
 package ps2_iop
 

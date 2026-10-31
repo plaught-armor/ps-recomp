@@ -1,5 +1,5 @@
 // loadcore: loading IRX modules onto the IOP's R3000, linking their imports
-// and running their start, behind PS_IRX=1 until the IOP has threads.
+// and running their start, behind PS_IRX=1.
 //
 // A module's imports go one of three ways:
 // - to a Sony library (iop_sony): the stub stays as linked, `jr ra; addiu
@@ -12,12 +12,15 @@
 //   a call before a module registers it is a compat row, not garbage in v0.
 //   RegisterLibraryEntries patches the pending stubs it satisfies.
 //
-// A start runs synchronously, on a coroutine of its own with a fixed budget
-// of instructions, until it returns. It fails when it calls an HLE function
-// that does not exist (a compat row names it), uses an import nobody
-// registered, or runs out of its budget. A failed load is undone: the
-// libraries it registered, the stubs it patched or mapped and the memory it
-// allocated, its own image included. What it wrote to memory stays.
+// A start runs as a thread (thread.odin), synchronously, within a fixed
+// budget of instructions shared with the threads that run after it returns.
+// It fails when it calls an HLE function that does not exist (a compat row
+// names it), uses an import nobody registered, waits with no thread ready,
+// or runs out of the budget. A failed load is undone: the libraries it
+// registered, the stubs it patched or mapped, the threads and semaphores it
+// made and the memory it allocated, its own image included. What it wrote to
+// memory stays. A path whose load failed is not run again until a library
+// registers or a load succeeds, either of which may let it link.
 package ps2_iop
 
 import "core:fmt"
@@ -28,8 +31,8 @@ import "ps:core"
 import cpu "../cpu"
 import r3000 "ps:psx/cpu"
 
-// Instructions a start may run before it is taken to spin. Fixed, so a
-// spinning start fails at the same point every run.
+// Instructions a load's start and threads may run before they are taken
+// to spin. Fixed, so a spinning start fails at the same point every run.
 IOP_START_BUDGET :: 1 << 23
 IOP_START_STACK :: 0x2000
 
@@ -104,6 +107,8 @@ iop_loader: struct {
 		stubs:   map[u32]Hle_Stub,
 		blocks:  [dynamic]Sys_Block,
 	},
+	// The paths whose load failed, cloned; true once a retry has said so.
+	failed_paths: map[string]bool,
 }
 
 // PS_IRX=1: LOADFILE runs the modules it loads. Host setting, read at init.
@@ -123,6 +128,14 @@ iop_loader_init :: proc() {
 	iop_loader.next_id = IOP_FIRST_ID
 	iop_loader.loading = 0
 	iop_loader.failed = false
+	failed_paths_clear()
+	th_init()
+}
+
+@(private = "file")
+failed_paths_clear :: proc() {
+	for p in iop_loader.failed_paths {delete(p)}
+	clear(&iop_loader.failed_paths)
 }
 
 iop_sony :: proc(name: string) -> bool {
@@ -155,12 +168,10 @@ phys :: #force_inline proc(a: u32) -> u32 {
 	return a & 0x1fffffff
 }
 
-@(private = "file")
 r32 :: proc(a: u32) -> u32 {
 	return iop_u32(a & (IOP_RAM_SIZE - 1))^
 }
 
-@(private = "file")
 w32 :: proc(a, v: u32) {
 	iop_u32(a & (IOP_RAM_SIZE - 1))^ = v
 }
@@ -175,6 +186,22 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		return KE_ERROR, 0
 	}
 	l := &iop_loader
+	if told, again := l.failed_paths[path]; again {
+		if !told {
+			fmt.eprintfln("iop: \"%s\" failed before, not run again", path)
+			l.failed_paths[path] = true
+		}
+		return KE_ERROR, 0
+	}
+	s := &iop_sched
+	mark_th, mark_sema := s.next_thid, s.next_semid
+	fail :: proc(path, name, why: string, mark_th, mark_sema: u32) -> (i32, u32) {
+		fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
+		th_undo(mark_th, mark_sema)
+		undo_restore()
+		iop_loader.failed_paths[strings.clone(path)] = false
+		return KE_ERROR, 0
+	}
 	undo_save()
 	clear(&l.patches)
 	l.loading = l.next_id
@@ -185,13 +212,13 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		size = irx_mem_size(x),
 	}
 	m.base = sys_alloc(.Low, m.size)
-	if m.base == 0 {return load_fail(x.name, "no memory")}
+	if m.base == 0 {return fail(path, x.name, "no memory", mark_th, mark_sema)}
 	img := iop_mem(m.base, m.size)
 	copy(img, data[x.file_off:][:x.file_size])
 	slice.zero(img[x.file_size:])
 	if err, detail := irx_relocate(data, img, m.base); err != .None {
 		if err == .Type {core.compat_unknown(.Irx_Reloc, detail)}
-		return load_fail(x.name, fmt.tprintf("relocation %v %#x", err, detail))
+		return fail(path, x.name, fmt.tprintf("relocation %v %#x", err, detail), mark_th, mark_sema)
 	}
 	tables := irx_tables(img[:min(x.text_size, m.size)], m.base, context.temp_allocator)
 	for &t in tables {
@@ -199,22 +226,33 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	}
 	m.argv = argv_block(path, args)
 	stack := sys_alloc(.High, IOP_START_STACK)
-	if m.argv == 0 || stack == 0 {return load_fail(x.name, "no memory")}
-	r := &r3000.state.r
-	r[4] = r32(m.argv)
-	r[5] = m.argv + 4
-	r[28] = m.base + x.gp
-	r[29] = stack + IOP_START_STACK - 16
-	r[31] = 0
-	done := iop_run(m.base + x.entry)
-	sys_free(stack)
-	if !done {
+	if m.argv == 0 || stack == 0 {return fail(path, x.name, "no memory", mark_th, mark_sema)}
+	st := th_new(m.base + x.entry, stack, IOP_START_STACK, m.base + x.gp, IOP_START_PRIO)
+	st.start, st.exit_delete = true, true
+	st.ctx.r[4] = r32(m.argv)
+	st.ctx.r[5] = m.argv + 4
+	th_ready(st)
+	s.start_done = false
+	r3000.next_event = r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN
+	th_schedule()
+	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
-		return load_fail(x.name, "start ran out of its budget")
+		return fail(path, x.name, "start ran out of its budget", mark_th, mark_sema)
 	}
-	if l.failed {return load_fail(x.name, "start called what the HLE lacks")}
+	if !s.start_done {
+		core.compat_unknown(.Iop_Blocked, core.compat_name(x.name))
+		return fail(path, x.name, "start waits with no thread ready", mark_th, mark_sema)
+	}
+	if l.failed {return fail(path, x.name, "start called what the HLE lacks", mark_th, mark_sema)}
+	if s.budget {
+		// The start returned, so the load succeeds; the threads it left ready
+		// stay so, their context saved, for a later load to run on.
+		core.compat_unknown(.Iop_Threads, core.compat_name(x.name))
+		fmt.eprintfln("iop: threads of \"%s\" ran out of the budget", x.name)
+	}
+	failed_paths_clear()
 	l.next_id += 1
-	result = r[2]
+	result = s.start_result
 	if result & 3 == NO_RESIDENT_END {
 		module_drop(m)
 	} else {
@@ -222,13 +260,6 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	}
 	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" at %x id %d start %x", x.name, m.base, m.id, result)}
 	return i32(m.id), result
-}
-
-@(private = "file")
-load_fail :: proc(name, why: string) -> (i32, u32) {
-	fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
-	undo_restore()
-	return KE_ERROR, 0
 }
 
 // {argc, argv[]...} then the strings: argv[0] the path, the rest `args`.
@@ -359,40 +390,6 @@ undo_restore :: proc() {
 	for a, s in l.undo.stubs {l.stubs[a] = s}
 }
 
-// ------------------------------------------------------------- the start
-
-@(private = "file")
-iop_run_entry: u32
-@(private = "file")
-iop_run_done: bool
-@(private = "file")
-iop_run_caller: ^core.Coroutine
-
-// Calls `entry` on a coroutine of its own; false when it ran out of
-// IOP_START_BUDGET. The interpreter checks the budget through run_events
-// every few instructions, so it stops at the same point every run; the
-// coroutine is then dropped mid-call, never resumed.
-@(private = "file")
-iop_run :: proc(entry: u32) -> bool {
-	iop_run_entry = entry
-	iop_run_done = false
-	iop_run_caller = core.co_current
-	frame := r3000.frame_ret
-	r3000.next_event = r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN
-	r3000.run_events = proc() {core.co_switch(iop_run_caller)}
-	co := core.co_create(proc(_: rawptr) {
-		r3000.call(iop_run_entry)
-		iop_run_done = true
-		core.co_switch(iop_run_caller)
-	}, nil)
-	core.co_switch(co)
-	core.co_kill(co)
-	r3000.next_event = IOP_EVENT_OFF
-	r3000.run_events = proc() {}
-	r3000.frame_ret = frame // a dropped call never restored it
-	return iop_run_done
-}
-
 // ------------------------------------------------------------- the HLE
 
 // psx_cpu's bios_entry: whether `addr` is a stub the HLE serves, and with
@@ -414,17 +411,17 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 		fmt.eprintfln("iop: call to %s fno %d, which no module registered", name, s.fno)
 	} else if v, ok := hle_fn(name, s.fno); ok {
 		r[2] = v
+		if iop_sched.resched {th_preempt()}
 		return
 	} else {
 		core.compat_unknown(.Iop_Call, core.compat_name(name), s.fno, pc = addr, ra = r[31])
 		fmt.eprintfln("iop: %s fno %d not implemented", name, s.fno)
 	}
 	r[2] = ke(KE_ERROR)
-	iop_loader.failed = true
+	th_call_failed()
 }
 
 // An error code as v0 holds it.
-@(private = "file")
 ke :: proc(e: i32) -> u32 {
 	return u32(e)
 }
@@ -474,6 +471,22 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		case 27: // SetRebootTimeLibraryHandlingMode
 			return KE_OK, true
 		}
+	case "intrman":
+		switch fno {
+		case 17: // CpuSuspendIntr(int *state): no interrupts to hold off
+			if a0 != 0 {w32(a0, 0)}
+			return KE_OK, true
+		case 18: // CpuResumeIntr(state)
+			return KE_OK, true
+		}
+	case "thbase":
+		return th_base(fno)
+	case "thsemap":
+		return th_semap(fno)
+	case "stdio":
+		return stdio_fn(fno)
+	case "sysclib":
+		return sysclib_fn(fno)
 	}
 	return 0, false
 }
@@ -494,6 +507,7 @@ lib_register :: proc(a: u32) -> u32 {
 	if _, dup := lib_find(name, b.version); dup {return ke(KE_LIBRARY_FOUND)}
 	for b.count < 256 && r32(a + 20 + 4 * b.count) != 0 {b.count += 1}
 	append(&l.libs, b)
+	failed_paths_clear()
 	for i := 0; i < len(l.pending); {
 		p := l.pending[i]
 		pn := p.name
