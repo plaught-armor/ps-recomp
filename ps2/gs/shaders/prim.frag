@@ -4,6 +4,11 @@
 // alpha test, depth test, blending and masked frame/depth writes. Pixel
 // interlock orders the read-modify-write of each pixel by primitive.
 #extension GL_ARB_fragment_shader_interlock : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// The swizzle tables as private globals rather than const: the copies NIR
+// makes then sit at the top of main, outside the State loop, and still
+// become constant data.
+#define TABLE
 #include "common.glsl"
 #include "draw.glsl"
 
@@ -140,70 +145,87 @@ void main() {
 	uvec2 hp = uvec2(gl_FragCoord.xy);
 	LB = ((hp.y % sc) * sc + hp.x % sc) * VRAM_WORDS;
 	uint px = hp.x / sc, py = hp.y / sc;
-	S = pc.states.s[i_state & 0x7fffffffu];
-	uint fl = S.flags;
-	bool alive = px >= S.sx0 && px <= S.sx1 && py >= S.sy0 && py <= S.sy1;
+	// A wave can hold pixels of several primitives. Each pass of this loop
+	// runs the phase before the interlock for the lanes of one State index,
+	// so S is wave-uniform there and its fields load into scalar registers.
+	// The interlock cannot sit inside control flow, so it follows the loop
+	// and reloads S per lane.
+	uint key = i_state & 0x7fffffffu;
+	uint fl;
+	bool alive, write_fb, write_z, write_alpha;
+	ivec4 src;
+	for (;;) {
+		uint first = subgroupBroadcastFirst(key);
+		if (first != key) continue;
+		S = pc.states.s[first];
+		fl = S.flags;
+		alive = px >= S.sx0 && px <= S.sx1 && py >= S.sy0 && py <= S.sy1;
 
-	// Bias for float interpolation error; see pixel() in draw.odin.
-	ivec4 src = ivec4(i_col + 1.0 / 256.0);
-	if (alive && (fl & F_TME) != 0u) {
-		float u = i_stq.x, v = i_stq.y;
-		int lod = tex_lod(1.0);
-		if ((fl & F_FST) == 0u) {
-			lod = tex_lod(i_stq.z);
-			float q = i_stq.z == 0.0 ? 1.0 : i_stq.z;
-			u = i_stq.x / q * float(S.tw);
-			v = i_stq.y / q * float(S.th);
-		}
-		// Upscaled edges stay off the texels beyond them (uv_clamp).
-		u = clamp(u, i_st_range.x, i_st_range.z);
-		v = clamp(v, i_st_range.y, i_st_range.w);
-		ivec4 t = sample_tex(u, v, lod);
-		bool tcc = (fl & F_TCC) != 0u;
-		switch (S.tfx) {
-		case 0u: // MODULATE
-			src.rgb = min((t.rgb * src.rgb) >> 7, ivec3(255));
-			if (tcc) src.a = min((t.a * src.a) >> 7, 255);
-			break;
-		case 1u: // DECAL
-			src.rgb = t.rgb;
-			if (tcc) src.a = t.a;
-			break;
-		default: // HIGHLIGHT, HIGHLIGHT2
-			src.rgb = min(((t.rgb * src.rgb) >> 7) + src.a, ivec3(255));
-			if (tcc) src.a = S.tfx == 2u ? min(t.a + src.a, 255) : t.a;
-			break;
-		}
-	}
-	if ((fl & F_FGE) != 0u) {
-		int f = int(i_fog);
-		ivec3 fc = ivec3(int(S.fogcol & 0xffu), int((S.fogcol >> 8) & 0xffu), int((S.fogcol >> 16) & 0xffu));
-		src.rgb = (f * src.rgb + (255 - f) * fc) >> 8;
-	}
-
-	bool write_fb = true, write_z = (fl & F_ZMSK) == 0u, write_alpha = true;
-	if ((fl & F_ATE) != 0u) {
-		uint a = uint(src.a);
-		bool pass = false;
-		switch (S.atst) {
-		case 0u: pass = false; break;
-		case 1u: pass = true; break;
-		case 2u: pass = a < S.aref; break;
-		case 3u: pass = a <= S.aref; break;
-		case 4u: pass = a == S.aref; break;
-		case 5u: pass = a >= S.aref; break;
-		case 6u: pass = a > S.aref; break;
-		case 7u: pass = a != S.aref; break;
-		}
-		if (!pass) {
-			switch (S.afail) {
-			case 0u: alive = false; break;
-			case 1u: write_z = false; break;
-			case 2u: write_fb = false; break;
-			case 3u: write_z = false; write_alpha = false; break;
+		// Bias for float interpolation error; see pixel() in draw.odin.
+		src = ivec4(i_col + 1.0 / 256.0);
+		if (alive && (fl & F_TME) != 0u) {
+			float u = i_stq.x, v = i_stq.y;
+			int lod = tex_lod(1.0);
+			if ((fl & F_FST) == 0u) {
+				lod = tex_lod(i_stq.z);
+				float q = i_stq.z == 0.0 ? 1.0 : i_stq.z;
+				u = i_stq.x / q * float(S.tw);
+				v = i_stq.y / q * float(S.th);
+			}
+			// Upscaled edges stay off the texels beyond them (uv_clamp).
+			u = clamp(u, i_st_range.x, i_st_range.z);
+			v = clamp(v, i_st_range.y, i_st_range.w);
+			ivec4 t = sample_tex(u, v, lod);
+			bool tcc = (fl & F_TCC) != 0u;
+			switch (S.tfx) {
+			case 0u: // MODULATE
+				src.rgb = min((t.rgb * src.rgb) >> 7, ivec3(255));
+				if (tcc) src.a = min((t.a * src.a) >> 7, 255);
+				break;
+			case 1u: // DECAL
+				src.rgb = t.rgb;
+				if (tcc) src.a = t.a;
+				break;
+			default: // HIGHLIGHT, HIGHLIGHT2
+				src.rgb = min(((t.rgb * src.rgb) >> 7) + src.a, ivec3(255));
+				if (tcc) src.a = S.tfx == 2u ? min(t.a + src.a, 255) : t.a;
+				break;
 			}
 		}
+		if ((fl & F_FGE) != 0u) {
+			int f = int(i_fog);
+			ivec3 fc = ivec3(int(S.fogcol & 0xffu), int((S.fogcol >> 8) & 0xffu), int((S.fogcol >> 16) & 0xffu));
+			src.rgb = (f * src.rgb + (255 - f) * fc) >> 8;
+		}
+
+		write_fb = true; write_z = (fl & F_ZMSK) == 0u; write_alpha = true;
+		if ((fl & F_ATE) != 0u) {
+			uint a = uint(src.a);
+			bool pass = false;
+			switch (S.atst) {
+			case 0u: pass = false; break;
+			case 1u: pass = true; break;
+			case 2u: pass = a < S.aref; break;
+			case 3u: pass = a <= S.aref; break;
+			case 4u: pass = a == S.aref; break;
+			case 5u: pass = a >= S.aref; break;
+			case 6u: pass = a > S.aref; break;
+			case 7u: pass = a != S.aref; break;
+			}
+			if (!pass) {
+				switch (S.afail) {
+				case 0u: alive = false; break;
+				case 1u: write_z = false; break;
+				case 2u: write_fb = false; break;
+				case 3u: write_z = false; write_alpha = false; break;
+				}
+			}
+		}
+		break;
 	}
+	S = pc.states.s[key];
+	fl = S.flags;
+
 	// The largest float below 2^32, so the conversion stays in range.
 	uint z = (i_state & 0x80000000u) != 0u ? i_zi : uint(clamp(i_z, 0.0, 4294967040.0));
 

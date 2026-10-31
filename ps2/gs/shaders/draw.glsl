@@ -48,7 +48,8 @@ struct State {
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer Verts {
 	Vert v[];
 };
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer States {
+// readonly restrict: prim.frag's wave-uniform State reads become scalar loads.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly restrict buffer States {
 	State s[];
 };
 
