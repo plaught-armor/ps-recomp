@@ -249,9 +249,9 @@ syscall :: proc(pc: u32) {
 		if t := thread(i32(a0)); t != nil {ret = i64(t.wakeups); t.wakeups = 0}
 	case 0x37, 0x38: ret = suspend_thread(i32(a0))
 	case 0x39, 0x3a: ret = resume_thread(i32(a0))
-	case 0x3c: ret = i64(setup_thread(a0, a1, a2, a3))
-	case 0x3d: // SetupHeap(start, size)
-		k.heap_end = a1 == 0xffffffff ? u32(c.r[29].d[0]) - 0x10000 : a0 + a1
+	case 0x3c: ret = i64(setup_thread(a0, a1, a2, a3, u32(c.r[8].d[0])))
+	case 0x3d: // SetupHeap(start, size): a negative size ends it at the stack
+		k.heap_end = i32(a1) < 0 ? k.current.stack : a0 + a1
 		ret = i64(k.heap_end)
 	case 0x3e: ret = i64(k.heap_end) // EndOfHeap
 	case 0x40: ret = create_sema(a0)
@@ -427,15 +427,25 @@ thread :: proc(id: i32) -> ^Thread {
 }
 
 // SetupThread(gp, stack, size, args, root): with args, the program's
-// arguments (exec.odin) are written there. Retail's stack differs: for -1
-// its top is the memory size less 0x1000, and it returns top - 0x2a0.
-setup_thread :: proc(gp, stack, size, args: u32) -> u32 {
+// arguments (exec.odin) are written there. As retail: stack -1 puts the top
+// 4 KiB below the end of memory (GetMemorySize); the thread's context frame
+// takes the 0x2a0 bytes below the top, of which only gp, sp, fp (both
+// top - 0x20) and ra (root) are written, each in its register's 16-byte
+// slot; and the program's stack starts below the frame (crt0 sets sp to
+// the result).
+setup_thread :: proc(gp, stack, size, args, root: u32) -> u32 {
+	FRAME :: 0x2a0
 	cpu.state.r[28].d[0] = cpu.sx32(gp)
-	top := stack == 0xffffffff ? mem.RAM_SIZE : stack + size
+	top := stack == 0xffffffff ? mem.RAM_SIZE - 0x1000 : stack + size
 	t := k.current
 	t.gp, t.stack, t.stack_size = gp, top - size, size
+	frame := top - FRAME
+	mem.wr32(frame + 28 * 16, gp)
+	mem.wr32(frame + 29 * 16, top - 0x20)
+	mem.wr32(frame + 30 * 16, top - 0x20)
+	mem.wr32(frame + 31 * 16, root)
 	if args != 0 {args_write(args)}
-	return top - 16
+	return frame
 }
 
 create_thread :: proc(param: u32) -> i64 {

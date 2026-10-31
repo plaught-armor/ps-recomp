@@ -241,6 +241,36 @@ loadelf_test :: proc() {
 	fmt.println("ok loadelf")
 }
 
+// SetupThread as retail: the program's sp 0x2a0 below the top, with only
+// gp, sp, fp and ra written into the context frame there, and a stack of -1
+// topping out 4 KiB below the end of memory; a negative heap size ends the
+// heap at the stack.
+setup_test :: proc() {
+	FRAME :: 0x2a0
+	GP :: 0x00123450
+	ROOT :: 0x00100040
+	SIZE :: 0x1000
+	for top in ([2]u32{STACK + SIZE, mem.RAM_SIZE - 0x1000}) {
+		stack: u32 = top == STACK + SIZE ? STACK : 0xffffffff
+		frame := top - FRAME
+		for &b in mem.ram[frame:][:FRAME] {b = FILL}
+		cpu.state.r[8].d[0] = ROOT
+		if sp := u32(sys(0x3c, GP, stack, SIZE, 0)); sp != frame {fail("fail: SetupThread(%x) sp %x, want %x", stack, sp, frame)}
+		want := [4]u32{GP, top - 0x20, top - 0x20, ROOT}
+		for o in u32(0) ..< FRAME / 16 {
+			at := frame + o * 16
+			if o < 28 || o >= 32 {
+				if !untouched(at, 16) {fail("fail: frame slot %d written", o)}
+				continue
+			}
+			if got := mem.rd32(at); got != want[o - 28] {fail("fail: frame slot %d %x, want %x", o, got, want[o - 28])}
+			if !untouched(at + 4, 12) {fail("fail: frame slot %d past its low word written", o)}
+		}
+		if end := u32(sys(0x3d, 0x00500000, 0xffffffff)); end != top - SIZE || u32(sys(0x3e)) != end {fail("fail: heap end %x, want the stack %x", end, top - SIZE)}
+	}
+	fmt.println("ok SetupThread")
+}
+
 fail :: proc(format: string, args: ..any) -> ! {
 	fmt.eprintfln(format, ..args)
 	os.exit(1)
@@ -316,6 +346,7 @@ main :: proc() {
 	fmt.println("ok _print")
 
 	loadelf_test()
+	setup_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.
 	main_t.co = core.co_create(proc(_: rawptr) {exec_prog()}, nil)
