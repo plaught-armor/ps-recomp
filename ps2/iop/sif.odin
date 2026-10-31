@@ -208,6 +208,16 @@ sif_reply :: proc(cid: u32, opt: u32, payload: []u32) {
 	w[2] = cid
 	w[3] = opt
 	for v, i in payload {w[4 + i] = v}
+	sif_queue(p)
+}
+
+// Queue a copy of packet `p`, its header filled in, for the EE.
+sif_send_raw :: proc(p: []u8) {
+	sif_queue(slice.clone(p))
+}
+
+@(private = "file")
+sif_queue :: proc(p: []u8) {
 	append(&sif.replies, p)
 	if !cpu.in_interrupt {cpu.next_event = cpu.state.cycles}
 }
@@ -295,6 +305,7 @@ sif_command :: proc(a, pc: u32) {
 		copy(mem.ram_slice(dest, size), iop_mem(src, size))
 		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_RDATA, 0, 0, 0})
 	case:
+		if iop_irx && iop_cmd_deliver(cid) {return}
 		if cid & 0x80000000 == 0 {
 			fmod_command(cid, opt, a)
 		} else {
@@ -874,6 +885,7 @@ sif_snap :: proc() {
 	core.snap_add(&iop_loader)
 	core.snap_add(&iop_sched)
 	core.snap_add(&iop_sifcmd)
+	core.snap_add(&iop_wake_ee)
 	iop_cpu_snap()
 	adx_snap()
 }

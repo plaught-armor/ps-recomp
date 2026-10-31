@@ -3,13 +3,26 @@
 // call frame on the host stack, so a thread that waits leaves its host
 // frames suspended there.
 //
-// Nothing runs the IOP but a load (loadcore.odin). A load runs its module's
-// start as a thread and schedules from the loader's coroutine: it picks the
-// ready thread of best priority, switches to it, and is switched back to
-// when that thread waits, yields, ends, is preempted by a thread of better
-// priority it readied, or spends the load's budget. It stops when no thread
+// Three things run the IOP, each from the EE's side and none inside
+// another: a load (loadcore.odin), a command packet the EE sends to a
+// module's handler (iop_cmd_deliver), and the EE's events once the IOP's
+// clock is due (iop_tick). Each schedules from the caller's coroutine: it
+// picks the ready thread of best priority, switches to it, and is switched
+// back to when that thread waits, yields, ends, is preempted by a thread of
+// better priority it readied, or spends the slice. It stops when no thread
 // is ready. Threads still waiting then stay suspended, their coroutines and
-// context kept, until a later load finds them ready.
+// context kept, until a later run finds them ready.
+//
+// The IOP's clock is r3000's cycle count, which runs ahead of the EE's while
+// IOP code runs and is brought up to it (at the EE's 8 cycles per IOP cycle)
+// before each run. A DelayThread waits until a cycle count; a tick or a
+// delivery that finds no thread ready moves the clock to the first such
+// wake within its slice. iop_wake_ee is when, in EE cycles, the EE's events
+// tick the IOP next: at a thread's wake, or at once while one is ready.
+//
+// A command handler runs on a coroutine of its own, not a thread's: retail
+// runs it in sifcmd's interrupt handler, where it may not wait. One that
+// waits, or spins past its budget, is stopped there (th_intr_stop).
 //
 // A thread's context: the R3000's r[0..31], hi and lo, cop0's sr, cause and
 // epc, and frame_ret, saved when it leaves the CPU and restored when it gets
@@ -33,6 +46,14 @@ IOP_START_PRIO :: 8
 // The system clock GetSystemTime reads counts the interpreter's cycles at
 // the IOP's clock rate.
 IOP_CLOCK :: 36_864_000
+// EE cycles per IOP cycle: 294.912 MHz to 36.864 MHz.
+IOP_EE_RATIO :: 8
+// What a tick or a delivery runs threads for: a millisecond of IOP time.
+IOP_SLICE :: 36_864
+// What a command handler may spend before it is stopped as stuck.
+IOP_INTR_BUDGET :: 1 << 20
+// The stack command handlers run on, below the packet buffer they read.
+IOP_INTR_STACK :: IOP_CMDBUF
 
 KE_ILLEGAL_CONTEXT :: -100
 KE_NO_MEMORY :: -400
@@ -61,6 +82,7 @@ Th_Status :: enum u8 {
 	Run,
 	Wait, // on a semaphore
 	Sleep,
+	Delay, // on DelayThread, until wake_at
 }
 
 Th_Context :: struct {
@@ -82,6 +104,7 @@ Iop_Thread :: struct {
 	sema:                   u32, // what it waits on
 	wakeups:                u32, // WakeupThread calls while it was awake
 	wake:                   u32, // what its wait returns
+	wake_at:                u64, // when its Delay ends, IOP cycles
 	ctx:                    Th_Context,
 	co:                     ^core.Coroutine,
 }
@@ -102,7 +125,22 @@ iop_sched: struct {
 	budget:               bool, // the load's budget is spent
 	start_done:           bool, // the start returned, its v0 in start_result
 	start_result:         u32,
+	intr:                 bool, // a command handler runs, on intr_co
+	intr_stop:            Intr_Stop, // why it was stopped
+	intr_handler:         u32, // what it runs and its argument
+	intr_harg:            u32,
+	intr_co:              ^core.Coroutine, // made at the first delivery
 }
+
+Intr_Stop :: enum u8 {
+	None,
+	Blocked, // it waited or spent its budget
+	Call, // it called what the HLE lacks
+}
+
+// When the EE's events tick the IOP next, in EE cycles (iop_wake_set). Off
+// unless PS_IRX=1. Emulated state: snapshotted (sif_snap).
+iop_wake_ee: u64 = max(u64)
 
 // The coroutine a load schedules from. Only set while a load runs.
 @(private = "file")
@@ -113,6 +151,7 @@ th_init :: proc() {
 	for &t in s.threads {
 		if t.co != nil {core.co_kill(t.co)}
 	}
+	if s.intr_co != nil {core.co_kill(s.intr_co)}
 	clear(&s.threads)
 	clear(&s.semas)
 	s^ = {
@@ -122,6 +161,7 @@ th_init :: proc() {
 		next_semid = 1,
 		head       = -1,
 	}
+	iop_wake_ee = max(u64)
 }
 
 th_find :: proc(id: u32) -> ^Iop_Thread {
@@ -181,18 +221,27 @@ th_wake :: proc(t: ^Iop_Thread, v: u32) {
 // ------------------------------------------------------------- the scheduler
 
 // Runs ready threads from the calling coroutine until none is ready, the
-// budget is spent, or the start returned from a failed load. The caller
-// set the budget (next_event) and readied the start.
-th_schedule :: proc() {
+// clock reaches `until` (the budget), or the start returned from a failed
+// load. With `idle`, no thread ready moves the clock to the first wake
+// before `until`, and they run on from there.
+th_schedule :: proc(until: u64, idle := false) {
 	s := &iop_sched
+	assert(th_loader == nil && s.cur == 0, "iop: the scheduler entered while the IOP runs")
 	th_loader = core.co_current
 	frame := r3000.frame_ret
 	s.budget = false
 	s.resched = false
+	r3000.next_event = until
 	r3000.run_events = th_budget
 	for !s.budget && !(s.start_done && iop_loader.failed) {
+		th_due()
 		t := th_pick()
-		if t == nil {break}
+		if t == nil {
+			w := th_next_wake()
+			if !idle || w > until {break}
+			r3000.state.cycles = w
+			continue
+		}
 		id := t.id
 		t.status = .Run
 		s.cur = id
@@ -201,10 +250,60 @@ th_schedule :: proc() {
 		s.cur = 0
 		if t = th_find(id); t != nil && t.status == .Dormant {th_stop(t)}
 	}
+	th_due()
 	r3000.next_event = IOP_EVENT_OFF
 	r3000.run_events = proc() {}
 	r3000.frame_ret = frame // a suspended thread's call has not restored it
 	th_loader = nil
+}
+
+// Readies the delayed threads whose wake the clock reached, in the order
+// they began to wait.
+@(private = "file")
+th_due :: proc() {
+	now := r3000.state.cycles
+	for {
+		first: ^Iop_Thread
+		for &t in iop_sched.threads {
+			if t.status == .Delay && t.wake_at <= now && (first == nil || t.seq < first.seq) {first = &t}
+		}
+		if first == nil {return}
+		th_ready(first)
+	}
+}
+
+// The first delayed thread's wake, max(u64) when none is delayed.
+@(private = "file")
+th_next_wake :: proc() -> u64 {
+	w := max(u64)
+	for t in iop_sched.threads {
+		if t.status == .Delay {w = min(w, t.wake_at)}
+	}
+	return w
+}
+
+// Brings the IOP's clock up to EE cycle `now`.
+iop_sync :: proc(now: u64) {
+	r3000.state.cycles = max(r3000.state.cycles, now / IOP_EE_RATIO)
+}
+
+// Sets iop_wake_ee from the threads: at once while one is ready, else at the
+// first wake. The EE's next event moves up to it, unless the EE is handling
+// events, which ends with update_next_event.
+iop_wake_set :: proc() {
+	w := th_next_wake()
+	if th_pick() != nil {w = r3000.state.cycles}
+	iop_wake_ee = w if w == max(u64) else w * IOP_EE_RATIO
+	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, iop_wake_ee)}
+}
+
+// The EE's events at EE cycle `now`, the IOP's wake due: runs its threads
+// for a slice.
+iop_tick :: proc(now: u64) {
+	iop_sync(now)
+	iop_sched.start_done = false
+	th_schedule(r3000.state.cycles + IOP_SLICE, idle = true)
+	iop_wake_set()
 }
 
 // The ready thread of best priority, first in its queue.
@@ -290,20 +389,23 @@ th_preempt :: proc() {
 	th_yield()
 }
 
-// run_events during a load: the budget is spent. The running thread stays
-// ready, first in its queue, its context saved.
+// run_events while the IOP runs: the budget is spent. The running thread
+// stays ready, first in its queue, its context saved; a command handler is
+// stopped.
 @(private = "file")
 th_budget :: proc() {
+	if iop_sched.intr {th_intr_stop(.Blocked)}
 	if iop_sched.cur == 0 {return}
 	iop_sched.budget = true
 	th_preempt()
 }
 
 // The running thread waits; what its waker gave, or KE_CAN_NOT_WAIT on the
-// loader.
+// loader. A command handler that waits is stopped.
 @(private = "file")
 th_wait :: proc(status: Th_Status, sema: u32 = 0) -> u32 {
 	s := &iop_sched
+	if s.intr {th_intr_stop(.Blocked)}
 	t := th_find(s.cur)
 	if t == nil {return ke(KE_CAN_NOT_WAIT)}
 	t.status = status
@@ -332,8 +434,10 @@ th_exit :: proc(delete := false) {
 }
 
 // An HLE call failed in the running thread. In a start the load fails once
-// the start returns; any other thread is stopped there, dormant.
+// the start returns; any other thread, or a command handler, is stopped
+// there, dormant.
 th_call_failed :: proc() {
+	if iop_sched.intr {th_intr_stop(.Call)}
 	t := th_find(iop_sched.cur)
 	if t == nil || t.start {
 		iop_loader.failed = true
@@ -341,6 +445,57 @@ th_call_failed :: proc() {
 	}
 	fmt.eprintfln("iop: thread %d stopped", t.id)
 	th_exit()
+}
+
+// Runs command handler `handler` with a0 the packet, a1 `harg`, on the
+// handler coroutine, for at most IOP_INTR_BUDGET cycles; why it stopped
+// early, if it did. The context it ran in is put back: no thread's is lost.
+th_intr :: proc(handler, harg: u32) -> Intr_Stop {
+	s := &iop_sched
+	assert(th_loader == nil && s.cur == 0, "iop: a command delivered while the IOP runs")
+	saved := Th_Context{r3000.state.r, r3000.state.hi, r3000.state.lo, r3000.cop0, r3000.frame_ret}
+	if s.intr_co == nil {s.intr_co = core.co_create(th_intr_main, nil)}
+	s.intr, s.intr_stop = true, .None
+	s.intr_handler, s.intr_harg = handler, harg
+	th_loader = core.co_current
+	r3000.next_event = r3000.state.cycles + IOP_INTR_BUDGET
+	r3000.run_events = th_budget
+	core.co_switch(s.intr_co)
+	th_loader = nil
+	r3000.next_event = IOP_EVENT_OFF
+	r3000.run_events = proc() {}
+	s.intr = false
+	if s.intr_stop != .None {
+		core.co_kill(s.intr_co)
+		s.intr_co = nil
+	}
+	r3000.state.r, r3000.state.hi, r3000.state.lo = saved.r, saved.hi, saved.lo
+	r3000.cop0, r3000.frame_ret = saved.cop0, saved.frame_ret
+	return s.intr_stop
+}
+
+// The handler coroutine: each delivery's handler, then back to its sender.
+// It never returns, so one coroutine serves every delivery until a handler
+// is stopped on it.
+@(private = "file")
+th_intr_main :: proc(_: rawptr) {
+	s := &iop_sched
+	for {
+		r := &r3000.state.r
+		r[4], r[5] = IOP_CMDBUF, s.intr_harg
+		r[29] = IOP_INTR_STACK - 16
+		r3000.call(s.intr_handler)
+		core.co_switch(th_loader)
+	}
+}
+
+// Stops the running command handler where it is; th_intr kills its
+// coroutine.
+@(private = "file")
+th_intr_stop :: proc(why: Intr_Stop) {
+	iop_sched.intr_stop = why
+	core.co_switch(th_loader)
+	unreachable()
 }
 
 // Undoes a failed load: deletes the semaphores and threads made since ids
@@ -446,12 +601,9 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			t.wakeups += 1
 		}
 		return KE_OK, true
-	case 33: // DelayThread(usec): no timers yet, so it yields to its equals
-		if t := th_find(s.cur); t != nil {
-			th_ready(t)
-			th_yield()
-		}
-		return KE_OK, true
+	case 33: // DelayThread(usec)
+		if t := th_find(s.cur); t != nil {t.wake_at = r3000.state.cycles + u64(a0) * (IOP_CLOCK / 1000) / 1000}
+		return th_wait(.Delay), true
 	case 34: // GetSystemTime(iop_sys_clock_t *)
 		w32(a0, u32(r3000.state.cycles))
 		w32(a0 + 4, u32(r3000.state.cycles >> 32))

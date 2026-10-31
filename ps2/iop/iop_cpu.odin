@@ -3,9 +3,10 @@
 // physical 0..8 MiB onto that 2 MiB, as the retail mirror does, so IOP code
 // never reaches iop_hle.
 //
-// It runs only during a module's load (loadcore.odin, PS_IRX=1): its start
-// and the threads ready then (thread.odin), synchronously. Its devices are a stub that logs each address once
-// and reads 0.
+// It runs only with PS_IRX=1, synchronously, from the EE's side: a module's
+// load (loadcore.odin), a command packet's handler (sifcmd.odin) and the
+// IOP's threads when its clock is due (thread.odin). Its devices are a stub
+// that logs each address once and reads 0.
 package ps2_iop
 
 import "core:fmt"

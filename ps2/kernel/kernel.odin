@@ -903,6 +903,7 @@ update_next_event :: proc() {
 	n := min(k.vblank_start, k.vblank_end)
 	for a in k.alarms {n = min(n, a.deadline)}
 	for t in mem.timer_next {n = min(n, t)}
+	n = min(n, iop.iop_wake_ee)
 	cpu.next_event = n
 }
 
@@ -947,6 +948,8 @@ run_events :: proc() {
 		}
 	}
 	mem.timer_events(now)
+	// Before delivery, so what the IOP's threads send the EE is pumped now.
+	if now >= iop.iop_wake_ee {iop.iop_tick(now)}
 	deliver_interrupts()
 
 	cpu.in_interrupt = false

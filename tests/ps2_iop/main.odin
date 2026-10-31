@@ -29,12 +29,21 @@
 // it at once. A start that waits with no thread ready fails with one compat
 // row, and the undo deletes its threads, semaphores and coroutines. A path
 // whose load failed is not run again until a library registers or a load
-// succeeds. A thread spinning on DelayThread after its start returned spends
+// succeeds. A thread spinning after its start returned spends
 // the budget: the load still succeeds, with one compat row, and the thread
 // stays ready with its context saved. intrman, printf, strtol, memset and
 // memcpy answer as the C library does. A snapshot taken while a thread waits
 // restores it, coroutine stack included, so a signal after the load wakes it
 // where it waited.
+//
+// Commands: a packet the EE sends to a command with a module's handler runs
+// it, and the thread it signals runs at once; that thread's DelayThread
+// wakes at the cycle integer math gives, a large delay included, and the
+// EE's next event moves up to that wake. The EE's events at the wake run
+// the thread, and what it sends with sceSifSendCmd is in EE RAM when they
+// return. One coroutine serves every handler; one that waits is stopped
+// with a compat row and its coroutine killed, and the next delivery makes
+// another. The loader's reset kills it.
 package main
 
 import "core:encoding/endian"
@@ -42,6 +51,8 @@ import "core:fmt"
 import "core:os"
 import "ps:core"
 import iop "ps:ps2/iop"
+import cpu "ps:ps2/cpu"
+import kernel "ps:ps2/kernel"
 import mem "ps:ps2/mem"
 import r3000 "ps:psx/cpu"
 
@@ -124,6 +135,7 @@ game :: proc(_: rawptr) {
 	test_libc()
 	test_thread_snap()
 	test_sifcmd()
+	test_cmd_deliver()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -799,12 +811,10 @@ test_thread_budget :: proc() {
 	fresh()
 	s := &iop.iop_sched
 	a: Asm
-	tb := imports(&a, "thbase", 4, 6, 33)
+	tb := imports(&a, "thbase", 4, 6)
 	th := at(&a)
 	put(&a, 0)
 	el := at(&a)
-	li(&a, A0, 100)
-	jal(&a, tb + 16) // DelayThread(100)
 	put_rel(&a, 0x08000000 | el >> 2, 4) // j el
 	put(&a, 0)
 	pl := thread_param(&a, el, 20)
@@ -995,4 +1005,118 @@ test_sifcmd :: proc() {
 	check(u(b, out + 24) == b + tab && s.user_tab == b + tab2 && s.user_size == 1, "sifcmd: a second table returns the first")
 	iop.iop_loader_init()
 	check(s^ == {}, "sifcmd: the loader's reset clears the tables")
+}
+
+EE_LIST :: 0x00100000 // a SifSetDma list in EE RAM
+EE_PKT :: 0x00100100 // the packet it sends
+EE_BUF :: 0x00100200 // the EE's command buffer
+
+// Sends the IOP a packet of command `cid`, as the EE's SifSetDma does.
+send_cmd :: proc(cid: u32) {
+	for w, i in ([4]u32{16, 0, cid, 0}) {mem.wr32(EE_PKT + 4 * u32(i), w)}
+	for w, i in ([4]u32{EE_PKT, iop.IOP_CMDBUF, 16, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
+	iop.sif_set_dma(EE_LIST, 1, 0)
+}
+
+test_cmd_deliver :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6, 33)
+	ts := imports(&a, "thsemap", 4, 6, 8)
+	sc := imports(&a, "sifcmd", 8, 10, 12)
+	sem, th, dl := at(&a), at(&a) + 4, at(&a) + 8
+	put(&a, 0, 0, 100)
+	tab := at(&a)
+	put(&a, 0, 0, 0, 0)
+	pkt := at(&a)
+	put(&a, 0, 0, 0, 0)
+	sp := sema_param(&a, 0, 0)
+	// Command 0's handler signals harg, command 1's waits on it.
+	h0 := at(&a)
+	prologue(&a)
+	put(&a, 0x00a02025) // or a0, a1, zero
+	jal(&a, ts + 8)
+	epilogue(&a)
+	h1 := at(&a)
+	prologue(&a)
+	put(&a, 0x00a02025)
+	jal(&a, ts + 16)
+	epilogue(&a)
+	// The thread: waits on sem, delays `dl`, sends command 0x10, again.
+	w := at(&a)
+	put(&a, 0x27bdffe8, 0xafa00010, 0xafa00014) // addiu sp, sp, -24; sw zero, 16(sp); sw zero, 20(sp)
+	wl := at(&a)
+	call_word(&a, ts + 16, sem)
+	lw_at(&a, A0, dl)
+	jal(&a, tb + 16)
+	li(&a, A0, 0x10)
+	la(&a, A1, pkt)
+	li(&a, A2, 16)
+	li(&a, 7, 0)
+	jal(&a, sc + 16)
+	put_rel(&a, 0x08000000 | wl >> 2, 4) // j wl
+	put(&a, 0)
+	tp := thread_param(&a, w, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, sp, sem)
+	call_addr(&a, tb, tp, th)
+	call_word(&a, tb + 8, th)
+	la(&a, A0, tab)
+	li(&a, A1, 2)
+	jal(&a, sc)
+	for c in ([2][2]u32{{0, h0}, {1, h1}}) {
+		lw_at(&a, A2, sem)
+		la(&a, A1, c[1])
+		li(&a, A0, c[0])
+		jal(&a, sc + 8)
+	}
+	li(&a, V0, 0)
+	epilogue(&a)
+	base := coroutines()
+	id, r := iop.iop_load(build_mod("modk", &a, entry), "modk", nil)
+	b := module_base(id)
+	t := iop.th_find(iop.iop_u32(b + th)^)
+	check(id > 0 && r == 0 && t != nil && t.status == .Wait, "deliver: the thread waits after the load")
+	check(iop.iop_wake_ee == max(u64), "deliver: no wake while every thread waits")
+
+	iop.sif.ee_buf = EE_BUF
+	mem.dmac_stat &~= 1 << mem.DMA_SIF0
+	cpu.state.cycles = 0
+	VBLANK :: 1 << 40
+	cpu.next_event = VBLANK
+	send_cmd(0)
+	t = iop.th_find(iop.iop_u32(b + th)^)
+	check(t.status == .Delay && t.wake_at == r3000.state.cycles + 3686, "deliver: the signalled thread delays 100 us, 3686 cycles")
+	check(iop.iop_wake_ee == t.wake_at * 8 && cpu.next_event == iop.iop_wake_ee, "deliver: the EE's next event is the wake, not the vblank")
+	check(coroutines() == base + 2 && len(iop.sif.replies) == 0, "deliver: a handler coroutine, nothing sent yet")
+
+	kernel.k.vblank_start, kernel.k.vblank_end = VBLANK, VBLANK
+	sr := cpu.state.cop0[12]
+	cpu.state.cop0[12] |= 0x10001
+	cpu.state.cycles = iop.iop_wake_ee
+	kernel.run_events()
+	cpu.state.cop0[12] = sr
+	t = iop.th_find(iop.iop_u32(b + th)^)
+	check(mem.rd32(EE_BUF) == 16 && mem.rd32(EE_BUF + 8) == 0x10 && len(iop.sif.replies) == 0, "tick: the thread's command is in EE RAM after one pass")
+	check(t.status == .Wait && iop.iop_wake_ee == max(u64) && cpu.next_event == VBLANK, "tick: the thread waits again, no wake")
+	mem.dmac_stat &~= 1 << mem.DMA_SIF0
+
+	iop.iop_u32(b + dl)^ = 0xffffffff
+	send_cmd(0)
+	t = iop.th_find(iop.iop_u32(b + th)^)
+	check(t.status == .Delay && t.wake_at == r3000.state.cycles + 158_329_674_362, "deliver: a delay of 2^32-1 us, in u64 cycles")
+	check(coroutines() == base + 2, "deliver: the handler coroutine serves again")
+
+	key := core.Compat_Key{.Iop_Intr, 1, 0}
+	send_cmd(1)
+	check(core.compat.calls[key].n == 1 && coroutines() == base + 1, "deliver: a handler that waits is stopped, a compat row, its coroutine killed")
+	check(!iop.iop_sched.intr && r3000.next_event == iop.IOP_EVENT_OFF, "deliver: the IOP off after it")
+	send_cmd(0)
+	check(coroutines() == base + 2 && iop.iop_sched.semas[0].count == 1 && core.compat.calls[key].n == 1, "deliver: the next delivery makes another and runs")
+
+	fresh()
+	check(coroutines() == base && iop.iop_wake_ee == max(u64), "deliver: the loader's reset kills it")
 }

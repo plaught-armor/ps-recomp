@@ -38,7 +38,8 @@ COMPAT_TOP :: 10
 // Iop_Start a module's name, whose start ran out of its budget;
 // Iop_Blocked a module's name, whose start waited with no thread ready;
 // Iop_Threads a module's name, whose threads ran out of the load's budget
-// after its start returned; Irx_Reloc the relocation type.
+// after its start returned; Iop_Intr the command id whose IOP handler
+// waited or ran out of its budget; Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -52,6 +53,7 @@ Compat_Call :: enum u8 {
 	Iop_Start,
 	Iop_Blocked,
 	Iop_Threads,
+	Iop_Intr,
 	Irx_Reloc,
 }
 
@@ -204,6 +206,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Start: return fmt.tprintf("IOP start %s budget", compat_names[k.id])
 	case .Iop_Blocked: return fmt.tprintf("IOP start %s blocked", compat_names[k.id])
 	case .Iop_Threads: return fmt.tprintf("IOP threads budget %s", compat_names[k.id])
+	case .Iop_Intr: return fmt.tprintf("IOP command handler %08x blocked", k.id)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

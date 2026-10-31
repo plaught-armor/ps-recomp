@@ -204,6 +204,7 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		return KE_ERROR, 0
 	}
 	undo_save()
+	defer iop_wake_set()
 	clear(&l.patches)
 	l.loading = l.next_id
 	l.failed = false
@@ -234,8 +235,8 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	st.ctx.r[5] = m.argv + 4
 	th_ready(st)
 	s.start_done = false
-	r3000.next_event = r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN
-	th_schedule()
+	iop_sync(cpu.state.cycles)
+	th_schedule(r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN)
 	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
 		return fail(path, x.name, "start ran out of its budget", mark_th, mark_sema)
@@ -490,6 +491,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return sysclib_fn(fno)
 	case "sifcmd":
 		return sifcmd_fn(fno)
+	case "sifman":
+		return sifman_fn(fno)
 	}
 	return 0, false
 }
