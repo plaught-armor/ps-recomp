@@ -1,6 +1,7 @@
 // play test: play runs small synthetic PS1 discs (a PS-X EXE that loops on
-// one branch) headless to FRAMES, under a DATA setting in the OS temp
-// directory. The test runs itself as play, the converter child included.
+// one branch), and in compat mode PS2 ones (an ELF), headless to FRAMES,
+// under a DATA setting in the OS temp directory. The test runs itself as
+// play, the converter child included.
 // - native, psx_exe: a disc with SYSTEM.CNF, and one with only PSX.EXE,
 //   convert; the blob and its key land in the disc's directory, the
 //   temporary file a crash left there is overwritten and gone, the memory
@@ -11,12 +12,13 @@
 // - interpreted: a converter that cannot write its output (a directory in
 //   the way) fails; play says it has no native code, stores nothing, and
 //   runs the game to FRAMES interpreted;
-// - compat: play --compat on a directory of discs (one that loops, one
-//   that makes a BIOS call the HLE lacks, one that starts on a reserved
-//   instruction) and a file that is not a disc gives one compat.tsv row
-//   per disc (ok, ok with the call stubbed, fatal) and skips the file; the
-//   looping disc run again with a vblank count it cannot reach in
-//   COMPAT_WAIT is a hang, and once more to FRAMES ok, each time in place.
+// - compat: play --compat on a directory of discs, PS1 and PS2 (one of
+//   each that loops, one that makes a BIOS call or an EE syscall the HLE
+//   lacks, one that starts on an invalid instruction), and a file that is
+//   not a disc gives one compat.tsv row per disc (ok, ok with the call
+//   stubbed, fatal) and skips the file; the looping PS1 disc run again
+//   with a vblank count it cannot reach in COMPAT_WAIT is a hang, and once
+//   more to FRAMES ok, each time in place.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -30,6 +32,7 @@ import "core:strings"
 import "ps:core"
 import "ps:core/disc"
 import "ps:play"
+import "ps:ps2/kernel"
 import "ps:tests/discimg"
 
 @(private = "file")
@@ -104,6 +107,67 @@ exe :: proc(code: ..u32) -> []u8 {
 cnf_disc :: proc(extra := "", code: ..u32) -> []u8 {
 	cnf := strings.concatenate({"BOOT = cdrom:\\DATA\\PSX.EXE;1\n", extra}, context.temp_allocator)
 	return discimg.make_iso(cnf, sub_name = "PSX.EXE;1", sub = string(exe(..code)))
+}
+
+// A PS2 ELF: one segment, and one .text section for the recompiler, of
+// `b .` and its delay slot at 0x00100000, or the code given.
+@(private = "file")
+elf :: proc(code: ..u32) -> []u8 {
+	TEXT :: 0x00100000
+	CODE :: 0x100 // file offset of the code
+	CODE_SIZE :: 0x40
+	SHSTRTAB :: "\x00.text\x00.shstrtab\x00"
+	SH :: 0x180 // file offset of the section headers
+	assert(len(code) * 4 <= CODE_SIZE)
+	e := make([]u8, 0x200, context.temp_allocator)
+	copy(e, "\x7fELF\x01\x01\x01")
+	endian.put_u16(e[16:], .Little, 2) // executable
+	endian.put_u16(e[18:], .Little, 8) // MIPS
+	endian.put_u32(e[20:], .Little, 1)
+	endian.put_u32(e[24:], .Little, TEXT) // entry
+	endian.put_u32(e[28:], .Little, 52) // program headers
+	endian.put_u32(e[32:], .Little, SH)
+	endian.put_u16(e[40:], .Little, 52)
+	endian.put_u16(e[42:], .Little, 32)
+	endian.put_u16(e[44:], .Little, 1)
+	endian.put_u16(e[46:], .Little, 40)
+	endian.put_u16(e[48:], .Little, 3)
+	endian.put_u16(e[50:], .Little, 2) // .shstrtab
+	ph := e[52:]
+	endian.put_u32(ph[0:], .Little, 1) // PT_LOAD
+	endian.put_u32(ph[4:], .Little, CODE)
+	endian.put_u32(ph[8:], .Little, TEXT)
+	endian.put_u32(ph[12:], .Little, TEXT)
+	endian.put_u32(ph[16:], .Little, CODE_SIZE)
+	endian.put_u32(ph[20:], .Little, CODE_SIZE)
+	endian.put_u32(ph[24:], .Little, 5) // read, execute
+	endian.put_u32(ph[28:], .Little, 16)
+	copy(e[0x80:], SHSTRTAB)
+	text := e[SH + 40:]
+	endian.put_u32(text[0:], .Little, 1) // ".text"
+	endian.put_u32(text[4:], .Little, 1) // PROGBITS
+	endian.put_u32(text[8:], .Little, 6) // alloc, execute
+	endian.put_u32(text[12:], .Little, TEXT)
+	endian.put_u32(text[16:], .Little, CODE)
+	endian.put_u32(text[20:], .Little, CODE_SIZE)
+	endian.put_u32(text[32:], .Little, 4)
+	strtab := e[SH + 80:]
+	endian.put_u32(strtab[0:], .Little, 7) // ".shstrtab"
+	endian.put_u32(strtab[4:], .Little, 3) // STRTAB
+	endian.put_u32(strtab[16:], .Little, 0x80)
+	endian.put_u32(strtab[20:], .Little, len(SHSTRTAB))
+	endian.put_u32(e[CODE:], .Little, 0x1000ffff)
+	for w, k in code {
+		endian.put_u32(e[CODE + 4 * k:], .Little, w)
+	}
+	return e
+}
+
+// A PS2 disc with SYSTEM.CNF naming DATA/SLUS_123.45, the ELF of code.
+@(private = "file")
+ps2_disc :: proc(code: ..u32) -> []u8 {
+	cnf :: "BOOT2 = cdrom0:\\DATA\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n"
+	return discimg.make_iso(cnf, sub_name = "SLUS_123.45;1", sub = string(elf(..code)))
 }
 
 // A disc with PSX.EXE in the root, where make_iso puts SYSTEM.CNF, and no
@@ -245,17 +309,27 @@ test_compat :: proc() {
 	Fixture :: struct {
 		file:   string,
 		img:    []u8,
+		system: string,
 		result: string,
 		status: string,
 		unimpl: string,
 	}
 	fixtures := [?]Fixture {
-		{"loop.iso", cnf_disc(), "ok", "0", ""},
+		{"loop.iso", cnf_disc(), "ps1", "ok", "0", ""},
 		// li t1, 0xff; jal 0xa0; nop; b .; nop: BIOS A(ffh), then loop.
-		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ok", "0", "BIOS A(ffh)=1"},
+		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ps1", "ok", "0", "BIOS A(ffh)=1"},
 		// Opcode 0x3f is reserved.
-		{"fatal.iso", cnf_disc("", 0xfc000000), "fatal", "1", ""},
+		{"fatal.iso", cnf_disc("", 0xfc000000), "ps1", "fatal", "1", ""},
+		{"ps2_loop.iso", ps2_disc(), "ps2", "ok", "0", ""},
+		// li v1, 1; syscall; b .; nop: ResetEE, which only the retail ROM
+		// has (checked below), then loop.
+		{"ps2_stub.iso", ps2_disc(0x24030001, 0x0000000c, 0x1000ffff, 0), "ps2", "ok", "0", "syscall 1=1"},
+		// Opcode 0x3b is not an EE instruction.
+		{"ps2_fatal.iso", ps2_disc(0xec000000), "ps2", "fatal", "1", ""},
 	}
+	// ps2_stub needs a syscall the HLE lacks that stops a run outside
+	// COMPAT; one the kernel implements stubs nothing.
+	check(name, kernel.ROM_ONLY_SYSCALLS[1] == "ResetEE", "syscall 1 is no longer one only the retail ROM has")
 	ids: [len(fixtures)]string
 	for f, k in fixtures {
 		path, _ := filepath.join({dir, f.file}, context.temp_allocator)
@@ -287,7 +361,8 @@ test_compat :: proc() {
 		what := fmt.tprintf("%s: %v", f.file, row)
 		check(name, row[.Result] == f.result && row[.Status] == f.status, what)
 		check(name, row[.Unimplemented] == f.unimpl, what)
-		check(name, row[.System] == "ps1" && row[.Frames_Wanted] == fmt.tprint(FRAMES), what)
+		check(name, row[.System] == f.system && row[.Frames_Wanted] == fmt.tprint(FRAMES), what)
+		check(name, row[.Vmode] == (f.system == "ps2" ? "NTSC" : ""), what)
 		check(name, row[.Native] == "yes" && row[.Build] == "test", what)
 		if f.result == "ok" {
 			check(name, row[.Frames] == fmt.tprint(FRAMES), what)
