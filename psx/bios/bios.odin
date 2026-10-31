@@ -453,11 +453,42 @@ hangs_on_retail :: proc(table: string, fn: u32) -> bool {
 	return false
 }
 
+// Table entries the retail kernel points at a bare `jr ra; move v0, zero`
+// (A: 0xbfc06fdc, C: 0x35a4): they return 0 and touch nothing else. Listed
+// by the PS1 BIOS index (v4.5 retail kernel):
+//   awk -F'\t' '$5 == "0xbfc06fdc" || $5 == "0x000035a4" {print $1, $2}' bios-index/ps1/index.tsv
+@(private)
+A0_RETURN_0 :: bit_set[0x57 ..= 0xb3; u128] {
+	0x57, 0x58, 0x59, 0x5a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x79, 0x7a, 0x7b,
+	0x7d, 0x7f, 0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a,
+	0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0xb0, 0xb1, 0xb3,
+}
+@(private)
+C0_RETURN_0 :: bit_set[0x0e ..= 0x14; u128]{0x0e, 0x0f, 0x10, 0x11, 0x14}
+
+// Whether table(fn) is one of those stubs. fn comes from the guest and can
+// lie outside a set's range, where `in` alone is not defined; the range is
+// tested first.
+returns_0_on_retail :: proc(table: string, fn: u32) -> bool {
+	switch table {
+	case "A":
+		return fn >= 0x57 && fn <= 0xb3 && int(fn) in A0_RETURN_0
+	case "C":
+		return fn >= 0x0e && fn <= 0x14 && int(fn) in C0_RETURN_0
+	}
+	return false
+}
+
 // A call the HLE BIOS does not handle stops the game, except under COMPAT,
-// where it returns 0. One that hangs on the retail kernel says so: the game
-// was never meant to get there.
+// where it returns 0. One the retail kernel sends to a return-0 stub returns
+// 0 silently, as retail does, and is not counted. One that hangs on the
+// retail kernel says so: the game was never meant to get there.
 @(private)
 bios_unknown :: proc(table: string, fn: u32) {
+	if returns_0_on_retail(table, fn) {
+		ret(0)
+		return
+	}
 	kind := core.Compat_Call.Bios_A
 	switch table {
 	case "B": kind = .Bios_B

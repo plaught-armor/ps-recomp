@@ -38,6 +38,8 @@
 //   AdjustA0Table puts there: A(03h) write and A(3Eh) puts.
 //   hangs_on_retail names the stubs that never return on retail, and no
 //   number below or above each table's set of them.
+//   The A and C slots retail points at a return-0 stub return 0; their
+//   neighbours, A(61h), A(6Fh) and the B table are not among them.
 package main
 
 import "core:fmt"
@@ -794,8 +796,47 @@ main :: proc() {
 		}
 	}
 
+	// Return-0 stubs: every one returns 0 through bios_a or bios_c, and the
+	// numbers next to them, A(61h) and A(6Fh) (which store as well) and the
+	// B table are not among them.
+	a_zero := [?]u32 {
+		0x57, 0x58, 0x59, 0x5a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x79, 0x7a, 0x7b,
+		0x7d, 0x7f, 0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a,
+		0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0xb0, 0xb1, 0xb3,
+	}
+	for fn in a_zero {
+		r[2] = 0xdeadbeef
+		check(fmt.tprintf("A(%02Xh) return-0 stub", fn), a(fn), 0)
+	}
+	for fn in ([?]u32{0x0e, 0x0f, 0x10, 0x11, 0x14}) {
+		r[2] = 0xdeadbeef
+		check(fmt.tprintf("C(%02Xh) return-0 stub", fn), c(fn), 0)
+	}
+	zero_cases := [?]struct {
+		table: string,
+		fn:    u32,
+	} {
+		{"A", 0x56},
+		{"A", 0x61},
+		{"A", 0x6f},
+		{"A", 0x78},
+		{"A", 0x81},
+		{"A", 0xb2},
+		{"A", 0xb4},
+		{"A", 0xffffffff},
+		{"B", 0x57},
+		{"C", 0x0d},
+		{"C", 0x12},
+		{"C", 0x15},
+	}
+	for z in zero_cases {
+		if bios.returns_0_on_retail(z.table, z.fn) {
+			fail("returns_0_on_retail(%s, %02xh) is true", z.table, z.fn)
+		}
+	}
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs, return-0 stubs")
 }
