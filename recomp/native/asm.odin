@@ -180,6 +180,12 @@ Asm :: struct {
 	slow:      [dynamic]Slow,
 	cached:    []u32, // state field offsets, at most CACHE_MAX
 	state:     string, // import: the state of the function being emitted
+	// import: one whose address the function being emitted keeps in a
+	// host register, x86-64's RAM register, for vec_load, vec_store,
+	// imp_load, imp_store and vec_ldst_at through it. Set only around a
+	// function that makes no RAM access, whose slot nothing changes while
+	// it runs.
+	pin:       string,
 }
 
 // The out-of-line end of a load that left RAM's fast path at far: a host
@@ -771,7 +777,7 @@ vec_funnel8 :: proc(a: ^Asm, dst, lo, hi: u32, buf: string) {
 vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: string, store: bool) {
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_vec_ldst_at(a, v, imp(a, base), store)
+		x64_vec_ldst_at(a, v, base, store)
 	case .Arm64:
 		a64_vec_ldst_at(a, v, imp(a, base), store)
 	}
@@ -908,6 +914,7 @@ call_func :: proc(a: ^Asm, l: Label) {
 // values are sign-extended. Loses B and C.
 load :: proc(a: ^Asm, w: Width, signed: bool, slow: string) {
 	assert(w <= .B32, "native: load width")
+	pin_check(a)
 	if a.ram.base == "" {
 		call(a, slow, .A)
 		return
@@ -931,6 +938,7 @@ load :: proc(a: ^Asm, w: Width, signed: bool, slow: string) {
 // import `base` instead. Loses A, B, C and V0.
 load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 	wide_check(a, w, off, base)
+	pin_check(a)
 	if a.ram.base == "" {
 		mov_imm(a, .B, n)
 		call(a, slow, .A, .B)
@@ -954,6 +962,7 @@ load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 // is a host call of a shared routine: inline, the guard and page checks
 // made the code half again as large for no measured speed.
 store :: proc(a: ^Asm, w: Width, slow: string) {
+	pin_check(a)
 	if a.ram.base == "" {
 		call(a, slow, .A, .B)
 		return
@@ -969,6 +978,7 @@ store :: proc(a: ^Asm, w: Width, slow: string) {
 // one per register. Loses A, B, C and V0.
 store_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, zero := false, base := "") {
 	wide_check(a, w, off, base)
+	pin_check(a)
 	if a.ram.base == "" {
 		mov_imm(a, .B, n)
 		call(a, slow, .A, .B)
@@ -985,6 +995,7 @@ store_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, zero := false,
 // it. Loses A, B and C.
 unaligned :: proc(a: ^Asm, op: Unal, off, n: u32, slow: string) {
 	wide_check(a, .B64, off, "")
+	pin_check(a)
 	_, _, _, store := unal_shape(op)
 	if a.ram.base == "" {
 		mov_imm(a, .B, n)
@@ -992,6 +1003,13 @@ unaligned :: proc(a: ^Asm, op: Unal, off, n: u32, slow: string) {
 		return
 	}
 	call_label(a, slow_path(a, {slow = slow, store = store, w = .B64, off = off, n = n, unal = op}))
+}
+
+// No RAM access in a function with a pinned import, which holds the RAM
+// register.
+@(private = "file")
+pin_check :: proc(a: ^Asm) {
+	assert(a.pin == "", "native: a RAM access with a pinned import")
 }
 
 @(private = "file")

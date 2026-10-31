@@ -1136,6 +1136,11 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 	cached := a.cached
 	a.cached = nil
 	defer a.cached = cached
+	// The code makes no RAM access, so the vf import's address stays in
+	// RAM's register: the slot never changes, and the interpreter calls
+	// keep the register, callee-saved on every host.
+	a.pin = IMPORTS[u][.Vf]
+	defer a.pin = ""
 	// As emit_program: a pair reached only by falling through from one
 	// whose known lanes are not KNOWN_NONE gets no label, and the dispatch
 	// misses it, so the lanes carry into it. Without entries every pair

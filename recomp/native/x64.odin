@@ -2,7 +2,9 @@
 //
 // rbx holds the guest state address and r12 the context pointer; T and LD
 // live in r13d and r14d, which both ABIs keep across calls. With guest RAM,
-// r15 holds its address and rbp that of its page bytes. A, B and C are
+// r15 holds its address and rbp that of its page bytes; in a function with
+// a pinned import, r15 holds that import's address instead, which both
+// ABIs keep across calls too. A, B and C are
 // eax, r10d and r11d: none is an argument register in either ABI, so moving
 // arguments never overwrites one. rcx and rdx are temporaries inside one
 // operation. The cached state fields live in esi, edi, r8d and r9d, which
@@ -137,7 +139,7 @@ CC := [Cond]u8{
 
 x64_prologue :: proc(a: ^Asm, state: int) {
 	emit8(a, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56) // push rbx r12 r13 r14
-	if a.ram.base != "" {
+	if a.ram.base != "" || a.pin != "" {
 		emit8(a, 0x41, 0x57, 0x55) // push r15 rbp
 	}
 	if win_cache(a) {
@@ -147,7 +149,9 @@ x64_prologue :: proc(a: ^Asm, state: int) {
 	args := SYSV_ARGS if a.arch == .X64_SysV else WIN_ARGS
 	op_rr(a, true, 0x89, args[0], R12) // mov r12, ctx
 	op_imp(a, true, 0x8b, RBX, state) // mov rbx, [state]
-	if a.ram.base != "" {
+	if a.pin != "" {
+		op_imp(a, true, 0x8b, R15, imp(a, a.pin)) // mov r15, [pin]
+	} else if a.ram.base != "" {
 		op_imp(a, true, 0x8b, R15, imp(a, a.ram.base))
 		op_imp(a, true, 0x8b, RBP, imp(a, a.ram.pages))
 	}
@@ -158,7 +162,7 @@ x64_epilogue :: proc(a: ^Asm) {
 	if win_cache(a) {
 		emit8(a, 0x5f, 0x5e) // pop rdi rsi
 	}
-	if a.ram.base != "" {
+	if a.ram.base != "" || a.pin != "" {
 		emit8(a, 0x5d, 0x41, 0x5f) // pop rbp r15
 	}
 	emit8(a, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5b) // pop r14 r13 r12 rbx
@@ -285,11 +289,13 @@ x64_not :: proc(a: ^Asm, dst: Reg) {
 	op_rr(a, false, 0xf7, 2, X64_REG[dst])
 }
 
-// movdqu of the field at off: in the state, or, through rdx, from the
-// address in import base.
+// movdqu of the field at off: in the state, or from the address in import
+// base, through r15 when it is the pinned import, else through rdx.
 x64_vec_ldst :: proc(a: ^Asm, v: Vreg, off: u32, store: bool, base := "") {
 	reg: u8 = RBX
-	if base != "" {
+	if base != "" && base == a.pin {
+		reg = R15
+	} else if base != "" {
 		op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
 		reg = RDX
 	}
@@ -309,10 +315,15 @@ x64_vec_funnel8 :: proc(a: ^Asm, dst, lo, hi: u32, buf: int) {
 	x64_vec_ldst(a, .V0, dst, true)
 }
 
-// Through rdx = the import's address.
-x64_vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: int, store: bool) {
+// Through r15 when base is the pinned import, else rdx = the import's
+// address.
+x64_vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: string, store: bool) {
 	assert(X64_REG[.A] == 0 && u8(v) < 8, "native: vector index register")
-	op_imp(a, true, 0x8b, RDX, base) // mov rdx, [slot]
+	if base == a.pin {
+		emit8(a, 0xf3, 0x41, 0x0f, 0x7f if store else 0x6f, 0x04 | u8(v) << 3, 0x07) // movdqu [r15 + rax]
+		return
+	}
+	op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
 	emit8(a, 0xf3, 0x0f, 0x7f if store else 0x6f, 0x04 | u8(v) << 3, 0x02) // movdqu [rdx + rax]
 }
 
@@ -563,10 +574,14 @@ x64_vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 	op_rr(a, false, 0x0f50, X64_REG[dst], u8(v)) // movmskps
 }
 
-// Through rdx.
+// Through r15 when base is the pinned import, else rdx.
 x64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32, w: Width, signed: bool) {
 	assert(w == .B16 || w == .B32, "native: import access width")
-	op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
+	reg: u8 = R15
+	if base != a.pin {
+		op_imp(a, true, 0x8b, RDX, imp(a, base)) // mov rdx, [slot]
+		reg = RDX
+	}
 	op: u32
 	switch {
 	case store:
@@ -577,7 +592,7 @@ x64_imp_ldst :: proc(a: ^Asm, r: Reg, base: string, store: bool, off: u32, w: Wi
 	case:
 		op = 0x8b
 	}
-	op_state(a, false, op, X64_REG[r], off, RDX)
+	op_state(a, false, op, X64_REG[r], off, reg)
 }
 
 x64_vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
