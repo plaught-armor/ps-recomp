@@ -60,6 +60,13 @@ text_hash :: proc() -> u64 {
 	return xxhash.XXH3_64_default(mem.ram[cpu.text_lo:cpu.text_hi])
 }
 
+// The boot program's arguments: argv[0] the path SYSTEM.CNF names, which
+// the ROM's loader passes on as for any program it starts.
+exec_boot_args :: proc(path: string) {
+	args_clear()
+	args_put(path, "boot")
+}
+
 // The table on when the recompiled range holds the boot program's bytes,
 // else off: the second program's code, whatever of the first it keeps, runs
 // interpreted. Said each time it turns.

@@ -10,6 +10,7 @@ import "core:fmt"
 import cpu "cpu"
 import host "host"
 import iop "iop"
+import kernel "kernel"
 import mem "mem"
 
 // What boot needs.
@@ -69,5 +70,6 @@ boot :: proc(b: Boot) -> bool {
 		return false
 	}
 	cpu.state.r[29].d[0] = mem.RAM_SIZE - 16
+	kernel.exec_boot_args(name)
 	run(entry)
 }
