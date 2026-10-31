@@ -69,10 +69,12 @@ Entry_Slot :: struct {
 
 compat: struct {
 	on:            bool,
-	// The console ("ps1", "ps2"), its cycle counter and the cycles its
-	// interpreter charges an instruction, from the host.
+	// The console ("ps1", "ps2"), its cycle counter, the cycles of it its
+	// kernel skipped with every thread waiting (nil: none skipped) and the
+	// cycles its interpreter charges an instruction, from the host.
 	system:        string,
 	cycles:        ^u64,
+	idle:          ^u64,
 	cpi:           u64,
 	interp_insns:  u64,
 	entries:       [ENTRY_SLOTS]Entry_Slot,
@@ -87,12 +89,14 @@ compat: struct {
 	reported:      bool,
 }
 
-// Read COMPAT, for the host's console, its cycle counter and the cycles its
-// interpreter charges an instruction. Call from the host's init.
-compat_init :: proc(system: string, cycles: ^u64, cycles_per_insn: u64) {
+// Read COMPAT, for the host's console, its cycle counter, the cycles its
+// interpreter charges an instruction and the idle cycles its kernel skips
+// (nil for none). Call from the host's init.
+compat_init :: proc(system: string, cycles: ^u64, cycles_per_insn: u64, idle: ^u64 = nil) {
 	compat.on = env("COMPAT") == "1"
 	compat.system = system
 	compat.cycles = cycles
+	compat.idle = idle
 	compat.cpi = cycles_per_insn
 }
 
@@ -178,18 +182,21 @@ Compat_Name :: struct {
 
 // The compat line's fields. result: "frames" (FRAMES reached), "fatal" or
 // "exit" (any other exit); frames: the last vblank the host counted;
-// cycles_per_insn: what the interpreter charges an instruction, so
-// interp_insns * cycles_per_insn / cycles is about the share of the run
-// interpreted (the cycles also hold stalls and skipped idle loops, so it
-// errs low); shown: the vblanks that showed a picture; ram_still_since:
-// the vblank from which main RAM was the same at the end, else 0 (also when
-// not checked: no FRAMES, or the run ended before FRAMES/2); build: the
-// ps-recomp commit (COMMIT).
+// idle_cycles: the cycles skipped with every guest thread waiting (0 where
+// the kernel skips none), so idle_cycles / cycles is the share of the run
+// the game sat idle; cycles_per_insn: what the interpreter charges an
+// instruction, so interp_insns * cycles_per_insn / cycles is about the
+// share of the run interpreted (the cycles also hold stalls and skipped
+// idle loops, so it errs low); shown: the vblanks that showed a picture;
+// ram_still_since: the vblank from which main RAM was the same at the end,
+// else 0 (also when not checked: no FRAMES, or the run ended before
+// FRAMES/2); build: the ps-recomp commit (COMMIT).
 Compat_Line :: struct {
 	system:               string,
 	result:               string,
 	frames:               u64,
 	cycles:               u64,
+	idle_cycles:          u64,
 	cycles_per_insn:      u64,
 	interp_insns:         u64,
 	interp_entries:       []Compat_Pc,
@@ -223,6 +230,9 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 	}
 	if compat.cycles != nil {
 		l.cycles = compat.cycles^
+	}
+	if compat.idle != nil {
+		l.idle_cycles = compat.idle^
 	}
 	slots := make([dynamic]Entry_Slot, 0, 64, context.temp_allocator)
 	for s in compat.entries {

@@ -719,7 +719,8 @@ switch_to :: proc(next: ^Thread) {
 	reap()
 }
 
-// Guest cycles skipped while every thread waits, for STATS.
+// Guest cycles skipped while every thread waits, for STATS and the compat
+// line.
 idle_cycles: u64
 
 @(private)

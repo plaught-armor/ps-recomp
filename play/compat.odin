@@ -47,16 +47,19 @@ FATAL_MAX :: 200
 
 // compat.tsv's columns. result: ok (FRAMES reached), stalled (FRAMES
 // reached with no progress: no picture shown, or main RAM unchanged from
-// FRAMES/2), exit (the game ended), fatal, crash (no compat line), hang
-// (stopped at COMPAT_WAIT), spawn (no child); status: the child's exit
-// status (the signal of a crash on POSIX), 1 for stalled as for fatal
-// though the child exits 0, "" for hang and spawn; native: whether the
-// run had the disc's native code; interp_share: interp_insns *
-// cycles_per_insn / cycles, at most 1; entries: the hottest interpreter
-// entries, pc:count, comma separated; unimplemented: name=count, semicolon
-// separated; fatal: the fatal message, else why a run stalled, else a
-// crash's last output line ("" for a hang); when: UTC; shown: the vblanks
-// that showed a picture.
+// FRAMES/2), exit (the game ended), fatal,
+// crash (no compat line), hang (stopped at COMPAT_WAIT), spawn (no child);
+// status: the child's exit status (the signal of a crash on POSIX), 1 for
+// stalled as for fatal though the child exits 0, "" for hang and spawn;
+// native: whether the run had the disc's native code; interp_share:
+// interp_insns * cycles_per_insn / cycles, at most 1; entries: the hottest
+// interpreter entries, pc:count, comma separated; unimplemented:
+// name=count, semicolon separated; fatal: the fatal message, else why a run
+// stalled, else a crash's last output line ("" for a hang); when: UTC;
+// shown: the vblanks that showed a picture; idle_share: idle_cycles /
+// cycles, the share of the run with every guest thread waiting (0 for a
+// console whose kernel skips no idle time); information only, as a game
+// waiting on vsync on a light screen idles nearly all the time too.
 Column :: enum {
 	Id,
 	Serial,
@@ -79,6 +82,7 @@ Column :: enum {
 	Build,
 	When,
 	Shown,
+	Idle_Share,
 }
 
 COLUMNS :: [Column]string {
@@ -103,6 +107,7 @@ COLUMNS :: [Column]string {
 	.Build         = "build",
 	.When          = "when",
 	.Shown         = "shown",
+	.Idle_Share    = "idle_share",
 }
 
 Row :: [Column]string
@@ -353,12 +358,19 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 	case: row[.Result] = l.result
 	}
 	row[.Fatal] = l.fatal
-	if l.result == "frames" && (l.shown == 0 || l.ram_still_since != 0) {
-		row[.Result], row[.Status] = "stalled", "1"
-		if l.shown == 0 {
-			row[.Fatal] = "stalled: no picture shown"
-		} else {
-			row[.Fatal] = fmt.tprintf("stalled: main RAM unchanged f%d-f%d", l.ram_still_since, l.frames)
+	idle := l.cycles > 0 ? min(1, f64(l.idle_cycles) / f64(l.cycles)) : 0
+	if l.cycles > 0 {
+		row[.Idle_Share] = fmt.tprintf("%.6f", idle)
+	}
+	if l.result == "frames" {
+		stalled := true
+		switch {
+		case l.shown == 0: row[.Fatal] = "stalled: no picture shown"
+		case l.ram_still_since != 0: row[.Fatal] = fmt.tprintf("stalled: main RAM unchanged f%d-f%d", l.ram_still_since, l.frames)
+		case: stalled = false
+		}
+		if stalled {
+			row[.Result], row[.Status] = "stalled", "1"
 		}
 	}
 	if l.system != "" {

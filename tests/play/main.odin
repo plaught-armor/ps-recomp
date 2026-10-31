@@ -19,9 +19,11 @@
 //   stalled with the call stubbed, fatal) and skips the file, keeping the
 //   row of a compat.tsv from before the shown column; a disc of each that
 //   turns the display on and counts in RAM is ok, and a PS1 one that turns
-//   it on and loops is stalled with main RAM unchanged. The looping PS1
-//   disc run again with a vblank count it cannot reach in COMPAT_WAIT is a
-//   hang, and once more to FRAMES stalled, each time in place. Three PS1 discs load a second
+//   it on and loops is stalled with main RAM unchanged, as is a PS2 one
+//   that turns it on and sleeps its only thread (the idle_share of every
+//   PS2 row past 0.95 only there). The looping PS1 disc run again
+//   with a vblank count it cannot reach in COMPAT_WAIT is a hang, and once
+//   more to FRAMES stalled, each time in place. Three PS1 discs load a second
 //   executable no native code covers: LoadExec of it, over the boot
 //   executable, checks its argc, stack and BSS; LoadExec of a missing file
 //   runs the boot executable again; Load and Exec of it return to the boot
@@ -40,6 +42,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "ps:core"
 import "ps:core/disc"
@@ -321,6 +324,10 @@ PS2_CNF :: "BOOT2 = cdrom0:\\DATA\\SLUS_123.45;1\r\nVER = 1.00\r\nVMODE = NTSC\r
 // DISPLAY 0 is 1x1); then the word at 0x00300000 counts up as PS1_COUNT's.
 @(private = "file")
 PS2_SHOW := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x3c0a0030, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0}
+// The display on as PS2_SHOW turns it on, then li v1, 0x32; syscall; b .;
+// nop: SleepThread, and with no thread left to run the kernel idles.
+@(private = "file")
+PS2_SLEEP := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x24030032, 0x0000000c, 0x1000ffff, 0}
 
 // A PS2 disc with SYSTEM.CNF naming DATA/SLUS_123.45, the ELF of code.
 @(private = "file")
@@ -534,7 +541,7 @@ test_compat :: proc() {
 		unimpl: string,
 		entry:  string, // in the row's entries, with interp_insns > 0
 		log:    string, // in compat.log
-		fatal:  string, // the fatal column of a stalled row
+		fatal:  string, // of a stalled row
 	}
 	fixtures := [?]Fixture {
 		{"loop.iso", cnf_disc(), "ps1", "stalled", "1", "", "", "", "stalled: no picture shown"},
@@ -560,6 +567,7 @@ test_compat :: proc() {
 		{"still.iso", cnf_disc("", ..PS1_STILL[:]), "ps1", "stalled", "1", "", "", "", fmt.tprintf("stalled: main RAM unchanged f%d-f%d", FRAMES / 2, FRAMES)},
 		// PMODE 1 turns read circuit 1 on, then a word in RAM counts up.
 		{"ps2_show.iso", ps2_disc(..PS2_SHOW[:]), "ps2", "ok", "0", "", "", "", ""},
+		{"ps2_sleep.iso", ps2_disc(..PS2_SLEEP[:]), "ps2", "stalled", "1", "", "", "", fmt.tprintf("stalled: main RAM unchanged f%d-f%d", FRAMES / 2, FRAMES)},
 	}
 	// ps2_stub needs a syscall the HLE lacks that stops a run outside
 	// COMPAT; one the kernel implements stubs nothing.
@@ -582,7 +590,7 @@ test_compat :: proc() {
 
 	// A compat.tsv from before the shown column keeps its rows.
 	cols := play.COLUMNS
-	old := slice.enumerated_array(&cols)[:len(play.Column) - 1]
+	old := slice.enumerated_array(&cols)[:int(play.Column.Shown)]
 	data, _ := core.data_dir()
 	tsv, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
 	old_row := strings.repeat("\tx", len(old) - 1, context.temp_allocator)
@@ -595,7 +603,7 @@ test_compat :: proc() {
 	out, errs, ok := run_compat(name, {dir, fmt.tprint(FRAMES)})
 	rows := compat_rows(name)
 	if row, found := compat_row(rows, "OLD"); found {
-		check(name, row[.When] == "x" && row[.Shown] == "", fmt.tprintf("old row: %v", row))
+		check(name, row[.When] == "x" && row[.Shown] == "" && row[.Idle_Share] == "", fmt.tprintf("old row: %v", row))
 	} else {
 		check(name, false, "the old compat.tsv's row is gone")
 	}
@@ -626,6 +634,10 @@ test_compat :: proc() {
 			check(name, (row[.Shown] == "0") == (f.fatal == "stalled: no picture shown"), what)
 		case:
 			check(name, row[.Fatal] != "", what)
+		}
+		if f.result != "fatal" {
+			idle, has_idle := strconv.parse_f64(row[.Idle_Share])
+			check(name, has_idle && (idle > 0.95) == (f.file == "ps2_sleep.iso") && (f.system == "ps2" || idle == 0), what)
 		}
 		if ddir, has := core.disc_dir(ids[k], context.temp_allocator); has {
 			log, err := os.read_entire_file(core.disc_path(ddir, .Compat_Log, context.temp_allocator), context.temp_allocator)
