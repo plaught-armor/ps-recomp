@@ -1,11 +1,12 @@
 // The program switches: _ExecPS2 (syscall 7) and _LoadExecPS2 (6), verified
 // against the SCPH-90001 retail kernel. Both end every other thread, the
-// semaphores, the interrupt handlers and the alarms, and run the new program
-// on the current thread with the caller's registers (v0 = its entry); its
-// crt0 picks up its arguments through SetupThread. LoadExecPS2 also clears
-// user memory and loads the ELF from the disc, which retail leaves to the
-// ROM's loader; the program gets the arguments that loader passes on. A new
-// program over the recompiled code turns the function table off (text_check).
+// semaphores, the interrupt handlers and the alarms, zero the scratchpad,
+// and run the new program on the current thread with the caller's registers
+// (v0 = its entry); its crt0 picks up its arguments through SetupThread.
+// LoadExecPS2 also clears user memory and loads the ELF from the disc, which
+// retail leaves to the ROM's loader; the program gets the arguments that
+// loader passes on. A new program over the recompiled code turns the function
+// table off (text_check).
 package ps2_kernel
 
 import "base:intrinsics"
@@ -129,9 +130,9 @@ args_write :: proc(args: u32) {
 
 // What both switches end: every thread but the current one, which drops to
 // priority 0 with no wakeups, the semaphores, the INTC and DMAC handlers and
-// the alarms. Retail also sets GS, the timers and the scratchpad up again;
-// the program's own libraries set GS and the timers, and whether the
-// scratchpad is cleared is not traced, so it is left.
+// the alarms; and it zeroes the scratchpad, all of it, as retail's restart
+// does for both. Retail also sets GS, the timers and the FPU up again; the
+// program's own libraries do that.
 @(private = "file")
 exec_reset :: proc(what: string) {
 	if cpu.in_interrupt {cpu.fatal("%s from an interrupt handler", what)}
@@ -156,6 +157,7 @@ exec_reset :: proc(what: string) {
 	k.next_handler = 1
 	k.next_alarm = 1
 	k.heap_end = 0
+	mem.spr = {}
 	update_next_event()
 }
 

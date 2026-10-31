@@ -4,11 +4,12 @@
 // was the last runnable thread, and the kernel idles on its coroutine until
 // an alarm wakes another. _print formats its arguments from registers. Last,
 // a program patches one word of its own text and ExecPS2s into itself: every
-// other thread, semaphore, handler and alarm is gone, the function table is
-// off, and SetupThread hands it the arguments; with the word back, ExecPS2
-// runs the native function again. Before that, LOADFILE's loadelf (an IOP
-// RPC, the EE's SifLoadElf) loads ELFs from a disc directory: the segments'
-// file bytes or one section, and nothing for a bad ELF or one out of range.
+// other thread, semaphore, handler and alarm is gone, the scratchpad is
+// zeroed, the function table is off, and SetupThread hands it the arguments;
+// with the word back, ExecPS2 runs the native function again. Before that,
+// LOADFILE's loadelf (an IOP RPC, the EE's SifLoadElf) loads ELFs from a disc
+// directory: the segments' file bytes or one section, and nothing for a bad
+// ELF or one out of range.
 package main
 
 import "core:fmt"
@@ -63,8 +64,9 @@ alarm :: proc() {
 }
 
 // Native, the first run: leave a thread, a semaphore, an alarm and a handler
-// behind, change a word of the text and ExecPS2 into itself with two
-// arguments. The second run is native again once the word is back.
+// behind and the scratchpad full, change a word of the text and ExecPS2 into
+// itself with two arguments. The second run is native again once the word is
+// back.
 exec_prog :: proc() {
 	execs += 1
 	if execs == 3 {
@@ -87,6 +89,7 @@ exec_prog :: proc() {
 	mem.wr32(ARGV, ARGV + 0x40)
 	mem.wr32(ARGV + 4, ARGV + 0x42)
 	copy(mem.ram_slice(ARGV + 0x40, 5), "a\x00bc\x00")
+	for &b, i in mem.spr {b = u8(i) | 1}
 	mem.wr32(PATCH, 1)
 	sys(7, EXEC, 0, 2, ARGV)
 	fail("fail: ExecPS2 returned")
@@ -105,6 +108,7 @@ exec_interp :: proc(addr: u32) {
 	for s in k.semas {if s != nil {fail("fail: semaphore %d left", s.id)}}
 	if len(k.intc) != 0 || len(k.alarms) != 0 {fail("fail: %d handlers, %d alarms left", len(k.intc), len(k.alarms))}
 	if k.exec.dead_co != nil {fail("fail: the old program's coroutine not freed")}
+	for x, i in mem.spr {if x != 0 {fail("fail: scratchpad byte %x left %x", i, x)}}
 	ARGS :: PARAM + 0x400
 	sys(0x3c, 0, STACK, 0x1000, ARGS) // SetupThread
 	if mem.rd32(ARGS) != 2 {fail("fail: argc %d", mem.rd32(ARGS))}

@@ -28,9 +28,9 @@
 //   executable with its registers. The second executable's entry is in the
 //   row's entries. Three PS2 discs switch programs: LoadExecPS2 of an ELF
 //   over the boot text, which runs interpreted and checks its argc and the
-//   memory cleared; LoadExecPS2 of a missing file, fatal; and a program that
-//   changes a word of its recompiled text and ExecPS2s into itself, which
-//   turns the function table off.
+//   memory and scratchpad cleared; LoadExecPS2 of a missing file, fatal; and
+//   a program that changes a word of its recompiled text and ExecPS2s into
+//   itself, which turns the function table off.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -341,25 +341,27 @@ ps2_exec_disc :: proc(boot: Elf, second: Elf = {}) -> []u8 {
 	)
 }
 
-// LoadExecPS2(name, 0, 0) after a 1 in the word at 0x00300000. SECOND.ELF
-// loads over the boot text and starts at 0x00100040, which differs from the
-// recompiled code; through SetupThread it checks argc 1 (the file), and the
-// word cleared, then loops. Any check failing, or LoadExecPS2 returning, runs
-// an instruction the EE lacks.
+// LoadExecPS2(name, 0, 0) after a 1 in the word at 0x00300000 and in the
+// scratchpad's last word. SECOND.ELF loads over the boot text and starts at
+// 0x00100040, which differs from the recompiled code; through SetupThread it
+// checks argc 1 (the file), and both words cleared, then loops. Any check
+// failing, or LoadExecPS2 returning, runs an instruction the EE lacks.
 @(private = "file")
 ps2_loadexec_disc :: proc(name := "cdrom0:\\DATA\\SECOND.ELF;1") -> []u8 {
 	path := la(A0, 0x00100000 + ELF_DATA)
 	boot := [?]u32 {
 		lui(T0, 0x0030), li(T1, 1), sw(T1, 0, T0), // 0
-		path[0], path[1], li(A1, 0), li(A2, 0), li(V1, 6), SYSCALL, // 3
-		EE_BAD, // 9
+		lui(T0, 0x7000), sw(T1, 0x3ffc, T0), // 3
+		path[0], path[1], li(A1, 0), li(A2, 0), li(V1, 6), SYSCALL, // 5
+		EE_BAD, // 11
 	}
 	second := [?]u32 {
 		lui(A3, 0x0020), li(A1, 0xffff), li(A2, 0), li(A0, 0), li(V1, 0x3c), SYSCALL, // 0: SetupThread(0, -1, 0, args)
-		lw(T0, 0, A3), li(T1, 1), bne(T0, T1, 7), NOP, // 6
-		lui(T2, 0x0030), lw(T2, 0, T2), bne(T2, 0, 3), NOP, // 10
-		LOOP, NOP, // 14
-		EE_BAD, // 16
+		lw(T0, 0, A3), li(T1, 1), bne(T0, T1, 11), NOP, // 6
+		lui(T2, 0x0030), lw(T2, 0, T2), bne(T2, 0, 7), NOP, // 10
+		lui(T2, 0x7000), lw(T2, 0x3ffc, T2), bne(T2, 0, 3), NOP, // 14
+		LOOP, NOP, // 18
+		EE_BAD, // 20
 	}
 	return ps2_exec_disc(
 		{text = 0x00100000, code = boot[:], data = strings.concatenate({name, "\x00"}, context.temp_allocator)},
