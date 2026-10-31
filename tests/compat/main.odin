@@ -51,7 +51,7 @@ main :: proc() {
 	}
 	if l, ok := run("psx", true, 0); ok {
 		check("psx", l.system == "ps1" && l.result == "frames" && l.frames == FRAMES, "result")
-		check("psx", l.fatal == "" && l.cycles > 0 && l.build == core.COMMIT, "fields")
+		check("psx", l.fatal == "" && l.cycles > 0 && l.cycles_per_insn == 2 && l.build == core.COMMIT, "fields")
 		check("psx", len(l.unimplemented) == 1 && l.unimplemented[0] == {"BIOS A(ffh)", 1}, "unimplemented")
 		check("psx", len(l.interp_entries) == 1 && l.interp_entries[0] == {"80001000", 2}, "entries")
 		check("psx", l.interp_insns >= 4 && l.interp_entries_other == 0, "interpreter work")
@@ -61,7 +61,7 @@ main :: proc() {
 	}
 	run("psx_off", false, 1)
 	if l, ok := run("ps2", true, 0); ok {
-		check("ps2", l.system == "ps2" && l.result == "frames" && l.frames == FRAMES, "result")
+		check("ps2", l.system == "ps2" && l.result == "frames" && l.frames == FRAMES && l.cycles_per_insn == 1, "result")
 		check("ps2", len(l.unimplemented) == 1 && l.unimplemented[0] == {"syscall 1", 1}, "unimplemented")
 		check("ps2", len(l.interp_entries) == 1 && l.interp_entries[0] == {"00100000", 2}, "entries")
 		check("ps2", l.interp_insns == 4 && l.interp_entries_other == 0, "interpreter work")

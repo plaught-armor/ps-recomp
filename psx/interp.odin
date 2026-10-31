@@ -49,10 +49,10 @@ interp_run :: proc(start: u32) {
 	}
 }
 
-// Average R3000A cost per instruction including memory stalls; matches the
-// recompiler's cycles_per_insn option. Native rewrites use it for the cycles
-// they charge under MAPCHECK and old replays (psx.charge_native).
-CYCLES_PER_INSN :: 2
+// cpu.CYCLES_PER_INSN, where the host reads it too. Native rewrites use it
+// for the cycles they charge under MAPCHECK and old replays
+// (psx.charge_native).
+CYCLES_PER_INSN :: cpu.CYCLES_PER_INSN
 
 // Execute the delay slot at st.pc, then follow a taken branch to target.
 @(private)

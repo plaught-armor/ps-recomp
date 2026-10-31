@@ -64,7 +64,7 @@ platform_init :: proc(title: cstring) -> bool {
 	// HEADLESS=1: no window, no 60 Hz pacing, no controllers. FRAMES=<n>:
 	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	if !core.headless_init() {return false}
-	core.compat_init("ps2", &cpu.state.cycles)
+	core.compat_init("ps2", &cpu.state.cycles, cpu.CYCLES_PER_INSN)
 	stats = core.env("STATS") == "1"
 	// PACE=<hz> paces a headless run too (netplay tests; a different
 	// rate on each peer stands in for clock drift).

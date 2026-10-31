@@ -112,6 +112,10 @@ register_overlay_funcs :: proc(entries: []Ovl_Entry) {
 // for the PS1 camera.
 host_camera: bool
 
+// Average R3000A cost per instruction including memory stalls, what the
+// interpreter charges; matches the recompiler's cycles_per_insn option.
+CYCLES_PER_INSN :: 2
+
 // Frames presented (one per emulated vblank) since power-on.
 presents: u64
 

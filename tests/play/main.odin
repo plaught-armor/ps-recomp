@@ -10,7 +10,13 @@
 //   load; play says so, removes its key and exits with status 1;
 // - interpreted: a converter that cannot write its output (a directory in
 //   the way) fails; play says it has no native code, stores nothing, and
-//   runs the game to FRAMES interpreted.
+//   runs the game to FRAMES interpreted;
+// - compat: play --compat on a directory of discs (one that loops, one
+//   that makes a BIOS call the HLE lacks, one that starts on a reserved
+//   instruction) and a file that is not a disc gives one compat.tsv row
+//   per disc (ok, ok with the call stubbed, fatal) and skips the file; the
+//   looping disc run again with a vblank count it cannot reach in
+//   COMPAT_WAIT is a hang, and once more to FRAMES ok, each time in place.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -19,6 +25,7 @@ import "core:encoding/endian"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "ps:core"
 import "ps:core/disc"
@@ -65,6 +72,7 @@ main :: proc() {
 	test_native("native", cnf_disc())
 	test_bad_blob(test_native("psx_exe", exe_disc()))
 	test_interpreted()
+	test_compat()
 	if os.remove_all(tmp) != nil {
 		check("", false, fmt.tprintf("cannot remove %s", tmp))
 	}
@@ -74,9 +82,10 @@ main :: proc() {
 	fmt.println("ok play")
 }
 
-// A PS-X EXE: header, then at 0x80010000 `b .` and its delay slot.
+// A PS-X EXE: header, then at 0x80010000 `b .` and its delay slot, or
+// the code given.
 @(private = "file")
-exe :: proc() -> []u8 {
+exe :: proc(code: ..u32) -> []u8 {
 	e := make([]u8, 0x1000, context.temp_allocator)
 	copy(e, "PS-X EXE")
 	endian.put_u32(e[0x10:], .Little, 0x80010000) // pc
@@ -84,14 +93,17 @@ exe :: proc() -> []u8 {
 	endian.put_u32(e[0x1c:], .Little, 0x800) // text size
 	endian.put_u32(e[0x30:], .Little, 0x801ffff0) // sp
 	endian.put_u32(e[0x800:], .Little, 0x1000ffff)
+	for w, k in code {
+		endian.put_u32(e[0x800 + 4 * k:], .Little, w)
+	}
 	return e
 }
 
 // A disc with SYSTEM.CNF naming DATA/PSX.EXE; extra goes in SYSTEM.CNF.
 @(private = "file")
-cnf_disc :: proc(extra := "") -> []u8 {
+cnf_disc :: proc(extra := "", code: ..u32) -> []u8 {
 	cnf := strings.concatenate({"BOOT = cdrom:\\DATA\\PSX.EXE;1\n", extra}, context.temp_allocator)
-	return discimg.make_iso(cnf, sub_name = "PSX.EXE;1", sub = string(exe()))
+	return discimg.make_iso(cnf, sub_name = "PSX.EXE;1", sub = string(exe(..code)))
 }
 
 // A disc with PSX.EXE in the root, where make_iso puts SYSTEM.CNF, and no
@@ -219,4 +231,171 @@ run :: proc(name, path: string, status := 0) -> (errs: string, ok: bool) {
 		return errs, false
 	}
 	return errs, true
+}
+
+// play --compat on a directory, then twice on its looping disc.
+@(private = "file")
+test_compat :: proc() {
+	name := "compat"
+	dir, _ := filepath.join({tmp, "compat"}, context.temp_allocator)
+	if os.make_directory(dir) != nil {
+		check(name, false, "cannot make the disc directory")
+		return
+	}
+	Fixture :: struct {
+		file:   string,
+		img:    []u8,
+		result: string,
+		status: string,
+		unimpl: string,
+	}
+	fixtures := [?]Fixture {
+		{"loop.iso", cnf_disc(), "ok", "0", ""},
+		// li t1, 0xff; jal 0xa0; nop; b .; nop: BIOS A(ffh), then loop.
+		{"stub.iso", cnf_disc("", 0x240900ff, 0x0c000028, 0, 0x1000ffff, 0), "ok", "0", "BIOS A(ffh)=1"},
+		// Opcode 0x3f is reserved.
+		{"fatal.iso", cnf_disc("", 0xfc000000), "fatal", "1", ""},
+	}
+	ids: [len(fixtures)]string
+	for f, k in fixtures {
+		path, _ := filepath.join({dir, f.file}, context.temp_allocator)
+		if os.write_entire_file(path, f.img) != nil {
+			check(name, false, fmt.tprintf("cannot write %s", path))
+			return
+		}
+		ids[k] = disc_id(name, path)
+	}
+	loop, _ := filepath.join({dir, "loop.iso"}, context.temp_allocator)
+	junk, _ := filepath.join({dir, "notadisc.bin"}, context.temp_allocator)
+	if os.write_entire_file(junk, make([]u8, 64 * 1024, context.temp_allocator)) != nil {
+		check(name, false, "cannot write the file that is not a disc")
+		return
+	}
+
+	out, errs, ok := run_compat(name, {dir, fmt.tprint(FRAMES)})
+	rows := compat_rows(name)
+	check(name, ok, fmt.tprintf("status, stdout:\n%s\nstderr:\n%s", out, errs))
+	check(name, strings.count(out, "\n") == len(fixtures), fmt.tprintf("stdout:\n%s", out))
+	check(name, len(rows) == len(fixtures), fmt.tprintf("%d rows, want %d", len(rows), len(fixtures)))
+	first_when: string
+	for f, k in fixtures {
+		row, found := compat_row(rows, ids[k])
+		if !found {
+			check(name, false, fmt.tprintf("no row for %s", f.file))
+			continue
+		}
+		what := fmt.tprintf("%s: %v", f.file, row)
+		check(name, row[.Result] == f.result && row[.Status] == f.status, what)
+		check(name, row[.Unimplemented] == f.unimpl, what)
+		check(name, row[.System] == "ps1" && row[.Frames_Wanted] == fmt.tprint(FRAMES), what)
+		check(name, row[.Native] == "yes" && row[.Build] == "test", what)
+		if f.result == "ok" {
+			check(name, row[.Frames] == fmt.tprint(FRAMES), what)
+		} else {
+			check(name, row[.Fatal] != "", what)
+		}
+		if ddir, has := core.disc_dir(ids[k], context.temp_allocator); has {
+			log, err := os.read_entire_file(core.disc_path(ddir, .Compat_Log, context.temp_allocator), context.temp_allocator)
+			check(name, err == nil && len(log) > 0, fmt.tprintf("%s: the child's output is not in compat.log (%v)", f.file, err))
+		}
+		if k == 0 {
+			first_when = row[.When]
+		}
+	}
+
+	os.set_env(core.env_name("COMPAT_WAIT"), "2")
+	out, errs, ok = run_compat(name, {loop, "1000000000"})
+	os.unset_env(core.env_name("COMPAT_WAIT"))
+	rows = compat_rows(name)
+	check(name, ok && len(rows) == len(fixtures), fmt.tprintf("hang run: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
+	if row, found := compat_row(rows, ids[0]); found {
+		check(name, row[.Result] == "hang" && row[.Status] == "", fmt.tprintf("hang: %v", row))
+	} else {
+		check(name, false, "hang: no row")
+	}
+
+	out, errs, ok = run_compat(name, {loop, fmt.tprint(FRAMES)})
+	rows = compat_rows(name)
+	check(name, ok && len(rows) == len(fixtures), fmt.tprintf("rerun: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
+	if row, found := compat_row(rows, ids[0]); found {
+		check(name, row[.Result] == "ok" && row[.When] != first_when, fmt.tprintf("rerun: %v", row))
+	} else {
+		check(name, false, "rerun: no row")
+	}
+}
+
+// The disc's id; "" on a failure.
+@(private = "file")
+disc_id :: proc(name, path: string) -> string {
+	d, ok := disc.open(path, context.temp_allocator)
+	if !ok {
+		check(name, false, fmt.tprintf("%s does not open", path))
+		return ""
+	}
+	defer disc.close(&d)
+	id, has_id := disc.id(&d, context.temp_allocator)
+	check(name, has_id, fmt.tprintf("%s has no id", path))
+	return id
+}
+
+// Run play --compat with args: stdout, stderr, and whether it ended with
+// status 0.
+@(private = "file")
+run_compat :: proc(name: string, args: []string) -> (out, errs: string, ok: bool) {
+	self, err := os.get_executable_path(context.temp_allocator)
+	if err != nil {
+		check(name, false, fmt.tprintf("cannot run play: %v", err))
+		return
+	}
+	command := make([dynamic]string, context.temp_allocator)
+	append(&command, self, "--compat")
+	append(&command, ..args)
+	state: os.Process_State
+	o, e: []u8
+	state, o, e, err = os.process_exec({command = command[:]}, context.temp_allocator)
+	if err != nil {
+		check(name, false, fmt.tprintf("cannot run play: %v", err))
+		return
+	}
+	return string(o), string(e), state.exited && state.exit_code == 0
+}
+
+// compat.tsv's rows, after checking its header.
+@(private = "file")
+compat_rows :: proc(name: string) -> []play.Row {
+	data, _ := core.data_dir()
+	path, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
+	text, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil {
+		check(name, false, fmt.tprintf("cannot read %s: %v", path, err))
+		return nil
+	}
+	cols := play.COLUMNS
+	rest := string(text)
+	header, _ := strings.split_lines_iterator(&rest)
+	check(name, header == strings.join(slice.enumerated_array(&cols), "\t", context.temp_allocator), fmt.tprintf("header %q", header))
+	rows := make([dynamic]play.Row, context.temp_allocator)
+	for line in strings.split_lines_iterator(&rest) {
+		fields := strings.split(line, "\t", context.temp_allocator)
+		if len(fields) != len(play.Column) {
+			check(name, false, fmt.tprintf("row %q", line))
+			continue
+		}
+		row: play.Row
+		for &f, c in row {
+			f = fields[int(c)]
+		}
+		append(&rows, row)
+	}
+	return rows[:]
+}
+
+@(private = "file")
+compat_row :: proc(rows: []play.Row, id: string) -> (play.Row, bool) {
+	for r in rows {
+		if r[.Id] == id {
+			return r, true
+		}
+	}
+	return {}, false
 }

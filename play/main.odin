@@ -1,6 +1,7 @@
 // play: run a game from its disc image.
 //
 // Usage: play <disc image>
+//        play --compat <disc image | directory> [frames]
 //
 // The disc image (a .cue sheet, or a single-track .bin or .iso) is all it
 // needs. The first run of a disc compiles the executable SYSTEM.CNF names to
@@ -10,6 +11,9 @@
 // use it. A dev build (no COMMIT) converts every time. When the conversion
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
+//
+// --compat runs each disc headless to a vblank count as a compatibility
+// run and keeps a row per disc in compat.tsv under DATA (compat.odin).
 package play
 
 import "core:fmt"
@@ -31,10 +35,13 @@ run :: proc(args: []string) -> int {
 	switch {
 	case len(args) == 4 && args[1] == "--convert":
 		return convert(args[2], args[3])
+	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
+		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
 		return play(args[1])
 	}
 	fmt.eprintln("usage: play <disc image>")
+	fmt.eprintln("       play --compat <disc image | directory> [frames]")
 	return 2
 }
 
@@ -50,25 +57,36 @@ native_failed :: proc() {
 	fmt.eprintln("play: the stored native code would not load; it is converted again next run")
 }
 
-// Run the game on the disc image.
-@(private = "file")
-play :: proc(image: string) -> int {
+// The disc image's id and SYSTEM.CNF, and its PSX.EXE when it has no
+// SYSTEM.CNF. False, after a message, when it is not a disc image or has no
+// executable to run.
+@(private)
+identify :: proc(image: string) -> (id: string, cnf: disc.System_Cnf, exe: []u8, ok: bool) {
 	d, opened := disc.open(image)
 	if !opened {
 		fmt.eprintln("play:", image, "is not a disc image")
-		return 1
+		return
 	}
-	id, has_id := disc.id(&d)
-	cnf, has_cnf := disc.system_cnf(&d)
+	defer disc.close(&d)
+	id, ok = disc.id(&d)
+	has_cnf: bool
+	cnf, has_cnf = disc.system_cnf(&d)
 	// With no SYSTEM.CNF a PS1 disc boots PSX.EXE, which psx.run does not
 	// look for.
-	exe: []u8
-	if has_id && !has_cnf {
-		exe, has_id = disc.read_file(&d, "PSX.EXE")
+	if ok && !has_cnf {
+		exe, ok = disc.read_file(&d, "PSX.EXE")
 	}
-	disc.close(&d)
-	if !has_id {
+	if !ok {
 		fmt.eprintln("play:", image, "has no executable to run")
+	}
+	return
+}
+
+// Run the game on the disc image.
+@(private = "file")
+play :: proc(image: string) -> int {
+	id, cnf, exe, has_id := identify(image)
+	if !has_id {
 		return 1
 	}
 	dir, has_dir := core.disc_dir(id)

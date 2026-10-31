@@ -6,6 +6,7 @@
 //     native.<arch>.bin    native code compiled for it (recomp/native)
 //     native.<arch>.key    the blob format and build that wrote it
 //     cards/  saves/  settings.tsv  compat.log  learn/
+//     press.txt            a PRESS script for compatibility runs
 //
 // <data> is the DATA setting, else SDL's per-user directory for ps-recomp
 // (~/.local/share/ps-recomp, ~/Library/Application Support/ps-recomp,
@@ -32,6 +33,7 @@ Disc_File :: enum {
 	Settings,
 	Compat_Log,
 	Learn,
+	Press,
 }
 
 DISC_FILES :: [Disc_File]string {
@@ -43,6 +45,7 @@ DISC_FILES :: [Disc_File]string {
 	.Settings   = "settings.tsv",
 	.Compat_Log = "compat.log",
 	.Learn      = "learn",
+	.Press      = "press.txt",
 }
 
 // The data directory, created if missing. False, after a message, when it

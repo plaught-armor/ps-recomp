@@ -51,6 +51,10 @@ Cpu :: struct {
 state: Cpu
 next_event: u64
 
+// What the interpreter charges an instruction; matches the recompiler's
+// cycles_per_insn option.
+CYCLES_PER_INSN :: 1
+
 EE_CLOCK :: 294_912_000
 CYCLES_PER_FRAME :: EE_CLOCK * 1001 / 60000 // NTSC 59.94 Hz
 

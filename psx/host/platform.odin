@@ -226,7 +226,7 @@ platform_init :: proc(title: cstring) -> bool {
 	// HEADLESS=1: no window, controllers, audio device or pacing. FRAMES=<n>:
 	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	core.headless_init() or_return
-	core.compat_init("ps1", &cpu.state.cycles)
+	core.compat_init("ps1", &cpu.state.cycles, cpu.CYCLES_PER_INSN)
 	subsystems := sdl.InitFlags{.VIDEO, .EVENTS, .GAMECONTROLLER}
 	if core.headless {subsystems -= {.GAMECONTROLLER}}
 	if sdl.Init(subsystems) != 0 {

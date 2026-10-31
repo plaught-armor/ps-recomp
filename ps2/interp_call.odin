@@ -43,7 +43,7 @@ branch_taken :: proc(i: r5900.Insn) -> bool {
 // stops on it.
 @(private = "file")
 delay_slot :: proc(pc: u32) {
-	cpu.state.cycles += 1
+	cpu.state.cycles += cpu.CYCLES_PER_INSN
 	i := r5900.decode(pc, mem.rd32(pc))
 	if i.kind == .Bad {cpu.bad_insn(pc, i.w)}
 	exec_insn(i)
@@ -81,7 +81,7 @@ interp_call :: proc(entry: u32) {
 	pc := entry
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
-		c.cycles += 1
+		c.cycles += cpu.CYCLES_PER_INSN
 		ret := pc + 8
 		switch i.kind {
 		case .Alu:
