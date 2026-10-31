@@ -446,6 +446,7 @@ irx_name :: proc(a: u32) -> string {
 FILEIO_REPLY :: 0x80000011
 ENOENT :: 2
 EBADF :: 9
+EINVAL :: 22
 
 @(private)
 fileio: struct {
@@ -474,29 +475,20 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0: // OPEN {hdr, flags, mode, name[0x400], slot}
 		result = fileio_open(string(cstring(&buf[0x14])), w[3])
 	case 1: // CLOSE {hdr, fd, slot}
-		if f := fileio_file(w[3]); f != nil {
-			f^ = {} // the host file stays open: see disc_open
-		} else {result = -EBADF}
+		result = fileio_close(w[3])
 	case 2: // READ {hdr, fd, buffer, size, slot}
 		f := fileio_file(w[3])
 		if f == nil {result = -EBADF; break}
-		n := i64(min(w[5], u32(max(f.size - f.pos, 0))))
 		// Through a host buffer: on macOS, rollback keeps RAM write-protected
 		// and a kernel write into it fails (rollback_darwin.odin).
-		tmp := make([]u8, n, context.temp_allocator)
-		got := disc_file_read(f.file, f.pos, tmp)
+		tmp := make([]u8, fileio_left(f, w[5]), context.temp_allocator)
+		got := fileio_read(f, tmp)
 		copy(mem.ram_slice(w[4], u32(got)), tmp[:got])
-		f.pos += i64(got)
 		result = i32(got)
 	case 3: // WRITE {hdr, fd, buffer, size, unaligned size, data...}: read-only disc
 		result = -EBADF
 	case 4: // SEEK {hdr, fd, offset, whence, slot}
-		f := fileio_file(w[3])
-		if f == nil {result = -EBADF; break}
-		base := [3]i64{0, f.pos, f.size}
-		if w[5] > 2 {result = -22; break}
-		f.pos = clamp(base[w[5]] + i64(i32(w[4])), 0, f.size)
-		result = i32(f.pos)
+		result = fileio_seek(w[3], i32(w[4]), w[5])
 	case:
 		return false
 	}
@@ -526,6 +518,42 @@ fileio_reset :: proc() {
 fileio_file :: proc(fd: u32) -> ^Iop_File {
 	if int(fd) >= len(fileio.files) || fileio.files[fd].f == nil {return nil}
 	return &fileio.files[fd]
+}
+
+// Closes fd: 0, or -EBADF when no file has it.
+@(private)
+fileio_close :: proc(fd: u32) -> i32 {
+	f := fileio_file(fd)
+	if f == nil {return -EBADF}
+	f^ = {} // the host file stays open: see disc_open
+	return 0
+}
+
+// How many of n bytes a read of f gets: what is left past its position.
+@(private)
+fileio_left :: proc(f: ^Iop_File, n: u32) -> i64 {
+	return i64(min(n, u32(max(f.size - f.pos, 0))))
+}
+
+// Reads len(buf) bytes of f from its position, which moves past them; the
+// count read.
+@(private)
+fileio_read :: proc(f: ^Iop_File, buf: []u8) -> int {
+	got := disc_file_read(f.file, f.pos, buf)
+	f.pos += i64(got)
+	return got
+}
+
+// Moves fd's position to offset from whence (0 start, 1 position, 2 end),
+// clamped to the file: the new position, -EBADF or -EINVAL.
+@(private)
+fileio_seek :: proc(fd: u32, offset: i32, whence: u32) -> i32 {
+	f := fileio_file(fd)
+	if f == nil {return -EBADF}
+	base := [3]i64{0, f.pos, f.size}
+	if whence > 2 {return -EINVAL}
+	f.pos = clamp(base[whence] + i64(offset), 0, f.size)
+	return i32(f.pos)
 }
 
 // Disc files stay open for the life of the process, one handle per path: a
@@ -802,24 +830,32 @@ disc_place :: proc(path: string, size: i64) -> u32 {
 @(private)
 disc_read :: proc(lsn, sectors, dest: u32) {
 	tmp := make([]u8, sectors * DISC_SECTOR, context.temp_allocator)
+	disc_sectors(lsn, tmp)
+	copy(mem.ram_slice(dest, u32(len(tmp))), tmp)
+}
+
+// Reads the sectors from `lsn` that fill buf, a whole number of them; what
+// no file or image holds reads as zeros.
+@(private)
+disc_sectors :: proc(lsn: u32, buf: []u8) {
+	sectors := len(buf) / DISC_SECTOR
+	slice.zero(buf)
 	if image.volume != 0 {
-		if disc.read_at(&image, lsn, 0, tmp) != len(tmp) { // the rest stays zero
+		if disc.read_at(&image, lsn, 0, buf) != len(buf) { // the rest stays zero
 			fmt.eprintfln("cdvd: read of lsn %x (%d sectors) past the image", lsn, sectors)
 		}
-		copy(mem.ram_slice(dest, u32(len(tmp))), tmp)
 		return
 	}
 	found := false
 	for e in disc_extents {
 		if lsn < e.lsn || lsn >= e.lsn + e.sectors {continue}
 		if f, err := disc_open(e.path); err == nil {
-			_, _ = os.read_at(f, tmp, i64(lsn - e.lsn) * DISC_SECTOR) // past the end stays zero
+			_, _ = os.read_at(f, buf, i64(lsn - e.lsn) * DISC_SECTOR) // past the end stays zero
 		}
 		found = true
 		break
 	}
 	if !found {fmt.eprintfln("cdvd: read of unplaced lsn %x (%d sectors)", lsn, sectors)}
-	copy(mem.ram_slice(dest, u32(len(tmp))), tmp)
 }
 
 // cdvdfsv N-commands. The EE library sends them without waiting and learns
@@ -856,24 +892,29 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 cdvd_search_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	if fno != 0 || len(buf) < 0x12c {return false}
-	name := strings.truncate_to_byte(string(buf[0x24:0x124]), 0)
-	w[0] = 0
-	found, path, ok := disc_find(name)
-	if !ok {
+	file, found := cdvd_search(strings.truncate_to_byte(string(buf[0x24:0x124]), 0))
+	if found {copy(mem.ram_slice(w[0x124 / 4], len(file)), file[:])}
+	w[0] = u32(found)
+	return true
+}
+
+// The sceCdlFILE {lsn, size, name[16], date[8], flag} of the disc file by
+// its IOP name, as sceCdSearchFile writes it; false when there is none.
+@(private)
+cdvd_search :: proc(name: string) -> (file: [0x24]u8, ok: bool) {
+	found, path, has := disc_find(name)
+	if !has {
 		fmt.eprintfln("cdvd: search \"%s\" not found", name)
-		return true
+		return {}, false
 	}
 	size := found.size
-	file: [0x24]u8
 	fw := ([^]u32)(&file)
 	fw[0], fw[1] = image.volume != 0 ? found.lba : disc_place(path, size), u32(size)
 	// The ISO9660 name of the last component, version included.
 	base := name[strings.last_index_any(name, "\\/") + 1:]
 	copy(file[8:0x17], base)
-	copy(mem.ram_slice(w[0x124 / 4], len(file)), file[:])
 	if cpu.debug >= 1 {fmt.eprintfln("cdvd: search \"%s\" -> lsn %x size %d", name, fw[0], size)}
-	w[0] = 1
-	return true
+	return file, true
 }
 
 // Emulated state, saved and restored by snapshots (snap.odin).
