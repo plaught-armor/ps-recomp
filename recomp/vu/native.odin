@@ -222,28 +222,14 @@ div :: proc(a: ^native.Asm, u: Unit, w, key: u32, status: bool) -> bool {
 	return true
 }
 
-// r = vi[n & 15] of unit u in its low 16 bits, the rest garbage, or
-// sign-extended with signed.
+// r = vi[n & 15] of unit u, zero-extended, or sign-extended with signed.
 vi_get :: proc(a: ^native.Asm, u: Unit, r: native.Reg, n: u32, signed := false) {
-	native.imp_load(a, r, IMPORTS[u][.Vf], VU_VI + 4 * ((n & 15) >> 1))
-	if signed {
-		if n & 1 == 0 {native.alu_imm(a, .Shl, r, 16)}
-		native.alu_imm(a, .Sar, r, 16)
-	} else if n & 1 != 0 {
-		native.alu_imm(a, .Shr, r, 16)
-	}
+	native.imp_load(a, r, IMPORTS[u][.Vf], VU_VI + 2 * (n & 15), .B16, signed)
 }
 
-// vi[n & 15] of unit u = the low 16 bits of A, by a read and write of the
-// word that holds it. Loses A and C.
+// vi[n & 15] of unit u = the low 16 bits of A.
 vi_put :: proc(a: ^native.Asm, u: Unit, n: u32) {
-	off := VU_VI + 4 * ((n & 15) >> 1)
-	native.imp_load(a, .C, IMPORTS[u][.Vf], off)
-	native.alu_imm(a, .And, .C, n & 1 != 0 ? 0xffff : 0xffff0000)
-	native.alu_imm(a, .And, .A, 0xffff)
-	if n & 1 != 0 {native.alu_imm(a, .Shl, .A, 16)}
-	native.alu(a, .Or, .C, .A)
-	native.imp_store(a, IMPORTS[u][.Vf], .C, off)
+	native.imp_store(a, IMPORTS[u][.Vf], .A, VU_VI + 2 * (n & 15), .B16)
 }
 
 // Code for op w with fn 0x30-0x3b as vu.vu_op runs it, or false to leave
@@ -336,11 +322,7 @@ lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
 	vi_get(a, u, .A, r)
 	if key >= 0x36 {
 		native.alu_imm(a, .Sub, .A, 1)
-		if r != 0 {
-			native.mov(a, .B, .A)
-			vi_put(a, u, r)
-			native.mov(a, .A, .B)
-		}
+		if r != 0 {vi_put(a, u, r)}
 	} else if r != 0 {
 		native.mov(a, .B, .A)
 	}
@@ -352,9 +334,8 @@ lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
 		native.alu_imm(a, .Add, .A, 1)
 		vi_put(a, u, r)
 	}
-	native.imp_load(a, .C, IMPORTS[u][.Vf], VU_VI)
-	native.alu_imm(a, .And, .C, 0xffff0000)
-	native.imp_store(a, IMPORTS[u][.Vf], .C, VU_VI)
+	native.mov_imm(a, .C, 0)
+	native.imp_store(a, IMPORTS[u][.Vf], .C, VU_VI, .B16)
 }
 
 // A = cpu.fdiv(A, B) for key 0x38, math.sqrt(abs(B)) unclamped for 0x39
@@ -815,7 +796,6 @@ ilw_isw :: proc(a: ^native.Asm, u: Unit, store: bool, dest, it: u32) {
 		return
 	}
 	vi_get(a, u, .B, it)
-	native.alu_imm(a, .And, .B, 0xffff)
 	for k in u32(0) ..< 4 {
 		if dest & (8 >> k) != 0 {native.imp_store(a, scratch, .B, SCR_QUAD + 4 * k)}
 	}
@@ -900,7 +880,6 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		native.imp_load(a, .A, mac)
 		native.alu_imm(a, .And, .A, 0xffff)
 		vi_get(a, u, .B, is)
-		native.alu_imm(a, .And, .B, 0xffff)
 		native.set_cond(a, .Eq, .A, .B)
 		vi_put(a, u, it)
 	case 0x1a, 0x1b: // FMAND, FMOR
@@ -962,7 +941,6 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 				return
 			}
 			vi_get(a, u, .A, is)
-			native.alu_imm(a, .And, .A, 0xffff)
 			native.call(a, IMPORTS[u][.Xgkick], .A)
 		case 0x70 ..= 0x76, 0x78 ..= 0x7a, 0x7c ..= 0x7e: // the EFU
 			efu(a, u, lw, key)
@@ -1089,9 +1067,7 @@ micro_branch :: proc(a: ^native.Asm, u: Unit, lw, pc, mask: u32) {
 	switch lw >> 25 {
 	case 0x28, 0x29: // IBEQ, IBNE
 		vi_get(a, u, .A, it)
-		native.alu_imm(a, .And, .A, 0xffff)
 		vi_get(a, u, .B, is)
-		native.alu_imm(a, .And, .B, 0xffff)
 		native.set_cond(a, native.Cond.Eq if lw >> 25 == 0x28 else native.Cond.Ne, .A, .B)
 		native.mov(a, .T, .A)
 	case 0x2c ..= 0x2f: // IBLTZ, IBGTZ, IBLEZ, IBGEZ

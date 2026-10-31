@@ -534,7 +534,6 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		if rt == 0 {return true}
 		if rd < 16 {
 			vu.vi_get(a, .VU0, .A, u32(rd))
-			native.alu_imm(a, .And, .A, 0xffff)
 		} else if f, ok := vu0_ctrl(rd, true); ok {
 			native.imp_load(a, .A, f)
 		} else {

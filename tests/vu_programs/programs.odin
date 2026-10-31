@@ -49,10 +49,13 @@ DIV :: 0x38
 SQRT :: 0x39
 RSQRT :: 0x3a
 MTIR :: 0x3c
+MFIR :: 0x3d
 ILWR :: 0x3e
 ISWR :: 0x3f
 IADDIU :: 0x08
 IADDI :: 0x32 // an IADD-family op, imm5 in the fd field
+IBLTZ :: 0x2c
+IBGEZ :: 0x2f
 MFP :: 0x64
 ESADD :: 0x70
 ERSADD :: 0x71
@@ -127,6 +130,19 @@ PROGRAMS := [?][]u32 {
 		lower_sp(ILWR, 0b0010, 8, 4), NOP_U, lower_sp(ILWR, 0b1000, 10, 4), NOP_U,
 		lower_sp(ILWR, 0b0001, 9, 6), NOP_U, lower_sp(ILWR, 0b1111, 12, 6), NOP_U,
 		lower_sp(ILWR, 0b1111, 0, 6), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
+	},
+	// vi3 = -1 and vi4 = 0x7fff through MFIR (sign-extended into xw of
+	// vf3, yz of vf4) and IBLTZ and IBGEZ: on vi3 IBLTZ is taken and
+	// IBGEZ is not, on vi4 the reverse. An IADDIU in each delay slot
+	// always runs; the one after runs only when the branch is not taken.
+	{
+		lower_op(0x40, 0, 3, 0, 0x1f << 6 | IADDI), NOP_U, lower_op(IADDIU, 0xf, 4, 0, 0x7ff), NOP_U,
+		lower_sp(MFIR, 0b1001, 3, 3), NOP_U,
+		lower_op(IBLTZ, 0, 0, 3, 2), NOP_U, lower_op(IADDIU, 0, 5, 0, 1), NOP_U, lower_op(IADDIU, 0, 6, 0, 1), NOP_U,
+		lower_op(IBGEZ, 0, 0, 3, 2), NOP_U, lower_op(IADDIU, 0, 7, 0, 1), NOP_U, lower_op(IADDIU, 0, 8, 0, 1), NOP_U,
+		lower_op(IBLTZ, 0, 0, 4, 2), NOP_U, lower_op(IADDIU, 0, 9, 0, 1), NOP_U, lower_op(IADDIU, 0, 10, 0, 1), NOP_U,
+		lower_op(IBGEZ, 0, 0, 4, 2), NOP_U, lower_op(IADDIU, 0, 11, 0, 1), NOP_U, lower_op(IADDIU, 0, 12, 0, 1), NOP_U,
+		lower_sp(MFIR, 0b0110, 4, 4), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
 	},
 }
 // VU0 only. DIV vf1.x / vf0.x (I or D) with ADD; SQRT vf1.y with MULq,

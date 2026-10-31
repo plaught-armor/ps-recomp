@@ -19,8 +19,9 @@
 // Last, the EFU: each op writes P and MFP reads it back into part of a
 // register, from random P first; then an ESIN reading and an MFP writing
 // the upper's dest. Then ILWR and ISWR on each field, at addresses that
-// wrap past the end of VU memory. Every program must compile without a
-// call into the interpreter.
+// wrap past the end of VU memory. Then a negative vi and a positive one
+// through MFIR, IBLTZ and IBGEZ, each branch taken on one and not on the
+// other. Every program must compile without a call into the interpreter.
 //
 // The clamp elision program is a chain of dependent ops on clamped
 // results, with a loop whose branch target is in the middle, compiled twice:
