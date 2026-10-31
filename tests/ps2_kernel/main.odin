@@ -9,7 +9,9 @@
 // with the word back, ExecPS2 runs the native function again. Before that,
 // LOADFILE's loadelf (an IOP RPC, the EE's SifLoadElf) loads ELFs from a disc
 // directory: the segments' file bytes or one section, and nothing for a bad
-// ELF or one out of range.
+// ELF or one out of range. SifDmaStat reports a transfer running for its
+// size's worth of cycles after SifSetDma, then done, and an older id or a
+// failed set's 0 as done.
 package main
 
 import "core:fmt"
@@ -271,6 +273,21 @@ setup_test :: proc() {
 	fmt.println("ok SetupThread")
 }
 
+// SifSetDma (0x77) of one 0x1000-byte transfer, then SifDmaStat (0x76).
+dma_stat_test :: proc() {
+	LIST :: PARAM + 0x300
+	for v, n in ([4]u32{PARAM, 0x40000, 0x1000, 0}) {mem.wr32(LIST + u32(n) * 4, v)}
+	first := sys(0x77, LIST, 1)
+	id := sys(0x77, LIST, 1)
+	if id <= 0 || first <= 0 {fail("fail: SifSetDma returned %d, %d", first, id)}
+	if st := sys(0x76, u32(id)); st < 0 {fail("fail: SifDmaStat %d right after the set, want >= 0", st)}
+	if st := sys(0x76, u32(first)); st != -1 {fail("fail: SifDmaStat of an older id %d, want -1", st)}
+	if st := sys(0x76, 0); st != -1 {fail("fail: SifDmaStat of id 0 %d, want -1", st)}
+	cpu.state.cycles += 2 * 0x1000 * iop.SIF_DMA_CYCLES_PER_BYTE
+	if st := sys(0x76, u32(id)); st != -1 {fail("fail: SifDmaStat %d after the transfer's cycles, want -1", st)}
+	fmt.println("ok SifDmaStat")
+}
+
 fail :: proc(format: string, args: ..any) -> ! {
 	fmt.eprintfln(format, ..args)
 	os.exit(1)
@@ -347,6 +364,7 @@ main :: proc() {
 
 	loadelf_test()
 	setup_test()
+	dma_stat_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.
 	main_t.co = core.co_create(proc(_: rawptr) {exec_prog()}, nil)

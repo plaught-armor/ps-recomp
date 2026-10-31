@@ -23,6 +23,7 @@ SIF_CMD_CHANGE_SADDR :: 0x80000000
 SIF_CMD_SET_SREG :: 0x80000001
 SIF_CMD_INIT_CMD :: 0x80000002
 SIF_CMD_RESET :: 0x80000003
+SIF_CMD_IOP_INTR :: 0x80000004 // see sif_command
 SIF_CMD_RPC_END :: 0x80000008
 SIF_CMD_RPC_BIND :: 0x80000009
 SIF_CMD_RPC_CALL :: 0x8000000a
@@ -50,6 +51,9 @@ sif: struct {
 	servers:   map[u32]Rpc_Server,
 	bound:     map[u32]u32, // sid -> fake server descriptor address
 	next_dma:  i32,
+	// The last transfer SifSetDma started and the EE cycle it ends at.
+	last_dma:  i32,
+	dma_done:  u64,
 }
 
 sif_init :: proc() {
@@ -128,25 +132,39 @@ sif_reg_get :: proc(reg: u32) -> u32 {
 	return 0
 }
 
+// EE cycles a SIF DMA takes per byte, approximately: one 32-bit word per
+// IOP bus clock (36.864 MHz), an eighth of the EE's.
+SIF_DMA_CYCLES_PER_BYTE :: 2
+
+// SifDmaStat(id): 0 while the transfer is running, -1 once it is done (the
+// kernel's 1, queued, never happens: one transfer runs at a time). The data
+// is copied when SifSetDma is called; only the status takes the transfer's
+// time, for games that test it the wrong way round and rely on a long
+// transfer still running when they first poll. SIF DMAs finish in order,
+// so any id but the last is done, as is 0 (a failed SifSetDma).
 sif_dma_stat :: proc(id: i32) -> i64 {
-	return -1 // every transfer completes immediately
+	return id != 0 && id == sif.last_dma && cpu.state.cycles < sif.dma_done ? 0 : -1
 }
 
 // SifSetDma(list, count), the syscall at pc: copy each {src, dest, size,
 // attr} to IOP memory and act on command packets.
 sif_set_dma :: proc(list, count, pc: u32) -> u32 {
+	bytes: u64
 	for n in 0 ..< count {
 		e := list + n * 16
 		src, dest, size := mem.rd32(e), mem.rd32(e + 4), mem.rd32(e + 8)
 		d := dest & (IOP_RAM_SIZE - 1)
 		size = min(size, IOP_RAM_SIZE - d)
 		copy(iop_ram[d:][:size], mem.ram_slice(src, size))
+		bytes += u64(size)
 		if cpu.debug == 2 {fmt.eprintfln("sif: dma %08x -> %08x size %x (%d/%d)", src, dest, size, n, count)}
 		if d == IOP_CMDBUF {sif_command(d, pc)}
 		adx_dma(d, size)
 	}
 	id := sif.next_dma
 	sif.next_dma = sif.next_dma % 0xffff + 1
+	sif.last_dma = id
+	sif.dma_done = max(sif.dma_done, cpu.state.cycles) + bytes * SIF_DMA_CYCLES_PER_BYTE
 	return u32(id)
 }
 
@@ -208,6 +226,10 @@ sif_command :: proc(a, pc: u32) {
 		clear(&sif.bound)
 		sif.ee_buf = 0
 		clear(&sif.replies)
+	case SIF_CMD_IOP_INTR:
+		// Sent with no payload after a game's own transfer, only so its
+		// arrival interrupts the IOP: retail SIFCMD has no handler for it
+		// and its dispatcher drops a command without one.
 	case SIF_CMD_RPC_BIND:
 		rec_id, pkt, rpc_id, client, sid := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3), arg(a, 4)
 		sd, ok := sif.bound[sid]
