@@ -220,20 +220,33 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 	return
 }
 
+// PRIM's bits decode_ctx reads: IIP, TME, FGE, ABE, FST, CTXT.
+@(private)
+CTX_PRIM :: 0x378
+
+// The last context decoded, and the ctx_gen and PRIM bits it was decoded
+// at. Primitives only read it.
+@(private)
+ctx_cur: Ctx
+@(private)
+ctx_key: [2]u64
+
 @(private)
 draw :: proc(kind, prim: u64) {
 	if skip_draw {return}
-	c := decode_ctx(prim)
+	key := [2]u64{ctx_gen, prim & CTX_PRIM}
+	if key != ctx_key {ctx_cur, ctx_key = decode_ctx(prim), key}
+	c := &ctx_cur
 	if c.zte && c.ztst == 0 {return} // NEVER
 	if hw_on {
-		hw_draw(&c, kind)
+		hw_draw(c, kind)
 		return
 	}
 	switch kind {
-	case 0: draw_point(&c, &queue[0])
-	case 1, 2: draw_line(&c, &queue[0], &queue[1])
-	case 3, 4, 5: draw_tri(&c, &queue[0], &queue[1], &queue[2])
-	case 6: draw_sprite(&c, &queue[0], &queue[1])
+	case 0: draw_point(c, &queue[0])
+	case 1, 2: draw_line(c, &queue[0], &queue[1])
+	case 3, 4, 5: draw_tri(c, &queue[0], &queue[1], &queue[2])
+	case 6: draw_sprite(c, &queue[0], &queue[1])
 	}
 }
 

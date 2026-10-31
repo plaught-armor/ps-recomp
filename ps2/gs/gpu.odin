@@ -151,6 +151,7 @@ hw: struct {
 	state:               Hw_State, // last state appended
 	state_idx:           u32,
 	state_ok:            bool, // state is in this slot's ring
+	state_key:           [2]u64, // a ctx_key whose context gives state
 	clut_off:            u32, // the CLUT's copy in the slot's ring
 	clut_ok:             bool,
 	// Pages drawn since the last barrier; a primitive texturing from one
@@ -626,6 +627,15 @@ spans_meet :: proc(a, b: [2]u32) -> bool {
 hw_state :: proc(c: ^Ctx) -> u32 {
 	s := &hw.slots[hw.cur]
 	t := &c.tex
+	// c is draw's ctx_cur, decoded at ctx_key. The same context gives the
+	// same state while its CLUT copy and decoded texture stand: the CLUT's
+	// offset moves only on a load (a TEX0/TEX2 write, which changes ctx_key)
+	// or below.
+	pal := c.tme && psm_bits(t.psm) <= 8
+	if hw.state_ok && hw.state_key == ctx_key && (!pal || hw.clut_ok) && (!c.tme || hw.dec_seq == hw.seq) {
+		return hw.state_idx
+	}
+	hw.state_key = ctx_key
 	f: bit_set[Hw_Flag; u32]
 	if c.tme {f += {.TME}}
 	if c.fge {f += {.FGE}}

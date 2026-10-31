@@ -23,6 +23,13 @@ GS_SIGNAL :: 0x60
 GS_FINISH :: 0x61
 GS_LABEL :: 0x62
 
+// Bumped by every register write that can change the drawing context
+// (decode_ctx), and by snapshot loads: draw keeps the last context it
+// decoded while this and PRIM's attribute bits are unchanged. Not emulated
+// state, so not saved; never reused, so a load cannot bring back a stale one.
+@(private)
+ctx_gen: u64 = 1
+
 GS_CSR_SIGNAL :: 0x1
 GS_CSR_FINISH :: 0x2
 
@@ -42,6 +49,10 @@ gs_write :: proc(reg: u8, v: u64) #no_bounds_check {
 	if reg >= len(state.regs) {return}
 	if cpu.debug == 3 {fmt.eprintfln("gs: %02x = %016x", reg, v)}
 	state.regs[reg] = v
+	switch reg {
+	case GS_PRIM, GS_RGBAQ, GS_ST, GS_UV, GS_XYZF2, GS_XYZ2, GS_FOG, GS_XYZF3, GS_XYZ3, GS_HWREG:
+	case: ctx_gen += 1
+	}
 	if state.write != nil {state.write(reg, v)}
 	switch reg {
 	case GS_SIGNAL: // ID/IDMSK into SIGLBLID low word
@@ -80,4 +91,5 @@ gs_priv :: proc(off: u32) -> u64 #no_bounds_check {
 // Emulated state, saved and restored by snapshots (snap.odin).
 gs_snap :: proc() {
 	core.snap_add(&state)
+	append(&core.snap_hooks, core.Snap_Hook{save = proc(_: int) {}, load = proc(_: int) {ctx_gen += 1}})
 }
