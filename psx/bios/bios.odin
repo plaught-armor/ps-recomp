@@ -32,8 +32,10 @@ bios: struct {
 	// The pad driver reads the pads (InitPAD, until libpad stops it through
 	// the pointer it takes from the driver's code).
 	pad_read:  bool,
-	// syscall 3 was called directly once (bios_syscall).
+	// syscall 3 to an address outside the TCBs (bios_syscall), and a
+	// thread restarted at a new epc (change_thread), warned about once.
 	tcb_warn:  bool,
+	epc_warn:  bool,
 	// SetConf/GetConf: event and thread control block counts, stack top.
 	conf:      [3]u32,
 }
@@ -391,13 +393,19 @@ bios_entry :: proc(addr: u32, run: bool) -> bool {
 
 // syscall with a0 of 3 or more, as the retail kernel's handler does it.
 // 3 is ChangeThreadSubFunction(tcb), the thread switch under ChangeTh
-// (B 10h); the HLE threads have no control blocks to switch by, so a
-// direct call returns 1 and stays on the running thread. Anything higher
-// delivers class 0xf0000010 spec 0x4000.
+// (B 10h), which makes a1 the running TCB. A TCB of the table switches as
+// ChangeTh does; retail would load registers from any other address, which
+// here returns 1 and stays on the running thread. Anything higher delivers
+// class 0xf0000010 spec 0x4000.
 bios_syscall :: proc() {
 	if arg(0) == 3 {
+		off := (arg(1) & 0x1fffffff) - TCB_ARRAY
+		if off < MAX_THREADS * TCB_SIZE && off % TCB_SIZE == 0 {
+			change_thread(off / TCB_SIZE)
+			return
+		}
 		if !bios.tcb_warn {
-			fmt.eprintfln("bios: syscall 3 (switch to TCB %#x) not done; ChangeTh is", arg(1))
+			fmt.eprintfln("bios: syscall 3 to %#x, not a TCB; staying on the running thread", arg(1))
 			bios.tcb_warn = true
 		}
 		ret(1)
@@ -593,6 +601,9 @@ B0_UNSET :: bit_set[0 ..< B0_ENTRIES; u128] {
 EXC_HANDLER :: 0xc80
 @(private)
 PAD_DRIVER :: 0x4000
+// The RAM kept free behind PAD_DRIVER for those patches.
+@(private)
+PAD_DRIVER_SIZE :: 0x198c
 
 // Offsets into the pad driver that libpad takes. It calls the first three
 // through pointers: setPadOutputData(buf1, n1, buf2, n2), and the start and
@@ -635,7 +646,11 @@ TABLE_STUBS :: FAKE_DCB_TABLE + 0x100
 
 // Kernel RAM the HLE BIOS fixes, from 0x3000: the DCB table and the stubs
 // to 0x34f0, KERNEL_EXEC (exec.odin) at 0x3800, PAD_DRIVER at 0x4000 to
-// about 0x48a0, and strtok's buffer and pointer (libc) at 0x9030-0x9133.
+// 0x598c, strtok's buffer and pointer (libc) at 0x9030-0x9133, and the
+// thread tables (PCB, TCB_ARRAY) at 0xe000-0xec10, in the 0xe000-0xffff
+// heap the retail kernel allocates them from.
+#assert(PAD_DRIVER + PAD_DRIVER_SIZE <= 0x9030)
+#assert(PCB >= 0xe000 && TCB_ARRAY + MAX_THREADS * TCB_SIZE <= 0x10000)
 
 bios_init :: proc() {
 	vector := EXC_VECTOR
@@ -674,6 +689,10 @@ bios_init :: proc() {
 	cpu.w32(FAKE_DCB_TABLE, FAKE_DCB_TABLE + DCB_SIZE)
 	cpu.w32(0x150, FAKE_DCB_TABLE)
 	cpu.w32(0x154, DCB_SIZE)
+	cpu.w32(0x108, KSEG1 | PCB)
+	cpu.w32(0x10c, 4)
+	cpu.w32(0x110, KSEG1 | TCB_ARRAY)
+	cpu.w32(0x114, MAX_THREADS * TCB_SIZE)
 	bios.rcnt_ack = {0 ..< len(bios.rcnt_ack) = true}
 	bios.conf = {MAX_EVENTS, MAX_THREADS, STACK_TOP}
 	threads_init()
@@ -1052,12 +1071,60 @@ hook_target :: proc(ra: u32) -> u32 {
 @(private)
 MAX_THREADS :: 16
 
+// The thread tables, as the retail kernel lays them out and points at them
+// from the system table (verified against v4.5 retail kernel): [0x108] the
+// process control block, whose one word is the running thread's TCB, and
+// [0x10c] its size; [0x110] the TCBs, and [0x114] their size in bytes. The
+// pointers are uncached, as the retail kernel heap's are. Here the tables
+// sit at fixed addresses in that heap (bios_init).
+@(private)
+KSEG1 :: 0xa0000000
+@(private)
+PCB :: 0xe000
+@(private)
+TCB_ARRAY :: 0xe010
+@(private)
+TCB_SIZE :: 0xc0
+
+// A TCB's words: status, mode, r0-r31, epc, hi and lo (placed by the gap
+// they leave; retail code seen does not name them), and sr.
+@(private)
+TCB_STATUS :: 0x00
+@(private)
+TCB_MODE :: 0x04
+@(private)
+TCB_REGS :: 0x08
+@(private)
+TCB_EPC :: 0x88
+@(private)
+TCB_HI :: 0x8c
+@(private)
+TCB_LO :: 0x90
+@(private)
+TCB_SR :: 0x94
+
+// Status words: a free TCB, and one OpenTh handed out.
+@(private)
+TCB_FREE :: 0x1000
+@(private)
+TCB_USED :: 0x4000
+
+// The epc of a thread the HLE switched away from: a kernel data address,
+// never code. Its continuation is native (its coroutine), not a guest pc.
+@(private)
+TCB_PARKED :: KSEG1 | PCB
+
+// The running thread's registers are cpu.state and cop0.sr, and its TCB is
+// stale; retail refreshes it on every exception, and nothing here reads it.
+// A suspended thread's registers are in its TCB, where the guest may change
+// them: switching back loads them. A guest write of an epc other than
+// TCB_PARKED discards the thread's coroutine and starts it over at that epc,
+// the only way to honour it. The status word says which TCBs are in use.
 @(private)
 Bios_Thread :: struct {
-	used:  bool,
-	regs:  cpu.Cpu,
-	sr:    u32,
+	// The guest pc the coroutine started at.
 	entry: u32,
+	// The thread's native continuation; nil until it first runs.
 	co:    ^core.Coroutine,
 }
 
@@ -1068,8 +1135,9 @@ threads: [MAX_THREADS]Bios_Thread
 @(private)
 cur_thread: int
 
-// Coroutine of a thread that closed itself. It keeps running until it
-// switches away; the next thread to run then discards it.
+// Coroutine of a thread that lost its slot while running (it closed itself,
+// or the guest freed its TCB and OpenTh reused it). It keeps running until
+// it switches away; the next thread to run then discards it.
 @(private)
 zombie: ^core.Coroutine
 
@@ -1082,31 +1150,63 @@ reap_zombie :: proc() {
 }
 
 @(private)
-threads_init :: proc() {
-	threads[0] = {
-		used = true,
-		co   = &core.co_main_thread,
-	}
-	cur_thread = 0
+tcb :: #force_inline proc(i: int) -> u32 {
+	return TCB_ARRAY + u32(i) * TCB_SIZE
 }
 
 @(private)
+threads_init :: proc() {
+	threads[0] = {
+		co = &core.co_main_thread,
+	}
+	for i in 0 ..< MAX_THREADS {
+		cpu.w32(tcb(i) + TCB_STATUS, i == 0 ? TCB_USED : TCB_FREE)
+	}
+	cpu.w32(PCB, KSEG1 | tcb(0))
+	cur_thread = 0
+}
+
+// Let go of slot i's coroutine. The running one finishes as the zombie; the
+// host main thread's own stack cannot be freed, and is only left.
+@(private)
+drop_thread :: proc(i: int) {
+	co := threads[i].co
+	threads[i].co = nil
+	switch {
+	case co == nil, co == &core.co_main_thread:
+	case co == core.co_current:
+		assert(zombie == nil)
+		zombie = co
+	case:
+		core.co_kill(co)
+	}
+}
+
+// OpenTh writes the fields retail does: status, mode, r28-r30 and epc. It
+// also clears the other registers and stores sr 0x40000404, the saved form
+// whose rfe gives the 0x40000401 BoF4's threads have always started with;
+// retail OpenTh leaves both as they were. BoF4 itself writes 0x40000404
+// there after OpenTh.
+@(private)
 open_thread :: proc(pc, sp, gp: u32) -> u32 {
-	for &t, i in threads {
-		if t.used {
+	for i in 0 ..< MAX_THREADS {
+		t := tcb(i)
+		if cpu.r32(t + TCB_STATUS) != TCB_FREE {
 			continue
 		}
-		t = {
-			used  = true,
-			entry = pc,
-			// The BIOS stores 0x40000404 and enters the thread with rfe;
-			// threads[].sr holds the live value after that rfe.
-			sr    = 0x40000401,
+		drop_thread(i)
+		for n in u32(0) ..< 32 {
+			cpu.w32(t + TCB_REGS + 4 * n, 0)
 		}
-		t.regs.r[29] = sp
-		t.regs.r[30] = sp
-		t.regs.r[28] = gp
-		t.co = core.co_create(thread_entry, rawptr(uintptr(i)))
+		cpu.w32(t + TCB_STATUS, TCB_USED)
+		cpu.w32(t + TCB_MODE, 0x1000)
+		cpu.w32(t + TCB_REGS + 4 * 28, gp)
+		cpu.w32(t + TCB_REGS + 4 * 29, sp)
+		cpu.w32(t + TCB_REGS + 4 * 30, sp)
+		cpu.w32(t + TCB_EPC, pc)
+		cpu.w32(t + TCB_HI, 0)
+		cpu.w32(t + TCB_LO, 0)
+		cpu.w32(t + TCB_SR, 0x40000404)
 		return 0xff000000 | u32(i)
 	}
 	fmt.eprintln("bios: thread table full")
@@ -1121,47 +1221,68 @@ thread_entry :: proc(arg: rawptr) {
 	cpu.fatal("thread %d returned from its entry %#08x", i, threads[i].entry)
 }
 
+// Unlike retail, which frees any slot and returns 1, a handle that is not
+// an open thread other than the main one returns 0.
 @(private)
 close_thread :: proc(h: u32) -> u32 {
 	i := int(h & 0xffff)
-	if i == 0 || i >= MAX_THREADS || !threads[i].used {
+	if i == 0 || i >= MAX_THREADS || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
 		return 0
 	}
-	if i == cur_thread {
-		zombie = threads[i].co
-	} else {
-		core.co_kill(threads[i].co)
-	}
-	threads[i] = {}
+	cpu.w32(tcb(i) + TCB_STATUS, TCB_FREE)
+	drop_thread(i)
 	return 1
 }
 
+// ChangeTh, and syscall 3 to a TCB. Retail switches to any handle without a
+// check; one that is not an open thread here warns and returns 0.
 @(private)
 change_thread :: proc(h: u32) {
 	i := int(h & 0xffff)
-	if i >= MAX_THREADS || !threads[i].used {
+	if i >= MAX_THREADS || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
 		fmt.eprintfln("bios: ChangeTh to bad handle %#x", h)
 		ret(0)
 		return
 	}
+	ret(1)
 	if i == cur_thread {
-		ret(1)
 		return
 	}
-	from := &threads[cur_thread]
-	to := &threads[i]
-	ret(1)
-	// A thread that closed itself has no slot to save into; OpenTh may even
-	// have reused it. Any other zombie was reaped when this thread resumed.
-	if zombie == nil {
-		from.regs = cpu.state
-		from.sr = cpu.cop0.sr
+	// A thread that lost its slot has no TCB to save into; OpenTh may have
+	// handed it to another thread.
+	if threads[cur_thread].co == core.co_current {
+		t := tcb(cur_thread)
+		for v, n in cpu.state.r {
+			cpu.w32(t + TCB_REGS + 4 * u32(n), v)
+		}
+		cpu.w32(t + TCB_HI, cpu.state.hi)
+		cpu.w32(t + TCB_LO, cpu.state.lo)
+		// The sr as exception entry saves it, interrupt-enable stack pushed.
+		cpu.w32(t + TCB_SR, (cpu.cop0.sr & ~u32(0x3f)) | ((cpu.cop0.sr << 2) & 0x3c))
+		cpu.w32(t + TCB_EPC, TCB_PARKED)
 	}
-	cycles := cpu.state.cycles
-	cpu.state = to.regs
-	cpu.state.cycles = cycles
-	cpu.cop0.sr = to.sr
+	t := tcb(i)
+	cpu.w32(PCB, KSEG1 | t)
+	for n in 1 ..< len(cpu.state.r) {
+		cpu.state.r[n] = cpu.r32(t + TCB_REGS + 4 * u32(n))
+	}
+	cpu.state.r[0] = 0
+	cpu.state.hi = cpu.r32(t + TCB_HI)
+	cpu.state.lo = cpu.r32(t + TCB_LO)
+	// Retail returns into the thread with rfe, popping the saved sr.
+	cpu.cop0.sr = cpu.r32(t + TCB_SR)
+	cpu.rfe()
 	cur_thread = i
+	to := &threads[i]
+	if epc := cpu.r32(t + TCB_EPC); to.co == nil || epc != TCB_PARKED {
+		if to.co != nil && !bios.epc_warn {
+			fmt.eprintfln("bios: thread %d's TCB epc set to %#08x; starting it over there", i, epc)
+			bios.epc_warn = true
+		}
+		drop_thread(i)
+		to.entry = epc
+		to.co = core.co_create(thread_entry, rawptr(uintptr(i)))
+	}
 	core.co_switch(to.co)
 	// Resumed: whoever switched back already loaded our registers.
 	reap_zombie()

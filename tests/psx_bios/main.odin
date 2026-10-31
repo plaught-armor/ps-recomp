@@ -14,9 +14,16 @@
 //   skipping the HookEntryInt handler; an acknowledged counter ends it
 //   with the other counters still pending. SetDefaultExitFromException
 //   ends the exception after the walk without the hook. WaitEvent with
-//   interrupts blocked gives up instead of hanging. syscall 3 returns 1;
-//   higher numbers deliver class 0xf0000010 spec 0x4000. UnDeliverEvent
-//   takes a delivery back.
+//   interrupts blocked gives up instead of hanging. syscall 3 to an
+//   address outside the TCBs returns 1; higher numbers deliver class
+//   0xf0000010 spec 0x4000. UnDeliverEvent takes a delivery back.
+//   The thread tables in kernel RAM: the system table words, the TCB fields
+//   OpenTh writes, a suspended thread's registers saved in its TCB (v0 1,
+//   sr as exception entry saves it) and loaded back from it after a guest
+//   write (sr through rfe), a guest epc write
+//   restarting the thread there, syscall 3 to a TCB switching as ChangeTh
+//   does, and CloseTh or a guest-freed TCB letting OpenTh reuse the slot
+//   without running out of coroutines.
 //   The kernel layout games read and patch: the exception vector (at 0x00
 //   too), the C0 and B0 tables (every entry callable but the B0 ones the
 //   retail kernel leaves 0), and the pad driver's pointers and vblank
@@ -82,6 +89,10 @@ FN_FIRST_LATE :: 0x80001400 // first() of a later chain: counts, returns 0
 FN_HOOK :: 0x80001500 // the HookEntryInt handler: counts
 @(private = "file")
 FN_EXEC :: 0x80001600 // an executable's pc0: records its registers, returns 7
+@(private = "file")
+FN_THREAD :: 0x80001700 // a thread: records what it sees, switches back
+@(private = "file")
+FN_RESTART :: 0x80001800 // a thread's new entry: counts, switches back
 
 // HookEntryInt jump buffer, and the setjmp return site it holds: a jal to
 // FN_HOOK.
@@ -136,6 +147,21 @@ STR_T :: 0x80006900
 calls: struct {
 	callback, second, late, hook: int,
 }
+
+// What FN_THREAD and FN_RESTART saw: s0, gp, sr and the running TCB at
+// entry, v0 and s0 after each switch back, and whether FN_THREAD ran past
+// the switch the epc write abandons.
+@(private = "file")
+th: struct {
+	s0, gp, sr, pcb:        u32,
+	v0, s0_back:            [2]u32,
+	abandoned:              bool,
+	restarts, resumes:      int,
+	restart_s0, restart_sr: u32,
+}
+
+@(private = "file")
+MAIN_THREAD :: 0xff000000
 
 // FN_EXEC's a0, a1, sp, fp and gp.
 @(private = "file")
@@ -272,6 +298,27 @@ main :: proc() {
 					exec_regs = {r[4], r[5], r[29], r[30], r[28]}
 					r[16], r[28], r[29], r[30], r[31] = 0, 0, 0, 0, 0
 					r[2] = 7
+				}},
+			{FN_THREAD, proc() {
+					r := &cpu.state.r
+					th.s0, th.gp, th.sr, th.pcb = r[16], r[28], cpu.cop0.sr, cpu.r32(cpu.r32(0x108))
+					r[16] = 0x1111
+					for k in 0 ..< 2 {
+						b(0x10, MAIN_THREAD)
+						th.v0[k], th.s0_back[k] = r[2], r[16]
+					}
+					th.abandoned = true
+					for {
+						b(0x10, MAIN_THREAD)
+					}
+				}},
+			{FN_RESTART, proc() {
+					th.restarts += 1
+					th.restart_s0, th.restart_sr = cpu.state.r[16], cpu.cop0.sr
+					for {
+						b(0x10, MAIN_THREAD)
+						th.resumes += 1
+					}
 				}},
 		},
 	)
@@ -482,7 +529,7 @@ main :: proc() {
 	check("SR after ExitCriticalSection", cpu.cop0.sr & 0x401, 0x401)
 	sys := open(0xf0000010, 0x4000, 0x2000)
 	cpu.state.r[2] = 0
-	cpu.state.r[4] = 3
+	cpu.state.r[4], cpu.state.r[5] = 3, 0
 	cpu.syscall(0)
 	check("syscall 3", cpu.state.r[2], 1)
 	check("syscall event after syscall 3", test(sys), 0)
@@ -549,6 +596,100 @@ main :: proc() {
 	check("GetConf events after SetConf", cpu.r32(CONF_BUF), 16)
 	check("GetConf threads after SetConf", cpu.r32(CONF_BUF + 4), 4)
 	check("GetConf stack after SetConf", cpu.r32(CONF_BUF + 8), 0x801ff000)
+
+	// The thread tables: the PCB's one word is the running TCB.
+	check("PCB pointer", cpu.r32(0x108), 0xa000e000)
+	check("PCB size", cpu.r32(0x10c), 4)
+	check("TCB array pointer", cpu.r32(0x110), 0xa000e010)
+	check("TCB array size", cpu.r32(0x114), 0xc00)
+	tcbs := cpu.r32(0x110)
+	check("running TCB at boot", cpu.r32(cpu.r32(0x108)), tcbs)
+	for k in u32(0) ..< 16 {
+		check(fmt.tprintf("TCB %d status at boot", k), cpu.r32(tcbs + k * 0xc0), k == 0 ? 0x4000 : 0x1000)
+	}
+	tcb1 := tcbs + 0xc0
+	reg :: proc(t: u32, n: u32) -> u32 {return t + 8 + 4 * n}
+	h := b(0x0e, FN_THREAD, 0x801f0000, 0x80012345)
+	check("OpenTh", h, 0xff000001)
+	check("OpenTh status", cpu.r32(tcb1), 0x4000)
+	check("OpenTh mode", cpu.r32(tcb1 + 4), 0x1000)
+	check("OpenTh gp", cpu.r32(reg(tcb1, 28)), 0x80012345)
+	check("OpenTh sp", cpu.r32(reg(tcb1, 29)), 0x801f0000)
+	check("OpenTh fp", cpu.r32(reg(tcb1, 30)), 0x801f0000)
+	check("OpenTh epc", cpu.r32(tcb1 + 0x88), FN_THREAD)
+	check("OpenTh sr", cpu.r32(tcb1 + 0x94), 0x40000404)
+
+	// A round trip: the thread starts on its TCB's registers, and comes back
+	// to the main thread's with v0 1. Its own are left in its TCB.
+	r := &cpu.state.r
+	r[16], r[29] = 0xaaaa, 0x801ffe00
+	main_sr := cpu.cop0.sr
+	check("ChangeTh", b(0x10, h), 1)
+	check("main thread s0 after ChangeTh", r[16], 0xaaaa)
+	check("main thread sp after ChangeTh", r[29], 0x801ffe00)
+	check("thread s0 at entry", th.s0, 0)
+	check("thread gp at entry", th.gp, 0x80012345)
+	check("thread sr at entry, the TCB's after rfe", th.sr, 0x40000401)
+	check("main thread sr after ChangeTh", cpu.cop0.sr, main_sr)
+	check("main thread's sr in its TCB, as exception entry saves it", cpu.r32(tcbs + 0x94), (main_sr & ~u32(0x3f)) | ((main_sr << 2) & 0x3c))
+	check("running TCB in the thread", th.pcb, tcb1)
+	check("running TCB back on the main thread", cpu.r32(cpu.r32(0x108)), tcbs)
+	check("suspended thread's s0 in its TCB", cpu.r32(reg(tcb1, 16)), 0x1111)
+	check("suspended thread's v0 in its TCB", cpu.r32(reg(tcb1, 2)), 1)
+	check("main thread's s0 in its TCB", cpu.r32(reg(tcbs, 16)), 0xaaaa)
+
+	// A guest write to a suspended TCB's s0 is what the thread resumes with.
+	cpu.w32(reg(tcb1, 16), 0x2222)
+	b(0x10, h)
+	check("thread v0 after its ChangeTh", th.v0[0], 1)
+	check("thread s0 after a write to its TCB", th.s0_back[0], 0x2222)
+
+	// A guest write of its epc starts it over there; the continuation it
+	// left is never resumed.
+	cpu.w32(tcb1 + 0x88, FN_RESTART)
+	cpu.w32(tcb1 + 0x94, 0x40000010)
+	b(0x10, h)
+	if th.restarts != 1 || th.abandoned {
+		fail("after an epc write the thread restarted %d times, abandoned continuation ran %v", th.restarts, th.abandoned)
+	}
+	check("restarted thread's s0", th.restart_s0, 0x2222)
+	check("restarted thread's sr after a write to its TCB", th.restart_sr, 0x40000014)
+
+	// syscall 3 to its TCB, in any segment, switches as ChangeTh does; to any
+	// other address it stays on the running thread.
+	r[4], r[5], r[16] = 3, 0x80000000 | (tcb1 & 0x1fffffff), 0xbbbb
+	cpu.syscall(0)
+	check("syscall 3 to a TCB", r[2], 1)
+	check("main thread s0 after syscall 3", r[16], 0xbbbb)
+	check("thread resumes after syscall 3", u32(th.resumes), 1)
+	for a5 in ([?]u32{tcb1 + 4, tcbs + 16 * 0xc0, 0x1234}) {
+		r[2], r[4], r[5] = 0, 3, a5
+		cpu.syscall(0)
+		check(fmt.tprintf("syscall 3 to %#x", a5), r[2], 1)
+	}
+	check("thread resumes after syscall 3 to other addresses", u32(th.resumes), 1)
+	check("running TCB after syscall 3 to other addresses", cpu.r32(cpu.r32(0x108)), tcbs)
+
+	// CloseTh frees the TCB; so does a guest write of its status. OpenTh
+	// then reuses the slot and lets the old coroutine go: more rounds than
+	// the coroutine pool holds stacks.
+	check("CloseTh", b(0x0f, h), 1)
+	check("CloseTh status", cpu.r32(tcb1), 0x1000)
+	check("ChangeTh to a closed thread", b(0x10, h), 0)
+	th.resumes = 0
+	for k in 0 ..< 140 {
+		h = b(0x0e, FN_RESTART, 0x801f0000, 0)
+		check("OpenTh of a freed slot", h, 0xff000001)
+		b(0x10, h)
+		b(0x10, h)
+		if k < 70 {
+			b(0x0f, h)
+		} else {
+			cpu.w32(tcb1, 0x1000)
+		}
+	}
+	check("restarted thread runs after reuse", u32(th.restarts), 141)
+	check("resumes over the reuse rounds", u32(th.resumes), 140)
 
 	// libpad's pointers into the pad driver stop and restart pad reading.
 	check("InitPAD", b(0x12, PAD_BUF, 0x22, 0, 0), 1)
@@ -715,7 +856,6 @@ main :: proc() {
 	// Exec clears the BSS in whole words (6 bytes clear 8), sets sp and fp
 	// from s_addr and s_size and gp from gp0, calls pc0 with argc and argv,
 	// and returns 1 with sp, fp, gp, ra and s0 back from the save area.
-	r := &cpu.state.r
 	r[16], r[28], r[29], r[30], r[31] = 0x16, 0x28, 0x801ffe00, 0x30, 0x31
 	check("Exec", a(0x43, EXEC_HDR, 2, 0x80006000), 1)
 	check("argc", exec_regs[0], 2)
@@ -838,5 +978,5 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs, return-0 stubs")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs, return-0 stubs, thread tables")
 }
