@@ -123,6 +123,9 @@ hw: struct {
 	rendering:           bool, // inside vkCmdBeginRendering
 	barrier_due:         bool, // a memory barrier must precede the next command
 	batch:               int, // first vertex not yet drawn
+	// The union of the GS scissors of the vertices since batch, in GS
+	// pixels (x0, y0, x1, y1 inclusive); empty while x1 < x0.
+	clip:                [4]i32,
 	state:               Hw_State, // last state appended
 	state_idx:           u32,
 	state_ok:            bool, // state is in this slot's ring
@@ -221,6 +224,7 @@ hw_begin_slot :: proc() {
 	core.vk_begin(s.cmd, s.fence)
 	s.nverts, s.nstates, s.ncluts, s.nup = 0, 0, 0, 0
 	hw.batch = 0
+	hw.clip = CLIP_EMPTY
 	hw.state_ok, hw.clut_ok = false, false
 	hw.rendering = false
 	hw.barrier_due = true // orders this slot after the previous one
@@ -255,15 +259,31 @@ hw_flush_draws :: proc() {
 		vk.CmdBindPipeline(s.cmd, .GRAPHICS, hw.prim)
 		vp := vk.Viewport{0, 0, f32(size), f32(size), 0, 1}
 		vk.CmdSetViewport(s.cmd, 0, 1, &vp)
-		sc := vk.Rect2D{extent = {size, size}}
-		vk.CmdSetScissor(s.cmd, 0, 1, &sc)
 		pc := Draw_PC{hw.vram.addr, s.states.addr, s.cluts.addr, s.verts.addr, hw.scale}
 		vk.CmdPushConstants(s.cmd, hw.draw_layout, {.VERTEX, .FRAGMENT}, 0, size_of(pc), &pc)
 		hw.rendering = true
 	}
-	vk.CmdDraw(s.cmd, u32(n), 1, u32(hw.batch), 0)
+	// The fragment shader tests the GS scissor exactly; the Vulkan scissor
+	// only keeps the rasterizer from running it on fragments outside every
+	// scissor of the draw. A primitive reaching past them (one crossing the
+	// camera plane spans the whole render area) costs nothing there.
+	// Emptiness is tested in GS pixels, before CLIP_EMPTY could be scaled.
+	if hw.clip[2] >= hw.clip[0] && hw.clip[3] >= hw.clip[1] {
+		sc, size := i64(hw.scale), i64(2048 * hw.scale)
+		x0, y0 := clamp(i64(hw.clip[0]) * sc, 0, size), clamp(i64(hw.clip[1]) * sc, 0, size)
+		x1, y1 := clamp((i64(hw.clip[2]) + 1) * sc, 0, size), clamp((i64(hw.clip[3]) + 1) * sc, 0, size)
+		if x1 > x0 && y1 > y0 { // else no pixel passes the shader's test
+			r := vk.Rect2D{{i32(x0), i32(y0)}, {u32(x1 - x0), u32(y1 - y0)}}
+			vk.CmdSetScissor(s.cmd, 0, 1, &r)
+			vk.CmdDraw(s.cmd, u32(n), 1, u32(hw.batch), 0)
+		}
+	}
 	hw.batch = s.nverts
+	hw.clip = CLIP_EMPTY
 }
+
+@(private)
+CLIP_EMPTY :: [4]i32{max(i32), max(i32), min(i32), min(i32)}
 
 // Make every draw so far visible to the commands after.
 @(private)
@@ -699,6 +719,7 @@ hw_draw :: proc(c: ^Ctx, kind: u64) {
 	if kind == 6 && hw.scale > 1 {sprite_snap(out[:n], c.tme && !c.tex.bilinear, c.fst, c.tex.w, c.tex.h)}
 	copy(([^]Hw_Vert)(s.verts.ptr)[s.nverts:][:n], out[:n])
 	s.nverts += n
+	hw.clip = {min(hw.clip[0], c.sx0), min(hw.clip[1], c.sy0), max(hw.clip[2], c.sx1), max(hw.clip[3], c.sy1)}
 }
 
 // -------------------------------------------------------------- frames
