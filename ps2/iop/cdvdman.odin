@@ -1,11 +1,14 @@
 // cdvdman and ioman as IOP modules import them (PS_IRX=1), over the disc the
 // EE's cdvdfsv and fileio read (sif.odin): the same reader, and the same fd
 // table, as on retail, where the EE's file calls are served by the IOP's
-// ioman. A read is done when its call returns, as cdvdfsv's is: no time
-// passes. The callback sceCdCallback sets, which retail's drive interrupt
-// runs when a read completes, runs at the next iop_tick after the read
-// (cd_intr_run), on the handler coroutine (th_intr), with the function code
-// retail gives it; that one pending run is the state a snapshot holds.
+// ioman. A command is done when its call returns, as cdvdfsv's read is: no
+// time passes. The callback sceCdCallback sets, which retail's drive
+// interrupt runs when a command completes, runs at the next iop_tick after
+// the command (cd_intr_run), on the handler coroutine (th_intr), with the
+// function code retail gives it. Retail refuses a command while one is busy;
+// none is busy here, so each command accepted gets its own callback run, in
+// the order the commands were made: those runs not yet made are the state a
+// snapshot holds.
 package ps2_iop
 
 import "core:fmt"
@@ -20,12 +23,23 @@ ENODEV :: 19
 // date[8], flag}.
 CD_FILE :: 0x24
 
-// The function code a read's callback gets, retail's for sceCdRead.
+// The function codes a command's callback gets, retail's for sceCdRead and
+// sceCdStandby.
 CD_FUNC_READ :: 1
+CD_FUNC_STANDBY :: 5
+
+// The disk type cdvdman's sceCdGetDiskType and cdvdfsv's GetDiskType answer:
+// a PS2 DVD, for any disc, as nothing reads the type from the disc yet.
+CD_DISK_PS2_DVD :: 0x14
+
+// The most callback runs one tick can owe: commands made faster than ticks
+// run their callbacks.
+CD_PENDING :: 4
 
 Iop_Cd :: struct {
-	callback: u32, // IOP address; 0 is none
-	pending:  u32, // the function code of a completed read's callback not yet run, 0 none
+	callback:  u32, // IOP address; 0 is none
+	n_pending: u32,
+	pending:   [CD_PENDING]u32, // the function codes of the completed commands' callbacks not yet run, first made first
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -37,6 +51,9 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	a0, a1, a2, a3 := r[4], r[5], r[6], r[7]
 	switch fno {
 	case 4: // sceCdInit(mode): 1 for every mode. 0 waits for the drive, always ready here; 5 shuts down, nothing held
+		return 1, true
+	case 5: // sceCdStandby: spins the disc up, done here; 1, the command accepted
+		cd_done(CD_FUNC_STANDBY)
 		return 1, true
 	case 6: // sceCdRead(lsn, sectors, buffer, sceCdRMode *{trycount, spindlctrl, datapattern})
 		if a3 != 0 {
@@ -54,10 +71,7 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			disc_sectors(a0 + k, sector[:])
 			copy(iop_ram_at(a2 + k * DISC_SECTOR, DISC_SECTOR), sector[:])
 		}
-		if iop_cd.callback != 0 {
-			iop_cd.pending = CD_FUNC_READ
-			iop_wake_set()
-		}
+		cd_done(CD_FUNC_READ)
 		return 1, true
 	case 8: // sceCdGetError: none
 		return 0, true
@@ -67,6 +81,8 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return u32(found), true
 	case 11: // sceCdSync(mode): the read is done
 		return 0, true
+	case 12: // sceCdGetDiskType
+		return CD_DISK_PS2_DVD, true
 	case 13: // sceCdDiskReady(mode): 2, ready
 		return 2, true
 	case 37: // sceCdCallback(func): the previous func. Retail returns 0 and sets nothing while a command is busy; none is here
@@ -79,35 +95,57 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	return 0, false
 }
 
-// When, in EE cycles, the read callback is due: at once (the IOP's clock)
-// while one is pending; max(u64) when none is.
-cd_next_ee :: proc() -> u64 {
-	return max(u64) if iop_cd.pending == 0 else r3000.state.cycles * IOP_EE_RATIO
+// Owes the callback a run with function code `code` for a command just
+// completed, when one is set; with CD_PENDING owed already, the run is
+// dropped with a compat row.
+@(private = "file")
+cd_done :: proc(code: u32) {
+	cb := iop_cd.callback
+	if cb == 0 {return}
+	if iop_cd.n_pending == CD_PENDING {
+		core.compat_unknown(.Iop_Cd_Intr, cb, sub = code, pc = r3000.state.r[31])
+		fmt.eprintfln("iop: cdvdman callback at %x: %d runs owed, code %d dropped", cb, CD_PENDING, code)
+		return
+	}
+	iop_cd.pending[iop_cd.n_pending] = code
+	iop_cd.n_pending += 1
+	iop_wake_set()
 }
 
-// Runs the pending read callback, the callback set now, as retail's
-// interrupt reads it at completion; one that waits is stopped there with a
-// compat row.
+// When, in EE cycles, the callback runs owed are due: at once (the IOP's
+// clock) while one is; max(u64) when none is.
+cd_next_ee :: proc() -> u64 {
+	return max(u64) if iop_cd.n_pending == 0 else r3000.state.cycles * IOP_EE_RATIO
+}
+
+// Makes the callback runs owed, first owed first, each with the callback set
+// when it runs, as retail's interrupt reads it at each completion; one that
+// waits is stopped there with a compat row, and the rest still run.
 cd_intr_run :: proc() {
-	code := iop_cd.pending
-	iop_cd.pending = 0
-	if code == 0 || iop_cd.callback == 0 {return}
-	cb := iop_cd.callback
-	switch th_intr(cb, code, 0) {
-	case .None:
-	case .Blocked:
-		core.compat_unknown(.Iop_Cd_Intr, cb, pc = cb)
-		fmt.eprintfln("iop: cdvdman callback at %x blocked", cb)
-	case .Call:
-		fmt.eprintfln("iop: cdvdman callback at %x stopped", cb)
+	n := iop_cd.n_pending
+	if n == 0 {return}
+	codes := iop_cd.pending
+	iop_cd.n_pending, iop_cd.pending = 0, {}
+	for code in codes[:n] {
+		cb := iop_cd.callback
+		if cb == 0 {continue}
+		switch th_intr(cb, code, 0) {
+		case .None:
+		case .Blocked:
+			core.compat_unknown(.Iop_Cd_Intr, cb, pc = cb)
+			fmt.eprintfln("iop: cdvdman callback at %x blocked", cb)
+		case .Call:
+			fmt.eprintfln("iop: cdvdman callback at %x stopped", cb)
+		}
 	}
 }
 
-// After a failed load: puts the callback back as it was when the load began
-// (`saved`) if it lies in `freed`, the memory its undo frees, dropping its
-// pending run.
+// After a failed load: puts the callback and the runs owed back as they
+// were when the load began (`saved`) if the callback lies in `freed`, the
+// memory its undo frees. The load's own runs go; those owed before it stay,
+// to run with the callback put back.
 cd_undo :: proc(saved: Iop_Cd, freed: []Sys_Block) {
-	if sys_in(freed, iop_cd.callback) {iop_cd = {callback = saved.callback}}
+	if sys_in(freed, iop_cd.callback) {iop_cd = saved}
 }
 
 // Function fno of ioman, as stdio_fn. Results as fileio_server's.

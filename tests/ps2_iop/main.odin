@@ -2146,7 +2146,7 @@ test_libsd :: proc() {
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
 }
 
-CDVDMAN_FNOS := [?]u32{4, 6, 8, 10, 11, 13, 37, 75}
+CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 37, 75}
 IOMAN_FNOS := [?]u32{4, 5, 6, 8}
 
 // Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
@@ -2200,14 +2200,16 @@ test_cdvdman :: proc() {
 	put(&a, 0)
 	buf := at(&a)
 	for _ in 0 ..< 3 * SECTOR / 4 {put(&a, 0)}
-	// The read callbacks: cb counts its calls and records a0; cbb waits.
+	// The callbacks: cb counts its calls and records each a0 after the
+	// count, in call order; cbb waits.
 	ts := imports(&a, "thbase", 24) // SleepThread
 	cbw := at(&a)
-	put(&a, 0, 0)
+	put(&a, 0, 0, 0, 0, 0, 0, 0, 0)
 	cb := at(&a)
 	la(&a, T0, cbw)
-	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
-	put(&a, 0xad040004, JR_RA, 0x24020001) // sw a0, 4(t0); jr ra; li v0, 1
+	put(&a, 0x8d090000, 0, 0x00095080, 0x01485021) // lw t1, 0(t0); nop; sll t2, t1, 2; addu t2, t2, t0
+	put(&a, 0xad440004, 0x25290001, 0xad090000) // sw a0, 4(t2); addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, JR_RA, 0x24020001) // jr ra; li v0, 1
 	cbb := at(&a)
 	prologue(&a)
 	jal(&a, ts)
@@ -2224,6 +2226,8 @@ test_cdvdman :: proc() {
 	check(cd_call(cd, 13, 0) == 2 && cd_call(cd, 8) == 0 && cd_call(cd, 11, 0) == 0, "cdvdman: DiskReady 2, no error, Sync done")
 	check(cd_call(cd, 4, 0) == 1 && cd_call(cd, 4, 1) == 1 && cd_call(cd, 4, 5) == 1 && cd_call(cd, 4, 0xffffffff) == 1, "cdvdman: sceCdInit returns 1 for every mode")
 	check(cd_call(cd, 75, 1) == 1 && cd_call(cd, 75, 2) == 1 && cd_call(cd, 75, 0xff) == 1, "cdvdman: sceCdMmode returns 1")
+	check(cd_call(cd, 12) == iop.CD_DISK_PS2_DVD, "cdvdman: sceCdGetDiskType is a PS2 DVD")
+	check(cd_call(cd, 5) == 1 && iop.iop_cd == {}, "cdvdman: sceCdStandby with no callback returns 1, no run owed")
 	check(cd_call(cd, 10, b + file, b + big) == 1, "cdvdman: SearchFile finds the file")
 	rec := iop.iop_mem(b + file, iop.CD_FILE)
 	check(endian.unchecked_get_u32le(rec) == 23 && endian.unchecked_get_u32le(rec[4:]) == discimg.BIG && string(rec[8:17]) == "BIG.BIN;1", "cdvdman: the record's lsn, size and name")
@@ -2248,10 +2252,10 @@ test_cdvdman :: proc() {
 	// interrupt context.
 	iop.iop_u32(b + mode)^ = 0
 	check(iop.iop_cd == {} && cd_call(cd, 37, b + cb) == 0 && cd_call(cd, 37, b + cb) == b + cb, "cdvdman: sceCdCallback returns the previous callback")
-	check(iop.iop_cd.pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: no callback due before a read")
+	check(iop.iop_cd.n_pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: no callback due before a read")
 	cd_call(cd, 6, 23, 1, b + buf, b + mode)
 	now := r3000.state.cycles * 8
-	check(iop.iop_cd.pending == 1 && iop.cd_next_ee() == now && iop.iop_wake_ee == now && iop.iop_u32(b + cbw)^ == 0, "cdvdman: a read's callback is due at once, not run in the call")
+	check(iop.iop_cd.n_pending == 1 && iop.iop_cd.pending[0] == iop.CD_FUNC_READ && iop.cd_next_ee() == now && iop.iop_wake_ee == now && iop.iop_u32(b + cbw)^ == 0, "cdvdman: a read's callback is due at once, not run in the call")
 	core.snap_op, core.snap_target = .Save, &snap8
 	core.snap_yield()
 	if !snap8_loaded {
@@ -2261,23 +2265,43 @@ test_cdvdman :: proc() {
 		core.snap_op, core.snap_target = .Load, &snap8
 		core.snap_yield()
 	}
-	check(iop.iop_cd == {b + cb, 1} && iop.iop_u32(b + cbw)^ == 0, "cdvdman: the load restores the pending callback")
+	check(iop.iop_cd == {callback = b + cb, n_pending = 1, pending = {iop.CD_FUNC_READ, 0, 0, 0}} && iop.iop_u32(b + cbw)^ == 0, "cdvdman: the load restores the pending callback")
 	iop.iop_tick(now)
-	check(iop.iop_u32(b + cbw)^ == 1 && iop.iop_u32(b + cbw + 4)^ == iop.CD_FUNC_READ && iop.iop_cd.pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: the callback runs once, a0 the read's code")
+	check(iop.iop_u32(b + cbw)^ == 1 && iop.iop_u32(b + cbw + 4)^ == iop.CD_FUNC_READ && iop.iop_cd.n_pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: the callback runs once, a0 the read's code")
+
+	// Read, read, standby: one run each, in the order made, at one tick;
+	// a fifth command with four owed is dropped with a row.
+	iop.iop_u32(b + cbw)^ = 0
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	check(cd_call(cd, 5) == 1 && iop.iop_cd.n_pending == 3 && iop.iop_u32(b + cbw)^ == 0, "cdvdman: three commands owe three runs, none run in the call")
+	iop.iop_tick(r3000.state.cycles * 8)
+	runs := iop.iop_mem(b + cbw, 16)
+	check(endian.unchecked_get_u32le(runs) == 3 && endian.unchecked_get_u32le(runs[4:]) == iop.CD_FUNC_READ && endian.unchecked_get_u32le(runs[8:]) == iop.CD_FUNC_READ && endian.unchecked_get_u32le(runs[12:]) == iop.CD_FUNC_STANDBY, "cdvdman: read, read, standby run 3 times in order")
+	check(iop.iop_cd.n_pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: none owed after the tick")
+	iop.iop_u32(b + cbw)^ = 0
+	for _ in 0 ..< iop.CD_PENDING {cd_call(cd, 6, 23, 1, b + buf, b + mode)}
+	check(cd_call(cd, 5) == 1 && iop.iop_cd.n_pending == iop.CD_PENDING, "cdvdman: a command past the runs owed is still accepted")
+	check(core.compat.calls[core.Compat_Key{.Iop_Cd_Intr, b + cb, iop.CD_FUNC_STANDBY}].n == 1, "cdvdman: its run is dropped with a row")
+	iop.iop_tick(r3000.state.cycles * 8)
+	check(iop.iop_u32(b + cbw)^ == iop.CD_PENDING && iop.iop_u32(b + cbw + 4 * iop.CD_PENDING)^ == iop.CD_FUNC_READ, "cdvdman: the runs owed are made, the dropped one not")
+
 	iop.iop_u32(b + mode)^ = 0x00010000
 	cd_call(cd, 6, 23, 1, b + buf, b + mode)
-	check(iop.iop_cd.pending == 0, "cdvdman: a read refused for its data pattern has no callback")
+	check(iop.iop_cd.n_pending == 0, "cdvdman: a read refused for its data pattern has no callback")
 	iop.iop_u32(b + mode)^ = 0
 	cd_call(cd, 37, 0)
 	cd_call(cd, 6, 23, 1, b + buf, b + mode)
-	check(iop.iop_cd.pending == 0, "cdvdman: no callback set, none due")
+	check(iop.iop_cd.n_pending == 0, "cdvdman: no callback set, none due")
+	// A callback that waits is stopped with a row; the next owed still runs.
 	cd_call(cd, 37, b + cbb)
 	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	cd_call(cd, 5)
 	iop.iop_tick(r3000.state.cycles * 8)
-	check(core.compat.calls[core.Compat_Key{.Iop_Cd_Intr, b + cbb, 0}].n == 1 && iop.iop_cd.pending == 0, "cdvdman: a callback that waits is stopped, a row")
+	check(core.compat.calls[core.Compat_Key{.Iop_Cd_Intr, b + cbb, 0}].n == 2 && iop.iop_cd.n_pending == 0, "cdvdman: a callback that waits is stopped, a row, each run")
 
 	// "modk" sets its own callback, reads, then fails: modc's put back, the
-	// pending run dropped.
+	// load's run dropped; a run owed before the load stays.
 	cd_call(cd, 37, b + cb)
 	k: Asm
 	kcd := imports(&k, "cdvdman", 6, 37)
@@ -2295,7 +2319,13 @@ test_cdvdman :: proc() {
 	jal(&k, kcd)
 	jal(&k, ksm)
 	epilogue(&k)
-	check(load_buffer(build_mod("modk", &k, entry)) == {2, 0} && iop.iop_cd == {b + cb, 0}, "cdvdman: modk falls back, modc's callback put back, nothing pending")
+	check(load_buffer(build_mod("modk", &k, entry)) == {2, 0} && iop.iop_cd == {callback = b + cb}, "cdvdman: modk falls back, modc's callback put back, nothing pending")
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	saved := iop.iop_cd
+	check(load_buffer(build_mod("modk", &k, entry)) == {2, 0} && iop.iop_cd == saved && saved.n_pending == 1, "cdvdman: modk fails with a run owed before it, which stays")
+	iop.iop_u32(b + cbw)^ = 0
+	iop.iop_tick(r3000.state.cycles * 8)
+	check(iop.iop_u32(b + cbw)^ == 1 && iop.iop_u32(b + cbw + 4)^ == iop.CD_FUNC_READ && iop.iop_cd.n_pending == 0, "cdvdman: it runs once with modc's callback, its own code")
 
 	// ioman, over fileio's files.
 	fd := io_call(io, 4, b + sub, 1)

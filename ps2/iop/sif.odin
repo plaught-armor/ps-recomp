@@ -777,7 +777,7 @@ cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	switch fno {
 	case 0x01: // ReadClock {result, clock[8]}
 		w[0], w[1], w[2] = 1, 0, 0
-	case 0x03: w[0] = 0x14 // GetDiskType: PS2 DVD
+	case 0x03: w[0] = CD_DISK_PS2_DVD // GetDiskType
 	case 0x04: w[0] = 0 // GetError
 	case 0x05: w[0], w[1] = 1, 0 // TrayReq {result, tray check}
 	case 0x0c: w[0] = 0x0a // Status: paused
