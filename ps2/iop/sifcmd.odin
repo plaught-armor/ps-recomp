@@ -61,6 +61,18 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return sifcmd_dma_id(), true
 	case 14, 17, 19, 22:
 		return sifrpc_fn(fno)
+	case 23: // sceSifGetOtherData(rd, src, dest, size, mode): done at once
+		src, dest, size := a1, a2, r[7]
+		// EE RAM by its low 28 bits, as the EE's DMA addresses it; bit 28 names
+		// registers or scratchpad, never RAM. IOP RAM by its physical address.
+		e, i := src & 0x0fffffff, dest & 0x1fffffff
+		if src & 0x10000000 != 0 || e >= mem.RAM_SIZE || size > mem.RAM_SIZE - e || i >= IOP_RAM_SIZE || size > IOP_RAM_SIZE - i {
+			core.compat_unknown(.Iop_Other_Data, src, sub = size, pc = r[31])
+			fmt.eprintfln("iop: GetOtherData of %x bytes from EE %08x to IOP %08x out of range", size, src, dest)
+			return 0, true
+		}
+		copy(iop_ram[i:][:size], mem.ram[e:][:size])
+		return 0, true
 	}
 	return 0, false
 }

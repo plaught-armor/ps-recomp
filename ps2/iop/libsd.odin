@@ -12,6 +12,7 @@
 package ps2_iop
 
 import "core:fmt"
+import "core:math"
 import "ps:core"
 import cpu "../cpu"
 import r3000 "ps:psx/cpu"
@@ -71,6 +72,10 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 11: // sceSdSetCoreAttr(entry, value)
 		if !sd_core_attr(a0, a1) {libsd_unknown(fno, a0)}
 		return 0, true
+	case 13: // sceSdNote2Pitch(center note, center fine, note, fine)
+		p, found := sd_note_pitch(u16(a0), u16(a1), u16(a2), i16(a3))
+		if !found {libsd_unknown(fno, a3 & 0xffff)}
+		return p, true
 	case 17: // sceSdVoiceTrans(channel, mode, iop address, spu address, size): done at once
 		size := r32(r[29] + 16)
 		if a1 & 3 > 1 {return 0, true}
@@ -124,6 +129,43 @@ sd_undo :: proc(saved: Iop_Sd, freed: []Sys_Block) {
 		s.pending &~= SD_PENDING_SPU2 | SD_PENDING_SPU2 << 1
 	}
 	sd_block_drop(freed)
+}
+
+// sceSdNote2Pitch's pitch for `note` and `fine` (128ths of a semitone), the
+// note played at 0x1000 being `center_note` and `center_fine`, as retail
+// libsd 1.5 computes it. The fines add, the sum's whole semitones (truncated)
+// move the note; note minus center, as 16 bits, splits into octaves and a
+// semitone (truncated, a negative semitone or fine borrowing from the one
+// above). The semitone's ratio, 0x8000 times 2 to the semitone/12, rounded
+// down, times the fine's, 0x8000 times 2 to the fine/1536, rounded down, is
+// the pitch two octaves up, halved, rounding, once per octave under that.
+// Retail shifts by the low 5 bits as MIPS does, and gives a note three
+// octaves up or more its pitch two octaves up. A fine sum under -128 that is not a whole
+// semitone borrows twice and reads past retail's tables: found false, 0.
+@(private = "file")
+sd_note_pitch :: proc(center_note, center_fine, note: u16, fine: i16) -> (pitch: u32, found: bool) {
+	f := i32(fine) + i32(center_fine)
+	q := f / 128
+	f -= q * 128
+	n := i32(i16(i32(note) + q - i32(center_note)))
+	oct := n / 12
+	semi, shift := n - oct * 12, oct - 2
+	if semi < 0 || semi == 0 && f < 0 {
+		semi += 12
+		shift -= 1
+	}
+	if f < 0 {
+		semi += q - 1
+		f += (q + 1) * 128
+	}
+	if u32(semi) >= 12 || u32(f) >= 128 {return 0, false}
+	ratio := math.floor(0x8000 * math.pow(2, f64(semi) / 12)) * math.floor(0x8000 * math.pow(2, f64(f) / 1536))
+	p := u32(ratio) >> 16
+	if shift < 0 {
+		s := u32(-shift)
+		p = (p + 1 << ((s - 1) & 31)) >> (s & 31)
+	}
+	return p & 0xffff, true
 }
 
 // A call's id libsd_fn does not decode: a compat row, and a line under

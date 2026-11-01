@@ -53,8 +53,9 @@ COMPAT_TOP :: 10
 // answered 0; Iop_Timer the source and mode of an IOP hardware timer set
 // up to count what is not timed here; Iop_Timer_Intr the address of a timer
 // compare handler that waited or ran out of its budget; Iop_Cd_Intr the
-// address of a cdvdman read callback that did; Irx_Reloc the relocation
-// type.
+// address of a cdvdman read callback that did; Iop_Other_Data the EE
+// address and size of an IOP sceSifGetOtherData whose source or destination
+// runs past RAM, nothing copied; Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -79,6 +80,7 @@ Compat_Call :: enum u8 {
 	Iop_Timer,
 	Iop_Timer_Intr,
 	Iop_Cd_Intr,
+	Iop_Other_Data,
 	Irx_Reloc,
 }
 
@@ -246,6 +248,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Timer: return fmt.tprintf("IOP timer source %d mode %d not timed", k.id, k.sub)
 	case .Iop_Timer_Intr: return fmt.tprintf("IOP timer handler %08x blocked", k.id)
 	case .Iop_Cd_Intr: return fmt.tprintf("IOP cdvdman callback %08x blocked", k.id)
+	case .Iop_Other_Data: return fmt.tprintf("IOP GetOtherData from %08x size %x out of range", k.id, k.sub)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

@@ -171,6 +171,7 @@ game :: proc(_: rawptr) {
 	test_import_major()
 	test_thread_snap()
 	test_sifcmd()
+	test_other_data()
 	test_cmd_deliver()
 	test_rpc()
 	test_libsd()
@@ -1244,6 +1245,38 @@ test_sifcmd :: proc() {
 	check(s^ == {}, "sifcmd: the loader's reset clears the tables")
 }
 
+// sceSifGetOtherData copies EE RAM to IOP RAM in the call, through the EE's
+// uncached alias and to the IOP's kseg0 one; a source or destination past
+// RAM, or a source in the EE's registers, is a row and copies nothing.
+test_other_data :: proc() {
+	fresh()
+	fnos := [?]u32{23}
+	a: Asm
+	sc := imports(&a, "sifcmd", ..fnos[:])
+	dst := at(&a)
+	put(&a, 0, 0, 0, 0, 0x77777777)
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("modg", &a, entry), "modg", nil)
+	b := module_base(id)
+	u := proc(at: u32) -> u32 {return iop.iop_u32(at)^}
+	EE_SRC :: 0x00100400
+	for i in u32(0) ..< 5 {mem.wr32(EE_SRC + 4 * i, 0x11111111 * (i + 1))}
+	get :: proc(stubs, src, dest, size: u32) -> u32 {
+		fnos := [?]u32{23}
+		return lib_call(stubs, fnos[:], 23, 0, src, dest, size)
+	}
+	check(id > 0 && get(b + sc, 0x20000000 | EE_SRC, 0x80000000 | (b + dst), 16) == 0, "GetOtherData: returns 0")
+	check(u(b + dst) == 0x11111111 && u(b + dst + 12) == 0x44444444 && u(b + dst + 16) == 0x77777777, "GetOtherData: 16 bytes copied, no more")
+	iop.iop_u32(b + dst)^ = 0
+	rows :: proc(src, size: u32) -> u64 {return core.compat.calls[core.Compat_Key{.Iop_Other_Data, src, size}].n}
+	check(get(b + sc, mem.RAM_SIZE - 8, b + dst, 16) == 0 && rows(mem.RAM_SIZE - 8, 16) == 1, "GetOtherData: a source past EE RAM is a row")
+	check(get(b + sc, 0x10003000, b + dst, 16) == 0 && rows(0x10003000, 16) == 1, "GetOtherData: a source in the EE's registers is a row")
+	check(get(b + sc, EE_SRC, iop.IOP_RAM_SIZE - 8, 16) == 0 && rows(EE_SRC, 16) == 1, "GetOtherData: a destination past IOP RAM is a row")
+	check(get(b + sc, EE_SRC, b + dst, 0xffffffff) == 0 && rows(EE_SRC, 0xffffffff) == 1, "GetOtherData: a size past both is a row")
+	check(u(b + dst) == 0, "GetOtherData: nothing copied for any of them")
+}
+
 EE_LIST :: 0x00100000 // a SifSetDma list in EE RAM
 EE_PKT :: 0x00100100 // the packet it sends
 EE_BUF :: 0x00100200 // the EE's command buffer
@@ -1454,7 +1487,7 @@ test_rpc :: proc() {
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6, 20)
 	ts := imports(&a, "thsemap", 4, 6, 8)
-	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 23)
+	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 21)
 	logp := log_words(&a, 24)
 	sem, th := at(&a), at(&a) + 4
 	put(&a, 0, 0)
@@ -1644,7 +1677,7 @@ test_rpc :: proc() {
 	// and leaves a row; its server goes, and the next call is modp's.
 	call(40, 3, 0, 0, 0, hsd)
 	lost := core.Compat_Key{.Iop_Rpc, RPC_SID, 3}
-	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 23}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
+	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 21}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
 	check(len(iop.sif.replies) == 0 && s.n_servers == 1 && s.n_queues == 1 && s.servers[0].sd == bp + psd, "rpc: no RPC_END, R's server dropped, modp's left")
 	call(41, 3, 0, 0, 0, hsd)
 	want = []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4, 1, 4, 1, 4, 3, 0} // R logged fno 3 before it stopped
@@ -1652,7 +1685,7 @@ test_rpc :: proc() {
 }
 
 // libsd's functions, in the order "modl" imports them.
-LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 17, 18, 19, 20, 23, 25, 26, 27}
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 13, 17, 18, 19, 20, 23, 25, 26, 27}
 
 // "modl" as loaded: its base, the offsets of its libsd stubs, its data
 // (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
@@ -1733,6 +1766,41 @@ test_libsd :: proc() {
 	b := sdm.b
 	check(id > 0 && res == 0 && sd_word(3) == 0 && coroutines() == base + 1, "libsd: the module loads, its thread waits")
 	check(sd_call(4, 0) == 0, "libsd: sceSdInit")
+
+	// sceSdNote2Pitch(center note, center fine, note, fine): 0x1000 at the
+	// center, by semitones and 128ths of one, doubling per octave up to two;
+	// further up it stays at two octaves'. Values as retail libsd 1.5 gives.
+	pitches := [?][5]u32 {
+		{12, 0, 12, 0, 0x1000},
+		{60, 0, 60, 0, 0x1000},
+		{12, 0, 24, 0, 0x2000},
+		{12, 0, 0, 0, 0x800},
+		{60, 0, 48, 0, 0x800},
+		{12, 0, 36, 0, 0x4000},
+		{12, 0, 47, 0, 0x78d0},
+		{12, 0, 13, 0, 0x10f4},
+		{12, 0, 11, 0, 0xf1a},
+		{12, 0, 12, 64, 0x1078},
+		{12, 0, 12, 0xffffffc0, 0xf8b}, // fine -64
+		{12, 0, 23, 127, 0x1ffc}, // under the octave by a 128th
+		{0, 0, 12, 0xffffffff, 0x1ffc}, // under it from above, the fine borrowing
+		{12, 0, 11, 0xffffffff, 0xf18},
+		{60, 0, 61, 0xffffff9c, 0x1034}, // fine -100
+		{12, 5, 12, 0xfffffffb, 0x1000}, // the fines cancel
+		{12, 0, 12, 0xffffff80, 0xf1a}, // fine -128, a whole semitone down
+		{12, 0x7fff, 12, 0x7fff, 0x6580}, // the fines' semitones move the note
+		{12, 0, 0xffff, 0, 0x78d}, // notes as 16 bits: 13 under
+		{12, 0, 0x7fff, 0, 0x5fe4}, // far up, shifted by the low 5 bits
+		{12, 0, 0x8000, 0, 0x6597},
+		{12, 0, 0x7ff0, 0xffffffff, 0x5098},
+	}
+	for p in pitches {
+		v := sd_call(13, p[0], p[1], p[2], p[3])
+		check(v == p[4], fmt.tprintf("libsd: sceSdNote2Pitch(%d, %d, %x, %d) is %x, got %x", p[0], i32(p[1]), p[2], i32(p[3]), p[4], v))
+	}
+	sd_rows := core.compat.calls[core.Compat_Key{.Iop_Sd, 0xff7f, 13}].n
+	check(sd_call(13, 12, 0, 12, 0xffffff7f) == 0, "libsd: a fine under -128 off a semitone, past retail's tables, is 0")
+	check(core.compat.calls[core.Compat_Key{.Iop_Sd, 0xff7f, 13}].n == sd_rows + 1, "libsd: and a row")
 
 	// A block transfer plays its buffer in the ADMA layout: per 1024 bytes,
 	// 256 left samples then 256 right. Looping, it wraps to the start.
