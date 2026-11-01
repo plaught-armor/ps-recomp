@@ -59,7 +59,8 @@ COMPAT_TOP :: 10
 // vblank handler that waited or ran out of its budget, or, marked 1, one
 // AddVblankHandler had no room for; Iop_Other_Data the EE
 // address and size of an IOP sceSifGetOtherData whose source or destination
-// runs past RAM, nothing copied; Irx_Reloc the relocation type.
+// runs past RAM, nothing copied; Iop_Adx a PS2RNA command CRI ADX's HLE
+// driver does not serve (adx.odin); Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -86,6 +87,7 @@ Compat_Call :: enum u8 {
 	Iop_Cd_Intr,
 	Iop_Vblank_Intr,
 	Iop_Other_Data,
+	Iop_Adx,
 	Irx_Reloc,
 }
 
@@ -259,6 +261,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 		if k.sub != 0 {return fmt.tprintf("IOP vblank handler %08x no room", k.id)}
 		return fmt.tprintf("IOP vblank handler %08x blocked", k.id)
 	case .Iop_Other_Data: return fmt.tprintf("IOP GetOtherData from %08x size %x out of range", k.id, k.sub)
+	case .Iop_Adx: return fmt.tprintf("IOP ADX RNA command %d", k.id)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

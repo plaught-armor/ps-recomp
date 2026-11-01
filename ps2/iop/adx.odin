@@ -1,6 +1,7 @@
 package ps2_iop
 
 import "core:fmt"
+import "core:math"
 import "ps:core"
 import cpu "../cpu"
 import mem "../mem"
@@ -28,7 +29,10 @@ import mem "../mem"
 // filled ({0, lane, 0, IOP SJX, address, length}) and gets each chunk back
 // once played ({0, free lane, 0, EE SJX, address, length}). DTX 1 carries
 // PS2RNA commands {command, RNA, argument, argument}: 2 starts (1) or stops
-// (0) playback, 4 sets the sample rate. Its replies are never read.
+// (0) playback, 4 sets the sample rate, 5 the volume and 9 a channel's pan
+// (adx_mix). Its replies are never read. The driver has other commands (a
+// stream flush request, 8, among them); those are the "IOP ADX RNA command"
+// row.
 ADX_DTX :: 4
 ADX_SJX :: 32
 ADX_RNA :: 16
@@ -40,6 +44,8 @@ ADX_DTX_SJX :: 0
 ADX_DTX_RNA :: 1
 ADX_RNA_PLAY :: 2
 ADX_RNA_RATE :: 4
+ADX_RNA_VOLUME :: 5
+ADX_RNA_PAN :: 9
 
 Adx_Chunk :: struct {
 	addr, size: u32,
@@ -56,6 +62,8 @@ Adx_Rna :: struct {
 	handle, rate, channels: u32,
 	sj:                     [2]u32,
 	playing:                bool,
+	volume:                 i32, // 0 (silent) to 255 (full), every channel's
+	pan:                    [2]i32, // by channel, -15 (left only) to 15 (right only)
 	since:                  u64, // EE cycles when playback last started
 	clock:                  u64, // sample count times EE_CLOCK not yet played
 	// Bytes of PCM per channel played but not yet returned (the reply was
@@ -160,7 +168,7 @@ adx_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		adx.handles += 1
 		for &r, i in adx.rna {
 			if r.handle != 0 {continue}
-			r = {handle = adx.handles, channels = min(w[0], 2), sj = {w[2], w[3]}}
+			r = {handle = adx.handles, channels = min(w[0], 2), sj = {w[2], w[3]}, volume = 255}
 			adx_out_reset(&adx_out[i])
 			break
 		}
@@ -204,6 +212,7 @@ adx_rna_packet :: proc(t: ^Adx_Dtx) {
 	for n in 0 ..< count {
 		e := t.iop_work + 16 + n * 16
 		cmd, handle, arg := iop_u32(e)^ & 0xffff, iop_u32(e + 4)^, iop_u32(e + 8)^
+		arg2 := i32(iop_u32(e + 12)^)
 		for &r, i in adx.rna {
 			if r.handle != handle || handle == 0 {continue}
 			switch cmd {
@@ -213,6 +222,14 @@ adx_rna_packet :: proc(t: ^Adx_Dtx) {
 				r.playing = arg != 0
 			case ADX_RNA_RATE:
 				r.rate = arg
+			case ADX_RNA_VOLUME:
+				r.volume = clamp(arg2, 0, 255)
+			case ADX_RNA_PAN:
+				// The driver does not bound the channel; one past the stream's
+				// is left alone here.
+				if arg < r.channels {r.pan[arg] = clamp(arg2, -15, 15)}
+			case:
+				core.compat_unknown(.Iop_Adx, cmd)
 			}
 		}
 	}
@@ -337,7 +354,10 @@ ADX_CORE :: 1
 
 // Add the playing streams to interleaved stereo at MIX_RATE, resampled from
 // each stream's rate, into ADX_CORE's sum ahead of its master volume and its
-// one saturate (spu_mix). A stream starts, and restarts after running dry,
+// one saturate (spu_mix). Each channel plays on both sides at the gains its
+// volume and pan give (adx_gain), as the driver's own mixer plays it; a new
+// stream is at full volume and centred, so a channel no pan reaches plays at
+// about 0.7 on each side. A stream starts, and restarts after running dry,
 // only once it holds two vblanks of PCM, since round trips deliver it in
 // bursts.
 @(private)
@@ -350,6 +370,14 @@ adx_mix :: proc(out: []i32) {
 		if adx_sjx_of(r.sj[lc]) == nil {lc = rc}
 		if adx_sjx_of(r.sj[rc]) == nil {rc = lc}
 		if adx_sjx_of(r.sj[lc]) == nil {continue}
+		// Each channel mixed once: a stream down to one side plays that
+		// channel alone, at its own gains.
+		src := [2]int{lc, rc}
+		chans := lc == rc ? 1 : 2
+		gain: [2][2]i32 // by channel, then side
+		for c in 0 ..< 2 {
+			gain[c] = {adx_gain(r.volume, 15 + r.pan[c]), adx_gain(r.volume, 15 - r.pan[c])}
+		}
 		have := min(o.wr[lc], o.wr[rc])
 		// Overrun, after a burst: keep the newer half of the side furthest
 		// ahead. The other side then waits for the samples it lacks.
@@ -364,13 +392,34 @@ adx_mix :: proc(out: []i32) {
 			i := o.pos >> 32
 			if i + 3 > have {o.primed = false; break} // gauss reads i-1 .. i+2
 			p := u32(o.pos >> 24)
-			l := adx_gauss(o, lc, i, p)
-			s := adx_gauss(o, rc, i, p)
-			out[n] += l
-			out[n + 1] += s
+			for c in src[:chans] {
+				x := adx_gauss(o, c, i, p)
+				out[n] += adx_scale(x, gain[c][0])
+				out[n + 1] += adx_scale(x, gain[c][1])
+			}
 			o.pos += step
 		}
 	}
+}
+
+// One side's gain, 0 to 255, for a channel at `volume` that sits `step` of
+// 30 pan steps away from that side: 0 is that side only, 15 the centre, 30
+// the other side only. The driver's pan curve is a quarter sine,
+// floor(255 * sin((30 - step) * 3 degrees)), so the centre is 180, about
+// 0.7. Its product with the volume is rounded at the first decimal, as the
+// driver rounds it. The driver's second pan, a falloff that only command 13
+// sets, stays at its default, full.
+@(private)
+adx_gain :: proc(volume, step: i32) -> i32 {
+	curve := i32(math.floor(255 * math.sin(f64(30 - step) * math.PI / 60)))
+	return (volume * curve * 10 / 255 + 5) / 10
+}
+
+// Sample `x` at `gain`: 255 is unity, as the driver copies a full channel,
+// and any other gain scales by gain / 256.
+@(private)
+adx_scale :: #force_inline proc(x, gain: i32) -> i32 {
+	return gain == 255 ? x : x * gain >> 8
 }
 
 // Channel `ch` of `o` at sample `i` plus fraction `p` (8 bits), Gaussian

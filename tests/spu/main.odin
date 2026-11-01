@@ -411,14 +411,15 @@ adx :: proc() {
 	adx_packet(1, {4, rna, 48000, 0})
 
 	iop.spu_master(1, 0x4000, 0x4000)
-	inv := adx_run(rna, sjx)
+	inv := adx_run(rna, sjx) // a new stream: centred, 180 a side
 	heard := true
-	for x in inv {if x > -ADX_LEVEL * 9 / 10 {heard = false}}
+	for x in inv {if x > -ADX_LEVEL * 180 / 256 * 9 / 10 {heard = false}}
 	check(heard, "ADX heard through core 1's master")
 	iop.spu_master(0, 0x2000, 0x2000)
 	check(scaled(adx_run(rna, sjx), inv, -0x4000, -0x4000), "core 0's master leaves ADX alone") // still inverted
 	iop.spu_master(1, 0x2ccc, 0x1000)
 	check(scaled(adx_run(rna, sjx), inv, 0x2ccc, 0x1000), "core 1's master scales ADX exactly")
+	adx_levels(rna, sjx, inv)
 
 	// With a loud voice of core 1, the core saturates the sum once.
 	iop.spu_master(1, 0x3fff, 0x3fff)
@@ -430,6 +431,51 @@ adx :: proc() {
 	silent := true
 	for x in mix(4) {if x != 0 {silent = false}}
 	check(silent, "a stopped stream is silent")
+}
+
+// out is the stream of `ref`, a run at unity on the left and silent on the
+// right through master 0x4000, at gains l and r as the driver's mixer plays
+// them.
+gained :: proc(out, ref: []i32, l, r: i32) -> bool {
+	at :: proc(x, g: i32) -> i32 {return g == 255 ? x : x * g >> 8}
+	for k := 0; k < len(out); k += 2 {
+		x := -ref[k]
+		if out[k] != -at(x, l) || out[k + 1] != -at(x, r) {return false}
+	}
+	return true
+}
+
+// PS2RNA volume (5, {RNA, 0, volume}) and pan (9, {RNA, channel, pan}) on
+// the one channel of `rna`; `centre` is its run as created.
+adx_levels :: proc(rna, sjx: u32, centre: []i32) {
+	iop.spu_master(1, 0x4000, 0x4000)
+	adx_packet(1, {9, rna, 0, transmute(u32)i32(-15)})
+	ref := adx_run(rna, sjx)
+	unity := true
+	for k := 0; k < len(ref); k += 2 {
+		if ref[k] > -ADX_LEVEL * 9 / 10 || ref[k + 1] != 0 {unity = false}
+	}
+	check(unity, "a channel panned left plays at unity on the left only")
+	check(gained(centre, ref, 180, 180), "a new stream plays at full volume, centred")
+	adx_packet(1, {5, rna, 0, 103})
+	check(gained(adx_run(rna, sjx), ref, 103, 0), "volume scales a channel by volume / 256")
+	adx_packet(1, {5, rna, 0, 200}, {9, rna, 0, 5})
+	check(gained(adx_run(rna, sjx), ref, 100, 173), "a pan between the sides takes the sine curve, rounded")
+	adx_packet(1, {9, rna, 1, 15})
+	check(gained(adx_run(rna, sjx), ref, 100, 173), "a pan of a channel the stream lacks is ignored")
+	adx_packet(1, {5, rna, 0, 300}, {9, rna, 0, 40})
+	check(gained(adx_run(rna, sjx), ref, 0, 255), "volume and pan clamp to their ranges")
+	adx_packet(1, {5, rna, 0, transmute(u32)i32(-5)})
+	check(gained(adx_run(rna, sjx), ref, 0, 0), "a negative volume clamps to silent")
+	adx_packet(1, {8, rna, 1, 0})
+	check(core.compat.calls[{.Iop_Adx, 8, 0}].n == 1, "a command the HLE does not serve is a row")
+	adx_packet(1, {5, rna, 0, 255}, {9, rna, 0, 0})
+
+	// A stereo stream whose right channel has no SJX: its left plays once.
+	half := adx_call(0x408, 2, 0, 0x111, 0x222)
+	adx_packet(1, {4, half, 48000, 0})
+	check(gained(adx_run(half, sjx), ref, 180, 180), "a stereo stream missing a side plays the other once, centred")
+	adx_call(0x409, half)
 }
 
 // Call sdrdrv's RPC function fno: the reply's first word. The EE side sends
