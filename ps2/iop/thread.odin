@@ -438,6 +438,17 @@ th_sleep :: proc() -> u32 {
 	return th_wait(.Sleep)
 }
 
+// The running thread waits until IOP cycle `at` as a delayed one, so the
+// scheduler wakes it with DelayThread's; at once when `at` is not ahead
+// (vblank.odin). A handler is stopped even then: retail refuses a wait in
+// an interrupt handler before it looks at what it would wait for.
+th_wait_until :: proc(at: u64) -> u32 {
+	if iop_sched.intr {th_intr_stop(.Blocked)}
+	if at <= r3000.state.cycles {return KE_OK}
+	if t := th_find(iop_sched.cur); t != nil {t.wake_at = at}
+	return th_wait(.Delay)
+}
+
 // WakeupThread(id): readies thread id if it sleeps, else counts a wakeup.
 th_wakeup :: proc(id: u32) -> u32 {
 	t := th_find(id)

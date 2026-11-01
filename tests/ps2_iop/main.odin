@@ -174,11 +174,15 @@ game :: proc(_: rawptr) {
 	test_other_data()
 	test_cmd_deliver()
 	test_rpc()
+	test_rpc_remove()
+	test_rpc_self_remove()
+	test_sifman()
 	test_libsd()
 	test_cdvdman()
 	test_sdrdrv()
 	test_timrman()
 	test_system_time()
+	test_vblank()
 	test_fallback()
 
 	if failed {os.exit(1)}
@@ -1684,8 +1688,217 @@ test_rpc :: proc() {
 	check(log_equal(b, logp, want) && core.compat.calls[{.Sif_Rpc, RPC_SID, 3}].n == 0 && call_ends(hsd, 41), "rpc: the next call is modp's, RPC_END and no row")
 }
 
+// sceSifRemoveRpc and sceSifRemoveRpcQueue return as retail's list walk: the
+// one removed when it was first, else the one before it, 0 when it is not
+// there; the servers left keep their order, so the first registered still
+// takes the calls; requests queued for what goes are lost with rows, the one
+// a queue's thread runs is not. A failed load's removals come back where
+// they were, the requests stay lost; one with no room to come back is a row.
+test_rpc_remove :: proc() {
+	fresh()
+	s := &iop.iop_rpc
+	call :: proc(fno: u32, args: ..u32) -> u32 {
+		r := &r3000.state.r
+		for v, i in args {r[4 + i] = v}
+		v, ok := iop.sifcmd_fn(fno)
+		check(ok, fmt.tprintf("rpc remove: sifcmd fno %d served", fno))
+		return v
+	}
+	sds :: proc(want: ..u32) -> bool {
+		s := &iop.iop_rpc
+		if s.n_servers != len(want) {return false}
+		for v, i in s.servers[:s.n_servers] {
+			if v.sd != want[i] {return false}
+		}
+		return true
+	}
+	qds :: proc(want: ..u32) -> bool {
+		s := &iop.iop_rpc
+		if s.n_queues != len(want) {return false}
+		for v, i in s.queues[:s.n_queues] {
+			if v.qd != want[i] {return false}
+		}
+		return true
+	}
+	Q1, Q2, Q3 :: 0x1f0000, 0x1f0100, 0x1f0200
+	A, B, C, D :: 0x1f1000, 0x1f1100, 0x1f1200, 0x1f1300
+	SID :: 0x5500
+	reset :: proc() {
+		s := &iop.iop_rpc
+		s^ = {}
+		s.servers[0] = {SID, A, Q1}
+		s.servers[1] = {SID, B, Q1}
+		s.servers[2] = {SID + 2, C, Q2}
+		s.servers[3] = {SID, D, Q1}
+		s.n_servers = 4
+		s.queues[0] = {qd = Q1}
+		s.queues[1] = {qd = Q2}
+		s.queues[2] = {qd = Q3}
+		s.n_queues = 3
+	}
+
+	reset()
+	s.reqs[0] = {sid = SID, sd = B, qd = Q1, fno = 7}
+	s.reqs[1] = {sid = SID, sd = A, qd = Q1, fno = 8}
+	s.n_reqs = 2
+	check(call(24, B, Q1) == A && sds(A, C, D), "rpc remove: a server after the first returns the one before it")
+	check(core.compat.calls[{.Iop_Rpc, SID, 7}].n == 1 && s.n_reqs == 1 && s.reqs[0].sd == A, "rpc remove: its queued request is lost with a row, the other's kept")
+	check(call(24, D, Q1) == A && sds(A, C), "rpc remove: one after a server on another queue returns the one before it on its own")
+	check(call(24, C, Q1) == 0 && sds(A, C), "rpc remove: a server on another queue is not removed, 0")
+	check(call(24, A, Q1) == A && sds(C) && s.n_reqs == 0, "rpc remove: the first returns itself")
+	check(call(24, A, Q1) == 0 && sds(C), "rpc remove: one not there is 0, nothing done")
+	check(core.compat.calls[{.Iop_Rpc, SID, 8}].n == 1, "rpc remove: the first's queued request is lost with a row")
+
+	reset()
+	check(call(24, B, Q1) == A && sds(A, C, D), "rpc remove: the first registered for the id is still first, the rest in order")
+
+	reset()
+	s.queues[1].busy, s.queues[1].cur = true, {sid = SID + 2, sd = C, qd = Q2, fno = 9}
+	s.reqs[0] = {sid = SID + 2, sd = C, qd = Q2, fno = 10}
+	s.n_reqs = 1
+	check(call(25, Q2) == Q1 && qds(Q1, Q3) && sds(A, B, D), "rpc remove: a queue after the first returns the one before it, its server goes")
+	check(core.compat.calls[{.Iop_Rpc, SID + 2, 10}].n == 1 && s.n_reqs == 0, "rpc remove: a request queued on it is lost with a row")
+	check(core.compat.calls[{.Iop_Rpc, SID + 2, 9}].n == 0, "rpc remove: the one its thread runs is not lost")
+	check(call(25, Q3) == Q1 && qds(Q1), "rpc remove: the last returns the one before it")
+	check(call(25, Q1) == Q1 && s.n_queues == 0 && s.n_servers == 0, "rpc remove: the first returns itself, its servers go")
+	check(call(25, Q1) == 0, "rpc remove: a queue not there is 0")
+
+	// "modx" removes B and queue Q2, then its load fails: both come back,
+	// where they were, with C; B's queued request stays lost.
+	reset()
+	for &q in s.queues[:s.n_queues] {
+		q.thread = iop.iop_sched.next_thid
+		append(&iop.iop_sched.threads, iop.Iop_Thread{id = q.thread})
+		iop.iop_sched.next_thid += 1
+	}
+	s.reqs[0] = {sid = SID, sd = B, qd = Q1, fno = 11}
+	s.n_reqs = 1
+	x: Asm
+	xsc := imports(&x, "sifcmd", 24, 25)
+	xsm := imports(&x, "sysmem", 99)
+	xentry := at(&x)
+	prologue(&x)
+	li32(&x, A0, B)
+	li32(&x, A1, Q1)
+	jal(&x, xsc)
+	li32(&x, A0, Q2)
+	jal(&x, xsc + 8)
+	jal(&x, xsm)
+	li(&x, V0, 0)
+	epilogue(&x)
+	saved := s^
+	idx, _ := iop.iop_load(build_mod("modx", &x, xentry), "modx", nil)
+	check(idx <= 0 && sds(A, B, C, D) && qds(Q1, Q2, Q3), "rpc remove: a failed load's removals come back where they were")
+	check(s.servers == saved.servers && s.queues == saved.queues, "rpc remove: as they were")
+	check(core.compat.calls[{.Iop_Rpc, SID, 11}].n == 1 && s.n_reqs == 0, "rpc remove: the request the removal lost stays lost, its row kept")
+
+	// A load removed B and registered two servers in memory that stays, the
+	// table full: B comes back where it was, the first new one after the
+	// servers there before, the second has no room and is a row.
+	reset()
+	for &q, i in s.queues[:s.n_queues] {q.thread = saved.queues[i].thread}
+	for i in 4 ..< 31 {s.servers[i] = {SID + 0x100 + u32(i), 0x1f2000 + 0x10 * u32(i), Q1}}
+	s.n_servers = 31
+	saved = s^
+	call(24, B, Q1)
+	s.servers[30] = {SID + 0x200, 0x1f4000, Q1}
+	s.servers[31] = {SID + 0x201, 0x1f4100, Q1}
+	s.n_servers = iop.IOP_RPC_SERVERS
+	iop.rpc_undo(saved, nil)
+	same := s.n_servers == iop.IOP_RPC_SERVERS
+	for i in 0 ..< 31 {same &&= s.servers[i] == saved.servers[i]}
+	check(same && s.servers[31].sid == SID + 0x200, "rpc remove: the server put back takes its place, the first new one follows")
+	check(core.compat.calls[{.Iop_Rpc, SID + 0x201, max(u32)}].n == 1, "rpc remove: the one with no room is a row")
+
+	// A load removed Q2 and set queue QN, with a server and a request queued
+	// for it, the queues full: Q2 comes back, QN has no room and is a row, its
+	// server goes with it, a row too, and its request is lost.
+	QN :: 0x1f0f00
+	reset()
+	for i in 3 ..< iop.IOP_RPC_QUEUES {s.queues[i] = {qd = Q1 + 0x100 * u32(i)}}
+	s.n_queues = iop.IOP_RPC_QUEUES
+	for &q in s.queues[:s.n_queues] {
+		q.thread = iop.iop_sched.next_thid
+		append(&iop.iop_sched.threads, iop.Iop_Thread{id = q.thread})
+		iop.iop_sched.next_thid += 1
+	}
+	saved = s^
+	call(25, Q2)
+	s.queues[iop.IOP_RPC_QUEUES - 1] = {qd = QN, thread = saved.queues[0].thread}
+	s.n_queues = iop.IOP_RPC_QUEUES
+	s.servers[s.n_servers] = {SID + 0x300, 0x1f5000, QN}
+	s.n_servers += 1
+	s.reqs[0] = {sid = SID + 0x300, sd = 0x1f5000, qd = QN, fno = 12}
+	s.n_reqs = 1
+	iop.rpc_undo(saved, nil)
+	check(s.queues == saved.queues && s.n_queues == iop.IOP_RPC_QUEUES && sds(A, B, C, D), "rpc remove: the queue put back takes its place, the new one and its server go")
+	check(core.compat.calls[{.Iop_Rpc, QN, max(u32)}].n == 1, "rpc remove: the queue with no room is a row")
+	check(core.compat.calls[{.Iop_Rpc, SID + 0x300, max(u32)}].n == 1, "rpc remove: its server is a row")
+	check(core.compat.calls[{.Iop_Rpc, SID + 0x300, 12}].n == 1 && s.n_reqs == 0, "rpc remove: the request queued for it is lost with a row")
+}
+
+RPC_SID3 :: 0x4323
+
+// A served function that removes its own queue: its call ends with RPC_END,
+// and the next call to the id is the HLE's.
+test_rpc_self_remove :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	drop_replies()
+	defer drop_replies()
+	cpu.state.cycles = 0
+	cpu.next_event = 1 << 40
+	// "modv": thread V serves RPC_SID3 with func, which removes V's queue
+	// and returns 0.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6, 20)
+	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 25)
+	th := at(&a)
+	put(&a, 0)
+	sd := at(&a)
+	for _ in 0 ..< 18 {put(&a, 0)}
+	qd := at(&a)
+	for _ in 0 ..< 8 {put(&a, 0)}
+	fn := at(&a)
+	prologue(&a)
+	la(&a, A0, qd)
+	jal(&a, sc + 32)
+	li(&a, V0, 0)
+	epilogue(&a)
+	ev := rpc_thread(&a, tb + 16, sc, RPC_SID3, {sd, fn, sd, qd}, false)
+	tp := thread_param(&a, ev, 10)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, tp, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modv", &a, entry), "modv", nil)
+	b := module_base(id)
+	s := &iop.iop_rpc
+	check(id > 0 && s.n_servers == 1 && s.servers[0] == {RPC_SID3, b + sd, b + qd} && s.n_queues == 1, "rpc self remove: V registers its server")
+	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, RPC_SID3)
+	hsd := reply_word(0, 9)
+	drop_replies()
+
+	send_pkt(iop.SIF_CMD_RPC_CALL, 2, 0, 0, 0, 1, 0, 0, 0, 0, hsd)
+	check(call_ends(hsd, 2) && s.n_queues == 0 && s.n_servers == 0, "rpc self remove: the call ends with RPC_END, the queue and server gone")
+	check(core.compat.calls[{.Iop_Rpc, RPC_SID3, 1}].n == 0, "rpc self remove: the call is not lost")
+	drop_replies()
+	send_pkt(iop.SIF_CMD_RPC_CALL, 3, 0, 0, 0, 4, 0, 0, 0, 0, hsd)
+	check(core.compat.calls[{.Sif_Rpc, RPC_SID3, 4}].n == 1 && call_ends(hsd, 3), "rpc self remove: the next call is the HLE's, a row and RPC_END")
+}
+
+// sceSifInit finds SIF set up, as at boot, and sceSifCheckInit says so.
+test_sifman :: proc() {
+	v5, ok5 := iop.sifman_fn(5)
+	v29, ok29 := iop.sifman_fn(29)
+	check(ok5 && v5 == 1 && ok29 && v29 == 1, "sifman: sceSifInit returns the flag set at boot, sceSifCheckInit it")
+}
+
 // libsd's functions, in the order "modl" imports them.
-LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 13, 17, 18, 19, 20, 23, 25, 26, 27}
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 13, 17, 18, 19, 20, 23, 25, 26, 27, 28}
 
 // "modl" as loaded: its base, the offsets of its libsd stubs, its data
 // (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
@@ -1835,6 +2048,8 @@ test_libsd :: proc() {
 	// runs after it. Taken after a snapshot, whose load drops the handler
 	// coroutine made since.
 	check(sd_call(26, 1, b + h, 7) == 0, "libsd: SetTransIntrHandler returns the previous handler, none")
+	check(sd_call(28, 1) == 7 && sd_call(28, 0) == 0, "libsd: GetTransIntrHandlerArgument is the channel's argument 26 set")
+	check(sd_call(28, 2) == 0 && core.compat.calls[{.Iop_Sd, 2, 28}].n == 1, "libsd: GetTransIntrHandlerArgument of a channel past 1 is 0 and a row")
 	C0 :: 5000
 	cpu.state.cycles = C0
 	sd_call(18, 1, 0x10, b + buf, 0x2000, 0)
@@ -2545,4 +2760,151 @@ test_system_time :: proc() {
 	check(lo == 0x2345_6789 && hi == 1 && lib_call(b + tb, fnos[:], 43) == lo, "thbase: GetSystemTimeLow is GetSystemTime's low word")
 	r3000.state.cycles = C + 1000
 	check(lib_call(b + tb, fnos[:], 43) == lo + 1000, "thbase: GetSystemTimeLow tracks the clock")
+}
+
+// The EE kernel's next vblank start and end the vblank test hands the IOP
+// (not emulated state: kernel_init points the IOP at the kernel's own).
+vbl_start, vbl_end: u64
+snap9: core.Snapshot
+snap9_loaded: bool // not emulated state
+
+// vblank 4 and 6 wait for the next vblank start and return at once in
+// vblank; 5 and 7 the same for the end, out of it; none at once before the
+// first start. A waiter is a delayed thread, woken at its edge with every
+// other on it; it survives a snapshot, a failed load's undo leaves none, a
+// handler that calls one is stopped.
+test_vblank :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	s := &iop.iop_sched
+	F :: cpu.CYCLES_PER_FRAME
+	L :: F / 262
+	iop.ee_vblank_start, iop.ee_vblank_end = &vbl_start, &vbl_end
+	defer iop.ee_vblank_start, iop.ee_vblank_end = nil, nil
+	// "modq": threads A and B (priority 20) wait for the end and log 1 and
+	// 2; C (20) waits for the start and logs 3; handlers h4 and h5 call 4
+	// and 5.
+	a: Asm
+	VB_FNOS :: [4]u32{4, 5, 6, 7}
+	fnos := VB_FNOS
+	vb := imports(&a, "vblank", ..fnos[:])
+	tb := imports(&a, "thbase", 4, 6)
+	logp := log_words(&a, 4)
+	ths := at(&a)
+	put(&a, 0, 0, 0)
+	ea := at(&a)
+	prologue(&a)
+	jal(&a, vb + 8)
+	log_v(&a, logp, 1)
+	epilogue(&a)
+	eb := at(&a)
+	prologue(&a)
+	jal(&a, vb + 8)
+	log_v(&a, logp, 2)
+	epilogue(&a)
+	ec := at(&a)
+	prologue(&a)
+	jal(&a, vb)
+	log_v(&a, logp, 3)
+	epilogue(&a)
+	h4 := at(&a)
+	prologue(&a)
+	jal(&a, vb)
+	epilogue(&a)
+	h5 := at(&a)
+	prologue(&a)
+	jal(&a, vb + 8)
+	epilogue(&a)
+	params := [3]u32{thread_param(&a, ea, 20), thread_param(&a, eb, 20), thread_param(&a, ec, 20)}
+	entry := at(&a)
+	prologue(&a)
+	for p, i in params {
+		call_addr(&a, tb, p, ths + 4 * u32(i))
+		call_word(&a, tb + 8, ths + 4 * u32(i))
+	}
+	li(&a, V0, 0)
+	epilogue(&a)
+
+	// Called with no thread: 0 at once, KE_CAN_NOT_WAIT for a wait.
+	vb_at :: proc(b, vb: u32, ee: u64) -> [4]u32 {
+		r3000.state.cycles = (ee + 7) / 8
+		out: [4]u32
+		fnos := VB_FNOS
+		for f, i in fnos {out[i] = lib_call(b + vb, fnos[:], f)}
+		return out
+	}
+	WAIT := neg(417)
+	vbl_start, vbl_end = F - 22 * L, F
+	cpu.state.cycles, r3000.state.cycles = 0, 0 // a load brings the IOP's clock up to the EE's
+	id, r := iop.iop_load(build_mod("modq", &a, entry), "modq", nil)
+	b := module_base(id)
+	check(id > 0 && r == 0, "vblank: modq loads")
+	check(vb_at(b, vb, 0) == {WAIT, WAIT, WAIT, WAIT} && vb_at(b, vb, F - 22 * L - 8) == {WAIT, WAIT, WAIT, WAIT}, "vblank: before the first start every call waits")
+	check(vb_at(b, vb, F - 22 * L) == {0, WAIT, 0, WAIT} && vb_at(b, vb, F - 8) == {0, WAIT, 0, WAIT}, "vblank: from a start, 4 and 6 at once, 5 and 7 wait")
+	check(vb_at(b, vb, F) == {WAIT, 0, WAIT, 0} && vb_at(b, vb, 2 * F - 22 * L - 8) == {WAIT, 0, WAIT, 0}, "vblank: from an end, 5 and 7 at once, 4 and 6 wait")
+	check(vb_at(b, vb, 10 * F + 1) == {WAIT, 0, WAIT, 0} && vb_at(b, vb, 11 * F - 21 * L) == {0, WAIT, 0, WAIT}, "vblank: the IOP's clock frames past the kernel's next edges")
+	vbl_start, vbl_end = 2 * F - 22 * L, 2 * F
+	check(vb_at(b, vb, F + 8) == {WAIT, 0, WAIT, 0}, "vblank: the kernel's next edges, past its last end")
+
+	// modq's threads, started in vblank: C passes, A and B wait for the end.
+	fresh()
+	vbl_start, vbl_end = 2 * F - 22 * L, F
+	cpu.state.cycles = F - 21 * L
+	r3000.state.cycles = cpu.state.cycles / 8
+	id, r = iop.iop_load(build_mod("modq", &a, entry), "modq", nil)
+	b = module_base(id)
+	th :: proc(b, ths: u32, i: u32) -> ^iop.Iop_Thread {return iop.th_find(iop.iop_u32(b + ths + 4 * i)^)}
+	WAKE :: (F + 7) / 8
+	check(id > 0 && r == 0 && log_equal(b, logp, {3}), "vblank: in vblank the start waiter passes at once")
+	ta, tb2 := th(b, ths, 0), th(b, ths, 1)
+	check(ta.status == .Delay && tb2.status == .Delay && ta.wake_at == WAKE && tb2.wake_at == WAKE, "vblank: the end waiters are delayed to the end")
+	check(iop.iop_wake_ee == WAKE * 8 && iop.iop_wake_ee >= F, "vblank: the IOP's wake is the end, not before it")
+	iop.iop_tick((F - 21 * L) & ~u64(7))
+	check(log_equal(b, logp, {3}) && th(b, ths, 0).status == .Delay, "vblank: a tick short of the end runs nothing, no thread ready")
+	core.snap_op, core.snap_target = .Save, &snap9
+	core.snap_yield()
+	if !snap9_loaded {
+		iop.iop_tick(F)
+		check(log_equal(b, logp, {3, 1, 2}), "vblank: at the end both waiters wake, in the order they waited")
+		snap9_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap9
+		core.snap_yield()
+	}
+	check(log_equal(b, logp, {3}) && th(b, ths, 0).status == .Delay && th(b, ths, 1).wake_at == WAKE, "vblank: the load puts the waiters back")
+	iop.iop_tick(F)
+	check(log_equal(b, logp, {3, 1, 2}), "vblank: the restored waiters wake at the end")
+
+	// Out of vblank, a handler is stopped, whether its call would wait (4)
+	// or pass (5).
+	check(iop.th_intr(b + h4, 0, 0) == .Blocked, "vblank: a handler waiting for the start is stopped")
+	check(iop.th_intr(b + h5, 0, 0) == .Blocked, "vblank: a handler whose call would pass is stopped too")
+
+	// "modz": its thread (priority 5) waits for the end, then its start
+	// fails: the thread and its wait are gone.
+	cpu.state.cycles = 2 * F - 21 * L
+	vbl_start, vbl_end = 3 * F - 22 * L, 2 * F
+	z: Asm
+	zvb := imports(&z, "vblank", 5)
+	ztb := imports(&z, "thbase", 4, 6)
+	zsm := imports(&z, "sysmem", 99)
+	zth := at(&z)
+	put(&z, 0)
+	ze := at(&z)
+	prologue(&z)
+	jal(&z, zvb)
+	epilogue(&z)
+	zp := thread_param(&z, ze, 5)
+	entry = at(&z)
+	prologue(&z)
+	call_addr(&z, ztb, zp, zth)
+	call_word(&z, ztb + 8, zth)
+	jal(&z, zsm)
+	li(&z, V0, 0)
+	epilogue(&z)
+	threads := len(s.threads)
+	idz, _ := iop.iop_load(build_mod("modz", &z, entry), "modz", nil)
+	delayed := 0
+	for t in s.threads {if t.status == .Delay {delayed += 1}}
+	check(idz <= 0 && len(s.threads) == threads && delayed == 0, "vblank: a failed load's waiting thread leaves no waiter")
 }

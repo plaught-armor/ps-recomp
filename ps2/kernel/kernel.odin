@@ -128,6 +128,7 @@ kernel_init :: proc() {
 	for n in u32(0) ..< 256 {mem.wr32(SYSCALL_TABLE + n * 4, 0x80001000 + n * 8)}
 	k.vblank_start = cpu.CYCLES_PER_FRAME - 22 * CYCLES_PER_LINE
 	k.vblank_end = cpu.CYCLES_PER_FRAME
+	iop.ee_vblank_start, iop.ee_vblank_end = &k.vblank_start, &k.vblank_end
 	update_next_event()
 }
 

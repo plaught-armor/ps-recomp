@@ -80,6 +80,10 @@ sifrpc_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 22: // sceSifRpcLoop(qd): returns only on a thread that cannot sleep
 		return rpc_loop(a0), true
+	case 24: // sceSifRemoveRpc(sd, qd)
+		return rpc_remove(a0, a1), true
+	case 25: // sceSifRemoveRpcQueue(qd)
+		return rpc_remove_queue(a0), true
 	}
 	return 0, false
 }
@@ -117,6 +121,44 @@ rpc_queue_set :: proc(qd, thread: u32) {
 		s.n_queues += 1
 	}
 	q^ = {qd = qd, thread = thread}
+}
+
+// sceSifRemoveRpc: takes server sd off queue qd, the requests queued for it
+// lost (rpc_drop_server). What retail's walk of the queue's list returns: sd
+// when it was the queue's first, else the server before it there; 0, and
+// nothing done, when sd is not on qd. The guest's list words are not kept
+// (rpc_register), so none is written.
+@(private = "file")
+rpc_remove :: proc(sd, qd: u32) -> u32 {
+	s := &iop_rpc
+	prev := sd
+	for v, i in s.servers[:s.n_servers] {
+		if v.qd != qd {continue}
+		if v.sd == sd {
+			rpc_drop_server(i)
+			return prev
+		}
+		prev = v.sd
+	}
+	return 0
+}
+
+// sceSifRemoveRpcQueue: takes queue qd off the list calls are routed by, and
+// with it its servers, whose calls retail no longer finds; the requests
+// queued for them are lost (rpc_drop_queue). One its thread runs ends as
+// usual. Returns as rpc_remove, by the order the queues were set.
+@(private = "file")
+rpc_remove_queue :: proc(qd: u32) -> u32 {
+	s := &iop_rpc
+	prev := qd
+	for q in s.queues[:s.n_queues] {
+		if q.qd == qd {
+			rpc_drop_queue(qd)
+			return prev
+		}
+		prev = q.qd
+	}
+	return 0
 }
 
 // The server that takes calls to sid, -1 if none: as retail's search, the
@@ -281,11 +323,17 @@ rpc_lost :: proc(req: Iop_Rpc_Req) {
 // request it ran and those queued for it are lost (rpc_lost).
 @(private = "file")
 rpc_gone :: proc(qd: u32) {
+	if q := rpc_queue(qd); q != nil && q.busy {rpc_lost(q.cur)}
+	rpc_drop_queue(qd)
+}
+
+// Removes queue qd, and its servers and the requests queued for them, which
+// are lost (rpc_lost).
+@(private = "file")
+rpc_drop_queue :: proc(qd: u32) {
 	s := &iop_rpc
 	for i := s.n_queues - 1; i >= 0; i -= 1 {
-		q := s.queues[i]
-		if q.qd != qd {continue}
-		if q.busy {rpc_lost(q.cur)}
+		if s.queues[i].qd != qd {continue}
 		copy(s.queues[i:s.n_queues - 1], s.queues[i + 1:s.n_queues])
 		s.n_queues -= 1
 	}
@@ -323,9 +371,17 @@ rpc_thread_gone :: proc(id: u32) {
 
 // After a failed load: drops each queue in `freed`, the memory its undo
 // frees, or whose thread the undo deleted (rpc_gone), and each server with
-// its descriptor, function or buffer there.
-rpc_undo :: proc(freed: []Sys_Block) {
-	s := &iop_rpc
+// its descriptor, function or buffer there. Then what the load removed
+// (rpc_remove, rpc_remove_queue) and was there when it began (`saved`) comes
+// back where it was: a queue whose thread is still there, then a server whose
+// queue is back or was never set. The requests the removal lost stay lost,
+// with their rows. A queue the load added that then has no room is a row
+// (function number all ones), and is dropped with its servers, each a row as
+// well, and the requests queued for them, lost; the one its thread runs ends
+// as usual. A server the load added with no room is rpc_register's row.
+rpc_undo :: proc(saved: Iop_Rpc, freed: []Sys_Block) {
+	s, saved := &iop_rpc, saved
+	was := saved.queues[:saved.n_queues]
 	for i := s.n_queues - 1; i >= 0; i -= 1 {
 		if i >= s.n_queues {continue}
 		q := s.queues[i]
@@ -336,4 +392,81 @@ rpc_undo :: proc(freed: []Sys_Block) {
 		sd := s.servers[i].sd
 		if sys_in(freed, sd) || sys_in(freed, r32(sd + 4)) || sys_in(freed, r32(sd + 8)) {rpc_drop_server(i)}
 	}
+
+	queues: [IOP_RPC_QUEUES]Iop_Rpc_Queue
+	n := 0
+	for v in was {
+		if q := rpc_queue(v.qd); q != nil {
+			queues[n] = q^
+		} else if !sys_in(freed, v.qd) && th_find(v.thread) != nil {
+			queues[n] = {qd = v.qd, thread = v.thread}
+			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc queue %x a failed load removed is back", v.qd)}
+		} else {
+			continue
+		}
+		n += 1
+	}
+	full: [IOP_RPC_QUEUES]u32
+	nf := 0
+	for v in s.queues[:s.n_queues] {
+		if rpc_set_in(was, v.qd) {continue}
+		if n == IOP_RPC_QUEUES {
+			full[nf] = v.qd
+			nf += 1
+			continue
+		}
+		queues[n] = v
+		n += 1
+	}
+	for qd in full[:nf] {
+		core.compat_unknown(.Iop_Rpc, qd, sub = max(u32))
+		fmt.eprintfln("iop: rpc queue %x: no room after a failed load, its servers left to the HLE", qd)
+		for v in s.servers[:s.n_servers] {
+			if v.qd == qd {core.compat_unknown(.Iop_Rpc, v.sid, sub = max(u32))}
+		}
+		rpc_drop_queue(qd)
+	}
+	s.queues, s.n_queues = queues, n
+
+	servers: [IOP_RPC_SERVERS]Iop_Rpc_Server
+	m := 0
+	for v in saved.servers[:saved.n_servers] {
+		cur := -1
+		for w, i in s.servers[:s.n_servers] {
+			if w.sd == v.sd {cur = i}
+		}
+		if cur >= 0 {
+			servers[m] = s.servers[cur]
+		} else if !sys_in(freed, v.sd) && (rpc_queue(v.qd) != nil || !rpc_set_in(was, v.qd)) {
+			servers[m] = v
+			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc server %08x a failed load removed is back", v.sid)}
+		} else {
+			continue
+		}
+		m += 1
+	}
+	for v in s.servers[:s.n_servers] {
+		known := false
+		for w in saved.servers[:saved.n_servers] {
+			if w.sd == v.sd {known = true}
+		}
+		if known {continue}
+		if m == IOP_RPC_SERVERS {
+			core.compat_unknown(.Iop_Rpc, v.sid, sub = max(u32))
+			fmt.eprintfln("iop: rpc server %08x: no room after a failed load, left to the HLE", v.sid)
+			continue
+		}
+		servers[m] = v
+		m += 1
+	}
+	s.servers, s.n_servers = servers, m
+}
+
+// Whether queue qd is one of `queues`.
+@(private = "file")
+rpc_set_in :: proc(queues: []Iop_Rpc_Queue, qd: u32) -> bool {
+	for q in queues {
+		if q.qd == qd {return true}
+	}
+	return false
 }

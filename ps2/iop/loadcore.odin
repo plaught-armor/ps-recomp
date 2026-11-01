@@ -101,8 +101,8 @@ iop_loader: struct {
 	// During a load: its module, whether it failed, the stubs it patched,
 	// and the state before it, which a failure restores (undo_restore): the
 	// loader's, sysmem's, the handlers sifcmd, libsd and sdrdrv hold, the
-	// timers, cdvdman's callback, the user table's words and which fds were
-	// open.
+	// timers, cdvdman's callback, the RPC servers and queues, the user
+	// table's words and which fds were open.
 	loading: u32,
 	failed:  bool,
 	gaps:    u32, // the HLE calls the start made that failed
@@ -118,6 +118,7 @@ iop_loader: struct {
 		sdr:     Iop_Sdr,
 		timr:    Iop_Timr,
 		cd:      Iop_Cd,
+		rpc:     Iop_Rpc,
 		open:    [dynamic]bool, // by fd
 	},
 	// The images whose load failed, keyed by failed_key.
@@ -433,7 +434,7 @@ undo_save :: proc() {
 	append(&u.blocks, ..sys_blocks[:])
 	clear(&u.stubs)
 	for a, s in iop_loader.stubs {u.stubs[a] = s}
-	u.sifcmd, u.sd, u.sdr, u.timr, u.cd = iop_sifcmd, iop_sd, iop_sdr, iop_timr, iop_cd
+	u.sifcmd, u.sd, u.sdr, u.timr, u.cd, u.rpc = iop_sifcmd, iop_sd, iop_sdr, iop_timr, iop_cd, iop_rpc
 	clear(&u.sif_tab)
 	for i in 0 ..< 2 * min(iop_sifcmd.user_size, IOP_RAM_SIZE / 8) {
 		append(&u.sif_tab, r32(iop_sifcmd.user_tab + 4 * i))
@@ -456,7 +457,8 @@ undo_restore :: proc() {
 	append(&l.pending, ..l.undo.pending[:])
 	// What the load allocated, which is freed below: no handler is left
 	// pointing there (cdvdman's callback included), the timers it allocated
-	// are as they were, and the fds it opened are closed. What else it did
+	// are as they were, the RPC servers and queues it removed are back
+	// (rpc_undo), and the fds it opened are closed. What else it did
 	// is kept: bytes it wrote to memory that stays, what it sent the EE, the
 	// SPU2 registers and voices it set, threads it did not make that it
 	// started or woke, and fds open before it that it closed or moved.
@@ -469,7 +471,7 @@ undo_restore :: proc() {
 	sdr_undo(l.undo.sdr, freed[:])
 	tim_undo(l.undo.timr, freed[:])
 	cd_undo(l.undo.cd, freed[:])
-	rpc_undo(freed[:])
+	rpc_undo(l.undo.rpc, freed[:])
 	for &f, i in fileio.files {
 		if f.f != nil && (i >= len(l.undo.open) || !l.undo.open[i]) {f = {}}
 	}
@@ -580,6 +582,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return th_base(fno)
 	case "thsemap":
 		return th_semap(fno)
+	case "vblank":
+		return vblank_fn(fno)
 	case "stdio":
 		return stdio_fn(fno)
 	case "sysclib":

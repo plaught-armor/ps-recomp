@@ -48,7 +48,8 @@ COMPAT_TOP :: 10
 // the first 4 bytes of a path an IOP ioman open names on a device other than
 // the disc; Iop_Rpc the server id and function number of an RPC to an IOP
 // module's server that got no RPC_END, or whose request or reply did not
-// fit (function number all ones: a server with no room); Iop_Sdr an EE
+// fit (function number all ones: a server, or by its descriptor a queue,
+// with no room); Iop_Sdr an EE
 // sdrdrv RPC whose IOP user command handler is set and was not run, the EE
 // answered 0; Iop_Timer the source and mode of an IOP hardware timer set
 // up to count what is not timed here; Iop_Timer_Intr the address of a timer

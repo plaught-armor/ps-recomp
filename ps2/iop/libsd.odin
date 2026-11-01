@@ -108,6 +108,12 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		old := s.spu2.func
 		s.spu2 = {a0, a1}
 		return old, true
+	case 28: // sceSdGetTransIntrHandlerArgument(channel): the arg 26 set
+		if a0 > 1 { // retail reads past its two channels
+			libsd_unknown(fno, a0)
+			return 0, true
+		}
+		return s.trans[a0].arg, true
 	}
 	return 0, false
 }
