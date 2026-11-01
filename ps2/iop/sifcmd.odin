@@ -59,6 +59,8 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		w32(pkt + 8, a0)
 		sif_send_raw(iop_ram_at(pkt, psize))
 		return sifcmd_dma_id(), true
+	case 14, 17, 19, 22:
+		return sifrpc_fn(fno)
 	}
 	return 0, false
 }

@@ -158,6 +158,7 @@ iop_loader_init :: proc() {
 	th_init()
 	iop_sifcmd = {}
 	iop_sd = {}
+	iop_rpc = {}
 }
 
 // The failed_paths key of image `data` loaded as `path`: two builds of one
@@ -456,6 +457,7 @@ undo_restore :: proc() {
 	}
 	sifcmd_undo(l.undo.sifcmd, l.undo.sif_tab[:], freed[:])
 	sd_undo(l.undo.sd, freed[:])
+	rpc_undo(freed[:])
 	for &f, i in fileio.files {
 		if f.f != nil && (i >= len(l.undo.open) || !l.undo.open[i]) {f = {}}
 	}

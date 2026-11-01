@@ -278,7 +278,8 @@ sif_command :: proc(a, pc: u32) {
 		if !ok {
 			sd = IOP_SERVERS + u32(len(sif.bound)) * 0x10000
 			sif.bound[sid] = sd
-			if sid not_in sif.servers {
+			// A module serving sid (PS_IRX=1) answers its calls: no row.
+			if sid not_in sif.servers && !(iop_irx && rpc_server(sid) >= 0) {
 				sif_unknown(pc, .Sif_Bind, sid, client = client)
 				fmt.eprintfln("sif: bind to unimplemented server %08x", sid)
 			}
@@ -289,6 +290,7 @@ sif_command :: proc(a, pc: u32) {
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		fno, send_size, receive, recv_size, server := arg(a, 4), arg(a, 5), arg(a, 6), arg(a, 7), arg(a, 9)
 		sid := iop_u32(server)^
+		if iop_irx && iop_rpc_call(a, sid) {return}
 		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
 		if !ok || !handler(fno, buf, send_size) {
@@ -927,6 +929,7 @@ sif_snap :: proc() {
 	core.snap_add(&iop_sched)
 	core.snap_add(&iop_sifcmd)
 	core.snap_add(&iop_sd)
+	core.snap_add(&iop_rpc)
 	core.snap_add(&iop_wake_ee)
 	iop_cpu_snap()
 	adx_snap()

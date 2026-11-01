@@ -45,7 +45,10 @@ COMPAT_TOP :: 10
 // interrupt handler that waited or ran out of its budget; Iop_Cd the data
 // pattern of an IOP sceCdRead, which reads only 2048-byte sectors; Iop_Io
 // the first 4 bytes of a path an IOP ioman open names on a device other than
-// the disc; Irx_Reloc the relocation type.
+// the disc; Iop_Rpc the server id and function number of an RPC to an IOP
+// module's server that got no RPC_END, or whose request or reply did not
+// fit (function number all ones: a server with no room); Irx_Reloc the
+// relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -65,6 +68,7 @@ Compat_Call :: enum u8 {
 	Iop_Sd_Intr,
 	Iop_Cd,
 	Iop_Io,
+	Iop_Rpc,
 	Irx_Reloc,
 }
 
@@ -225,6 +229,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Io:
 		dev := transmute([4]u8)k.id
 		return fmt.tprintf("IOP ioman device %q", strings.truncate_to_byte(string(dev[:]), 0))
+	case .Iop_Rpc: return fmt.tprintf("IOP server %08x fno %d", k.id, i32(k.sub))
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

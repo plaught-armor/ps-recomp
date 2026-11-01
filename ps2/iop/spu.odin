@@ -497,6 +497,15 @@ sd_block_status :: proc(channel: u32) -> u32 {
 	return sdr_block_pos(&spu.block[channel & 1]) & 0xffffff
 }
 
+// sceSdBlockTransStatus as libsd answers it: sd_block_status, and in bit 24
+// the half of the buffer it reads now.
+sd_block_status_half :: proc(channel: u32) -> u32 {
+	b := &spu.block[channel & 1]
+	pos := sdr_block_pos(b)
+	half := u32(pos - b.base >= b.size / 2 && b.size != 0)
+	return pos & 0xffffff | half << 24
+}
+
 // libsd's calls past sdrdrv's, which only libsd.odin makes, after the shared
 // ones above did not decode the id.
 

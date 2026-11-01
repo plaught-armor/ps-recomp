@@ -84,6 +84,8 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return v, true
 	case 19: // sceSdVoiceTransStatus(channel, flag): always done
 		return 1, true
+	case 20: // sceSdBlockTransStatus(channel, flag)
+		return sd_block_status_half(a0), true
 	case 23: // sceSdSetEffectAttr(core, sceSdEffectAttr *)
 		e := a1
 		set := spu_effect(int(a0 & 1), r32(e + 4), i16(r32(e + 8)), i16(r32(e + 8) >> 16))

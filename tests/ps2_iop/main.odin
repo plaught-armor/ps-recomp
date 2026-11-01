@@ -158,6 +158,7 @@ game :: proc(_: rawptr) {
 	test_thread_snap()
 	test_sifcmd()
 	test_cmd_deliver()
+	test_rpc()
 	test_libsd()
 	test_cdvdman()
 	test_fallback()
@@ -1189,8 +1190,301 @@ test_cmd_deliver :: proc() {
 	check(coroutines() == base && iop.iop_wake_ee == max(u64), "deliver: the loader's reset kills it")
 }
 
+// Sends the IOP a packet of command `cid` with payload `args`.
+send_pkt :: proc(cid: u32, args: ..u32) {
+	n := 16 + 4 * u32(len(args))
+	for w, i in ([4]u32{n, 0, cid, 0}) {mem.wr32(EE_PKT + 4 * u32(i), w)}
+	for w, i in args {mem.wr32(EE_PKT + 16 + 4 * u32(i), w)}
+	for w, i in ([4]u32{EE_PKT, iop.IOP_CMDBUF, n, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
+	iop.sif_set_dma(EE_LIST, 1, 0)
+}
+
+// Word w of the IOP's queued packet i.
+reply_word :: proc(i, w: int) -> u32 {return ([^]u32)(raw_data(iop.sif.replies[i]))[w]}
+
+drop_replies :: proc() {
+	for p in iop.sif.replies {delete(p)}
+	clear(&iop.sif.replies)
+}
+
+// Whether the IOP's queued packets are, in order, the RPC_ENDs of the calls
+// with rec_id `recs`, made to descriptor sd.
+call_ends :: proc(sd: u32, recs: ..u32) -> bool {
+	if len(iop.sif.replies) != len(recs) {return false}
+	for rec, i in recs {
+		if reply_word(i, 2) != iop.SIF_CMD_RPC_END || reply_word(i, 4) != rec {return false}
+		if reply_word(i, 8) != iop.SIF_CMD_RPC_CALL || reply_word(i, 9) != sd {return false}
+	}
+	return true
+}
+
+A3 :: 7
+T1 :: 9
+T2 :: 10
+
+li32 :: proc(a: ^Asm, rt, v: u32) {put(a, 0x3c000000 | rt << 16 | v >> 16, 0x34000000 | rt << 21 | rt << 16 | v & 0xffff)}
+
+// bne rs, rt to a label not yet placed; its word index, for branch_to.
+bne :: proc(a: ^Asm, rs, rt: u32) -> int {
+	put(a, 0x14000000 | rs << 21 | rt << 16, 0)
+	return len(a.w) - 2
+}
+branch_to :: proc(a: ^Asm, i: int) {a.w[i] |= (at(a) - 4 * u32(i) - 4) / 4 & 0xffff}
+
+// A thread entry that serves server `sid` (sd, func, buf, qd its four
+// words, IOP addresses or offsets after `rel`) on queue qd: InitRpc,
+// SetRpcQueue, RegisterRpc, RpcLoop. Stubs: GetThreadId, sifcmd 14, 17, 19
+// and 22 at sc, sc + 8, ...
+rpc_thread :: proc(a: ^Asm, gtid, sc, sid: u32, w: [4]u32, abs: bool) -> u32 {
+	addr :: proc(a: ^Asm, rt, v: u32, abs: bool) {if abs {li32(a, rt, v)} else {la(a, rt, v)}}
+	sd, fn, buf, qd := w[0], w[1], w[2], w[3]
+	e := at(a)
+	put(a, 0x27bdffe0, 0xafbf001c) // addiu sp, sp, -32; sw ra, 28(sp)
+	li(a, A0, 0)
+	jal(a, sc)
+	jal(a, gtid)
+	addr(a, A0, qd, abs)
+	put(a, 0x00402825) // or a1, v0, zero
+	jal(a, sc + 16)
+	addr(a, A0, sd, abs)
+	li(a, A1, sid)
+	addr(a, A2, fn, abs)
+	addr(a, A3, buf, abs)
+	addr(a, T0, qd, abs)
+	put(a, 0xafa00010, 0xafa00014, 0xafa80018) // sw zero, 16(sp); sw zero, 20(sp); sw t0, 24(sp)
+	jal(a, sc + 8)
+	addr(a, A0, qd, abs)
+	jal(a, sc + 24)
+	put(a, 0x8fbf001c, JR_RA, 0x27bd0020) // lw ra, 28(sp); jr ra; addiu sp, sp, 32
+	return e
+}
+
+snap5: core.Snapshot
+snap5_loaded: bool // not emulated state
+
+RPC_SID :: 0x4321
+RPC_SID2 :: 0x4322 // registered by a load that fails
+
+// Conditions: a bind made before the module registers reaches its server;
+// the EE's request and reply are bounded by the server's buffer and EE
+// RAM; calls are served first come first, one queued while the function
+// waits is kept, and both survive a snapshot; a request whose RPC_END never
+// comes leaves a row; a queue whose thread a failed load's undo killed is
+// dropped, its server's call left to the HLE; of two servers for one id,
+// the first registered takes the calls, and dropping it leaves the other.
+test_rpc :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	drop_replies()
+	defer drop_replies()
+	cpu.state.cycles = 0
+	cpu.next_event = 1 << 40
+	// "modr": thread R serves RPC_SID with func, which logs fno and size;
+	// fno 2 waits on sem, fno 3 calls what sifcmd lacks; it returns buf,
+	// or 0 for fno 0.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6, 20)
+	ts := imports(&a, "thsemap", 4, 6, 8)
+	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 23)
+	logp := log_words(&a, 24)
+	sem, th := at(&a), at(&a) + 4
+	put(&a, 0, 0)
+	sd := at(&a)
+	for _ in 0 ..< 18 {put(&a, 0)}
+	qd := at(&a)
+	for _ in 0 ..< 8 {put(&a, 0)}
+	buf := at(&a)
+	for _ in 0 ..< 16 {put(&a, 0)}
+	sd2 := at(&a)
+	for _ in 0 ..< 18 {put(&a, 0)}
+	qd2 := at(&a)
+	for _ in 0 ..< 8 {put(&a, 0)}
+	buf2 := at(&a)
+	for _ in 0 ..< 16 {put(&a, 0)}
+	sd3 := at(&a)
+	for _ in 0 ..< 18 {put(&a, 0)}
+	qd3 := at(&a)
+	for _ in 0 ..< 8 {put(&a, 0)}
+	semp := sema_param(&a, 0, 0)
+	fn := at(&a)
+	put(&a, 0x27bdfff0, 0xafbf0000, 0xafa50004, 0xafa40008) // addiu sp, sp, -16; sw ra, 0(sp); sw a1, 4(sp); sw a0, 8(sp)
+	la(&a, T0, logp)
+	put(&a, 0x8d090000, 0, 0xad240000, 0xad260004, 0x25290008, 0xad090000) // lw t1, 0(t0); nop; sw a0, 0(t1); sw a2, 4(t1); addiu t1, t1, 8; sw t1, 0(t0)
+	li(&a, T2, 2)
+	l1 := bne(&a, A0, T2)
+	lw_at(&a, A0, sem)
+	jal(&a, ts + 16)
+	branch_to(&a, l1)
+	put(&a, 0x8fa40008, 0) // lw a0, 8(sp); nop
+	li(&a, T2, 3)
+	l2 := bne(&a, A0, T2)
+	jal(&a, sc + 32)
+	branch_to(&a, l2)
+	put(&a, 0x8fa20004, 0x8fa40008, 0) // lw v0, 4(sp); lw a0, 8(sp); nop
+	l3 := bne(&a, A0, 0)
+	li(&a, V0, 0)
+	branch_to(&a, l3)
+	epilogue(&a)
+	er := rpc_thread(&a, tb + 16, sc, RPC_SID, {sd, fn, buf, qd}, false)
+	tp := thread_param(&a, er, 10)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, semp, sem)
+	call_addr(&a, tb, tp, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+
+	// The bind comes first: the HLE's descriptor, as without a server.
+	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, RPC_SID)
+	hsd := reply_word(0, 9)
+	check(len(iop.sif.replies) == 1 && iop.iop_u32(hsd)^ == RPC_SID, "rpc: a bind before the module answers the HLE's descriptor")
+	drop_replies()
+	id, r := iop.iop_load(build_mod("modr", &a, entry), "modr", nil)
+	b := module_base(id)
+	s := &iop.iop_rpc
+	check(id > 0 && r == 0 && s.n_servers == 1 && s.servers[0] == {RPC_SID, b + sd, b + qd}, "rpc: R registers its server")
+	check(iop.iop_u32(b + sd)^ == RPC_SID && iop.iop_u32(b + sd + 4)^ == b + fn && iop.iop_u32(b + sd + 8)^ == b + buf && iop.iop_u32(b + sd + 0x40)^ == b + qd, "rpc: RegisterRpc fills the descriptor")
+	check(iop.iop_u32(b + qd)^ == iop.iop_u32(b + th)^ && s.n_queues == 1 && !s.queues[0].busy, "rpc: SetRpcQueue names R, which sleeps")
+	check(core.compat.calls[{.Sif_Bind, RPC_SID, 0}].n == 1, "rpc: the bind before the module leaves a row")
+	delete_key(&iop.sif.bound, RPC_SID)
+	send_pkt(iop.SIF_CMD_RPC_BIND, 3, 0, 0, 0, RPC_SID)
+	check(core.compat.calls[{.Sif_Bind, RPC_SID, 0}].n == 1, "rpc: a bind to a sid a module serves leaves no row")
+	hsd = reply_word(0, 9)
+	drop_replies()
+
+	// A call reaches func with the request copied in; the reply is the
+	// rsize bytes func returned, then RPC_END.
+	EE_RECV :: 0x00100400
+	call :: proc(rec, fno, size, recv, rsize, sd: u32) {
+		send_pkt(iop.SIF_CMD_RPC_CALL, rec, 0, 0, 0, fno, size, recv, rsize, 0, sd)
+	}
+	iop.iop_u32(hsd + 0x100)^, iop.iop_u32(hsd + 0x104)^ = 0x11111111, 0x22222222
+	call(10, 1, 8, EE_RECV, 8, hsd)
+	check(log_equal(b, logp, {1, 8}) && s.calls == 1, "rpc: the call reaches func with fno and size")
+	check(mem.rd32(EE_RECV) == 0x11111111 && mem.rd32(EE_RECV + 4) == 0x22222222, "rpc: the request in buf, the reply from what func returned")
+	check(call_ends(hsd, 10), "rpc: then RPC_END")
+	drop_replies()
+
+	mem.wr32(EE_RECV, 0xaaaaaaaa)
+	call(11, 0, 8, EE_RECV, 8, hsd)
+	check(log_equal(b, logp, {1, 8, 0, 8}) && mem.rd32(EE_RECV) == 0xaaaaaaaa && call_ends(hsd, 11), "rpc: func returning 0 copies nothing, RPC_END all the same")
+	drop_replies()
+
+	// Out of bounds: the request past the module's block, the reply past EE
+	// RAM; a row each, and RPC_END.
+	row := core.Compat_Key{.Iop_Rpc, RPC_SID, 1}
+	call(12, 1, 0x8000, EE_RECV, 8, hsd)
+	check(log_equal(b, logp, {1, 8, 0, 8, 1, 0}) && core.compat.calls[row].n == 1 && call_ends(hsd, 12), "rpc: a request past the buffer's block is cut to 0 bytes, a row")
+	drop_replies()
+	call(13, 1, 8, mem.RAM_SIZE - 4, 8, hsd)
+	check(core.compat.calls[row].n == 2 && call_ends(hsd, 13), "rpc: a reply past EE RAM is not copied, a row")
+	drop_replies()
+
+	// fno 2 waits in func; a call made meanwhile is queued behind it.
+	call(20, 2, 4, 0, 0, hsd)
+	call(21, 1, 4, 0, 0, hsd)
+	want := []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4}
+	check(log_equal(b, logp, want) && len(iop.sif.replies) == 0 && s.n_reqs == 1 && s.queues[0].busy, "rpc: a call while func waits is queued, no RPC_END yet")
+	core.snap_op, core.snap_target = .Save, &snap5
+	core.snap_yield()
+	if !snap5_loaded {
+		ids, _ := iop.iop_load(mod_s(), "mods", nil)
+		check(ids > 0 && log_equal(b, logp, {1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4}) && call_ends(hsd, 20, 21), "rpc: the signal ends fno 2, then the queued call runs, in order")
+		drop_replies()
+		snap5_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap5
+		core.snap_yield()
+	}
+	drop_replies()
+	check(log_equal(b, logp, want) && s.n_reqs == 1 && s.queues[0].busy && s.queues[0].cur.rec_id == 20, "rpc: the snapshot keeps the request in func and the one queued")
+	ids, _ := iop.iop_load(mod_s(), "mods", nil)
+	check(ids > 0 && log_equal(b, logp, {1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4}) && call_ends(hsd, 20, 21) && s.n_reqs == 0, "rpc: after the load both end as before")
+	drop_replies()
+
+	// A failed load whose threads registered RPC_SID2, and RPC_SID again,
+	// their descriptors and queues in modr's resident memory: the undo kills
+	// the threads, their queues and servers go, and a call to RPC_SID2 is the
+	// HLE's; RPC_SID is still R's.
+	q: Asm
+	qtb := imports(&q, "thbase", 4, 6, 20)
+	qsc := imports(&q, "sifcmd", 14, 17, 19, 22)
+	qsm := imports(&q, "sysmem", 99)
+	qth := at(&q)
+	put(&q, 0, 0)
+	eq := rpc_thread(&q, qtb + 16, qsc, RPC_SID2, {b + sd2, b + fn, b + buf2, b + qd2}, true)
+	qtp := thread_param(&q, eq, 4) // ahead of the start, which it preempts
+	eq3 := rpc_thread(&q, qtb + 16, qsc, RPC_SID, {b + sd3, b + fn, b + buf2, b + qd3}, true)
+	qtp3 := thread_param(&q, eq3, 4)
+	qentry := at(&q)
+	prologue(&q)
+	call_addr(&q, qtb, qtp, qth)
+	call_word(&q, qtb + 8, qth)
+	call_addr(&q, qtb, qtp3, qth + 4)
+	call_word(&q, qtb + 8, qth + 4)
+	jal(&q, qsm)
+	li(&q, V0, 0)
+	epilogue(&q)
+	idq, _ := iop.iop_load(build_mod("modq", &q, qentry), "modq", nil)
+	check(idq <= 0 && iop.iop_u32(b + sd2)^ == RPC_SID2, "rpc: modq's thread registered RPC_SID2 before its load failed")
+	check(iop.iop_u32(b + sd3)^ == RPC_SID, "rpc: modq's other thread registered RPC_SID again")
+	check(s.n_servers == 1 && s.n_queues == 1 && s.servers[0] == {RPC_SID, b + sd, b + qd}, "rpc: the undo drops the queues of the killed threads and their servers, R's stays")
+	call(31, 1, 4, 0, 0, hsd)
+	want = []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4, 1, 4}
+	check(log_equal(b, logp, want) && call_ends(hsd, 31), "rpc: a call to RPC_SID still reaches R's func")
+	drop_replies()
+	drop_replies()
+	send_pkt(iop.SIF_CMD_RPC_BIND, 2, 0, 0, 0, RPC_SID2)
+	hsd2 := reply_word(0, 9)
+	drop_replies()
+	check(core.compat.calls[{.Sif_Bind, RPC_SID2, 0}].n == 1, "rpc: a bind to the dropped server leaves a row")
+	call(30, 5, 0, 0, 0, hsd2)
+	check(core.compat.calls[{.Sif_Rpc, RPC_SID2, 5}].n == 1 && call_ends(hsd2, 30), "rpc: a call to the dropped server is the HLE's, a row and RPC_END")
+	drop_replies()
+
+	// "modp" loads and registers RPC_SID again, with a func that logs
+	// nothing and returns 0: the first server, R's, still takes the calls.
+	p: Asm
+	ptb := imports(&p, "thbase", 4, 6, 20)
+	psc := imports(&p, "sifcmd", 14, 17, 19, 22)
+	pth := at(&p)
+	put(&p, 0)
+	psd := at(&p)
+	for _ in 0 ..< 18 {put(&p, 0)}
+	pqd := at(&p)
+	for _ in 0 ..< 8 {put(&p, 0)}
+	pfn := at(&p)
+	put(&p, JR_RA, 0x24020000) // jr ra; li v0, 0
+	ep := rpc_thread(&p, ptb + 16, psc, RPC_SID, {psd, pfn, psd, pqd}, false)
+	ptp := thread_param(&p, ep, 4)
+	pentry := at(&p)
+	prologue(&p)
+	call_addr(&p, ptb, ptp, pth)
+	call_word(&p, ptb + 8, pth)
+	li(&p, V0, 0)
+	epilogue(&p)
+	idp, _ := iop.iop_load(build_mod("modp", &p, pentry), "modp", nil)
+	bp := module_base(idp)
+	check(idp > 0 && s.n_servers == 2 && s.servers[1] == {RPC_SID, bp + psd, bp + pqd}, "rpc: modp registers RPC_SID a second time")
+	call(32, 1, 4, 0, 0, hsd)
+	want = []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4, 1, 4, 1, 4}
+	check(log_equal(b, logp, want) && call_ends(hsd, 32), "rpc: the first server registered takes the call")
+	drop_replies()
+
+	// fno 3 calls what sifcmd lacks: R is stopped, the call gets no RPC_END
+	// and leaves a row; its server goes, and the next call is modp's.
+	call(40, 3, 0, 0, 0, hsd)
+	lost := core.Compat_Key{.Iop_Rpc, RPC_SID, 3}
+	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 23}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
+	check(len(iop.sif.replies) == 0 && s.n_servers == 1 && s.n_queues == 1 && s.servers[0].sd == bp + psd, "rpc: no RPC_END, R's server dropped, modp's left")
+	call(41, 3, 0, 0, 0, hsd)
+	want = []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4, 1, 4, 1, 4, 3, 0} // R logged fno 3 before it stopped
+	check(log_equal(b, logp, want) && core.compat.calls[{.Sif_Rpc, RPC_SID, 3}].n == 0 && call_ends(hsd, 41), "rpc: the next call is modp's, RPC_END and no row")
+}
+
 // libsd's functions, in the order "modl" imports them.
-LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 17, 18, 19, 23, 25, 26, 27}
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 17, 18, 19, 20, 23, 25, 26, 27}
 
 // "modl" as loaded: its base, the offsets of its libsd stubs, its data
 // (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
@@ -1330,6 +1624,10 @@ test_libsd :: proc() {
 	C1 :: C0 + 3 * SD_HALF
 	cpu.state.cycles = C1
 	sd_call(18, 1, 0, b + buf, 0x2000, 0)
+	check(sd_call(20, 1, 0) == (b + buf) & 0xffffff, "libsd: BlockTransStatus, the first half at the start")
+	cpu.state.cycles = C1 + SD_HALF
+	check(sd_call(20, 1, 0) == 1 << 24 | (b + buf + 0x1000) & 0xffffff, "libsd: BlockTransStatus, bit 24 the second half")
+	cpu.state.cycles = C1
 	iop.iop_tick(C1 + SD_HALF)
 	check(sd_word(0) == 3 && iop.iop_wake_ee == C1 + 2 * SD_HALF, "libsd: a one-shot block crosses at its half")
 	iop.iop_tick(C1 + 2 * SD_HALF)

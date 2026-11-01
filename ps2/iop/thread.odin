@@ -332,9 +332,10 @@ th_main :: proc(arg: rawptr) {
 }
 
 // Drops a dormant thread's coroutine, and the thread itself when it asked
-// to be deleted.
+// to be deleted; the RPC queues it served go (rpc_thread_gone).
 @(private = "file")
 th_stop :: proc(t: ^Iop_Thread) {
+	rpc_thread_gone(t.id)
 	if t.co != nil {
 		core.co_kill(t.co)
 		t.co = nil
@@ -419,6 +420,31 @@ th_wait :: proc(status: Th_Status, sema: u32 = 0) -> u32 {
 	t.wake = KE_OK
 	th_yield()
 	return th_find(s.cur).wake
+}
+
+// SleepThread: the running thread sleeps, unless a wakeup came while it was
+// awake, which it uses up. What its sleep returns.
+th_sleep :: proc() -> u32 {
+	t := th_find(iop_sched.cur)
+	if t != nil && t.wakeups > 0 {
+		t.wakeups -= 1
+		return KE_OK
+	}
+	return th_wait(.Sleep)
+}
+
+// WakeupThread(id): readies thread id if it sleeps, else counts a wakeup.
+th_wakeup :: proc(id: u32) -> u32 {
+	t := th_find(id)
+	if t == nil {return ke(KE_UNKNOWN_THID)}
+	if t.id == iop_sched.cur {return ke(KE_ILLEGAL_THID)}
+	if t.status == .Dormant {return ke(KE_DORMANT)}
+	if t.status == .Sleep {
+		th_wake(t, KE_OK)
+	} else {
+		t.wakeups += 1
+	}
+	return KE_OK
 }
 
 // Ends the running thread; the loader drops its coroutine. A start's end
@@ -594,23 +620,9 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 20: // GetThreadId
 		return s.cur, true
 	case 24: // SleepThread
-		t := th_find(s.cur)
-		if t != nil && t.wakeups > 0 {
-			t.wakeups -= 1
-			return KE_OK, true
-		}
-		return th_wait(.Sleep), true
+		return th_sleep(), true
 	case 25, 26: // WakeupThread(thid), iWakeupThread(thid)
-		t := th_find(a0)
-		if t == nil {return ke(KE_UNKNOWN_THID), true}
-		if t.id == s.cur {return ke(KE_ILLEGAL_THID), true}
-		if t.status == .Dormant {return ke(KE_DORMANT), true}
-		if t.status == .Sleep {
-			th_wake(t, KE_OK)
-		} else {
-			t.wakeups += 1
-		}
-		return KE_OK, true
+		return th_wakeup(a0), true
 	case 33: // DelayThread(usec)
 		if t := th_find(s.cur); t != nil {t.wake_at = r3000.state.cycles + u64(a0) * (IOP_CLOCK / 1000) / 1000}
 		return th_wait(.Delay), true
