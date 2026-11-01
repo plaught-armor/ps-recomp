@@ -138,6 +138,9 @@ voices :: proc() {
 	check(st.on && !st.endx && st.nax == ONCE, "key on clears ENDX")
 	iop.spu_voice_off(1, 23)
 	mix(4)
+	iop.spu_voice_on(0, 23, key(ONCE))
+	mix(56)
+	check(iop.spu_voice_status(0, 23).endx, "a one-shot on core 0 ends")
 
 	// Ends during a slow attack (rate 0x2c: +7 every sample): its last
 	// sample is still heard, and ENVX is 0 once it stops.
@@ -148,6 +151,8 @@ voices :: proc() {
 	out = mix(28)
 	st = iop.spu_voice_status(1, 0)
 	check(!st.on && st.endx && st.envx == 0, "end during attack zeroes ENVX")
+	check(iop.spu_voice_status(0, 23).endx, "core 0's end flag kept by core 1's end")
+	check(iop.sd_switch_extra(0x1701, 0) && !iop.spu_voice_status(1, 0).endx && iop.spu_voice_status(0, 23).endx, "SetSwitch ENDX clears the core's end flags, whatever the value, not the other's")
 	check(out[54] > 0, "last sample of a one-shot heard")
 
 	edge: [8]u8

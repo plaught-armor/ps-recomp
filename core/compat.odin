@@ -55,7 +55,9 @@ COMPAT_TOP :: 10
 // up to count what is not timed here; Iop_Timer_Intr the address of a timer
 // compare handler that waited or ran out of its budget; Iop_Cd_Intr the
 // address of a cdvdman callback that did, or by its function code a run
-// of it dropped with CD_PENDING owed; Iop_Other_Data the EE
+// of it dropped with CD_PENDING owed; Iop_Vblank_Intr the address of a
+// vblank handler that waited or ran out of its budget, or, marked 1, one
+// AddVblankHandler had no room for; Iop_Other_Data the EE
 // address and size of an IOP sceSifGetOtherData whose source or destination
 // runs past RAM, nothing copied; Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
@@ -82,6 +84,7 @@ Compat_Call :: enum u8 {
 	Iop_Timer,
 	Iop_Timer_Intr,
 	Iop_Cd_Intr,
+	Iop_Vblank_Intr,
 	Iop_Other_Data,
 	Irx_Reloc,
 }
@@ -252,6 +255,9 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Cd_Intr:
 		if k.sub != 0 {return fmt.tprintf("IOP cdvdman callback %08x code %d dropped", k.id, k.sub)}
 		return fmt.tprintf("IOP cdvdman callback %08x blocked", k.id)
+	case .Iop_Vblank_Intr:
+		if k.sub != 0 {return fmt.tprintf("IOP vblank handler %08x no room", k.id)}
+		return fmt.tprintf("IOP vblank handler %08x blocked", k.id)
 	case .Iop_Other_Data: return fmt.tprintf("IOP GetOtherData from %08x size %x out of range", k.id, k.sub)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}

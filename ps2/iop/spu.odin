@@ -534,6 +534,8 @@ SD_S_PMON :: 0x1300
 @(private = "file")
 SD_S_NON :: 0x1400
 @(private = "file")
+SD_S_ENDX :: 0x1700
+@(private = "file")
 SD_S_VMIXL :: 0x1800
 @(private = "file")
 SD_S_VMIXEL :: 0x1900
@@ -596,11 +598,17 @@ sd_core_param :: proc(id, value: u32) -> bool {
 
 // sceSdSetSwitch(id, voice mask) for VMIXEL and VMIXER, a voice in the
 // effect send with its bit set (both share the one send here); PMON, NON
-// and the dry mixes VMIXL, VMIXR are taken and change nothing.
+// and the dry mixes VMIXL, VMIXR are taken and change nothing. ENDX: LIBSD
+// 1.5 writes both halves of the core's ENDX register, and a write there
+// clears the end flags whatever the value (as known of the SPU2, not seen on
+// hardware), so every voice of the core loses its end flag. Nothing served
+// reads it back yet; serving sceSdGetSwitch means checking this again.
 sd_switch_extra :: proc(id, mask: u32) -> bool {
 	switch id & 0xff00 {
 	case SD_S_VMIXEL, SD_S_VMIXER:
 		for &v, i in spu.voice[id & 1] {v.dry = mask & (1 << u32(i)) == 0}
+	case SD_S_ENDX:
+		for &v in spu.voice[id & 1] {v.endx = false}
 	case SD_S_PMON, SD_S_NON, SD_S_VMIXL, SD_S_VMIXR:
 	case: return false
 	}

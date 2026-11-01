@@ -118,6 +118,7 @@ iop_loader: struct {
 		sdr:     Iop_Sdr,
 		timr:    Iop_Timr,
 		cd:      Iop_Cd,
+		vbl:     Iop_Vblank,
 		rpc:     Iop_Rpc,
 		open:    [dynamic]bool, // by fd
 	},
@@ -167,6 +168,7 @@ iop_loader_init :: proc() {
 	iop_sdr = {}
 	iop_timr = {}
 	iop_cd = {}
+	iop_vbl = {}
 	iop_rpc = {}
 }
 
@@ -435,6 +437,7 @@ undo_save :: proc() {
 	clear(&u.stubs)
 	for a, s in iop_loader.stubs {u.stubs[a] = s}
 	u.sifcmd, u.sd, u.sdr, u.timr, u.cd, u.rpc = iop_sifcmd, iop_sd, iop_sdr, iop_timr, iop_cd, iop_rpc
+	u.vbl = iop_vbl
 	clear(&u.sif_tab)
 	for i in 0 ..< 2 * min(iop_sifcmd.user_size, IOP_RAM_SIZE / 8) {
 		append(&u.sif_tab, r32(iop_sifcmd.user_tab + 4 * i))
@@ -471,6 +474,7 @@ undo_restore :: proc() {
 	sdr_undo(l.undo.sdr, freed[:])
 	tim_undo(l.undo.timr, freed[:])
 	cd_undo(l.undo.cd, freed[:])
+	vbl_undo(l.undo.vbl, freed[:])
 	rpc_undo(l.undo.rpc, freed[:])
 	for &f, i in fileio.files {
 		if f.f != nil && (i >= len(l.undo.open) || !l.undo.open[i]) {f = {}}

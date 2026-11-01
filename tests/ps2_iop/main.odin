@@ -183,6 +183,7 @@ game :: proc(_: rawptr) {
 	test_timrman()
 	test_system_time()
 	test_vblank()
+	test_vblank_handlers()
 	test_fallback()
 
 	if failed {os.exit(1)}
@@ -2797,6 +2798,8 @@ test_system_time :: proc() {
 vbl_start, vbl_end: u64
 snap9: core.Snapshot
 snap9_loaded: bool // not emulated state
+snap10: core.Snapshot
+snap10_loaded: bool // not emulated state
 
 // vblank 4 and 6 wait for the next vblank start and return at once in
 // vblank; 5 and 7 the same for the end, out of it; none at once before the
@@ -2937,4 +2940,213 @@ test_vblank :: proc() {
 	delayed := 0
 	for t in s.threads {if t.status == .Delay {delayed += 1}}
 	check(idz <= 0 && len(s.threads) == threads && delayed == 0, "vblank: a failed load's waiting thread leaves no waiter")
+}
+
+// vblank 8 and 9: a list per edge, lowest priority first, equal ones in the
+// order added; Add refuses a duplicate and, full, is a row; Del one not
+// there. A list runs once at its edge, before the threads, a handler that
+// returns 0 or waits dropped; after a stall only the latest edge of each
+// kind runs, in the order they fell. A handler's Add or Del is refused. It
+// survives a snapshot; a failed load's undo puts back what it removed and
+// drops what it added.
+test_vblank_handlers :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	F :: cpu.CYCLES_PER_FRAME
+	L :: F / 262
+	up8 :: proc(x: u64) -> u64 {return (x + 7) / 8 * 8}
+	iop.ee_vblank_start, iop.ee_vblank_end = &vbl_start, &vbl_end
+	defer iop.ee_vblank_start, iop.ee_vblank_end = nil, nil
+	// "modv": thread T (priority 20) sleeps, then logs 9. Handlers h1 and h3
+	// log 1 and 3 and return 1, h2 logs 2 and returns 0; hw wakes T and
+	// logs 4; ha and hd log 5 and 6 after calling Add and Del, keeping what
+	// they return; hb waits for the start.
+	a: Asm
+	VFN :: [3]u32{4, 8, 9}
+	vfn := VFN
+	vb := imports(&a, "vblank", ..vfn[:])
+	tb := imports(&a, "thbase", 4, 6, 24, 26)
+	logp := log_words(&a, 24)
+	ths := at(&a)
+	put(&a, 0, 0, 0)
+	out := ths + 4
+	et := at(&a)
+	prologue(&a)
+	jal(&a, tb + 16)
+	log_v(&a, logp, 9)
+	li(&a, V0, 0)
+	epilogue(&a)
+	hv := [4]u32{}
+	for v, i in ([3]u32{1, 2, 3}) {
+		hv[i] = at(&a)
+		prologue(&a)
+		log_v(&a, logp, v)
+		li(&a, V0, u32(v != 2))
+		epilogue(&a)
+	}
+	h1, h2, h3 := hv[0], hv[1], hv[2]
+	hw := at(&a)
+	prologue(&a)
+	lw_at(&a, A0, ths)
+	jal(&a, tb + 24)
+	log_v(&a, logp, 4)
+	li(&a, V0, 1)
+	epilogue(&a)
+	ha := at(&a)
+	prologue(&a)
+	li(&a, A0, 0)
+	li(&a, A1, 0)
+	li(&a, A2, 0)
+	li(&a, A3, 0)
+	jal(&a, vb + 8)
+	store_v0(&a, out)
+	log_v(&a, logp, 5)
+	li(&a, V0, 1)
+	epilogue(&a)
+	hd := at(&a)
+	prologue(&a)
+	li(&a, A0, 0)
+	li(&a, A1, 0)
+	jal(&a, vb + 16)
+	store_v0(&a, out + 4)
+	log_v(&a, logp, 6)
+	li(&a, V0, 1)
+	epilogue(&a)
+	hb := at(&a)
+	prologue(&a)
+	jal(&a, vb)
+	li(&a, V0, 1)
+	epilogue(&a)
+	tp := thread_param(&a, et, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, tp, ths)
+	call_word(&a, tb + 8, ths)
+	li(&a, V0, 0)
+	epilogue(&a)
+
+	vbl_start, vbl_end = F - 22 * L, F
+	cpu.state.cycles, r3000.state.cycles = 0, 0
+	id, r := iop.iop_load(build_mod("modv", &a, entry), "modv", nil)
+	b := module_base(id)
+	check(id > 0 && r == 0 && log_equal(b, logp, {}), "vblank handlers: modv loads, T sleeps")
+	v := &iop.iop_vbl
+	check(iop.vbl_next_ee() == max(u64), "vblank handlers: none, no wake")
+	add :: proc(b, vb, end, prio, h: u32) -> u32 {
+		vfn := VFN
+		return lib_call(b + vb, vfn[:], 8, end, prio, h, 0)
+	}
+	del :: proc(b, vb, end, h: u32) -> u32 {
+		vfn := VFN
+		return lib_call(b + vb, vfn[:], 9, end, h)
+	}
+	check(add(b, vb, 1, 10, b + h1) == 0 && add(b, vb, 7, 5, b + h3) == 0 && add(b, vb, 1, 5, b + h2) == 0 && add(b, vb, 0, 0, b + hw) == 0, "vblank handlers: Add returns 0")
+	order :: proc(v: ^iop.Iop_Vblank) -> (o: [iop.VBL_HANDLERS]u32) {
+		for x, i in v.h[:v.n] {o[i] = x.handler}
+		return
+	}
+	check(v.n == 4 && order(v) == {0 = b + h3, 1 = b + h2, 2 = b + h1, 3 = b + hw} && v.h[0].end == 1 && v.h[3].end == 0, "vblank handlers: lowest priority first, equal after, any nonzero edge the end")
+	check(v.next == {F - 22 * L, F} && iop.vbl_next_ee() == up8(F - 22 * L), "vblank handlers: the next edges are the kernel's, the wake the start")
+	check(add(b, vb, 1, 0, b + h1) == neg(-iop.KE_FOUND_HANDLER), "vblank handlers: Add of one already on the edge is KE_FOUND_HANDLER")
+	check(add(b, vb, 0, 0, b + h1) == 0 && del(b, vb, 0, b + h1) == 0 && del(b, vb, 0, b + h1) == neg(-iop.KE_NOTFOUND_HANDLER) && v.n == 4, "vblank handlers: one handler on both edges; Del of one not there is KE_NOTFOUND_HANDLER")
+
+	iop.iop_tick(up8(F - 22 * L))
+	check(log_equal(b, logp, {4, 9}) && v.next[0] == 2 * F - 22 * L, "vblank handlers: at the start hw runs, the thread it wakes in that tick")
+	iop.iop_tick(up8(F - 22 * L))
+	check(log_equal(b, logp, {4, 9}), "vblank handlers: an edge runs once")
+	core.snap_op, core.snap_target = .Save, &snap10
+	core.snap_yield()
+	if !snap10_loaded {
+		iop.iop_tick(up8(F))
+		check(log_equal(b, logp, {4, 9, 3, 2, 1}) && v.n == 3, "vblank handlers: at the end h3, h2, h1, h2 dropped on 0")
+		snap10_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap10
+		core.snap_yield()
+	}
+	check(log_equal(b, logp, {4, 9}) && v.n == 4 && v.next == {2 * F - 22 * L, F}, "vblank handlers: the load puts the handlers and their edges back")
+	iop.iop_tick(up8(F))
+	check(log_equal(b, logp, {4, 9, 3, 2, 1}) && v.n == 3 && v.next[1] == 2 * F, "vblank handlers: the restored end runs, dropping h2")
+	iop.iop_tick(5 * F + 16)
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1}) && v.next == {6 * F - 22 * L, 6 * F}, "vblank handlers: after a stall the latest start, then the latest end, once each")
+	iop.iop_tick(up8(8 * F - 22 * L))
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4}) && v.next == {9 * F - 22 * L, 8 * F}, "vblank handlers: the end first when it fell first")
+
+	rows := core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + hb, 0}].n
+	check(del(b, vb, 0, b + hw) == 0 && add(b, vb, 0, 0, b + ha) == 0 && add(b, vb, 0, 1, b + hd) == 0 && add(b, vb, 0, 2, b + hb) == 0, "vblank handlers: ha, hd and hb added")
+	iop.iop_tick(up8(9 * F - 22 * L))
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6}) && iop.iop_u32(b + out)^ == neg(-iop.KE_ILLEGAL_CONTEXT) && iop.iop_u32(b + out + 4)^ == neg(-iop.KE_ILLEGAL_CONTEXT), "vblank handlers: a handler's Add and Del are KE_ILLEGAL_CONTEXT")
+	check(core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + hb, 0}].n == rows + 1 && v.n == 4 && order(v) == {0 = b + h3, 1 = b + h1, 2 = b + ha, 3 = b + hd}, "vblank handlers: a handler that waits is stopped, a row, dropped")
+	check(del(b, vb, 0, b + ha) == 0 && del(b, vb, 0, b + hd) == 0 && v.n == 2, "vblank handlers: ha and hd removed")
+
+	full := b + 0x10000
+	for i in 0 ..< u32(iop.VBL_HANDLERS - 2) {check(add(b, vb, 0, 0, full + 4 * i) == 0, "vblank handlers: the table fills")}
+	rows = core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, full + 0x100, 1}].n
+	check(add(b, vb, 0, 0, full + 0x100) == neg(-iop.KE_NO_MEMORY) && v.n == iop.VBL_HANDLERS, "vblank handlers: Add to a full table is KE_NO_MEMORY")
+	check(core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, full + 0x100, 1}].n == rows + 1, "vblank handlers: and a row")
+	for i in 0 ..< u32(iop.VBL_HANDLERS - 2) {check(del(b, vb, 0, full + 4 * i) == 0, "vblank handlers: the table empties")}
+
+	// "modu": its start removes h1, adds its own hu, then fails.
+	u: Asm
+	uvb := imports(&u, "vblank", 8, 9)
+	usm := imports(&u, "sysmem", 99)
+	hu := at(&u)
+	put(&u, JR_RA, 0x24020001) // jr ra; li v0, 1
+	entry = at(&u)
+	prologue(&u)
+	li(&u, A0, 1)
+	put(&u, 0x3c050000 | (b + h1) >> 16, 0x34a50000 | (b + h1) & 0xffff) // lui a1, hi; ori a1, a1, lo
+	jal(&u, uvb + 8)
+	li(&u, A0, 1)
+	li(&u, A1, 0)
+	la(&u, A2, hu)
+	li(&u, A3, 0)
+	jal(&u, uvb)
+	jal(&u, usm)
+	li(&u, V0, 0)
+	epilogue(&u)
+	before := v^
+	idu, _ := iop.iop_load(build_mod("modu", &u, entry), "modu", nil)
+	check(idu <= 0 && v^ == before, "vblank handlers: a failed load's removal comes back, its own handler is dropped")
+
+	// A module whose start deletes handler `dh` from edge `de`, adds `ah`
+	// to edge `ae` (each skipped when 0), then fails.
+	fails :: proc(name: string, de, dh, ae, ah: u32) -> i32 {
+		u: Asm
+		uvb := imports(&u, "vblank", 8, 9)
+		usm := imports(&u, "sysmem", 99)
+		entry := at(&u)
+		prologue(&u)
+		if dh != 0 {
+			li(&u, A0, de)
+			put(&u, 0x3c050000 | dh >> 16, 0x34a50000 | dh & 0xffff) // lui a1, hi; ori a1, a1, lo
+			jal(&u, uvb + 8)
+		}
+		if ah != 0 {
+			li(&u, A0, ae)
+			li(&u, A1, 0)
+			put(&u, 0x3c060000 | ah >> 16, 0x34c60000 | ah & 0xffff) // lui a2, hi; ori a2, a2, lo
+			li(&u, A3, 0)
+			jal(&u, uvb)
+		}
+		jal(&u, usm)
+		li(&u, V0, 0)
+		epilogue(&u)
+		id, _ := iop.iop_load(build_mod(name, &u, entry), name, nil)
+		return id
+	}
+	check(del(b, vb, 1, b + h1) == 0 && v.n == 1 && v.next[1] == 9 * F, "vblank handlers: h3 alone on the end, due at the next tick")
+	before = v^
+	check(fails("modd", 1, b + h3, 0, 0) <= 0 && v^ == before, "vblank handlers: a failed load that deleted an edge's only handler puts it back, its next edge unchanged")
+	iop.iop_tick(up8(9 * F))
+	iop.iop_tick(up8(9 * F))
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 3}) && v.next[1] == 10 * F, "vblank handlers: and it runs at that edge once")
+	check(fails("moda", 0, 0, 0, b + h2) <= 0 && v.n == 2 && v.h[1] == {0, 0, b + h2, 0} && v.next[0] == 10 * F - 22 * L, "vblank handlers: a failed load's handler outside its memory stays, its new list from the kernel's next edge")
+	iop.iop_tick(up8(10 * F - 22 * L))
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 3, 2}) && v.n == 1, "vblank handlers: and runs at that edge")
+	for i in 0 ..< u32(iop.VBL_HANDLERS - 1) {check(add(b, vb, 0, 0, full + 4 * i) == 0, "vblank handlers: the table fills again")}
+	before = v^
+	rows = core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + h1, 1}].n
+	check(fails("modf", 0, full, 0, b + h1) <= 0 && v^ == before, "vblank handlers: with no entry left, the deleted one comes back")
+	check(core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + h1, 1}].n == rows + 1, "vblank handlers: the one added is dropped with Add's row")
 }
