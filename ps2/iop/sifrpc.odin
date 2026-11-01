@@ -88,6 +88,20 @@ sifrpc_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	return 0, false
 }
 
+// A server the HLE runs on a guest thread of its own: sid at descriptor sd,
+// on queue qd that `thread` serves. The caller checks there is room for
+// both (rpc_host_room).
+rpc_host_server :: proc(sid, sd, qd, thread: u32) {
+	assert(rpc_host_room(), "iop: rpc_host_server with no room")
+	rpc_queue_set(qd, thread)
+	rpc_register(sid, sd, qd)
+}
+
+// Whether a server and a queue can be added.
+rpc_host_room :: proc() -> bool {
+	return iop_rpc.n_servers < IOP_RPC_SERVERS && iop_rpc.n_queues < IOP_RPC_QUEUES
+}
+
 // Adds server sid at descriptor sd on queue qd. A sid already served keeps
 // its server too, as retail appends to the queue's list without a check:
 // rpc_server picks between them, and dropping one leaves the other.

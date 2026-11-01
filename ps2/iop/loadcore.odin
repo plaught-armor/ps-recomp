@@ -519,6 +519,15 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 	th_call_failed()
 }
 
+// Maps a call to IOP address `addr` to function fno of the HLE's library
+// `name`, as an import's stub of a version 1 table: a function the HLE
+// itself hands to guest code, as a thread's entry or a server's function.
+hle_host_stub :: proc(addr: u32, name: string, fno: u32) {
+	s := Hle_Stub{fno = fno, version = IOP_HLE_MAJOR << 8 | 1}
+	copy(s.name[:], name)
+	iop_loader.stubs[phys(addr)] = s
+}
+
 // The major version of each Sony library hle_fn serves: its numbers are
 // those of the version 1 export tables. An import of another major names
 // other functions by the same numbers, so a call to it is not served.

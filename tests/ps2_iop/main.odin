@@ -181,6 +181,7 @@ game :: proc(_: rawptr) {
 	test_libsd()
 	test_cdvdman()
 	test_sdrdrv()
+	test_sdr_thread()
 	test_timrman()
 	test_system_time()
 	test_vblank()
@@ -2501,6 +2502,176 @@ test_sdrdrv :: proc() {
 
 	fresh()
 	check(iop.iop_sdr == {}, "sdrdrv: the loader's reset clears the slots")
+}
+
+snap11: core.Snapshot
+snap11_loaded: bool // not emulated state
+
+// "modk": slots 0 and 1 set to a handler that logs the command and the
+// request's second word, waits on its semaphore (id 1) for 0x9010, and
+// returns 0x5a5a. The module's base, the log's offset and sdrdrv's stub.
+mod_k :: proc() -> (b, logp, sdr: u32) {
+	a: Asm
+	sdr = imports(&a, "sdrdrv", 5)
+	ts := imports(&a, "thsemap", 4, 8)
+	logp = log_words(&a, 16)
+	sem := at(&a)
+	put(&a, 0)
+	semp := sema_param(&a, 0, 0)
+	h := at(&a)
+	prologue(&a)
+	la(&a, T0, logp)
+	put(&a, 0x8d090000, 0x8caa0004, 0xad240000, 0xad2a0004, 0x25290008, 0xad090000) // lw t1, 0(t0); lw t2, 4(a1); sw a0, 0(t1); sw t2, 4(t1); addiu t1, t1, 8; sw t1, 0(t0)
+	ori(&a, T2, 0x9010)
+	l := bne(&a, A0, T2)
+	lw_at(&a, A0, sem)
+	jal(&a, ts + 8)
+	branch_to(&a, l)
+	ori(&a, V0, 0x5a5a)
+	epilogue(&a)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, semp, sem)
+	for cmd in ([2]u32{0x9000, 0x9010}) {
+		ori(&a, A0, cmd)
+		la(&a, A1, h)
+		jal(&a, sdr)
+	}
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modk", &a, entry), "modk", nil)
+	check(id > 0 && iop.iop_sdr.user[0] != 0 && iop.iop_sdr.user[1] != 0, "sdrdrv thread: modk sets slots 0 and 1")
+	return module_base(id), logp, sdr
+}
+
+// Conditions: the EE's first sdrdrv RPC after a handler is set starts the
+// sdrdrv thread, never during a load; from there each RPC runs on it in the
+// order sent: a handler that waits holds back its RPC_END and the calls
+// behind it, and both survive a snapshot; a slot cleared since is not
+// called; a host command's reply bytes are those of the host path. With no
+// memory the host answers on, the row each call; without PS_IRX nothing
+// starts.
+test_sdr_thread :: proc() {
+	fresh()
+	clear(&core.compat.calls)
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	drop_replies()
+	defer drop_replies()
+	cpu.state.cycles = 0
+	cpu.next_event = 1 << 40
+	EE_RECV :: 0x00100400
+	call :: proc(rec, fno, size, recv, rsize, sd: u32) {
+		send_pkt(iop.SIF_CMD_RPC_CALL, rec, 0, 0, 0, fno, size, recv, rsize, 0, sd)
+	}
+	bind :: proc() -> u32 {
+		send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, iop.SDR_SID)
+		hsd := reply_word(0, 9)
+		drop_replies()
+		iop.iop_u32(hsd + 0x104)^ = 0x77
+		return hsd
+	}
+	d := &iop.iop_sdr
+	s := &iop.iop_rpc
+	b, logp, sdr := mod_k()
+	check(d.thread == 0 && s.n_servers == 0, "sdrdrv thread: none when the handlers are set")
+	hsd := bind()
+	check(len(core.compat.calls) == 0, "sdrdrv thread: the bind is no row")
+
+	// A user command: the handler runs on the thread with the request; the
+	// reply its result, the rest of the first 64 bytes 0.
+	iop.iop_u32(hsd + 0x100)^ = 0x11
+	mem.wr32(EE_RECV + 4, 0xffffffff)
+	call(1, 0x9003, 8, EE_RECV, 8, hsd)
+	t := iop.th_find(d.thread)
+	check(t != nil && t.prio == iop.SDR_PRIO && s.n_servers == 1 && s.servers[0].sid == iop.SDR_SID, "sdrdrv thread: the first call starts it, the server on it")
+	check(log_equal(b, logp, {0x9003, 0x77}) && mem.rd32(EE_RECV) == 0x5a5a && mem.rd32(EE_RECV + 4) == 0, "sdrdrv thread: the handler gets the command and the request, the EE its result")
+	check(call_ends(hsd, 1) && len(core.compat.calls) == 0, "sdrdrv thread: RPC_END, no row")
+	drop_replies()
+
+	// 0x9010 waits in the handler; a host command made meanwhile waits
+	// behind it.
+	call(2, 0x9010, 8, EE_RECV, 4, hsd)
+	mem.wr32(EE_RECV + 0x10, 0xffffffff)
+	call(3, 0x80f0, 8, EE_RECV + 0x10, 4, hsd)
+	want := []u32{0x9003, 0x77, 0x9010, 0x77}
+	check(log_equal(b, logp, want) && len(iop.sif.replies) == 0 && s.n_reqs == 1 && mem.rd32(EE_RECV + 0x10) == 0xffffffff, "sdrdrv thread: a call while the handler waits is queued, no RPC_END yet")
+	core.snap_op, core.snap_target = .Save, &snap11
+	core.snap_yield()
+	if !snap11_loaded {
+		ids, _ := iop.iop_load(mod_s(), "mods", nil)
+		check(ids > 0 && call_ends(hsd, 2, 3) && mem.rd32(EE_RECV + 0x10) == 1, "sdrdrv thread: the signal ends 0x9010, then the host command runs")
+		drop_replies()
+		snap11_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap11
+		core.snap_yield()
+	}
+	drop_replies()
+	check(log_equal(b, logp, want) && s.n_reqs == 1 && d.thread == t.id, "sdrdrv thread: the snapshot keeps the waiting call and the queued one")
+	ids, _ := iop.iop_load(mod_s(), "mods", nil)
+	check(ids > 0 && call_ends(hsd, 2, 3) && mem.rd32(EE_RECV) == 0x5a5a && mem.rd32(EE_RECV + 0x10) == 1, "sdrdrv thread: after the load both end as before")
+	drop_replies()
+
+	// Slot 0 cleared: 0x9000 is a host command, no handler called, no row.
+	row := core.Compat_Key{.Iop_Sdr, 0x9000, 0}
+	lib_call(b + sdr, {5}, 5, 0x9000, 0)
+	mem.wr32(EE_RECV, 0xffffffff)
+	call(4, 0x9000, 8, EE_RECV, 4, hsd)
+	check(log_equal(b, logp, want) && mem.rd32(EE_RECV) == 0 && core.compat.calls[row].n == 0 && call_ends(hsd, 4), "sdrdrv thread: a slot cleared since is a host command, no handler called")
+	drop_replies()
+
+	// A host command's reply: the bytes the host path gives.
+	req: [0x80]u8
+	for &x, i in req {x = u8(i * 7 + 3)}
+	(^u32)(&req[4])^ = 0
+	copy(iop.iop_mem(hsd + 0x100, 0x80), req[:])
+	host := req
+	iop.sif.servers[iop.SDR_SID](0x8100, host[:], 0x80)
+	call(5, 0x8100, 0x80, EE_RECV, 0x80, hsd)
+	check(call_ends(hsd, 5) && string(mem.ram_slice(EE_RECV, 0x80)) == string(host[:]), "sdrdrv thread: a host command's reply bytes are the host path's")
+	drop_replies()
+
+	// During a load nothing starts; the call after does.
+	fresh()
+	iop.iop_irx = true
+	clear(&core.compat.calls)
+	b, logp, _ = mod_k()
+	hsd = bind()
+	iop.iop_loader.loading = 9
+	call(6, 0x9000, 8, EE_RECV, 4, hsd)
+	iop.iop_loader.loading = 0
+	check(d.thread == 0 && core.compat.calls[row].n == 1 && call_ends(hsd, 6), "sdrdrv thread: not started during a load, the host answers with the row")
+	drop_replies()
+	iop.iop_u32(hsd + 0x104)^ = 0x77 // the host's reply zeroed it
+	call(7, 0x9000, 8, EE_RECV, 4, hsd)
+	check(d.thread != 0 && log_equal(b, logp, {0x9000, 0x77}) && core.compat.calls[row].n == 1 && call_ends(hsd, 7), "sdrdrv thread: the call after the load starts it")
+	drop_replies()
+
+	// No memory: the host answers on, the row each call.
+	fresh()
+	iop.iop_irx = true
+	clear(&core.compat.calls)
+	b, logp, _ = mod_k()
+	hsd = bind()
+	for iop.sys_alloc(.Low, iop.SYS_ALIGN) != 0 {}
+	call(8, 0x9000, 8, EE_RECV, 4, hsd)
+	call(9, 0x9000, 8, EE_RECV, 4, hsd)
+	check(d.thread == 0 && d.failed && s.n_servers == 0 && core.compat.calls[row].n == 2 && call_ends(hsd, 8, 9), "sdrdrv thread: no memory, the host answers with the row each call")
+	drop_replies()
+
+	// Without PS_IRX nothing starts.
+	fresh()
+	iop.iop_irx = true
+	clear(&core.compat.calls)
+	b, logp, _ = mod_k()
+	hsd = bind()
+	iop.iop_irx = false
+	call(10, 0x9000, 8, EE_RECV, 4, hsd)
+	iop.iop_irx = true
+	check(d.thread == 0 && log_equal(b, logp, {}) && call_ends(hsd, 10), "sdrdrv thread: none without PS_IRX")
+	drop_replies()
+	fresh()
+	clear(&core.compat.calls)
 }
 
 // Conditions: a failed start is answered as a module not run, with a row;

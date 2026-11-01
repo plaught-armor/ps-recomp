@@ -97,7 +97,7 @@ sif_init :: proc() {
 	sif.servers[0x80000100] = padman_server
 	sif.servers[0x80000101] = padman_server
 	sif.servers[0x80000900] = mtap_server
-	sif.servers[0x80000701] = sdr_server
+	sif.servers[SDR_SID] = sdr_server
 	sif.servers[0x90000200] = adx_server
 }
 
@@ -290,7 +290,10 @@ sif_command :: proc(a, pc: u32) {
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		fno, send_size, receive, recv_size, server := arg(a, 4), arg(a, 5), arg(a, 6), arg(a, 7), arg(a, 9)
 		sid := iop_u32(server)^
-		if iop_irx && iop_rpc_call(a, sid) {return}
+		if iop_irx {
+			if sid == SDR_SID {sdr_thread_start()}
+			if iop_rpc_call(a, sid) {return}
+		}
 		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
 		if !ok || !handler(fno, buf, send_size) {
