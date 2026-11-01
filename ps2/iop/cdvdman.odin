@@ -32,6 +32,12 @@ CD_FUNC_STANDBY :: 5
 // a PS2 DVD, for any disc, as nothing reads the type from the disc yet.
 CD_DISK_PS2_DVD :: 0x14
 
+// The drive status cdvdman's sceCdStatus and cdvdfsv's S-command Status
+// answer: paused, the disc spun up with no command running. Commands finish
+// in their call here, so the drive is never seen reading, seeking or
+// stopped, and the tray is never open.
+CD_STAT_PAUSE :: 0x0a
+
 // The most callback runs one tick can owe: commands made faster than ticks
 // run their callbacks.
 CD_PENDING :: 4
@@ -85,6 +91,8 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return CD_DISK_PS2_DVD, true
 	case 13: // sceCdDiskReady(mode): 2, ready
 		return 2, true
+	case 28: // sceCdStatus
+		return CD_STAT_PAUSE, true
 	case 37: // sceCdCallback(func): the previous func. Retail returns 0 and sets nothing while a command is busy; none is here
 		old := iop_cd.callback
 		iop_cd.callback = a0

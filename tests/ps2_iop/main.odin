@@ -2175,7 +2175,7 @@ test_libsd :: proc() {
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
 }
 
-CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 37, 75}
+CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 28, 37, 75}
 IOMAN_FNOS := [?]u32{4, 5, 6, 8}
 
 // Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
@@ -2257,6 +2257,7 @@ test_cdvdman :: proc() {
 	check(cd_call(cd, 4, 0) == 1 && cd_call(cd, 4, 1) == 1 && cd_call(cd, 4, 5) == 1 && cd_call(cd, 4, 0xffffffff) == 1, "cdvdman: sceCdInit returns 1 for every mode")
 	check(cd_call(cd, 75, 1) == 1 && cd_call(cd, 75, 2) == 1 && cd_call(cd, 75, 0xff) == 1, "cdvdman: sceCdMmode returns 1")
 	check(cd_call(cd, 12) == iop.CD_DISK_PS2_DVD, "cdvdman: sceCdGetDiskType is a PS2 DVD")
+	check(cd_call(cd, 28) == 0x0a, "cdvdman: sceCdStatus is paused")
 	check(cd_call(cd, 5) == 1 && iop.iop_cd == {}, "cdvdman: sceCdStandby with no callback returns 1, no run owed")
 	check(cd_call(cd, 10, b + file, b + big) == 1, "cdvdman: SearchFile finds the file")
 	rec := iop.iop_mem(b + file, iop.CD_FILE)

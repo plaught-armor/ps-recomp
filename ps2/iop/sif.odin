@@ -780,7 +780,7 @@ cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x03: w[0] = CD_DISK_PS2_DVD // GetDiskType
 	case 0x04: w[0] = 0 // GetError
 	case 0x05: w[0], w[1] = 1, 0 // TrayReq {result, tray check}
-	case 0x0c: w[0] = 0x0a // Status: paused
+	case 0x0c: w[0] = CD_STAT_PAUSE // Status
 	case 0x16, 0x22: w[0] = 1 // Break, MMode
 	case: return false
 	}
