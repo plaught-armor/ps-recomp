@@ -169,6 +169,7 @@ game :: proc(_: rawptr) {
 	test_libc()
 	test_sysclib()
 	test_import_major()
+	test_sony_stream()
 	test_thread_snap()
 	test_sifcmd()
 	test_other_data()
@@ -1138,6 +1139,33 @@ test_import_major :: proc() {
 	key := core.Compat_Key{.Iop_Import, core.compat_name("sysclib"), 0x0201}
 	r3000.state.r[4] = b + s
 	check(iop_call(b + v2) == 0xffffffff && core.compat.calls[key].n == 1, "major: major 2 fails with a row, not served")
+}
+
+// cdvdstm is a Sony library: LOADFILE does not run a module that exports
+// it, and a module importing it gets the HLE's unserved-call failure and
+// row, not a pending import's.
+test_sony_stream :: proc() {
+	fresh()
+	m: Asm
+	entry := at(&m)
+	prologue(&m)
+	li(&m, V0, 0)
+	epilogue(&m)
+	check(iop.iop_runs(build_mod("modn", &m, entry)), "cdvdstm: LOADFILE runs another module")
+	_, ptr := exports(&m, "cdvdstm")
+	m.w[ptr] = entry
+	check(!iop.iop_runs(build_mod("cdvd_st_driver", &m, entry)), "cdvdstm: LOADFILE does not run the module that exports it")
+	a: Asm
+	st := imports(&a, "cdvdstm", 5)
+	entry = at(&a)
+	prologue(&a)
+	jal(&a, st)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("mods", &a, entry), "mods", nil)
+	call := core.Compat_Key{.Iop_Call, core.compat_name("cdvdstm"), 5}
+	pending := core.Compat_Key{.Iop_Import, core.compat_name("cdvdstm"), 0}
+	check(id == -1 && core.compat.calls[call].n == 1 && core.compat.calls[pending].n == 0, "cdvdstm: an import's call is the HLE's, unserved, a row")
 }
 
 snap3: core.Snapshot
@@ -2195,6 +2223,7 @@ test_cdvdman :: proc() {
 	sub := str_words(&a, "cdrom0:\\DATA\\SUB.TXT;1")
 	bigf := str_words(&a, "cdrom0:\\BIG.BIN;1")
 	host := str_words(&a, "host:x")
+	stm := str_words(&a, "cdrom_stm0:\\X;1")
 	file := at(&a)
 	for _ in 0 ..< iop.CD_FILE / 4 {put(&a, 0)}
 	mode := at(&a)
@@ -2349,6 +2378,10 @@ test_cdvdman :: proc() {
 	check(io_call(io, 4, b + host, 1) == neg(19), "ioman: another device is not here")
 	dev := [4]u8{'h', 'o', 's', 't'}
 	check(core.compat.calls[core.Compat_Key{.Iop_Io, transmute(u32)dev, 0}].n == 1, "ioman: another device is a compat row")
+	// cdvdstm's stream device is not served: an open fails with the same
+	// row, named by the device's first four bytes.
+	stm_dev := [4]u8{'c', 'd', 'r', 'o'}
+	check(io_call(io, 4, b + stm, 1) == neg(19) && core.compat.calls[core.Compat_Key{.Iop_Io, transmute(u32)stm_dev, 0}].n == 1, "ioman: the stream device is not here, a compat row")
 }
 
 mem_eq :: proc(x, y, n: u32) -> bool {

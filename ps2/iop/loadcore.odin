@@ -56,7 +56,7 @@ IOP_SONY := [?]string {
 	"thvpool", "thrdman", "vblank", "stdio", "sifman", "sifcmd", "secrman",
 	"loadfile", "modload", "ioman", "iomanx", "cdvdman", "cdvdfsv", "sio2man",
 	"padman", "mtapman", "mcman", "mcserv", "libsd", "sdrdrv", "usbd", "dev9",
-	"rmman", "siftool", "reboot", "eesync",
+	"rmman", "siftool", "reboot", "eesync", "cdvdstm",
 }
 
 Iop_Lib :: struct {
