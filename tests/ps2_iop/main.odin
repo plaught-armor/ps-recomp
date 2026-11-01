@@ -850,6 +850,28 @@ test_failed_paths :: proc() {
 	}
 	check(core.compat.calls[call].n == calls + iop.IOP_LOAD_FAILS, "failed paths: a path's start runs at most IOP_LOAD_FAILS times")
 	check(core.compat.calls[back].n == backs + 10, "failed paths: each failure and refusal a fallback row")
+
+	// A failure is the image's, not the name's: another build loaded under
+	// the failed one's path still runs.
+	idz, _ := iop.iop_load(fz, "modz", nil)
+	check(idz == -1, "failed paths: modz still refused")
+	idz, _ = iop.iop_load(build_mod("modz", &g, 0), "modz", nil)
+	check(idz > 0, "failed paths: another image under the same path runs")
+
+	// A start looping on a missing call is stopped at its IOP_START_GAPS-th,
+	// one row counting them all.
+	y: Asm
+	sm = imports(&y, "sysmem", 98)
+	entry = at(&y)
+	prologue(&y)
+	jal(&y, sm)
+	put(&y, 0x1000fffd, 0) // b back to the jal
+	loop := core.Compat_Key{.Iop_Call, core.compat_name("sysmem"), 98}
+	calls = core.compat.calls[loop].n
+	idy, _ := iop.iop_load(build_mod("mody", &y, entry), "mody", nil)
+	check(idy == -1, "failed paths: a start looping on a missing call fails")
+	check(core.compat.calls[loop].n == calls + iop.IOP_START_GAPS, "failed paths: stopped at IOP_START_GAPS calls")
+	check(!iop.iop_sched.budget, "failed paths: stopped by the cap, not the budget")
 }
 
 // Condition: a budget spent after the start returned still loads.

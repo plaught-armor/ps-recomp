@@ -24,6 +24,7 @@
 package ps2_iop
 
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
@@ -102,6 +103,7 @@ iop_loader: struct {
 	// table's words and which fds were open.
 	loading: u32,
 	failed:  bool,
+	gaps:    u32, // the HLE calls the start made that failed
 	patches: [dynamic]Iop_Patch,
 	undo:    struct {
 		libs:    [dynamic]Iop_Lib,
@@ -113,11 +115,11 @@ iop_loader: struct {
 		sd:      Iop_Sd,
 		open:    [dynamic]bool, // by fd
 	},
-	// The paths whose load failed, cloned.
+	// The images whose load failed, keyed by failed_key.
 	failed_paths: map[string]Failed_Path,
 }
 
-// A path whose load failed: how often, whether it may run again (a library
+// An image whose load failed: how often, whether it may run again (a library
 // registered or a load succeeded since its last failure), and whether a
 // refusal has said so.
 Failed_Path :: struct {
@@ -130,6 +132,10 @@ Failed_Path :: struct {
 // whatever registers, so a game that reloads a failing module costs at most
 // this many starts of it.
 IOP_LOAD_FAILS :: 3
+
+// The most HLE calls one start makes that fail: a start goes on past one,
+// to find what else it lacks, but one looping on a call is stopped here.
+IOP_START_GAPS :: 64
 
 // PS_IRX=1: LOADFILE runs the modules it loads. Host setting, read at init.
 iop_irx: bool
@@ -152,6 +158,13 @@ iop_loader_init :: proc() {
 	th_init()
 	iop_sifcmd = {}
 	iop_sd = {}
+}
+
+// The failed_paths key of image `data` loaded as `path`: two builds of one
+// module under one name are two images.
+@(private = "file")
+failed_key :: proc(path: string, data: []u8, allocator := context.temp_allocator) -> string {
+	return fmt.aprintf("%s#%016x", path, xxhash.XXH3_64_default(data), allocator = allocator)
 }
 
 @(private = "file")
@@ -218,47 +231,48 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		return KE_ERROR, 0
 	}
 	l := &iop_loader
-	if f, again := l.failed_paths[path]; again && (!f.retry || f.fails >= IOP_LOAD_FAILS) {
+	key := failed_key(path, data)
+	if f, again := l.failed_paths[key]; again && (!f.retry || f.fails >= IOP_LOAD_FAILS) {
 		if !f.told {
 			fmt.eprintfln("iop: \"%s\" failed before, not run again", path)
 			f.told = true
-			l.failed_paths[path] = f
+			l.failed_paths[key] = f
 		}
 		core.compat_unknown(.Iop_Fallback, core.compat_name(x.name))
 		return KE_ERROR, 0
 	}
 	s := &iop_sched
 	mark_th, mark_sema := s.next_thid, s.next_semid
-	fail :: proc(path, name, why: string, mark_th, mark_sema: u32) -> (i32, u32) {
+	fail :: proc(key, name, why: string, mark_th, mark_sema: u32) -> (i32, u32) {
 		fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
 		th_undo(mark_th, mark_sema)
 		undo_restore()
 		core.compat_unknown(.Iop_Fallback, core.compat_name(name))
 		paths := &iop_loader.failed_paths
-		f, again := paths[path]
+		f, again := paths[key]
 		f.fails += 1
 		f.retry = false
-		if again {paths[path] = f} else {paths[strings.clone(path)] = f}
+		if again {paths[key] = f} else {paths[strings.clone(key)] = f}
 		return KE_ERROR, 0
 	}
 	undo_save()
 	defer iop_wake_set()
 	clear(&l.patches)
 	l.loading = l.next_id
-	l.failed = false
+	l.failed, l.gaps = false, 0
 	defer l.loading = 0
 	m := Iop_Module {
 		id   = l.next_id,
 		size = irx_mem_size(x),
 	}
 	m.base = sys_alloc(.Low, m.size)
-	if m.base == 0 {return fail(path, x.name, "no memory", mark_th, mark_sema)}
+	if m.base == 0 {return fail(key, x.name, "no memory", mark_th, mark_sema)}
 	img := iop_mem(m.base, m.size)
 	copy(img, data[x.file_off:][:x.file_size])
 	slice.zero(img[x.file_size:])
 	if err, detail := irx_relocate(data, img, m.base); err != .None {
 		if err == .Type {core.compat_unknown(.Irx_Reloc, detail)}
-		return fail(path, x.name, fmt.tprintf("relocation %v %#x", err, detail), mark_th, mark_sema)
+		return fail(key, x.name, fmt.tprintf("relocation %v %#x", err, detail), mark_th, mark_sema)
 	}
 	tables := irx_tables(img[:min(x.text_size, m.size)], m.base, context.temp_allocator)
 	for &t in tables {
@@ -266,7 +280,7 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	}
 	m.argv = argv_block(path, args)
 	stack := sys_alloc(.High, IOP_START_STACK)
-	if m.argv == 0 || stack == 0 {return fail(path, x.name, "no memory", mark_th, mark_sema)}
+	if m.argv == 0 || stack == 0 {return fail(key, x.name, "no memory", mark_th, mark_sema)}
 	st := th_new(m.base + x.entry, stack, IOP_START_STACK, m.base + x.gp, IOP_START_PRIO)
 	st.start, st.exit_delete = true, true
 	st.ctx.r[4] = r32(m.argv)
@@ -277,13 +291,13 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	th_schedule(r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN)
 	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
-		return fail(path, x.name, "start ran out of its budget", mark_th, mark_sema)
+		return fail(key, x.name, "start ran out of its budget", mark_th, mark_sema)
 	}
 	if !s.start_done {
 		core.compat_unknown(.Iop_Blocked, core.compat_name(x.name))
-		return fail(path, x.name, "start waits with no thread ready", mark_th, mark_sema)
+		return fail(key, x.name, "start waits with no thread ready", mark_th, mark_sema)
 	}
-	if l.failed {return fail(path, x.name, "start called what the HLE lacks", mark_th, mark_sema)}
+	if l.failed {return fail(key, x.name, "start called what the HLE lacks", mark_th, mark_sema)}
 	if s.budget {
 		// The start returned, so the load succeeds; the threads it left ready
 		// stay so, their context saved, for a later load to run on.

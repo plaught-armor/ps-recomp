@@ -438,13 +438,19 @@ th_exit :: proc(delete := false) {
 }
 
 // An HLE call failed in the running thread. In a start the load fails once
-// the start returns; any other thread, or a command handler, is stopped
-// there, dormant.
+// the start returns, or at once at its IOP_START_GAPS-th; any other thread,
+// or a command handler, is stopped there, dormant.
 th_call_failed :: proc() {
 	if iop_sched.intr {th_intr_stop(.Call)}
 	t := th_find(iop_sched.cur)
 	if t == nil || t.start {
-		iop_loader.failed = true
+		l := &iop_loader
+		l.failed = true
+		l.gaps += 1
+		if t != nil && l.gaps >= IOP_START_GAPS {
+			fmt.eprintfln("iop: start stopped after %d failed calls", l.gaps)
+			th_exit()
+		}
 		return
 	}
 	fmt.eprintfln("iop: thread %d stopped", t.id)
