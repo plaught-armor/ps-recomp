@@ -30,12 +30,14 @@ Sd_Handler :: struct {
 	func, arg: u32, // IOP addresses; func 0 is none
 }
 
-// Emulated state, snapshotted (sif_snap) and reset with the loader.
-iop_sd: struct {
+Iop_Sd :: struct {
 	trans:   [2]Sd_Handler, // per channel
 	spu2:    Sd_Handler,
 	pending: u8, // the interrupts raised and not yet run, SD_PENDING_*
 }
+
+// Emulated state, snapshotted (sif_snap) and reset with the loader.
+iop_sd: Iop_Sd
 
 // Function fno of libsd, as stdio_fn.
 libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
@@ -101,6 +103,25 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return old, true
 	}
 	return 0, false
+}
+
+// After a failed load: puts back each handler it left with its func or arg
+// in `freed`, the memory its undo frees, as it was when the load began
+// (`saved`), and drops what it had raised; stops the block transfers whose
+// buffer is there.
+sd_undo :: proc(saved: Iop_Sd, freed: []Sys_Block) {
+	s := &iop_sd
+	for c in u32(0) ..< 2 {
+		if sys_in(freed, s.trans[c].func) || sys_in(freed, s.trans[c].arg) {
+			s.trans[c] = saved.trans[c]
+			s.pending &~= SD_PENDING_TRANS << c
+		}
+	}
+	if sys_in(freed, s.spu2.func) || sys_in(freed, s.spu2.arg) {
+		s.spu2 = saved.spu2
+		s.pending &~= SD_PENDING_SPU2 | SD_PENDING_SPU2 << 1
+	}
+	sd_block_drop(freed)
 }
 
 // A call's id libsd_fn does not decode: a compat row, and a line under

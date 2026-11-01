@@ -32,6 +32,15 @@ sys_init :: proc() {
 	clear(&sys_blocks)
 }
 
+// Whether IOP address `a` is in one of `blocks`.
+sys_in :: proc(blocks: []Sys_Block, a: u32) -> bool {
+	p := a & 0x1fffffff
+	for b in blocks {
+		if p - b.addr < b.size {return true}
+	}
+	return false
+}
+
 // A block of `req` bytes rounded up to SYS_ALIGN, or 0 when none fits. A
 // size of 0 returns where a block of SYS_ALIGN would go and allocates
 // nothing, as the EE heap's old bump allocator did: not the empty gap

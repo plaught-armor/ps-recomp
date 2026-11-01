@@ -160,6 +160,7 @@ game :: proc(_: rawptr) {
 	test_cmd_deliver()
 	test_libsd()
 	test_cdvdman()
+	test_fallback()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -829,6 +830,26 @@ test_failed_paths :: proc() {
 	ida, _ := iop.iop_load(fa, "moda", nil)
 	idb2, rb := iop.iop_load(fb, "modb", nil)
 	check(ida > 0 && idb2 > 0 && rb == 0x700, "failed paths: once liba registers, the retry runs and links")
+
+	// However often a load succeeds in between, a path's start runs at most
+	// IOP_LOAD_FAILS times; every refusal is still a fallback row.
+	z: Asm
+	sm := imports(&z, "sysmem", 99)
+	entry := at(&z)
+	prologue(&z)
+	jal(&z, sm)
+	epilogue(&z)
+	fz := build_mod("modz", &z, entry)
+	call := core.Compat_Key{.Iop_Call, core.compat_name("sysmem"), 99}
+	back := core.Compat_Key{.Iop_Fallback, core.compat_name("modz"), 0}
+	calls, backs := core.compat.calls[call].n, core.compat.calls[back].n
+	for _ in 0 ..< 10 {
+		idz, _ := iop.iop_load(fz, "modz", nil)
+		idg, _ = iop.iop_load(build_mod("modg", &g, 0), "modg", nil)
+		check(idz == -1 && idg > 0, "failed paths: modz fails, modg loads")
+	}
+	check(core.compat.calls[call].n == calls + iop.IOP_LOAD_FAILS, "failed paths: a path's start runs at most IOP_LOAD_FAILS times")
+	check(core.compat.calls[back].n == backs + 10, "failed paths: each failure and refusal a fallback row")
 }
 
 // Condition: a budget spent after the start returned still loads.
@@ -1466,4 +1487,164 @@ mem_eq :: proc(x, y, n: u32) -> bool {
 		if iop.iop_u32(x + i)^ != iop.iop_u32(y + i)^ {return false}
 	}
 	return true
+}
+
+// LOADFILE's LoadModuleBuffer of IRX file `f`, put in IOP RAM: its reply.
+load_buffer :: proc(f: []u8) -> [2]u32 {
+	at := iop.sys_alloc(.High, u32(len(f)))
+	copy(iop.iop_mem(at, u32(len(f))), f)
+	buf: [0x208]u8
+	w := ([^]u32)(&buf)
+	w[0] = at
+	iop.sif.servers[0x80000006](6, buf[:], 0)
+	iop.sys_free(at)
+	return {w[0], w[1]}
+}
+
+// Conditions: a failed start is answered as a module not run, with a row;
+// it leaves no handler, fd or block transfer in the memory its undo frees;
+// a module importing a library of a failed one fails and falls back too.
+test_fallback :: proc() {
+	dir, err := os.make_directory_temp("", "ps_iop_fb_test_*", context.allocator)
+	if err != nil {
+		check(false, "fallback: no temp directory")
+		return
+	}
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s/cd.iso", dir)
+	_ = os.write_entire_file(path, discimg.make_iso(discimg.CNF_PS2))
+	if !iop.disc_image_open(path) {
+		check(false, "fallback: the image opens")
+		return
+	}
+	defer iop.disc_image_close() // before the directory is removed
+	iop.fileio_reset()
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	l := &iop.iop_loader
+
+	// The reply: {2, 0} as without PS_IRX, then a refusal answers the same.
+	z: Asm
+	sm := imports(&z, "sysmem", 99)
+	entry := at(&z)
+	prologue(&z)
+	jal(&z, sm)
+	epilogue(&z)
+	fz := build_mod("modx", &z, entry)
+	back := core.Compat_Key{.Iop_Fallback, core.compat_name("modx"), 0}
+	clear(&core.compat.calls) // earlier tests' fallbacks
+	check(!core.compat_line().fallback, "fallback: no compat line says so before")
+	check(load_buffer(fz) == {2, 0} && core.compat.calls[back].n == 1, "fallback: a failed start replies {2, 0} with a row")
+	check(core.compat_line().fallback, "fallback: the compat line says so")
+	check(load_buffer(fz) == {2, 0} && core.compat.calls[back].n == 2, "fallback: a refused retry replies the same, another count")
+	fa, _ := mod_a()
+	r := load_buffer(fa)
+	check(r[0] >= 3 && r[1] == 0, "fallback: a start that returns replies its id")
+
+	// "modo", resident, holds an fd open; "modh"'s start sets sifcmd and
+	// libsd handlers in itself, one over modo's, starts a block transfer
+	// from its buffer, opens a file, then calls what the HLE lacks.
+	fresh()
+	iop.iop_irx = true
+	o: Asm
+	ioo := imports(&o, "ioman", ..IOMAN_FNOS[:])
+	sub := str_words(&o, "cdrom0:\\DATA\\SUB.TXT;1")
+	ow := at(&o)
+	put(&o, 0)
+	oh := at(&o)
+	put(&o, JR_RA, 0)
+	entry = at(&o)
+	put(&o, JR_RA, 0x24020000)
+	ido, _ := iop.iop_load(build_mod("modo", &o, entry), "modo", nil)
+	ob := module_base(ido)
+	fd := io_call(ob + ioo, 4, ob + sub, 1)
+	check(ido > 0 && fd == 0, "fallback: modo loads and opens fd 0")
+	iop.iop_sifcmd.sys[6] = {ob + oh, 7}
+
+	h: Asm
+	sc := imports(&h, "sifcmd", 8, 10)
+	lsd := imports(&h, "libsd", 18, 26)
+	hio := imports(&h, "ioman", 4)
+	hsm := imports(&h, "sysmem", 99)
+	big := str_words(&h, "cdrom0:\\BIG.BIN;1")
+	tab := at(&h)
+	put(&h, 0, 0, 0, 0)
+	hh := at(&h)
+	put(&h, JR_RA, 0)
+	buf := at(&h)
+	for _ in 0 ..< 0x40 {put(&h, 0)}
+	entry = at(&h)
+	put(&h, 0x27bdffe0, 0xafbf0000) // addiu sp, sp, -32; sw ra, 0(sp)
+	la(&h, A0, tab)
+	li(&h, A1, 2)
+	jal(&h, sc)
+	for cid in ([3]u32{0x80000005, 0x80000006, 1}) {
+		if cid & 0x80000000 != 0 {
+			put(&h, 0x3c040000 | 0x8000, 0x34840000 | cid & 0xffff) // lui a0, 0x8000; ori a0, a0, cid
+		} else {
+			li(&h, A0, cid)
+		}
+		la(&h, A1, hh)
+		li(&h, A2, 0)
+		jal(&h, sc + 8)
+	}
+	li(&h, A0, 0)
+	la(&h, A1, hh)
+	li(&h, A2, 0)
+	jal(&h, lsd + 8)
+	li(&h, A0, 0)
+	li(&h, A1, 0)
+	la(&h, A2, buf)
+	li(&h, 7, 0x100)
+	jal(&h, lsd)
+	la(&h, A0, big)
+	li(&h, A1, 1)
+	jal(&h, hio)
+	jal(&h, hsm)
+	put(&h, 0x8fbf0000, JR_RA, 0x27bd0020) // lw ra, 0(sp); jr ra; addiu sp, sp, 32
+	fh := build_mod("modh", &h, entry)
+	cos := coroutines()
+	before := slice_clone(iop.sys_blocks[:])
+	r = load_buffer(fh)
+	back = core.Compat_Key{.Iop_Fallback, core.compat_name("modh"), 0}
+	check(r == {2, 0} && core.compat.calls[back].n == 1, "fallback: modh falls back")
+	check(blocks_equal(before, iop.sys_blocks[:]) && coroutines() == cos, "fallback: modh's memory and threads undone")
+	sc_ := &iop.iop_sifcmd
+	check(sc_.sys[5] == {} && sc_.sys[6] == {ob + oh, 7}, "fallback: its system handler dropped, modo's put back")
+	check(sc_.user_tab == 0 && sc_.user_size == 0, "fallback: its user table dropped")
+	check(!iop.iop_cmd_deliver(0x80000005) && !iop.iop_cmd_deliver(1), "fallback: its commands deliver nowhere")
+	check(iop.iop_sd.trans[0] == {} && iop.iop_sd.pending == 0, "fallback: its libsd handler dropped")
+	iop.iop_sd.trans[0] = {ob + oh, 0}
+	check(iop.sd_next_ee() == max(u64), "fallback: its block transfer stopped: none due with a handler")
+	iop.iop_sd.trans[0] = {}
+	check(io_call(ob + ioo, 6, 1, ob + ow, 1) == neg(9), "fallback: the fd it opened closed")
+	check(io_call(ob + ioo, 6, fd, ob + ow, 1) == 1, "fallback: modo's fd still open")
+	iop.iop_tick(cpu.state.cycles + 1 << 30)
+	check(coroutines() == cos, "fallback: no handler runs after")
+
+	// "modq" registers liba, then fails: modb, which calls liba, fails and
+	// falls back too, its stub never patched into modq's freed image.
+	fresh()
+	iop.iop_irx = true
+	q: Asm
+	lc := imports(&q, "loadcore", 6)
+	qsm := imports(&q, "sysmem", 99)
+	tbl, ptr := exports(&q, "liba")
+	q.w[ptr] = at(&q)
+	put(&q, JR_RA, 0x24020700)
+	entry = at(&q)
+	prologue(&q)
+	la(&q, A0, tbl)
+	jal(&q, lc)
+	jal(&q, qsm)
+	epilogue(&q)
+	check(load_buffer(build_mod("modq", &q, entry)) == {2, 0} && len(l.libs) == 0, "fallback: modq falls back, liba gone")
+	imp := core.Compat_Key{.Iop_Import, core.compat_name("liba"), 0}
+	back = core.Compat_Key{.Iop_Fallback, core.compat_name("modb"), 0}
+	n_imp, n_back := core.compat.calls[imp].n, core.compat.calls[back].n
+	fb, _ := mod_b(true)
+	check(load_buffer(fb) == {2, 0}, "fallback: modb, importing liba, replies {2, 0}")
+	check(core.compat.calls[imp].n == n_imp + 1 && core.compat.calls[back].n == n_back + 1, "fallback: modb's call reached no export, a row each")
+	check(len(l.stubs) == 0 && len(l.pending) == 0 && len(l.modules) == 0, "fallback: nothing of modb is left")
 }

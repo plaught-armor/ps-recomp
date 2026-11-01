@@ -38,8 +38,9 @@ COMPAT_TOP :: 10
 // Iop_Start a module's name, whose start ran out of its budget;
 // Iop_Blocked a module's name, whose start waited with no thread ready;
 // Iop_Threads a module's name, whose threads ran out of the load's budget
-// after its start returned; Iop_Intr the command id whose IOP handler
-// waited or ran out of its budget; Iop_Sd the id an IOP libsd call did not
+// after its start returned; Iop_Fallback a module's name, whose load failed
+// or was refused as one that failed, answered as a module not run; Iop_Intr
+// the command id whose IOP handler waited or ran out of its budget; Iop_Sd the id an IOP libsd call did not
 // decode and its function number; Iop_Sd_Intr the address of a libsd
 // interrupt handler that waited or ran out of its budget; Iop_Cd the data
 // pattern of an IOP sceCdRead, which reads only 2048-byte sectors; Iop_Io
@@ -58,6 +59,7 @@ Compat_Call :: enum u8 {
 	Iop_Start,
 	Iop_Blocked,
 	Iop_Threads,
+	Iop_Fallback,
 	Iop_Intr,
 	Iop_Sd,
 	Iop_Sd_Intr,
@@ -215,6 +217,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Start: return fmt.tprintf("IOP start %s budget", compat_names[k.id])
 	case .Iop_Blocked: return fmt.tprintf("IOP start %s blocked", compat_names[k.id])
 	case .Iop_Threads: return fmt.tprintf("IOP threads budget %s", compat_names[k.id])
+	case .Iop_Fallback: return fmt.tprintf("IOP fallback %s", compat_names[k.id])
 	case .Iop_Intr: return fmt.tprintf("IOP command handler %08x blocked", k.id)
 	case .Iop_Sd: return fmt.tprintf("IOP libsd fno %d id %04x", k.sub, k.id)
 	case .Iop_Sd_Intr: return fmt.tprintf("IOP libsd handler %08x blocked", k.id)
@@ -254,7 +257,8 @@ Compat_Name :: struct {
 // FRAMES, -1 when not counted (a run that ended before it, a host that does
 // not count); ram_still_since: the vblank from which main RAM was the same at
 // the end, else 0 (also when not checked: no FRAMES, or the run ended before
-// FRAMES/2); build: the ps-recomp commit (COMMIT).
+// FRAMES/2); fallback: an IOP module's load failed and the HLE stood in for
+// it (an Iop_Fallback row); build: the ps-recomp commit (COMMIT).
 Compat_Line :: struct {
 	system:               string,
 	result:               string,
@@ -270,6 +274,7 @@ Compat_Line :: struct {
 	shown:                u64,
 	lit:                  i64,
 	ram_still_since:      u64,
+	fallback:             bool,
 	build:                string,
 }
 
@@ -319,6 +324,7 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 	hex :: proc(v: u32) -> string {return v != 0 ? fmt.tprintf("%08x", v) : ""}
 	for k, h in compat.calls {
 		calls[i] = {compat_call_name(k), h.n, hex(h.pc), hex(h.ra), hex(h.client)}
+		l.fallback ||= k.kind == .Iop_Fallback
 		i += 1
 	}
 	slice.sort_by(calls, proc(a, b: Compat_Name) -> bool {

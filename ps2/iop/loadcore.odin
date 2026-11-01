@@ -97,7 +97,9 @@ iop_loader: struct {
 	modules: [dynamic]Iop_Module,
 	next_id: u32,
 	// During a load: its module, whether it failed, the stubs it patched,
-	// and the loader's state before it, which a failure restores.
+	// and the state before it, which a failure restores (undo_restore): the
+	// loader's, sysmem's, the handlers sifcmd and libsd hold, the user
+	// table's words and which fds were open.
 	loading: u32,
 	failed:  bool,
 	patches: [dynamic]Iop_Patch,
@@ -106,10 +108,28 @@ iop_loader: struct {
 		pending: [dynamic]Iop_Import,
 		stubs:   map[u32]Hle_Stub,
 		blocks:  [dynamic]Sys_Block,
+		sifcmd:  Iop_Sifcmd,
+		sif_tab: [dynamic]u32,
+		sd:      Iop_Sd,
+		open:    [dynamic]bool, // by fd
 	},
-	// The paths whose load failed, cloned; true once a retry has said so.
-	failed_paths: map[string]bool,
+	// The paths whose load failed, cloned.
+	failed_paths: map[string]Failed_Path,
 }
+
+// A path whose load failed: how often, whether it may run again (a library
+// registered or a load succeeded since its last failure), and whether a
+// refusal has said so.
+Failed_Path :: struct {
+	fails: u8,
+	retry: bool,
+	told:  bool,
+}
+
+// The most times one path's load fails: past it the path never runs again,
+// whatever registers, so a game that reloads a failing module costs at most
+// this many starts of it.
+IOP_LOAD_FAILS :: 3
 
 // PS_IRX=1: LOADFILE runs the modules it loads. Host setting, read at init.
 iop_irx: bool
@@ -138,6 +158,13 @@ iop_loader_init :: proc() {
 failed_paths_clear :: proc() {
 	for p in iop_loader.failed_paths {delete(p)}
 	clear(&iop_loader.failed_paths)
+}
+
+// Lets each failed path run again, up to IOP_LOAD_FAILS: what it lacked may
+// be here now.
+@(private = "file")
+failed_paths_retry :: proc() {
+	for _, &f in iop_loader.failed_paths {f.retry = true}
 }
 
 iop_sony :: proc(name: string) -> bool {
@@ -180,7 +207,10 @@ w32 :: proc(a, v: u32) {
 
 // Loads IRX file `data` (none of it in the block it is loaded to), links it
 // and runs its start with `args`, NUL-separated after argv[0] `path`. The
-// module's id and what its start returned, or KE_ERROR.
+// module's id and what its start returned, or KE_ERROR. A load that fails,
+// or is refused as one that failed before, raises an Iop_Fallback row:
+// LOADFILE answers it as it does a module it does not run, and its servers
+// are left to the HLE.
 iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32) {
 	x, ok := irx_parse(data)
 	if !ok {
@@ -188,11 +218,13 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		return KE_ERROR, 0
 	}
 	l := &iop_loader
-	if told, again := l.failed_paths[path]; again {
-		if !told {
+	if f, again := l.failed_paths[path]; again && (!f.retry || f.fails >= IOP_LOAD_FAILS) {
+		if !f.told {
 			fmt.eprintfln("iop: \"%s\" failed before, not run again", path)
-			l.failed_paths[path] = true
+			f.told = true
+			l.failed_paths[path] = f
 		}
+		core.compat_unknown(.Iop_Fallback, core.compat_name(x.name))
 		return KE_ERROR, 0
 	}
 	s := &iop_sched
@@ -201,7 +233,12 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
 		th_undo(mark_th, mark_sema)
 		undo_restore()
-		iop_loader.failed_paths[strings.clone(path)] = false
+		core.compat_unknown(.Iop_Fallback, core.compat_name(name))
+		paths := &iop_loader.failed_paths
+		f, again := paths[path]
+		f.fails += 1
+		f.retry = false
+		if again {paths[path] = f} else {paths[strings.clone(path)] = f}
 		return KE_ERROR, 0
 	}
 	undo_save()
@@ -253,7 +290,7 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		core.compat_unknown(.Iop_Threads, core.compat_name(x.name))
 		fmt.eprintfln("iop: threads of \"%s\" ran out of the budget", x.name)
 	}
-	failed_paths_clear()
+	failed_paths_retry()
 	l.next_id += 1
 	result = s.start_result
 	if result & 3 == NO_RESIDENT_END {
@@ -373,6 +410,13 @@ undo_save :: proc() {
 	append(&u.blocks, ..sys_blocks[:])
 	clear(&u.stubs)
 	for a, s in iop_loader.stubs {u.stubs[a] = s}
+	u.sifcmd, u.sd = iop_sifcmd, iop_sd
+	clear(&u.sif_tab)
+	for i in 0 ..< 2 * min(iop_sifcmd.user_size, IOP_RAM_SIZE / 8) {
+		append(&u.sif_tab, r32(iop_sifcmd.user_tab + 4 * i))
+	}
+	clear(&u.open)
+	for f in fileio.files {append(&u.open, f.f != nil)}
 }
 
 @(private = "file")
@@ -387,6 +431,20 @@ undo_restore :: proc() {
 	append(&l.libs, ..l.undo.libs[:])
 	clear(&l.pending)
 	append(&l.pending, ..l.undo.pending[:])
+	// What the load allocated, which is freed below: no handler is left
+	// pointing there, and the fds it opened are closed. What else it did is
+	// kept: bytes it wrote to memory that stays, what it sent the EE, the
+	// SPU2 registers and voices it set, threads it did not make that it
+	// started or woke, and fds open before it that it closed or moved.
+	freed := make([dynamic]Sys_Block, 0, len(sys_blocks), context.temp_allocator)
+	for b in sys_blocks {
+		if !slice.contains(l.undo.blocks[:], b) {append(&freed, b)}
+	}
+	sifcmd_undo(l.undo.sifcmd, l.undo.sif_tab[:], freed[:])
+	sd_undo(l.undo.sd, freed[:])
+	for &f, i in fileio.files {
+		if f.f != nil && (i >= len(l.undo.open) || !l.undo.open[i]) {f = {}}
+	}
 	clear(&sys_blocks)
 	append(&sys_blocks, ..l.undo.blocks[:])
 	clear(&l.stubs)
@@ -520,7 +578,7 @@ lib_register :: proc(a: u32) -> u32 {
 	if _, dup := lib_find(name, b.version); dup {return ke(KE_LIBRARY_FOUND)}
 	for b.count < 256 && r32(a + 20 + 4 * b.count) != 0 {b.count += 1}
 	append(&l.libs, b)
-	failed_paths_clear()
+	failed_paths_retry()
 	for i := 0; i < len(l.pending); {
 		p := l.pending[i]
 		pn := p.name

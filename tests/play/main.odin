@@ -93,6 +93,7 @@ main :: proc() {
 	test_bad_blob(test_native("psx_exe", exe_disc()))
 	test_interpreted()
 	test_compat()
+	test_line_row()
 	if os.remove_all(tmp) != nil {
 		check("", false, fmt.tprintf("cannot remove %s", tmp))
 	}
@@ -546,6 +547,25 @@ run :: proc(name, path: string, status := 0) -> (errs: string, ok: bool) {
 		return errs, false
 	}
 	return errs, true
+}
+
+// The result of a run that reached FRAMES with progress and a fallen-back
+// IOP module: fallback, unless it stalled, which comes first.
+@(private = "file")
+test_line_row :: proc() {
+	name := "line_row"
+	row: play.Row
+	l := core.Compat_Line{result = "frames", frames = FRAMES, shown = 1, lit = 1, fallback = true}
+	play.line_row(&row, l)
+	check(name, row[.Result] == "fallback" && row[.Status] == "" && row[.Fatal] == "", fmt.tprintf("fallback: %v", row))
+	row = {}
+	l.lit = 0
+	play.line_row(&row, l)
+	check(name, row[.Result] == "stalled" && row[.Status] == "1" && row[.Fatal] == "stalled: nothing drawn", fmt.tprintf("stalled: %v", row))
+	row = {}
+	l.lit, l.fallback = 1, false
+	play.line_row(&row, l)
+	check(name, row[.Result] == "ok", fmt.tprintf("ok: %v", row))
 }
 
 // play --compat on a directory, then twice on its looping disc.

@@ -47,8 +47,9 @@ FATAL_MAX :: 200
 
 // compat.tsv's columns. result: ok (FRAMES reached), stalled (FRAMES reached
 // with no progress: the display never on, nothing drawn on the last frame, or
-// main RAM unchanged from FRAMES/2), exit (the game ended), fatal, crash (no
-// compat line), hang (stopped at COMPAT_WAIT), spawn (no child); status: the
+// main RAM unchanged from FRAMES/2), fallback (FRAMES reached with progress,
+// but an IOP module's load failed and the HLE stood in for it), exit (the
+// game ended), fatal, crash (no compat line), hang (stopped at COMPAT_WAIT), spawn (no child); status: the
 // child's exit status (the signal of a crash on POSIX), 1 for stalled as for
 // fatal though the child exits 0, "" for hang and spawn; native: whether the
 // run had the disc's native code; interp_share: interp_insns *
@@ -354,7 +355,6 @@ log_lines :: proc(path: string) -> (line, last: string) {
 }
 
 // Fill the row from the child's compat line.
-@(private = "file")
 line_row :: proc(row: ^Row, l: core.Compat_Line) {
 	switch l.result {
 	case "frames": row[.Result] = "ok"
@@ -375,6 +375,8 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 		}
 		if stalled {
 			row[.Result], row[.Status] = "stalled", "1"
+		} else if l.fallback {
+			row[.Result] = "fallback"
 		}
 	}
 	if l.system != "" {

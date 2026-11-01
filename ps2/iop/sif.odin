@@ -319,7 +319,9 @@ sif_command :: proc(a, pc: u32) {
 
 // loadfile: modules are native here, so loading one only reports success;
 // an ELF is loaded into EE RAM (loadelf). With PS_IRX=1 a module that is no
-// Sony one is loaded and started on the IOP (loadcore.odin).
+// Sony one is loaded and started on the IOP (loadcore.odin); one whose load
+// fails is answered as without it, its servers left to the HLE (iop_load's
+// Iop_Fallback row).
 @(private)
 loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
@@ -333,8 +335,7 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		w[1] = 0
 		if iop_irx && !strings.has_prefix(path, "rom0:") {
 			if data, ok := disc_file(path, context.temp_allocator); ok && iop_runs(data) {
-				id, result := iop_load(data, path, args)
-				w[0], w[1] = u32(id), result
+				if id, result := iop_load(data, path, args); id >= 0 {w[0], w[1] = u32(id), result}
 			}
 		}
 		return true
@@ -358,8 +359,7 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		w[0] = 2
 		w[1] = 0
 		if iop_irx && iop_runs(data) {
-			id, result := iop_load(data, name, args)
-			w[0], w[1] = u32(id), result
+			if id, result := iop_load(data, name, args); id >= 0 {w[0], w[1] = u32(id), result}
 		}
 		return true
 	case 255: // version handshake: the EE library refuses to load modules

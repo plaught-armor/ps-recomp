@@ -15,8 +15,7 @@ import r3000 "ps:psx/cpu"
 
 IOP_SYS_CMDS :: 32
 
-// Emulated state, snapshotted (sif_snap) and reset with the loader.
-iop_sifcmd: struct {
+Iop_Sifcmd :: struct {
 	user_tab:  u32, // the module's table, IOP address
 	user_size: u32, // its entries
 	sys:       [IOP_SYS_CMDS]struct {
@@ -24,6 +23,9 @@ iop_sifcmd: struct {
 	},
 	dma_id:    u32, // the last DMA id handed out
 }
+
+// Emulated state, snapshotted (sif_snap) and reset with the loader.
+iop_sifcmd: Iop_Sifcmd
 
 // Function fno of sifcmd, as stdio_fn.
 sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
@@ -80,6 +82,26 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return ke(-1), true
 	}
 	return 0, false
+}
+
+// After a failed load: puts back each handler it left with its handler or
+// harg in `freed`, the memory its undo frees, as it was when the load began
+// (`saved`, and `tab` the words of the user table then), so no command is
+// delivered there. The table too, when it was in `freed`.
+sifcmd_undo :: proc(saved: Iop_Sifcmd, tab: []u32, freed: []Sys_Block) {
+	s := &iop_sifcmd
+	for &h, i in s.sys {
+		if sys_in(freed, h.handler) || sys_in(freed, h.harg) {h = saved.sys[i]}
+	}
+	if sys_in(freed, s.user_tab) {s.user_tab, s.user_size = saved.user_tab, saved.user_size}
+	for i in 0 ..< min(s.user_size, IOP_RAM_SIZE / 8) {
+		e := s.user_tab + 8 * i
+		if !sys_in(freed, r32(e)) && !sys_in(freed, r32(e + 4)) {continue}
+		old: [2]u32
+		if s.user_tab == saved.user_tab && 2 * i + 1 < u32(len(tab)) {old = {tab[2 * i], tab[2 * i + 1]}}
+		w32(e, old[0])
+		w32(e + 4, old[1])
+	}
 }
 
 // A DMA id, never 0, which a failed transfer returns.

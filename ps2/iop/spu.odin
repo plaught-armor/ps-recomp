@@ -644,6 +644,14 @@ sd_lib_init :: proc() {
 	spu.block = {}
 }
 
+// Stops the block transfers whose buffer starts in `freed`, the memory a
+// failed IOP load frees (sd_undo).
+sd_block_drop :: proc(freed: []Sys_Block) {
+	for &b in spu.block {
+		if b.on && sys_in(freed, b.base) {b.on, b.play = false, false}
+	}
+}
+
 // Makes channel's block transfer, just started by sd_block_trans, libsd's:
 // it plays, and its first half-buffer crossing is set.
 sd_block_arm :: proc(channel: u32) {
