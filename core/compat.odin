@@ -34,7 +34,8 @@ COMPAT_TOP :: 10
 // Bios_A/B/C the function number; Syscall the syscall number (as an i32);
 // Sif_Bind the server id; Sif_Rpc the server id and function number;
 // Sif_Cmd the command id; Iop_Call an IOP library's name (compat_name) and
-// function number; Iop_Import a library's name no module registered;
+// function number; Iop_Import a library's name no module registered, or
+// with sub the version of a Sony library's import the HLE does not serve;
 // Iop_Start a module's name, whose start ran out of its budget;
 // Iop_Blocked a module's name, whose start waited with no thread ready;
 // Iop_Threads a module's name, whose threads ran out of the load's budget
@@ -217,7 +218,9 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Sif_Rpc: return fmt.tprintf("SIF server %08x fno %d", k.id, k.sub)
 	case .Sif_Cmd: return fmt.tprintf("SIF command %08x", k.id)
 	case .Iop_Call: return fmt.tprintf("IOP %s fno %d", compat_names[k.id], k.sub)
-	case .Iop_Import: return fmt.tprintf("IOP import %s", compat_names[k.id])
+	case .Iop_Import:
+		if k.sub != 0 {return fmt.tprintf("IOP import %s version %x", compat_names[k.id], k.sub)}
+		return fmt.tprintf("IOP import %s", compat_names[k.id])
 	case .Iop_Start: return fmt.tprintf("IOP start %s budget", compat_names[k.id])
 	case .Iop_Blocked: return fmt.tprintf("IOP start %s blocked", compat_names[k.id])
 	case .Iop_Threads: return fmt.tprintf("IOP threads budget %s", compat_names[k.id])

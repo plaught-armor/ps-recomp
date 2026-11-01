@@ -78,6 +78,7 @@ Hle_Stub :: struct {
 	name:    [8]u8,
 	fno:     u32,
 	pending: bool, // a library nobody registered yet, else a Sony one
+	version: u16, // a Sony one's, as the import names it
 }
 
 Iop_Module :: struct {
@@ -358,10 +359,10 @@ link_imports :: proc(table: u32, t: ^Irx_Table) {
 		if lib, ok := lib_find(name, t.version); ok {
 			link_stub(stub, lib, fno)
 		} else if iop_sony(name) {
-			l.stubs[phys(stub)] = {t.name, fno, false}
+			l.stubs[phys(stub)] = {t.name, fno, false, t.version}
 		} else {
 			append(&l.pending, Iop_Import{t.name, t.version, stub, fno})
-			l.stubs[phys(stub)] = {t.name, fno, true}
+			l.stubs[phys(stub)] = {t.name, fno, true, 0}
 		}
 	}
 }
@@ -380,7 +381,7 @@ lib_find :: proc(name: string, version: u16) -> (lib: Iop_Lib, ok: bool) {
 link_stub :: proc(stub: u32, lib: Iop_Lib, fno: u32) -> bool {
 	l := &iop_loader
 	if fno >= lib.count {
-		l.stubs[phys(stub)] = {lib.name, fno, true}
+		l.stubs[phys(stub)] = {lib.name, fno, true, 0}
 		return false
 	}
 	f := r32(lib.table + 20 + 4 * fno)
@@ -486,6 +487,9 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 	if s.pending {
 		core.compat_unknown(.Iop_Import, core.compat_name(name), pc = addr, ra = r[31])
 		fmt.eprintfln("iop: call to %s fno %d, which no module registered", name, s.fno)
+	} else if s.version >> 8 != IOP_HLE_MAJOR {
+		core.compat_unknown(.Iop_Import, core.compat_name(name), u32(s.version), pc = addr, ra = r[31])
+		fmt.eprintfln("iop: call to %s version %x fno %d, a major version the HLE does not serve", name, s.version, s.fno)
 	} else if v, ok := hle_fn(name, s.fno); ok {
 		r[2] = v
 		if iop_sched.resched {th_preempt()}
@@ -497,6 +501,11 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 	r[2] = ke(KE_ERROR)
 	th_call_failed()
 }
+
+// The major version of each Sony library hle_fn serves: its numbers are
+// those of the version 1 export tables. An import of another major names
+// other functions by the same numbers, so a call to it is not served.
+IOP_HLE_MAJOR :: 1
 
 // An error code as v0 holds it.
 ke :: proc(e: i32) -> u32 {

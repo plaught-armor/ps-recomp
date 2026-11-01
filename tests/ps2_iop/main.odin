@@ -155,6 +155,8 @@ game :: proc(_: rawptr) {
 	test_failed_paths()
 	test_thread_budget()
 	test_libc()
+	test_sysclib()
+	test_import_major()
 	test_thread_snap()
 	test_sifcmd()
 	test_cmd_deliver()
@@ -401,8 +403,13 @@ name_words :: proc(s: string) -> (n: [2]u32) {
 
 // An import table of `lib` 1.1; the offset of its first stub.
 imports :: proc(a: ^Asm, lib: string, fnos: ..u32) -> u32 {
+	return imports_v(a, lib, 0x0101, ..fnos)
+}
+
+// imports, of `lib` at `version`.
+imports_v :: proc(a: ^Asm, lib: string, version: u32, fnos: ..u32) -> u32 {
 	n := name_words(lib)
-	put(a, IMPORT, 0, 0x0101, n[0], n[1])
+	put(a, IMPORT, 0, version, n[0], n[1])
 	stubs := at(a)
 	for f in fnos {put(a, JR_RA, 0x24000000 | f)}
 	put(a, 0, 0)
@@ -962,8 +969,154 @@ test_libc :: proc() {
 	r := &r3000.state.r
 	r[5], r[6], r[7], r[29] = 0xffffffff, 0xff, 0xab, 0x1f000
 	iop.iop_u32(0x1f010)^, iop.iop_u32(0x1f014)^ = 'z', 7
-	got := iop.iop_format("%5d|%-3x|%08X|%c|%u%%|%ld")
+	got, _ := iop.iop_format("%5d|%-3x|%08X|%c|%u%%|%ld")
 	check(got == "   -1|ff |000000AB|z|7%|0", fmt.tprintf("libc: printf conversions, arguments past a3 from the stack: %q", got))
+}
+
+// sysclib's string calls over IOP RAM, from their edges; called directly.
+test_sysclib :: proc() {
+	fresh()
+	r := &r3000.state.r
+	ram := iop.iop_ram
+	TOP :: iop.IOP_RAM_SIZE
+	put_str :: proc(a: u32, s: string) {
+		copy(iop.iop_ram[a:], s)
+		iop.iop_ram[a + u32(len(s))] = 0
+	}
+	call :: proc(fno: u32, args: ..u32) -> u32 {
+		r := &r3000.state.r
+		for v, i in args {r[4 + i] = v}
+		v, ok := iop.sysclib_fn(fno)
+		check(ok, fmt.tprintf("sysclib: fno %d served", fno))
+		return v
+	}
+	str :: proc(a: u32) -> string {return string(cstring(&iop.iop_ram[a]))}
+	A, B, C :: 0x100000, 0x100100, 0x100200
+
+	// look_ctype_table: classes, EOF, past the table.
+	check(call(8, 'G') == 0x01 && call(8, 'c') == 0x42 && call(8, '7') == 0x04, "sysclib: ctype letters and digits")
+	check(call(8, '\t') == 0x08 && call(8, ' ') == 0x18 && call(8, 1) == 0x20 && call(8, 127) == 0x20, "sysclib: ctype space, control")
+	check(call(8, '~') == 0x10 && call(8, 0xffffffff) == 0 && call(8, 150) == 0, "sysclib: ctype punct; EOF and 128..158 are 0")
+	ct := core.Compat_Key{.Iop_Call, core.compat_name("sysclib"), 8}
+	check(core.compat.calls[ct].n == 0 && call(8, 159) == 0 && call(8, 0xfffffffe) == 0 && core.compat.calls[ct].n == 2, "sysclib: ctype past -1..158 is 0 with a row")
+
+	// memcmp: n <= 0, first difference unsigned, -1/1.
+	put_str(A, "ab\x80")
+	put_str(B, "ab\x01")
+	check(call(11, A, B, 0) == 0 && call(11, A, B, 0x80000000) == 0, "sysclib: memcmp n <= 0 is 0")
+	check(call(11, A, B, 2) == 0 && call(11, A, B, 3) == 1 && call(11, B, A, 3) == 0xffffffff, "sysclib: memcmp unsigned, -1 or 1")
+	check(call(11, TOP - 2, TOP - 2, 100) == 0, "sysclib: memcmp stops at RAM's end")
+
+	// bzero: n <= 0, a run to RAM's end.
+	ram[A], ram[A + 1] = 7, 7
+	call(17, A, 1)
+	check(ram[A] == 0 && ram[A + 1] == 7, "sysclib: bzero n")
+	call(17, A + 1, 0x80000000)
+	check(ram[A + 1] == 7, "sysclib: bzero n < 0 writes none")
+	ram[TOP - 1] = 9
+	call(17, TOP - 1, 100)
+	check(ram[TOP - 1] == 0, "sysclib: bzero stops at RAM's end")
+
+	// strlen, strcmp, strncmp: null rules, signed difference, n.
+	put_str(A, "abc")
+	put_str(B, "ab\xff")
+	check(call(27, 0) == 0 && call(27, A) == 3, "sysclib: strlen, 0 for null")
+	ram[TOP - 1] = 'x'
+	check(call(27, TOP - 1) == 1, "sysclib: strlen of an unterminated string stops at RAM's end")
+	check(call(22, 0, 0) == 0 && call(22, 0, A) == 0xffffffff && call(22, A, 0) == 1, "sysclib: strcmp null rules")
+	check(call(22, A, B) == u32('c' + 1) && call(22, B, A) == ~u32('c'), "sysclib: strcmp signed difference")
+	check(call(22, A, A) == 0 && call(22, TOP - 1, TOP - 1) == 0, "sysclib: strcmp equal, unterminated at RAM's end")
+	check(call(29, A, B, 2) == 0 && call(29, A, B, 3) == u32('c' + 1) && call(29, A, B, 0) == 0 && call(29, A, B, 0xffffffff) == 0, "sysclib: strncmp within n, n <= 0")
+	check(call(29, 0, A, 0) == 0xffffffff, "sysclib: strncmp null before n")
+	put_str(C, "abc")
+	check(call(29, A, C, 100) == 0, "sysclib: strncmp stops at a shared NUL")
+
+	// strcpy, strcat: null, return, overlap, same end.
+	check(call(23, 0, A) == 0 && call(23, C, 0) == 0, "sysclib: strcpy null gives 0")
+	check(call(23, C, A) == C && str(C) == "abc", "sysclib: strcpy returns dst")
+	put_str(A, "abcdef")
+	check(call(23, A, A + 2) == A && str(A) == "cdef", "sysclib: strcpy overlap, dst before src")
+	check(call(20, 0, A) == 0 && call(20, A, 0) == 0, "sysclib: strcat null gives 0")
+	put_str(A, "ab")
+	put_str(B, "cd")
+	check(call(20, A, B) == A && str(A) == "abcd", "sysclib: strcat appends, returns dst")
+	put_str(A, "abcd")
+	check(call(20, A, A + 2) == 0 && str(A) == "abcd", "sysclib: strcat of strings ending at one address gives 0")
+	put_str(B, "xyz")
+	call(23, TOP - 2, B)
+	check(ram[TOP - 2] == 'x' && ram[TOP - 1] == 'y', "sysclib: strcpy stops at RAM's end")
+
+	// strncpy: padding, no NUL at n, n <= 0.
+	for i in u32(0) ..< 8 {ram[C + i] = 0xee}
+	put_str(B, "ab")
+	check(call(30, C, B, 5) == C && str(C) == "ab" && ram[C + 3] == 0 && ram[C + 4] == 0 && ram[C + 5] == 0xee, "sysclib: strncpy pads with NUL to n")
+	put_str(B, "wxyz")
+	check(call(30, C, B, 2) == C && ram[C] == 'w' && ram[C + 1] == 'x' && ram[C + 2] == 0, "sysclib: strncpy at n writes no NUL")
+	check(call(30, C, B, 0) == C && call(30, C, B, 0x80000000) == C && ram[C] == 'w', "sysclib: strncpy n <= 0 returns dst")
+	check(call(30, 0, B, 2) == 0 && call(30, C, 0, 2) == 0, "sysclib: strncpy null gives 0")
+	call(30, TOP - 1, B, 100)
+	check(ram[TOP - 1] == 'w', "sysclib: strncpy stops at RAM's end")
+
+	// sprintf: return, NUL, null format, RAM's end, the formatter's quirks.
+	put_str(A, "%d-%s")
+	put_str(B, "ok")
+	for i in u32(0) ..< 8 {ram[C + i] = 0xee}
+	check(call(19, C, A, 0xfffffff9, B) == 5 && str(C) == "-7-ok" && ram[C + 5] == 0, "sysclib: sprintf returns the count without the NUL")
+	ram[C] = 0xee
+	check(call(19, C, 0) == 0 && ram[C] == 0xee, "sysclib: sprintf of a null format writes none")
+	put_str(A, "abcd")
+	check(call(19, TOP - 2, A) == 4 && ram[TOP - 2] == 'a' && ram[TOP - 1] == 'b', "sysclib: sprintf stops at RAM's end")
+	r[5], r[6], r[7], r[29] = 0x12345678, 0xfffffff4, 0, 0x1f000
+	for v, i in ([]u32{0x1f100, 0x0003ffff, 8, 0, 0x1f104}) {iop.iop_u32(0x1f010 + 4 * u32(i))^ = v}
+	iop.iop_u32(0x1f104)^ = 0xffffffff
+	got, _ := iop.iop_format("%#x|%.5d|%09s|%p|%hd|%#o|%.0d|%hn|%f%%", 1)
+	head :: "0x12345678|-0012|000(null)|1f100|262143|010||"
+	check(got == head + "|f%", fmt.tprintf("sysclib: formatter quirks: %q", got))
+	check(iop.iop_u32(0x1f104)^ == len(head), "sysclib: %hn stores the count's whole word")
+
+	// A format's end right after % or a flag; 32-bit widths and precisions.
+	out, n := iop.iop_format("ab%")
+	check(out == "ab" && n == 2, "sysclib: a format ending after % prints what came before")
+	out, n = iop.iop_format("ab%-0")
+	check(out == "ab" && n == 2, "sysclib: a format ending after a flag prints what came before")
+	r[5], r[6] = 5, 5
+	out, n = iop.iop_format("%4294967297d|%.4294967295d", 1)
+	check(out == "5|5", fmt.tprintf("sysclib: a digit run wraps at 32 bits, a negative precision is none: %q", out))
+	r[5], r[6] = 0x80000000, 5
+	out, n = iop.iop_format("%*d", 1)
+	check(out == "5", "sysclib: a * width of the most negative int pads nothing")
+
+	// Output past IOP RAM's size: counted, not kept; sprintf stops at RAM's end.
+	r[5] = 5
+	out, n = iop.iop_format("%2147483647d", 1)
+	check(n == 0x7fffffff && len(out) == iop.IOP_RAM_SIZE, fmt.tprintf("sysclib: a huge width is counted, kept to RAM's size: %x %x", n, len(out)))
+	r[5], r[6], r[7] = 0x7fffffff, 1, 0x7fffffff
+	out, n = iop.iop_format("%*d%*d", 1)
+	check(n == 0xfffffffe, "sysclib: the count wraps at 32 bits")
+	put_str(A, "%*d")
+	check(call(19, TOP - 0x10000, A, 0x7fffffff, 5) == 0x7fffffff, "sysclib: sprintf with width 0x7fffffff returns the count")
+	check(ram[TOP - 1] == ' ' && ram[TOP - 0x10000] == ' ', "sysclib: sprintf with width 0x7fffffff stops at RAM's end")
+}
+
+// A Sony import of another major version is not served; another minor is.
+test_import_major :: proc() {
+	fresh()
+	a: Asm
+	v2 := imports_v(&a, "sysclib", 0x0201, 27)
+	v1 := imports_v(&a, "sysclib", 0x0105, 27)
+	s := str_words(&a, "abc")
+	entry := at(&a)
+	prologue(&a)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modv", &a, entry), "modv", nil)
+	b := module_base(id)
+	check(id > 0, "major: modv loads")
+	r3000.state.r[4] = b + s
+	check(iop_call(b + v1) == 3, "major: another minor version is served")
+	key := core.Compat_Key{.Iop_Import, core.compat_name("sysclib"), 0x0201}
+	r3000.state.r[4] = b + s
+	check(iop_call(b + v2) == 0xffffffff && core.compat.calls[key].n == 1, "major: major 2 fails with a row, not served")
 }
 
 snap3: core.Snapshot
