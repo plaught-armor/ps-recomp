@@ -60,7 +60,7 @@ Spu_Voice :: struct {
 	hist:       [2]i32, // ADPCM predictor history
 	pitch:      u32,
 	voll, volr: i32,
-	dry:        bool, // out of the effect send (VMIXEL/VMIXER), which libsd's init opens to every voice
+	dry:        bool, // out of the effect send (VMIXEL/VMIXER), which libsd's init opens to every voice (sd_lib_init)
 }
 
 @(private = "file")
@@ -76,7 +76,12 @@ spu: struct {
 	block:  [2]Sdr_Block, // the block transfers, per channel
 	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
 	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
+	switches: [2][Spu_Switch]u32, // the voice masks sd_switch_extra keeps, 24 bits, per core
 }
+
+// The voice masks sceSdSetSwitch writes and sceSdGetSwitch reads back.
+@(private = "file")
+Spu_Switch :: enum u8 {PMON, NON, VMIXL, VMIXEL, VMIXR, VMIXER}
 
 // A block transfer (sceSdBlockTrans) as a clock only: its samples are not
 // played. It reads its buffer from `start` on, at a modelled 48 kHz of
@@ -596,23 +601,58 @@ sd_core_param :: proc(id, value: u32) -> bool {
 	return true
 }
 
-// sceSdSetSwitch(id, voice mask) for VMIXEL and VMIXER, a voice in the
-// effect send with its bit set (both share the one send here); PMON, NON
-// and the dry mixes VMIXL, VMIXR are taken and change nothing. ENDX: LIBSD
-// 1.5 writes both halves of the core's ENDX register, and a write there
-// clears the end flags whatever the value (as known of the SPU2, not seen on
-// hardware), so every voice of the core loses its end flag. Nothing served
-// reads it back yet; serving sceSdGetSwitch means checking this again.
+// sceSdSetSwitch(id, voice mask) for PMON, NON, the dry mixes VMIXL, VMIXR
+// and the effect mixes VMIXEL, VMIXER: the mask is kept for sceSdGetSwitch,
+// 24 bits as LIBSD 1.5 writes them, and only the effect mixes change what
+// plays, a voice in the effect send with its bit set. Both share the one
+// send here, so the last of the two written decides for both, though each
+// reads back its own mask. ENDX: LIBSD 1.5 writes both halves of the core's
+// ENDX register, and a write there clears the end flags whatever the value
+// (as known of the SPU2, not seen on hardware), so every voice of the core
+// loses its end flag.
 sd_switch_extra :: proc(id, mask: u32) -> bool {
-	switch id & 0xff00 {
-	case SD_S_VMIXEL, SD_S_VMIXER:
-		for &v, i in spu.voice[id & 1] {v.dry = mask & (1 << u32(i)) == 0}
-	case SD_S_ENDX:
-		for &v in spu.voice[id & 1] {v.endx = false}
-	case SD_S_PMON, SD_S_NON, SD_S_VMIXL, SD_S_VMIXR:
-	case: return false
+	c := id & 1
+	if id & 0xff00 == SD_S_ENDX {
+		for &v in spu.voice[c] {v.endx = false}
+		return true
+	}
+	s, found := spu_switch(id)
+	if !found {return false}
+	spu.switches[c][s] = mask & 0xffffff
+	if s == .VMIXEL || s == .VMIXER {
+		for &v, i in spu.voice[c] {v.dry = mask & (1 << u32(i)) == 0}
 	}
 	return true
+}
+
+// sceSdGetSwitch(id) for ENDX, voice n's end flag in bit n, left set (LIBSD
+// 1.5 only reads the register), and the masks sd_switch_extra keeps. KON
+// and KOFF are not: LIBSD 1.5 reads their registers, whose value is not
+// known.
+sd_get_switch :: proc(id: u32) -> (u32, bool) {
+	c := id & 1
+	if id & 0xff00 == SD_S_ENDX {
+		bits: u32
+		for &v, i in spu.voice[c] {if v.endx {bits |= 1 << u32(i)}}
+		return bits, true
+	}
+	s, found := spu_switch(id)
+	if !found {return 0, false}
+	return spu.switches[c][s], true
+}
+
+// The mask id names, its core aside.
+@(private = "file")
+spu_switch :: proc(id: u32) -> (Spu_Switch, bool) {
+	switch id & 0xff00 {
+	case SD_S_PMON: return .PMON, true
+	case SD_S_NON: return .NON, true
+	case SD_S_VMIXL: return .VMIXL, true
+	case SD_S_VMIXEL: return .VMIXEL, true
+	case SD_S_VMIXR: return .VMIXR, true
+	case SD_S_VMIXER: return .VMIXER, true
+	}
+	return {}, false
 }
 
 // sceSdSetAddr(id, address) for a core's IRQA; ESA, EEA and TSA are taken
@@ -655,10 +695,14 @@ sd_clear_effect :: proc(core: u32) {
 }
 
 // sceSdInit's part past sd_init: the cores' IRQs off, every block transfer
-// stopped.
+// stopped, and every voice in the four mixes, as LIBSD 1.5's init writes
+// VMIXL, VMIXEL, VMIXR and VMIXER all ones on both cores (sd_init's voices
+// are out of no send already). It does not write PMON or NON: they are
+// kept 0, the zero state, as their value at power on is not known.
 sd_lib_init :: proc() {
 	spu.irqa, spu.irq_watch = {}, 0
 	spu.block = {}
+	for &c in spu.switches {c = {.PMON = 0, .NON = 0, .VMIXL = 0xffffff, .VMIXEL = 0xffffff, .VMIXR = 0xffffff, .VMIXER = 0xffffff}}
 }
 
 // Stops the block transfers whose buffer starts in `freed`, the memory a

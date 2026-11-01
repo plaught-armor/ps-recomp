@@ -152,7 +152,16 @@ voices :: proc() {
 	st = iop.spu_voice_status(1, 0)
 	check(!st.on && st.endx && st.envx == 0, "end during attack zeroes ENVX")
 	check(iop.spu_voice_status(0, 23).endx, "core 0's end flag kept by core 1's end")
+	e0, _ := iop.sd_get_switch(0x1700)
+	e1, _ := iop.sd_get_switch(0x1701)
+	e1b, _ := iop.sd_get_switch(0x17ff) // LIBSD 1.5 takes the core from bit 0 alone
+	check(e0 & (1 << 23) != 0 && e1 & 1 != 0 && e1b == e1, "GetSwitch ENDX: an ended voice's bit, a core each")
+	e0b, _ := iop.sd_get_switch(0x1700)
+	check(e0b == e0, "GetSwitch ENDX leaves the flags set")
 	check(iop.sd_switch_extra(0x1701, 0) && !iop.spu_voice_status(1, 0).endx && iop.spu_voice_status(0, 23).endx, "SetSwitch ENDX clears the core's end flags, whatever the value, not the other's")
+	e1, _ = iop.sd_get_switch(0x1701)
+	e0b, _ = iop.sd_get_switch(0x1700)
+	check(e1 == 0 && e0b == e0, "GetSwitch ENDX after it: the core's 0, the other's kept")
 	check(out[54] > 0, "last sample of a one-shot heard")
 
 	edge: [8]u8

@@ -1927,7 +1927,7 @@ test_sifman :: proc() {
 }
 
 // libsd's functions, in the order "modl" imports them.
-LIBSD_FNOS := [?]u32{4, 5, 6, 7, 9, 10, 11, 13, 17, 18, 19, 20, 23, 25, 26, 27, 28}
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 8, 9, 10, 11, 13, 17, 18, 19, 20, 23, 25, 26, 27, 28}
 
 // "modl" as loaded: its base, the offsets of its libsd stubs, its data
 // (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
@@ -2084,9 +2084,11 @@ test_libsd :: proc() {
 	sd_call(18, 1, 0x10, b + buf, 0x2000, 0)
 	check(iop.iop_wake_ee == C0 + SD_HALF, "libsd: the wake is the first half-buffer crossing")
 	saved := coroutines()
+	sd_call(7, 0x1301, 0x123456)
 	core.snap_op, core.snap_target = .Save, &snap4
 	core.snap_yield()
 	if !snap4_loaded {
+		sd_call(7, 0x1301, 0)
 		iop.iop_tick(C0 + SD_HALF - 1)
 		check(sd_word(0) == 0, "libsd: no handler before the crossing")
 		iop.iop_tick(C0 + SD_HALF)
@@ -2096,6 +2098,7 @@ test_libsd :: proc() {
 		core.snap_yield()
 	}
 	check(sd_word(0) == 0 && coroutines() == saved && iop.iop_sd.trans[1] == {b + h, 7}, "libsd: the load restores the handler and drops the coroutine")
+	check(sd_call(8, 0x1301) == 0x123456, "libsd: the load restores a SetSwitch mask")
 	iop.iop_tick(C0 + SD_HALF)
 	check(sd_word(0) == 1 && sd_word(1) == 1 && sd_word(2) == 7 && sd_word(3) == 1, "libsd: the handler gets channel and argument, the thread runs after")
 	check(iop.iop_wake_ee == C0 + 2 * SD_HALF, "libsd: the next wake is the second half")
@@ -2165,6 +2168,26 @@ test_libsd :: proc() {
 	sd_call(17, 0, 0, b + adp, 0x5000, 32)
 	iop.iop_tick(cpu.state.cycles)
 	check(sd_word(0) == n0 + 3 && sd_word(1) == 0 && sd_word(2) == 5, "libsd: the transfer handler runs, a0 the channel")
+
+	// GetSwitch: the masks as sceSdInit leaves them, LIBSD 1.5's four mixes
+	// all ones and PMON, NON 0, then as SetSwitch writes them, 24 bits, a
+	// core each. An id's other low bits are ignored, as LIBSD 1.5 takes
+	// the core from bit 0 alone.
+	sd_call(4, 0)
+	check(sd_call(8, 0x1800) == 0xffffff && sd_call(8, 0x1901) == 0xffffff && sd_call(8, 0x1a00) == 0xffffff && sd_call(8, 0x1b01) == 0xffffff && sd_call(8, 0x1300) == 0 && sd_call(8, 0x1401) == 0, "libsd: GetSwitch after sceSdInit: the mixes all ones, PMON and NON 0")
+	SWITCHES :: [?]u32{0x1300, 0x1400, 0x1800, 0x1900, 0x1a00, 0x1b00}
+	for id, i in SWITCHES {
+		sd_call(7, id, 0xff000000 | u32(i + 1))
+		sd_call(7, id | 0x81, u32(i + 1) << 16)
+	}
+	same := true
+	for id, i in SWITCHES {
+		same &&= sd_call(8, id) == u32(i + 1) && sd_call(8, id | 1) == u32(i + 1) << 16 && sd_call(8, id | 0x42) == u32(i + 1)
+	}
+	check(same, "libsd: GetSwitch returns the mask SetSwitch wrote, 24 bits, per core, other low bits ignored")
+	sd_call(7, 0x1700, 0)
+	check(sd_call(8, 0x1700) == 0, "libsd: GetSwitch ENDX after SetSwitch clears it")
+	check(sd_call(8, 0x1500) == 0 && core.compat.calls[core.Compat_Key{.Iop_Sd, 0x1500, 8}].n == 1, "libsd: GetSwitch KON is 0 and a row")
 
 	// An id libsd_fn does not decode raises a compat row.
 	sd_call(5, 0x3f00, 0)

@@ -61,6 +61,10 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 7: // sceSdSetSwitch(entry, value)
 		if !sd_set_switch(a0, a1) && !sd_switch_extra(a0, a1) {libsd_unknown(fno, a0)}
 		return 0, true
+	case 8: // sceSdGetSwitch(entry)
+		v, found := sd_get_switch(a0)
+		if !found {libsd_unknown(fno, a0)}
+		return v, true
 	case 9: // sceSdSetAddr(entry, value)
 		if !sd_set_addr(a0, a1) && !sd_addr_extra(a0, a1) {libsd_unknown(fno, a0)}
 		return 0, true
