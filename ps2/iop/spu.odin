@@ -715,7 +715,9 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x80f0: r = 1 // sceSdVoiceTransStatus {channel, flag}: always complete
 	case 0x8100: r = sd_block_status(w[1])
 	case:
-		if cpu.debug >= 1 {fmt.eprintfln("sdr: unhandled fno %x", fno)}
+		if h := sdr_user_handler(fno); h != 0 {
+			sdr_user_unrun(fno, h, w[:16]) // an IOP module's handler (sdrdrv.odin)
+		} else if cpu.debug >= 1 {fmt.eprintfln("sdr: unhandled fno %x", fno)}
 	}
 	for &b in buf[:64] {b = 0}
 	w[0] = r

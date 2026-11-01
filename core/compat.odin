@@ -48,8 +48,9 @@ COMPAT_TOP :: 10
 // the first 4 bytes of a path an IOP ioman open names on a device other than
 // the disc; Iop_Rpc the server id and function number of an RPC to an IOP
 // module's server that got no RPC_END, or whose request or reply did not
-// fit (function number all ones: a server with no room); Irx_Reloc the
-// relocation type.
+// fit (function number all ones: a server with no room); Iop_Sdr an EE
+// sdrdrv RPC whose IOP user command handler is set and was not run, the EE
+// answered 0; Irx_Reloc the relocation type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -70,6 +71,7 @@ Compat_Call :: enum u8 {
 	Iop_Cd,
 	Iop_Io,
 	Iop_Rpc,
+	Iop_Sdr,
 	Irx_Reloc,
 }
 
@@ -233,6 +235,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 		dev := transmute([4]u8)k.id
 		return fmt.tprintf("IOP ioman device %q", strings.truncate_to_byte(string(dev[:]), 0))
 	case .Iop_Rpc: return fmt.tprintf("IOP server %08x fno %d", k.id, i32(k.sub))
+	case .Iop_Sdr: return fmt.tprintf("IOP sdrdrv command %04x handler not run", k.id)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""

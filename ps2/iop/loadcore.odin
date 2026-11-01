@@ -114,6 +114,7 @@ iop_loader: struct {
 		sifcmd:  Iop_Sifcmd,
 		sif_tab: [dynamic]u32,
 		sd:      Iop_Sd,
+		sdr:     Iop_Sdr,
 		open:    [dynamic]bool, // by fd
 	},
 	// The images whose load failed, keyed by failed_key.
@@ -159,6 +160,7 @@ iop_loader_init :: proc() {
 	th_init()
 	iop_sifcmd = {}
 	iop_sd = {}
+	iop_sdr = {}
 	iop_rpc = {}
 }
 
@@ -426,7 +428,7 @@ undo_save :: proc() {
 	append(&u.blocks, ..sys_blocks[:])
 	clear(&u.stubs)
 	for a, s in iop_loader.stubs {u.stubs[a] = s}
-	u.sifcmd, u.sd = iop_sifcmd, iop_sd
+	u.sifcmd, u.sd, u.sdr = iop_sifcmd, iop_sd, iop_sdr
 	clear(&u.sif_tab)
 	for i in 0 ..< 2 * min(iop_sifcmd.user_size, IOP_RAM_SIZE / 8) {
 		append(&u.sif_tab, r32(iop_sifcmd.user_tab + 4 * i))
@@ -458,6 +460,7 @@ undo_restore :: proc() {
 	}
 	sifcmd_undo(l.undo.sifcmd, l.undo.sif_tab[:], freed[:])
 	sd_undo(l.undo.sd, freed[:])
+	sdr_undo(l.undo.sdr, freed[:])
 	rpc_undo(freed[:])
 	for &f, i in fileio.files {
 		if f.f != nil && (i >= len(l.undo.open) || !l.undo.open[i]) {f = {}}
@@ -579,6 +582,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return sifman_fn(fno)
 	case "libsd":
 		return libsd_fn(fno)
+	case "sdrdrv":
+		return sdrdrv_fn(fno)
 	case "cdvdman":
 		return cdvdman_fn(fno)
 	case "ioman":

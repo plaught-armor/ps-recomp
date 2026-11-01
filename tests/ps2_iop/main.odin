@@ -61,10 +61,14 @@
 // cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
 // record and a miss leaves it; sceCdRead copies whole sectors from the lsn
 // to the buffer, zeros past the volume, and a data pattern reads nothing
-// with a compat row. ioman's open, read, lseek and close share fileio's fd
-// table: a read over sectors gets the file's bytes, a closed fd is bad and
-// then reused, fileio's reset closes ioman's files, a write open fails as
-// fileio's, and another device is a compat row.
+// with a compat row; sceCdInit and sceCdMmode return 1. ioman's open,
+// read, lseek and close share fileio's fd table: a read over sectors gets
+// the file's bytes, a closed fd is bad and then reused, fileio's reset
+// closes ioman's files, a write open fails as fileio's, and another device
+// is a compat row.
+//
+// sdrdrv: a user command handler's slot, range and previous handler; an
+// EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
 package main
 
 import "core:encoding/endian"
@@ -163,6 +167,7 @@ game :: proc(_: rawptr) {
 	test_rpc()
 	test_libsd()
 	test_cdvdman()
+	test_sdrdrv()
 	test_fallback()
 
 	if failed {os.exit(1)}
@@ -1848,7 +1853,7 @@ test_libsd :: proc() {
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
 }
 
-CDVDMAN_FNOS := [?]u32{6, 8, 10, 11, 13}
+CDVDMAN_FNOS := [?]u32{4, 6, 8, 10, 11, 13, 75}
 IOMAN_FNOS := [?]u32{4, 5, 6, 8}
 
 // Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
@@ -1912,6 +1917,8 @@ test_cdvdman :: proc() {
 	cd, io := b + cdo, b + ioo
 
 	check(cd_call(cd, 13, 0) == 2 && cd_call(cd, 8) == 0 && cd_call(cd, 11, 0) == 0, "cdvdman: DiskReady 2, no error, Sync done")
+	check(cd_call(cd, 4, 0) == 1 && cd_call(cd, 4, 1) == 1 && cd_call(cd, 4, 5) == 1 && cd_call(cd, 4, 0xffffffff) == 1, "cdvdman: sceCdInit returns 1 for every mode")
+	check(cd_call(cd, 75, 1) == 1 && cd_call(cd, 75, 2) == 1 && cd_call(cd, 75, 0xff) == 1, "cdvdman: sceCdMmode returns 1")
 	check(cd_call(cd, 10, b + file, b + big) == 1, "cdvdman: SearchFile finds the file")
 	rec := iop.iop_mem(b + file, iop.CD_FILE)
 	check(endian.unchecked_get_u32le(rec) == 23 && endian.unchecked_get_u32le(rec[4:]) == discimg.BIG && string(rec[8:17]) == "BIG.BIN;1", "cdvdman: the record's lsn, size and name")
@@ -1972,6 +1979,82 @@ load_buffer :: proc(f: []u8) -> [2]u32 {
 	iop.sif.servers[0x80000006](6, buf[:], 0)
 	iop.sys_free(at)
 	return {w[0], w[1]}
+}
+
+snap6: core.Snapshot
+snap6_loaded: bool // not emulated state
+
+ori :: proc(a: ^Asm, rt, imm: u32) {put(a, 0x34000000 | rt << 16 | imm)} // ori rt, zero, imm
+
+// sdrdrv's SetUserCommandFunction: the slot is bits 4-7 of a command in
+// 0x9000..0x90f0, the previous handler returned, -1 out of range; an EE
+// RPC to a set slot is a row and answers 0, and none without PS_IRX; the
+// slots survive a snapshot, the loader's reset clears them, and a failed
+// load puts back the ones it replaced.
+test_sdrdrv :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	a: Asm
+	sdr := imports(&a, "sdrdrv", 5)
+	h := at(&a)
+	put(&a, JR_RA, 0)
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("modr", &a, entry), "modr", nil)
+	b := module_base(id)
+	set :: proc(stub, cmd, f: u32) -> u32 {return lib_call(stub, {5}, 5, cmd, f)}
+	check(id > 0 && set(b + sdr, 0x9000, b + h) == 0, "sdrdrv: slot 0 set, none before")
+	check(set(b + sdr, 0x9001, 0x1234) == b + h && iop.iop_sdr.user[0] == 0x1234, "sdrdrv: 0x9001 is slot 0, the previous handler returned")
+	check(set(b + sdr, 0x90f0, b + h) == 0 && iop.iop_sdr.user[15] == b + h, "sdrdrv: 0x90f0 is slot 15")
+	check(set(b + sdr, 0x90f1, 7) == 0xffffffff && set(b + sdr, 0x8fff, 7) == 0xffffffff && set(b + sdr, 0x9100, 7) == 0xffffffff && set(b + sdr, 0, 7) == 0xffffffff, "sdrdrv: out of range -1")
+	check(iop.iop_sdr.user[15] == b + h && iop.iop_sdr.user[0] == 0x1234, "sdrdrv: out of range sets nothing")
+	check(iop.sdr_user_handler(0x90f3) == b + h && iop.sdr_user_handler(0x9010) == 0 && iop.sdr_user_handler(0x9100) == 0, "sdrdrv: an RPC's handler by bits 4-15")
+
+	// The EE's RPC: a row naming the command, the reply 0.
+	buf: [64]u8
+	w := ([^]u32)(&buf)
+	w[0], w[1] = 0x55, 0x66
+	key := core.Compat_Key{.Iop_Sdr, 0x90f0, 0}
+	clear(&core.compat.calls)
+	check(iop.sif.servers[0x80000701](0x90f0, buf[:], 64) && w[0] == 0 && core.compat.calls[key].n == 1, "sdrdrv: an RPC to a set slot is a row, the reply 0")
+	iop.sif.servers[0x80000701](0x9010, buf[:], 64)
+	check(len(core.compat.calls) == 1, "sdrdrv: an RPC to an empty slot is no row")
+	iop.iop_irx = false
+	iop.sif.servers[0x80000701](0x90f0, buf[:], 64)
+	check(core.compat.calls[key].n == 1, "sdrdrv: none without PS_IRX")
+	iop.iop_irx = true
+
+	core.snap_op, core.snap_target = .Save, &snap6
+	core.snap_yield()
+	if !snap6_loaded {
+		set(b + sdr, 0x90f0, 0)
+		snap6_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap6
+		core.snap_yield()
+	}
+	check(iop.iop_sdr.user[15] == b + h && iop.iop_sdr.user[0] == 0x1234, "sdrdrv: the load restores the slots")
+
+	// "modu" sets slot 0, over modr's, and slot 2, then fails.
+	u: Asm
+	usd := imports(&u, "sdrdrv", 5)
+	usm := imports(&u, "sysmem", 99)
+	uh := at(&u)
+	put(&u, JR_RA, 0)
+	entry = at(&u)
+	prologue(&u)
+	for cmd in ([2]u32{0x9000, 0x9020}) {
+		ori(&u, A0, cmd)
+		la(&u, A1, uh)
+		jal(&u, usd)
+	}
+	jal(&u, usm)
+	epilogue(&u)
+	check(load_buffer(build_mod("modu", &u, entry)) == {2, 0}, "sdrdrv: modu falls back")
+	check(iop.iop_sdr.user[0] == 0x1234 && iop.iop_sdr.user[2] == 0 && iop.iop_sdr.user[15] == b + h, "sdrdrv: its slots put back, modr's kept")
+
+	fresh()
+	check(iop.iop_sdr == {}, "sdrdrv: the loader's reset clears the slots")
 }
 
 // Conditions: a failed start is answered as a module not run, with a row;

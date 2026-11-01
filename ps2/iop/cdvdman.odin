@@ -22,6 +22,8 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
 	a0, a1, a2, a3 := r[4], r[5], r[6], r[7]
 	switch fno {
+	case 4: // sceCdInit(mode): 1 for every mode. 0 waits for the drive, always ready here; 5 shuts down, nothing held
+		return 1, true
 	case 6: // sceCdRead(lsn, sectors, buffer, sceCdRMode *{trycount, spindlctrl, datapattern})
 		if a3 != 0 {
 			if pattern := iop_ram_at(a3 + 2, 1)[0]; pattern != 0 { // 0x918- and 0x924-byte sectors
@@ -49,6 +51,8 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 13: // sceCdDiskReady(mode): 2, ready
 		return 2, true
+	case 75: // sceCdMmode(media): 1. The media only gates disk type checks, none made here
+		return 1, true
 	}
 	return 0, false
 }

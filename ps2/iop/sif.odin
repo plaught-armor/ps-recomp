@@ -929,6 +929,7 @@ sif_snap :: proc() {
 	core.snap_add(&iop_sched)
 	core.snap_add(&iop_sifcmd)
 	core.snap_add(&iop_sd)
+	core.snap_add(&iop_sdr)
 	core.snap_add(&iop_rpc)
 	core.snap_add(&iop_wake_ee)
 	iop_cpu_snap()
