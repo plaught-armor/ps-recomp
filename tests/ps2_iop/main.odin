@@ -61,7 +61,10 @@
 // cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
 // record and a miss leaves it; sceCdRead copies whole sectors from the lsn
 // to the buffer, zeros past the volume, and a data pattern reads nothing
-// with a compat row; sceCdInit and sceCdMmode return 1. ioman's open,
+// with a compat row; sceCdInit and sceCdMmode return 1. sceCdCallback
+// returns the previous callback; a read's runs at the next tick, a0 1, and
+// not for a refused read or with none set; a snapshot restores it pending;
+// one that waits is a row; a failed load's is put back. ioman's open,
 // read, lseek and close share fileio's fd table: a read over sectors gets
 // the file's bytes, a closed fd is bad and then reused, fileio's reset
 // closes ioman's files, a write open fails as fileio's, and another device
@@ -69,6 +72,11 @@
 //
 // sdrdrv: a user command handler's slot, range and previous handler; an
 // EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
+//
+// timrman: allocation order and errors; a sysclock timer's compare handler
+// at its cycle, its v0 the next compare and 0 a stop; catching up; -100 and
+// a stop with a row from interrupt context; 16-bit compares; another source
+// a row; snapshot, reset and undo.
 package main
 
 import "core:encoding/endian"
@@ -168,6 +176,8 @@ game :: proc(_: rawptr) {
 	test_libsd()
 	test_cdvdman()
 	test_sdrdrv()
+	test_timrman()
+	test_system_time()
 	test_fallback()
 
 	if failed {os.exit(1)}
@@ -1853,7 +1863,7 @@ test_libsd :: proc() {
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
 }
 
-CDVDMAN_FNOS := [?]u32{4, 6, 8, 10, 11, 13, 75}
+CDVDMAN_FNOS := [?]u32{4, 6, 8, 10, 11, 13, 37, 75}
 IOMAN_FNOS := [?]u32{4, 5, 6, 8}
 
 // Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
@@ -1907,6 +1917,18 @@ test_cdvdman :: proc() {
 	put(&a, 0)
 	buf := at(&a)
 	for _ in 0 ..< 3 * SECTOR / 4 {put(&a, 0)}
+	// The read callbacks: cb counts its calls and records a0; cbb waits.
+	ts := imports(&a, "thbase", 24) // SleepThread
+	cbw := at(&a)
+	put(&a, 0, 0)
+	cb := at(&a)
+	la(&a, T0, cbw)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0xad040004, JR_RA, 0x24020001) // sw a0, 4(t0); jr ra; li v0, 1
+	cbb := at(&a)
+	prologue(&a)
+	jal(&a, ts)
+	epilogue(&a)
 	entry := at(&a)
 	prologue(&a)
 	li(&a, V0, 0)
@@ -1938,6 +1960,59 @@ test_cdvdman :: proc() {
 	iop.iop_u32(b + mode)^ = 0x00010000 // datapattern 1
 	check(cd_call(cd, 6, 23, 1, b + buf, b + mode) == 0 && data[0] == 0xff, "cdvdman: a data pattern reads nothing")
 	check(core.compat.calls[core.Compat_Key{.Iop_Cd, 1, 0}].n == 1, "cdvdman: the data pattern is a compat row")
+
+	// sceCdCallback: a read's callback runs at the next tick, a0 1, in
+	// interrupt context.
+	iop.iop_u32(b + mode)^ = 0
+	check(iop.iop_cd == {} && cd_call(cd, 37, b + cb) == 0 && cd_call(cd, 37, b + cb) == b + cb, "cdvdman: sceCdCallback returns the previous callback")
+	check(iop.iop_cd.pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: no callback due before a read")
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	now := r3000.state.cycles * 8
+	check(iop.iop_cd.pending == 1 && iop.cd_next_ee() == now && iop.iop_wake_ee == now && iop.iop_u32(b + cbw)^ == 0, "cdvdman: a read's callback is due at once, not run in the call")
+	core.snap_op, core.snap_target = .Save, &snap8
+	core.snap_yield()
+	if !snap8_loaded {
+		iop.iop_tick(now)
+		check(iop.iop_u32(b + cbw)^ == 1, "cdvdman: the callback runs")
+		snap8_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap8
+		core.snap_yield()
+	}
+	check(iop.iop_cd == {b + cb, 1} && iop.iop_u32(b + cbw)^ == 0, "cdvdman: the load restores the pending callback")
+	iop.iop_tick(now)
+	check(iop.iop_u32(b + cbw)^ == 1 && iop.iop_u32(b + cbw + 4)^ == iop.CD_FUNC_READ && iop.iop_cd.pending == 0 && iop.cd_next_ee() == max(u64), "cdvdman: the callback runs once, a0 the read's code")
+	iop.iop_u32(b + mode)^ = 0x00010000
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	check(iop.iop_cd.pending == 0, "cdvdman: a read refused for its data pattern has no callback")
+	iop.iop_u32(b + mode)^ = 0
+	cd_call(cd, 37, 0)
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	check(iop.iop_cd.pending == 0, "cdvdman: no callback set, none due")
+	cd_call(cd, 37, b + cbb)
+	cd_call(cd, 6, 23, 1, b + buf, b + mode)
+	iop.iop_tick(r3000.state.cycles * 8)
+	check(core.compat.calls[core.Compat_Key{.Iop_Cd_Intr, b + cbb, 0}].n == 1 && iop.iop_cd.pending == 0, "cdvdman: a callback that waits is stopped, a row")
+
+	// "modk" sets its own callback, reads, then fails: modc's put back, the
+	// pending run dropped.
+	cd_call(cd, 37, b + cb)
+	k: Asm
+	kcd := imports(&k, "cdvdman", 6, 37)
+	ksm := imports(&k, "sysmem", 99)
+	kh := at(&k)
+	put(&k, JR_RA, 0)
+	entry = at(&k)
+	prologue(&k)
+	la(&k, A0, kh)
+	jal(&k, kcd + 8)
+	li(&k, A0, 23)
+	li(&k, A1, 0)
+	li(&k, A2, 0)
+	li(&k, A3, 0)
+	jal(&k, kcd)
+	jal(&k, ksm)
+	epilogue(&k)
+	check(load_buffer(build_mod("modk", &k, entry)) == {2, 0} && iop.iop_cd == {b + cb, 0}, "cdvdman: modk falls back, modc's callback put back, nothing pending")
 
 	// ioman, over fileio's files.
 	fd := io_call(io, 4, b + sub, 1)
@@ -2203,4 +2278,203 @@ test_fallback :: proc() {
 	check(load_buffer(fb) == {2, 0}, "fallback: modb, importing liba, replies {2, 0}")
 	check(core.compat.calls[imp].n == n_imp + 1 && core.compat.calls[back].n == n_back + 1, "fallback: modb's call reached no export, a row each")
 	check(len(l.stubs) == 0 && len(l.pending) == 0 && len(l.modules) == 0, "fallback: nothing of modb is left")
+}
+
+snap8: core.Snapshot
+snap8_loaded: bool // not emulated state
+
+snap7: core.Snapshot
+snap7_loaded: bool // not emulated state
+
+TIMR_FNOS := [?]u32{4, 6, 20, 22, 23, 24}
+
+// timrman's ids: the timer's number from 1 in the top 4 bits, its base.
+TIMER0 :: 0x1bf80110
+TIMER1 :: 0x2bf80111
+TIMER2 :: 0x3bf80112
+TIMER3 :: 0x4bf80148
+TIMER4 :: 0x5bf80149
+TIMER5 :: 0x6bf8014a
+
+// timrman: AllocHardTimer's search order and matching, FreeHardTimer, and
+// each call's errors; a sysclock timer's compare handler runs at the cycle
+// its compare and prescale give, its v0 the next compare, 0 stopping it; a
+// timer far behind runs 16 and drops the rest; a handler that allocates
+// gets -100, one that waits is stopped with a row; a 16-bit timer's compare
+// is its low 16 bits, 0 a full wrap; another source is a row and never
+// fires; the timers survive a snapshot, the loader's reset clears them, and
+// a failed load puts back the timer it allocated.
+test_timrman :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	// "modt": d {count, a0, next compare, an allocation's result}. h counts,
+	// records a0 and returns d's next compare; ha allocates and returns 0;
+	// hb waits.
+	a: Asm
+	tmo := imports(&a, "timrman", ..TIMR_FNOS[:])
+	ts := imports(&a, "thbase", 24) // SleepThread
+	d := at(&a)
+	put(&a, 0, 0, 0, 0)
+	h := at(&a)
+	la(&a, T0, d)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0xad040004, 0x8d020008, JR_RA, 0) // sw a0, 4(t0); lw v0, 8(t0); jr ra
+	ha := at(&a)
+	prologue(&a)
+	li(&a, A0, 1)
+	li(&a, A1, 32)
+	li(&a, A2, 1)
+	jal(&a, tmo)
+	la(&a, T0, d)
+	put(&a, 0xad02000c) // sw v0, 12(t0)
+	li(&a, V0, 0)
+	epilogue(&a)
+	hb := at(&a)
+	prologue(&a)
+	jal(&a, ts)
+	li(&a, V0, 100)
+	epilogue(&a)
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("modt", &a, entry), "modt", nil)
+	b := module_base(id)
+	tm :: proc(stubs, fno: u32, args: ..u32) -> u32 {return lib_call(stubs, TIMR_FNOS[:], fno, ..args)}
+	t := b + tmo
+	word :: proc(at: u32) -> u32 {return iop.iop_u32(at)^}
+	check(id > 0 && iop.tim_next_ee() == max(u64), "timrman: the module loads, no timer due")
+
+	check(tm(t, 4, 1, 32, 1) == TIMER5 && tm(t, 4, 1, 32, 1) == TIMER4 && tm(t, 4, 1, 32, 1) == TIMER3, "timrman: 32-bit sysclock timers in the order 5, 4, 3")
+	check(tm(t, 4, 1, 32, 1) == neg(150) && tm(t, 4, 1, 32, 256) == neg(150), "timrman: none free")
+	check(tm(t, 4, 1, 16, 8) == TIMER2 && tm(t, 4, 1, 16, 2) == neg(150), "timrman: timer 2 for prescale 8, none for a 16-bit prescale 2 left")
+	check(tm(t, 4, 2, 16, 1) == TIMER0 && tm(t, 4, 4, 16, 1) == TIMER1, "timrman: the pixel and hline sources")
+	check(tm(t, 6, 0) == neg(151) && tm(t, 6, 0x7bf80000) == neg(151), "timrman: FreeHardTimer of no timer")
+	check(tm(t, 6, TIMER4) == 0 && tm(t, 6, TIMER3) == 0 && tm(t, 6, TIMER0) == 0 && tm(t, 6, TIMER1) == 0 && tm(t, 6, TIMER4) == neg(151), "timrman: FreeHardTimer, once")
+	check(tm(t, 22, TIMER5, 1, 2, 1) == neg(405) && tm(t, 22, TIMER5, 1, 0, 3) == neg(153) && tm(t, 22, TIMER2, 1, 0, 16) == neg(153), "timrman: a bad mode, prescale")
+	check(tm(t, 22, TIMER5, 2, 0, 1) == neg(152) && tm(t, 22, TIMER5, 3, 0, 1) == neg(152), "timrman: a source the timer lacks")
+	check(tm(t, 23, TIMER5) == neg(155) && tm(t, 24, TIMER5) == neg(156), "timrman: start before setup, stop before start")
+
+	// Timer 5 counts the sysclock at prescale 1: the handler at compare.
+	check(tm(t, 20, TIMER5, 1000, b + h, 0x55) == 0 && tm(t, 22, TIMER5, 1, 0, 1) == 0, "timrman: handler set, set up")
+	C :: 100_000
+	r3000.state.cycles = C
+	check(tm(t, 23, TIMER5) == 0 && iop.tim_next_ee() == (C + 1000) * 8 && iop.iop_wake_ee == (C + 1000) * 8, "timrman: started, the wake at its compare")
+	check(tm(t, 23, TIMER5) == neg(154) && tm(t, 20, TIMER5, 5, b + h, 0) == neg(154) && tm(t, 22, TIMER5, 1, 0, 1) == neg(154), "timrman: busy while running")
+	iop.iop_u32(b + d + 8)^ = 500
+	iop.iop_tick((C + 999) * 8)
+	check(word(b + d) == 0, "timrman: no handler before the compare")
+	iop.iop_tick((C + 1000) * 8)
+	check(word(b + d) == 1 && word(b + d + 4) == 0x55 && iop.tim_next_ee() == (C + 1500) * 8, "timrman: the handler at the compare, its arg in a0, its v0 the next compare")
+	core.snap_op, core.snap_target = .Save, &snap7
+	core.snap_yield()
+	if !snap7_loaded {
+		iop.iop_tick((C + 1500) * 8)
+		check(word(b + d) == 2, "timrman: the next compare")
+		snap7_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap7
+		core.snap_yield()
+	}
+	check(word(b + d) == 1 && iop.iop_timr.t[5].due == C + 1500 && iop.iop_timr.armed == 1 << 5, "timrman: the load restores the timer")
+	iop.iop_tick((C + 21_500) * 8)
+	check(word(b + d) == 17 && iop.iop_timr.t[5].due == C + 22_000, "timrman: far behind, 16 run and the rest dropped, the grid kept")
+	iop.iop_u32(b + d + 8)^ = 0
+	iop.iop_tick((C + 22_000) * 8)
+	check(word(b + d) == 18 && iop.iop_timr.armed == 0 && iop.tim_next_ee() == max(u64) && tm(t, 24, TIMER5) == neg(156), "timrman: v0 0 stops the timer")
+	check(tm(t, 23, TIMER5) == 0 && iop.iop_timr.armed == 1 << 5 && tm(t, 24, TIMER5) == 0 && iop.iop_timr.armed == 0, "timrman: started again, stopped")
+
+	// Handlers in interrupt context: an allocation is -100; a wait stops it.
+	tm(t, 20, TIMER5, 100, b + ha, 0)
+	cur := r3000.state.cycles
+	tm(t, 23, TIMER5)
+	iop.iop_tick((cur + 100) * 8)
+	check(word(b + d + 12) == neg(100) && iop.iop_timr.armed == 0, "timrman: AllocHardTimer in a handler is -100, its v0 0 stops it")
+	tm(t, 20, TIMER5, 100, b + hb, 0)
+	cur = r3000.state.cycles
+	tm(t, 23, TIMER5)
+	iop.iop_tick((cur + 100) * 8)
+	check(core.compat.calls[core.Compat_Key{.Iop_Timer_Intr, b + hb, 0}].n == 1 && iop.iop_timr.armed == 0 && iop.iop_timr.t[5].mode == 0, "timrman: a handler that waits is stopped, a row, the timer stopped")
+
+	// A 16-bit timer: the compare's low 16 bits, 0 a full count, by the prescale.
+	tm(t, 20, TIMER2, 0x12345, b + h, 0)
+	check(tm(t, 22, TIMER2, 1, 0, 8) == 0, "timrman: timer 2 at prescale 8")
+	cur = r3000.state.cycles
+	tm(t, 23, TIMER2)
+	check(iop.tim_next_ee() == (cur + 0x2345 * 8) * 8, "timrman: a 16-bit compare's low bits")
+	tm(t, 24, TIMER2)
+	tm(t, 20, TIMER2, 0x10000, b + h, 0)
+	tm(t, 23, TIMER2)
+	check(iop.tim_next_ee() == (cur + 0x10000 * 8) * 8, "timrman: compare 0 counts the full 16 bits")
+	tm(t, 24, TIMER2)
+
+	// Another source: set up and started, never fires, a row.
+	t0 := tm(t, 4, 2, 16, 1)
+	tm(t, 20, t0, 10, b + h, 0)
+	check(tm(t, 22, t0, 2, 0, 1) == 0 && core.compat.calls[core.Compat_Key{.Iop_Timer, 2, 0}].n == 1, "timrman: the pixel source is a row")
+	check(tm(t, 23, t0) == 0 && iop.iop_timr.armed == 0, "timrman: started, never due")
+	check(tm(t, 24, t0) == 0 && tm(t, 6, t0) == 0, "timrman: stopped, freed")
+
+	// "modv" starts timer 4 with its handler, then fails: put back, timer 5 kept.
+	iop.iop_u32(b + d + 8)^ = 500
+	tm(t, 20, TIMER5, 500, b + h, 0)
+	tm(t, 23, TIMER5)
+	before := iop.iop_timr.t[4]
+	v: Asm
+	vt := imports(&v, "timrman", 4, 20, 22, 23)
+	vsm := imports(&v, "sysmem", 99)
+	vd := at(&v)
+	put(&v, 0)
+	vh := at(&v)
+	put(&v, JR_RA, 0)
+	entry = at(&v)
+	prologue(&v)
+	li(&v, A0, 1)
+	li(&v, A1, 32)
+	li(&v, A2, 1)
+	jal(&v, vt)
+	la(&v, T0, vd)
+	put(&v, 0xad020000) // sw v0, 0(t0)
+	la(&v, T0, vd)
+	put(&v, 0x8d040000) // lw a0, 0(t0)
+	li(&v, A1, 50)
+	la(&v, A2, vh)
+	li(&v, A3, 0)
+	jal(&v, vt + 8)
+	la(&v, T0, vd)
+	put(&v, 0x8d040000)
+	li(&v, A1, 1)
+	li(&v, A2, 0)
+	li(&v, A3, 1)
+	jal(&v, vt + 16)
+	la(&v, T0, vd)
+	put(&v, 0x8d040000)
+	jal(&v, vt + 24)
+	jal(&v, vsm)
+	epilogue(&v)
+	check(load_buffer(build_mod("modv", &v, entry)) == {2, 0}, "timrman: modv falls back")
+	check(iop.iop_timr.t[4] == before && iop.iop_timr.armed == 1 << 5 && iop.iop_timr.t[5].handler == b + h, "timrman: its timer put back, modt's kept")
+
+	fresh()
+	check(iop.iop_timr == {} && iop.tim_next_ee() == max(u64), "timrman: the loader's reset clears the timers")
+}
+
+// thbase 43 GetSystemTimeLow: the low word of what 34 GetSystemTime gives,
+// tracking the IOP's clock past 32 bits.
+test_system_time :: proc() {
+	fresh()
+	fnos := [?]u32{34, 43}
+	a: Asm
+	tb := imports(&a, "thbase", ..fnos[:])
+	d := at(&a)
+	put(&a, 0, 0)
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("mods", &a, entry), "mods", nil)
+	b := module_base(id)
+	C :: u64(0x1_2345_6789)
+	r3000.state.cycles = C
+	check(id > 0 && lib_call(b + tb, fnos[:], 34, b + d) == 0, "thbase: GetSystemTime")
+	lo, hi := iop.iop_u32(b + d)^, iop.iop_u32(b + d + 4)^
+	check(lo == 0x2345_6789 && hi == 1 && lib_call(b + tb, fnos[:], 43) == lo, "thbase: GetSystemTimeLow is GetSystemTime's low word")
+	r3000.state.cycles = C + 1000
+	check(lib_call(b + tb, fnos[:], 43) == lo + 1000, "thbase: GetSystemTimeLow tracks the clock")
 }

@@ -18,13 +18,13 @@
 // before each run. A DelayThread waits until a cycle count; a tick or a
 // delivery that finds no thread ready moves the clock to the first such
 // wake within its slice. iop_wake_ee is when, in EE cycles, the EE's events
-// tick the IOP next: at a thread's wake, at once while one is ready, or at
-// a libsd interrupt (libsd.odin).
+// tick the IOP next: at a thread's wake, at once while one is ready, at a
+// libsd interrupt (libsd.odin), or at a timer's compare (timrman.odin).
 //
-// A command handler, and a libsd interrupt handler, runs on a coroutine of
-// its own, not a thread's: retail runs it in an interrupt handler, where it
-// may not wait. One that waits, or spins past its budget, is stopped there
-// (th_intr_stop).
+// A command handler, and a libsd, timer or cdvdman interrupt handler, runs
+// on a coroutine of its own, not a thread's: retail runs it in an interrupt
+// handler, where it may not wait. One that waits, or spins past its
+// budget, is stopped there (th_intr_stop).
 //
 // A thread's context: the R3000's r[0..31], hi and lo, cop0's sr, cause and
 // epc, and frame_ret, saved when it leaves the CPU and restored when it gets
@@ -131,6 +131,7 @@ iop_sched: struct {
 	intr_stop:            Intr_Stop, // why it was stopped
 	intr_handler:         u32, // what it runs and its arguments
 	intr_a0, intr_a1:     u32,
+	intr_v0:              u32, // what it returned, when it returned
 	intr_co:              ^core.Coroutine, // made at the first handler
 }
 
@@ -290,21 +291,25 @@ iop_sync :: proc(now: u64) {
 }
 
 // Sets iop_wake_ee from the threads, at once while one is ready, else at the
-// first wake, and from libsd's interrupts (sd_next_ee). The EE's next event
-// moves up to it, unless the EE is handling events, which ends with
+// first wake, from libsd's interrupts (sd_next_ee), the timers' compares
+// (tim_next_ee) and cdvdman's read callback (cd_next_ee). The EE's next
+// event moves up to it, unless the EE is handling events, which ends with
 // update_next_event.
 iop_wake_set :: proc() {
 	w := th_next_wake()
 	if th_pick() != nil {w = r3000.state.cycles}
-	iop_wake_ee = min(w if w == max(u64) else w * IOP_EE_RATIO, sd_next_ee())
+	iop_wake_ee = min(w if w == max(u64) else w * IOP_EE_RATIO, sd_next_ee(), tim_next_ee(), cd_next_ee())
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, iop_wake_ee)}
 }
 
 // The EE's events at EE cycle `now`, the IOP's wake due: runs libsd's due
-// interrupt handlers, then its threads for a slice.
+// interrupt handlers, then the timers' due compare handlers, then cdvdman's
+// pending read callback, then its threads for a slice.
 iop_tick :: proc(now: u64) {
 	iop_sync(now)
 	sd_intr_run(now)
+	tim_intr_run()
+	cd_intr_run()
 	iop_sched.start_done = false
 	th_schedule(r3000.state.cycles + IOP_SLICE, idle = true)
 	iop_wake_set()
@@ -521,6 +526,7 @@ th_intr_main :: proc(_: rawptr) {
 		r[4], r[5] = s.intr_a0, s.intr_a1
 		r[29] = IOP_INTR_STACK - 16
 		r3000.call(s.intr_handler)
+		s.intr_v0 = r[2]
 		core.co_switch(th_loader)
 	}
 }
@@ -640,6 +646,8 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		w32(a1, u32(c / IOP_CLOCK))
 		w32(a2, u32(c % IOP_CLOCK * 1_000_000 / IOP_CLOCK))
 		return KE_OK, true
+	case 43: // GetSystemTimeLow: the system clock's low 32 bits, as 34 gives them
+		return u32(r3000.state.cycles), true
 	}
 	return 0, false
 }

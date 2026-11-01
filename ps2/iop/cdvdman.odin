@@ -2,7 +2,10 @@
 // EE's cdvdfsv and fileio read (sif.odin): the same reader, and the same fd
 // table, as on retail, where the EE's file calls are served by the IOP's
 // ioman. A read is done when its call returns, as cdvdfsv's is: no time
-// passes, and nothing is pending for a snapshot to hold.
+// passes. The callback sceCdCallback sets, which retail's drive interrupt
+// runs when a read completes, runs at the next iop_tick after the read
+// (cd_intr_run), on the handler coroutine (th_intr), with the function code
+// retail gives it; that one pending run is the state a snapshot holds.
 package ps2_iop
 
 import "core:fmt"
@@ -16,6 +19,17 @@ ENODEV :: 19
 // The bytes of the sceCdlFILE sceCdSearchFile writes: {lsn, size, name[16],
 // date[8], flag}.
 CD_FILE :: 0x24
+
+// The function code a read's callback gets, retail's for sceCdRead.
+CD_FUNC_READ :: 1
+
+Iop_Cd :: struct {
+	callback: u32, // IOP address; 0 is none
+	pending:  u32, // the function code of a completed read's callback not yet run, 0 none
+}
+
+// Emulated state, snapshotted (sif_snap) and reset with the loader.
+iop_cd: Iop_Cd
 
 // Function fno of cdvdman, as stdio_fn.
 cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
@@ -40,6 +54,10 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			disc_sectors(a0 + k, sector[:])
 			copy(iop_ram_at(a2 + k * DISC_SECTOR, DISC_SECTOR), sector[:])
 		}
+		if iop_cd.callback != 0 {
+			iop_cd.pending = CD_FUNC_READ
+			iop_wake_set()
+		}
 		return 1, true
 	case 8: // sceCdGetError: none
 		return 0, true
@@ -51,10 +69,45 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 13: // sceCdDiskReady(mode): 2, ready
 		return 2, true
+	case 37: // sceCdCallback(func): the previous func. Retail returns 0 and sets nothing while a command is busy; none is here
+		old := iop_cd.callback
+		iop_cd.callback = a0
+		return old, true
 	case 75: // sceCdMmode(media): 1. The media only gates disk type checks, none made here
 		return 1, true
 	}
 	return 0, false
+}
+
+// When, in EE cycles, the read callback is due: at once (the IOP's clock)
+// while one is pending; max(u64) when none is.
+cd_next_ee :: proc() -> u64 {
+	return max(u64) if iop_cd.pending == 0 else r3000.state.cycles * IOP_EE_RATIO
+}
+
+// Runs the pending read callback, the callback set now, as retail's
+// interrupt reads it at completion; one that waits is stopped there with a
+// compat row.
+cd_intr_run :: proc() {
+	code := iop_cd.pending
+	iop_cd.pending = 0
+	if code == 0 || iop_cd.callback == 0 {return}
+	cb := iop_cd.callback
+	switch th_intr(cb, code, 0) {
+	case .None:
+	case .Blocked:
+		core.compat_unknown(.Iop_Cd_Intr, cb, pc = cb)
+		fmt.eprintfln("iop: cdvdman callback at %x blocked", cb)
+	case .Call:
+		fmt.eprintfln("iop: cdvdman callback at %x stopped", cb)
+	}
+}
+
+// After a failed load: puts the callback back as it was when the load began
+// (`saved`) if it lies in `freed`, the memory its undo frees, dropping its
+// pending run.
+cd_undo :: proc(saved: Iop_Cd, freed: []Sys_Block) {
+	if sys_in(freed, iop_cd.callback) {iop_cd = {callback = saved.callback}}
 }
 
 // Function fno of ioman, as stdio_fn. Results as fileio_server's.

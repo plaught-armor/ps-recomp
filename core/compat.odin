@@ -50,7 +50,11 @@ COMPAT_TOP :: 10
 // module's server that got no RPC_END, or whose request or reply did not
 // fit (function number all ones: a server with no room); Iop_Sdr an EE
 // sdrdrv RPC whose IOP user command handler is set and was not run, the EE
-// answered 0; Irx_Reloc the relocation type.
+// answered 0; Iop_Timer the source and mode of an IOP hardware timer set
+// up to count what is not timed here; Iop_Timer_Intr the address of a timer
+// compare handler that waited or ran out of its budget; Iop_Cd_Intr the
+// address of a cdvdman read callback that did; Irx_Reloc the relocation
+// type.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -72,6 +76,9 @@ Compat_Call :: enum u8 {
 	Iop_Io,
 	Iop_Rpc,
 	Iop_Sdr,
+	Iop_Timer,
+	Iop_Timer_Intr,
+	Iop_Cd_Intr,
 	Irx_Reloc,
 }
 
@@ -236,6 +243,9 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 		return fmt.tprintf("IOP ioman device %q", strings.truncate_to_byte(string(dev[:]), 0))
 	case .Iop_Rpc: return fmt.tprintf("IOP server %08x fno %d", k.id, i32(k.sub))
 	case .Iop_Sdr: return fmt.tprintf("IOP sdrdrv command %04x handler not run", k.id)
+	case .Iop_Timer: return fmt.tprintf("IOP timer source %d mode %d not timed", k.id, k.sub)
+	case .Iop_Timer_Intr: return fmt.tprintf("IOP timer handler %08x blocked", k.id)
+	case .Iop_Cd_Intr: return fmt.tprintf("IOP cdvdman callback %08x blocked", k.id)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
 	}
 	return ""
