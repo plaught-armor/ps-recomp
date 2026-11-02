@@ -102,9 +102,9 @@ check_volume :: proc(d: ^disc.Disc, cnf: string, what: string) {
 }
 
 @(private = "file")
-check_cnf :: proc(d: ^disc.Disc, boot: string, ps2: bool, serial, vmode, what: string) {
+check_cnf :: proc(d: ^disc.Disc, boot, argv: string, ps2: bool, serial, vmode, what: string) {
 	c, ok := disc.system_cnf(d, context.temp_allocator)
-	if !ok || c.boot != boot || c.ps2 != ps2 || c.serial != serial || c.vmode != vmode {
+	if !ok || c.boot != boot || c.argv != argv || c.ps2 != ps2 || c.serial != serial || c.vmode != vmode {
 		fail("%s: system_cnf %v %v", what, c, ok)
 	}
 }
@@ -135,7 +135,7 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 	buf: [disc.DATA]u8
 	if d, ok := open(iso_path, "iso"); ok {
 		check_volume(&d, discimg.CNF_PS2, "iso")
-		check_cnf(&d, "SLUS_123.45", true, "SLUS-12345", "NTSC", "iso")
+		check_cnf(&d, "SLUS_123.45", "cdrom0:\\SLUS_123.45;1", true, "SLUS-12345", "NTSC", "iso")
 		// A 2048-byte sector as the Mode 2 Form 1 sector holding it.
 		check(disc.read_raw(&d, 16, raw[:]) && raw[12] == 0 && raw[13] == 2 && raw[14] == 0x16 && raw[15] == 2, "iso raw header")
 		check(string(raw[25:30]) == "CD001", "iso raw data")
@@ -143,7 +143,7 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 	}
 	if d, ok := open(mode1_path, "mode 1"); ok {
 		check_volume(&d, discimg.CNF_PS1, "mode 1")
-		check_cnf(&d, "DATA/Sub.Txt", false, "", "", "mode 1")
+		check_cnf(&d, "DATA/Sub.Txt", "cdrom:\\DATA\\Sub.Txt;1", false, "", "", "mode 1")
 		disc.close(&d)
 	}
 	if d, ok := open(mode2_path, "mode 2"); ok {
@@ -387,8 +387,8 @@ test_iop :: proc(iso: []u8) {
 		return
 	}
 	defer iop.disc_image_close() // before the directory is removed
-	boot, ok := iop.disc_boot(context.temp_allocator)
-	check(ok && boot == "SLUS_123.45", "iop boot")
+	boot, argv0, ok := iop.disc_boot(context.temp_allocator)
+	check(ok && boot == "SLUS_123.45" && argv0 == "cdrom0:\\SLUS_123.45;1", "iop boot")
 	for _ in 0 ..< 2 { // the second time from the cache
 		data, read := iop.disc_file("cdrom0:\\DATA\\SUB.TXT;1", context.temp_allocator)
 		check(read && string(data) == discimg.SUB, "iop file")

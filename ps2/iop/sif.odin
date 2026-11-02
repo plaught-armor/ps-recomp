@@ -750,12 +750,14 @@ disc_file :: proc(name: string, allocator := context.allocator) -> (data: []u8, 
 }
 
 // The PS2 executable the disc image's SYSTEM.CNF names (BOOT2), as a disc
-// path for disc_file. False with no image open or no BOOT2 line.
-disc_boot :: proc(allocator := context.allocator) -> (string, bool) {
-	if image.volume == 0 {return "", false}
-	cnf, ok := disc.system_cnf(&image, context.temp_allocator)
-	if !ok || !cnf.ps2 {return "", false}
-	return strings.clone(cnf.boot, allocator), true
+// path for disc_file, and the BOOT2 value the ROM's loader passes on as the
+// program's argv[0] (System_Cnf.argv). False with no image open or no BOOT2
+// line.
+disc_boot :: proc(allocator := context.allocator) -> (path, argv0: string, ok: bool) {
+	if image.volume == 0 {return "", "", false}
+	cnf := disc.system_cnf(&image, context.temp_allocator) or_return
+	if !cnf.ps2 {return "", "", false}
+	return strings.clone(cnf.boot, allocator), strings.clone(cnf.argv, allocator), true
 }
 
 // Map an IOP device path ("cdrom0:\DIR\FILE.EXT;1") to a file under

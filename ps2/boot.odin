@@ -40,7 +40,7 @@ Boot :: struct {
 // returns.
 boot :: proc(b: Boot) -> bool {
 	iop.disc_image_open(b.disc) or_return
-	name, found := iop.disc_boot()
+	name, argv0, found := iop.disc_boot()
 	if !found {
 		fmt.eprintln("disc: no PS2 executable named in SYSTEM.CNF")
 		return false
@@ -70,6 +70,6 @@ boot :: proc(b: Boot) -> bool {
 		return false
 	}
 	cpu.state.r[29].d[0] = mem.RAM_SIZE - 16
-	kernel.exec_boot_args(name)
+	kernel.exec_boot_args(argv0)
 	run(entry)
 }

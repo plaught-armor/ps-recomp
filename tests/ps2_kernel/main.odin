@@ -345,6 +345,18 @@ setup_test :: proc() {
 	fmt.println("ok SetupThread")
 }
 
+// The boot program's arguments as SetupThread hands them over: argc 1 and
+// argv[0] the BOOT2 value unchanged, device, backslash and `;1` kept.
+boot_args_test :: proc() {
+	ARGS :: PARAM + 0x400
+	RAW :: "cdrom0:\\SLUS_123.45;1"
+	kernel.exec_boot_args(RAW)
+	sys(0x3c, 0, STACK, 0x1000, ARGS) // SetupThread
+	if argc := mem.rd32(ARGS); argc != 1 {fail("fail: boot argc %d, want 1", argc)}
+	if s, _ := kernel.guest_string(mem.rd32(ARGS + 4), 64); s != RAW {fail("fail: boot argv[0] %q, want %q", s, RAW)}
+	fmt.println("ok boot arguments")
+}
+
 // SifSetDma (0x77) of one 0x1000-byte transfer, then SifDmaStat (0x76).
 dma_stat_test :: proc() {
 	LIST :: PARAM + 0x300
@@ -501,6 +513,7 @@ main :: proc() {
 	timer_test()
 	loadelf_test()
 	setup_test()
+	boot_args_test()
 	dma_stat_test()
 	loadfile_version_test()
 

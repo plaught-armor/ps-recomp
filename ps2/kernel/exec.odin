@@ -63,11 +63,14 @@ text_hash :: proc() -> u64 {
 	return xxhash.XXH3_64_default(mem.ram[cpu.text_lo:cpu.text_hi])
 }
 
-// The boot program's arguments: argv[0] the path SYSTEM.CNF names, which
-// the ROM's loader passes on as for any program it starts.
-exec_boot_args :: proc(path: string) {
+// The boot program's arguments: argc 1, argv[0] the BOOT2 value as
+// SYSTEM.CNF writes it (System_Cnf.argv: "cdrom0:\SLUS_123.45;1", device,
+// backslash, case and `;1` kept), which the ROM's loader passes on as for
+// any program it starts. Programs take their data device and directory from
+// it.
+exec_boot_args :: proc(argv0: string) {
 	args_clear()
-	args_put(path, "boot")
+	args_put(argv0, "boot")
 }
 
 // The table on when the recompiled range holds the boot program's bytes,

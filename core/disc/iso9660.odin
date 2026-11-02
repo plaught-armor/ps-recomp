@@ -259,10 +259,15 @@ read_file :: proc(d: ^Disc, path: string, allocator := context.allocator) -> (da
 }
 
 // What SYSTEM.CNF says: the executable's disc path (device and `;1` left
-// out), whether it is a PS2 one (BOOT2), the serial its name makes
-// (SLUS_123.45 is SLUS-12345, "" when it has no such form) and VMODE.
+// out), the same line's value as written (`argv`), whether it is a PS2 one
+// (BOOT2), the serial its name makes (SLUS_123.45 is SLUS-12345, "" when it
+// has no such form) and VMODE.
 System_Cnf :: struct {
 	boot:   string,
+	// The value as the ROM's loader passes it on as the program's argv[0]:
+	// from its first printable byte up to the next space or control byte,
+	// device, backslashes, case and `;1` kept ("cdrom0:\SLUS_123.45;1").
+	argv:   string,
 	ps2:    bool,
 	serial: string,
 	vmode:  string,
@@ -295,6 +300,9 @@ system_cnf :: proc(d: ^Disc, allocator := context.allocator) -> (c: System_Cnf, 
 		return {}, false
 	}
 	c.boot = strings.join(parts[:], "/", allocator)
+	end := 0
+	for end < len(boot) && boot[end] > ' ' && boot[end] < 0x7f {end += 1}
+	c.argv = strings.clone(boot[:end], allocator)
 	c.vmode = strings.clone(vmode, allocator)
 	c.serial = serial(parts[len(parts) - 1], allocator)
 	return c, true
