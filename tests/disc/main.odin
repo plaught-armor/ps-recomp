@@ -195,15 +195,56 @@ test_formats :: proc(iso, mode1, mode2, audio: []u8) {
 	}
 }
 
-// A dual-layer image: a second volume descriptor at the first's end + 16.
+// Dual-layer images: the ISO twice, the second copy a layer starting at
+// sector VOLUME whose records count from there. Its volume descriptor, 16
+// sectors in, sits at the first volume's end + 16, or at its end when the
+// first volume's size counts it in (images of both are seen).
 @(private = "file")
 test_dual_layer :: proc(iso: []u8) {
-	img := make([]u8, (discimg.VOLUME + 20) * disc.DATA, context.temp_allocator)
-	copy(img, iso)
-	copy(discimg.sector(img, discimg.VOLUME + 16), discimg.sector(iso, 16))
-	if d, ok := open(write("dl.iso", img), "dual layer"); ok {
-		check(d.volume == discimg.VOLUME && d.layer1 == discimg.VOLUME, "dual layer")
+	V :: discimg.VOLUME
+	img := make([]u8, 2 * V * disc.DATA, context.temp_allocator)
+	for first_size in ([]int{V, V + 16}) {
+		what := fmt.tprintf("dual layer, first volume %d", first_size)
+		copy(img, iso)
+		copy(img[V * disc.DATA:], iso)
+		discimg.put32(discimg.sector(img, 16)[80:], first_size)
+		d, ok := open(write("dl.iso", img), what)
+		if !ok {continue}
+		check(d.volume == u32(first_size) && d.layer1 == V && d.volume1 == V, what)
+		e0, found0 := disc.find(&d, "BIG.BIN", context.temp_allocator)
+		check(found0 && e0.lba == 23 && e0.layer == 0, what)
+		e, found := disc.find(&d, "\\Big.Bin;1", context.temp_allocator, layer = 1)
+		check(found && e.lba == V + 23 && e.size == discimg.BIG && e.layer == 1, what)
+		data := make([]u8, discimg.BIG, context.temp_allocator)
+		good := found && disc.read_at(&d, e.lba, 0, data) == len(data)
+		for i in 0 ..< len(data) {
+			good &&= data[i] == discimg.big_byte(i)
+		}
+		check(good, what)
+		sub, found_sub := disc.find(&d, "DATA/SUB.TXT", context.temp_allocator, layer = 1)
+		check(found_sub && sub.lba == V + 26, what)
+		_, found = disc.find(&d, "BIG.BIN", context.temp_allocator, layer = 2)
+		check(!found, what)
 		disc.close(&d)
+	}
+	// Not a second layer: a descriptor whose root is not a directory that
+	// starts with its `.` record, and one whose volume runs past the image.
+	bad := make([]u8, (V + 20) * disc.DATA, context.temp_allocator)
+	copy(bad, iso)
+	copy(discimg.sector(bad, V), discimg.sector(iso, 16))
+	copy(img, iso)
+	copy(img[V * disc.DATA:], iso)
+	discimg.put32(discimg.sector(img, V + 16)[80:], V + 1)
+	for c in ([]struct {
+			img:  []u8,
+			what: string,
+		}{{bad, "second descriptor without its root"}, {img, "second volume past the image"}}) {
+		if d, ok := open(write("dl.iso", c.img), c.what); ok {
+			check(d.layer1 == 0, c.what)
+			_, found := disc.find(&d, "BIG.BIN", context.temp_allocator, layer = 1)
+			check(!found, c.what)
+			disc.close(&d)
+		}
 	}
 }
 

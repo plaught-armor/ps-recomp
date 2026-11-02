@@ -665,12 +665,12 @@ Disc_File :: struct {
 }
 
 // The disc image disc_image_open opened (host state, like disc_files), and
-// its files found by the names the game passed: a game may open a file
-// every frame, and a lookup reads each directory on the way.
+// its files found by the names the game passed, one map per layer: a game
+// may open a file every frame, and a lookup reads each directory on the way.
 @(private)
 image: disc.Disc
 @(private)
-image_found: map[string]disc.Entry
+image_found: [2]map[string]disc.Entry
 
 // Read the disc's files and sectors from a disc image (a .iso, or a .cue
 // or .bin of 2048-byte data) in place of disc_dir. False, with the reason
@@ -691,19 +691,24 @@ disc_image_open :: proc(path: string) -> bool {
 // again.
 disc_image_close :: proc() {
 	context.allocator = core.host_allocator
-	for name in image_found {
-		delete(name)
+	for &found in image_found {
+		for name in found {
+			delete(name)
+		}
+		delete(found)
+		found = nil
 	}
-	delete(image_found)
-	image_found = nil
 	disc.close(&image)
 }
 
-// Find a disc file by its IOP name (`cdrom0:\DIR\FILE.EXT;1`); path is its
-// host path under disc_dir, "" on the image.
+// Find a disc file by its IOP name (`cdrom0:\DIR\FILE.EXT;1`) in a layer's
+// volume (1: a dual-layer image's second; disc_dir has only the first);
+// path is its host path under disc_dir, "" on the image.
 @(private)
-disc_find :: proc(name: string) -> (file: Disc_File, path: string, ok: bool) {
+disc_find :: proc(name: string, layer: u8 = 0) -> (file: Disc_File, path: string, ok: bool) {
+	if layer > 1 {return {}, "", false}
 	if image.volume == 0 {
+		if layer != 0 {return {}, "", false}
 		path = host_path(name) or_return
 		if os.is_dir(path) {return {}, "", false}
 		f, err := disc_open(path)
@@ -712,10 +717,10 @@ disc_find :: proc(name: string) -> (file: Disc_File, path: string, ok: bool) {
 		return {f, 0, size}, path, true
 	}
 	context.allocator = core.host_allocator
-	e, cached := image_found[name]
+	e, cached := image_found[layer][name]
 	if !cached {
-		e = disc.find(&image, name) or_return
-		image_found[strings.clone(name)] = e
+		e = disc.find(&image, name, layer = layer) or_return
+		image_found[layer][strings.clone(name)] = e
 	}
 	t := disc.track_of(&image, e.lba)
 	if e.dir || t == nil {return {}, "", false}
@@ -846,7 +851,13 @@ cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x04: w[0] = 0 // GetError
 	case 0x05: w[0], w[1] = 1, 0 // TrayReq {result, tray check}
 	case 0x0c: w[0] = CD_STAT_PAUSE // Status
-	case 0x16, 0x22: w[0] = 1 // Break, MMode
+	case 0x16, 0x22, 0x23: w[0] = 1 // Break, MMode, ChangeThreadPriority
+	case 0x27:
+		// ReadDvdDualInfo {result, on_dual, layer1_start}: layer1_start is
+		// the sector the second layer's volume starts at, counted on from
+		// the first layer's (an LSN, not a physical sector number; unverified
+		// on hardware, as is on_dual for opposite-track discs).
+		w[0], w[1], w[2] = 1, u32(image.layer1 != 0), image.layer1
 	case: return false
 	}
 	return true
@@ -959,17 +970,20 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 cdvd_search_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	if fno != 0 || len(buf) < 0x12c {return false}
-	file, found := cdvd_search(strings.truncate_to_byte(string(buf[0x24:0x124]), 0))
+	// A request too short to hold the layer searches the first.
+	layer := send_size >= 0x12c ? min(w[0x128 / 4], 2) : 0
+	file, found := cdvd_search(strings.truncate_to_byte(string(buf[0x24:0x124]), 0), u8(layer))
 	if found {copy(mem.ram_slice(w[0x124 / 4], len(file)), file[:])}
 	w[0] = u32(found)
 	return true
 }
 
 // The sceCdlFILE {lsn, size, name[16], date[8], flag} of the disc file by
-// its IOP name, as sceCdSearchFile writes it; false when there is none.
+// its IOP name in a layer's volume, as sceCdSearchFile (layer 0) and
+// sceCdLayerSearchFile write it; false when there is none.
 @(private)
-cdvd_search :: proc(name: string) -> (file: [0x24]u8, ok: bool) {
-	found, path, has := disc_find(name)
+cdvd_search :: proc(name: string, layer: u8 = 0) -> (file: [0x24]u8, ok: bool) {
+	found, path, has := disc_find(name, layer)
 	if !has {
 		fmt.eprintfln("cdvd: search \"%s\" not found", name)
 		return {}, false

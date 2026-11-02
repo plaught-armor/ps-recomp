@@ -37,12 +37,14 @@ Disc :: struct {
 	// The host files, each closed once.
 	files:   [dynamic]^os.File,
 	// The ISO9660 volume's size in sectors (0: no volume found), and where
-	// a dual-layer DVD's second layer starts (0: one layer). Reads past the
-	// first layer are not mapped yet.
+	// a dual-layer DVD's second layer starts (0: one layer) and its volume's
+	// size. Sectors are numbered on through both layers.
 	volume:  u32,
 	layer1:  u32,
-	// The volume's root directory.
+	volume1: u32,
+	// The root directory of each layer's volume.
 	root:    Entry,
+	root1:   Entry,
 }
 
 // Open a disc image by its extension: .cue, or a single-track .iso, .bin or

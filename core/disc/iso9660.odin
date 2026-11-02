@@ -5,16 +5,16 @@
 package disc
 
 import "core:encoding/endian"
-import "core:fmt"
 import "core:strings"
 
 // A file or directory: its name (no `;1` version), first LBA and size in
-// bytes.
+// bytes, and the layer whose volume holds it.
 Entry :: struct {
-	name: string,
-	lba:  u32,
-	size: u32,
-	dir:  bool,
+	name:  string,
+	lba:   u32,
+	size:  u32,
+	dir:   bool,
+	layer: u8,
 }
 
 // The most components a path may have.
@@ -47,7 +47,7 @@ volume_probe :: proc(d: ^Disc) {
 			continue
 		}
 		d.volume, _ = endian.get_u32(sector[80:84], .Little)
-		root, ok := record(sector[156:190], min(d.volume, end(d)))
+		root, ok := record(sector[156:190], 0, min(d.volume, end(d)))
 		if !ok || !root.dir {
 			d.volume = 0
 			return
@@ -55,18 +55,60 @@ volume_probe :: proc(d: ^Disc) {
 		d.root = root
 		break
 	}
-	layer1: [DATA]u8
-	if d.volume > 0 && end(d) > d.volume + 16 && read(d, d.volume + 16, layer1[:]) && string(layer1[1:6]) == "CD001" {
-		d.layer1 = d.volume
-		fmt.eprintfln("disc: dual layer, the second from LBA %d: only the first is read", d.layer1)
+	// A dual-layer DVD's second layer holds a volume of its own, its
+	// descriptor 16 sectors into the layer, which starts at the first
+	// volume's end or 16 sectors before it (images of both are seen). Its
+	// records count sectors from the layer's start. Taken only when the
+	// descriptor is a primary one whose volume ends inside the image and
+	// whose root directory starts with its `.` record.
+	if d.volume == 0 {
+		return
+	}
+	for pvd in ([2]u32{d.volume, d.volume + 16}) {
+		if pvd < 32 || !read(d, pvd, sector[:]) || sector[0] != 1 || string(sector[1:6]) != "CD001" {
+			continue
+		}
+		start := pvd - 16
+		size, _ := endian.get_u32(sector[80:84], .Little)
+		if size == 0 || u64(start) + u64(size) > u64(end(d)) {
+			continue
+		}
+		root, ok := record(sector[156:190], start, start + size)
+		if !ok || !root.dir || !self_record(d, root, start, start + size) {
+			continue
+		}
+		root.layer = 1
+		d.layer1, d.volume1, d.root1 = start, size, root
+		return
 	}
 }
 
-// The directory record at the start of rec, which holds len(rec) bytes,
-// its extent checked against limit. ok false when malformed; name "" for
-// the `.` and `..` records. The name is a slice of rec.
+// Whether directory dir's first record is its `.`, pointing back at dir.
 @(private = "file")
-record :: proc(rec: []u8, limit: u32) -> (e: Entry, ok: bool) {
+self_record :: proc(d: ^Disc, dir: Entry, base, limit: u32) -> bool {
+	sector: [DATA]u8
+	if !read(d, dir.lba, sector[:]) {
+		return false
+	}
+	e, ok := record(sector[:], base, limit)
+	return ok && e.name == "" && e.dir && e.lba == dir.lba
+}
+
+// The sectors a layer's volume spans: its first and the first past it.
+@(private = "file")
+layer_span :: proc(d: ^Disc, layer: u8) -> (base, limit: u32) {
+	if layer == 0 {
+		return 0, min(d.volume, end(d))
+	}
+	return d.layer1, d.layer1 + d.volume1
+}
+
+// The directory record at the start of rec, which holds len(rec) bytes, its
+// LBA counted from base and its extent checked against limit. ok false when
+// malformed; name "" for the `.` and `..` records. The name is a slice of
+// rec.
+@(private = "file")
+record :: proc(rec: []u8, base, limit: u32) -> (e: Entry, ok: bool) {
 	n := len(rec)
 	if n < 34 || int(rec[0]) > n || rec[0] < 34 {
 		return {}, false
@@ -76,13 +118,14 @@ record :: proc(rec: []u8, limit: u32) -> (e: Entry, ok: bool) {
 	if 33 + name_len > n {
 		return {}, false
 	}
-	e.lba, _ = endian.get_u32(rec[2:6], .Little)
+	rel, _ := endian.get_u32(rec[2:6], .Little)
 	e.size, _ = endian.get_u32(rec[10:14], .Little)
 	e.dir = rec[25] & 2 != 0
 	sectors := (u64(e.size) + DATA - 1) / DATA
-	if u64(e.lba) + sectors > u64(limit) {
+	if u64(base) + u64(rel) + sectors > u64(limit) {
 		return {}, false
 	}
+	e.lba = base + rel
 	name := string(rec[33:33 + name_len])
 	if name_len == 1 && (name[0] == 0 || name[0] == 1) {
 		return e, true
@@ -104,7 +147,7 @@ list_entry :: proc(d: ^Disc, dir: Entry, allocator := context.allocator) -> (ent
 		return nil, false
 	}
 	sectors := (dir.size + DATA - 1) / DATA
-	limit := min(d.volume, end(d))
+	base, limit := layer_span(d, dir.layer)
 	if sectors > MAX_DIR_SECTORS || u64(dir.lba) + u64(sectors) > u64(limit) {
 		return nil, false
 	}
@@ -130,7 +173,8 @@ list_entry :: proc(d: ^Disc, dir: Entry, allocator := context.allocator) -> (ent
 				}
 				break
 			}
-			e := record(sector[at:], limit) or_return
+			e := record(sector[at:], base, limit) or_return
+			e.layer = dir.layer
 			at += int(sector[at])
 			if e.name != "" {
 				e.name = strings.clone(e.name, allocator)
@@ -168,14 +212,15 @@ split_path :: proc(path: string) -> (parts: [dynamic]string, ok: bool) {
 	return parts, len(parts) <= MAX_DEPTH
 }
 
-// Find the file or directory at a disc path, matching names
-// case-insensitively; "" or `\` is the root. The name is allocated.
-find :: proc(d: ^Disc, path: string, allocator := context.allocator) -> (e: Entry, ok: bool) {
-	if d.volume == 0 {
+// Find the file or directory at a disc path in a layer's volume (1: a
+// dual-layer DVD's second), matching names case-insensitively; "" or `\` is
+// the root. The name is allocated.
+find :: proc(d: ^Disc, path: string, allocator := context.allocator, layer: u8 = 0) -> (e: Entry, ok: bool) {
+	if d.volume == 0 || layer > 1 || (layer == 1 && d.layer1 == 0) {
 		return {}, false
 	}
 	parts := split_path(path) or_return
-	at := d.root
+	at := layer == 0 ? d.root : d.root1
 	for part in parts {
 		entries := list_entry(d, at, context.temp_allocator) or_return
 		found := false
