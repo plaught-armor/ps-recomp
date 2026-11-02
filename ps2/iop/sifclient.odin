@@ -14,6 +14,10 @@
 // RPC_END, the bytes first; so recv holds them when an end function or a
 // waiter runs.
 //
+// A client freed with a packet out leaves the packet an orphan (client | 1): its
+// slot stays reserved until the answer, which the EE still owes, and that answer
+// touches no memory the packet's client had.
+//
 // RPC_END runs where retail's sifcmd interrupt handler runs it: the end
 // function on the handler coroutine (th_intr), where it cannot wait, then the
 // waiter wakes, then the packet is freed.
@@ -37,6 +41,7 @@ CL_RPC_ID :: 0x04 // that packet's rpc_id, by address
 CL_WAITER :: 0x08 // the thread waiting for RPC_END, all ones for none
 CL_UNUSED :: 0x10 // cleared by a bind
 CL_BUFF :: 0x14 // the EE server's buffer
+CL_CBUF :: 0x18 // the EE server's client buffer
 CL_END :: 0x1c // the end function
 CL_END_PARAM :: 0x20 // its argument
 CL_SERVER :: 0x24 // the EE server's descriptor, 0 until a bind found one
@@ -60,9 +65,12 @@ END_CLIENT :: 0x1c
 END_CID :: 0x20
 END_SERVER :: 0x24
 END_BUFF :: 0x28
+END_CBUF :: 0x2c
 
 // Function number of a compat row for a bind no EE server answered.
 RPC_NO_SERVER :: 0xfffffffe
+// Function number of a compat row for a waited call with no thread to wait.
+RPC_NO_THREAD :: 0xfffffffd
 
 // sceSifBindRpc(client, sid, mode). A sid with no server is no error here: the
 // EE answers RPC_END with server 0 and the call returns 0, as retail; a module
@@ -72,11 +80,12 @@ rpc_client_bind :: proc(client, sid, mode: u32) -> u32 {
 		rpc_client_refused(client, sid)
 		return ke(-2)
 	}
-	w32(client + CL_UNUSED, 0)
-	w32(client + CL_SERVER, 0)
 	pkt := rpc_pkt_new(client)
 	if pkt == 0 {return ke(-1)}
+	w32(client + CL_UNUSED, 0)
+	w32(client + CL_SERVER, 0)
 	w32(pkt + PK_ARG, sid)
+	w32(pkt + PK_RMODE, 1)
 	if cpu.debug >= 1 {fmt.eprintfln("iop: rpc bind to EE server %08x, client %x", sid, client)}
 	rpc_client_send(client, SIF_CMD_RPC_BIND, pkt, 0, 0, 0, mode)
 	return 0
@@ -89,7 +98,7 @@ rpc_client_bind :: proc(client, sid, mode: u32) -> u32 {
 rpc_client_call :: proc(client, fno, mode, send: u32) -> u32 {
 	sp := r3000.state.r[29]
 	ssize, recv, rsize, end, param := r32(sp + 16), r32(sp + 20), r32(sp + 24), r32(sp + 28), r32(sp + 32)
-	if !rpc_client_ok(client) || r32(client + CL_SERVER) == 0 || !rpc_iop_fits(send, ssize) || !rpc_iop_fits(recv, rsize) {
+	if !rpc_client_ok(client) || r32(client + CL_SERVER) == 0 || !rpc_iop_fits(send, ssize) || !rpc_iop_fits(recv, rsize) || (end != 0 && !rpc_iop_fits(end, 4)) {
 		rpc_client_refused(client, fno)
 		return ke(-2)
 	}
@@ -116,12 +125,14 @@ rpc_client_call :: proc(client, fno, mode, send: u32) -> u32 {
 }
 
 // Sends the packet, and without NOWAIT waits for its RPC_END on the running
-// thread. Not on a thread (the loader) nothing waits; a handler is stopped
-// there, as any handler that waits.
+// thread. Not on a thread (the loader) nothing can wait, with a row; a handler
+// is stopped there, as any handler that waits.
 @(private = "file")
 rpc_client_send :: proc(client, cid, pkt, src, dest, size, mode: u32) {
 	wait := mode & RPC_NOWAIT == 0
-	w32(client + CL_WAITER, iop_sched.cur if wait && th_find(iop_sched.cur) != nil else ~u32(0))
+	on_thread := th_find(iop_sched.cur) != nil
+	if wait && !on_thread && !iop_sched.intr {core.compat_unknown(.Iop_Rpc, client, sub = RPC_NO_THREAD)}
+	w32(client + CL_WAITER, iop_sched.cur if wait && on_thread else ~u32(0))
 	sifcmd_send(cid, pkt, RPC_PKT_SIZE, src, dest, size)
 	if wait {th_rpc_wait()}
 }
@@ -129,26 +140,31 @@ rpc_client_send :: proc(client, cid, pkt, src, dest, size, mode: u32) {
 // sif_command's RPC_END, the packet at `a`, with no module's handler for it.
 // An END for a client with no packet out is dropped with a row: the EE's word,
 // trusted no further than the packets this side sent. Each END frees one of
-// the client's packets; retail frees the last sent, and loses the rest.
+// the client's packets; retail frees the last sent, and loses the rest. An
+// orphan goes first: it is the older, and the EE answers in order.
 rpc_client_end :: proc(a: u32) {
 	client, cid := iop_u32(a + END_CLIENT)^, iop_u32(a + END_CID)^
+	iop_sync(cpu.state.cycles)
+	if orphan := rpc_pkt_of(client | 1); orphan != 0 {
+		rpc_pkt_free(orphan)
+		core.compat_unknown(.Iop_Rpc, client, sub = cid)
+		fmt.eprintfln("iop: RPC_END of %08x for client %x, which was freed", cid, client)
+		return
+	}
 	pkt := rpc_pkt_of(client)
 	if pkt == 0 {
 		core.compat_unknown(.Iop_Rpc, client, sub = cid)
 		fmt.eprintfln("iop: RPC_END of %08x for client %x, which has no packet out", cid, client)
 		return
 	}
-	iop_sync(cpu.state.cycles)
 	switch cid {
 	case SIF_CMD_RPC_CALL:
 		if end := r32(client + CL_END); end != 0 {
 			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc END client %x fno %#x, end function %x", client, r32(pkt + PK_ARG), end)}
 			switch th_intr(end, r32(client + CL_END_PARAM), 0) {
 			case .None:
-			case .Blocked:
+			case .Blocked, .Call:
 				core.compat_unknown(.Iop_Intr, cid, pc = end)
-				fmt.eprintfln("iop: rpc end function at %x blocked", end)
-			case .Call:
 				fmt.eprintfln("iop: rpc end function at %x stopped", end)
 			}
 		} else if cpu.debug >= 1 {
@@ -158,36 +174,52 @@ rpc_client_end :: proc(a: u32) {
 		server := iop_u32(a + END_SERVER)^
 		w32(client + CL_SERVER, server)
 		w32(client + CL_BUFF, iop_u32(a + END_BUFF)^)
+		w32(client + CL_CBUF, iop_u32(a + END_CBUF)^)
 		sid := r32(pkt + PK_ARG)
 		if cpu.debug >= 1 {fmt.eprintfln("iop: rpc bind to EE server %08x answered, server %x", sid, server)}
 		if server == 0 {core.compat_unknown(.Iop_Rpc, sid, sub = RPC_NO_SERVER)}
 	}
 	if w := r32(client + CL_WAITER); w != ~u32(0) {th_rpc_wake(w)}
-	w32(pkt + PK_REC_ID, r32(pkt + PK_REC_ID) &~ PK_IN_USE)
-	w32(pkt + PK_RPC_ID, 0)
-	w32(client + CL_PKT, 0)
+	rpc_pkt_free(pkt)
+	// What the client's last field says of its packets: the one left, if any.
+	left := rpc_pkt_of(client)
+	w32(client + CL_PKT, left)
+	if left != 0 {w32(client + CL_RPC_ID, left + PK_RPC_ID)}
 	iop_sched.start_done = false
 	th_schedule(r3000.state.cycles + IOP_SLICE)
 	iop_wake_set()
 }
 
-// After a failed load: forgets the pool in `freed`, and each packet of a
-// client or end function there, so no RPC_END reaches them.
-rpc_client_undo :: proc(freed: []Sys_Block) {
+// `freed` is about to be memory no module owns. Each packet out for a client
+// there is orphaned and its waiter woken, so its RPC_END reaches none of that;
+// a client that lives on, with its end function there, ends with none. The pool
+// itself is never in `freed`: the EE holds its addresses (undo_restore).
+rpc_client_freed :: proc(freed: []Sys_Block) {
 	s := &iop_sifcmd
 	if s.rpc_pool == 0 {return}
-	if sys_in(freed, s.rpc_pool) {
-		s.rpc_pool = 0
-		return
-	}
+	woke := false
 	for i in u32(0) ..< RPC_PKTS {
 		pkt := s.rpc_pool + i * RPC_PKT_SIZE
-		if r32(pkt + PK_REC_ID) & PK_IN_USE == 0 {continue}
 		client := r32(pkt + PK_CLIENT)
-		if sys_in(freed, client) || sys_in(freed, r32(client + CL_END)) {
-			w32(pkt + PK_REC_ID, r32(pkt + PK_REC_ID) &~ PK_IN_USE)
+		if r32(pkt + PK_REC_ID) & PK_IN_USE == 0 || client & 1 != 0 {continue}
+		if sys_in(freed, client) {
+			if w := r32(client + CL_WAITER); w != ~u32(0) {
+				th_rpc_wake(w)
+				woke = true
+			}
+			w32(pkt + PK_CLIENT, client | 1)
+		} else if sys_in(freed, r32(client + CL_END)) {
+			w32(client + CL_END, 0)
 		}
 	}
+	// Not th_schedule: this may be on a thread, and the next slice runs what woke.
+	if woke {iop_wake_set()}
+}
+
+@(private = "file")
+rpc_pkt_free :: proc(pkt: u32) {
+	w32(pkt + PK_REC_ID, r32(pkt + PK_REC_ID) &~ PK_IN_USE)
+	w32(pkt + PK_RPC_ID, 0)
 }
 
 // A free packet made ready for `client`, recorded there; 0 with none, which
@@ -219,14 +251,15 @@ rpc_pkt_new :: proc(client: u32) -> u32 {
 	return 0
 }
 
-// The first packet out for `client`, 0 if none.
+// The first packet out for `client` that its RPC_END will answer, 0 if none. A
+// NOWAIT call's packet with no end function has no RPC_END to be taken by.
 @(private = "file")
 rpc_pkt_of :: proc(client: u32) -> u32 {
 	s := &iop_sifcmd
 	if s.rpc_pool == 0 || client == 0 {return 0}
 	for i in u32(0) ..< RPC_PKTS {
 		pkt := s.rpc_pool + i * RPC_PKT_SIZE
-		if r32(pkt + PK_REC_ID) & PK_IN_USE != 0 && r32(pkt + PK_CLIENT) == client {return pkt}
+		if r32(pkt + PK_REC_ID) & PK_IN_USE != 0 && r32(pkt + PK_CLIENT) == client && r32(pkt + PK_RMODE) != 0 {return pkt}
 	}
 	return 0
 }

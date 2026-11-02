@@ -78,6 +78,7 @@ sys_alloc :: proc(kind: Sys_Alloc, req: u32, addr: u32 = 0) -> u32 {
 sys_free :: proc(addr: u32) -> bool {
 	for b, i in sys_blocks {
 		if b.addr == addr {
+			rpc_client_freed({b})
 			ordered_remove(&sys_blocks, i)
 			return true
 		}

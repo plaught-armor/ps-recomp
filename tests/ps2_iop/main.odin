@@ -179,6 +179,7 @@ game :: proc(_: rawptr) {
 	test_rpc_remove()
 	test_rpc_self_remove()
 	test_rpc_client()
+	test_rpc_pool_kept()
 	test_c1_gaps()
 	test_sifman()
 	test_libsd()
@@ -2028,6 +2029,7 @@ test_rpc_client :: proc() {
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6, 24)
 	sc := imports(&a, "sifcmd", 15, 16)
+	ub := imports(&a, "usbd", 6)
 	logp := log_words(&a, 32)
 	cl := [5]u32{}
 	for &c in cl {
@@ -2058,6 +2060,15 @@ test_rpc_client :: proc() {
 	bad := at(&a)
 	prologue(&a)
 	jal(&a, tb + 16)
+	put(&a, 0)
+	epilogue(&a)
+	// An end function that logs nothing, for the pool's 32: the log holds 32 words.
+	idle := at(&a)
+	put(&a, JR_RA, 0)
+	// An end function that reaches a gap.
+	gap := at(&a)
+	prologue(&a)
+	jal(&a, ub)
 	put(&a, 0)
 	epilogue(&a)
 	call :: proc(a: ^Asm, sc, client, fno, mode, send, recv, end, param: u32) {
@@ -2112,7 +2123,7 @@ test_rpc_client :: proc() {
 			e = 16
 		}
 		for w, i in ([4]u32{64, 0, iop.SIF_CMD_RPC_END, 0}) {mem.wr32(EE_PKT + 4 * u32(i), w)}
-		for w, i in ([8]u32{0, EE_PKT, 0, client, cid, server, buff, 0}) {mem.wr32(EE_PKT + 16 + 4 * u32(i), w)}
+		for w, i in ([8]u32{0, EE_PKT, 0, client, cid, server, buff, 0xcb0f}) {mem.wr32(EE_PKT + 16 + 4 * u32(i), w)}
 		for w, i in ([4]u32{EE_PKT, iop.IOP_CMDBUF, 64, 0}) {mem.wr32(EE_LIST + e + 4 * u32(i), w)}
 		iop.sif_set_dma(EE_LIST, 1 if n == 0 else 2, 0)
 	}
@@ -2132,7 +2143,7 @@ test_rpc_client :: proc() {
 
 	// RPC_END of the bind: the server, then the call goes out, its bytes first.
 	ee_end(c0, iop.SIF_CMD_RPC_BIND, 0x7000, EE_SRV, 0, 0, 0)
-	check(word(c0, iop.CL_SERVER) == 0x7000 && word(c0, iop.CL_BUFF) == EE_SRV, "rpc client: RPC_END of the bind writes server and buffer")
+	check(word(c0, iop.CL_SERVER) == 0x7000 && word(c0, iop.CL_BUFF) == EE_SRV && word(c0, iop.CL_CBUF) == 0xcb0f, "rpc client: RPC_END of the bind writes server and buffer")
 	check(word(b, logp + 4) == 1, "rpc client: the bind's waiter wakes")
 	check(len(iop.sif.replies) == 1 && reply_word(0, 2) == iop.SIF_CMD_RPC_CALL && reply_word(0, 8) == 1 && reply_word(0, 9) == 4 && reply_word(0, 10) == b + recv && reply_word(0, 11) == 4 && reply_word(0, 12) == 1 && reply_word(0, 13) == 0x7000, "rpc client: the call's packet as retail's")
 	check(reply_word(0, 1) == EE_SRV && mem.rd32(EE_SRV) == 0x5a5a1234 && word(b, logp + 8) == 0, "rpc client: the send bytes are in the buffer, the call waits")
@@ -2176,6 +2187,7 @@ test_rpc_client :: proc() {
 	check(fn_call(stk, c2, 10, 1, b + send, 4, b + recv, 4, 0, 0) == 0xfffffffe && row(c2, 10) == 1, "rpc client: a buffer outside EE RAM is refused")
 	iop.iop_u32(c2 + iop.CL_BUFF)^ = EE_SRV
 	check(fn_call(stk, c2 + 1, 11, 1, b + send, 4, b + recv, 4, 0, 0) == 0xfffffffe && row(c2 + 1, 11) == 1, "rpc client: a misaligned client is refused")
+	check(fn_call(stk, c2, 12, 1, b + send, 4, b + recv, 4, 0x7ffffff0, 0) == 0xfffffffe && row(c2, 12) == 1 && len(iop.sif.replies) == 0, "rpc client: an end function outside IOP RAM is refused")
 	check(len(iop.sif.replies) == 0, "rpc client: nothing refused was sent")
 
 	// NOWAIT with no end function: no RPC_END asked; the EE's DMA frees it.
@@ -2191,12 +2203,23 @@ test_rpc_client :: proc() {
 
 	// The pool: 32 out, the 33rd refused; an END frees one.
 	for _ in 0 ..< iop.RPC_PKTS {
-		check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: 32 packets out")
+		check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + idle, 0) == 0, "rpc client: 32 packets out")
 	}
-	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + end, 0) == 0xffffffff, "rpc client: the 33rd returns -1")
+	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + idle, 0) == 0xffffffff, "rpc client: the 33rd returns -1")
+	iop.iop_u32(c3 + iop.CL_SERVER)^ = 0x7200
+	r[4], r[5], r[6] = c3, 0x124, 1
+	bv, bok := iop.sifcmd_fn(15)
+	check(bok && bv == 0xffffffff && word(c3, iop.CL_SERVER) == 0x7200, "rpc client: a bind with no free packet leaves the client as it was")
 	drop_replies()
 	for _ in 0 ..< iop.RPC_PKTS {ee_end(c2, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)}
-	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, 0, 0) == 0, "rpc client: each END frees one")
+	check(word(c2, iop.CL_PKT) == 0, "rpc client: each END frees one")
+	for _ in 0 ..< iop.RPC_PKTS {
+		check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + idle, 0) == 0, "rpc client: all 32 are free again")
+	}
+	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + idle, 0) == 0xffffffff, "rpc client: and the 33rd is still refused")
+	drop_replies()
+	for _ in 0 ..< iop.RPC_PKTS {ee_end(c2, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)}
+	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, 0, 0) == 0, "rpc client: NOWAIT again")
 	drop_replies()
 	for w, i in ([4]u32{EE_PKT, word(c2, iop.CL_PKT), 64, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
 	iop.sif_set_dma(EE_LIST, 1, 0)
@@ -2204,7 +2227,7 @@ test_rpc_client :: proc() {
 	// A bind no server answers: 0, a row, the client left unbound.
 	r[4], r[5], r[6] = c3, 0x123, 1
 	v, ok := iop.sifcmd_fn(15)
-	check(ok && v == 0 && reply_word(0, 8) == 0x123, "rpc client: NOWAIT bind sent")
+	check(ok && v == 0 && reply_word(0, 8) == 0x123 && reply_word(0, 12) == 1, "rpc client: NOWAIT bind sent, asking its RPC_END in a slot a NOWAIT call used")
 	drop_replies()
 	ee_end(c3, iop.SIF_CMD_RPC_BIND, 0, 0, 0, 0, 0)
 	check(word(c3, iop.CL_SERVER) == 0 && row(0x123, iop.RPC_NO_SERVER) == 1, "rpc client: a bind to no server is 0, with a row")
@@ -2217,6 +2240,37 @@ test_rpc_client :: proc() {
 	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
 	blocked := core.compat.calls[core.Compat_Key{.Iop_Intr, iop.SIF_CMD_RPC_CALL, 0}].n
 	check(blocked == 1 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function that waits is a row, the packet freed")
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + gap, 0) == 0, "rpc client: a call with an end function at a gap")
+	drop_replies()
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	blocked = core.compat.calls[core.Compat_Key{.Iop_Intr, iop.SIF_CMD_RPC_CALL, 0}].n
+	check(blocked == 2 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function at a gap is the same row, the packet freed")
+
+	// A waited call with no thread: sent, with a row, and nothing waits.
+	check(fn_call(stk, c3, 13, 0, b + send, 4, b + recv, 4, 0, 0) == 0 && row(c3, iop.RPC_NO_THREAD) == 1 && len(iop.sif.replies) == 1, "rpc client: a waited call from the loader is a row")
+	drop_replies()
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+
+	// Two packets on one client: each END frees one, the client's packet the
+	// one left.
+	lg := word(b, logp)
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0 && fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: two calls on one client")
+	drop_replies()
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(word(c3, iop.CL_PKT) != 0 && word(word(c3, iop.CL_PKT), iop.PK_REC_ID) & iop.PK_IN_USE != 0 && word(c3, iop.CL_RPC_ID) == word(c3, iop.CL_PKT) + iop.PK_RPC_ID, "rpc client: after the first END the client names the packet still out")
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(word(c3, iop.CL_PKT) == 0 && word(b, logp) == lg + 16, "rpc client: the second END ends it, each ran the end function")
+
+	// A packet no END answers is not taken for one that is.
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, 0, 0) == 0, "rpc client: a call that asks no END")
+	quiet := word(c3, iop.CL_PKT)
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: and one that does")
+	drop_replies()
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(word(quiet, iop.PK_REC_ID) & iop.PK_IN_USE != 0, "rpc client: END leaves the packet that asked none")
+	for i in u32(0) ..< 16 {mem.wr32(EE_PKT + 4 * i, 0)}
+	for w, i in ([4]u32{EE_PKT, quiet, 64, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
+	iop.sif_set_dma(EE_LIST, 1, 0)
 
 	// A stray RPC_END; one whose client a failed load freed.
 	before := len(iop.sif.replies)
@@ -2225,15 +2279,87 @@ test_rpc_client :: proc() {
 	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: a call out when the load fails")
 	drop_replies()
 	log_at := word(b, logp)
-	iop.rpc_client_undo({{addr = c3, size = 0x28}})
+	orphan := word(c3, iop.CL_PKT)
+	waiter := iop.th_new(0x1000, 0x2000, 0x100, 0, 10)
+	waiter.status = .Wait
+	iop.iop_u32(c3 + iop.CL_WAITER)^ = waiter.id
+	iop.rpc_client_freed({{addr = c3, size = 0x28}})
+	check(waiter.status != .Wait, "rpc client: freeing a client wakes its waiter")
+	waiter.status = .Dormant
+	check(word(orphan, iop.PK_REC_ID) & iop.PK_IN_USE != 0 && word(orphan, iop.PK_CLIENT) == c3 | 1, "rpc client: the packet stays reserved, an orphan")
+	// The memory reused for a client whose call follows: the EE answers the older first.
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: a client at the same address")
+	drop_replies()
 	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
-	check(row(c3, iop.SIF_CMD_RPC_CALL) == 1 && word(b, logp) == log_at, "rpc client: RPC_END for a freed client is a row, its end function not run")
+	check(row(c3, iop.SIF_CMD_RPC_CALL) == 1 && word(b, logp) == log_at && word(orphan, iop.PK_REC_ID) & iop.PK_IN_USE == 0, "rpc client: RPC_END for a freed client is a row, the packet freed, its end function not run")
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(word(b, logp) == log_at + 8 && word(c3, iop.CL_PKT) == 0, "rpc client: the new client's RPC_END is its own")
 
-	// Without PS_IRX, as before: a row, the client untouched.
-	iop.iop_irx = false
+	// An end function freed from under a client that lives on.
+	log_at = word(b, logp)
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: a call with an end function")
+	drop_replies()
+	iop.rpc_client_freed({{addr = b + end, size = 4}})
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(word(c3, iop.CL_END) == 0 && word(b, logp) == log_at && word(c3, iop.CL_PKT) == 0 && row(c3, iop.SIF_CMD_RPC_CALL) == 1, "rpc client: its RPC_END runs none and frees the packet")
+
+	// A module that stays no more, its block freed as any: the client in it.
+	cx := iop.sys_alloc(.Low, 0x40)
+	for i in u32(0) ..< 16 {iop.iop_u32(cx + 4 * i)^ = 0}
+	iop.iop_u32(cx + iop.CL_SERVER)^ = 0x7200
+	iop.iop_u32(cx + iop.CL_BUFF)^ = EE_SRV
+	check(fn_call(stk, cx, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: a call on a client in a block")
+	drop_replies()
+	check(iop.sys_free(cx), "rpc client: the block frees")
+	ee_end(cx, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(row(cx, iop.SIF_CMD_RPC_CALL) == 1 && word(b, logp) == log_at, "rpc client: sys_free orphans what the block held")
+
+	// Without PS_IRX, as before: the client untouched, its packet still out, a row.
 	c4 := b + cl[4]
+	iop.iop_u32(c4 + iop.CL_SERVER)^ = 0x7400
+	iop.iop_u32(c4 + iop.CL_BUFF)^ = EE_SRV
+	check(fn_call(stk, c4, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: a packet out when PS_IRX goes off")
+	drop_replies()
+	out := word(c4, iop.CL_PKT)
+	log_at = word(b, logp)
+	rows := len(core.compat.calls)
+	iop.iop_irx = false
 	ee_end(c4, iop.SIF_CMD_RPC_BIND, 0x7300, EE_SRV, 0, 0, 0)
-	check(word(c4, iop.CL_SERVER) == 0, "rpc client: without PS_IRX RPC_END writes nothing")
+	check(word(c4, iop.CL_SERVER) == 0x7400 && word(c4, iop.CL_PKT) == out && word(out, iop.PK_REC_ID) & iop.PK_IN_USE != 0 && word(b, logp) == log_at && len(core.compat.calls) > rows, "rpc client: without PS_IRX RPC_END writes nothing and is a row")
+}
+
+// A load that fails after its start allocated the pool: the pool stays, so what
+// the EE owes finds it, and the client that was in the module is an orphan.
+test_rpc_pool_kept :: proc() {
+	fresh()
+	clear(&core.compat.calls)
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	drop_replies()
+	defer drop_replies()
+	iop.iop_sifcmd.rpc_pool = 0
+	a: Asm
+	sc := imports(&a, "sifcmd", 15)
+	ub := imports(&a, "usbd", 6)
+	client := at(&a)
+	for _ in 0 ..< 10 {put(&a, 0)}
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, client)
+	li(&a, A1, 0x200)
+	li(&a, A2, iop.RPC_NOWAIT)
+	jal(&a, sc)
+	put(&a, 0)
+	jal(&a, ub)
+	put(&a, 0)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modp", &a, entry), "modp", nil)
+	check(id <= 0, "rpc pool: the load fails")
+	pool := iop.iop_sifcmd.rpc_pool
+	check(pool != 0 && iop.sys_in(iop.sys_blocks[:], pool), "rpc pool: the pool is kept, its block still held")
+	check(iop.iop_u32(pool + iop.PK_REC_ID)^ & iop.PK_IN_USE != 0 && iop.iop_u32(pool + iop.PK_CLIENT)^ & 1 == 1, "rpc pool: the failed module's packet is an orphan")
+	check(iop.sys_alloc(.Addr, 0x100, pool) == 0, "rpc pool: nothing else can have its memory")
 }
 
 

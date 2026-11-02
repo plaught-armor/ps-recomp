@@ -119,7 +119,7 @@ sifcmd_undo :: proc(saved: Iop_Sifcmd, tab: []u32, freed: []Sys_Block) {
 		w32(e, old[0])
 		w32(e + 4, old[1])
 	}
-	rpc_client_undo(freed)
+	rpc_client_freed(freed)
 }
 
 // Sends the EE command cid, packet at `pkt`, and `size` bytes from src to dest

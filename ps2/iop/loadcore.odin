@@ -472,7 +472,7 @@ undo_restore :: proc() {
 	// started or woke, and fds open before it that it closed or moved.
 	freed := make([dynamic]Sys_Block, 0, len(sys_blocks), context.temp_allocator)
 	for b in sys_blocks {
-		if !slice.contains(l.undo.blocks[:], b) {append(&freed, b)}
+		if !slice.contains(l.undo.blocks[:], b) && b.addr != iop_sifcmd.rpc_pool {append(&freed, b)}
 	}
 	sifcmd_undo(l.undo.sifcmd, l.undo.sif_tab[:], freed[:])
 	sd_undo(l.undo.sd, freed[:])
@@ -486,6 +486,8 @@ undo_restore :: proc() {
 	}
 	clear(&sys_blocks)
 	append(&sys_blocks, ..l.undo.blocks[:])
+	// The RPC client's pool stays where it is, however late it was allocated.
+	if p := iop_sifcmd.rpc_pool; p != 0 && !sys_in(sys_blocks[:], p) {sys_alloc(.Addr, RPC_PKTS * RPC_PKT_SIZE, p)}
 	clear(&l.stubs)
 	for a, s in l.undo.stubs {l.stubs[a] = s}
 }
