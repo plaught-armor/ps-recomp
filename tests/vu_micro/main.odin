@@ -3,8 +3,9 @@
 // tests/vu_macro: this program generates cases/main.odin, one run_<n> per
 // program and unit, then runs it with `odin run`. Each program runs from
 // random state, once in the interpreter and once compiled, and must leave
-// vf, vi, ACC, MAC, Q, P and memory the same. Every program runs on VU1 and
-// on VU0; on VU0 status must match too, since compiled VU0 code computes it.
+// vf, vi, ACC, MAC, Q, P, the pending DIV's I and D bits (q_flags, q_due)
+// and memory the same. Every program runs on VU1 and on VU0; on VU0 status
+// must match too, since compiled VU0 code computes it.
 // The seed is fixed, so a run is reproducible. cases/ is generated, not
 // checked in.
 //
@@ -14,7 +15,9 @@
 // upper writes: the lower must read it from before the upper, and its own
 // write must win unless it leaves the register as it was. The VU0-only
 // programs pair DIV, SQRT and RSQRT with an upper op, so the two status
-// writes merge, with divisors that set I or D on every trial.
+// writes merge, with divisors that set I or D on every trial. Two more let
+// Q's wait reach four inside the stall of a DIV or a WAITQ after a DIV that
+// sets D: the stalled pair takes the bits, so the end status keeps sticky D.
 //
 // Last, the EFU: each op writes P and MFP reads it back into part of a
 // register, from random P first; then an ESIN reading and an MFP writing
@@ -177,6 +180,8 @@ main :: proc() {
 			init.i = transmute(f32)rnd()
 			init.q = transmute(f32)rnd()
 			init.q_next, init.q_wait = transmute(f32)rnd(), 0 // as a microprogram starts: no Q pending
+			init.q_flags, init.q_due = rand.uint32() & 0x30, 0 // a stale DIV's bits, none due
+			init.p_next, init.p_wait = transmute(f32)rnd(), 0 // nor P
 			init.p = transmute(f32)rnd()
 			init.mac = rand.uint32() & 0xffff
 			init.status = rand.uint32() & 0xfcf // I and D clear, so the control counts the program's
@@ -200,14 +205,16 @@ main :: proc() {
 			copy(mem, mem_init)
 			budget := 1000
 			pc, exit := c.run(c.pc, &budget)
-			// The end drains a pending Q, as vu0_exec and vu1_exec do after the run.
-			if exit == .End && v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}
+			// The end drains a pending Q and P, as vu0_exec and vu1_exec do after the run.
+			if exit == .End {vu.vu_drain(v)}
 			got := v^
 			if want.mac != init.mac {flagged += 1}
 			if c.vu0 && want.status & 0x30 != 0 {status_set += 1}
 			same := exit == want_exit && pc == want.tpc && got.vi == want.vi && got.acc.u == want.acc.u && got.mac == want.mac
 			same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p && slice.equal(mem, mem_want)
 			same &&= transmute(u32)got.q_next == transmute(u32)want.q_next && got.q_wait == want.q_wait
+			same &&= transmute(u32)got.p_next == transmute(u32)want.p_next && got.p_wait == want.p_wait
+			same &&= got.q_flags == want.q_flags && got.q_due == want.q_due
 			same &&= !c.vu0 || got.status == want.status
 			for k in 0 ..< 32 {same &&= got.vf[k].u == want.vf[k].u}
 			if !same {

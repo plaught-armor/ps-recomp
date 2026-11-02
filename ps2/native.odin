@@ -48,6 +48,10 @@ import vu "vu"
 #assert(offset_of(vu.Vu, old_clip) - offset_of(vu.Vu, vf) == 612)
 #assert(offset_of(vu.Vu, q_next) - offset_of(vu.Vu, vf) == 624)
 #assert(offset_of(vu.Vu, q_wait) - offset_of(vu.Vu, vf) == 628)
+#assert(offset_of(vu.Vu, p_next) - offset_of(vu.Vu, vf) == 632)
+#assert(offset_of(vu.Vu, p_wait) - offset_of(vu.Vu, vf) == 636)
+#assert(offset_of(vu.Vu, q_flags) - offset_of(vu.Vu, vf) == 640)
+#assert(offset_of(vu.Vu, q_due) - offset_of(vu.Vu, vf) == 644)
 
 // bc_cond for native code, which reads a 32-bit result.
 @(private = "file")
@@ -298,6 +302,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.upper"] = p(rawptr(vu.vu0_upper))
 	m["vu.lower"] = p(rawptr(vu.vu0_lower))
 	m["vu.pair"] = p(rawptr(vu.vu0_pair))
+	m["vu.wait"] = p(rawptr(vu.vu0_wait))
 	m["vu.itop"] = p(&vu.vifs[0].itop)
 	m["vu.run_pc"] = p(&vu.native_run[0].pc)
 	m["vu.run_budget"] = p(&vu.native_run[0].budget)
@@ -316,6 +321,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu1.upper"] = p(rawptr(vu.vu1_upper))
 	m["vu1.lower"] = p(rawptr(vu.vu1_lower))
 	m["vu1.pair"] = p(rawptr(vu.vu1_pair))
+	m["vu1.wait"] = p(rawptr(vu.vu1_wait))
 	m["vu1.xgkick"] = p(rawptr(vu.vu1_xgkick))
 	m["vu1.top"] = p(&vu.vifs[1].top)
 	m["vu1.itop"] = p(&vu.vifs[1].itop)

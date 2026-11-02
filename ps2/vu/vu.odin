@@ -2,8 +2,8 @@
 // instructions issued by the EE).
 //
 // VU floats are IEEE singles without infinities or NaNs, clamped like the
-// FPU. MAC, status and clip flags are kept as vu_put_flags, vu_div_flags
-// and CLIP set them.
+// FPU. MAC, status and clip flags are kept as vu_put_flags, CLIP and the
+// FDIV unit's status bits (VU_Q_DIV) set them.
 //
 // In micro mode a flag read sees the flags four pairs late: the FMAC
 // pipeline writes them four cycles after an op issues, so FMAND, FCAND,
@@ -13,11 +13,12 @@
 // keeps the three older values each flag passed through (old_mac and the
 // rest), shifted once per pair by every backend (vu_flags_shift), and the
 // reads take the oldest. Sticky status bits (6-11) are read as they are
-// now. Stalls are not modelled: hardware holds a pair whose operand an
-// earlier FMAC op has not yet written, which moves later flags into the
-// window, and FDIV (see VU_Q_DIV), EFU and integer waits likewise; VU_STALL_COUNT counts
-// the reads such a stall could reach. Macro mode reads the newest flags:
-// CFC2 waits for the pipeline to drain.
+// now. A stall for Q or P (vu_before) shifts the flags once per cycle, as
+// an empty pair would. FMAC operand stalls are not modelled: hardware holds
+// a pair whose operand an earlier FMAC op has not yet written, which moves
+// later flags into the window, and integer waits likewise; VU_STALL_COUNT
+// counts the reads such a stall could reach. Macro mode reads the newest
+// flags: CFC2 waits for the pipeline to drain.
 package ps2_vu
 
 import "base:runtime"
@@ -53,9 +54,19 @@ Vu :: struct {
 	old_status: [3]u32,
 	old_clip:   [3]u32,
 	// Q as DIV, SQRT or RSQRT leaves it, and the pairs until it lands (0:
-	// none pending). See vu_q_before.
+	// none pending). See VU_Q_DIV.
 	q_next: f32,
 	q_wait: u32,
+	// P as an EFU op leaves it, and the pairs until it lands (0: none
+	// pending). See VU_EFU_LATENCY.
+	p_next: f32,
+	p_wait: u32,
+	// Status I (0x10) and D (0x20) of the pending DIV, SQRT or RSQRT, set
+	// by the pair after its wait drops to VU_Q_FLAGS.
+	q_flags: u32,
+	// Nonzero: Q's wait has reached VU_Q_FLAGS and its I and D bits are not
+	// yet in status; the next pair sets them (vu_q_due).
+	q_due:   u32,
 	fbrst:  u32,
 	tpc:    u32,
 	cmsar:  u32,
@@ -159,7 +170,7 @@ vclamp4 :: #force_inline proc(r: [4]f32) -> [4]f32 {return {vclamp(r.x), vclamp(
 vu0_macro :: proc(w: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0[cpu.cop2_key(w)] += 1}
 	vu_op(&vu0, w)
-	vu_q_drain(&vu0) // macro mode waits for Q
+	vu_drain(&vu0) // macro mode waits for Q, and sets I and D at once
 }
 
 // One operation in COP2 layout. Macro instructions, micro-mode upper
@@ -333,13 +344,13 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		if w & 3 == 1 && it != 0 {v.vi[it] += 1}
 		v.vi[0] = 0
 	case 0x38: // VDIV
-		vu_div_flags(v, s[fsf], t[ftf])
+		v.q_flags = vu_div_bits(s[fsf], t[ftf])
 		v.q_next, v.q_wait = cpu.fdiv(s[fsf], t[ftf]), VU_Q_DIV
 	case 0x39: // VSQRT
-		vu_div_flags(v, 1, t[ftf] < 0 ? 0 : 1)
+		v.q_flags = vu_div_bits(1, t[ftf] < 0 ? 0 : 1)
 		v.q_next, v.q_wait = math.sqrt(abs(ct[ftf])), VU_Q_DIV
 	case 0x3a: // VRSQRT
-		vu_div_flags(v, s[fsf], t[ftf])
+		v.q_flags = vu_div_bits(s[fsf], t[ftf])
 		v.q_next, v.q_wait = cpu.frsqrt(s[fsf], t[ftf]), VU_Q_RSQRT
 	case 0x3b: // VWAITQ
 	case 0x3c: if it != 0 {v.vi[it] = u16(v.vf[fs].u[fsf])} // VMTIR
@@ -373,20 +384,20 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 	case 0x6c: // XGKICK (VU1 only)
 		if v != &vu1 {cpu.fatal("vu0: XGKICK %08x does not exist on VU0", w)}
 		vu1_xgkick(v.vi[is])
-	case 0x70: v.p = vclamp(cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ESADD
-	case 0x71: v.p = cpu.fdiv(1, cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ERSADD
-	case 0x72: v.p = math.sqrt(cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ELENG
-	case 0x73: v.p = cpu.frsqrt(1, cs.x * cs.x + cs.y * cs.y + cs.z * cs.z) // ERLENG
-	case 0x74: v.p = math.atan(cpu.fdiv(cs.y, cs.x)) // EATANxy
-	case 0x75: v.p = math.atan(cpu.fdiv(cs.z, cs.x)) // EATANxz
-	case 0x76: v.p = vclamp(cs.x + cs.y + cs.z + cs.w) // ESUM
-	case 0x78: v.p = math.sqrt(abs(cs[fsf])) // ESQRT
-	case 0x79: v.p = cpu.frsqrt(1, cs[fsf]) // ERSQRT
-	case 0x7a: v.p = cpu.fdiv(1, cs[fsf]) // ERCPR
+	case 0x70: v.p_next, v.p_wait = vclamp(cs.x * cs.x + cs.y * cs.y + cs.z * cs.z), VU_EFU_LATENCY[0x0] // ESADD
+	case 0x71: v.p_next, v.p_wait = cpu.fdiv(1, cs.x * cs.x + cs.y * cs.y + cs.z * cs.z), VU_EFU_LATENCY[0x1] // ERSADD
+	case 0x72: v.p_next, v.p_wait = math.sqrt(cs.x * cs.x + cs.y * cs.y + cs.z * cs.z), VU_EFU_LATENCY[0x2] // ELENG
+	case 0x73: v.p_next, v.p_wait = cpu.frsqrt(1, cs.x * cs.x + cs.y * cs.y + cs.z * cs.z), VU_EFU_LATENCY[0x3] // ERLENG
+	case 0x74: v.p_next, v.p_wait = math.atan(cpu.fdiv(cs.y, cs.x)), VU_EFU_LATENCY[0x4] // EATANxy
+	case 0x75: v.p_next, v.p_wait = math.atan(cpu.fdiv(cs.z, cs.x)), VU_EFU_LATENCY[0x5] // EATANxz
+	case 0x76: v.p_next, v.p_wait = vclamp(cs.x + cs.y + cs.z + cs.w), VU_EFU_LATENCY[0x6] // ESUM
+	case 0x78: v.p_next, v.p_wait = math.sqrt(abs(cs[fsf])), VU_EFU_LATENCY[0x8] // ESQRT
+	case 0x79: v.p_next, v.p_wait = cpu.frsqrt(1, cs[fsf]), VU_EFU_LATENCY[0x9] // ERSQRT
+	case 0x7a: v.p_next, v.p_wait = cpu.fdiv(1, cs[fsf]), VU_EFU_LATENCY[0xa] // ERCPR
 	case 0x7b: // WAITP
-	case 0x7c: v.p = math.sin(cs[fsf]) // ESIN
-	case 0x7d: v.p = math.atan(cs[fsf]) // EATAN
-	case 0x7e: v.p = vclamp(math.exp(-cs[fsf])) // EEXP
+	case 0x7c: v.p_next, v.p_wait = math.sin(cs[fsf]), VU_EFU_LATENCY[0xc] // ESIN
+	case 0x7d: v.p_next, v.p_wait = math.atan(cs[fsf]), VU_EFU_LATENCY[0xd] // EATAN
+	case 0x7e: v.p_next, v.p_wait = vclamp(math.exp(-cs[fsf])), VU_EFU_LATENCY[0xe] // EEXP
 	case:
 		cpu.fatal("vu%d: unknown op %08x", v == &vu1 ? 1 : 0, w)
 	}
@@ -419,12 +430,13 @@ vu_put_flags :: proc(v: ^Vu, dst: ^Vf, dest: u32, r: [4]f32) #no_bounds_check {
 	v.status = (v.status &~ 0xf) | st | st << 6
 }
 
-// Status I/D bits for DIV-family ops: 0/0 is invalid, x/0 divide by zero.
+// Status I/D bits for DIV-family ops of a / b: 0/0 is invalid (0x10), x/0
+// divide by zero (0x20). Held in q_flags until the pair after the wait
+// drops to VU_Q_FLAGS (vu_q_due).
 @(private)
-vu_div_flags :: proc(v: ^Vu, a, b: f32) {
-	f: u32 = 0
-	if b == 0 {f = a == 0 ? 0x10 : 0x20}
-	v.status = (v.status &~ 0x30) | f | f << 6
+vu_div_bits :: proc "contextless" (a, b: f32) -> u32 {
+	if b != 0 {return 0}
+	return a == 0 ? 0x10 : 0x20
 }
 
 @(private)
@@ -701,7 +713,7 @@ vu1_start :: proc(addr: u32) {
 @(private)
 vu1_exec :: proc(addr: u32, compiled: bool) {
 	pc, ended := micro_exec(&vu1, &vu1_table, &vu1_micro_gen, vu1_pairs[:], addr, compiled)
-	vu_q_drain(&vu1)
+	vu_drain(&vu1)
 	if !ended && !vu1_overrun {
 		vu1_overrun = true
 		fmt.eprintfln("vu1: microprogram at %04x ran %d steps without ending", addr, VU_STEP_LIMIT)
@@ -728,10 +740,10 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 	budget := VU_STEP_LIMIT
 	for budget > 0 {
 		// A program that hands back a pair it compiles leaves that pair to
-		// the interpreter. Compiled code starts with no Q pending
-		// (recomp/vu's demand_q): until it lands, the interpreter runs.
+		// the interpreter. Compiled code starts with no Q or P pending
+		// (recomp/vu's demand_waits): until both land, the interpreter runs.
 		last: ^Vu_Program
-		for compiled && t.stop[pc / 8] && v.q_wait == 0 {
+		for compiled && t.stop[pc / 8] && v.q_wait | v.p_wait == 0 {
 			prog := micro_lookup(t, v.micro, gen^, pc)
 			if prog == nil || prog == last {break}
 			last = prog
@@ -783,7 +795,7 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 
 // Interpret from pc for at least one pair, until the program ends or
 // control reaches a pair marked in `stop` (compiled code may run there)
-// with no branch, end or Q pending. Inlined into micro_exec.
+// with no branch, end, Q or P pending. Inlined into micro_exec.
 // No bounds checks: callers pass a masked pc, every later pc is masked, and
 // pairs holds one entry per pair of v.micro; stop is checked against len.
 @(private)
@@ -804,8 +816,9 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		taken: bool
 		dst: u32
 		when VU_STALL_COUNT {vu_stall_count(v, uw, lw)}
+		vu_before(v, uw, lw)
 		pre := [3]u32{v.mac, v.status, v.clip}
-		vu_q_before(v, uw, lw)
+		vu_q_due(v)
 		if info.serial {
 			vu_op(v, uw)
 			taken, dst = vu_lower(v, lw, pc)
@@ -813,7 +826,7 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 			taken, dst = vu_pair(v, uw, lw, pc)
 		}
 		vu_flags_shift(v, pre)
-		vu_q_tick(v)
+		vu_tick(v)
 		if jumping { // that was the delay slot
 			next = target & mask
 			jumping = false
@@ -825,7 +838,7 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		if ending {return next, true}
 		if uw & (1 << 30) != 0 {ending = true}
 		pc = next
-		if !jumping && !ending && v.q_wait == 0 && int(pc / 8) < len(stop) && stop[pc / 8] {break}
+		if !jumping && !ending && v.q_wait | v.p_wait == 0 && int(pc / 8) < len(stop) && stop[pc / 8] {break}
 	}
 	return pc, false
 }
@@ -844,39 +857,109 @@ vu_flags_seed :: proc "contextless" (v: ^Vu) {
 // so with no stall the pair VU_Q_DIV (VU_Q_RSQRT) after the DIV is the
 // first to read the new Q and the ones before read the old. The FDIV unit
 // keeps one op: a WAITQ, or a DIV, SQRT or RSQRT while one is pending,
-// waits for it, and that pair's upper op reads the new Q. The wait itself is
-// not modelled: Q lands at once and later pairs keep their timing, which
-// hardware would shift by the stall. Status I and D are set at issue, not
-// when Q lands (unverified: microVU sets them close to the landing). The
-// end of a microprogram (E bit) drains the unit, as microVU does, and macro
-// mode reads the newest Q. Every backend runs vu_q_before before a pair and
-// vu_q_tick after it, compiled code only where a DIV can be pending.
+// stalls until it lands (q_wait cycles, as microVU's mVUanalyzeFDIV and
+// WAITQ stall regs.q), and that pair's upper op reads the new Q. Status I
+// and D of the op are set by the first pair to start after its wait drops
+// to VU_Q_FLAGS, after that pair's stall, as microVU's mVUincCycles sets
+// doDivFlag once q is 4 or less (counting the pair's own cycle and its
+// stall) and mVUdivSet then writes them into that pair's status: the third
+// pair after a DIV or SQRT, the ninth after an RSQRT, so with no stall FSAND
+// reads the non-sticky bit at +7 (+13) and the sticky one at +3 (+9). The end of a microprogram (E bit) drains the unit, as microVU's
+// mVUendProgram does, and macro mode reads the newest Q and status. Every
+// backend runs vu_before before a pair and vu_tick after it, compiled code
+// only where a DIV or an EFU op can be pending.
 VU_Q_DIV :: 7
 VU_Q_RSQRT :: 13
+VU_Q_FLAGS :: 4
 
-// Whether pair (uw, lw) waits for a pending Q: its lower op (no I bit) is
-// WAITQ, DIV, SQRT or RSQRT.
-vu_q_waits :: #force_inline proc "contextless" (uw, lw: u32) -> bool {
-	op := ((lw >> 4) & 0x7c) | (lw & 3)
-	return uw & (1 << 31) == 0 && lw >> 25 == 0x40 && lw & 0x3c == 0x3c && op >= 0x38 && op <= 0x3b
+// P latency per EFU op key - 0x70 (PCSX2 microVU_Lower.inl, the
+// mVUanalyzeEFU1/EFU2 counts; 0 for 0x77 and WAITP, which issue nothing):
+// with no stall the pair that many after the op is the first whose MFP
+// reads the new P. The EFU keeps one op: a WAITP, or an EFU op while one
+// is pending, stalls until one cycle is left (microVU's analyzePreg:
+// p - 1), so the pair after a WAITP reads the new P, and a new EFU op lands
+// the old result and issues. VU0 has no EFU, so P never waits there.
+VU_EFU_LATENCY :: [15]u32 {
+	11, // ESADD
+	18, // ERSADD
+	18, // ELENG
+	24, // ERLENG
+	54, // EATANxy
+	54, // EATANxz
+	12, // ESUM
+	0,
+	12, // ESQRT
+	18, // ERSQRT
+	12, // ERCPR
+	0, // WAITP
+	29, // ESIN
+	54, // EATAN
+	44, // EEXP
 }
 
+// Before pair (uw, lw) runs: its stall, if its lower op (no I bit) waits
+// for the FDIV unit (WAITQ, DIV, SQRT, RSQRT) or the EFU (WAITP, an EFU
+// op), and an EFU op's landing of the pending P.
 @(private)
-vu_q_before :: #force_inline proc "contextless" (v: ^Vu, uw, lw: u32) {
-	if v.q_wait != 0 && vu_q_waits(uw, lw) {vu_q_drain(v)}
-}
-
-@(private)
-vu_q_tick :: #force_inline proc "contextless" (v: ^Vu) {
-	if v.q_wait != 0 {
-		v.q_wait -= 1
-		if v.q_wait == 0 {v.q = v.q_next}
+vu_before :: #force_inline proc "contextless" (v: ^Vu, uw, lw: u32) {
+	if v.q_wait | v.p_wait == 0 || uw & (1 << 31) != 0 || lw >> 25 != 0x40 || lw & 0x3c != 0x3c {return}
+	switch ((lw >> 4) & 0x7c) | (lw & 3) {
+	case 0x38 ..= 0x3b: if v.q_wait != 0 {vu_wait(v, v.q_wait)}
+	case 0x7b: if v.p_wait > 1 {vu_wait(v, v.p_wait - 1)}
+	case 0x70 ..= 0x76, 0x78 ..= 0x7a, 0x7c ..= 0x7e:
+		if v.p_wait > 1 {vu_wait(v, v.p_wait - 1)}
+		if v.p_wait != 0 {v.p, v.p_wait = v.p_next, 0}
 	}
 }
 
+// s stall cycles: each shifts the flags as an empty pair would and moves
+// the pending Q and P on.
+vu_wait :: proc "contextless" (v: ^Vu, s: u32) {
+	for _ in 0 ..< s {
+		vu_flags_shift(v, {v.mac, v.status, v.clip})
+		vu_tick(v)
+	}
+}
+
+// One cycle of the FDIV unit and the EFU, after a pair or a stall cycle.
 @(private)
-vu_q_drain :: #force_inline proc "contextless" (v: ^Vu) {
-	if v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}
+vu_tick :: #force_inline proc "contextless" (v: ^Vu) {
+	if v.q_wait != 0 {
+		v.q_wait -= 1
+		if v.q_wait == VU_Q_FLAGS {
+			v.q_due = 1
+		} else if v.q_wait == 0 {
+			v.q = v.q_next
+		}
+	}
+	if v.p_wait != 0 {
+		v.p_wait -= 1
+		if v.p_wait == 0 {v.p = v.p_next}
+	}
+}
+
+// Land the pending Q and P, setting I and D if not yet set: at the E-bit
+// end, and before macro or EE code reads the registers.
+vu_drain :: #force_inline proc "contextless" (v: ^Vu) {
+	if v.q_due != 0 || v.q_wait > VU_Q_FLAGS {vu_q_flags(v)}
+	if v.q_wait != 0 {v.q = v.q_next}
+	v.q_wait, v.q_due = 0, 0
+	if v.p_wait != 0 {v.p, v.p_wait = v.p_next, 0}
+}
+
+// I and D due from the FDIV unit, set at the start of a pair, after its
+// stall and once the flags it starts with are taken.
+vu_q_due :: #force_inline proc "contextless" (v: ^Vu) {
+	if v.q_due != 0 {
+		vu_q_flags(v)
+		v.q_due = 0
+	}
+}
+
+// Status I and D, each also sticky (bits 10 and 11), from q_flags.
+@(private)
+vu_q_flags :: #force_inline proc "contextless" (v: ^Vu) {
+	v.status = (v.status &~ 0x30) | v.q_flags | v.q_flags << 6
 }
 
 // After a pair, which started with flags pre (MAC, status, clip): each
@@ -963,12 +1046,13 @@ vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, entry
 	unit := v == &vu1 ? 1 : 0
 	vf_bad := false
 	for k in 0 ..< 32 {vf_bad ||= v1.vf[k].q != v2.vf[k].q}
-	status_bad := unit == 0 && v1.status != v2.status
+	status_bad := unit == 0 && (v1.status != v2.status || v1.q_flags != v2.q_flags)
 	mem_bad := !slice.equal(mem, mem1)
 	prog := -1
 	for p, k in programs {if p == entry {prog = k}}
 	bad := kick1 != kick2 || mem_bad || vf_bad || v1.vi != v2.vi ||
-		v1.acc.q != v2.acc.q || v1.q != v2.q || v1.q_next != v2.q_next || v1.q_wait != v2.q_wait || v1.p != v2.p || v1.i != v2.i ||
+		v1.acc.q != v2.acc.q || v1.q != v2.q || v1.q_next != v2.q_next || v1.q_wait != v2.q_wait || v1.q_due != v2.q_due || v1.p != v2.p ||
+		v1.p_next != v2.p_next || v1.p_wait != v2.p_wait || v1.i != v2.i ||
 		v1.r != v2.r || v1.clip != v2.clip || v1.mac != v2.mac || status_bad || v1.tpc != v2.tpc
 	if bad && reported < 20 {
 		reported += 1
@@ -996,15 +1080,19 @@ vu0_lower :: proc(lw, pc: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_lower[lw >> 25 == 0x40 ? 128 + cpu.cop2_key(lw) : lw >> 25] += 1}
 	vu_lower(&vu0, lw, pc)
 }
-// A whole pair, so these shift the flags and tick Q too, as vu_interp does.
+// A whole pair, so these stall, shift the flags and tick Q and P too, as
+// vu_interp does.
 vu0_pair :: proc(uw, lw, pc: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_pair += 1}
+	vu_before(&vu0, uw, lw)
 	pre := [3]u32{vu0.mac, vu0.status, vu0.clip}
-	vu_q_before(&vu0, uw, lw)
+	vu_q_due(&vu0)
 	vu_pair(&vu0, uw, lw, pc)
 	vu_flags_shift(&vu0, pre)
-	vu_q_tick(&vu0)
+	vu_tick(&vu0)
 }
+// s stall cycles before a pair, for compiled code: as vu_before stalls.
+vu0_wait :: proc(s: u32) {vu_wait(&vu0, s)}
 vu1_upper :: proc(uw: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu1_upper[cpu.cop2_key(uw)] += 1}
 	vu_op(&vu1, uw)
@@ -1015,12 +1103,15 @@ vu1_lower :: proc(lw, pc: u32) {
 }
 vu1_pair :: proc(uw, lw, pc: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu1_pair += 1}
+	vu_before(&vu1, uw, lw)
 	pre := [3]u32{vu1.mac, vu1.status, vu1.clip}
-	vu_q_before(&vu1, uw, lw)
+	vu_q_due(&vu1)
 	vu_pair(&vu1, uw, lw, pc)
 	vu_flags_shift(&vu1, pre)
-	vu_q_tick(&vu1)
+	vu_tick(&vu1)
 }
+// s stall cycles before a pair, for compiled code: as vu_before stalls.
+vu1_wait :: proc(s: u32) {vu_wait(&vu1, s)}
 
 // What decoding a pair tells the interpreter, cached per micro address and
 // tagged with the words so uploads need no invalidation.
@@ -1245,7 +1336,7 @@ vu0_call_micro :: proc(addr: u32) {
 @(private)
 vu0_exec :: proc(addr: u32, compiled: bool) {
 	pc, ended := micro_exec(&vu0, &vu0_table, &vu0_micro_gen, vu0_pairs[:], addr, compiled)
-	vu_q_drain(&vu0)
+	vu_drain(&vu0)
 	if !ended && !vu0_overrun {
 		vu0_overrun = true
 		fmt.eprintfln("vu0: microprogram at %04x ran %d steps without ending", addr, VU_STEP_LIMIT)

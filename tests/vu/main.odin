@@ -191,9 +191,10 @@ div_efu :: proc() {
 		v := c.name == "ESUM" ? &vu.vu1 : &vu.vu0 // the EFU is VU1's
 		v.vf[1].u, v.vf[2].u, v.q, v.p = c.s, c.t, 1, 1
 		if c.name == "ESUM" {vu.vu_op(v, c.w | 2 << 16 | 1 << 11)} else {vu.vu0_macro(c.w | 2 << 16 | 1 << 11)}
-		got := transmute(u32)(c.name == "ESUM" ? v.p : v.q)
+		got := transmute(u32)(c.name == "ESUM" ? v.p_next : v.q) // P waits for the EFU's latency
 		if got != c.want {fail("%s %08x %08x: %08x, want %08x", c.name, c.s.x, c.t.x, got, c.want)}
 	}
+	vu.vu_drain(&vu.vu1) // land the ESUM, as an E bit would
 }
 
 // Flags of a macro op whose fd is vf0: MAC and status still update, vf0
@@ -363,6 +364,134 @@ q_latency :: proc() {
 	if v.q != 0.25 || v.q_wait != 0 {fail("macro VDIV: Q %v wait %d, want 0.25 0", v.q, v.q_wait)}
 }
 
+// Stalls and the FDIV and EFU timing (PCSX2 microVU: Analyze.inl
+// analyzeQreg/analyzePreg, Compile.inl mVUincCycles). A WAITQ, DIV, SQRT or
+// RSQRT waits for a pending Q, a WAITP or EFU op for P to be one cycle from
+// landing, and each stall cycle ages the late flags as a pair does. Status
+// I and D of a DIV or SQRT are set by the first pair to start, after its
+// stall, once 4 cycles are left: the third pair after issue (RSQRT the
+// ninth), so FSAND
+// reads sticky D at +3 (+9) and D itself, 4 pairs late, at +7 (+13); or at
+// the E-bit end. P lands each EFU op's latency after issue.
+@(private = "file")
+stalls :: proc() {
+	NOP_L :: 0x8000033c
+	NOP_U :: 0x000002ff
+	E :: 1 << 30
+	sp :: proc(key, dest, ft, fs: u32) -> u32 {return 0x40 << 25 | dest << 21 | ft << 16 | fs << 11 | (key & 0x7c) << 4 | 0x3c | key & 3}
+	add :: proc(d, s, t: u32) -> u32 {return 0xf << 21 | t << 16 | s << 11 | d << 6 | 0x28} // VADD.xyzw
+	fmand :: proc(t: u32) -> u32 {return 0x1a << 25 | t << 16 | 2 << 11} // FMAND vi<t>, vi2
+	fsand :: proc(t, imm: u32) -> u32 {return 0x16 << 25 | (imm & 0x800) << 10 | t << 16 | imm & 0x7ff}
+	mfp :: proc(t: u32) -> u32 {return sp(0x64, 0xf, t, 0)}
+	DIV_0 :: 0x40 << 25 | 0b0011 << 21 | 5 << 16 | 0x3bc // DIV Q, vf0w, vf5x: 1 / 0, D
+	RSQRT_0 :: 0x40 << 25 | 0b0011 << 21 | 5 << 16 | 0x3be // RSQRT Q, vf0w, vf5x: 1 / sqrt 0, D
+	DIV_2 :: 0x40 << 25 | 0b0011 << 21 | 6 << 16 | 0x3bc // DIV Q, vf0w, vf6x: 1 / 2
+	WAITQ :: 0x40 << 25 | 0x3bf
+	nops :: [2]u32{NOP_L, NOP_U}
+	end :: [2]u32{NOP_L, NOP_U | E}
+	// VU0 from addr with vf1 + vf2 negative (MAC 0xf0), vf5 0, vf6.x 2.
+	call := proc(addr: u32) {
+		v := &vu.vu0
+		v.vf[1].f, v.vf[2].f = {-1, -2, -3, -4}, {}
+		for r in 3 ..< 32 {v.vf[r] = {}}
+		v.vf[6].f = {2, 2, 2, 2}
+		v.vi = {}
+		v.vi[2] = 0xffff
+		v.mac, v.status, v.clip = 0, 0, 0
+		v.old_mac, v.old_status, v.old_clip = {}, {}, {}
+		v.q, v.q_wait = 3, 0
+		vu.vu_op(v, 0x4a000038 | (addr / 8) << 6) // VCALLMS
+	}
+	v := &vu.vu0
+
+	// DIV, an ADD that changes MAC, a WAITQ for the 5 cycles left, then
+	// FMAND: the stall ages MAC past the 4-pair delay, so it sees the ADD's.
+	put_pairs(0x900, {DIV_2, NOP_U}, {NOP_L, add(3, 1, 2)}, {WAITQ, NOP_U}, {fmand(4), NOP_U}, end, nops)
+	call(0x900)
+	if v.vi[4] != 0xf0 || v.q != 0.5 {fail("WAITQ stall: FMAND %x Q %v, want f0 0.5", v.vi[4], v.q)}
+	// Without the WAITQ it is two pairs after the ADD, and does not.
+	put_pairs(0x900, {DIV_2, NOP_U}, {NOP_L, add(3, 1, 2)}, nops, {fmand(4), NOP_U}, end, nops)
+	call(0x900)
+	if v.vi[4] != 0 {fail("no stall: FMAND %x, want 0", v.vi[4])}
+
+	// DIV by 0: sticky D (read at once) from DIV +3, D itself (read 4
+	// pairs late) from DIV +7.
+	put_pairs(0xa00, {DIV_0, NOP_U}, {fsand(3, 0x800), NOP_U}, {fsand(4, 0x800), NOP_U}, {fsand(5, 0x800), NOP_U}, nops, nops,
+		{fsand(6, 0x20), NOP_U}, {fsand(7, 0x20), NOP_U}, end, nops)
+	call(0xa00)
+	got := [5]u16{v.vi[3], v.vi[4], v.vi[5], v.vi[6], v.vi[7]}
+	if got != ([5]u16{0, 0, 0x800, 0, 0x20}) {fail("DIV D timing: +1 +2 +3 DS, +6 +7 D = %x, want 0 0 800 0 20", got)}
+	// RSQRT: sticky from +9, D from +13.
+	put_pairs(0xa00, {RSQRT_0, NOP_U}, nops, nops, nops, nops, nops, nops, nops, {fsand(3, 0x800), NOP_U}, {fsand(4, 0x800), NOP_U},
+		nops, nops, {fsand(5, 0x20), NOP_U}, {fsand(6, 0x20), NOP_U}, end, nops)
+	call(0xa00)
+	got4 := [4]u16{v.vi[3], v.vi[4], v.vi[5], v.vi[6]}
+	if got4 != ([4]u16{0, 0x800, 0, 0x20}) {fail("RSQRT D timing: +8 +9 DS, +12 +13 D = %x, want 0 800 0 20", got4)}
+	// Q's wait reaches 4 inside a WAITQ's stall: the WAITQ pair sets D once
+	// the flags it starts with are taken, so D reads from +5, sticky D at +2.
+	put_pairs(0xa00, {DIV_0, NOP_U}, {WAITQ, NOP_U}, {fsand(3, 0x800), NOP_U}, nops, {fsand(4, 0x20), NOP_U}, {fsand(5, 0x20), NOP_U}, end, nops)
+	call(0xa00)
+	got3 := [3]u16{v.vi[3], v.vi[4], v.vi[5]}
+	if got3 != ([3]u16{0x800, 0, 0x20}) {fail("WAITQ stall D timing: +2 DS, +4 +5 D = %x, want 800 0 20", got3)}
+	// The E bit's end sets them.
+	put_pairs(0xa00, {DIV_0, NOP_U | E}, nops)
+	call(0xa00)
+	if v.status & 0x830 != 0x820 || v.q_wait != 0 {fail("DIV D at the end: status %x wait %d, want 820 0", v.status, v.q_wait)}
+	// Back-to-back: the second DIV's stall sets the first's D, its own
+	// clears it, leaving only the sticky bit.
+	put_pairs(0xa00, {DIV_0, NOP_U}, {DIV_2, NOP_U}, {fsand(3, 0x800), NOP_U}, nops, end, nops)
+	call(0xa00)
+	if v.vi[3] != 0x800 || v.status & 0x830 != 0x800 || v.q != 0.5 {fail("back-to-back DIV: DS %x status %x Q %v, want 800 800 0.5", v.vi[3], v.status & 0x830, v.q)}
+
+	// A loop of three runs: each DIV after the first stalls 3 cycles to
+	// land the one before, 1 / 2, 1 / 4 and 1 / 8 as the ADD in its pair
+	// doubles vf6; ADDq sums Q three times a run: 3 3 3, 1/2 x3, 1/4 x3.
+	ADDQ :: 0xf << 21 | 3 << 11 | 3 << 6 | 0x20 // ADDq.xyzw vf3, vf3, Q
+	put_pairs(0xb00, {0x08 << 25 | 1 << 16 | 3, NOP_U}, {DIV_2, add(6, 6, 6)}, {0x40 << 25 | 1 << 16 | 1 << 11 | 0x1f << 6 | 0x32, ADDQ},
+		{0x29 << 25 | 1 << 16 | 0x7fd, ADDQ}, {NOP_L, ADDQ}, {NOP_L, 0xf << 21 | 5 << 6 | 0x1c | E}, nops)
+	call(0xb00)
+	if v.vf[3].f.x != 11.25 || v.vf[5].f.w != 0.25 || v.q != 0.125 || v.vi[1] != 0 {fail("Q loop: sum %v MULq %v Q %v vi1 %d, want 11.25 0.25 0.125 0", v.vf[3].f.x, v.vf[5].f.w, v.q, v.vi[1])}
+
+	// VU1's EFU: each op, then MFP at issue + latency - 1 (the old P) and
+	// + latency (the new).
+	u := &vu.vu1
+	call1 := proc(code: []u32) {
+		u := &vu.vu1
+		u.vf[1].f = {2, 3, 4, 5}
+		u.vf[8].f, u.vf[9].f = {-1, -2, -3, -4}, {}
+		for r in 3 ..< 8 {u.vf[r] = {}}
+		u.vi = {}
+		u.vi[2] = 0xffff
+		u.mac, u.old_mac = 0, {}
+		u.p, u.p_wait = 1, 0
+		mpg(&vu.vifs[1], code)
+		vu.vu1_start(0)
+	}
+	LATENCY := [?][2]u32{{0x70, 11}, {0x71, 18}, {0x72, 18}, {0x73, 24}, {0x74, 54}, {0x75, 54}, {0x76, 12}, {0x78, 12}, {0x79, 18}, {0x7a, 12}, {0x7c, 29}, {0x7d, 54}, {0x7e, 44}}
+	for l in LATENCY {
+		code := make([dynamic]u32, context.temp_allocator)
+		append(&code, sp(l[0], 0b1110, 0, 1), NOP_U)
+		for _ in 0 ..< l[1] - 2 {append(&code, NOP_L, NOP_U)}
+		append(&code, mfp(3), NOP_U, mfp(4), NOP_U, NOP_L, NOP_U | E, NOP_L, NOP_U)
+		call1(code[:])
+		if u.vf[3].f.x != 1 || u.vf[4].f.x != u.p || u.p == 1 || u.p_wait != 0 {
+			fail("EFU %x latency %d: P at -1 %v, at it %v, end %v", l[0], l[1], u.vf[3].f.x, u.vf[4].f.x, u.p)
+		}
+	}
+	ESQRT :: 0x40 << 25 | 1 << 11 | 0x7bc // ESQRT P, vf1x: sqrt 2
+	ERCPR :: 0x40 << 25 | 1 << 11 | 0x7be // ERCPR P, vf1x: 1 / 2
+	// WAITP after an ADD that changes MAC: 9 stall cycles (12 less the 2
+	// pairs run, less 1), so FMAND after it sees the ADD's, and P has landed.
+	code := [?]u32{ESQRT, NOP_U, NOP_L, add(7, 8, 9), sp(0x7b, 0, 0, 0), NOP_U, fmand(4), NOP_U, mfp(5), NOP_U, NOP_L, NOP_U | E, NOP_L, NOP_U}
+	call1(code[:])
+	if u.vi[4] != 0xf0 || u.vf[5].f.x != f32(1.4142135) {fail("WAITP stall: FMAND %x P %v, want f0 1.4142135", u.vi[4], u.vf[5].f.x)}
+	// An EFU op lands the one before it; one pending at the E bit lands at
+	// the end.
+	code2 := [?]u32{ESQRT, NOP_U, ERCPR, NOP_U, mfp(6), NOP_U, NOP_L, NOP_U | E, NOP_L, NOP_U}
+	call1(code2[:])
+	if u.vf[6].f.x != f32(1.4142135) || u.p != 0.5 || u.p_wait != 0 {fail("EFU after EFU: MFP %v P %v wait %d, want 1.4142135 0.5 0", u.vf[6].f.x, u.p, u.p_wait)}
+}
+
 @(private = "file")
 flag_delay :: proc() {
 	NOP_L :: 0x8000033c
@@ -468,6 +597,7 @@ main :: proc() {
 	micro_writes()
 	flag_delay()
 	q_latency()
+	stalls()
 	ibit()
 	fmt.println("vu: ok")
 }

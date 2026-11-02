@@ -148,10 +148,16 @@ PROGRAMS := [?][]u32 {
 // VU0 only. DIV vf1.x / vf0.x (I or D) with ADD; SQRT vf1.y with MULq,
 // then RSQRT vf2.z / vf0.y (I or D) with MAX, which leaves status;
 // DIV vf3.z / vf0.y with an E-bit MULq, after the ADD that writes vf3.
+// Then DIV vf1.x / vf0.x (D, or I) with Q's wait reaching four inside the
+// stall of the op after it, a DIV and a WAITQ, which then take its I and D
+// before a DIV vf0.w / vf1.x (neither, but for vf1.x 0) replaces them: the
+// end status keeps only the sticky bit, which a late merge would miss.
 PROGRAMS_VU0 := [?][]u32 {
 	{lower_sp(DIV, 0, 0, 1), upper(ADD, 3, 1, 2), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
 	{lower_sp(SQRT, 0b0100, 1, 0), upper(MULq, 3, 1, 0), lower_sp(RSQRT, 0b0110, 0, 2), upper(MAX, 4, 1, 2), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
 	{NOP_L, upper(ADD, 3, 1, 2), lower_sp(DIV, 0b0110, 0, 3), upper(MULq, 3, 3, 0) | E_BIT, NOP_L, upper(ADD, 3, 3, 1)},
+	{lower_sp(DIV, 0, 0, 1), NOP_U, lower_sp(DIV, 0b0011, 1, 0), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
+	{lower_sp(DIV, 0, 0, 1), NOP_U, lower_sp(WAITQ, 0, 0, 0), NOP_U, lower_sp(DIV, 0b0011, 1, 0), NOP_U | E_BIT, NOP_L, NOP_U},
 }
 // Clamp elision. Clamped results (ADD, MUL, ITOF, and MAX of two) feed
 // later operands; MOVE.xy and FTOI make lanes unclamped again. vi1
@@ -291,6 +297,44 @@ Q_LOOP := []u32 {
 Q_LAT_PCS := []u32{0, 0x08, 0x38, 0xb8}
 Q_BRANCH_PCS := []u32{0, 0x10, 0x20}
 
+// Stalls: WAITQ, and a Q op issued while Q is pending, stall until Q lands,
+// and the late flags age through the stall. ADD's MAC, written at DIV +1,
+// is four pairs back once WAITQ has stalled to DIV +7, so FMAND sees it.
+// The end status holds D and I, set by the pair after Q's wait drops to
+// four, here inside the WAITQ's stall (no FSAND: a status read is left to
+// the interpreter). The last DIV is left
+// pending at the E bit.
+WAITP :: 0x7b
+Q_STALL := []u32 {
+	VI15, NOP_U,
+	Q_DIV, NOP_U,
+	NOP_L, upper(ADD, 3, 1, 2),
+	lower_sp(WAITQ, 0, 0, 0), NOP_U,
+	fmand(4), mulq(5), // 0x20
+	NOP_L, NOP_U,
+	Q_RSQRT, NOP_U,
+	Q_DIV, NOP_U, // stalls on the RSQRT
+	NOP_L, mulq(6), // 0x40
+	NOP_L, NOP_U,
+	NOP_L, NOP_U,
+	NOP_L, mulq(7) | E_BIT,
+	NOP_L, NOP_U,
+}
+// WAITP, an EFU op issued while P is pending, and MFP after each.
+P_STALL := []u32 {
+	lower_sp(ESQRT, 0, 0, 1), NOP_U,
+	NOP_L, upper(ADD, 3, 1, 2),
+	lower_sp(WAITP, 0, 0, 0), NOP_U,
+	lower_sp(MFP, 0b1111, 4, 0), NOP_U,
+	lower_sp(ERCPR, 0, 0, 2), NOP_U, // 0x20
+	lower_sp(ESQRT, 0, 0, 3), NOP_U, // stalls on the ERCPR
+	lower_sp(MFP, 0b1111, 5, 0), NOP_U,
+	lower_sp(ERCPR, 0, 0, 4), NOP_U | E_BIT, // pending at the E bit
+	NOP_L, NOP_U,
+}
+Q_STALL_PCS := []u32{0, 0x18, 0x38}
+P_STALL_PCS := []u32{0, 0x10, 0x28}
+
 // Every program, on each unit it runs on.
 programs :: proc() -> (progs: [dynamic]Prog) {
 	for w in PROGRAMS {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
@@ -299,7 +343,7 @@ programs :: proc() -> (progs: [dynamic]Prog) {
 	// entered at each pc.
 	late := [?]struct {
 		words, pcs: []u32,
-	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}, {Q_LAT, Q_LAT_PCS}, {Q_BRANCH, Q_BRANCH_PCS}, {Q_LOOP, AT_0}}
+	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}, {Q_LAT, Q_LAT_PCS}, {Q_BRANCH, Q_BRANCH_PCS}, {Q_LOOP, AT_0}, {Q_STALL, Q_STALL_PCS}, {P_STALL, P_STALL_PCS}}
 	for l in late {
 		for u in vu.Unit {append(&progs, Prog{l.words, u, nil, l.pcs, nil}, Prog{l.words, u, l.pcs, l.pcs, nil})}
 	}

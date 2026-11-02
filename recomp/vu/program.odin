@@ -47,7 +47,8 @@ Pair :: struct {
 	reads:      [Flag]u8, // the depths of each flag the pair reads (Depths)
 	kills:      bit_set[Flag], // the flags the pair sets whole
 	out:        [Flag]u8, // the depths of each flag after the pair that can be seen
-	q:          u16, // the Q waits the pair can start with, when not run as a delay slot (demand_q)
+	waits:      Waits, // the Q and P waits the pair can start with, when not run as a delay slot (demand_waits)
+	stall:      bool, // the pair can stall before it runs (stall_waits)
 }
 
 // The flags a micro-mode read sees late.
@@ -191,8 +192,8 @@ classify :: proc(lw, uw: u32) -> Pair {
 		}
 		switch ((lw >> 4) & 0x7c) | (lw & 3) {
 		case 0x3b, 0x3e, 0x3f, 0x68, 0x69, 0x6c, 0x7b: p.mode = .Serial
-		// DIV, SQRT and RSQRT also share status: dead on VU1, merged as
-		// vu_pair does by emit_pair on VU0
+		// DIV, SQRT and RSQRT hold their status bits in q_flags until
+		// the pair that sets them (emit_wait_pair)
 		case: p.mode = touches ? .Hazard : .Serial
 		}
 	}
@@ -206,7 +207,8 @@ classify :: proc(lw, uw: u32) -> Pair {
 // Backward dataflow: the depths of each flag after pair n (out) that a
 // later read or an exit can see. A pair's shift moves depth k to depth k+1
 // (the newest into old[0]); the newest passes through unless the pair sets
-// that flag whole. Leaving for the interpreter needs every depth, which it
+// that flag whole, and a stall before the pair shifts it more (stall).
+// Leaving for the interpreter needs every depth, which it
 // shifts and reads itself; an E bit only the newest, which the EE can read
 // and the next program starts from. Status counts only on VU0: VU1 code
 // never computes it.
@@ -240,6 +242,15 @@ demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
 			if !leave_pair(pairs, i) {
 				for f in Flag {
 					inn[f] = p.reads[f] | out[f] >> 1 | (f in p.kills ? 0 : out[f] & DEPTH_NOW)
+					// A stall's cycles each shift as the pair does, with
+					// no flag set: up to three of them reach every depth.
+					if p.stall {
+						d := inn[f]
+						for _ in 0 ..< 3 {
+							d = d >> 1 | d & DEPTH_NOW
+							inn[f] |= d
+						}
+					}
 				}
 			}
 			if unit == .VU1 {inn[.Status] = 0}
@@ -249,78 +260,182 @@ demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
 	}
 }
 
-// As the runtime's VU_Q_DIV and VU_Q_RSQRT.
+// As the runtime's VU_Q_DIV, VU_Q_RSQRT, VU_Q_FLAGS and VU_EFU_LATENCY.
 @(private)
-Q_DIV, Q_RSQRT :: 7, 13
+Q_DIV, Q_RSQRT, Q_FLAGS :: 7, 13, 4
+@(private)
+@(rodata)
+EFU_LATENCY := [15]u32{11, 18, 18, 24, 54, 54, 12, 0, 12, 18, 12, 0, 29, 54, 44}
+
+// The Q and P waits a pair can start or leave with, as sets: bit k for k
+// pairs left until the value lands, bit 0 for none pending.
+@(private)
+Waits :: struct {
+	q, p: u64,
+}
+
+// No wait pending.
+@(private)
+WAITS_NONE :: Waits{1, 1}
+
+// The lower op key of p when it is a special op under no I bit, else 0.
+@(private = "file")
+special_key :: proc(p: Pair) -> u32 {
+	if p.ibit || p.lw >> 25 != 0x40 || p.lw & 0x3c != 0x3c {return 0}
+	return ((p.lw >> 4) & 0x7c) | (p.lw & 3)
+}
 
 // Whether pair p's lower waits for a pending Q (WAITQ, DIV, SQRT, RSQRT),
-// as vu_q_waits.
+// as the runtime's vu_before.
 @(private)
 q_waits :: proc(p: Pair) -> bool {
-	key := ((p.lw >> 4) & 0x7c) | (p.lw & 3)
-	return !p.ibit && p.lw >> 25 == 0x40 && p.lw & 0x3c == 0x3c && key >= 0x38 && key <= 0x3b
+	key := special_key(p)
+	return key >= 0x38 && key <= 0x3b
+}
+
+// Whether pair p's lower waits for a pending P (WAITP, an EFU op), as the
+// runtime's vu_before.
+@(private)
+p_waits :: proc(p: Pair) -> bool {
+	key := special_key(p)
+	return key >= 0x70 && key <= 0x7e && key != 0x77
 }
 
 // The pairs until Q lands that pair p's lower starts: Q_DIV, Q_RSQRT, or
 // 0 for none.
 @(private)
 q_issue :: proc(p: Pair) -> u32 {
-	if !q_waits(p) {return 0}
-	switch ((p.lw >> 4) & 0x7c) | (p.lw & 3) {
+	switch special_key(p) {
 	case 0x38, 0x39: return Q_DIV
 	case 0x3a: return Q_RSQRT
 	}
 	return 0
 }
 
-// The Q waits after pair p for those it starts with, s, as bits: bit k for
-// k pairs left, bit 0 for none pending. As the runtime's vu_q_before, the
-// pair's op, then vu_q_tick.
+// The pairs until P lands that pair p's EFU op starts, or 0 for none.
 @(private)
-q_after :: proc(p: Pair, s: u16) -> u16 {
-	if l := q_issue(p); l != 0 {return u16(1) << (l - 1)}
-	if q_waits(p) {return 1}
-	return s & 1 | s >> 1
+p_issue :: proc(p: Pair) -> u32 {
+	key := special_key(p)
+	if key < 0x70 || key > 0x7e {return 0}
+	return EFU_LATENCY[key - 0x70]
 }
 
-// Forward dataflow: the Q waits each pair can start with (q). Compiled
-// code is entered only with none pending (the runtime's vu_interp hands
-// over no sooner), so every pair can start with none. A pair also starts
-// with what the pair before it leaves when that falls through, and a
-// branch target with what the branch's delay slot leaves; the delay slot
-// runs inline from what the branch leaves. A JR or JALR can land on any
-// pair. A pair left for the interpreter runs nothing compiled.
+// Waits set s after n cycles: every wait less n, those at or below n none.
 @(private)
-demand_q :: proc(pairs: []Pair, ext: []bool, mask: u32) {
-	for &p in pairs {p.q = 1}
-	add :: proc(pairs: []Pair, ext: []bool, j: int, s: u16) -> bool {
-		if j >= len(pairs) || (ext != nil && !ext[j]) || pairs[j].q | s == pairs[j].q {return false}
-		pairs[j].q |= s
+waits_less :: proc(s: u64, n: u32) -> u64 {
+	if n >= 63 {return 1}
+	return s >> n | u64(s & (u64(2) << n - 1) != 0)
+}
+
+// The waits pair p runs its op with, from those it starts with, w, as the
+// runtime's vu_before: a stall for a pending Q or P moves both on, then an
+// EFU op lands a pending P. stalls holds bit s for each stall of s cycles
+// the pair can make, bit 0 for none.
+@(private)
+stall_waits :: proc(p: Pair, w: Waits) -> (after: Waits, stalls: u64) {
+	after = w
+	switch {
+	case q_waits(p):
+		// q_wait cycles, landing Q.
+		stalls = w.q
+		after.q = 1
+	case p_waits(p):
+		// p_wait - 1 cycles, leaving at most 1.
+		stalls = w.p >> 1 &~ 1 | u64(w.p & 3 != 0)
+		after.p = w.p & 1 | u64(w.p &~ 1 != 0) << 1
+		if p_issue(p) != 0 {after.p = 1} // lands the pending P
+	case:
+		return w, 1
+	}
+	if stalls == 1 {return}
+	other := &after.p if q_waits(p) else &after.q
+	moved: u64 = 0
+	for s := u32(0); s < 64; s += 1 {
+		if stalls & (u64(1) << s) != 0 {moved |= waits_less(other^, s)}
+	}
+	other^ = moved
+	return
+}
+
+// The waits pair p's op leaves before the tick, from those it runs with:
+// an issue starts its wait.
+@(private)
+issue_waits :: proc(p: Pair, w: Waits) -> Waits {
+	w := w
+	if l := q_issue(p); l != 0 {w.q = u64(1) << l}
+	if l := p_issue(p); l != 0 {w.p = u64(1) << l}
+	return w
+}
+
+// Whether pair p, starting with waits w, can find status I and D due from
+// the FDIV unit (vu.vu_q_due) once its stall is done: the last tick left
+// Q's wait at Q_FLAGS, or a stall can carry a longer wait down to it.
+@(private)
+q_due :: proc(p: Pair, w: Waits) -> bool {
+	_, stalls := stall_waits(p, w)
+	return w.q & (u64(1) << Q_FLAGS) != 0 || (stalls &~ 1 != 0 && w.q >> (Q_FLAGS + 1) != 0)
+}
+
+// The waits after pair p, from those it starts with, w: vu_before, the
+// op, then vu_tick.
+@(private)
+waits_after :: proc(p: Pair, w: Waits) -> Waits {
+	mid, _ := stall_waits(p, w)
+	mid = issue_waits(p, mid)
+	return {waits_less(mid.q, 1), waits_less(mid.p, 1)}
+}
+
+// Forward dataflow: the Q and P waits each pair can start with (waits),
+// and whether it can stall (stall). Compiled code is entered only with
+// none pending (the runtime's vu_interp hands over no sooner), so every
+// pair can start with none. A pair also starts with what the pair before
+// it leaves when that falls through, and a branch target with what the
+// branch's delay slot leaves; the delay slot runs inline from what the
+// branch leaves. A JR or JALR can land on any pair. A pair left for the
+// interpreter runs nothing compiled.
+@(private)
+demand_waits :: proc(pairs: []Pair, ext: []bool, mask: u32) {
+	for &p in pairs {p.waits = WAITS_NONE}
+	add :: proc(pairs: []Pair, ext: []bool, j: int, s: Waits) -> bool {
+		if j >= len(pairs) || (ext != nil && !ext[j]) {return false}
+		w := &pairs[j].waits
+		if w.q | s.q == w.q && w.p | s.p == w.p {return false}
+		w.q |= s.q
+		w.p |= s.p
 		return true
 	}
-	jr := u16(1)
+	jr := WAITS_NONE
 	for changed := true; changed; {
 		changed = false
 		for p, i in pairs {
 			if (ext != nil && !ext[i]) || leave_pair(pairs, i) {continue}
-			s := q_after(p, p.q)
+			s := waits_after(p, p.waits)
 			branch := !p.ibit && p.branch != .None
 			if !branch && !p.ebit {
 				changed = add(pairs, ext, i + 1, s) || changed
 				continue
 			}
 			if p.ebit {continue} // the program ends after the delay slot
-			s = q_after(pairs[i + 1], s) // leave_pair holds i + 1 in range
+			s = waits_after(pairs[i + 1], s) // leave_pair holds i + 1 in range
 			switch p.branch {
 			case .None:
 			case .Uncond: changed = add(pairs, ext, int(branch_target(p.lw, u32(i) * 8, mask) / 8), s) || changed
 			case .Cond:
 				changed = add(pairs, ext, int(branch_target(p.lw, u32(i) * 8, mask) / 8), s) || changed
 				changed = add(pairs, ext, int(((u32(i) * 8 + 16) & mask) / 8), s) || changed
-			case .Reg: jr |= s
+			case .Reg: jr.q |= s.q; jr.p |= s.p
 			}
 		}
 		for _, i in pairs {changed = add(pairs, ext, i, jr) || changed}
+	}
+	// A delay slot can also start with what its branch leaves.
+	for &p, i in pairs {
+		_, stalls := stall_waits(p, p.waits)
+		p.stall = stalls &~ 1 != 0
+		if i > 0 && !pairs[i - 1].ibit && pairs[i - 1].branch != .None {
+			_, stalls = stall_waits(p, waits_after(pairs[i - 1], pairs[i - 1].waits))
+			p.stall ||= stalls &~ 1 != 0
+		}
 	}
 }
 
@@ -522,7 +637,7 @@ analyze :: proc(words: []u32, ext: []bool, entries: []u32, unit: Unit) -> (pairs
 	mask := MASK[unit]
 	pairs = make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
+	demand_waits(pairs, ext, mask)
 	demand_flags(pairs, ext, mask, unit)
-	demand_q(pairs, ext, mask)
 	return pairs, dispatch_targets(pairs, mask, entries)
 }

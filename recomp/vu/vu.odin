@@ -387,7 +387,7 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string, q := "v.q_nex
 		end_block(sb)
 	}
 	efu :: proc(sb: ^strings.Builder, fs: u32, p: string) {
-		fmt.sbprintfln(sb, "\t\t\t{{s := clamp4(vf[%d].f); v.p = %s}", fs, p)
+		fmt.sbprintfln(sb, "\t\t\t{{s := clamp4(vf[%d].f); v.p_next = %s}", fs, p)
 	}
 	interp :: proc(sb: ^strings.Builder, lw, pc: u32) -> bool {
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_lower(0x%08x, 0x%04x)", lower_unit, lw, pc)
@@ -504,8 +504,8 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string, q := "v.q_nex
 				if on {fmt.sbprintf(sb, "vf[%d].f[%d] = p; ", ft, k)}
 			}
 			end_block(sb)
-		// The EFU, as the interpreter: P written at once, the operand
-		// clamped, the sums in the same order.
+		// The EFU, as the interpreter: the pending P, its wait set by
+		// emit_wait_pair, the operand clamped, the sums in the same order.
 		case 0x70: efu(sb, fs, "fclamp(s.x * s.x + s.y * s.y + s.z * s.z)") // ESADD
 		case 0x71: efu(sb, fs, "fdiv(1, s.x * s.x + s.y * s.y + s.z * s.z)") // ERSADD
 		case 0x72: efu(sb, fs, "math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z)") // ELENG
@@ -550,20 +550,19 @@ FLAG_NAME := [Flag]string {
 
 // Emit pair p at pc, without its branch. Counts the halves that call the
 // interpreter in slow, by opcode. known, when not nil, tracks the clamped
-// lanes past it.
+// lanes past it. due: status I and D can be due from the FDIV unit, set
+// once the flag shift has taken the status the pair starts with, as
+// vu.vu_q_due; vu_pair does it for a Slow pair.
 @(private = "file")
-emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known) {
+emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known, due: bool) {
 	// The keys outlive the temp allocator, which each program frees.
 	count :: proc(slow: ^map[string]int, key: string) {
 		if key not_in slow {slow[strings.clone(key)] = 0}
 		slow[key] += 1
 	}
-	// VU0 computes status. A DIV-family lower sets it too, and as vu_pair
-	// its write replaces the upper's when it changes status at all.
-	merge := unit == .VU0 && !p.ibit && p.mode != .Slow && p.lw >> 25 == 0x40 && p.lw & 0x3c == 0x3c
-	merge &&= ((p.lw >> 4) & 0x7c) | (p.lw & 3) >= 0x38 && ((p.lw >> 4) & 0x7c) | (p.lw & 3) <= 0x3a
-	upper :: proc(sb: ^strings.Builder, p: Pair, unit: Unit, merge: bool, slow: ^map[string]int, known: ^Known) {
-		defer if merge {fmt.sbprintln(sb, "\t\t\tust := v.status\n\t\t\tv.status = st0")}
+	// VU0 computes status; a DIV-family lower, on either unit, holds its
+	// bits in q_flags until the pair that sets them (emit_wait_pair).
+	upper :: proc(sb: ^strings.Builder, p: Pair, unit: Unit, slow: ^map[string]int, known: ^Known) {
 		flags := Flags.Mac_Status
 		if unit == .VU1 {flags = p.out[.Mac] & DEPTH_NOW != 0 ? .Mac : .None}
 		if !emit_upper(sb, p.uw, flags, known) {return}
@@ -576,18 +575,17 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			count(slow, fmt.tprintf("upper special %02x", ((p.uw >> 4) & 0x7c) | (p.uw & 3)))
 		}
 	}
-	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, merge: bool, slow: ^map[string]int, known: ^Known) {
+	lower :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known) {
 		if !emit_lower(sb, p.lw, pc, MEM[unit]) {
 			if lower_writes_vf(p.lw) {overwrite(known, (p.lw >> 16) & 31, (p.lw >> 21) & 15)}
-			if !merge {return}
+			if q_issue(p) == 0 {return}
 			// DIV and RSQRT fs.fsf / ft.ftf, SQRT ft.ftf, as emit_macro
 			ft, fs := (p.lw >> 16) & 31, (p.lw >> 11) & 31
 			if p.lw & 3 == 1 {
-				fmt.sbprintfln(sb, "\t\t\tdiv_flags(v, 1, vf[%d].f[%d] < 0 ? 0 : 1)", ft, (p.lw >> 23) & 3)
+				fmt.sbprintfln(sb, "\t\t\tv.q_flags = div_bits(1, vf[%d].f[%d] < 0 ? 0 : 1)", ft, (p.lw >> 23) & 3)
 			} else {
-				fmt.sbprintfln(sb, "\t\t\tdiv_flags(v, vf[%d].f[%d], vf[%d].f[%d])", fs, (p.lw >> 21) & 3, ft, (p.lw >> 23) & 3)
+				fmt.sbprintfln(sb, "\t\t\tv.q_flags = div_bits(vf[%d].f[%d], vf[%d].f[%d])", fs, (p.lw >> 21) & 3, ft, (p.lw >> 23) & 3)
 			}
-			fmt.sbprintln(sb, "\t\t\tif v.status == st0 {v.status = ust}")
 			return
 		}
 		if known != nil {forget(known)}
@@ -610,24 +608,28 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			if o & 2 != 0 {fmt.sbprintfln(sb, "\t\t\tv.old_%s[0] = v.%s", name, name)}
 		}
 	}
-	if p.mode != .Slow && p.mode != .Lower_First {shift(sb, p)}
+	set_due :: proc(sb: ^strings.Builder, due: bool) {
+		if due {fmt.sbprintln(sb, "\t\t\tif v.q_due != 0 {v.status = (v.status &~ 0x30) | v.q_flags | v.q_flags << 6; v.q_due = 0}")}
+	}
+	if p.mode != .Slow && p.mode != .Lower_First {
+		shift(sb, p)
+		set_due(sb, due)
+	}
 	if p.ibit { // the upper still reads the old I
-		upper(sb, p, unit, false, slow, known)
+		upper(sb, p, unit, slow, known)
 		fmt.sbprintfln(sb, "\t\t\tv.i = transmute(f32)u32(0x%08x)", p.lw)
 		return
 	}
-	if merge {fmt.sbprintln(sb, "\t\t\t{\n\t\t\tst0 := v.status")}
-	defer if merge {fmt.sbprintln(sb, "\t\t\t}")}
-	if known != nil && merge {known.nested = true}
 	defer if known != nil {known.nested = false}
 	switch p.mode {
 	case .Serial:
-		upper(sb, p, unit, merge, slow, known)
-		if p.branch == .None {lower(sb, p, pc, unit, merge, slow, known)}
+		upper(sb, p, unit, slow, known)
+		if p.branch == .None {lower(sb, p, pc, unit, slow, known)}
 	case .Lower_First:
-		lower(sb, p, pc, unit, merge, slow, known)
+		lower(sb, p, pc, unit, slow, known) // reads MAC or clip, writes only VI
 		shift(sb, p)
-		upper(sb, p, unit, merge, slow, known)
+		set_due(sb, due)
+		upper(sb, p, unit, slow, known)
 	case .Hazard:
 		// As vu_pair: the lower reads the upper's dest from before the
 		// upper, and its own write to it, if any, wins unless it leaves the
@@ -637,10 +639,10 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 		fmt.sbprintln(sb, "\t\t\t{")
 		if known != nil {known.nested = true}
 		fmt.sbprintfln(sb, "\t\t\tsaved := vf[%d]", ud)
-		upper(sb, p, unit, merge, slow, known)
+		upper(sb, p, unit, slow, known)
 		fmt.sbprintfln(sb, "\t\t\tresult := vf[%d]", ud)
 		fmt.sbprintfln(sb, "\t\t\tvf[%d] = saved", ud)
-		lower(sb, p, pc, unit, merge, slow, known)
+		lower(sb, p, pc, unit, slow, known)
 		if (p.lw >> 16) & 31 == ud { // every lower VF write goes to ft
 			fmt.sbprintfln(sb, "\t\t\tif vf[%d].q == saved.q {{vf[%d] = result}}", ud, ud)
 		} else {
@@ -678,32 +680,53 @@ emit_branch :: proc(sb: ^strings.Builder, lw, pc, mask: u32) {
 	}
 }
 
-// emit_pair, with Q's latency around it for the Q waits it starts with, s
-// (demand_q): before the pair a WAITQ or DIV-family lower lands a pending
-// Q; after it, a DIV-family op starts the wait or a pending one moves on,
-// as the runtime's vu_q_before and vu_q_tick. vu_pair runs both for a Slow
-// pair.
+// emit_pair, with the FDIV unit's and the EFU's latency around it for the
+// waits it starts with, w (demand_waits), as the runtime's vu_before and
+// vu_tick: before the pair a stall for a WAITQ, DIV-family op, WAITP or
+// EFU op (vu.vu_wait shifts the flags and moves Q and P on), and an EFU
+// op's landing of the pending P; after it, an issue starts its wait, a
+// pending one moves on, and a Q wait dropping to Q_FLAGS makes status I and
+// D due, for the next pair to set after its stall (emit_pair). vu_pair runs
+// all of it for a Slow pair.
 @(private = "file")
-emit_q_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known, s: u16) {
+emit_wait_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known, w: Waits) {
 	slow_pair := p.mode == .Slow && !p.ibit
-	if !slow_pair && q_waits(p) && s != 1 {
-		fmt.sbprintln(sb, s & 1 == 0 ? "\t\t\tv.q, v.q_wait = v.q_next, 0" : "\t\t\tif v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}")
-	}
-	emit_pair(sb, p, pc, unit, slow, known)
-	after := q_after(p, s)
-	switch {
-	case slow_pair:
-	case q_issue(p) != 0: fmt.sbprintfln(sb, "\t\t\tv.q_wait = %d", q_issue(p) - 1)
-	case q_waits(p), s == 1:
-	case s & 1 == 0 && s & (s - 1) == 0: // one wait, known
-		if after == 1 {
-			fmt.sbprintln(sb, "\t\t\tv.q, v.q_wait = v.q_next, 0")
-		} else {
-			fmt.sbprintfln(sb, "\t\t\tv.q_wait = %d", intrinsics.count_trailing_zeros(after))
+	mid, stalls := stall_waits(p, w)
+	if !slow_pair && stalls &~ 1 != 0 {
+		known_stall := stalls & (stalls - 1) == 0
+		s := intrinsics.count_trailing_zeros(stalls)
+		switch {
+		case known_stall: fmt.sbprintfln(sb, "\t\t\tvu.vu_wait(v, %d)", s)
+		case q_waits(p): fmt.sbprintln(sb, "\t\t\tif v.q_wait != 0 {vu.vu_wait(v, v.q_wait)}")
+		case: fmt.sbprintln(sb, "\t\t\tif v.p_wait > 1 {vu.vu_wait(v, v.p_wait - 1)}")
 		}
-	case:
-		fmt.sbprintln(sb, "\t\t\tif v.q_wait != 0 {v.q_wait -= 1; if v.q_wait == 0 {v.q = v.q_next}}")
 	}
+	if !slow_pair && p_issue(p) != 0 && w.p != 1 {
+		fmt.sbprintln(sb, "\t\t\tif v.p_wait != 0 {v.p, v.p_wait = v.p_next, 0}")
+	}
+	emit_pair(sb, p, pc, unit, slow, known, !slow_pair && q_due(p, w))
+	if slow_pair {return}
+	mid = issue_waits(p, mid)
+	tick :: proc(sb: ^strings.Builder, m: u64, wait, next, reg: string, flags: bool) {
+		if m == 1 {return} // none pending
+		if m & 1 == 0 && m & (m - 1) == 0 { // one wait, known
+			left := intrinsics.count_trailing_zeros(m) - 1
+			if left == 0 {
+				fmt.sbprintfln(sb, "\t\t\tv.%s, v.%s = v.%s, 0", reg, wait, next)
+				return
+			}
+			fmt.sbprintfln(sb, "\t\t\tv.%s = %d", wait, left)
+			if flags && left == Q_FLAGS {fmt.sbprintln(sb, "\t\t\tv.q_due = 1")}
+			return
+		}
+		fmt.sbprintf(sb, "\t\t\tif v.%s != 0 {{v.%s -= 1; if v.%s == 0 {{v.%s = v.%s}", wait, wait, wait, reg, next)
+		if flags && m & (u64(1) << (Q_FLAGS + 1)) != 0 {
+			fmt.sbprintf(sb, " else if v.%s == %d {{v.q_due = 1}", wait, Q_FLAGS)
+		}
+		fmt.sbprintln(sb, "}")
+	}
+	tick(sb, mid.q, "q_wait", "q_next", "q", true)
+	tick(sb, mid.p, "p_wait", "p_next", "p", false)
 }
 
 @(private = "file")
@@ -740,9 +763,9 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 		case leave_pair(pairs, i):
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", pc)
 		case branch:
-			emit_q_pair(sb, p, pc, unit, slow, k, p.q)
+			emit_wait_pair(sb, p, pc, unit, slow, k, p.waits)
 			emit_branch(sb, p.lw, pc, mask)
-			emit_q_pair(sb, next, pc + 8, unit, slow, k, q_after(p, p.q))
+			emit_wait_pair(sb, next, pc + 8, unit, slow, k, waits_after(p, p.waits))
 			fmt.sbprintln(sb, "\t\t\tif tk {")
 			fmt.sbprintln(sb, "\t\t\t\tbudget^ -= 1")
 			fmt.sbprintln(sb, "\t\t\t\tif budget^ <= 0 {return tg, .Leave}")
@@ -752,11 +775,11 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 			fmt.sbprintln(sb, "\t\t\t}")
 			fmt.sbprintln(sb, "\t\t\tcontinue")
 		case p.ebit:
-			emit_q_pair(sb, p, pc, unit, slow, k, p.q)
-			emit_q_pair(sb, next, pc + 8, unit, slow, k, q_after(p, p.q))
+			emit_wait_pair(sb, p, pc, unit, slow, k, p.waits)
+			emit_wait_pair(sb, next, pc + 8, unit, slow, k, waits_after(p, p.waits))
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .End", (pc + 16) & mask)
 		case:
-			emit_q_pair(sb, p, pc, unit, slow, k, p.q)
+			emit_wait_pair(sb, p, pc, unit, slow, k, p.waits)
 			if i + 1 < len(pairs) && in_ext(ext, i + 1) {
 				fell = true
 			} else {
@@ -956,10 +979,18 @@ put_status :: #force_inline proc "contextless" (v: ^vu.Vu) {
 }
 
 // Status I (bit 4, 0/0) and D (bit 5, x/0) for a DIV-family op of a / b, as
-// the interpreter's vu_div_flags, each also sticky (bits 10 and 11).
+// the interpreter's vu_div_bits.
+div_bits :: #force_inline proc "contextless" (a, b: f32) -> u32 {
+	if b != 0 {return 0}
+	return a == 0 ? 0x10 : 0x20
+}
+
+// Those bits in q_flags, as vu_op leaves them, and set at once in status,
+// each also sticky (bits 10 and 11), as a macro op: vu0_macro drains the
+// FDIV unit.
 div_flags :: #force_inline proc "contextless" (v: ^vu.Vu, a, b: f32) {
-	f: u32 = 0
-	if b == 0 {f = a == 0 ? 0x10 : 0x20}
+	f := div_bits(a, b)
+	v.q_flags = f
 	v.status = (v.status &~ 0x30) | f | f << 6
 }
 `

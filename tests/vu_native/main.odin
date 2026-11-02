@@ -3,7 +3,8 @@
 // tests/vu_micro's (tests/vu_programs), each assembled for the host as a
 // function of its own and loaded with the runtime's imports. From the same
 // random state, the native function and the interpreter must leave the same
-// vf, vi, ACC, Q, P, I, R, CLIP, MAC, memory and stopping pc; on VU0 status
+// vf, vi, ACC, Q, P, I, R, CLIP, MAC, the pending DIV's I and D bits
+// (q_flags, q_due), memory and stopping pc; on VU0 status
 // too, as VU0 code computes it. Every native run must end the program, and
 // no program may call the interpreter for an instruction, and a run from
 // one of a program's leaves must leave at once. A second pass
@@ -58,6 +59,8 @@ random_state :: proc(init: ^vu.Vu, mem: []u32) {
 	init.i = transmute(f32)rnd()
 	init.q = transmute(f32)rnd()
 	init.q_next, init.q_wait = transmute(f32)rnd(), 0 // as a microprogram starts: no Q pending
+	init.q_flags, init.q_due = rand.uint32() & 0x30, 0 // a stale DIV's bits, none due
+	init.p_next, init.p_wait = transmute(f32)rnd(), 0 // nor P
 	init.p = transmute(f32)rnd()
 	init.mac = rand.uint32() & 0xffff
 	init.clip = rand.uint32() & 0xffffff
@@ -67,11 +70,11 @@ random_state :: proc(init: ^vu.Vu, mem: []u32) {
 	for &w in mem {w = rnd()}
 }
 
-// At the end (pc with END_BIT), a pending Q lands, as vu0_exec and
-// vu1_exec drain it after the run.
+// At the end (pc with END_BIT), a pending Q and P land, as vu0_exec and
+// vu1_exec drain them after the run.
 @(private = "file")
 drain :: proc(v: ^vu.Vu, pc: u32) {
-	if pc & END_BIT != 0 && v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}
+	if pc & END_BIT != 0 {vu.vu_drain(v)}
 }
 
 // Whether got and want hold the same registers, but for the pc.
@@ -81,7 +84,9 @@ same_regs :: proc(got, want: ^vu.Vu, vu0: bool) -> bool {
 	for r in 0 ..< 32 {same &&= got.vf[r].u == want.vf[r].u}
 	same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p
 	same &&= transmute(u32)got.q_next == transmute(u32)want.q_next && got.q_wait == want.q_wait
+	same &&= transmute(u32)got.p_next == transmute(u32)want.p_next && got.p_wait == want.p_wait
 	same &&= transmute(u32)got.i == transmute(u32)want.i && got.r == want.r && got.clip == want.clip && got.mac == want.mac
+	same &&= got.q_flags == want.q_flags && got.q_due == want.q_due
 	return same && (!vu0 || got.status == want.status)
 }
 
