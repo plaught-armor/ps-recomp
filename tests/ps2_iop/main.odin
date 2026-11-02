@@ -62,8 +62,11 @@
 // input area plays at BVOL, its read at IRQA the sample at that cycle; a
 // block playing into a core takes its place, at the same BVOL. The other
 // VOLL sweeps step as PCSX2's, bit 12 turning the step, and a write keeps
-// the counter. A voice transfer runs its channel's handler. Undecoded ids
-// are compat rows; the loader's reset clears the handlers.
+// the counter; it counts as PCSX2's, clamping only at a step, an
+// exponential decrease rounding down, at shift 27 adding 1 and at step 3
+// 0, and a sweep steps on a voice not playing. A voice transfer runs its
+// channel's handler. Undecoded ids are compat rows; the loader's reset
+// clears the handlers.
 //
 // cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
 // record and a miss leaves it; sceCdRead copies whole sectors from the lsn
@@ -2789,6 +2792,61 @@ test_libsd :: proc() {
 	sd_call(5, 0x0000, 0x8030)
 	iop.spu_mix(out[:2])
 	check(sd_call(6, 0x0600) == 7, "libsd: a write keeps the sweep's counter")
+	// The counter as PCSX2 runs it: each sample adds 0x8000 >> (shift - 11)
+	// (at least 1, but 0 in a sweep at step 3 or shift 31) and the level
+	// steps, and only then clamps, once it reaches 0x8000. That last step
+	// left it at 0.
+	// A slow decrease in the negative phase (bit 12) from +0x3000, rate 0x70
+	// (shift 28 adds 1): no step for 0x8000 samples, so it holds 0x3000.
+	sd_call(5, 0x0000, 0x1800)
+	sd_call(5, 0x0000, 0xb070)
+	iop.spu_mix(out)
+	check(sd_call(6, 0x0600) == 0x3000, "libsd: a slow decrease holds a positive volume until its step")
+	// Rate 0x30 then, the counter kept: 800 + 0x4000 is short of 0x8000, so
+	// one sample holds 0x3000; the next steps it, clamped to 0.
+	sd_call(5, 0x0000, 0xb030)
+	iop.spu_mix(out[:2])
+	check(sd_call(6, 0x0600) == 0x3000, "libsd: a rate change keeps the counter's count")
+	iop.spu_mix(out[:2])
+	check(sd_call(6, 0x0600) == 0, "libsd: the step clamps the volume to 0")
+	// An exponential increase, rate 0x30: one sample from 0x5ff8 counts
+	// 0x4000; the volume then written to 0x7000, over 0x6000 the add is
+	// 0x1000, so the step (+7) comes 4 samples on, at 0x8000.
+	sd_call(5, 0x0000, 0x2ffc)
+	sd_call(5, 0x0000, 0xc030)
+	iop.spu_mix(out[:2])
+	sd_call(5, 0x0000, 0x3800)
+	sd_call(5, 0x0000, 0xc030)
+	iop.spu_mix(out[:6])
+	check(sd_call(6, 0x0600) == 0x7000, "libsd: over 0x6000 the count goes on at a quarter")
+	iop.spu_mix(out[:2])
+	check(sd_call(6, 0x0600) == 0x7007, "libsd: the step comes at 0x8000")
+	// An exponential decrease scales -8 by the volume and rounds down:
+	// -8 * 0x3002 >> 15 = -4 (-3.0005); from 2, -1 then -1 to 0.
+	sd_call(5, 0x0000, 0x1801)
+	sd_call(5, 0x0000, 0xe030)
+	iop.spu_mix(out[:4])
+	check(sd_call(6, 0x0600) == 0x2ffe, "libsd: an exponential decrease rounds down")
+	sd_call(5, 0x0000, 0x0001)
+	sd_call(5, 0x0000, 0xe030)
+	iop.spu_mix(out[:8])
+	check(sd_call(6, 0x0600) == 0, "libsd: an exponential decrease reaches 0")
+	// Voice 1 is not playing; its sweeps step all the same. At shift 27 the
+	// add is 1: step 0 (rate 0x6c) steps at 0x8000 and 0x10000 samples, +7
+	// each; step 3 (rate 0x6f) adds 0 and never steps.
+	check(!iop.spu_voice_status(0, 1).on, "libsd: voice 1 is not playing")
+	sd_call(5, 0x0002, 0)
+	sd_call(5, 0x0102, 0)
+	sd_call(5, 0x0002, 0x8030)
+	sd_call(5, 0x0102, 0x8030)
+	iop.spu_mix(out)
+	check(sd_call(6, 0x0602) == 2800 && sd_call(6, 0x0702) == 2800, "libsd: a sweep steps on a voice not playing")
+	sd_call(5, 0x0002, 0x806c)
+	sd_call(5, 0x0102, 0x806f)
+	for _ in 0 ..< 82 {iop.spu_mix(out)} // 65600 samples
+	check(sd_call(6, 0x0602) == 2800 + 14 && sd_call(6, 0x0702) == 2800, "libsd: shift 27 adds 1, at step 3 0")
+	sd_call(5, 0x0002, 0)
+	sd_call(5, 0x0102, 0)
 	sd_call(5, 0x0000, 0x3fff)
 	check(iop.iop_sd.pending == 0, "libsd: no IRQ while it is off")
 

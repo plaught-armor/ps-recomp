@@ -6,8 +6,9 @@
 // models what that needs: sound RAM, voice transfers, ADPCM playback with
 // the block loop flags, pitch (gaussian interpolated, gauss.odin), volume
 // key on/off and the ADSR envelope (stepping after ps2-web-recomp's
-// spu2.cpp, MIT, Samir Nuri) and the voice volume sweeps (Spu_Vol); a
-// master volume's sweep is taken at full scale.
+// spu2.cpp, MIT, Samir Nuri) and the voice volume sweeps (Spu_Vol), both
+// counted as PCSX2 counts them (spu_rate_step); a master volume's sweep is
+// taken at full scale.
 //
 // Voices advance by the samples spu_mix renders, the same clock the FMOD
 // voices run on. A block transfer (a PCM stream into a core) through sdrdrv
@@ -53,7 +54,7 @@ Spu_Voice :: struct {
 	adsr1:      u32,
 	adsr2:      u32,
 	level:      i32, // envelope, 0..0x7fff
-	counter:    i32, // samples since its last step
+	counter:    u32, // toward its next step (spu_rate_step)
 	ssa, lsa:   u32, // byte addresses in sound RAM
 	nax:        u32, // the block playing
 	endx:       bool, // a block with the end flag has finished since key on
@@ -275,28 +276,38 @@ spu_start :: proc(v: ^Spu_Voice) {
 	spu_block(v)
 }
 
-// What a level steps by this sample at `rate` (7 bits: shift in the high
-// 5, step in the low 2), 0 between steps, counter its samples since its
-// last step: the envelope's stepping and a volume sweep's. An exponential
-// decrease rounds toward zero, where PCSX2's (>> 15) rounds down.
+// One sample of a level's stepping at `rate` (7 bits: shift in the high 5,
+// step in the low 2), the envelope's and a volume sweep's, as PCSX2 counts
+// it (ADSR.cpp): the counter adds 0x8000 >> (shift - 11), all of 0x8000 at
+// shift 11 and under, a quarter of that in an exponential increase over
+// 0x6000, and at least 1; once it reaches 0x8000 it clears and the level
+// steps by delta (stepped true, and only then is the level clamped). The
+// step is (7 - step) up, (step - 8) down, << (11 - shift) at shift 11 and
+// under; an exponential decrease scales it by level / 0x8000, rounded down
+// (>> 15). A sweep's add may be 0, so it never steps, at step 3 or at
+// shift 31: PCSX2's V_VolumeSlide reads its "all bits of the rate set" as
+// either; the envelope's add never is 0. A rate change keeps the counter.
 @(private = "file")
-spu_env_delta :: proc(level: i32, counter: ^i32, rate: u32, decrease, exponential: bool) -> i32 {
-	shift := i32(rate >> 2)
-	cycles := i32(1) << u32(max(0, shift - 11))
-	if exponential && !decrease && level > 0x6000 {cycles *= 4}
-	counter^ += 1
-	if counter^ < cycles {return 0}
+spu_rate_step :: proc(level: i32, counter: ^u32, rate: u32, decrease, exponential, sweep: bool) -> (delta: i32, stepped: bool) {
+	shift := rate >> 2
+	inc := u32(0x8000) >> (max(shift, 11) - 11)
+	if exponential && !decrease && level > 0x6000 {inc >>= 2}
+	if !sweep || (rate & 3 != 3 && shift != 31) {inc = max(inc, 1)}
+	counter^ += inc
+	if counter^ < 0x8000 {return 0, false}
 	counter^ = 0
 	step := i32(rate & 3)
-	delta := (decrease ? -8 + step : 7 - step) << u32(max(0, 11 - shift))
-	if exponential && decrease {delta = delta * level / 0x8000}
-	return delta
+	delta = (decrease ? step - 8 : 7 - step) << (11 - min(shift, 11))
+	if exponential && decrease {delta = i32(i16((delta * level) >> 15))}
+	return delta, true
 }
 
-// Step an envelope level (0..0x7fff) one sample (spu_env_delta).
+// Step an envelope level (0..0x7fff) one sample (spu_rate_step).
 @(private = "file")
-spu_env_step :: proc(level, counter: ^i32, rate: u32, decrease, exponential: bool) {
-	level^ = clamp(level^ + spu_env_delta(level^, counter, rate, decrease, exponential), 0, 0x7fff)
+spu_env_step :: proc(level: ^i32, counter: ^u32, rate: u32, decrease, exponential: bool) {
+	if d, ok := spu_rate_step(level^, counter, rate, decrease, exponential, false); ok {
+		level^ = clamp(level^ + d, 0, 0x7fff)
+	}
 }
 
 // Advance the envelope one sample; a release that reaches zero stops the voice.
@@ -322,18 +333,19 @@ spu_envelope :: proc(v: ^Spu_Voice) {
 // 15 clear the register's bits 14-0 are a signed level, half the volume, so
 // 0x3fff is unity and 0x4000 (-0x4000) inverts. With bit 15 set the volume
 // sweeps from where it is: bit 13 down (else up), bit 14 exponential (else
-// linear), bits 6-0 the rate, stepped as the envelope's (spu_env_delta).
+// linear), bits 6-0 the rate, stepped as the envelope's (spu_rate_step).
 // Bit 12, the negative phase, turns the step's sign: an increase heads for
 // -0x8000, and a decrease rises to 0 from below (a positive volume goes
 // straight to 0); it does nothing to an exponential decrease. An increase runs over the
 // whole range, a decrease stops at 0. A write keeps the sweep's counter,
 // even of a new rate. That is PCSX2's V_VolumeSlide, unverified on SPU2
-// hardware. A sweep runs while its voice plays.
+// hardware. A sweep steps every sample, its voice playing or not, before
+// the sample takes the volume (PCSX2's MixVoice).
 @(private = "file")
 Spu_Vol :: struct {
 	reg:     u16,
 	cur:     i32,
-	counter: i32, // samples since the sweep's last step
+	counter: u32, // toward the sweep's next step (spu_rate_step)
 }
 
 @(private = "file")
@@ -348,7 +360,8 @@ spu_sweep :: proc(x: ^Spu_Vol) {
 	r := u32(x.reg)
 	if r & 0x8000 == 0 {return}
 	decrease, exponential := r & 0x2000 != 0, r & 0x4000 != 0
-	d := spu_env_delta(x.cur, &x.counter, r & 0x7f, decrease, exponential)
+	d, ok := spu_rate_step(x.cur, &x.counter, r & 0x7f, decrease, exponential, true)
+	if !ok {return}
 	switch {
 	case decrease && exponential: x.cur = clamp(x.cur + d, 0, 0x7fff)
 	case r & 0x1000 != 0: x.cur = clamp(x.cur - d, -0x8000, decrease ? 0 : 0x7fff)
@@ -394,16 +407,20 @@ spu_mix :: proc(out: []i32) {
 		send: []i32
 		if wet {send = make([]i32, len(out), context.temp_allocator)}
 		for &v in core {
-			if !v.on {continue}
+			sweeping := (v.vol[0].reg | v.vol[1].reg) & 0x8000 != 0
+			if !v.on && !sweeping {continue}
 			for n := 0; n < len(out); n += 2 {
-				if !v.on {break}
+				spu_sweep(&v.vol[0])
+				spu_sweep(&v.vol[1])
+				if !v.on {
+					if sweeping {continue}
+					break
+				}
 				// The level before the sample: an end without repeat zeroes it.
 				level := v.level
 				s := spu_sample(&v) * level >> 15
 				if v.on {spu_envelope(&v)}
 				sl, sr := s * v.vol[0].cur >> 15, s * v.vol[1].cur >> 15
-				spu_sweep(&v.vol[0])
-				spu_sweep(&v.vol[1])
 				acc[n] += sl
 				acc[n + 1] += sr
 				if wet && !v.dry {
@@ -543,9 +560,15 @@ spu_effect_enable :: proc(core: int, on: bool) {
 	spu.effect[core] = on
 }
 
-// Key a voice off, as KOFF: its envelope goes to release.
+// Key a voice off, as KOFF: its envelope goes to release, its counter
+// cleared (PCSX2's V_ADSR::Release).
 spu_voice_off :: proc(core, voice: int) {
-	spu_voice_at(core, voice).phase = .Release
+	spu_release(spu_voice_at(core, voice))
+}
+
+@(private = "file")
+spu_release :: proc(v: ^Spu_Voice) {
+	v.phase, v.counter = .Release, 0
 }
 
 Spu_Status :: struct {
@@ -596,7 +619,7 @@ sd_set_switch :: proc(id, mask: u32) -> bool {
 		if mask & (1 << u32(i)) == 0 {continue}
 		switch id & 0xff00 {
 		case SD_S_KON: spu_start(&core[i])
-		case SD_S_KOFF: core[i].phase = .Release
+		case SD_S_KOFF: spu_release(&core[i])
 		}
 	}
 	return true
