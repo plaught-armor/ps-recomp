@@ -15,6 +15,10 @@ import r3000 "ps:psx/cpu"
 
 IOP_SYS_CMDS :: 32
 
+// The completion callbacks sceSifSetDmaIntr may owe at once, as retail's
+// per-buffer list holds.
+SIF_DMA_CBS :: 32
+
 Iop_Sifcmd :: struct {
 	user_tab:  u32, // the module's table, IOP address
 	user_size: u32, // its entries
@@ -24,6 +28,10 @@ Iop_Sifcmd :: struct {
 	dma_id:    u32, // the last DMA id handed out
 	rpc_pool:  u32, // the RPC client's packets, IOP address (sifclient.odin)
 	rpc_id:    u32, // the last rpc_id handed out
+	dma_cb:    [SIF_DMA_CBS]struct {
+		func, arg: u32,
+	}, // the completion callbacks owed, first owed first
+	n_dma_cb:  u32,
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -76,29 +84,79 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	return 0, false
 }
 
-// Function fno of sifman, as stdio_fn. A DMA is done when it is set.
+// Function fno of sifman, as stdio_fn. A DMA is done when it is set; a
+// completion callback runs at the next tick (sif_dma_intr_run).
 sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
 	switch fno {
 	case 5: // sceSifInit: SIF is set up at boot, so retail finds its flag set and returns it
 		return 1, true
 	case 7: // sceSifSetDma(SifDmaTransfer_t *, count): {src, dest, size, attr}
-		for n in 0 ..< r[5] {
-			e := r[4] + 16 * n
-			src, dest, size := r32(e), r32(e + 4), r32(e + 8)
-			if dest == sif.ee_buf {
-				sif_send_raw(iop_ram_at(src, size))
-			} else {
-				copy(mem.ram_slice(dest, size), iop_ram_at(src, size))
-			}
-		}
-		return sifcmd_dma_id(), true
+		return sifman_dma(r[4], r[5]), true
 	case 8: // sceSifDmaStat(id): done
 		return ke(-1), true
 	case 29: // sceSifCheckInit: the flag sceSifInit sets, set at boot
 		return 1, true
+	case 32: // sceSifSetDmaIntr(SifDmaTransfer_t *, count, cb, arg): SetDma, then cb(arg) when done
+		// Retail returns 0, nothing sent, when the transfer's tags do not
+		// fit its 32-tag buffer. Ours are copied at once, so tags never
+		// pile up; the callbacks owed stand in for that test.
+		s := &iop_sifcmd
+		if r[6] != 0 && s.n_dma_cb == SIF_DMA_CBS {return 0, true}
+		cb, arg := r[6], r[7]
+		id := sifman_dma(r[4], r[5])
+		if cb != 0 {
+			s.dma_cb[s.n_dma_cb] = {cb, arg}
+			s.n_dma_cb += 1
+			iop_wake_set()
+		}
+		return id, true
 	}
 	return 0, false
+}
+
+// Copies each of the `count` transfers listed at `list`, {src, dest, size,
+// attr}, from IOP RAM to the EE; to the EE's command buffer it is sent as a
+// command. The DMA's id.
+@(private = "file")
+sifman_dma :: proc(list, count: u32) -> u32 {
+	for n in 0 ..< count {
+		e := list + 16 * n
+		src, dest, size := r32(e), r32(e + 4), r32(e + 8)
+		if dest == sif.ee_buf {
+			sif_send_raw(iop_ram_at(src, size))
+		} else {
+			copy(mem.ram_slice(dest, size), iop_ram_at(src, size))
+		}
+	}
+	return sifcmd_dma_id()
+}
+
+// When, in EE cycles, the completion callbacks owed are due: at once (the
+// IOP's clock) while one is; max(u64) when none is.
+sif_dma_next_ee :: proc() -> u64 {
+	return max(u64) if iop_sifcmd.n_dma_cb == 0 else r3000.state.cycles * IOP_EE_RATIO
+}
+
+// Runs the completion callbacks owed, first owed first, each with a0 its
+// arg, as retail's SIF0 DMA interrupt does; one that waits is stopped there
+// with a compat row, and the rest still run.
+sif_dma_intr_run :: proc() {
+	s := &iop_sifcmd
+	n := s.n_dma_cb
+	if n == 0 {return}
+	cbs := s.dma_cb
+	s.n_dma_cb, s.dma_cb = 0, {}
+	for c in cbs[:n] {
+		switch th_intr(c.func, c.arg, 0) {
+		case .None:
+		case .Blocked:
+			core.compat_unknown(.Iop_Sif_Intr, c.func, pc = c.func)
+			fmt.eprintfln("iop: sifman DMA callback at %x blocked", c.func)
+		case .Call:
+			fmt.eprintfln("iop: sifman DMA callback at %x stopped", c.func)
+		}
+	}
 }
 
 // After a failed load: puts back each handler it left with its handler or
@@ -111,6 +169,14 @@ sifcmd_undo :: proc(saved: Iop_Sifcmd, tab: []u32, freed: []Sys_Block) {
 		if sys_in(freed, h.handler) || sys_in(freed, h.harg) {h = saved.sys[i]}
 	}
 	if sys_in(freed, s.user_tab) {s.user_tab, s.user_size = saved.user_tab, saved.user_size}
+	n: u32
+	for c in s.dma_cb[:s.n_dma_cb] {
+		if sys_in(freed, c.func) || sys_in(freed, c.arg) {continue}
+		s.dma_cb[n] = c
+		n += 1
+	}
+	for &c in s.dma_cb[n:s.n_dma_cb] {c = {}}
+	s.n_dma_cb = n
 	for i in 0 ..< min(s.user_size, IOP_RAM_SIZE / 8) {
 		e := s.user_tab + 8 * i
 		if !sys_in(freed, r32(e)) && !sys_in(freed, r32(e + 4)) {continue}

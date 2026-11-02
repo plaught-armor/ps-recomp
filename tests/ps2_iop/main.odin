@@ -209,6 +209,7 @@ game :: proc(_: rawptr) {
 	test_rpc_pool_kept()
 	test_c1_gaps()
 	test_sifman()
+	test_sif_dma_intr()
 	test_libsd()
 	test_cdvdman()
 	test_cdvd_search_server()
@@ -3171,6 +3172,110 @@ test_sifman :: proc() {
 	v5, ok5 := iop.sifman_fn(5)
 	v29, ok29 := iop.sifman_fn(29)
 	check(ok5 && v5 == 1 && ok29 && v29 == 1, "sifman: sceSifInit returns the flag set at boot, sceSifCheckInit it")
+}
+
+SIFMAN_FNOS := [?]u32{7, 32}
+
+snap15: core.Snapshot
+snap15_loaded: bool // not emulated state
+
+// sceSifSetDmaIntr: the copy at once, as sceSifSetDma; the callback owed
+// to the next tick, run there with a0 its arg as retail's SIF0 interrupt
+// does, so a thread it signals runs after.
+test_sif_dma_intr :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	// "mods": a thread that waits on sem and counts its passes; a callback
+	// that records a0, counts its calls and iSignalSemas sem; one that waits.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	ts := imports(&a, "thsemap", 4, 7, 8)
+	sm := imports(&a, "sifman", ..SIFMAN_FNOS[:])
+	d := at(&a) // callback calls, its last a0, thread passes, sem, th
+	put(&a, 0, 0, 0, 0, 0)
+	src := at(&a)
+	put(&a, 0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00)
+	dmat := at(&a) // {src, dest, size, attr}, filled in below
+	put(&a, 0, 0, 0, 0)
+	semp := at(&a)
+	put(&a, 0, 0, 0, 64) // attr, option, initial, max
+	h := at(&a)
+	prologue(&a)
+	la(&a, T0, d)
+	put(&a, 0xad040004) // sw a0, 4(t0)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0x8d04000c, 0) // lw a0, 12(t0); nop
+	jal(&a, ts + 8)
+	epilogue(&a)
+	hb := at(&a)
+	prologue(&a)
+	call_word(&a, ts + 16, d + 12)
+	epilogue(&a)
+	w := at(&a)
+	call_word(&a, ts + 16, d + 12)
+	la(&a, T0, d)
+	put(&a, 0x8d090008, 0, 0x25290001, 0xad090008) // lw t1, 8(t0); nop; addiu t1, t1, 1; sw t1, 8(t0)
+	put_rel(&a, 0x08000000 | w >> 2, 4) // j w
+	put(&a, 0)
+	tp := thread_param(&a, w, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, semp, d + 12)
+	call_addr(&a, tb, tp, d + 16)
+	call_word(&a, tb + 8, d + 16)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, res := iop.iop_load(build_mod("mods", &a, entry), "mods", nil)
+	b := module_base(id)
+	word :: proc(b, d, i: u32) -> u32 {return iop.iop_u32(b + d + 4 * i)^}
+	check(id > 0 && res == 0 && word(b, d, 2) == 0, "sifman 32: the module loads, its thread waits")
+	EE_DEST :: 0x100000
+	t := iop.iop_mem(b + dmat, 16)
+	endian.put_u32(t[0:], .Little, b + src)
+	endian.put_u32(t[4:], .Little, EE_DEST)
+	endian.put_u32(t[8:], .Little, 16)
+	call :: proc(b, sm, fno: u32, args: ..u32) -> u32 {
+		fnos := SIFMAN_FNOS
+		return lib_call(b + sm, fnos[:], fno, ..args)
+	}
+	s := &iop.iop_sifcmd
+
+	r3000.state.cycles = 1000
+	id7 := call(b, sm, 7, b + dmat, 1)
+	copy(mem.ram_slice(EE_DEST, 16), make([]u8, 16, context.temp_allocator))
+	id32 := call(b, sm, 32, b + dmat, 1, b + h, 0x55)
+	check(id32 != 0 && id32 != id7 && string(mem.ram_slice(EE_DEST, 16)) == string(iop.iop_mem(b + src, 16)), "sifman 32: the copy is done at the call, a new id")
+	now := r3000.state.cycles * iop.IOP_EE_RATIO
+	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && iop.sif_dma_next_ee() == now && iop.iop_wake_ee == now, "sifman 32: the callback is owed, not run, the wake now")
+	core.snap_op, core.snap_target = .Save, &snap15
+	core.snap_yield()
+	if !snap15_loaded {
+		iop.iop_tick(iop.iop_wake_ee)
+		check(word(b, d, 0) == 1 && s.n_dma_cb == 0, "sifman 32: the tick runs it")
+		snap15_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap15
+		core.snap_yield()
+	}
+	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && s.dma_cb[0] == {b + h, 0x55}, "sifman 32: the load puts the owed callback back")
+	iop.iop_tick(iop.iop_wake_ee)
+	check(word(b, d, 0) == 1 && word(b, d, 1) == 0x55 && word(b, d, 2) == 1, "sifman 32: the callback gets its arg, the thread it signals runs after")
+	check(s.n_dma_cb == 0 && iop.sif_dma_next_ee() == max(u64), "sifman 32: none owed, no wake")
+
+	ok := true
+	for i in 0 ..< iop.SIF_DMA_CBS {ok &&= call(b, sm, 32, b + dmat, 1, b + h, u32(i)) != 0}
+	check(ok && call(b, sm, 32, b + dmat, 1, b + h, 99) == 0, "sifman 32: one past the callbacks owed returns 0")
+	check(call(b, sm, 32, b + dmat, 1, 0, 0) != 0, "sifman 32: one with no callback is still sent")
+	iop.iop_tick(iop.iop_wake_ee)
+	check(word(b, d, 0) == 1 + iop.SIF_DMA_CBS && word(b, d, 1) == iop.SIF_DMA_CBS - 1 && word(b, d, 2) == 1 + iop.SIF_DMA_CBS, "sifman 32: all run first owed first, the thread passing for each")
+
+	key := core.Compat_Key{.Iop_Sif_Intr, b + hb, 0}
+	call(b, sm, 32, b + dmat, 1, b + hb, 0)
+	call(b, sm, 32, b + dmat, 1, b + h, 7)
+	iop.iop_tick(iop.iop_wake_ee)
+	check(core.compat.calls[key].n == 1 && word(b, d, 1) == 7 && s.n_dma_cb == 0, "sifman 32: one that waits is stopped with a row, the next still runs")
+	fresh()
+	check(iop.iop_sifcmd.n_dma_cb == 0, "sifman 32: the loader's reset clears the callbacks owed")
 }
 
 // libsd's functions, in the order "modl" imports them.

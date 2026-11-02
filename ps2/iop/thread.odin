@@ -321,26 +321,27 @@ iop_sync :: proc(now: u64) {
 
 // Sets iop_wake_ee from the threads, at once while one is ready, else at the
 // first wake, from libsd's interrupts (sd_next_ee), the timers' compares
-// (tim_next_ee), cdvdman's read callback (cd_next_ee) and the vblank
-// handlers' next edge (vbl_next_ee). The EE's next
-// event moves up to it, unless the EE is handling events, which ends with
-// update_next_event.
+// (tim_next_ee), cdvdman's read callback (cd_next_ee), sifman's DMA
+// completion callbacks (sif_dma_next_ee) and the vblank handlers' next
+// edge (vbl_next_ee). The EE's next event moves up to it, unless the EE is
+// handling events, which ends with update_next_event.
 iop_wake_set :: proc() {
 	w := th_next_wake()
 	if th_pick() != nil {w = r3000.state.cycles}
-	iop_wake_ee = min(w if w == max(u64) else w * IOP_EE_RATIO, sd_next_ee(), tim_next_ee(), cd_next_ee(), vbl_next_ee())
+	iop_wake_ee = min(w if w == max(u64) else w * IOP_EE_RATIO, sd_next_ee(), tim_next_ee(), cd_next_ee(), sif_dma_next_ee(), vbl_next_ee())
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, iop_wake_ee)}
 }
 
 // The EE's events at EE cycle `now`, the IOP's wake due: runs libsd's due
 // interrupt handlers, then the timers' due compare handlers, then cdvdman's
-// pending read callback, then the vblank handlers due, then its threads
-// for a slice.
+// pending read callback, then sifman's DMA completion callbacks, then the
+// vblank handlers due, then its threads for a slice.
 iop_tick :: proc(now: u64) {
 	iop_sync(now)
 	sd_intr_run(now)
 	tim_intr_run()
 	cd_intr_run()
+	sif_dma_intr_run()
 	vbl_intr_run()
 	iop_sched.start_done = false
 	th_schedule(r3000.state.cycles + IOP_SLICE, idle = true)
