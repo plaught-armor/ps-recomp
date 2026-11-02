@@ -59,16 +59,21 @@ IOP_INTR_STACK :: IOP_CMDBUF
 
 KE_ILLEGAL_CONTEXT :: -100
 KE_NO_MEMORY :: -400
+KE_ILLEGAL_ATTR :: -401
 KE_ILLEGAL_ENTRY :: -402
 KE_ILLEGAL_PRIORITY :: -403
 KE_ILLEGAL_THID :: -406
 KE_UNKNOWN_THID :: -407
 KE_UNKNOWN_SEMID :: -408
+KE_UNKNOWN_EVFID :: -409
 KE_DORMANT :: -413
 KE_NOT_DORMANT :: -414
 KE_CAN_NOT_WAIT :: -417
 KE_SEMA_ZERO :: -419
 KE_SEMA_OVF :: -420
+KE_EVF_COND :: -421
+KE_EVF_MULTI :: -422
+KE_EVF_ILPAT :: -423
 KE_WAIT_DELETE :: -425
 
 @(private = "file")
@@ -77,12 +82,19 @@ PRIO_HIGHEST :: 1
 PRIO_LOWEST :: 126
 @(private = "file")
 SA_THPRI :: 1 // a semaphore's waiters by priority, else first come
+@(private = "file")
+EA_MULTI :: 2 // an event flag more than one thread may wait on
+@(private = "file")
+WEF_OR :: 1 // a wait any of whose bits will do, else all of them
+@(private = "file")
+WEF_CLEAR :: 0x10 // a wait that clears the flag's bits once met
 
 Th_Status :: enum u8 {
 	Dormant,
 	Ready,
 	Run,
 	Wait, // on a semaphore
+	Evf, // on an event flag
 	Sleep,
 	Delay, // on DelayThread, until wake_at
 }
@@ -103,7 +115,9 @@ Iop_Thread :: struct {
 	start:                  bool, // a module's start
 	exit_delete:            bool, // removed once it is dormant
 	seq:                    i64, // its place in its ready or wait queue
-	sema:                   u32, // what it waits on
+	sema:                   u32, // what it waits on: a semaphore's or event flag's id
+	evf_bits, evf_mode:     u32, // an event flag wait's pattern and mode
+	evf_res:                u32, // and where its met bits go, 0 for nowhere
 	wakeups:                u32, // WakeupThread calls while it was awake
 	wake:                   u32, // what its wait returns
 	wake_at:                u64, // when its Delay ends, IOP cycles
@@ -117,11 +131,18 @@ Iop_Sema :: struct {
 	initial:          i32,
 }
 
+Iop_Evf :: struct {
+	id, attr, option: u32,
+	initial, bits:    u32,
+}
+
 // Emulated state, in the emu heap: snapshotted (sif_snap).
 iop_sched: struct {
 	threads:              [dynamic]Iop_Thread,
 	semas:                [dynamic]Iop_Sema,
+	evfs:                 [dynamic]Iop_Evf,
 	next_thid, next_semid: u32,
+	next_evfid:           u32,
 	head, tail:           i64, // the next seq at a queue's head, at its tail
 	cur:                  u32, // the running thread, 0 on the loader
 	resched:              bool, // a thread of better priority than cur became ready
@@ -158,11 +179,14 @@ th_init :: proc() {
 	if s.intr_co != nil {core.co_kill(s.intr_co)}
 	clear(&s.threads)
 	clear(&s.semas)
+	clear(&s.evfs)
 	s^ = {
 		threads    = s.threads,
 		semas      = s.semas,
+		evfs       = s.evfs,
 		next_thid  = 1,
 		next_semid = 1,
+		next_evfid = 1,
 		head       = -1,
 	}
 	iop_wake_ee = max(u64)
@@ -567,13 +591,27 @@ th_intr_stop :: proc(why: Intr_Stop) {
 	unreachable()
 }
 
-// Undoes a failed load: deletes the semaphores and threads made since ids
-// `thid` and `semid`, killing the threads' coroutines. Their stacks are
-// freed by the caller's sys_blocks restore.
-th_undo :: proc(thid, semid: u32) {
+// The ids a load's threads, semaphores and event flags start from.
+Th_Mark :: struct {
+	thid, semid, evfid: u32,
+}
+
+th_mark :: proc() -> Th_Mark {
 	s := &iop_sched
+	return {s.next_thid, s.next_semid, s.next_evfid}
+}
+
+// Undoes a failed load: deletes the semaphores, event flags and threads
+// made since mark `m`, killing the threads' coroutines. Their stacks are
+// freed by the caller's sys_blocks restore.
+th_undo :: proc(m: Th_Mark) {
+	s := &iop_sched
+	thid := m.thid
 	for i := len(s.semas) - 1; i >= 0; i -= 1 {
-		if s.semas[i].id >= semid {sema_delete(i)}
+		if s.semas[i].id >= m.semid {sema_delete(i)}
+	}
+	for i := len(s.evfs) - 1; i >= 0; i -= 1 {
+		if s.evfs[i].id >= m.evfid {evf_delete(i)}
 	}
 	for i := len(s.threads) - 1; i >= 0; i -= 1 {
 		t := &s.threads[i]
@@ -751,4 +789,117 @@ sema_waiter :: proc(m: Iop_Sema) -> ^Iop_Thread {
 		if better {best = &t}
 	}
 	return best
+}
+
+// ------------------------------------------------------------- thevent
+
+// Function fno of thevent, as th_base. Each call runs only in its context:
+// the i-variants in a handler, the rest on a thread or the loader.
+th_event :: proc(fno: u32) -> (v0: u32, ok: bool) {
+	s := &iop_sched
+	r := &r3000.state.r
+	a0, a1, a2, a3 := r[4], r[5], r[6], r[7]
+	if fno < 4 || fno > 14 || fno == 12 {return 0, false}
+	if s.intr != (fno == 7 || fno == 9 || fno == 14) {return ke(KE_ILLEGAL_CONTEXT), true}
+	switch fno {
+	case 4: // CreateEventFlag(iop_event_t *): attr, option, bits
+		attr := r32(a0)
+		if attr &~ EA_MULTI != 0 {return ke(KE_ILLEGAL_ATTR), true}
+		append(&s.evfs, Iop_Evf{s.next_evfid, attr, r32(a0 + 4), r32(a0 + 8), r32(a0 + 8)})
+		s.next_evfid += 1
+		return s.next_evfid - 1, true
+	case 5: // DeleteEventFlag(ef)
+		for e, i in s.evfs {
+			if e.id == a0 {
+				evf_delete(i)
+				return KE_OK, true
+			}
+		}
+		return ke(KE_UNKNOWN_EVFID), true
+	case 6, 7: // SetEventFlag(ef, bits), iSetEventFlag(ef, bits)
+		e := evf_find(a0)
+		if e == nil {return ke(KE_UNKNOWN_EVFID), true}
+		e.bits |= a1
+		evf_wake(e)
+		return KE_OK, true
+	case 8, 9: // ClearEventFlag(ef, bits), iClearEventFlag(ef, bits): the bits kept
+		e := evf_find(a0)
+		if e == nil {return ke(KE_UNKNOWN_EVFID), true}
+		e.bits &= a1
+		return KE_OK, true
+	case 10, 11: // WaitEventFlag(ef, bits, mode, u32 *resbits), PollEventFlag
+		if a2 &~ (WEF_OR | WEF_CLEAR) != 0 {return ke(KE_ILLEGAL_MODE), true}
+		if a1 == 0 {return ke(KE_EVF_ILPAT), true}
+		e := evf_find(a0)
+		if e == nil {return ke(KE_UNKNOWN_EVFID), true}
+		if e.attr & EA_MULTI == 0 && evf_waiters(e.id) > 0 {return ke(KE_EVF_MULTI), true}
+		if evf_met(e^, a1, a2) {
+			if a3 != 0 {w32(a3, e.bits)}
+			if a2 & WEF_CLEAR != 0 {e.bits = 0}
+			return KE_OK, true
+		}
+		if fno == 11 {return ke(KE_EVF_COND), true}
+		if t := th_find(s.cur); t != nil {t.evf_bits, t.evf_mode, t.evf_res = a1, a2, a3}
+		return th_wait(.Evf, e.id), true
+	case 13, 14: // ReferEventFlagStatus(ef, iop_event_info_t *), iReferEventFlagStatus
+		e := evf_find(a0)
+		if e == nil {return ke(KE_UNKNOWN_EVFID), true}
+		for w, i in ([5]u32{e.attr, e.option, e.initial, e.bits, evf_waiters(e.id)}) {
+			w32(a1 + 4 * u32(i), w)
+		}
+		return KE_OK, true
+	}
+	return 0, false
+}
+
+@(private = "file")
+evf_find :: proc(id: u32) -> ^Iop_Evf {
+	for &e in iop_sched.evfs {
+		if e.id == id {return &e}
+	}
+	return nil
+}
+
+@(private = "file")
+evf_waiters :: proc(id: u32) -> (n: u32) {
+	for t in iop_sched.threads {
+		if t.status == .Evf && t.sema == id {n += 1}
+	}
+	return
+}
+
+// Whether e's bits meet pattern `bits` in `mode`: any of them for WEF_OR,
+// else all.
+@(private = "file")
+evf_met :: proc(e: Iop_Evf, bits, mode: u32) -> bool {
+	m := e.bits & bits
+	return m != 0 if mode & WEF_OR != 0 else m == bits
+}
+
+// Wakes e's waiters its bits now meet, first come first. Each gets the bits
+// as they were before its own WEF_CLEAR, which leaves none for the rest.
+@(private = "file")
+evf_wake :: proc(e: ^Iop_Evf) {
+	for e.bits != 0 {
+		first: ^Iop_Thread
+		for &t in iop_sched.threads {
+			if t.status != .Evf || t.sema != e.id || !evf_met(e^, t.evf_bits, t.evf_mode) {continue}
+			if first == nil || t.seq < first.seq {first = &t}
+		}
+		if first == nil {return}
+		if first.evf_res != 0 {w32(first.evf_res, e.bits)}
+		if first.evf_mode & WEF_CLEAR != 0 {e.bits = 0}
+		th_wake(first, KE_OK)
+	}
+}
+
+// Removes event flag i; its waiters wake with KE_WAIT_DELETE.
+@(private = "file")
+evf_delete :: proc(i: int) {
+	s := &iop_sched
+	id := s.evfs[i].id
+	ordered_remove(&s.evfs, i)
+	for &t in s.threads {
+		if t.status == .Evf && t.sema == id {th_wake(&t, ke(KE_WAIT_DELETE))}
+	}
 }

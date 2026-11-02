@@ -254,10 +254,10 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		return KE_ERROR, 0
 	}
 	s := &iop_sched
-	mark_th, mark_sema := s.next_thid, s.next_semid
-	fail :: proc(key, name, why: string, mark_th, mark_sema: u32) -> (i32, u32) {
+	mark := th_mark()
+	fail :: proc(key, name, why: string, mark: Th_Mark) -> (i32, u32) {
 		fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
-		th_undo(mark_th, mark_sema)
+		th_undo(mark)
 		undo_restore()
 		core.compat_unknown(.Iop_Fallback, core.compat_name(name))
 		paths := &iop_loader.failed_paths
@@ -274,7 +274,7 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	l.failed, l.gaps = false, 0
 	defer l.loading = 0
 	size, fits := irx_mem_size(x)
-	if !fits {return fail(key, x.name, fmt.tprintf("memory size %#x", x.mem_size), mark_th, mark_sema)}
+	if !fits {return fail(key, x.name, fmt.tprintf("memory size %#x", x.mem_size), mark)}
 	if cpu.debug >= 1 && size != x.text_size + x.data_size + x.bss_size {
 		fmt.eprintfln("iop: \"%s\" holds %#x bytes, its module info says %#x", x.name, size, x.text_size + x.data_size + x.bss_size)
 	}
@@ -283,13 +283,13 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		size = size,
 	}
 	m.base = sys_alloc(.Low, m.size)
-	if m.base == 0 {return fail(key, x.name, "no memory", mark_th, mark_sema)}
+	if m.base == 0 {return fail(key, x.name, "no memory", mark)}
 	img := iop_mem(m.base, m.size)
 	copy(img, data[x.file_off:][:x.file_size])
 	slice.zero(img[x.file_size:])
 	if err, detail := irx_relocate(data, img, m.base); err != .None {
 		if err == .Type {core.compat_unknown(.Irx_Reloc, detail)}
-		return fail(key, x.name, fmt.tprintf("relocation %v %#x", err, detail), mark_th, mark_sema)
+		return fail(key, x.name, fmt.tprintf("relocation %v %#x", err, detail), mark)
 	}
 	tables := irx_tables(img[:min(x.text_size, m.size)], m.base, context.temp_allocator)
 	for &t in tables {
@@ -297,7 +297,7 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	}
 	m.argv = argv_block(path, args)
 	stack := sys_alloc(.High, IOP_START_STACK)
-	if m.argv == 0 || stack == 0 {return fail(key, x.name, "no memory", mark_th, mark_sema)}
+	if m.argv == 0 || stack == 0 {return fail(key, x.name, "no memory", mark)}
 	st := th_new(m.base + x.entry, stack, IOP_START_STACK, m.base + x.gp, IOP_START_PRIO)
 	st.start, st.exit_delete = true, true
 	st.ctx.r[4] = r32(m.argv)
@@ -308,13 +308,13 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	th_schedule(r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN)
 	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
-		return fail(key, x.name, "start ran out of its budget", mark_th, mark_sema)
+		return fail(key, x.name, "start ran out of its budget", mark)
 	}
 	if !s.start_done {
 		core.compat_unknown(.Iop_Blocked, core.compat_name(x.name))
-		return fail(key, x.name, "start waits with no thread ready", mark_th, mark_sema)
+		return fail(key, x.name, "start waits with no thread ready", mark)
 	}
-	if l.failed {return fail(key, x.name, "start called what the HLE lacks", mark_th, mark_sema)}
+	if l.failed {return fail(key, x.name, "start called what the HLE lacks", mark)}
 	if s.budget {
 		// The start returned, so the load succeeds; the threads it left ready
 		// stay so, their context saved, for a later load to run on.
@@ -612,6 +612,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return th_base(fno)
 	case "thsemap":
 		return th_semap(fno)
+	case "thevent":
+		return th_event(fno)
 	case "vblank":
 		return vblank_fn(fno)
 	case "stdio":

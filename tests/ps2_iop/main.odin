@@ -188,6 +188,9 @@ game :: proc(_: rawptr) {
 	test_import_major()
 	test_sony_stream()
 	test_thread_snap()
+	test_event_flags()
+	test_event_snap()
+	test_event_undo()
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
@@ -1342,6 +1345,197 @@ test_thread_snap :: proc() {
 	check(log_equal(base, logp, {}), "thread snapshot: H waits again after the load")
 	ids, _ := iop.iop_load(mod_s(), "mods", nil)
 	check(ids > 0 && log_equal(base, logp, {7}), "thread snapshot: the restored H wakes where it waited")
+}
+
+// thevent fno with a0..a3.
+ev :: proc(fno: u32, a0: u32 = 0, a1: u32 = 0, a2: u32 = 0, a3: u32 = 0) -> u32 {
+	r := &r3000.state.r
+	r[4], r[5], r[6], r[7] = a0, a1, a2, a3
+	v, ok := iop.th_event(fno)
+	check(ok, "event: a served call")
+	return v
+}
+
+// A thread that waits on event flag ef for `bits` in `mode`, its met bits to
+// `res`, its place in the wait queue `seq`.
+evf_waiter :: proc(ef, bits, mode, res: u32, seq: i64) -> ^iop.Iop_Thread {
+	t := iop.th_new(0x1000, 0x2000, 0x100, 0, 10)
+	t.status, t.sema, t.seq = .Evf, ef, seq
+	t.evf_bits, t.evf_mode, t.evf_res = bits, mode, res
+	return t
+}
+
+// Each event-flag call against ps2sdk's thevent: attributes, AND and OR
+// patterns, WEF_CLEAR, the bits a wait gets, one waiter unless EA_MULTI, a
+// set waking its waiters first come first until a clear, a delete waking
+// them with KE_WAIT_DELETE, and each call in its context only.
+test_event_flags :: proc() {
+	fresh()
+	P :: 0x00040000
+	word :: proc(i: u32) -> u32 {return iop.iop_u32(P + 4 * i)^}
+	param :: proc(attr, bits: u32) -> u32 {
+		for w, i in ([3]u32{attr, 9, bits}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+		return P
+	}
+	check(ev(4, param(1, 0)) == neg(-iop.KE_ILLEGAL_ATTR), "event: an attribute other than EA_MULTI is illegal")
+	e1 := ev(4, param(0, 5))
+	e2 := ev(4, param(2, 0))
+	check(e1 == 1 && e2 == 2, "event: Create gives ids")
+	check(ev(13, e1, P + 0x40) == 0 && word(0x10) == 0 && word(0x11) == 9 && word(0x12) == 5 && word(0x13) == 5 && word(0x14) == 0, "event: Refer by retail's layout")
+
+	// Poll: AND needs every bit, OR any; the bits before a clear come back.
+	check(ev(11, e1, 4, 0, P + 0x80) == 0 && word(0x20) == 5, "event: an AND poll met gives the bits")
+	check(ev(11, e1, 6, 0, P + 0x80) == neg(-iop.KE_EVF_COND), "event: an AND poll short of a bit is unmet")
+	check(ev(11, e1, 6, 1, 0) == 0, "event: an OR poll with one bit is met, no resbits")
+	check(ev(11, e1, 0, 0, 0) == neg(-iop.KE_EVF_ILPAT), "event: an empty pattern is illegal")
+	check(ev(11, e1, 1, 2, 0) == neg(-iop.KE_ILLEGAL_MODE), "event: an unknown mode bit is illegal")
+	check(ev(11, 99, 1, 0, 0) == neg(-iop.KE_UNKNOWN_EVFID), "event: an unknown flag")
+	iop.iop_u32(P + 0x80)^ = 0
+	check(ev(11, e1, 1, 0x11, P + 0x80) == 0 && word(0x20) == 5, "event: an OR|CLEAR poll gives the bits before its clear")
+	ev(13, e1, P + 0x40)
+	check(word(0x13) == 0, "event: WEF_CLEAR leaves no bits")
+
+	// Set ORs, Clear keeps the bits it is given.
+	check(ev(6, e1, 0xff) == 0 && ev(8, e1, 0x0f) == 0 && ev(13, e1, P + 0x40) == 0 && word(0x13) == 0x0f, "event: Set ORs, Clear ANDs")
+	check(ev(10, e1, 1, 0, P + 0x80) == 0 && word(0x20) == 0x0f, "event: a wait met at once returns")
+	check(ev(10, e1, 0x10, 0, 0) == neg(-iop.KE_CAN_NOT_WAIT), "event: an unmet wait on the loader cannot wait")
+
+	// One waiter unless EA_MULTI.
+	w := evf_waiter(e1, 0x10, 0, 0, 0)
+	check(ev(11, e1, 1, 0, 0) == neg(-iop.KE_EVF_MULTI), "event: a single flag with a waiter refuses another")
+	ev(13, e1, P + 0x40)
+	check(word(0x14) == 1, "event: Refer counts the waiter")
+	w.status = .Dormant
+
+	// e2: A wants 3 (AND), B 1 (OR, CLEAR), C 1 (OR), in that order.
+	a := evf_waiter(e2, 3, 0, P + 0x84, 1)
+	b := evf_waiter(e2, 1, 0x11, P + 0x88, 2)
+	c := evf_waiter(e2, 1, 1, 0, 3)
+	ida, idb, idc := a.id, b.id, c.id
+	check(ev(11, e2, 4, 1, 0) == neg(-iop.KE_EVF_COND), "event: a multi flag with waiters takes another")
+	ev(6, e2, 1)
+	a, b, c = iop.th_find(ida), iop.th_find(idb), iop.th_find(idc)
+	check(a.status == .Evf && b.status == .Ready && b.wake == 0 && word(0x22) == 1 && c.status == .Evf, "event: a set wakes the first met waiter, whose clear leaves none for the rest")
+	ev(13, e2, P + 0x40)
+	check(word(0x13) == 0 && word(0x14) == 2, "event: the clear took the bits")
+	ev(6, e2, 3)
+	a, c = iop.th_find(ida), iop.th_find(idc)
+	check(a.status == .Ready && word(0x21) == 3 && c.status == .Ready && a.seq < c.seq, "event: a set wakes every met waiter, first come first")
+	ev(13, e2, P + 0x40)
+	check(word(0x13) == 3, "event: no clear keeps the bits")
+
+	// Delete wakes its waiters with KE_WAIT_DELETE.
+	d := evf_waiter(e2, 0x100, 0, 0, 4)
+	idd := d.id
+	check(ev(5, e2) == 0 && ev(13, e2, P + 0x40) == neg(-iop.KE_UNKNOWN_EVFID), "event: Delete removes the flag")
+	d = iop.th_find(idd)
+	check(d.status == .Ready && d.wake == neg(-iop.KE_WAIT_DELETE), "event: Delete wakes its waiter with KE_WAIT_DELETE")
+	check(ev(5, e2) == neg(-iop.KE_UNKNOWN_EVFID), "event: Delete of an unknown flag")
+
+	// Contexts: the i-variants only in a handler, the rest only on a thread.
+	for fno in ([4]u32{7, 9, 14, 7}) {check(ev(fno, e1, 1, 0, P + 0x40) == neg(-iop.KE_ILLEGAL_CONTEXT), "event: an i-call on a thread is illegal")}
+	iop.iop_sched.intr = true
+	for fno in ([7]u32{4, 5, 6, 8, 10, 11, 13}) {check(ev(fno, e1, 1, 0, P + 0x40) == neg(-iop.KE_ILLEGAL_CONTEXT), "event: a thread's call in a handler is illegal")}
+	check(ev(7, e1, 0x30) == 0 && ev(9, e1, 0x20) == 0 && ev(14, e1, P + 0x40) == 0 && word(0x13) == 0x20, "event: iSet, iClear and iRefer in a handler")
+	iop.iop_sched.intr = false
+	r3000.state.r[4] = e1
+	_, ok12 := iop.th_event(12)
+	_, ok15 := iop.th_event(15)
+	check(!ok12 && !ok15, "event: thevent 12 and 15 are not served")
+}
+
+snap13: core.Snapshot
+snap13_loaded: bool // not emulated state
+
+// "mode": its start sets bit 1 of event flag 1 and returns.
+mod_e :: proc() -> []u8 {
+	a: Asm
+	te := imports(&a, "thevent", 6)
+	entry := at(&a)
+	prologue(&a)
+	li(&a, A0, 1)
+	li(&a, A1, 1)
+	jal(&a, te)
+	li(&a, V0, 1) // NO_RESIDENT_END
+	epilogue(&a)
+	return build_mod("mode", &a, entry)
+}
+
+// A thread waiting on an event flag through a real WaitEventFlag, as
+// test_thread_snap: the snapshot keeps its .Evf wait and the flag.
+test_event_snap :: proc() {
+	fresh()
+	// "modf": event flag 1, and thread H, which waits on its bit 1 and then
+	// logs 7 and the bits it got.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	te := imports(&a, "thevent", 4, 10)
+	logp := log_words(&a, 4)
+	th, res := at(&a), at(&a) + 4
+	put(&a, 0, 0)
+	evp := at(&a)
+	put(&a, 0, 0, 0)
+	eh := at(&a)
+	prologue(&a)
+	li(&a, A0, 1)
+	li(&a, A1, 1)
+	li(&a, A2, 0)
+	la(&a, A3, res)
+	jal(&a, te + 8)
+	log_v(&a, logp, 7)
+	epilogue(&a)
+	ph := thread_param(&a, eh, 10)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, evp)
+	jal(&a, te)
+	call_addr(&a, tb, ph, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modf", &a, entry), "modf", nil)
+	base := module_base(id)
+	t := iop.th_find(iop.iop_u32(base + th)^)
+	check(id > 0 && log_equal(base, logp, {}) && t != nil && t.status == .Evf && t.sema == 1, "event snapshot: H waits on the flag")
+	core.snap_op, core.snap_target = .Save, &snap13
+	core.snap_yield()
+	if !snap13_loaded {
+		ids, _ := iop.iop_load(mod_e(), "mode", nil)
+		check(ids > 0 && log_equal(base, logp, {7}) && iop.iop_u32(base + res)^ == 1, "event snapshot: a set wakes H with the bits")
+		snap13_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap13
+		core.snap_yield()
+	}
+	t = iop.th_find(iop.iop_u32(base + th)^)
+	check(log_equal(base, logp, {}) && t != nil && t.status == .Evf && iop.iop_u32(base + res)^ == 0, "event snapshot: H waits again after the load")
+	ids, _ := iop.iop_load(mod_e(), "mode", nil)
+	check(ids > 0 && log_equal(base, logp, {7}) && iop.iop_u32(base + res)^ == 1, "event snapshot: the restored H wakes where it waited")
+}
+
+// A failed load deletes the event flags it made, waking their waiters from
+// earlier loads with KE_WAIT_DELETE; earlier flags stay.
+test_event_undo :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	P :: 0x00040000
+	iop.iop_u32(P)^, iop.iop_u32(P + 4)^, iop.iop_u32(P + 8)^ = 0, 0, 0
+	r3000.state.r[4] = P
+	kept, _ := iop.th_event(4)
+	// "modu": makes a flag, then calls thevent 12, which the HLE lacks.
+	a: Asm
+	te := imports(&a, "thevent", 4, 12)
+	evp := at(&a)
+	put(&a, 0, 0, 0)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, evp)
+	jal(&a, te)
+	jal(&a, te + 8)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modu", &a, entry), "modu", nil)
+	check(id == -1 && len(s.evfs) == 1 && s.evfs[0].id == kept, "event undo: the failed load's flag is deleted, the earlier one kept")
+	check(s.next_evfid == kept + 2, "event undo: ids go on past the deleted flag")
 }
 
 // sceSifSetCmdBuffer and sceSifAddCmdHandler fill the module's table and the
