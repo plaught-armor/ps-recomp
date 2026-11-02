@@ -95,6 +95,7 @@ Th_Status :: enum u8 {
 	Run,
 	Wait, // on a semaphore
 	Evf, // on an event flag
+	Lock, // on sio2man's transfer lock (th_lock)
 	Sleep,
 	Delay, // on DelayThread, until wake_at
 }
@@ -143,6 +144,7 @@ iop_sched: struct {
 	evfs:                 [dynamic]Iop_Evf,
 	next_thid, next_semid: u32,
 	next_evfid:           u32,
+	lock:                 i32, // sio2man's transfer lock, a semaphore's count
 	head, tail:           i64, // the next seq at a queue's head, at its tail
 	cur:                  u32, // the running thread, 0 on the loader
 	resched:              bool, // a thread of better priority than cur became ready
@@ -187,6 +189,7 @@ th_init :: proc() {
 		next_thid  = 1,
 		next_semid = 1,
 		next_evfid = 1,
+		lock       = 1,
 		head       = -1,
 	}
 	iop_wake_ee = max(u64)
@@ -621,6 +624,40 @@ th_undo :: proc(m: Th_Mark) {
 	}
 	for t in s.threads {assert(t.id < thid, "iop: a failed load's thread left queued")}
 	s.resched = false
+}
+
+// sio2man's transfer lock: the semaphore its start makes {FIFO, initial 1,
+// max 0x40}, which pad2_transfer_init and mc2_transfer_init wait on and
+// transfer_reset3 signals (sio2.odin). Not a numbered semaphore: no guest
+// code names it. A failed load's waiter goes with its thread (th_undo); the
+// count stays, as an earlier semaphore's does.
+SIO2_LOCK_MAX :: 0x40
+
+// The running thread takes the lock, waiting for it if it is held.
+th_lock :: proc() -> u32 {
+	s := &iop_sched
+	if s.lock > 0 {
+		s.lock -= 1
+		return KE_OK
+	}
+	return th_wait(.Lock)
+}
+
+// Gives the lock to its first waiter, else back.
+th_unlock :: proc() -> u32 {
+	s := &iop_sched
+	w: ^Iop_Thread
+	for &t in s.threads {
+		if t.status == .Lock && (w == nil || t.seq < w.seq) {w = &t}
+	}
+	if w != nil {
+		th_wake(w, KE_OK)
+	} else if s.lock >= SIO2_LOCK_MAX {
+		return ke(KE_SEMA_OVF)
+	} else {
+		s.lock += 1
+	}
+	return KE_OK
 }
 
 // Removes semaphore i; its waiters wake with KE_WAIT_DELETE.

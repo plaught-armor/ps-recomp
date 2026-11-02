@@ -511,7 +511,7 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 	if s.pending {
 		core.compat_unknown(.Iop_Import, core.compat_name(name), pc = addr, ra = r[31])
 		fmt.eprintfln("iop: call to %s fno %d, which no module registered", name, s.fno)
-	} else if s.version >> 8 != IOP_HLE_MAJOR {
+	} else if u32(s.version >> 8) != hle_major(name) {
 		core.compat_unknown(.Iop_Import, core.compat_name(name), u32(s.version), pc = addr, ra = r[31])
 		fmt.eprintfln("iop: call to %s version %x fno %d, a major version the HLE does not serve", name, s.version, s.fno)
 	} else if v, ok := hle_fn(name, s.fno); ok {
@@ -530,15 +530,19 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 // `name`, as an import's stub of a version 1 table: a function the HLE
 // itself hands to guest code, as a thread's entry or a server's function.
 hle_host_stub :: proc(addr: u32, name: string, fno: u32) {
-	s := Hle_Stub{fno = fno, version = IOP_HLE_MAJOR << 8 | 1}
+	s := Hle_Stub{fno = fno, version = u16(hle_major(name) << 8 | 1)}
 	copy(s.name[:], name)
 	iop_loader.stubs[phys(addr)] = s
 }
 
-// The major version of each Sony library hle_fn serves: its numbers are
-// those of the version 1 export tables. An import of another major names
+// The major version of Sony library `name` that hle_fn serves: its numbers
+// are those of that major's export table. An import of another major names
 // other functions by the same numbers, so a call to it is not served.
-IOP_HLE_MAJOR :: 1
+// sio2man is served at 2, whose table adds the locked transfer functions
+// (rsio2man.h); every other library at 1.
+hle_major :: proc(name: string) -> u32 {
+	return 2 if name == "sio2man" else 1
+}
 
 // An error code as v0 holds it.
 ke :: proc(e: i32) -> u32 {
@@ -612,6 +616,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return th_base(fno)
 	case "thsemap":
 		return th_semap(fno)
+	case "sio2man":
+		return sio2man_fn(fno)
 	case "thevent":
 		return th_event(fno)
 	case "vblank":

@@ -191,6 +191,9 @@ game :: proc(_: rawptr) {
 	test_event_flags()
 	test_event_snap()
 	test_event_undo()
+	test_sio2_lock()
+	test_sio2_lock_snap()
+	test_sio2_lock_undo()
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
@@ -1260,6 +1263,21 @@ test_import_major :: proc() {
 	key := core.Compat_Key{.Iop_Import, core.compat_name("sysclib"), 0x0201}
 	r3000.state.r[4] = b + s
 	check(iop_call(b + v2) == 0xffffffff && core.compat.calls[key].n == 1, "major: major 2 fails with a row, not served")
+
+	// sio2man is served at major 2 alone.
+	fresh()
+	a = {}
+	s2 := imports_v(&a, "sio2man", 0x0204, 26)
+	s1 := imports_v(&a, "sio2man", 0x0101, 26)
+	entry = at(&a)
+	prologue(&a)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ = iop.iop_load(build_mod("mods", &a, entry), "mods", nil)
+	b = module_base(id)
+	key = core.Compat_Key{.Iop_Import, core.compat_name("sio2man"), 0x0101}
+	check(id > 0 && iop_call(b + s2) == 0, "major: sio2man 2.4 is served")
+	check(iop_call(b + s1) == 0xffffffff && core.compat.calls[key].n == 1, "major: sio2man major 1 fails with a row, not served")
 }
 
 // cdvdstm is a Sony library: LOADFILE does not run a module that exports
@@ -1536,6 +1554,143 @@ test_event_undo :: proc() {
 	id, _ := iop.iop_load(build_mod("modu", &a, entry), "modu", nil)
 	check(id == -1 && len(s.evfs) == 1 && s.evfs[0].id == kept, "event undo: the failed load's flag is deleted, the earlier one kept")
 	check(s.next_evfid == kept + 2, "event undo: ids go on past the deleted flag")
+}
+
+// sio2man fno with a0 from the loader; v0.
+sio2 :: proc(fno: u32, a0: u32 = 0) -> u32 {
+	r3000.state.r[4] = a0
+	v, ok := iop.sio2man_fn(fno)
+	check(ok, "sio2: a served call")
+	return v
+}
+
+// A thread waiting on sio2man's lock, its place in the queue `seq`.
+lock_waiter :: proc(seq: i64) -> ^iop.Iop_Thread {
+	t := iop.th_new(0x1000, 0x2000, 0x100, 0, 10)
+	t.status, t.seq = .Lock, seq
+	return t
+}
+
+// The lock against the v2.04 module: one holder at first, 61 and 63 take it
+// and wait while it is held, 62 hands it to the first waiter first come, else
+// gives it back up to 0x40; the handshake calls do nothing.
+test_sio2_lock :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	check(s.lock == 1, "sio2 lock: free at first")
+	check(sio2(61) == 0 && s.lock == 0, "sio2 lock: 61 takes it")
+	check(sio2(63) == iop.ke(iop.KE_CAN_NOT_WAIT) && s.lock == 0, "sio2 lock: the loader cannot wait for it")
+	w1, w2 := lock_waiter(5).id, lock_waiter(3).id
+	check(sio2(62) == 0 && iop.th_find(w2).status == .Ready && iop.th_find(w1).status == .Lock && s.lock == 0, "sio2 lock: 62 wakes the first waiter")
+	check(sio2(62) == 0 && iop.th_find(w1).status == .Ready && s.lock == 0, "sio2 lock: then the next")
+	check(sio2(62) == 0 && s.lock == 1, "sio2 lock: with no waiter it is given back")
+	for _ in 0 ..< 0x50 {sio2(62)}
+	check(s.lock == iop.SIO2_LOCK_MAX, "sio2 lock: its count stops at 0x40")
+	check(sio2(63) == 0 && s.lock == iop.SIO2_LOCK_MAX - 1, "sio2 lock: 63 takes it")
+	for fno in ([9]u32{23, 24, 46, 47, 48, 49, 50, 26, 52}) {check(sio2(fno) == 0, "sio2 lock: a handshake call does nothing")}
+	check(s.lock == iop.SIO2_LOCK_MAX - 1, "sio2 lock: nor touches the lock")
+	r3000.state.r[4] = 0
+	_, ok := iop.sio2man_fn(53)
+	check(!ok, "sio2: 53 is not served")
+}
+
+snap14: core.Snapshot
+snap14_loaded: bool // not emulated state
+
+// "modr": its start gives sio2man's lock back (62) and returns.
+mod_r :: proc() -> []u8 {
+	a: Asm
+	sm := imports_v(&a, "sio2man", 0x0204, 62)
+	entry := at(&a)
+	prologue(&a)
+	jal(&a, sm)
+	li(&a, V0, 1) // NO_RESIDENT_END
+	epilogue(&a)
+	return build_mod("modr", &a, entry)
+}
+
+// "modl": thread H takes the lock twice, waiting the second time, then logs
+// 7. Its start makes and starts H; H's id at `th`.
+mod_l :: proc() -> (f: []u8, th, logp: u32) {
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	sm := imports_v(&a, "sio2man", 0x0204, 61)
+	logp = log_words(&a, 4)
+	th = at(&a)
+	put(&a, 0)
+	eh := at(&a)
+	prologue(&a)
+	jal(&a, sm)
+	jal(&a, sm)
+	log_v(&a, logp, 7)
+	epilogue(&a)
+	ph := thread_param(&a, eh, 10)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, ph, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+	return build_mod("modl", &a, entry), th, logp
+}
+
+// A thread waiting on the lock through a real pad2_transfer_init, as
+// test_event_snap: the snapshot keeps its .Lock wait and the lock's count.
+test_sio2_lock_snap :: proc() {
+	fresh()
+	f, th, logp := mod_l()
+	id, _ := iop.iop_load(f, "modl", nil)
+	base := module_base(id)
+	t := iop.th_find(iop.iop_u32(base + th)^)
+	check(id > 0 && log_equal(base, logp, {}) && t != nil && t.status == .Lock && iop.iop_sched.lock == 0, "sio2 lock snapshot: H waits on the lock")
+	core.snap_op, core.snap_target = .Save, &snap14
+	core.snap_yield()
+	if !snap14_loaded {
+		ids, _ := iop.iop_load(mod_r(), "modr", nil)
+		check(ids > 0 && log_equal(base, logp, {7}), "sio2 lock snapshot: 62 wakes H")
+		snap14_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap14
+		core.snap_yield()
+	}
+	t = iop.th_find(iop.iop_u32(base + th)^)
+	check(log_equal(base, logp, {}) && t != nil && t.status == .Lock && iop.iop_sched.lock == 0, "sio2 lock snapshot: H waits again after the load")
+	ids, _ := iop.iop_load(mod_r(), "modr", nil)
+	check(ids > 0 && log_equal(base, logp, {7}) && iop.iop_sched.lock == 0, "sio2 lock snapshot: the restored H wakes where it waited")
+}
+
+// A failed load's thread waiting on the lock goes with the load; a waiter
+// from before it keeps waiting, and the lock stays held.
+test_sio2_lock_undo :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	s.lock = 0
+	kept := lock_waiter(0).id
+	// "modq": starts thread T, of better priority than its start, which waits
+	// on the lock; then calls thevent 12, which the HLE lacks.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	te := imports(&a, "thevent", 12)
+	sm := imports_v(&a, "sio2man", 0x0204, 61)
+	th := at(&a)
+	put(&a, 0)
+	et := at(&a)
+	prologue(&a)
+	jal(&a, sm)
+	epilogue(&a)
+	pt := thread_param(&a, et, 4)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, pt, th)
+	call_word(&a, tb + 8, th)
+	jal(&a, te)
+	li(&a, V0, 0)
+	epilogue(&a)
+	n := len(s.threads)
+	id, _ := iop.iop_load(build_mod("modq", &a, entry), "modq", nil)
+	waiting := 0
+	for t in s.threads {if t.status == .Lock {waiting += 1}}
+	check(id == -1 && len(s.threads) == n && waiting == 1 && iop.th_find(kept).status == .Lock, "sio2 lock undo: T goes, the earlier waiter stays")
+	check(s.lock == 0, "sio2 lock undo: the lock stays held")
 }
 
 // sceSifSetCmdBuffer and sceSifAddCmdHandler fill the module's table and the
