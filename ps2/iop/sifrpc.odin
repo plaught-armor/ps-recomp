@@ -243,6 +243,7 @@ iop_rpc_call :: proc(a, sid: u32) -> bool {
 		rpc_lost(req)
 		return true
 	}
+	rpc_busy_check(q^, req)
 	copy(iop_ram_at(buf, req.size), iop_mem(req.server + 0x100, req.size))
 	s.reqs[s.n_reqs] = req
 	s.n_reqs += 1
@@ -253,6 +254,30 @@ iop_rpc_call :: proc(a, sid: u32) -> bool {
 	th_schedule(r3000.state.cycles + IOP_SLICE)
 	iop_wake_set()
 	return true
+}
+
+// A call to a server descriptor that already holds a request, which its
+// thread runs (on queue q) or has yet to: a compat row. Retail keeps one
+// request per descriptor, in the descriptor, and the EE writes its bytes to
+// the server's buffer when it sends, so the new call may overwrite what the
+// earlier one is still reading, or has yet to read. The bytes are copied all
+// the same, as the EE's write would land; both requests are kept and run in
+// order, which retail may not do. An EE client that waits for each RPC_END
+// before its next call never gets here: the reply is sent after the function
+// returns and the queue is free again before the EE runs. Two clients on one
+// sid, or one that does not wait, can.
+@(private = "file")
+rpc_busy_check :: proc(q: Iop_Rpc_Queue, req: Iop_Rpc_Req) {
+	held := q.busy && q.cur.sd == req.sd
+	for v in iop_rpc.reqs[:iop_rpc.n_reqs] {
+		if held {break}
+		held = v.sd == req.sd
+	}
+	if !held {return}
+	core.compat_unknown(.Iop_Rpc_Busy, req.sid, sub = req.fno, client = req.client)
+	if core.compat.calls[core.Compat_Key{.Iop_Rpc_Busy, req.sid, req.fno}].n == 1 {
+		fmt.eprintfln("iop: rpc %08x fno %d called while the server holds a request, its buffer possibly overwritten", req.sid, req.fno)
+	}
 }
 
 // Whether the `size` bytes of the EE's request fit the server's buffer at

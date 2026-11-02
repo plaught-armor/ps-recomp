@@ -1742,11 +1742,21 @@ test_rpc :: proc() {
 	check(core.compat.calls[row].n == 2 && call_ends(hsd, 13), "rpc: a reply past EE RAM is not copied, a row")
 	drop_replies()
 
-	// fno 2 waits in func; a call made meanwhile is queued behind it.
+	// Calls made one after another, each after the last one's RPC_END, as
+	// an EE client that waits makes them: the server never holds one when the
+	// next comes.
+	busy :: proc(fno: u32) -> u64 {return core.compat.calls[core.Compat_Key{.Iop_Rpc_Busy, RPC_SID, fno}].n}
+	check(busy(0) == 0 && busy(1) == 0, "rpc: calls one after another are no busy row")
+
+	// fno 2 waits in func; a call made meanwhile is queued behind it, with a
+	// busy row: retail's descriptor holds one request, and the EE's bytes
+	// land in the buffer fno 2 may still read.
 	call(20, 2, 4, 0, 0, hsd)
+	check(busy(2) == 0, "rpc: a call to an idle server is no busy row")
 	call(21, 1, 4, 0, 0, hsd)
 	want := []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4}
 	check(log_equal(b, logp, want) && len(iop.sif.replies) == 0 && s.n_reqs == 1 && s.queues[0].busy, "rpc: a call while func waits is queued, no RPC_END yet")
+	check(busy(1) == 1, "rpc: a call while func waits is a busy row")
 	core.snap_op, core.snap_target = .Save, &snap5
 	core.snap_yield()
 	if !snap5_loaded {
@@ -1762,6 +1772,14 @@ test_rpc :: proc() {
 	ids, _ := iop.iop_load(mod_s(), "mods", nil)
 	check(ids > 0 && log_equal(b, logp, {1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4}) && call_ends(hsd, 20, 21) && s.n_reqs == 0, "rpc: after the load both end as before")
 	drop_replies()
+
+	// A full queue: the call is lost with a row, no busy row, func not run.
+	for &v in s.reqs {v = {sid = 0x7e570000, sd = 1, qd = 1}}
+	s.n_reqs = iop.IOP_RPC_REQS
+	call(22, 5, 4, 0, 0, hsd)
+	check(core.compat.calls[{.Iop_Rpc, RPC_SID, 5}].n == 1 && busy(5) == 0 && len(iop.sif.replies) == 0 && s.n_reqs == iop.IOP_RPC_REQS, "rpc: a call past a full queue gets no RPC_END, a row")
+	check(log_equal(b, logp, {1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4}), "rpc: func does not run it")
+	s.n_reqs = 0
 
 	// A failed load whose threads registered RPC_SID2, and RPC_SID again,
 	// their descriptors and queues in modr's resident memory: the undo kills
@@ -3160,9 +3178,16 @@ test_sdr_thread :: proc() {
 	// behind it.
 	call(2, 0x9010, 8, EE_RECV, 4, hsd)
 	mem.wr32(EE_RECV + 0x10, 0xffffffff)
+	iop.iop_u32(hsd + 0x100)^ = 0x33
 	call(3, 0x80f0, 8, EE_RECV + 0x10, 4, hsd)
 	want := []u32{0x9003, 0x77, 0x9010, 0x77}
 	check(log_equal(b, logp, want) && len(iop.sif.replies) == 0 && s.n_reqs == 1 && mem.rd32(EE_RECV + 0x10) == 0xffffffff, "sdrdrv thread: a call while the handler waits is queued, no RPC_END yet")
+	// Not a call that waits for the last one's end: a busy row, and its bytes
+	// are in the buffer the handler is still reading, as the EE's write
+	// would put them on retail.
+	sbuf := iop.iop_u32(s.servers[0].sd + 8)^
+	check(core.compat.calls[{.Iop_Rpc_Busy, iop.SDR_SID, 0x80f0}].n == 1 && core.compat.calls[{.Iop_Rpc_Busy, iop.SDR_SID, 0x9010}].n == 0, "sdrdrv thread: a call while the handler waits is a busy row")
+	check(iop.iop_u32(sbuf)^ == 0x33, "sdrdrv thread: its bytes land in the buffer the handler reads")
 	core.snap_op, core.snap_target = .Save, &snap11
 	core.snap_yield()
 	if !snap11_loaded {

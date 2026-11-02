@@ -52,7 +52,9 @@ COMPAT_TOP :: 10
 // with no room); or, of an IOP module's RPC client (sifclient.odin), the
 // server id of a bind no EE server answered (function number 0xfffffffe), the
 // client and function number of a call refused, or the client and command of
-// an RPC_END with no packet out; Iop_Sdr an EE
+// an RPC_END with no packet out; Iop_Rpc_Busy the server id and function
+// number of an RPC to an IOP module's server that arrived while the server
+// held an earlier request, its buffer possibly overwritten; Iop_Sdr an EE
 // sdrdrv RPC whose IOP user command handler is set and was not run, the EE
 // answered 0; Iop_Timer the source and mode of an IOP hardware timer set
 // up to count what is not timed here; Iop_Timer_Intr the address of a timer
@@ -84,6 +86,7 @@ Compat_Call :: enum u8 {
 	Iop_Cd,
 	Iop_Io,
 	Iop_Rpc,
+	Iop_Rpc_Busy,
 	Iop_Sdr,
 	Iop_Timer,
 	Iop_Timer_Intr,
@@ -254,6 +257,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 		dev := transmute([4]u8)k.id
 		return fmt.tprintf("IOP ioman device %q", strings.truncate_to_byte(string(dev[:]), 0))
 	case .Iop_Rpc: return fmt.tprintf("IOP server %08x fno %d", k.id, i32(k.sub))
+	case .Iop_Rpc_Busy: return fmt.tprintf("IOP server %08x fno %d called while busy (possible overwrite)", k.id, i32(k.sub))
 	case .Iop_Sdr: return fmt.tprintf("IOP sdrdrv command %04x handler not run", k.id)
 	case .Iop_Timer: return fmt.tprintf("IOP timer source %d mode %d not timed", k.id, k.sub)
 	case .Iop_Timer_Intr: return fmt.tprintf("IOP timer handler %08x blocked", k.id)
