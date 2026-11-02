@@ -65,7 +65,8 @@
 // the counter; it counts as PCSX2's, clamping only at a step, an
 // exponential decrease rounding down, at shift 27 adding 1 and at step 3
 // 0, and a sweep steps on a voice not playing. A voice transfer runs its
-// channel's handler. Undecoded ids are compat rows; the loader's reset
+// channel's handler. A stopped voice still runs through its blocks and
+// raises the IRQ at IRQA. Undecoded ids are compat rows; the loader's reset
 // clears the handlers.
 //
 // cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
@@ -2969,6 +2970,22 @@ test_libsd :: proc() {
 	sd_call(17, 0, 0, b + adp, 0x5000, 32)
 	iop.iop_tick(cpu.state.cycles)
 	check(sd_word(0) == n0 + 4 && sd_word(1) == 0 && sd_word(2) == 5, "libsd: the transfer handler runs, a0 the channel")
+
+	// A stopped voice runs on through its blocks at its pitch, as PCSX2's
+	// MixVoice runs every voice for its IRQs: voice 0, keyed off with
+	// release rate 0 (0x7fff, 0x3fff, then 0 and stopped), still raises
+	// core 0's IRQ entering the block at IRQA, 0x5010, within one 56-sample
+	// pass of its two blocks.
+	sd_call(7, 0x1600, 1)
+	iop.spu_mix(out[:4])
+	check(!iop.spu_voice_status(0, 0).on && sd_call(6, 0x0500) == 0, "libsd: voice 0 keyed off stops, ENVX 0")
+	sd_call(11, 0x4, 1)
+	n1 := sd_word(0)
+	iop.spu_mix(make([]i32, 2 * 64, context.temp_allocator))
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2, "libsd: a stopped voice entering the block at IRQA raises the IRQ")
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n1 + 1 && sd_word(1) == 1 && sd_word(2) == 9, "libsd: and the SPU2 handler runs, a0 core 0's bit")
+	sd_call(11, 0x4, 0)
 
 	// GetSwitch: the masks as sceSdInit leaves them, LIBSD 1.5's four mixes
 	// all ones and PMON, NON 0, then as SetSwitch writes them, 24 bits, a

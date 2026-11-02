@@ -45,12 +45,11 @@ import r3000 "ps:psx/cpu"
 SPU_RAM_SIZE :: 2 << 20
 
 @(private = "file")
-Spu_Phase :: enum u8 {Attack, Decay, Sustain, Release}
+Spu_Phase :: enum u8 {Stopped, Attack, Decay, Sustain, Release}
 
 @(private = "file")
 Spu_Voice :: struct {
-	on:         bool,
-	phase:      Spu_Phase,
+	phase:      Spu_Phase, // Stopped: not playing (PCSX2's PHASE_STOPPED)
 	adsr1:      u32,
 	adsr2:      u32,
 	level:      i32, // envelope, 0..0x7fff
@@ -157,22 +156,27 @@ spu_voice :: proc(id: u32) -> ^Spu_Voice {
 	return &spu.voice[id & 1][min((id >> 1) & 31, 23)]
 }
 
-// Decode the block at v.nax, taking its loop start flag.
+// Enter the block at v.nax: take its loop flags (a loop start sets LSA),
+// decode it if the voice plays, and raise the IRQ if it is at IRQA. A
+// stopped voice's blocks are not decoded, its ADPCM history kept, as
+// PCSX2's DecodeSamples.
 @(private = "file")
 spu_block :: proc(v: ^Spu_Voice) {
 	F := [5][2]i32{{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}}
 	b := spu.ram[v.nax & (SPU_RAM_SIZE - 16):][:16]
-	shift := u32(b[0] & 15)
-	f := min(int(b[0] >> 4), 4)
 	v.flags = b[1]
 	if v.flags & 4 != 0 {v.lsa = v.nax}
-	for n in 0 ..< 28 {
-		nib := (b[2 + n / 2] >> (u32(n & 1) * 4)) & 15
-		s := i32(i16(u16(nib) << 12)) >> shift
-		s += (v.hist[0] * F[f][0] + v.hist[1] * F[f][1] + 32) >> 6
-		s = clamp(s, -32768, 32767)
-		v.hist[1], v.hist[0] = v.hist[0], s
-		v.pcm[n] = i16(s)
+	if v.phase != .Stopped {
+		shift := u32(b[0] & 15)
+		f := min(int(b[0] >> 4), 4)
+		for n in 0 ..< 28 {
+			nib := (b[2 + n / 2] >> (u32(n & 1) * 4)) & 15
+			s := i32(i16(u16(nib) << 12)) >> shift
+			s += (v.hist[0] * F[f][0] + v.hist[1] * F[f][1] + 32) >> 6
+			s = clamp(s, -32768, 32767)
+			v.hist[1], v.hist[0] = v.hist[0], s
+			v.pcm[n] = i16(s)
+		}
 	}
 	if spu.irq_watch != 0 {sd_irq_check(v)}
 }
@@ -269,7 +273,7 @@ spu_ram16 :: #force_inline proc(a: u32) -> i32 {
 
 @(private = "file")
 spu_start :: proc(v: ^Spu_Voice) {
-	v.on, v.endx = true, false
+	v.endx = false
 	v.phase, v.level, v.counter = .Attack, 0, 0
 	v.nax, v.lsa = v.ssa, v.ssa
 	v.idx, v.frac, v.last, v.hist = 0, 0, {}, {}
@@ -310,7 +314,9 @@ spu_env_step :: proc(level: ^i32, counter: ^u32, rate: u32, decrease, exponentia
 	}
 }
 
-// Advance the envelope one sample; a release that reaches zero stops the voice.
+// Advance the envelope of a playing voice one sample; a sustain or a
+// release that reaches zero stops the voice (PCSX2's V_ADSR::Calculate; its
+// decay stops at the sustain level, never 0). ENDX is left as it is.
 @(private = "file")
 spu_envelope :: proc(v: ^Spu_Voice) {
 	switch v.phase {
@@ -322,9 +328,11 @@ spu_envelope :: proc(v: ^Spu_Voice) {
 		if v.level <= i32((v.adsr1 & 15) + 1) * 0x800 {v.phase = .Sustain}
 	case .Sustain:
 		spu_env_step(&v.level, &v.counter, (v.adsr2 >> 6) & 0x7f, v.adsr2 & 0x4000 != 0, v.adsr2 & 0x8000 != 0)
+		if v.level == 0 {v.phase = .Stopped}
 	case .Release:
 		spu_env_step(&v.level, &v.counter, (v.adsr2 & 31) << 2, true, v.adsr2 & 0x20 != 0)
-		if v.level == 0 {v.on = false}
+		if v.level == 0 {v.phase = .Stopped}
+	case .Stopped:
 	}
 }
 
@@ -369,24 +377,26 @@ spu_sweep :: proc(x: ^Spu_Vol) {
 	}
 }
 
-// One sample of a playing voice, then advance it by its pitch.
+// One sample of a voice, then advance it by its pitch. A block with the end
+// flag sets ENDX and goes on at LSA; without the repeat flag the voice stops
+// there, its envelope at 0. A stopped voice advances all the same, through
+// its blocks' flags and the IRQ at IRQA, silent: PCSX2's MixVoice runs every
+// voice's address for its IRQs (its sample, of a stopped voice, unused).
 @(private = "file")
 spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 	s := gauss(v.last[0], v.last[1], v.last[2], i32(v.pcm[v.idx]), v.frac >> 4)
 	v.frac += v.pitch
-	for v.frac >= 0x1000 && v.on {
+	for v.frac >= 0x1000 {
 		v.frac -= 0x1000
 		v.last = {v.last[1], v.last[2], i32(v.pcm[v.idx])}
 		v.idx += 1
 		if v.idx < 28 {continue}
 		v.idx = 0
-		if v.flags & 1 != 0 {v.endx = true}
-		switch {
-		case v.flags & 1 == 0: v.nax += 16
-		case v.flags & 2 != 0: v.nax = v.lsa
-		case: // end without repeat: the voice stops, its envelope at 0
-			v.on, v.level = false, 0
-			return s
+		if v.flags & 1 == 0 {
+			v.nax += 16
+		} else {
+			v.endx, v.nax = true, v.lsa
+			if v.flags & 2 == 0 {v.phase, v.level = .Stopped, 0}
 		}
 		spu_block(v)
 	}
@@ -407,19 +417,20 @@ spu_mix :: proc(out: []i32) {
 		send: []i32
 		if wet {send = make([]i32, len(out), context.temp_allocator)}
 		for &v in core {
+			// A stopped voice still sweeps and advances (spu_sample); at
+			// pitch 0 with no sweep it has nothing to do.
 			sweeping := (v.vol[0].reg | v.vol[1].reg) & 0x8000 != 0
-			if !v.on && !sweeping {continue}
+			if v.phase == .Stopped && v.pitch == 0 && !sweeping {continue}
 			for n := 0; n < len(out); n += 2 {
 				spu_sweep(&v.vol[0])
 				spu_sweep(&v.vol[1])
-				if !v.on {
-					if sweeping {continue}
-					break
-				}
-				// The level before the sample: an end without repeat zeroes it.
-				level := v.level
-				s := spu_sample(&v) * level >> 15
-				if v.on {spu_envelope(&v)}
+				s := spu_sample(&v)
+				// An end without repeat in this sample stopped it, silent.
+				if v.phase == .Stopped {continue}
+				// The sample takes the envelope's level after this sample's
+				// step, as PCSX2's MixVoice: 0 if the step stopped it.
+				spu_envelope(&v)
+				s = s * v.level >> 15
 				sl, sr := s * v.vol[0].cur >> 15, s * v.vol[1].cur >> 15
 				acc[n] += sl
 				acc[n + 1] += sr
@@ -560,19 +571,19 @@ spu_effect_enable :: proc(core: int, on: bool) {
 	spu.effect[core] = on
 }
 
-// Key a voice off, as KOFF: its envelope goes to release, its counter
-// cleared (PCSX2's V_ADSR::Release).
+// Key a voice off, as KOFF: a playing voice's envelope goes to release, its
+// counter cleared; a stopped one stays stopped (PCSX2's V_ADSR::Release).
 spu_voice_off :: proc(core, voice: int) {
 	spu_release(spu_voice_at(core, voice))
 }
 
 @(private = "file")
 spu_release :: proc(v: ^Spu_Voice) {
-	v.phase, v.counter = .Release, 0
+	if v.phase != .Stopped {v.phase, v.counter = .Release, 0}
 }
 
 Spu_Status :: struct {
-	on:   bool, // playing (a release that reaches zero or an end without repeat stops it)
+	on:   bool, // playing (a sustain or release that reaches zero, or an end without repeat, stops it)
 	endx: bool, // ENDX: a block with the end flag has finished since key on
 	envx: u16, // ENVX: the envelope level, 0..0x7fff
 	nax:  u32, // NAX: the block playing, a byte address
@@ -581,7 +592,7 @@ Spu_Status :: struct {
 
 spu_voice_status :: proc(core, voice: int) -> Spu_Status {
 	v := spu_voice_at(core, voice)
-	return {on = v.on, endx = v.endx, envx = u16(v.level), nax = v.nax, lsax = v.lsa}
+	return {on = v.phase != .Stopped, endx = v.endx, envx = u16(v.level), nax = v.nax, lsax = v.lsa}
 }
 
 // libsd's calls on the voices, as both of its front ends take them: sdrdrv

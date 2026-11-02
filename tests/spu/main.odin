@@ -34,6 +34,7 @@ ONCE :: 0x2000 // plain, end without repeat
 SHORT :: 0x3000 // one block, end without repeat
 EFFECT :: 0x4000 // one block, end without repeat
 WIDE :: 0x5000 // one block looping on itself
+ENV :: 0x6000 // one block looping on itself
 SNAP :: 0x10000 // varied samples, end with repeat
 BLOCKS :: 3
 
@@ -131,7 +132,7 @@ voices :: proc() {
 	iop.spu_voice_on(1, 23, key(ONCE))
 	mix(56)
 	st = iop.spu_voice_status(1, 23)
-	check(!st.on && st.endx && st.nax == ONCE + 16, "end without repeat stops")
+	check(!st.on && st.endx && st.nax == ONCE, "end without repeat stops, NAX at LSA")
 	check(st.envx == 0, "end without repeat zeroes ENVX")
 	iop.spu_voice_on(1, 23, key(ONCE))
 	st = iop.spu_voice_status(1, 23)
@@ -142,8 +143,8 @@ voices :: proc() {
 	mix(56)
 	check(iop.spu_voice_status(0, 23).endx, "a one-shot on core 0 ends")
 
-	// Ends during a slow attack (rate 0x2c: +7 every sample): its last
-	// sample is still heard, and ENVX is 0 once it stops.
+	// Ends during a slow attack (rate 0x2c: +7 every sample): the sample in
+	// which it stops is silent, the one before heard, and ENVX is 0.
 	block(SHORT, 1, 1)
 	k := key(SHORT)
 	k.adsr1 = 0x2c00 | ADSR1 & 0xff
@@ -162,10 +163,65 @@ voices :: proc() {
 	e1, _ = iop.sd_get_switch(0x1701)
 	e0b, _ = iop.sd_get_switch(0x1700)
 	check(e1 == 0 && e0b == e0, "GetSwitch ENDX after it: the core's 0, the other's kept")
-	check(out[54] > 0, "last sample of a one-shot heard")
+	check(out[52] > 0 && out[54] == 0, "a one-shot's sample before its end heard, the end's silent")
 
 	edge: [8]u8
 	check(iop.spu_write(iop.SPU_RAM_SIZE - 4, edge[:]) == 4, "spu_write clipped at the end of sound RAM")
+}
+
+// The envelope steps and the sample takes its new level in the same sample,
+// as PCSX2's MixVoice applies V_ADSR::Calculate's value. Every sample of ENV
+// is 7 << 12 = 28672; the gauss weights at phase 0 (GAUSS[0], [0x100],
+// [0x1ff], [0xff]) are -1, 0x1307, 0x59b3, 0x12c7, so from the zeros before
+// key on the samples are 28672 * -1 >> 15 = -1, * 0x1306 >> 15 = 4261,
+// * 0x6cb9 >> 15 = 24353, then 28672 * 0x7f80 >> 15 = 28560 steady. Each
+// is times the level >> 15, then times VOLL's 0x7ffe >> 15. These values
+// follow the port's gauss, which sums the four products and rounds once
+// (gauss.odin). PCSX2's GetVoiceValues shifts each product before the sum,
+// so its steady sample is 28559: samples 0-2 match PCSX2 too, but PCSX2
+// gives 28556 at 0x7fff (the port 28557) and 14277 at 0x3fff (the port
+// 14278), in the release and the sustain checks below.
+envelope :: proc() {
+	block(ENV, 7, 7)
+	// Attack at rate 0, +0x3800 a sample: 0x3800, 0x7000, 0x7fff. The first
+	// sample takes 0x3800, not 0.
+	iop.spu_voice_on(0, 1, key(ENV))
+	out := mix(3)
+	check(out[0] == -1 && out[2] == 3727 && out[4] == 24350, fmt.tprintf("the first attack samples take the stepped level: %d %d %d", out[0], out[2], out[4]))
+	// Release at rate 0, -0x4000 a sample from 0x7fff: the first sample
+	// takes 0x3fff (28560 * 0x3fff >> 15 = 14279, 14278 at VOLL), the
+	// second 0 and the voice stops, one sample sooner than the level
+	// before the step gives.
+	mix(25)
+	iop.spu_voice_off(0, 1)
+	out = mix(1)
+	check(out[0] == 14278 && iop.spu_voice_status(0, 1).on, fmt.tprintf("release: the first sample takes 0x3fff: %d", out[0]))
+	out = mix(1)
+	st := iop.spu_voice_status(0, 1)
+	check(out[0] == 0 && !st.on && st.envx == 0, "release: the second is silent, the voice stopped")
+	// A sustain decreasing at rate 0 (ADSR2 0x4000): attack to 0x7fff over
+	// samples 0-2, decay (target 0x8000) to sustain in sample 3, its counter
+	// at 0x800, then 0x3fff in sample 4 and 0 in sample 5, which stops the
+	// voice as PCSX2's sustain at 0 does, ENDX untouched.
+	k := key(ENV)
+	k.adsr2 = 0x4000
+	iop.spu_voice_on(0, 1, k)
+	out = mix(6)
+	st = iop.spu_voice_status(0, 1)
+	check(out[6] == 28557 && out[8] == 14278 && out[10] == 0, fmt.tprintf("sustain decreases to 0: %d %d %d", out[6], out[8], out[10]))
+	check(!st.on && !st.endx && st.envx == 0, "sustain at 0 stops the voice, ENDX clear")
+	// Key off leaves a stopped voice stopped (PCSX2 keeps PHASE_STOPPED):
+	// no release, nothing heard.
+	iop.spu_voice_off(0, 1)
+	check(!iop.spu_voice_status(0, 1).on, "key off on a stopped voice leaves it stopped")
+	// Stopped, it runs on through its blocks silent: at the end of its block
+	// (sample 28) ENDX sets and NAX stays at LSA.
+	out = mix(23)
+	silent := true
+	for x in out {silent &&= x == 0}
+	st = iop.spu_voice_status(0, 1)
+	check(silent && !st.on && st.endx && st.nax == ENV, "a stopped voice runs on to its end block, silent, ENDX set")
+	iop.spu_voice_set(0, 1, 0, 0x3fff, 0x3fff)
 }
 
 // Mix n stereo samples onto a buffer already holding `base`, as the host's
@@ -513,6 +569,7 @@ block_trans :: proc() {
 
 game :: proc(_: rawptr) {
 	voices()
+	envelope()
 	wide()
 	master()
 	reverb_presets()
