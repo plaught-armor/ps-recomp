@@ -76,9 +76,12 @@ GAUSS := [0x200]i32 {
 }
 
 // Four consecutive samples, oldest first, at position `p` (the top 8 bits of
-// the fraction) between the second and third.
+// the fraction) between the second and third. Each product is shifted down
+// before the sum, as psx-spx gives it and PCSX2's GetVoiceValues takes it, so
+// each rounds toward minus infinity on its own: a constant 28672 at position
+// 0 gives 28559, where one shift of the sum gives 28560.
 @(private)
 gauss :: #force_inline proc "contextless" (s0, s1, s2, s3: i32, pos: u32) -> i32 {
 	p := pos & 0xff
-	return (s0 * GAUSS[0xff - p] + s1 * GAUSS[0x1ff - p] + s2 * GAUSS[0x100 + p] + s3 * GAUSS[p]) >> 15
+	return (s0 * GAUSS[0xff - p] >> 15) + (s1 * GAUSS[0x1ff - p] >> 15) + (s2 * GAUSS[0x100 + p] >> 15) + (s3 * GAUSS[p] >> 15)
 }

@@ -23,10 +23,11 @@
 // area it fills would. Each raises its transfer interrupt at every half of
 // its buffer. Without one, a core's input area in sound RAM plays dry at its
 // BVOL. A core with its IRQ enabled raises it
-// when a voice enters the block at its IRQA or the input area's read
-// (SPU_IN_BASE) reaches it, which libsd takes by disabling it. The layout,
-// the half-buffer interrupt and the input read are PCSX2 practice,
-// unverified on hardware.
+// when any voice of either core enters the block at its IRQA or is in the
+// block starting there, or the input area's read (SPU_IN_BASE) or output
+// areas' write (SPU_OUT_BASE) reaches it, which libsd takes by disabling
+// it. The layout, the half-buffer interrupt, the input read and the IRQ's
+// sources are PCSX2 practice, unverified on hardware.
 //
 // A port whose sound driver is its own HLE code, not sdrdrv, drives the same
 // voices through spu_write, spu_voice_on, spu_voice_set, spu_voice_off and
@@ -81,9 +82,9 @@ spu: struct {
 	block:  [2]Sdr_Block, // the block transfers, per channel
 	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
 	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
-	// The EE cycle at which the input area's read reaches IRQA, per core
-	// whose bit irq_watch has and whose IRQA is in the input area, else
-	// max(u64) (sd_in_arm).
+	// The EE cycle at which the input area's read or the output areas'
+	// write reaches IRQA, per core whose bit irq_watch has and whose IRQA
+	// is in those areas, else max(u64) (sd_in_arm).
 	in_irq: [2]u64,
 	bvol:   [2][2]i32, // BVOLL, BVOLR, the input area's volume, per core (libsd)
 	switches: [2][Spu_Switch]u32, // the voice masks sd_switch_extra keeps, 24 bits, per core
@@ -178,16 +179,20 @@ spu_block :: proc(v: ^Spu_Voice) {
 			v.pcm[n] = i16(s)
 		}
 	}
-	if spu.irq_watch != 0 {sd_irq_check(v)}
+	if spu.irq_watch != 0 {sd_irq_check(v, ~u32(15))}
 }
 
-// Raises the voice's core's IRQ if it is enabled and v.nax is the block at
-// its IRQA: when a voice enters that block.
+// Raises the IRQ of each core with its IRQ enabled whose IRQA, masked by
+// `mask`, is the block at v.nax: with ~15 any address in the block, as a
+// voice entering it reads its words in turn (PCSX2's IncrementNextA); with
+// ~0 only the block's start, as PCSX2's UpdateBlockHeader compares it with
+// every voice's block every sample. Either core's IRQ, the voice's own or
+// the other's: PCSX2 checks both for every voice's address.
 @(private = "file")
-sd_irq_check :: proc(v: ^Spu_Voice) {
-	c := u32(1 if uintptr(v) >= uintptr(&spu.voice[1][0]) else 0)
-	if spu.irq_watch & (1 << c) == 0 || v.nax &~ 15 != spu.irqa[c] &~ 15 {return}
-	sd_irq_raise(c)
+sd_irq_check :: proc(v: ^Spu_Voice, mask: u32) {
+	for c in u32(0) ..< 2 {
+		if spu.irq_watch & (1 << c) != 0 && spu.irqa[c] & mask == v.nax &~ 15 {sd_irq_raise(c)}
+	}
 }
 
 // Raises core c's IRQ, and takes it as libsd's interrupt handler does
@@ -217,8 +222,17 @@ sd_irq_raise :: proc(c: u32) {
 // IRQA in the area its refill clock. PCSX2 gated the read on ADMA in 2021
 // (c84e563) and took the gate out four days later (83fcd4b) as it broke a
 // game's sounds; it now zeroes the area when an ADMA is turned off.
+//
+// Below the input areas, from SPU_OUT_BASE, PCSX2 writes the cores' outputs
+// to sound RAM at that same position every sample (Mixer.cpp: voices 1 and
+// 3, the external input, each core's dry and wet sums), 0x200 samples
+// each, and a write at a core's IRQA raises its IRQ as a read does. They
+// are not written here, but an IRQA among them raises the IRQ at its write's
+// cycle all the same, on the input read's clock.
 @(private = "file")
 SPU_IN_BASE :: 0x4000
+@(private = "file")
+SPU_OUT_BASE :: 0x800
 
 // Input samples read by EE cycle t.
 @(private = "file")
@@ -226,14 +240,14 @@ spu_in_sample :: proc(t: u64) -> u64 {
 	return t * MIX_RATE / cpu.EE_CLOCK
 }
 
-// Sets core c's in_irq, the cycle of the first input read past now (the
-// IOP's clock) at its IRQA if its IRQ is enabled and IRQA is in the input
-// area, and the IOP's wake to match.
+// Sets core c's in_irq, the cycle of the first input read or output write
+// past now (the IOP's clock) at its IRQA if its IRQ is enabled and IRQA is
+// in the input or output areas, and the IOP's wake to match.
 @(private = "file")
 sd_in_arm :: proc(c: u32) {
 	spu.in_irq[c] = max(u64)
 	a := spu.irqa[c]
-	if spu.irq_watch & (1 << c) != 0 && a >= SPU_IN_BASE && a < SPU_IN_BASE + 0x1000 {
+	if spu.irq_watch & (1 << c) != 0 && a >= SPU_OUT_BASE && a < SPU_IN_BASE + 0x1000 {
 		// The first position not yet read at IRQA, read once spu_in_sample
 		// passes it, as sd_input_mix takes it.
 		k := spu_in_sample(r3000.state.cycles * IOP_EE_RATIO)
@@ -243,8 +257,8 @@ sd_in_arm :: proc(c: u32) {
 	iop_wake_set()
 }
 
-// Raises the IRQ of each core whose input read at IRQA is due by EE cycle
-// now.
+// Raises the IRQ of each core whose input read or output write at IRQA is
+// due by EE cycle now.
 sd_in_cross :: proc(now: u64) {
 	for c in u32(0) ..< 2 {
 		if spu.irq_watch & (1 << c) != 0 && spu.in_irq[c] <= now {sd_irq_raise(c)}
@@ -417,6 +431,13 @@ spu_mix :: proc(out: []i32) {
 		send: []i32
 		if wet {send = make([]i32, len(out), context.temp_allocator)}
 		for &v in core {
+			// Every sample, every voice's block start at IRQA raises the
+			// IRQ, stopped or at pitch 0 (PCSX2's UpdateBlockHeader). IRQA
+			// and the IRQ enables change only between passes, an IRQ raised
+			// only clears its enable, and a voice changes block only by
+			// entering one (spu_block checks it), so one check at the pass's
+			// start is that check's every sample.
+			if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(0))}
 			// A stopped voice still sweeps and advances (spu_sample); at
 			// pitch 0 with no sweep it has nothing to do.
 			sweeping := (v.vol[0].reg | v.vol[1].reg) & 0x8000 != 0
@@ -956,8 +977,8 @@ sd_block_cross :: proc(channel: u32, now: u64) -> bool {
 
 // When, in EE cycles, libsd's interrupts are due: at once (the IOP's clock)
 // while one is raised, else at the first half-buffer crossing of a block
-// transfer with a transfer handler or input read at an enabled IRQA;
-// max(u64) when none is.
+// transfer with a transfer handler or input read or output write at an
+// enabled IRQA; max(u64) when none is.
 sd_next_ee :: proc() -> u64 {
 	if iop_sd.pending != 0 {return r3000.state.cycles * IOP_EE_RATIO}
 	t := max(u64)

@@ -2987,6 +2987,66 @@ test_libsd :: proc() {
 	check(sd_word(0) == n1 + 1 && sd_word(1) == 1 && sd_word(2) == 9, "libsd: and the SPU2 handler runs, a0 core 0's bit")
 	sd_call(11, 0x4, 0)
 
+	// Every voice's block start at IRQA raises the IRQ the sample after IRQA
+	// is set, whatever the voice does there (PCSX2's UpdateBlockHeader):
+	// voice 2, keyed on at pitch 0 at 0x6000 with the IRQ off, raises core
+	// 0's once it is enabled at 0x6000; parked there, keyed off and stopped,
+	// it raises it again, and core 1's at 0x6000 too.
+	sd_call(17, 0, 0, b + adp, 0x6000, 32)
+	iop.iop_tick(cpu.state.cycles) // the transfer handler on channel 0
+	n2 := sd_word(0)
+	sd_call(9, 0x2044, 0x6000)
+	sd_call(5, 0x0204, 0)
+	sd_call(9, 0x1f00, 0x6000)
+	sd_call(7, 0x1500, 1 << 2)
+	iop.spu_mix(out[:2])
+	check(iop.iop_sd.pending == 0 && sd_call(10, 0x2244) == 0x6000, "libsd: voice 2 keyed on at IRQA with the IRQ off raises nothing")
+	sd_call(11, 0x4, 1)
+	iop.spu_mix(out[:2])
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2, "libsd: a pitch-0 voice at IRQA raises the IRQ the sample after it is enabled")
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n2 + 1 && sd_word(1) == 1, "libsd: the SPU2 handler runs, a0 core 0's bit")
+	sd_call(7, 0x1600, 1 << 2)
+	iop.spu_mix(out[:16])
+	check(!iop.spu_voice_status(0, 2).on && sd_call(10, 0x2244) == 0x6000 && iop.iop_sd.pending == 0, "libsd: voice 2 keyed off stops, parked at 0x6000")
+	sd_call(11, 0x4, 1)
+	iop.spu_mix(out[:2])
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2, "libsd: a stopped pitch-0 voice at IRQA raises the IRQ the sample after it is enabled")
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n2 + 2 && sd_word(1) == 1, "libsd: and the SPU2 handler runs, a0 core 0's bit")
+	sd_call(9, 0x1f01, 0x6000)
+	sd_call(11, 0x5, 1)
+	iop.spu_mix(out[:2])
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2 << 1, "libsd: a core 0 voice at core 1's IRQA raises core 1's IRQ")
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n2 + 3 && sd_word(1) == 2, "libsd: the SPU2 handler runs, a0 core 1's bit")
+
+	// A voice playing in the block at IRQA raises the IRQ once it is
+	// enabled there mid-block, not at its next block: voice 2 at pitch
+	// 0x1000, 8 samples into the block at 0x6000.
+	sd_call(5, 0x0204, 0x1000)
+	sd_call(7, 0x1500, 1 << 2)
+	iop.spu_mix(out[:8])
+	check(iop.spu_voice_status(0, 2).on && sd_call(10, 0x2244) == 0x6000 && iop.iop_sd.pending == 0, "libsd: voice 2 plays mid-block at 0x6000, the IRQ off")
+	sd_call(11, 0x4, 1)
+	iop.spu_mix(out[:2])
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2, "libsd: enabled mid-block at the playing voice's block, the IRQ is raised")
+	iop.iop_tick(cpu.state.cycles)
+	check(sd_word(0) == n2 + 4, "libsd: and the SPU2 handler runs")
+	sd_call(7, 0x1600, 1 << 2)
+	sd_call(5, 0x0204, 0)
+	iop.spu_mix(out[:16])
+
+	// IRQA in the output areas below the input areas, written every sample
+	// (PCSX2's spu2M_WriteFast), raises the IRQ on the input read's clock:
+	// core 0's at 0x800 within one pass of 0x200 samples.
+	sd_call(9, 0x1f00, 0x800)
+	sd_call(11, 0x4, 1)
+	out_due := iop.iop_wake_ee
+	check(out_due > r3000.state.cycles * 8 && out_due <= r3000.state.cycles * 8 + 0x201 * SAMPLE, "libsd: an enabled IRQA in the output area wakes the IOP within a pass")
+	iop.iop_tick(out_due)
+	check(sd_word(0) == n2 + 5 && sd_word(1) == 1, "libsd: the write at IRQA runs the SPU2 handler, a0 core 0's bit")
+
 	// GetSwitch: the masks as sceSdInit leaves them, LIBSD 1.5's four mixes
 	// all ones and PMON, NON 0, then as SetSwitch writes them, 24 bits, a
 	// core each. An id's other low bits are ignored, as LIBSD 1.5 takes

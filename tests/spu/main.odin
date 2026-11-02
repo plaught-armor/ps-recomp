@@ -35,6 +35,7 @@ SHORT :: 0x3000 // one block, end without repeat
 EFFECT :: 0x4000 // one block, end without repeat
 WIDE :: 0x5000 // one block looping on itself
 ENV :: 0x6000 // one block looping on itself
+INTERP :: 0x7000 // one block of varied samples looping on itself
 SNAP :: 0x10000 // varied samples, end with repeat
 BLOCKS :: 3
 
@@ -173,14 +174,13 @@ voices :: proc() {
 // as PCSX2's MixVoice applies V_ADSR::Calculate's value. Every sample of ENV
 // is 7 << 12 = 28672; the gauss weights at phase 0 (GAUSS[0], [0x100],
 // [0x1ff], [0xff]) are -1, 0x1307, 0x59b3, 0x12c7, so from the zeros before
-// key on the samples are 28672 * -1 >> 15 = -1, * 0x1306 >> 15 = 4261,
-// * 0x6cb9 >> 15 = 24353, then 28672 * 0x7f80 >> 15 = 28560 steady. Each
-// is times the level >> 15, then times VOLL's 0x7ffe >> 15. These values
-// follow the port's gauss, which sums the four products and rounds once
-// (gauss.odin). PCSX2's GetVoiceValues shifts each product before the sum,
-// so its steady sample is 28559: samples 0-2 match PCSX2 too, but PCSX2
-// gives 28556 at 0x7fff (the port 28557) and 14277 at 0x3fff (the port
-// 14278), in the release and the sustain checks below.
+// key on the samples are 28672 * -1 >> 15 = -1, then 28672 * 0x1307 >> 15
+// = 4262 plus that -1, 4261, then 28672 * 0x59b3 >> 15 = 20092 more, 24353,
+// then 28672 * 0x12c7 >> 15 = 4206 more, 28559 steady: each product is
+// shifted before the sum, as PCSX2's GetVoiceValues does (one shift of the
+// sum gives 28560). Each is times the level >> 15, then times VOLL's 0x7ffe
+// >> 15: 28559 at 0x7fff gives 28558, then 28556; at 0x3fff 14278, then
+// 14277.
 envelope :: proc() {
 	block(ENV, 7, 7)
 	// Attack at rate 0, +0x3800 a sample: 0x3800, 0x7000, 0x7fff. The first
@@ -189,13 +189,13 @@ envelope :: proc() {
 	out := mix(3)
 	check(out[0] == -1 && out[2] == 3727 && out[4] == 24350, fmt.tprintf("the first attack samples take the stepped level: %d %d %d", out[0], out[2], out[4]))
 	// Release at rate 0, -0x4000 a sample from 0x7fff: the first sample
-	// takes 0x3fff (28560 * 0x3fff >> 15 = 14279, 14278 at VOLL), the
+	// takes 0x3fff (28559 * 0x3fff >> 15 = 14278, 14277 at VOLL), the
 	// second 0 and the voice stops, one sample sooner than the level
 	// before the step gives.
 	mix(25)
 	iop.spu_voice_off(0, 1)
 	out = mix(1)
-	check(out[0] == 14278 && iop.spu_voice_status(0, 1).on, fmt.tprintf("release: the first sample takes 0x3fff: %d", out[0]))
+	check(out[0] == 14277 && iop.spu_voice_status(0, 1).on, fmt.tprintf("release: the first sample takes 0x3fff: %d", out[0]))
 	out = mix(1)
 	st := iop.spu_voice_status(0, 1)
 	check(out[0] == 0 && !st.on && st.envx == 0, "release: the second is silent, the voice stopped")
@@ -208,7 +208,7 @@ envelope :: proc() {
 	iop.spu_voice_on(0, 1, k)
 	out = mix(6)
 	st = iop.spu_voice_status(0, 1)
-	check(out[6] == 28557 && out[8] == 14278 && out[10] == 0, fmt.tprintf("sustain decreases to 0: %d %d %d", out[6], out[8], out[10]))
+	check(out[6] == 28556 && out[8] == 14277 && out[10] == 0, fmt.tprintf("sustain decreases to 0: %d %d %d", out[6], out[8], out[10]))
 	check(!st.on && !st.endx && st.envx == 0, "sustain at 0 stops the voice, ENDX clear")
 	// Key off leaves a stopped voice stopped (PCSX2 keeps PHASE_STOPPED):
 	// no release, nothing heard.
@@ -221,6 +221,34 @@ envelope :: proc() {
 	for x in out {silent &&= x == 0}
 	st = iop.spu_voice_status(0, 1)
 	check(silent && !st.on && st.endx && st.nax == ENV, "a stopped voice runs on to its end block, silent, ENDX set")
+	iop.spu_voice_set(0, 1, 0, 0x3fff, 0x3fff)
+}
+
+// The gaussian interpolation shifts each of its four products down before
+// it sums them, so each rounds toward minus infinity on its own (PCSX2's
+// GetVoiceValues, psx-spx). INTERP's samples, filter 0 and shift 0, are its
+// nibbles << 12: 4096, 28672, -28672, 12288, -4096, 8192, -32768, ...; at
+// pitch 0x800 a sample sits at position 0 then 0x80 between the same four.
+// Sample 6, position 0, takes 4096, 28672, -28672, 12288: 4096 * 0x12c7 >>
+// 15 = 600, 28672 * 0x59b3 >> 15 = 20092, -28672 * 0x1307 >> 15 = -4263,
+// 12288 * -1 >> 15 = -1, 16428 (one shift of the sum: 16431). Sample 7,
+// position 0x80, the same four at 0x19c, 0x3def, 0x3e4c, 0x1a8: 51, 13873,
+// -13955, 159, 128 (one shift: 129). Sample 12, position 0, 12288, -4096,
+// 8192, -32768: 1802, -2871, 1217, 1, 149 (one shift: 151). Each is then
+// times level 0x7fff >> 15 and VOLL's 0x7ffe >> 15: 16425, 126, 147.
+interp :: proc() {
+	b: [16]u8
+	b[1] = 7
+	nibs := [14]u8{1, 7, 9, 3, 15, 2, 8, 5, 12, 6, 4, 14, 0, 11}
+	for k in 0 ..< 14 {b[2 + k] = nibs[k % 7 * 2] | nibs[k % 7 * 2 + 1] << 4}
+	check(iop.spu_write(INTERP, b[:]) == 16, "spu_write block")
+	k := key(INTERP)
+	k.pitch = 0x800
+	iop.spu_voice_on(0, 1, k)
+	out := mix(13)
+	check(out[12] == 16425 && out[14] == 126 && out[24] == 147, fmt.tprintf("gauss rounds each product: %d %d %d", out[12], out[14], out[24]))
+	iop.spu_voice_off(0, 1)
+	mix(4)
 	iop.spu_voice_set(0, 1, 0, 0x3fff, 0x3fff)
 }
 
@@ -277,8 +305,9 @@ wide :: proc() {
 	check(!st.on && st.envx == 0, "pitch 0 envelope releases to zero")
 }
 
-// A loud voice's output before master volume existed (8a73a97).
-PRE_MASTER :: 28557
+// A loud voice's output with no master volume set: 28559 at level 0x7fff
+// and VOLL 0x7ffe (envelope).
+PRE_MASTER :: 28556
 
 // MVOLL and MVOLR scale a core's output, in the format of a voice volume.
 master :: proc() {
@@ -570,6 +599,7 @@ block_trans :: proc() {
 game :: proc(_: rawptr) {
 	voices()
 	envelope()
+	interp()
 	wide()
 	master()
 	reverb_presets()
