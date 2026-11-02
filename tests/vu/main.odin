@@ -19,6 +19,11 @@
 // write that changes the compiled code makes the next start miss it and
 // interpret.
 //
+// Then the flag delay: a micro-mode FMAND, FCGET or FSAND sees the MAC, clip
+// and status as they were after the pair four executed pairs back (a branch
+// counts the pairs run, not their addresses), except the sticky status bits,
+// which it sees at once. A new program starts with the flags as they are.
+//
 // Then VIF i-bits: a code with bit 31 runs, raises its VIF's INTC once and
 // stalls the VIF; what follows, in that transfer or later ones, waits until
 // FBRST.STC, then runs. With VIF_ERR.MII set an i-bit does nothing.
@@ -298,6 +303,66 @@ feed :: proc(vif: ^vu.Vif, code: ..u32) {
 	vu.vif_feed(vif, ([^]u8)(raw_data(w))[:len(w) * 4])
 }
 
+// Each pair as lower, upper.
+@(private = "file")
+put_pairs :: proc(addr: u32, pairs: ..[2]u32) {
+	for p, k in pairs {
+		put(addr + u32(k) * 8, p[0])
+		put(addr + u32(k) * 8 + 4, p[1])
+	}
+}
+
+@(private = "file")
+flag_delay :: proc() {
+	NOP_L :: 0x8000033c
+	NOP_U :: 0x000002ff
+	E :: 1 << 30
+	ADD_3_1_2 :: 0xf << 21 | 2 << 16 | 1 << 11 | 3 << 6 | 0x28 // VADD.xyzw vf3, vf1, vf2
+	CLIP_1_2 :: 0xe << 21 | 2 << 16 | 1 << 11 | 0x1ff // VCLIPw.xyz vf1, vf2
+	fmand :: proc(t: u32) -> u32 {return 0x1a << 25 | t << 16 | 2 << 11} // FMAND vi<t>, vi2
+	fcget :: proc(t: u32) -> u32 {return 0x1c << 25 | t << 16}
+	fsand :: proc(t: u32) -> u32 {return 0x16 << 25 | t << 16 | 0x82} // FSAND vi<t>, S | SS
+	v := &vu.vu0
+	call := proc(v: ^vu.Vu, addr: u32) {
+		v.vf[1].f = {-1, -2, -3, -4}
+		v.vf[2].f = {0, 0, 0, 0.5}
+		v.vi = {}
+		v.vi[2] = 0xffff
+		v.mac, v.status, v.clip = 0, 0, 0
+		vu.vu_op(v, 0x4a000038 | (addr / 8) << 6) // VCALLMS
+	}
+	// The ADD sets the four sign bits of MAC (0xf0) and status S and SS; the
+	// CLIP sets the three minus bits (0x2a).
+	put_pairs(0x200, {NOP_L, ADD_3_1_2}, {fmand(1), NOP_U}, {fsand(3), CLIP_1_2}, {fmand(4), NOP_U}, {fmand(5), NOP_U}, {fcget(6), NOP_U}, {fcget(7), NOP_U | E}, {fsand(8), NOP_U})
+	call(v, 0x200)
+	want := [?][2]u16{{1, 0}, {3, 0x80}, {4, 0}, {5, 0xf0}, {6, 0}, {7, 0x2a}, {8, 0x82}}
+	for w in want {if v.vi[w[0]] != w[1] {fail("flag delay: vi%d = %x, want %x", w[0], v.vi[w[0]], w[1])}}
+
+	// B over a pair: the FMAND after it is the third pair run after the ADD.
+	B_2 :: 0x20 << 25 | 2 // B +2
+	put_pairs(0x300, {NOP_L, ADD_3_1_2}, {B_2, NOP_U}, {NOP_L, NOP_U}, {fmand(9), NOP_U}, {fmand(4), NOP_U}, {fmand(5), NOP_U | E}, {NOP_L, NOP_U})
+	call(v, 0x300)
+	if v.vi[9] != 0 || v.vi[4] != 0 || v.vi[5] != 0xf0 {fail("flag delay over a branch: vi9 %x vi4 %x vi5 %x, want 0 0 f0", v.vi[9], v.vi[4], v.vi[5])}
+
+	// A new program sees the flags the last one (or the EE) left at once.
+	put_pairs(0x400, {fmand(1), NOP_U | E}, {NOP_L, NOP_U})
+	v.mac = 0x1234
+	v.vi[1], v.vi[2] = 0, 0xffff
+	vu.vu_op(v, 0x4a000038 | (0x400 / 8) << 6)
+	if v.vi[1] != 0x1234 {fail("flag delay at a program's start: vi1 = %x, want 1234", v.vi[1])}
+
+	// VU1 delays its MAC too.
+	vu.vu1.vf[1].f = {-1, -2, -3, -4}
+	vu.vu1.vf[2] = {}
+	vu.vu1.vi = {}
+	vu.vu1.vi[2] = 0xffff
+	vu.vu1.mac = 0
+	code := [?]u32{NOP_L, ADD_3_1_2, fmand(4), NOP_U, NOP_L, NOP_U, fmand(3), NOP_U, fmand(5), NOP_U | E, NOP_L, NOP_U}
+	mpg(&vu.vifs[1], code[:])
+	vu.vu1_start(0)
+	if vu.vu1.vi[4] != 0 || vu.vu1.vi[3] != 0 || vu.vu1.vi[5] != 0xf0 {fail("VU1 flag delay: vi4 %x vi3 %x vi5 %x, want 0 0 f0", vu.vu1.vi[4], vu.vu1.vi[3], vu.vu1.vi[5])}
+}
+
 @(private = "file")
 ibit :: proc() {
 	v := &vu.vifs[1]
@@ -350,6 +415,7 @@ main :: proc() {
 	minmax()
 	vu0_compiled()
 	micro_writes()
+	flag_delay()
 	ibit()
 	fmt.println("vu: ok")
 }

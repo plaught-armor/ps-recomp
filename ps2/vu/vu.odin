@@ -2,7 +2,22 @@
 // instructions issued by the EE).
 //
 // VU floats are IEEE singles without infinities or NaNs, clamped like the
-// FPU. MAC/status flags are not tracked yet.
+// FPU. MAC, status and clip flags are kept as vu_put_flags, vu_div_flags
+// and CLIP set them.
+//
+// In micro mode a flag read sees the flags four pairs late: the FMAC
+// pipeline writes them four cycles after an op issues, so FMAND, FCAND,
+// FSAND and the rest at pair n see the flags as they were after pair n-4.
+// Programs rely on it: one computes a vertex's facing from the MAC of an
+// op whose MAC a later op has overwritten by the time the read runs. Vu
+// keeps the three older values each flag passed through (old_mac and the
+// rest), shifted once per pair by every backend (vu_flags_shift), and the
+// reads take the oldest. Sticky status bits (6-11) are read as they are
+// now. Stalls are not modelled: hardware holds a pair whose operand an
+// earlier FMAC op has not yet written, which moves later flags into the
+// window, and FDIV, EFU and integer waits likewise; VU_STALL_COUNT counts
+// the reads such a stall could reach. Macro mode reads the newest flags:
+// CFC2 waits for the pipeline to drain.
 package ps2_vu
 
 import "base:runtime"
@@ -31,6 +46,12 @@ Vu :: struct {
 	clip:   u32,
 	status: u32,
 	mac:    u32,
+	// Each flag after the pair before last, two before, and three before:
+	// [2] is what a flag read in micro mode sees. Seeded with the newest
+	// flags when a microprogram starts.
+	old_mac:    [3]u32,
+	old_status: [3]u32,
+	old_clip:   [3]u32,
 	fbrst:  u32,
 	tpc:    u32,
 	cmsar:  u32,
@@ -642,6 +663,11 @@ vu_options :: proc() {
 vu_stats_print :: proc() {
 	if vu0_stats {micro_stats_print(0, vu0_table.programs[:])}
 	if vu1_stats {micro_stats_print(1, vu1_table.programs[:])}
+	when VU_STALL_COUNT {
+		for st, k in vu_stalls {
+			fmt.eprintfln("vu%d: %d flag reads, %d with an FMAC stall in their window", k, st.reads, st.stalled)
+		}
+	}
 }
 
 @(private)
@@ -654,7 +680,8 @@ micro_stats_print :: proc(unit: int, programs: []^Vu_Program) {
 }
 
 // Run a VU1 microprogram to its E bit. The VU runs synchronously with the
-// EE, without pipeline timing: results are visible to the next pair.
+// EE, without pipeline timing: results are visible to the next pair, and
+// flags to reads four pairs on (the header).
 vu1_start :: proc(addr: u32) {
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU1, t)
@@ -686,6 +713,7 @@ vu1_exec :: proc(addr: u32, compiled: bool) {
 micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: []Vu_Pair_Info, addr: u32, compiled: bool) -> (pc: u32, ended: bool) #no_bounds_check {
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc = addr & mask
+	vu_flags_seed(v)
 	if t.stop_gen != gen^ {
 		t.stop_gen = gen^
 		t.stop = t.compiled
@@ -768,12 +796,15 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		}
 		taken: bool
 		dst: u32
+		when VU_STALL_COUNT {vu_stall_count(v, uw, lw)}
+		pre := [3]u32{v.mac, v.status, v.clip}
 		if info.serial {
 			vu_op(v, uw)
 			taken, dst = vu_lower(v, lw, pc)
 		} else {
 			taken, dst = vu_pair(v, uw, lw, pc)
 		}
+		vu_flags_shift(v, pre)
 		if jumping { // that was the delay slot
 			next = target & mask
 			jumping = false
@@ -788,6 +819,63 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		if !jumping && !ending && int(pc / 8) < len(stop) && stop[pc / 8] {break}
 	}
 	return pc, false
+}
+
+// A microprogram starts with the pipeline drained: every older flag is the
+// newest.
+@(private)
+vu_flags_seed :: proc "contextless" (v: ^Vu) {
+	v.old_mac = v.mac
+	v.old_status = v.status
+	v.old_clip = v.clip
+}
+
+// After a pair, which started with flags pre (MAC, status, clip): each
+// flag's older values move back one. Every backend does this once per pair;
+// compiled code only for the values a later read or an exit can see.
+@(private)
+vu_flags_shift :: #force_inline proc "contextless" (v: ^Vu, pre: [3]u32) {
+	v.old_mac = {pre[0], v.old_mac[0], v.old_mac[1]}
+	v.old_status = {pre[1], v.old_status[0], v.old_status[1]}
+	v.old_clip = {pre[2], v.old_clip[0], v.old_clip[1]}
+}
+
+// -define:VU_STALL_COUNT=true counts, per VU, the flag reads the
+// interpreter runs (VUNOCOMP=1 sends every pair there) and those whose
+// window holds an FMAC stall, which the four-pair delay does not model: a
+// pair reading a VF register an upper op of one of the three pairs before
+// it writes, at that pair or one of the three before. Registers, not
+// lanes, and every fs and ft field counts as read, so it is an upper bound.
+VU_STALL_COUNT :: #config(VU_STALL_COUNT, false)
+
+@(private)
+Vu_Stalls :: struct {
+	dests:          [3]u32, // the VF register each of the last three upper ops wrote, newest first
+	window:         u8, // bit k: the pair k back stalled
+	reads, stalled: u64,
+}
+@(private)
+vu_stalls: [2]Vu_Stalls
+
+@(private)
+vu_stall_count :: proc(v: ^Vu, uw, lw: u32) {
+	st := &vu_stalls[v == &vu0 ? 0 : 1]
+	ibit := uw & (1 << 31) != 0
+	waits :: proc(st: ^Vu_Stalls, r: u32) -> bool {
+		return r != 0 && (st.dests[0] == r || st.dests[1] == r || st.dests[2] == r)
+	}
+	stall := uw & 0x7ff != 0x2ff && (waits(st, (uw >> 11) & 31) || waits(st, (uw >> 16) & 31))
+	if !ibit && (lw >> 25 == 0x01 || (lw >> 25 == 0x40 && lw & 63 >= 0x3c)) {
+		stall ||= waits(st, (lw >> 11) & 31) || (lw >> 25 == 0x40 && waits(st, (lw >> 16) & 31))
+	}
+	st.window = (st.window << 1 | u8(stall)) & 0xf
+	switch lw >> 25 {
+	case 0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c:
+		if ibit {break}
+		st.reads += 1
+		if st.window != 0 {st.stalled += 1}
+	}
+	st.dests = {vu_upper_dest(uw), st.dests[0], st.dests[1]}
 }
 
 // VUCHECK: run the interpreter, then the compiled code from the same
@@ -859,9 +947,12 @@ vu0_lower :: proc(lw, pc: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_lower[lw >> 25 == 0x40 ? 128 + cpu.cop2_key(lw) : lw >> 25] += 1}
 	vu_lower(&vu0, lw, pc)
 }
+// A whole pair, so these shift the flags too, as vu_interp does.
 vu0_pair :: proc(uw, lw, pc: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0_pair += 1}
+	pre := [3]u32{vu0.mac, vu0.status, vu0.clip}
 	vu_pair(&vu0, uw, lw, pc)
+	vu_flags_shift(&vu0, pre)
 }
 vu1_upper :: proc(uw: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu1_upper[cpu.cop2_key(uw)] += 1}
@@ -873,7 +964,9 @@ vu1_lower :: proc(lw, pc: u32) {
 }
 vu1_pair :: proc(uw, lw, pc: u32) {
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu1_pair += 1}
+	pre := [3]u32{vu1.mac, vu1.status, vu1.clip}
 	vu_pair(&vu1, uw, lw, pc)
+	vu_flags_shift(&vu1, pre)
 }
 
 // What decoding a pair tells the interpreter, cached per micro address and
@@ -971,6 +1064,10 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 	vi := &v.vi
 	branch := pc + 8 + u32(i32(i16(imm11))) * 8
 	set_vi :: #force_inline proc(vi: ^[16]u16, n: u32, x: u16) #no_bounds_check {if n != 0 {vi[n & 15] = x}}
+	// The flag reads see the flags after the pair four back (the header);
+	// FSSET and the sticky status bits act on the newest.
+	clip, mac := v.old_clip[2], v.old_mac[2]
+	status := (v.old_status[2] & 0x3f) | (v.status & 0xfc0)
 	switch w >> 25 {
 	case 0x00: // LQ
 		q := vu_mem_q(v, vi[is] + imm11)
@@ -988,18 +1085,18 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {q[k] = u32(vi[it])}}
 	case 0x08: set_vi(vi, it, vi[is] + imm15) // IADDIU
 	case 0x09: set_vi(vi, it, vi[is] - imm15) // ISUBIU
-	case 0x10: vi[1] = u16(v.clip & 0xffffff == imm24) // FCEQ
+	case 0x10: vi[1] = u16(clip & 0xffffff == imm24) // FCEQ
 	case 0x11: v.clip = imm24 // FCSET
-	case 0x12: vi[1] = u16(v.clip & imm24 != 0) // FCAND
-	case 0x13: vi[1] = u16((v.clip | imm24) & 0xffffff == 0xffffff) // FCOR
-	case 0x14: set_vi(vi, it, u16(v.status & 0xfff == imm12)) // FSEQ
+	case 0x12: vi[1] = u16(clip & imm24 != 0) // FCAND
+	case 0x13: vi[1] = u16((clip | imm24) & 0xffffff == 0xffffff) // FCOR
+	case 0x14: set_vi(vi, it, u16(status & 0xfff == imm12)) // FSEQ
 	case 0x15: v.status = (v.status & 0x3f) | (imm12 & 0xfc0) // FSSET
-	case 0x16: set_vi(vi, it, u16(v.status & imm12)) // FSAND
-	case 0x17: set_vi(vi, it, u16((v.status | imm12) & 0xfff == 0xfff)) // FSOR
-	case 0x18: set_vi(vi, it, u16(v.mac & 0xffff == u32(vi[is]))) // FMEQ
-	case 0x1a: set_vi(vi, it, u16(v.mac) & vi[is]) // FMAND
-	case 0x1b: set_vi(vi, it, u16((v.mac | u32(vi[is])) & 0xffff == 0xffff)) // FMOR
-	case 0x1c: set_vi(vi, it, u16(v.clip & 0xfff)) // FCGET
+	case 0x16: set_vi(vi, it, u16(status & imm12)) // FSAND
+	case 0x17: set_vi(vi, it, u16((status | imm12) & 0xfff == 0xfff)) // FSOR
+	case 0x18: set_vi(vi, it, u16(mac & 0xffff == u32(vi[is]))) // FMEQ
+	case 0x1a: set_vi(vi, it, u16(mac) & vi[is]) // FMAND
+	case 0x1b: set_vi(vi, it, u16((mac | u32(vi[is])) & 0xffff == 0xffff)) // FMOR
+	case 0x1c: set_vi(vi, it, u16(clip & 0xfff)) // FCGET
 	case 0x20: return true, branch // B
 	case 0x21: // BAL
 		set_vi(vi, it, u16((pc + 16) / 8))

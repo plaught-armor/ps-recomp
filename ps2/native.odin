@@ -43,6 +43,9 @@ import vu "vu"
 #assert(offset_of(vu.Vu, clip) - offset_of(vu.Vu, vf) == 576)
 #assert(offset_of(vu.Vu, status) - offset_of(vu.Vu, vf) == 580)
 #assert(offset_of(vu.Vu, mac) - offset_of(vu.Vu, vf) == 584)
+#assert(offset_of(vu.Vu, old_mac) - offset_of(vu.Vu, vf) == 588)
+#assert(offset_of(vu.Vu, old_status) - offset_of(vu.Vu, vf) == 600)
+#assert(offset_of(vu.Vu, old_clip) - offset_of(vu.Vu, vf) == 612)
 
 // bc_cond for native code, which reads a 32-bit result.
 @(private = "file")
