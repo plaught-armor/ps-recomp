@@ -219,12 +219,16 @@ sd_intr_run :: proc(now: u64) {
 			sd_intr(h, c)
 		}
 	}
+	sd_in_cross(now)
 	p := s.pending
 	s.pending = 0
 	for c in u32(0) ..< 2 {
 		if p & (SD_PENDING_TRANS << c) != 0 && s.trans[c].func != 0 {sd_intr(s.trans[c], c)}
-		if p & (SD_PENDING_SPU2 << c) != 0 && s.spu2.func != 0 {sd_intr(s.spu2, 1 << c)}
 	}
+	// One call for the cores raised, a0 a bit each, as libsd's handler
+	// passes them (ps2sdk's freesd, Spu2Interrupt).
+	cores := u32(p / SD_PENDING_SPU2) & 3
+	if cores != 0 && s.spu2.func != 0 {sd_intr(s.spu2, cores)}
 }
 
 // Runs handler h with a0 `a0` and a1 its argument; one that waits is

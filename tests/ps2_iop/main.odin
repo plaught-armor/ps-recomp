@@ -46,16 +46,23 @@
 // another. The loader's reset kills it.
 //
 // libsd: a block transfer libsd starts plays its buffer de-interleaved from
-// the ADMA layout, wrapping when it loops, silent once stopped. Its transfer
+// the ADMA layout at its core's BVOL, wrapping when it loops, silent once
+// stopped or at BVOL 0. Its transfer
 // handler runs at each half of the buffer (and a one-shot's end, not past
 // it), with a0 the channel, the EE's wake set to the crossing and the thread
 // it signals running after it; one started inside its buffer crosses at the
 // next half, and with no handler a block adds no wake and runs nothing. A
 // snapshot before the first crossing restores the handler and drops the
 // coroutine made since. Voice transfers write and read sound RAM, a keyed
-// voice plays with ENVX at full, and a voice entering the block at IRQA of a
-// core with its IRQ enabled runs the SPU2 handler once, a0 the core's bit,
-// for either core; a voice transfer runs its channel's handler. Undecoded ids
+// voice plays with ENVX at full, VOLX is its volume and a VOLL sweep moves
+// VOLXL alone. A voice entering the block at IRQA of a core with its IRQ
+// enabled runs the SPU2 handler once, a0 the core's bit, for either core,
+// and the IRQ is off after; so does the input area's read reaching IRQA, at
+// the EE cycle it takes that position, restored pending by a snapshot. The
+// input area plays at BVOL, its read at IRQA the sample at that cycle; a
+// block playing into a core takes its place, at the same BVOL. The other
+// VOLL sweeps step as PCSX2's, bit 12 turning the step, and a write keeps
+// the counter. A voice transfer runs its channel's handler. Undecoded ids
 // are compat rows; the loader's reset clears the handlers.
 //
 // cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
@@ -2559,6 +2566,8 @@ sd_word :: proc(i: u32) -> u32 {return iop.iop_u32(sdm.b + sdm.d + 4 * i)^}
 
 snap4: core.Snapshot
 snap4_loaded: bool // not emulated state
+snap12: core.Snapshot
+snap12_loaded: bool // not emulated state
 
 SD_HALF :: 0x1000 * cpu.EE_CLOCK / (48000 * 4) // EE cycles to move half of a 0x2000-byte buffer
 
@@ -2648,7 +2657,8 @@ test_libsd :: proc() {
 	check(core.compat.calls[core.Compat_Key{.Iop_Sd, 0xff7f, 13}].n == sd_rows + 1, "libsd: and a row")
 
 	// A block transfer plays its buffer in the ADMA layout: per 1024 bytes,
-	// 256 left samples then 256 right. Looping, it wraps to the start.
+	// 256 left samples then 256 right, at its core's BVOL. Looping, it wraps
+	// to the start. BVOL -0x8000 negates exactly.
 	pcm := iop.iop_mem(b + buf, 2048)
 	for k in 0 ..< 2 {
 		for j in 0 ..< 256 {
@@ -2658,6 +2668,8 @@ test_libsd :: proc() {
 		}
 	}
 	cpu.state.cycles = 1000
+	sd_call(5, 0x0f00, 0x8000)
+	sd_call(5, 0x1000, 0x8000)
 	check(sd_call(18, 0, 0x10, b + buf, 2048, 0) == 0, "libsd: a looping block transfer starts")
 	check(iop.iop_wake_ee == max(u64), "libsd: a block transfer with no handler adds no wake")
 	out := make([]i32, 2 * 600, context.temp_allocator)
@@ -2665,15 +2677,22 @@ test_libsd :: proc() {
 	played := true
 	for n in 0 ..< 600 {
 		v := i32(n % 512 + 1)
-		played &&= out[2 * n] == v && out[2 * n + 1] == -v
+		played &&= out[2 * n] == -v && out[2 * n + 1] == v
 	}
-	check(played, "libsd: the block plays de-interleaved, wrapping")
+	check(played, "libsd: the block plays de-interleaved, wrapping, at BVOL")
 	iop.iop_tick(1000 + 4 * SD_HALF)
 	check(sd_word(0) == 0, "libsd: a block's crossings run no handler while it has none")
 	sd_call(18, 0, 2)
 	for &x in out {x = 0}
 	iop.spu_mix(out)
 	check(out[0] == 0, "libsd: a stopped block is silent")
+	sd_call(5, 0x0f00, 0)
+	sd_call(5, 0x1000, 0)
+	sd_call(18, 0, 0x10, b + buf, 2048, 0)
+	for &x in out {x = 0}
+	iop.spu_mix(out)
+	check(out[0] == 0 && out[1] == 0, "libsd: a block plays nothing at BVOL 0")
+	sd_call(18, 0, 2)
 
 	// A transfer handler runs at each half of a block transfer's buffer,
 	// with a0 the channel and a1 its argument, and the thread it signals
@@ -2740,6 +2759,37 @@ test_libsd :: proc() {
 	iop.spu_mix(out)
 	st := iop.spu_voice_status(0, 0)
 	check(st.on && sd_call(6, 0x0500) == 0x7fff && sd_call(10, 0x2240) &~ 15 == st.nax, "libsd: the keyed voice plays, ENVX at full, NAX")
+	check(sd_call(6, 0x0600) == 0x7ffe && sd_call(6, 0x0700) == 0x7ffe, "libsd: VOLX is the volume, twice VOL's level, apart from the envelope")
+	// A linear decrease at rate 0x30 steps by 8 every second sample, from
+	// where the volume is; VOLL reads back without bit 15.
+	sd_call(5, 0x0000, 0xa030)
+	iop.spu_mix(out)
+	check(sd_call(6, 0x0600) == 0x7ffe - 400 * 8 && sd_call(6, 0x0700) == 0x7ffe && sd_call(6, 0x0000) == 0x2030, "libsd: a VOLL sweep moves VOLXL alone")
+	// The other sweeps, as PCSX2's V_VolumeSlide: a linear increase by 7
+	// every second sample; with bit 12 (the negative phase) it heads for
+	// -0x8000, and a decrease rises to 0 from below, a positive volume going
+	// straight to 0. An exponential increase slows to a quarter over 0x6000.
+	// The voice plays on through them all. VOLX reads as 16 bits.
+	sweeps := [?][3]u32 {
+		{0x0000, 0x8030, 2800},
+		{0x0000, 0x9030, u32(u16(0x10000 - 2800))},
+		{0x4000, 0xb030, u32(u16(0x10000 - 29568))}, // from -0x8000
+		{0x1000, 0xb030, 0},
+		{0x2fff, 0xc030, 25274}, // from 0x5ffe; ends 6 samples into a step
+	}
+	for w in sweeps {
+		sd_call(5, 0x0000, w[0])
+		sd_call(5, 0x0000, w[1])
+		iop.spu_mix(out)
+		check(sd_call(6, 0x0600) == w[2], fmt.tprintf("libsd: VOLL %x from %x gives VOLXL %x, got %x", w[1], w[0], w[2], sd_call(6, 0x0600)))
+	}
+	check(iop.spu_voice_status(0, 0).on, "libsd: the voice plays on through the sweeps")
+	// A write keeps the counter: 6 samples in, the next sample steps.
+	sd_call(5, 0x0000, 0)
+	sd_call(5, 0x0000, 0x8030)
+	iop.spu_mix(out[:2])
+	check(sd_call(6, 0x0600) == 7, "libsd: a write keeps the sweep's counter")
+	sd_call(5, 0x0000, 0x3fff)
 	check(iop.iop_sd.pending == 0, "libsd: no IRQ while it is off")
 
 	// The SPU2 handler runs once a voice enters the block at IRQA, with a0
@@ -2764,13 +2814,103 @@ test_libsd :: proc() {
 	iop.spu_mix(out)
 	iop.iop_tick(cpu.state.cycles)
 	check(sd_word(0) == n0 + 2 && sd_word(1) == 2, "libsd: core 1's IRQ, a0 its bit")
+	iop.spu_mix(out)
+	check(iop.iop_sd.pending == 0, "libsd: a raised IRQ is taken: off until enabled again")
+	sd_call(11, 0x5, 0)
+
+	// The input area's read raises a core's IRQ at IRQA: core 1's at 0x4a00,
+	// position 0x100 of its left half (0x4e00, its right half's, the same),
+	// is due when the read, at 48 kHz of EE time, takes it. At IOP cycle
+	// 0x2100000 (EE 0x10800000), 0xb000 samples read, the next at 0x100 is
+	// read 0xb100, taken once 0xb101 samples are read, at 0xb101 * 6144. The
+	// handler runs once there, not a cycle before, a0 core 1's bit, and the
+	// IRQ is off after; a snapshot while it is pending restores it. Enabled
+	// again just after the read 0xb300, it is due at the read 0xb500.
+	SAMPLE :: cpu.EE_CLOCK / 48000
+	IN_DUE :: 0xb101 * SAMPLE
+	check(r3000.state.cycles <= 0x2100000 && cpu.state.cycles <= 0x10800000, "libsd: the clocks are before the input IRQ test's")
+	r3000.state.cycles, cpu.state.cycles = 0x2100000, 0x10800000
+	sd_call(9, 0x1f01, 0x4e00)
+	sd_call(11, 0x5, 1)
+	check(iop.iop_wake_ee == IN_DUE, "libsd: an enabled IRQA in the input area's right half wakes the IOP at the read there")
+	sd_call(9, 0x1f01, 0x4a00)
+	check(iop.iop_wake_ee == IN_DUE, "libsd: and in its left half, at the read there")
+	core.snap_op, core.snap_target = .Save, &snap12
+	core.snap_yield()
+	if !snap12_loaded {
+		iop.iop_tick(IN_DUE)
+		check(sd_word(0) == n0 + 3, "libsd: the input IRQ runs before the snapshot's load")
+		snap12_loaded = true
+		core.snap_op, core.snap_target = .Load, &snap12
+		core.snap_yield()
+	}
+	check(sd_word(0) == n0 + 2 && iop.iop_wake_ee == IN_DUE, "libsd: the load restores the input IRQ pending")
+	iop.iop_tick(IN_DUE - 1)
+	check(sd_word(0) == n0 + 2, "libsd: no IRQ before the read reaches IRQA")
+	iop.iop_tick(IN_DUE)
+	check(sd_word(0) == n0 + 3 && sd_word(1) == 2, "libsd: the read at IRQA runs the SPU2 handler, a0 core 1's bit")
+	iop.iop_tick(IN_DUE + 0x200 * SAMPLE)
+	check(sd_word(0) == n0 + 3, "libsd: the IRQ is off once taken")
+	sd_call(11, 0x5, 1)
+	check(iop.iop_wake_ee == 0xb501 * SAMPLE, "libsd: enabled again, it is due at the next pass")
+	sd_call(11, 0x5, 0)
+
+	// The input area plays at its core's BVOL: core 1's, filled 2(i + 1) at
+	// left position i and the negative at right, at BVOL 0x4000 plays i + 1.
+	// Mixed at IN_DUE, its last sample is the read at IRQA, position 0x100.
+	// The voices are silenced.
+	vols := [?]u32{0x0000, 0x0100, 0x0001, 0x0101}
+	for v in vols {sd_call(5, v, 0)}
+	inp := iop.iop_mem(b + buf, 0x800)
+	for i in 0 ..< 512 {
+		endian.put_u16(inp[i * 2:], .Little, u16(2 * (i + 1)))
+		endian.put_u16(inp[0x400 + i * 2:], .Little, u16(0x10000 - 2 * (i + 1)))
+	}
+	check(sd_call(17, 0, 0, b + buf, 0x4800, 0x800) == 0x800, "libsd: VoiceTrans fills core 1's input area")
+	sd_call(5, 0x0f01, 0x4000)
+	sd_call(5, 0x1001, 0x4000)
+	cpu.state.cycles = IN_DUE
+	for &x in out {x = 0}
+	iop.spu_mix(out)
+	inplay := out[len(out) - 2] == 0x101 && out[len(out) - 1] == -0x101
+	for n in 0 ..< len(out) / 2 {
+		v := i32((0xb100 - (len(out) / 2 - 1) + n) & 0x1ff) + 1
+		inplay &&= out[2 * n] == v && out[2 * n + 1] == -v
+	}
+	check(inplay, "libsd: core 1's input area plays at its BVOL, the read at IRQA last at its cycle")
+	sd_call(5, 0x0f01, 0)
+	sd_call(5, 0x1001, 0)
+
+	// A block playing into a core takes its input's place: core 0's input
+	// area filled 0xfff left and -0x800 right, a looping block of -0x1000,
+	// BVOL 0x7fff and 0x4000.
+	for i in 0 ..< 512 {
+		endian.put_u16(inp[i * 2:], .Little, 0x0fff)
+		endian.put_u16(inp[0x400 + i * 2:], .Little, 0xf800)
+	}
+	sd_call(17, 0, 0, b + buf, 0x4000, 0x800)
+	for i in 0 ..< 512 {endian.put_u16(inp[i * 2:], .Little, 0xf000)}
+	sd_call(5, 0x0f00, 0x7fff)
+	sd_call(5, 0x1000, 0x4000)
+	sd_call(18, 0, 0x10, b + buf, 1024, 0)
+	for &x in out {x = 0}
+	iop.spu_mix(out)
+	blk := true
+	for n in 0 ..< len(out) / 2 {blk &&= out[2 * n] == -0x1000 && out[2 * n + 1] == -0x800}
+	check(blk, "libsd: a playing block takes the input area's place, at BVOL")
+	sd_call(18, 0, 2)
+	for &x in out {x = 0}
+	iop.spu_mix(out)
+	check(out[0] == 0xffe && out[1] == -0x400, "libsd: stopped, the input area plays")
+	sd_call(5, 0x0f00, 0)
+	sd_call(5, 0x1000, 0)
 	sd_call(11, 0x5, 0)
 
 	// A voice transfer on a channel with a handler raises it, done at once.
 	sd_call(26, 0, b + h, 5)
 	sd_call(17, 0, 0, b + adp, 0x5000, 32)
 	iop.iop_tick(cpu.state.cycles)
-	check(sd_word(0) == n0 + 3 && sd_word(1) == 0 && sd_word(2) == 5, "libsd: the transfer handler runs, a0 the channel")
+	check(sd_word(0) == n0 + 4 && sd_word(1) == 0 && sd_word(2) == 5, "libsd: the transfer handler runs, a0 the channel")
 
 	// GetSwitch: the masks as sceSdInit leaves them, LIBSD 1.5's four mixes
 	// all ones and PMON, NON 0, then as SetSwitch writes them, 24 bits, a
@@ -2791,6 +2931,25 @@ test_libsd :: proc() {
 	sd_call(7, 0x1700, 0)
 	check(sd_call(8, 0x1700) == 0, "libsd: GetSwitch ENDX after SetSwitch clears it")
 	check(sd_call(8, 0x1500) == 0 && core.compat.calls[core.Compat_Key{.Iop_Sd, 0x1500, 8}].n == 1, "libsd: GetSwitch KON is 0 and a row")
+
+	// The input area plays dry at BVOL: core 0's left at 0x4000 and right at
+	// 0x4400, silent at sceSdInit's BVOL 0, then each sample times BVOL >> 15.
+	for i in u32(0) ..< 0x100 {iop.iop_u32(b + buf + 4 * i)^ = 0x10001000}
+	sd_call(17, 0, 0, b + buf, 0x4000, 0x400)
+	for i in u32(0) ..< 0x100 {iop.iop_u32(b + buf + 4 * i)^ = 0xf000f000}
+	sd_call(17, 0, 0, b + buf, 0x4400, 0x400)
+	out = make([]i32, 2 * 800, context.temp_allocator)
+	iop.spu_mix(out)
+	silent := true
+	for x in out {silent &&= x == 0}
+	check(silent, "libsd: the input area is silent at BVOL 0")
+	sd_call(5, 0x0f00, 0x7fff)
+	sd_call(5, 0x1000, 0x4000)
+	out = make([]i32, 2 * 800, context.temp_allocator)
+	iop.spu_mix(out)
+	input := true
+	for n := 0; n < len(out); n += 2 {input &&= out[n] == 0xfff && out[n + 1] == -0x800}
+	check(input, "libsd: the input area plays at BVOL, left and right")
 
 	// An id libsd_fn does not decode raises a compat row.
 	sd_call(5, 0x3f00, 0)
