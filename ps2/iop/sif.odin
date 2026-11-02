@@ -965,15 +965,20 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 
 // cdvdfsv SearchFile {file[0x24], path[256], EE address of the request,
 // layer}: the IOP writes the sceCdlFILE {lsn, size, name[16], date[8], flag}
-// back over the start of the EE's request and returns 1 found, 0 not.
+// back over the start of the EE's request and returns 1 found, 0 not. The
+// layout follows the size sent, as cdvdfsv's does: 0x124 is the old
+// library's {file[0x20], path[256], EE address}, written back without the
+// flag word; 0x128 adds the flag and searches the first layer; 0x12c adds
+// the layer word, any nonzero value the second layer, as cdvdman maps it.
 @(private)
 cdvd_search_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	if fno != 0 || len(buf) < 0x12c {return false}
-	// A request too short to hold the layer searches the first.
-	layer := send_size >= 0x12c ? min(w[0x128 / 4], 2) : 0
-	file, found := cdvd_search(strings.truncate_to_byte(string(buf[0x24:0x124]), 0), u8(layer))
-	if found {copy(mem.ram_slice(w[0x124 / 4], len(file)), file[:])}
+	file_size: u32 = send_size == 0x124 ? 0x20 : CD_FILE
+	layer := send_size >= 0x12c && w[0x128 / 4] != 0
+	path := buf[file_size:][:0x100]
+	file, found := cdvd_search(strings.truncate_to_byte(string(path), 0), u8(layer))
+	if found {copy(mem.ram_slice(w[(file_size + 0x100) / 4], file_size), file[:file_size])}
 	w[0] = u32(found)
 	return true
 }

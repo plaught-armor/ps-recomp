@@ -81,6 +81,10 @@
 // closes ioman's files, a write open fails as fileio's, and another device
 // is a compat row.
 //
+// cdvdfsv's SearchFile server, on a dual-layer image: an old 0x124 request
+// reads its path at 0x20 and gets a 0x20 record; 0x128 searches the first
+// layer; any nonzero layer word searches the second; a miss writes nothing.
+//
 // sdrdrv: a user command handler's slot, range and previous handler; an
 // EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
 //
@@ -196,6 +200,7 @@ game :: proc(_: rawptr) {
 	test_sifman()
 	test_libsd()
 	test_cdvdman()
+	test_cdvd_search_server()
 	test_sdrdrv()
 	test_sdr_thread()
 	test_timrman()
@@ -3125,6 +3130,63 @@ io_call :: proc(stubs, fno: u32, args: ..u32) -> u32 {return lib_call(stubs, IOM
 neg :: proc(e: i32) -> u32 {return u32(-e)}
 
 SECTOR :: 2048
+
+// cdvdfsv's SearchFile server on a dual-layer image, the EE request in buf
+// and its record written at an EE address: the old 0x124 request with its
+// 0x20 record, 0x128 on the first layer, and any nonzero layer the second.
+test_cdvd_search_server :: proc() {
+	dir, err := os.make_directory_temp("", "ps_iop_search_test_*", context.allocator)
+	if err != nil {
+		check(false, "search server: no temp directory")
+		return
+	}
+	defer os.remove_all(dir)
+	V :: discimg.VOLUME
+	iso := discimg.make_iso(discimg.CNF_PS2)
+	img := make([]u8, 2 * len(iso), context.temp_allocator)
+	copy(img, iso)
+	copy(img[len(iso):], iso)
+	path := fmt.tprintf("%s/dl.iso", dir)
+	_ = os.write_entire_file(path, img)
+	if !iop.disc_image_open(path) {
+		check(false, "search server: the image opens")
+		return
+	}
+	defer iop.disc_image_close() // before the directory is removed
+	iop.fileio_reset()
+	fresh()
+
+	EE_DEST :: 0x00100400
+	search := iop.sif.servers[0x80000597]
+	// Sends name at path_at with the EE address after it and the layer word
+	// at 0x128, then returns the found word and the record at EE_DEST.
+	ask :: proc(search: iop.Rpc_Server, size, path_at, layer: u32, name: string) -> (found: u32, rec: []u8) {
+		buf: [0x12c]u8
+		w := ([^]u32)(raw_data(buf[:]))
+		copy(buf[path_at:], name)
+		w[(path_at + 0x100) / 4] = EE_DEST
+		w[0x128 / 4] = layer
+		for i in u32(0) ..< 0x28 / 4 {mem.wr32(EE_DEST + 4 * i, 0xaaaaaaaa)}
+		ok := search(0, buf[:], size)
+		check(ok, "search server: fno 0 answers")
+		return w[0], mem.ram_slice(EE_DEST, 0x28)
+	}
+	lsn :: proc(rec: []u8) -> u32 {return endian.unchecked_get_u32le(rec)}
+
+	found, rec := ask(search, 0x124, 0x20, 1, "\\BIG.BIN;1")
+	check(found == 1 && lsn(rec) == 23 && endian.unchecked_get_u32le(rec[4:]) == discimg.BIG && string(rec[8:17]) == "BIG.BIN;1", "search server: an old request reads the path at 0x20")
+	check(endian.unchecked_get_u32le(rec[0x20:]) == 0xaaaaaaaa, "search server: an old request's record is 0x20 bytes")
+	found, rec = ask(search, 0x128, 0x24, 1, "\\BIG.BIN;1")
+	check(found == 1 && lsn(rec) == 23 && endian.unchecked_get_u32le(rec[0x24:]) == 0xaaaaaaaa, "search server: 0x128 searches the first layer, a 0x24 record")
+	found, rec = ask(search, 0x12c, 0x24, 0, "\\BIG.BIN;1")
+	check(found == 1 && lsn(rec) == 23, "search server: layer 0")
+	found, rec = ask(search, 0x12c, 0x24, 1, "\\BIG.BIN;1")
+	check(found == 1 && lsn(rec) == V + 23, "search server: layer 1")
+	found, rec = ask(search, 0x12c, 0x24, 3, "\\BIG.BIN;1")
+	check(found == 1 && lsn(rec) == V + 23, "search server: any nonzero layer is the second")
+	found, rec = ask(search, 0x12c, 0x24, 0, "\\NOPE.BIN;1")
+	check(found == 0 && lsn(rec) == 0xaaaaaaaa, "search server: a miss returns 0 and writes nothing")
+}
 
 test_cdvdman :: proc() {
 	dir, err := os.make_directory_temp("", "ps_iop_cd_test_*", context.allocator)
