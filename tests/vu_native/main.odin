@@ -145,13 +145,18 @@ main :: proc() {
 			for _ in 0 ..< TRIALS {
 				init := v^
 				random_state(&init, mem_init)
+				// A VU0 program reaches VU1's registers through its window.
+				vu1_init := vu0 ? vu_programs.vu1_random(rnd) : vu.vu1
 
+				if vu0 {vu.vu1 = vu1_init}
 				v^ = init
 				copy(mem, mem_init)
 				if vu0 {vu.vu0_call_micro(pc)} else {vu.vu1_start(pc)}
 				want := v^
+				vu1_want := vu.vu1
 				copy(mem_want, mem)
 
+				if vu0 {vu.vu1 = vu1_init}
 				v^ = init
 				copy(mem, mem_init)
 				nr.pc, nr.budget = i32(pc), BUDGET
@@ -163,6 +168,7 @@ main :: proc() {
 				if want.mac != init.mac {flagged += 1}
 				if vu0 && want.status & 0x30 != 0 {status_set += 1}
 				same := got_pc == want.tpc | END_BIT && same_regs(&got, &want, status) && slice.equal(mem, mem_want)
+				same &&= !vu0 || vu_programs.vu1_same(&vu.vu1, &vu1_want)
 				if !same {
 					fails += 1
 					if fails < 10 {
@@ -220,7 +226,9 @@ main :: proc() {
 			for _ in 0 ..< TRIALS {
 				init := v^
 				random_state(&init, mem_init)
+				vu1_init := vu0 ? vu_programs.vu1_random(rnd) : vu.vu1
 
+				if vu0 {vu.vu1 = vu1_init}
 				v^ = init
 				copy(mem, mem_init)
 				nr.pc, nr.budget = i32(pc), BUDGET
@@ -228,13 +236,15 @@ main :: proc() {
 				drain(v, u32(nr.pc))
 				want := v^
 				want_pc := u32(nr.pc) &~ END_BIT
+				vu1_want := vu.vu1
 				copy(mem_want, mem)
 
+				if vu0 {vu.vu1 = vu1_init}
 				v^ = init
 				copy(mem, mem_init)
 				if vu0 {vu.vu0_call_micro(pc)} else {vu.vu1_start(pc)}
 				got := v^
-				if got.tpc != want_pc || !same_regs(&got, &want, status) || !slice.equal(mem, mem_want) {
+				if got.tpc != want_pc || !same_regs(&got, &want, status) || !slice.equal(mem, mem_want) || (vu0 && !vu_programs.vu1_same(&vu.vu1, &vu1_want)) {
 					dispatch_fails += 1
 					if dispatch_fails < 10 {
 						fmt.eprintfln("FAIL vu_native dispatch program %d (vu%d, from %04x): got pc %04x, want %04x; same registers %v, memory %v",

@@ -332,9 +332,11 @@ lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
 	dest, ft, fs := (w >> 21) & 15, (w >> 16) & 31, (w >> 11) & 31
 	store := key & 1 != 0
 	r := (ft if store else fs) & 15
+	lw := (w & 0x1ffffff) | 0x40 << 25
 	vi_get(a, u, .A, r)
+	if key >= 0x36 {native.alu_imm(a, .Sub, .A, 1)}
+	win := window_begin(a, u)
 	if key >= 0x36 {
-		native.alu_imm(a, .Sub, .A, 1)
 		if r != 0 {vi_put(a, u, r)}
 	} else if r != 0 {
 		native.mov(a, .B, .A)
@@ -349,6 +351,48 @@ lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
 	}
 	native.mov_imm(a, .C, 0)
 	native.imp_store(a, IMPORTS[u][.Vf], .C, VU_VI, .B16)
+	window_end(a, win, lw)
+}
+
+// Where a VU0 load or store goes, with its quadword address in A and
+// nothing written yet. An address with bit 0x400 set reaches VU1's
+// registers (the runtime's vu0_window_load), which only the interpreter
+// maps, so there the op is a call of VU0's lower interpreter: a test of
+// A's bit, to a call that window_end puts after the op's own code. Even a
+// vi0 base is tested, as an integer op with a field of 16 writes vi[0].
+// Other units go on. Uses C.
+@(private = "file")
+Window :: struct {
+	call:   native.Label,
+	tested: bool,
+}
+
+@(private = "file")
+window_begin :: proc(a: ^native.Asm, u: Unit) -> Window {
+	if u != .VU0 {return {}}
+	win := Window{native.new_label(a), true}
+	native.mov(a, .C, .A)
+	native.alu_imm(a, .And, .C, VU0_WINDOW)
+	native.br_zero(a, .C, win.call, nonzero = true)
+	return win
+}
+
+@(private = "file")
+window_end :: proc(a: ^native.Asm, win: Window, lw: u32) {
+	if !win.tested {return}
+	done := native.new_label(a)
+	native.jmp(a, done)
+	native.bind(a, win.call)
+	window_call(a, lw)
+	native.bind(a, done)
+}
+
+// vu.vu0_lower of lower op lw, with pc 0: it is not a branch.
+@(private = "file")
+window_call :: proc(a: ^native.Asm, lw: u32) {
+	native.mov_imm(a, .A, lw)
+	native.mov_imm(a, .B, 0)
+	native.call(a, IMPORTS[.VU0][.Lower], .A, .B)
 }
 
 // A = cpu.fdiv(A, B) for key 0x38, math.sqrt(abs(B)) unclamped for 0x39
@@ -783,13 +827,15 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 // ---------------------------------------------------------------- micro mode
 
 // A = the byte address in data memory of quadword vi[n] + off, as mq wraps
-// it.
+// it; on VU0, with window_begin's test.
 @(private = "file")
-quad_addr :: proc(a: ^native.Asm, u: Unit, n, off: u32) {
+quad_addr :: proc(a: ^native.Asm, u: Unit, n, off: u32) -> Window {
 	vi_get(a, u, .A, n)
 	if off != 0 {native.alu_imm(a, .Add, .A, off)}
+	win := window_begin(a, u)
 	native.alu_imm(a, .And, .A, MEM_QUADS[u])
 	native.alu_imm(a, .Shl, .A, 4)
+	return win
 }
 
 // ILW and ILWR (store false) from the quadword at byte A: vi[it] = the
@@ -856,16 +902,19 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int,
 	switch lw >> 25 {
 	case 0x00: // LQ
 		if ft == 0 || dest == 0 {return}
-		quad_addr(a, u, is, imm11)
+		win := quad_addr(a, u, is, imm11)
 		quad(a, u, false, dest, ft)
+		window_end(a, win, lw)
 	case 0x01: // SQ
 		if dest == 0 {return}
-		quad_addr(a, u, it, imm11)
+		win := quad_addr(a, u, it, imm11)
 		quad(a, u, true, dest, fs)
+		window_end(a, win, lw)
 	case 0x04, 0x05: // ILW, ISW
 		if dest == 0 || (lw >> 25 == 0x04 && it == 0) {return}
-		quad_addr(a, u, is, imm11)
+		win := quad_addr(a, u, is, imm11)
 		ilw_isw(a, u, lw >> 25 == 0x05, dest, it)
+		window_end(a, win, lw)
 	case 0x08, 0x09: // IADDIU, ISUBIU
 		if it == 0 {return}
 		vi_get(a, u, .A, is)
@@ -932,8 +981,9 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int,
 			vi_put(a, u, it)
 		case 0x3e, 0x3f: // ILWR, ISWR
 			if dest == 0 || (key == 0x3e && it == 0) {return}
-			quad_addr(a, u, is, 0)
+			win := quad_addr(a, u, is, 0)
 			ilw_isw(a, u, key == 0x3f, dest, it)
+			window_end(a, win, lw)
 		case 0x64: // MFP: no flags, clamped
 			if ft == 0 || dest == 0 {return}
 			native.imp_load(a, .A, vf, VU_P)

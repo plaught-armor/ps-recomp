@@ -350,9 +350,35 @@ store :: proc(sb: ^strings.Builder, dst: string, dest: u32, field := "f") {
 @(private = "file", thread_local)
 lower_unit: int
 
+// The bit of a VU0 quadword address that reaches VU1's registers, the
+// runtime's vu.VU0_WINDOW.
+VU0_WINDOW :: 0x400
+
+// For a lower op lw that loads or stores data memory, the VI register
+// its address comes from and the offset added to it, -1 for the
+// decrementing LQD and SQD.
+@(private = "file")
+vu0_mem_base :: proc(lw: u32) -> (n: u32, off: u16, ok: bool) {
+	it, is := (lw >> 16) & 15, (lw >> 11) & 15
+	imm11 := u16(i16(u16(lw & 0x7ff) << 5) >> 5)
+	switch lw >> 25 {
+	case 0x00, 0x04, 0x05: return is, imm11, true // LQ, ILW, ISW
+	case 0x01: return it, imm11, true // SQ
+	case 0x40:
+		if lw & 0x3c != 0x3c {return}
+		switch ((lw >> 4) & 0x7c) | (lw & 3) {
+		case 0x34, 0x3e, 0x3f: return is, 0, true // LQI, ILWR, ISWR
+		case 0x35: return it, 0, true // SQI
+		case 0x36: return is, 0xffff, true // LQD
+		case 0x37: return it, 0xffff, true // SQD
+		}
+	}
+	return
+}
+
 // Emit a non-branch lower op. mem names the VU's data memory size for mq.
 @(private = "file")
-emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string, q := "v.q_next") -> (slow: bool) {
+emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string, q := "v.q_next", window := true) -> (slow: bool) {
 	lower_unit = mem == MEM[.VU0] ? 0 : 1
 	dest := (lw >> 21) & 15
 	ft, fs, fd := (lw >> 16) & 31, (lw >> 11) & 31, (lw >> 6) & 31
@@ -395,6 +421,20 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string, q := "v.q_nex
 	interp :: proc(sb: ^strings.Builder, lw, pc: u32) -> bool {
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_lower(0x%08x, 0x%04x)", lower_unit, lw, pc)
 		return true
+	}
+	// A VU0 address with bit 0x400 set reaches VU1's registers (the
+	// runtime's vu0_window_load), which the interpreter maps: tested before
+	// the op touches anything. Even a vi0 base is tested, as an integer op
+	// with a field of 16 writes vi[0].
+	if n, off, ok := vu0_mem_base(lw); ok && window && lower_unit == 0 {
+		fast := strings.builder_make(context.temp_allocator)
+		slow = emit_lower(&fast, lw, pc, mem, q, false)
+		if strings.builder_len(fast) != 0 {
+			fmt.sbprintfln(sb, "\t\t\tif (vi[%d] + 0x%x) & 0x%x != 0 {{vu.vu0_lower(0x%08x, 0x%04x)}} else {{", n, off, VU0_WINDOW, lw, pc)
+			strings.write_string(sb, strings.to_string(fast))
+			fmt.sbprintln(sb, "\t\t\t}")
+		}
+		return
 	}
 	// XTOP and XGKICK exist only on VU1: VU0's interpreter stops on them.
 	if lower_unit == 0 && lw >> 25 == 0x40 && lw & 0x3c == 0x3c {

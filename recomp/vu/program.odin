@@ -633,10 +633,11 @@ load_programs :: proc(img: mips.Image, capture: string, unit: Unit) -> (progs: [
 // Whether a unit's compiled code computes status: always on VU0, where the
 // EE reads it with CFC2 and macro ops set it; on VU1 only when one of its
 // programs, in any pair, compiled or not, reads it (FSEQ, FSAND, FSOR). VU1
-// status is otherwise never read: the EE has no path to it, and VU0 data
-// memory wraps at its end (the runtime's vu_mem_q) instead of mapping VU1's
-// registers. Code no program covers runs in the interpreter, which computes
-// status itself.
+// status is otherwise never read: the EE has no path to it, and VU0 reaches
+// it only through its window onto VU1's registers (the runtime's
+// vu0_window_load), at an address with bit 0x400 set that no captured VU0
+// program uses; such a read sees the status VU1 last stored. Code no
+// program covers runs in the interpreter, which computes status itself.
 @(private)
 reads_status :: proc(progs: []Prog, unit: Unit) -> bool {
 	if unit == .VU0 {return true}

@@ -32,11 +32,14 @@
 // (PATH2) that split one packet sends its own packet, and the second DIRECT
 // carries on with the first's.
 //
+// Then VU0's window onto VU1's registers, read and written by LQ and SQ.
+//
 //   odin run tests/vu -collection:ps=.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import gs "ps:ps2/gs"
 import "ps:ps2/mem"
 import "ps:ps2/vu"
@@ -605,6 +608,49 @@ gif_paths :: proc() {
 	}
 }
 
+// VU0's window onto VU1's registers: a VU0 LQ or SQ at a quadword address
+// with bit 0x400 set reads and writes VU1's VF, VI and control registers,
+// not VU0 memory, mirrored every 0x40 quadwords. The stores to VF0, VI0
+// and status are dropped; R keeps 23 bits, a VI 16.
+@(private = "file")
+window :: proc() {
+	v, u := &vu.vu0, &vu.vu1
+	LQ :: proc(dest, ft, is, imm: u32) -> u32 {return 0x00 << 25 | dest << 21 | ft << 16 | is << 11 | (imm & 0x7ff)}
+	SQ :: proc(dest, it, fs, imm: u32) -> u32 {return 0x01 << 25 | dest << 21 | it << 16 | fs << 11 | (imm & 0x7ff)}
+	u.vf[5].u = {1, 2, 3, 4}
+	u.vi[3], u.r, u.i, u.status, u.tpc = 0x1234, 0x123, 2.5, 0xabc, 0x2a8
+	v.vi[1] = 0x400
+	before := slice.clone(v.mem)
+	defer delete(before)
+	vu.vu0_lower(LQ(0xf, 3, 1, 5), 0)
+	if v.vf[3].u != {1, 2, 3, 4} {fail("window LQ of vf5: %v", v.vf[3].u)}
+	vu.vu0_lower(LQ(0xf, 3, 1, 0x47), 0) // mirror of slot 7
+	if v.vf[3].u != u.vf[7].u {fail("window LQ of vf7's mirror: %v, want %v", v.vf[3].u, u.vf[7].u)}
+	reads := [?][2]u32{{0x23, 0x1234}, {0x30, 0xabc}, {0x34, 0x3f800123}, {0x35, transmute(u32)f32(2.5)}, {0x3a, 0x2a8}, {0x39, 0}}
+	for r in reads {
+		vu.vu0_lower(LQ(0xf, 3, 1, r[0]), 0)
+		if v.vf[3].u != {r[1], 0, 0, 0} {fail("window LQ of slot %02x: %v, want x %08x", r[0], v.vf[3].u, r[1])}
+	}
+	v.vf[6].u = {0x11117777, 0x22220001, 0x33330002, 0x44440003}
+	want9 := u.vf[9].u
+	want9.y, want9.z = 0x22220001, 0x33330002
+	vu.vu0_lower(SQ(0b0110, 1, 6, 9), 0) // .yz to vf9
+	if u.vf[9].u != want9 {fail("window SQ.yz to vf9: %v, want %v", u.vf[9].u, want9)}
+	vu.vu0_lower(SQ(0xf, 1, 6, 0), 0)
+	if u.vf[0].f != {0, 0, 0, 1} {fail("window SQ to vf0: %v", u.vf[0].f)}
+	vu.vu0_lower(SQ(0x8, 1, 6, 0x24), 0)
+	if u.vi[4] != 0x7777 {fail("window SQ.x to vi4: %04x", u.vi[4])}
+	vu.vu0_lower(SQ(0x8, 1, 6, 0x20), 0)
+	if u.vi[0] != 0 {fail("window SQ.x to vi0: %04x", u.vi[0])}
+	vu.vu0_lower(SQ(0x8, 1, 6, 0x30), 0)
+	if u.status != 0xabc {fail("window SQ.x to status: %03x", u.status)}
+	vu.vu0_lower(SQ(0x8, 1, 6, 0x34), 0)
+	if u.r != 0x117777 {fail("window SQ.x to R: %06x", u.r)}
+	vu.vu0_lower(SQ(0x7, 1, 6, 0x35), 0) // no x: I stays
+	if u.i != 2.5 {fail("window SQ.yzw to I: %v", u.i)}
+	if !slice.equal(v.mem, before) {fail("window LQ or SQ touched VU0 memory")}
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -629,5 +675,6 @@ main :: proc() {
 	stalls()
 	ibit()
 	gif_paths()
+	window()
 	fmt.println("vu: ok")
 }

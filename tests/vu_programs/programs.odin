@@ -3,7 +3,32 @@
 // interpreter; tests/vu_micro says what each one checks.
 package vu_programs
 
+import "core:math/rand"
+import ps2_vu "ps:ps2/vu"
 import "ps:recomp/vu"
+
+// VU1's registers at random, from rnd for VF, I, Q and P: a VU0 program
+// reaches them through its window (ps2/vu vu0_window_load), so a VU0 trial
+// starts both from the same VU1 and checks it after with vu1_same.
+vu1_random :: proc(rnd: proc() -> u32) -> ps2_vu.Vu {
+	u := ps2_vu.vu1
+	u.vf[0].f = {0, 0, 0, 1}
+	for k in 1 ..< 32 {for l in 0 ..< 4 {u.vf[k].u[l] = rnd()}}
+	u.vi[0] = 0
+	for k in 1 ..< 16 {u.vi[k] = u16(rand.uint32())}
+	u.r = rand.uint32() & 0x7fffff
+	u.i, u.q, u.p = transmute(f32)rnd(), transmute(f32)rnd(), transmute(f32)rnd()
+	u.status, u.mac, u.clip = rand.uint32() & 0xfff, rand.uint32() & 0xffff, rand.uint32() & 0xffffff
+	u.tpc = rand.uint32() & 0x7ff
+	return u
+}
+
+// Whether a and b hold the VU1 registers a VU0 window store can write.
+vu1_same :: proc(a, b: ^ps2_vu.Vu) -> bool {
+	for k in 0 ..< 32 {if a.vf[k].u != b.vf[k].u {return false}}
+	return a.vi == b.vi && a.r == b.r && transmute(u32)a.i == transmute(u32)b.i && transmute(u32)a.q == transmute(u32)b.q &&
+		transmute(u32)a.p == transmute(u32)b.p && a.status == b.status && a.mac == b.mac && a.clip == b.clip && a.tpc == b.tpc
+}
 
 // Pair halves: lower word first, as in micro memory.
 NOP_L :: 0x8000033c
@@ -62,6 +87,10 @@ MOVE :: 0x30
 MR32 :: 0x31
 LQI :: 0x34
 SQI :: 0x35
+LQD :: 0x36
+SQD :: 0x37
+ILW :: 0x04
+ISW :: 0x05
 DIV :: 0x38
 SQRT :: 0x39
 RSQRT :: 0x3a
@@ -175,6 +204,29 @@ PROGRAMS_VU0 := [?][]u32 {
 	{NOP_L, upper(ADD, 3, 1, 2), lower_sp(DIV, 0b0110, 0, 3), upper(MULq, 3, 3, 0) | E_BIT, NOP_L, upper(ADD, 3, 3, 1)},
 	{lower_sp(DIV, 0, 0, 1), NOP_U, lower_sp(DIV, 0b0011, 1, 0), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
 	{lower_sp(DIV, 0, 0, 1), NOP_U, lower_sp(WAITQ, 0, 0, 0), NOP_U, lower_sp(DIV, 0b0011, 1, 0), NOP_U | E_BIT, NOP_L, NOP_U},
+	// The window onto VU1's registers (ps2/vu vu0_window_load), at
+	// addresses with bit 0x400 set. LQ from vi0 - 0x3fb (0xfc05, slot 5:
+	// VU1's vf5) and SQ to vi0 - 0x3f9 (vf7).
+	// Through vi5 = 0x421, VU1's vi1: ILWR, then ISWR. Through vi6 = 0x434:
+	// LQ of R, SQ.x to I, SQ to Q, SQ to P, LQ of status, TPC and the unused
+	// slot 57. Through vi8 = 0x430: SQI to status, dropped, SQD back to it,
+	// LQD of VU1's vi15. Through vi10 = 0x400: SQ to vf0, dropped, SQ.yz to
+	// vf1 and LQ at vi10 + 0x47, a mirror of vf7. Last LQ, SQ, ILW and ISW
+	// through the random vi3, vi4, vi12 and vi14, in the window or not.
+	{
+		lower_op(LQ, 0xf, 3, 0, 0x405), NOP_U, lower_op(SQ, 0xf, 0, 4, 0x407), NOP_U,
+		lower_op(IADDIU, 0, 5, 0, 0x421), NOP_U, lower_sp(ILWR, 0b1000, 7, 5), NOP_U, lower_sp(ISWR, 0b1000, 9, 5), NOP_U,
+		lower_op(IADDIU, 0, 6, 0, 0x434), NOP_U, lower_op(LQ, 0xf, 10, 6, 0), NOP_U, lower_op(SQ, 0b1000, 6, 11, 1), NOP_U,
+		lower_op(SQ, 0xf, 6, 12, 2), NOP_U, lower_op(SQ, 0xf, 6, 21, 3), NOP_U, lower_op(LQ, 0xf, 19, 6, 0x7fc), NOP_U,
+		lower_op(LQ, 0xf, 20, 6, 6), NOP_U, lower_op(LQ, 0xf, 22, 6, 5), NOP_U,
+		lower_op(IADDIU, 0, 8, 0, 0x430), NOP_U, lower_sp(SQI, 0xf, 8, 13), NOP_U, lower_sp(SQD, 0xf, 8, 14), NOP_U,
+		lower_sp(LQD, 0xf, 15, 8), NOP_U,
+		lower_op(IADDIU, 0, 10, 0, 0x400), NOP_U, lower_op(SQ, 0xf, 10, 1, 0), NOP_U, lower_op(SQ, 0b0110, 10, 2, 1), NOP_U,
+		lower_op(LQ, 0xf, 16, 10, 0x47), NOP_U,
+		lower_op(LQ, 0xf, 17, 3, 0), NOP_U, lower_op(SQ, 0xf, 4, 18, 0), NOP_U,
+		lower_op(ILW, 0b0100, 11, 12, 0), NOP_U, lower_op(ISW, 0b1001, 13, 14, 0), NOP_U,
+		NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
+	},
 }
 // Clamp elision. Clamped results (ADD, MUL, ITOF, and MAX of two) feed
 // later operands; MOVE.xy and FTOI make lanes unclamped again. vi1

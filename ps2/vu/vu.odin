@@ -331,7 +331,7 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		}
 	case 0x34, 0x36: // VLQI, VLQD
 		if w & 3 == 2 {v.vi[is] -= 1}
-		q := vu_mem_q(v, v.vi[is])
+		q := vu_load_q(v, v.vi[is])
 		if ft != 0 {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vf[ft].u[k] = q[k]}}
 		}
@@ -339,8 +339,7 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		v.vi[0] = 0
 	case 0x35, 0x37: // VSQI, VSQD: store fs to [it]
 		if w & 3 == 3 {v.vi[it] -= 1}
-		q := vu_mem_q(v, v.vi[it])
-		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {q[k] = v.vf[fs].u[k]}}
+		vu_store_q(v, v.vi[it], v.vf[fs].u, dest)
 		if w & 3 == 1 && it != 0 {v.vi[it] += 1}
 		v.vi[0] = 0
 	case 0x38: // VDIV
@@ -360,13 +359,13 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vf[ft].u[k] = x}}
 		}
 	case 0x3e: // VILWR
-		q := vu_mem_q(v, v.vi[is])
+		q := vu_load_q(v, v.vi[is])
 		if it != 0 {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vi[it] = u16(q[k])}}
 		}
 	case 0x3f: // VISWR
-		q := vu_mem_q(v, v.vi[is])
-		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {q[k] = u32(v.vi[it])}}
+		x := u32(v.vi[it])
+		vu_store_q(v, v.vi[is], {x, x, x, x}, dest)
 	case 0x40: // VRNEXT
 		x := v.r
 		x = ((x << 1) | (((x >> 4) ~ (x >> 22)) & 1)) & 0x7fffff
@@ -448,10 +447,80 @@ vu_put_r :: proc(v: ^Vu, ft, dest: u32) {
 }
 
 // Quadword `n` of a VU data memory (wrapping like the hardware).
-// No bounds checks: keep the index reduced % len(v.mem).
+// No bounds checks: keep the index reduced % len(v.mem). VU0 loads and
+// stores go through vu_load_q and vu_store_q, for the window below.
 vu_mem_q :: proc(v: ^Vu, n: u16) -> ^[4]u32 #no_bounds_check {
 	o := (u32(n) * 16) % u32(len(v.mem))
 	return (^[4]u32)(&v.mem[o])
+}
+
+// The quadword a load at address n reads: VU0's window onto VU1's
+// registers when n has VU0_WINDOW set, else data memory.
+vu_load_q :: proc(v: ^Vu, n: u16) -> [4]u32 {
+	if v == &vu0 && n & VU0_WINDOW != 0 {return vu0_window_load(n)}
+	return vu_mem_q(v, n)^
+}
+
+// Store the dest lanes of x at address n, as vu_load_q reads it.
+vu_store_q :: proc(v: ^Vu, n: u16, x: [4]u32, dest: u32) {
+	if v == &vu0 && n & VU0_WINDOW != 0 {
+		vu0_window_store(n, x, dest)
+		return
+	}
+	q := vu_mem_q(v, n)
+	for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {q[k] = x[k]}}
+}
+
+// A VU0 load or store whose quadword address has bit 0x400 set reaches
+// VU1's registers, not VU0 data memory, mirrored every 0x40 quadwords:
+// slot n & 0x3f is VF0-VF31 at 0-31, VI0-VI15 at 32-47 (the 16 bits in
+// x; y, z and w read 0), status, MAC and clip at 48-50, R, I, Q and P at 52-55
+// and TPC at 58. Other slots read 0. R reads as RNEXT and RGET see it,
+// 0x3f800000 | r. This is the map of PCSX2's microVU (mVUaddrFix tests
+// bit 0x400) over its VU register file, VF[32] then VI[32] with the
+// control registers at VI[16] on.
+VU0_WINDOW :: 0x400
+
+// The quadword of window slot n & 0x3f.
+vu0_window_load :: proc(n: u16) -> (q: [4]u32) {
+	s := n & 0x3f
+	switch s {
+	case 0 ..< 32: q = vu1.vf[s].u
+	case 32 ..< 48: q.x = u32(vu1.vi[s - 32])
+	case 48: q.x = vu1.status
+	case 49: q.x = vu1.mac
+	case 50: q.x = vu1.clip
+	case 52: q.x = 0x3f800000 | vu1.r
+	case 53: q.x = transmute(u32)vu1.i
+	case 54: q.x = transmute(u32)vu1.q
+	case 55: q.x = transmute(u32)vu1.p
+	case 58: q.x = vu1.tpc
+	}
+	return
+}
+
+// Store the dest lanes of x to window slot n & 0x3f. Only the registers a
+// program can set land: VF1-VF31, VI1-VI15 (the low 16 bits of x), R (its
+// 23 bits), I, Q and P, each from x but the VFs. The writes to VF0, VI0,
+// status, MAC, clip and TPC are dropped: VF0 and VI0 are constants on the
+// hardware, and PCSX2, which stores them all, marks clobbering them a
+// problem in its own ToDo. Lanes y, z and w of the one-word registers are
+// padding and also dropped.
+vu0_window_store :: proc(n: u16, x: [4]u32, dest: u32) {
+	s := n & 0x3f
+	if s < 32 {
+		if s == 0 {return}
+		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {vu1.vf[s].u[k] = x[k]}}
+		return
+	}
+	if dest & 8 == 0 {return}
+	switch s {
+	case 33 ..< 48: vu1.vi[s - 32] = u16(x.x)
+	case 52: vu1.r = x.x & 0x7fffff
+	case 53: vu1.i = transmute(f32)x.x
+	case 54: vu1.q = transmute(f32)x.x
+	case 55: vu1.p = transmute(f32)x.x
+	}
 }
 
 // MAX and MINI order the raw words by sign and magnitude: exponent 255 is
@@ -1226,19 +1295,18 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 	status := (v.old_status[2] & 0x3f) | (v.status & 0xfc0)
 	switch w >> 25 {
 	case 0x00: // LQ
-		q := vu_mem_q(v, vi[is] + imm11)
+		q := vu_load_q(v, vi[is] + imm11)
 		if ft != 0 {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vf[ft].u[k] = q[k]}}
 		}
 	case 0x01: // SQ
-		q := vu_mem_q(v, vi[it] + imm11)
-		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {q[k] = v.vf[fs].u[k]}}
+		vu_store_q(v, vi[it] + imm11, v.vf[fs].u, dest)
 	case 0x04: // ILW
-		q := vu_mem_q(v, vi[is] + imm11)
+		q := vu_load_q(v, vi[is] + imm11)
 		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {set_vi(vi, it, u16(q[k]))}}
 	case 0x05: // ISW
-		q := vu_mem_q(v, vi[is] + imm11)
-		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {q[k] = u32(vi[it])}}
+		x := u32(vi[it])
+		vu_store_q(v, vi[is] + imm11, {x, x, x, x}, dest)
 	case 0x08: set_vi(vi, it, vi[is] + imm15) // IADDIU
 	case 0x09: set_vi(vi, it, vi[is] - imm15) // ISUBIU
 	case 0x10: vi[1] = u16(clip & 0xffffff == imm24) // FCEQ
