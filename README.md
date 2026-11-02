@@ -1,21 +1,174 @@
 # ps-recomp
 
-A static recompilation framework for PlayStation (PS1) and PlayStation 2
-games, written in [Odin](https://odin-lang.org).
+Play PlayStation and PlayStation 2 games from your own discs as native
+programs on your computer.
+
+Most emulators work out each console instruction while the game runs.
+ps-recomp converts the game's code to native code for your computer ahead
+of time ("static recompilation"), then runs it on a built-in stand-in for
+the rest of the console: graphics, sound, controllers, memory cards and the
+console's system software.
+
+**You bring the game.** This repository contains no game code or data. It
+also needs no console BIOS file and ships none: the console's system
+software is reimplemented in this project (known as high-level emulation,
+or HLE). All you need is a disc image made from a disc you own.
+
+## Who this is for
+
+- **Players** who are comfortable building from source: use `play` to run a
+  disc image. See [Getting started](#getting-started).
+- **Port authors** turning one game into its own native program, with its
+  own fixes and features. See [Making a port](#making-a-port).
+- **Emulation and recompilation developers.** See
+  [How it works](#how-it-works).
+
+There are no prebuilt downloads: you build it yourself with the Odin
+compiler.
+
+## Project status
+
+ps-recomp is a work in progress. Not every game runs, and a game that
+starts may still have bugs.
+
+| System | Status |
+|---|---|
+| Linux | The only system games have been played on. Automated tests run on x86-64 and arm64. |
+| Windows | Untested with games. Only the automated tests have run here. |
+| macOS | Untested with games. Only the automated tests have run here (arm64, and a subset as x86-64 under Rosetta). |
+
+## Getting started
+
+### What you need
+
+- [Odin](https://odin-lang.org) version `dev-2026-10`
+- SDL2, for the window, input and audio
+- Vulkan 1.3, for graphics. PS1 games can draw in software instead
+  (`PS_GPU=sw`); PS2 graphics use Vulkan.
+- A PS1 or PS2 disc image: a `.cue` sheet, or a single-track `.bin` or `.iso`
+
+### Build and play
+
+From the top of this repository:
+
+```sh
+odin build play -collection:ps=. -o:speed -out:play-bin
+./play-bin path/to/game.cue
+```
+
+The first time you run a disc, `play` converts the game to native code and
+shows its progress. That result is saved, so later runs of the same build
+start at once. If the conversion fails, the game still runs, but slowly,
+through an interpreter (which works out each instruction as it goes).
+
+A build made without `-define:COMMIT=<hash>` counts as a development build
+and converts the game again on every run. Add that option, with the current
+commit hash, to keep the converted code between runs.
+
+### Controls
+
+Controllers use the usual layout: the buttons map by position (A is Cross,
+B is Circle, X is Square, Y is Triangle), the triggers are L2 and R2, and
+clicking the sticks gives L3 and R3 on PS2. Back is Select.
+
+Keyboard defaults differ by console:
+
+| PlayStation button | PS1 | PS2 |
+|---|---|---|
+| D-pad | Arrow keys or W A S D | Arrow keys |
+| Cross | E | Z |
+| Circle | Esc or left Shift | X |
+| Square | Tab | A |
+| Triangle | Space | S |
+| L1 / R1 | Mouse wheel | Q / W |
+| L2 / R2 | Q / R | 1 / 2 |
+| Start | Return | Return |
+| Select | Backspace | Right Shift |
+
+On PS1 the left and right mouse buttons are also Cross and Circle.
+
+### Where your files go
+
+Saves, memory cards and converted code are kept for each disc in the user
+data directory, under `discs/<disc id>/`:
+
+| System | Default location |
+|---|---|
+| Linux | `~/.local/share/ps-recomp` |
+| macOS | `~/Library/Application Support/ps-recomp` |
+| Windows | `%APPDATA%\ps-recomp` |
+
+Set `PS_DATA` to use a different directory.
+
+### Settings
+
+Settings are environment variables. With `play`, each name starts with
+`PS_`, for example:
+
+```sh
+PS_GPU=sw ./play-bin path/to/game.cue
+```
+
+| Setting | What it does |
+|---|---|
+| `PS_DATA` | The user data directory. |
+| `PS_GPU` | PS1 only: `vk` draws with Vulkan (the default), `sw` in software. |
+| `PS_SCALE` | PS2 only: window size as a multiple of the console's resolution, 1 to 8 (default 3 in a window). |
+| `PS_IRX` | PS2 only: `1` runs a game's own sound and I/O modules on an emulated copy of the console's I/O processor. **Off by default and not ready for general use.** |
+
+The full list is wherever each setting is read; see `core/env.odin` for how
+names are built. A port chooses its own prefix when it is built
+(`-define:ENV_PREFIX=GAME_` makes settings read `GAME_*`). Debug aids such
+as scripted input (`INPUT`, `STICK`), replays and memory pokes are described
+where they are read.
+
+### Testing whether your games run
+
+```sh
+./play-bin --compat path/to/discs [vblanks]
+```
+
+Compatibility mode takes a disc image, or a directory and every `.cue`,
+`.iso` and `.bin` in it. It runs each one with no window and no speed limit,
+in its own child process, for a set number of vblanks, the console's
+once-per-screen-refresh signal. The count is the `vblanks` argument, else
+`FRAMES`, else 3600. Unknown BIOS calls and syscalls are stubbed so that a
+run can continue (`COMPAT`).
+
+Each disc gets one row, its latest run, in `compat.tsv` in the user data
+directory. The row gives how the run ended, how much of it the interpreter
+ran, and the calls it stubbed:
+
+| Result | Meaning |
+|---|---|
+| `ok` | Reached the vblank count. |
+| `stalled` | Reached the count with no picture shown, or with main RAM unchanged over the second half. |
+| `fallback` | Reached the count with progress, but a module on the emulated I/O processor failed to load and the built-in stand-in took over. |
+| `exit` | The game ended. |
+| `fatal` | The runtime stopped on a fatal error. |
+| `crash` | The run crashed: it ended without writing its result line. |
+| `hang` | Still not finished after `COMPAT_WAIT` seconds (default 600). |
+| `spawn` | The child process could not be started. |
+
+The child's output goes to the disc's `compat.log`. A `press.txt` beside it
+is its `PRESS` input script.
+
+## How it works
 
 `recomp` translates a game's MIPS machine code (R3000A for PS1, R5900 for
-PS2) into Odin source, one procedure per guest function. The game is then
-built as a native program against the runtime packages here, which emulate
-the rest of the console: memory, DMA, the GPU or GS, sound, controllers,
-memory cards and the BIOS or kernel calls the game makes. `recomp` can
-also emit x86-64 (SysV or Win64) or arm64 machine code alongside the Odin
-source (`native_arch`, `native_out`).
+PS2) into Odin source, one procedure per guest function (a function in the
+game's code). The game is then built as a native program against the
+runtime packages here, which emulate the rest of the console: memory, DMA,
+the GPU or GS (the PS2's graphics chip), sound, controllers, memory cards
+and the BIOS or kernel calls the game makes. `recomp` can also emit x86-64
+(SysV or Win64) or arm64 machine code alongside the Odin source
+(`native_arch`, `native_out`).
 
-This repository holds no game code or data. A port lives in its own
-repository: it supplies the game's executable (from a disc the user owns),
-a `recomp` options file, and any per-game code.
+`play` uses the machine-code route, so it needs no Odin source and no port.
+A port lives in its own repository: it supplies the game's executable (from
+a disc the user owns), a `recomp` options file, and any per-game code.
 
-## Layout
+### Layout
 
 | Path | What |
 |---|---|
@@ -24,17 +177,9 @@ a `recomp` options file, and any per-game code.
 | `core/` | Console-independent runtime: coroutines, save states and rollback, netplay, input and rebinding, audio, recording and replay, Vulkan device, capture; `disc` (disc images, ISO9660 and disc ids); the user data directory; compatibility counters and the COMPAT line |
 | `psx/` | PS1 runtime: `cpu`, `gte`, `gpu` and `render`, `spu`, `mdec`, `bios`, `io`, `native` (the names native code imports), `host` (SDL2 window, pacing, input), and the interpreter, checkpoints and hooks |
 | `ps2/` | PS2 runtime: `cpu`, `mem`, `dma`, `gif`, `gs` (Vulkan), `vu`, `ipu`, `iop` (HLE IOP modules, memory cards), `kernel`, `r5900` (EE instruction decoder), `host` (SDL2 window, audio, input, net), and the interpreter and bus |
-| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `vu_micro` (whole VU microprograms through the VU recompiler against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots), `ps2_kernel` (EE kernel threads, ExecPS2), `ps2_interp` (whole EE functions in the interpreter), `psx_cover` (which R3000 encodings each PS1 backend does inline), `psx_fallback` (the PS1 ways out of recompiled code and their counts), `psx_codewatch` (recompiled PS1 code demoted when a write changes it, promoted again when it is back), `psx_unaligned` (fused PS1 unaligned words), `psx_gte` (GTE register moves as native code), `psx_timer` (root counter timing), `psx_bios` (BIOS events, counters and IRQs, the executable loaders), `psx_bios_libc` (the BIOS C library), `disc` (disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image), `host_frames` (each host, headless, exits at FRAMES), `data` (the user data directory and its cached native code), `compat` (each host's compat line, and stubbed calls, under COMPAT), `play` (`play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included), `discimg` (the small disc images `disc` and `play` use) |
+| `tests/` | `core` (coroutines, snapshots, rollback, file writes, PS2 ELF loading), `native` (machine-code emitter), `ee_native` (EE instructions through the native backend against the interpreter), `fpu` (EE FPU vectors), `lower` (r5900 and r3000 branch lowering), `vu` (VU0 microprograms from the EE, macro flags), `vu_macro` (the EE recompiler's VU0 macro code against the interpreter), `ee_emit` (the EE recompiler's inline MMI, multiply-add and FPU code against the interpreter), `vu_micro` (whole VU microprograms through the VU recompiler against the interpreter), `vu_native` (VU microprograms through the native backend against the interpreter), `spu` (SPU2 voices through the port API, sound RAM in snapshots), `ps2_kernel` (EE kernel threads, ExecPS2), `ps2_iop` (the IOP CPU and the IOP modules run on it), `ps2_interp` (whole EE functions in the interpreter), `psx_cover` (which R3000 encodings each PS1 backend does inline), `psx_fallback` (the PS1 ways out of recompiled code and their counts), `psx_codewatch` (recompiled PS1 code demoted when a write changes it, promoted again when it is back), `psx_unaligned` (fused PS1 unaligned words), `psx_gte` (GTE register moves as native code), `psx_timer` (root counter timing), `psx_bios` (BIOS events, counters and IRQs, the executable loaders), `psx_bios_libc` (the BIOS C library), `psx_interp` (the PS1 interpreter's jumps into the BIOS), `disc` (disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image), `host_frames` (each host, headless, exits at FRAMES), `data` (the user data directory and its cached native code), `compat` (each host's compat line, and stubbed calls, under COMPAT), `play` (`play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included), `discimg` (the small disc images `disc` and `play` use) |
 
-## Requirements
-
-- Odin `dev-2026-10`
-- SDL2 (window, input, audio), Vulkan 1.3 (PS1 renderer, `GPU=sw` draws in
-  software; PS2 GS)
-- `glslc` only to rebuild the shaders (`ps2/gs/shaders/build.sh`,
-  `psx/render/shaders/build.sh`); the compiled `.spv` files are committed
-
-## Building the recompiler
+## Using the recompiler
 
 ```sh
 odin build recomp -collection:ps=. -out:recomp-bin
@@ -42,13 +187,14 @@ odin build recomp -collection:ps=. -out:recomp-bin
 ./recomp-bin path/to/game.cue [source dir]
 ```
 
-Given a disc image (a `.cue` sheet, or a single-track `.bin` or `.iso`)
-in place of an options file, recomp needs no options: it compiles the
+Given a disc image (a `.cue` sheet, or a single-track `.bin` or `.iso`) in
+place of an options file, recomp needs no options: it compiles the
 executable `SYSTEM.CNF` names (`PSX.EXE` on a PS1 disc without one) to
 machine code for the host, into `<serial>.<arch>.bin` in the working
-directory, and to Odin source too when given a source directory. Code the executable loads from other files
-(PS1 overlays) is not found; an ELF without `.text` has its executable
-sections compiled whole, data in them included.
+directory, and to Odin source too when given a source directory. Code the
+executable loads from other files (PS1 overlays) is not found; an ELF
+without `.text` has its executable sections compiled whole, data in them
+included.
 
 The options file is tab-separated: a `key<TAB>value` header row, then one
 option per row; lines starting with `#` are comments. `backend` (`r3000` or
@@ -61,95 +207,12 @@ relative ones are relative to the directory recomp runs in.
 A port imports the runtime through the `ps` collection, for example
 `odin build port -collection:ps=<path to ps-recomp> -use-separate-modules
 -o:speed`. `-use-separate-modules` lets a generated program of many packages
-build in parallel (a few minutes for a PS2 game of about 20 packages,
-much longer without it). Generated code is not vetted: check it without
-`-vet`.
+build in parallel (a few minutes for a PS2 game of about 20 packages, much
+longer without it). Generated code is not vetted: check it without `-vet`.
 
-## Playing a disc
-
-```sh
-odin build play -collection:ps=. -o:speed -out:play-bin
-./play-bin path/to/game.cue
-```
-
-`play` needs only the disc image. Its first run of a disc compiles the
-executable `SYSTEM.CNF` names to machine code for the host, in a child
-process whose progress it shows, and keeps it in the disc's directory under
-the user data directory (`DATA`, else SDL's) with the memory cards; later
-runs of the same build start at once. A build without `-define:COMMIT=<hash>`
-converts on every run. When the conversion fails the game runs interpreted,
-slowly.
-
-```sh
-./play-bin --compat path/to/discs [vblanks]
-```
-
-`--compat` runs a disc image, or every `.cue`, `.iso` and `.bin` in a
-directory, headless and unpaced to a vblank count (`FRAMES`, else 3600),
-each in its own child with unknown BIOS calls and syscalls stubbed
-(`COMPAT`). Each disc gets one row, its latest run, in `compat.tsv` in the
-user data directory: how the run ended (`ok`, `stalled` when it got there
-with no picture shown or main RAM unchanged over the second half, `exit`,
-`fatal`, `crash`, or `hang` after `COMPAT_WAIT` seconds, default 600), how
-much of it the interpreter ran, and the calls it stubbed. The child's output goes to the
-disc's `compat.log`; a `press.txt` there is its `PRESS` input script.
-
-## Tests
-
-From the repository root:
-
-```sh
-odin run tests/core -collection:ps=.
-odin run tests/native -collection:ps=.
-odin run tests/ee_native -collection:ps=.
-odin run tests/fpu -collection:ps=.
-odin run tests/lower -collection:ps=.
-odin run tests/vu -collection:ps=.
-odin run tests/vu_macro -collection:ps=.
-odin run tests/vu_micro -collection:ps=.
-odin run tests/ee_emit -collection:ps=.
-odin run tests/spu -collection:ps=.
-odin run tests/psx_fallback -collection:ps=.
-odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true
-odin run tests/psx_codewatch -collection:ps=.
-odin run tests/psx_codewatch -collection:ps=. -define:FALLBACK_COUNT=true
-odin run tests/psx_unaligned -collection:ps=.
-odin run tests/psx_gte -collection:ps=.
-odin run tests/psx_cover -collection:ps=.
-odin run tests/psx_timer -collection:ps=.
-odin run tests/ps2_kernel -collection:ps=.
-odin run tests/ps2_interp -collection:ps=.
-odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true
-odin run tests/psx_bios -collection:ps=.
-odin run tests/psx_bios_libc -collection:ps=.
-odin run tests/disc -collection:ps=.
-odin run tests/host_frames -collection:ps=.
-odin run tests/data -collection:ps=.
-odin run tests/compat -collection:ps=.
-odin run tests/play -collection:ps=. -define:COMMIT=test
-```
-
-`.github/workflows/ci.yml` is the list CI runs; a new test goes there and
-here.
-
-CI type-checks every package on linux and darwin (amd64 and arm64) and on
-Windows, and runs the tests on Linux (x86-64, arm64), macOS (arm64; a
-subset as x86-64 under Rosetta) and Windows. Games have only been played on
-Linux.
-
-Before sending a change, check what it touches as CI does, with vet and
-strict style:
-
-```sh
-odin check psx -no-entry-point -collection:ps=. -vet -strict-style
-odin check recomp -collection:ps=. -vet -strict-style
-odin check tests/core -collection:ps=. -vet -strict-style
-```
-
-The runtime packages (`core`, `core/disc`, `psx`, `ps2`, `ps2/host`) and
-`tests/discimg` take `-no-entry-point`; `recomp`, `play` and the tests do
-not. Add `-target:` to check another platform, as CI does for
-`linux_arm64`, `darwin_amd64` and `darwin_arm64`.
+`glslc` is needed only to rebuild the shaders
+(`ps2/gs/shaders/build.sh`, `psx/render/shaders/build.sh`); the compiled
+`.spv` files are committed.
 
 ## Making a port
 
@@ -273,13 +336,65 @@ are 128 KiB images, `slot1.mcd` and `slot2.mcd` in the working directory
 (`MCD`, `MCD2`, or `bios.card_files` before `memcard_init`). PS2 cards are
 directories, `memcard0/` and `memcard1/` in the working directory or in `MC`.
 
-## Configuration
+## Tests
 
-Runtime options come from environment variables, prefixed per port
-(`-define:ENV_PREFIX=GAME_`); see `core/env.odin`. Debug aids such as
-scripted input (`INPUT`, `STICK`), replays and memory pokes are described
-where they are read.
+From the repository root:
+
+```sh
+odin run tests/core -collection:ps=.
+odin run tests/native -collection:ps=.
+odin run tests/ee_native -collection:ps=.
+odin run tests/fpu -collection:ps=.
+odin run tests/lower -collection:ps=.
+odin run tests/vu -collection:ps=.
+odin run tests/vu_macro -collection:ps=.
+odin run tests/vu_micro -collection:ps=.
+odin run tests/vu_native -collection:ps=.
+odin run tests/ee_emit -collection:ps=.
+odin run tests/spu -collection:ps=.
+odin run tests/psx_fallback -collection:ps=.
+odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true
+odin run tests/psx_codewatch -collection:ps=.
+odin run tests/psx_codewatch -collection:ps=. -define:FALLBACK_COUNT=true
+odin run tests/psx_unaligned -collection:ps=.
+odin run tests/psx_gte -collection:ps=.
+odin run tests/psx_cover -collection:ps=.
+odin run tests/psx_timer -collection:ps=.
+odin run tests/ps2_kernel -collection:ps=.
+odin run tests/ps2_iop -collection:ps=.
+odin run tests/ps2_interp -collection:ps=.
+odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true
+odin run tests/psx_bios -collection:ps=.
+odin run tests/psx_bios_libc -collection:ps=.
+odin run tests/disc -collection:ps=.
+odin run tests/host_frames -collection:ps=.
+odin run tests/data -collection:ps=.
+odin run tests/psx_interp -collection:ps=.
+odin run tests/compat -collection:ps=.
+odin run tests/play -collection:ps=. -define:COMMIT=test
+```
+
+`.github/workflows/ci.yml` is the list CI runs; a new test goes there and
+here.
+
+CI type-checks every package on Linux and macOS (amd64 and arm64) and on
+Windows, and runs the tests on Linux (x86-64, arm64), macOS (arm64; a
+subset as x86-64 under Rosetta) and Windows.
+
+Before sending a change, check what it touches as CI does, with vet and
+strict style:
+
+```sh
+odin check psx -no-entry-point -collection:ps=. -vet -strict-style
+odin check recomp -collection:ps=. -vet -strict-style
+odin check tests/core -collection:ps=. -vet -strict-style
+```
+
+The runtime packages (`core`, `core/disc`, `psx`, `ps2`, `ps2/host`) and
+`tests/discimg` take `-no-entry-point`; `recomp`, `play` and the tests do
+not. Add `-target:` to check another platform, as CI does for
+`linux_arm64`, `darwin_amd64` and `darwin_arm64`.
 
 ## License
 
-GPL-3.0; see `LICENSE`.
+GPL-3.0; see [LICENSE](LICENSE).
