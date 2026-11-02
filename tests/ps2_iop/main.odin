@@ -72,7 +72,8 @@
 // cdvdman and ioman, on a synthetic disc image: SearchFile writes a file's
 // record and a miss leaves it; sceCdRead copies whole sectors from the lsn
 // to the buffer, zeros past the volume, and a data pattern reads nothing
-// with a compat row; sceCdInit and sceCdMmode return 1. sceCdCallback
+// with a compat row; sceCdInit and sceCdMmode return 1; sceCdGetReadPos is
+// 0 idle and after a read, no read being in flight. sceCdCallback
 // returns the previous callback; a read's runs at the next tick, a0 1, and
 // not for a refused read or with none set; a snapshot restores it pending;
 // one that waits is a row; a failed load's is put back. ioman's open,
@@ -3129,7 +3130,7 @@ test_libsd :: proc() {
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
 }
 
-CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 28, 37, 75}
+CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 28, 37, 44, 75}
 IOMAN_FNOS := [?]u32{4, 5, 6, 8}
 
 // Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
@@ -3269,6 +3270,7 @@ test_cdvdman :: proc() {
 	check(cd_call(cd, 75, 1) == 1 && cd_call(cd, 75, 2) == 1 && cd_call(cd, 75, 0xff) == 1, "cdvdman: sceCdMmode returns 1")
 	check(cd_call(cd, 12) == iop.CD_DISK_PS2_DVD, "cdvdman: sceCdGetDiskType is a PS2 DVD")
 	check(cd_call(cd, 28) == 0x0a, "cdvdman: sceCdStatus is paused")
+	check(cd_call(cd, 44) == 0, "cdvdman: sceCdGetReadPos is 0 with no read")
 	check(cd_call(cd, 5) == 1 && iop.iop_cd == {}, "cdvdman: sceCdStandby with no callback returns 1, no run owed")
 	check(cd_call(cd, 10, b + file, b + big) == 1, "cdvdman: SearchFile finds the file")
 	rec := iop.iop_mem(b + file, iop.CD_FILE)
@@ -3281,6 +3283,7 @@ test_cdvdman :: proc() {
 	good := true
 	for i in 0 ..< len(data) {good &&= data[i] == (i < discimg.BIG ? discimg.big_byte(i) : 0)}
 	check(good, "cdvdman: the sectors read are the file's")
+	check(cd_call(cd, 44) == 0, "cdvdman: sceCdGetReadPos is 0 after a read")
 	for &x in data {x = 0xff}
 	cd_call(cd, 6, discimg.VOLUME, 1, b + buf + SECTOR, 0)
 	good = true

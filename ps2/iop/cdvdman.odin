@@ -97,6 +97,8 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		old := iop_cd.callback
 		iop_cd.callback = a0
 		return old, true
+	case 44: // sceCdGetReadPos: the bytes the read in flight has put in its buffer, 0 with none. Reads are done in their call here, so 0
+		return 0, true
 	case 75: // sceCdMmode(media): 1. The media only gates disk type checks, none made here
 		return 1, true
 	}
