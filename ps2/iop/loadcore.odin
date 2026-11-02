@@ -273,9 +273,14 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	l.loading = l.next_id
 	l.failed, l.gaps = false, 0
 	defer l.loading = 0
+	size, fits := irx_mem_size(x)
+	if !fits {return fail(key, x.name, fmt.tprintf("memory size %#x", x.mem_size), mark_th, mark_sema)}
+	if size != x.text_size + x.data_size + x.bss_size {
+		fmt.eprintfln("iop: \"%s\" holds %#x bytes, its module info says %#x", x.name, size, x.text_size + x.data_size + x.bss_size)
+	}
 	m := Iop_Module {
 		id   = l.next_id,
-		size = irx_mem_size(x),
+		size = size,
 	}
 	m.base = sys_alloc(.Low, m.size)
 	if m.base == 0 {return fail(key, x.name, "no memory", mark_th, mark_sema)}

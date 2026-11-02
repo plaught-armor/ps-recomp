@@ -110,7 +110,7 @@ rpc_client_call :: proc(client, fno, mode, send: u32) -> u32 {
 	// With no end function a NOWAIT call asks no RPC_END: the EE's DMA frees the
 	// packet, and a status check is all that can see it end.
 	w32(pkt + PK_RMODE, 1 if mode & RPC_NOWAIT == 0 || end != 0 else 0)
-	if cpu.debug >= 1 {fmt.eprintfln("iop: rpc call to EE, client %x fno %d send %d recv %d", client, fno, ssize, rsize)}
+	if cpu.debug >= 1 {fmt.eprintfln("iop: rpc call to EE, client %x fno %#x send %d recv %d", client, fno, ssize, rsize)}
 	rpc_client_send(client, SIF_CMD_RPC_CALL, pkt, send, buff, ssize, mode)
 	return 0
 }
@@ -142,7 +142,7 @@ rpc_client_end :: proc(a: u32) {
 	switch cid {
 	case SIF_CMD_RPC_CALL:
 		if end := r32(client + CL_END); end != 0 {
-			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc END client %x, end function %x", client, end)}
+			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc END client %x fno %#x, end function %x", client, r32(pkt + PK_ARG), end)}
 			switch th_intr(end, r32(client + CL_END_PARAM), 0) {
 			case .None:
 			case .Blocked:
@@ -152,7 +152,7 @@ rpc_client_end :: proc(a: u32) {
 				fmt.eprintfln("iop: rpc end function at %x stopped", end)
 			}
 		} else if cpu.debug >= 1 {
-			fmt.eprintfln("iop: rpc END client %x", client)
+			fmt.eprintfln("iop: rpc END client %x fno %#x", client, r32(pkt + PK_ARG))
 		}
 	case SIF_CMD_RPC_BIND:
 		server := iop_u32(a + END_SERVER)^

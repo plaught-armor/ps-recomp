@@ -23,6 +23,7 @@ Irx :: struct {
 	entry, gp:                       u32, // relative to the image's base
 	text_size, data_size, bss_size: u32,
 	file_off, file_size:             u32, // the PT_LOAD bytes in the file
+	mem_size:                        u32, // the PT_LOAD's p_memsz, unchecked
 }
 
 // What `irx_relocate` refused, if anything.
@@ -79,6 +80,7 @@ irx_parse :: proc(data: []u8) -> (x: Irx, ok: bool) {
 		version   = u16(data[info + 24]) | u16(data[info + 25]) << 8,
 		file_off  = irx_u32(data, load + 4),
 		file_size = irx_u32(data, load + 16),
+		mem_size  = irx_u32(data, load + 20),
 	}
 	n := info + 26
 	end := n
@@ -89,9 +91,15 @@ irx_parse :: proc(data: []u8) -> (x: Irx, ok: bool) {
 	return x, true
 }
 
-// The bytes the module occupies in memory: text, data and bss.
-irx_mem_size :: proc(x: Irx) -> u32 {
-	return x.text_size + x.data_size + x.bss_size
+// The bytes the module occupies in memory: text, data and bss, or the PT_LOAD's
+// p_memsz when that is more, as a module can hold bss its module info leaves
+// out. False when p_memsz is less than the file's bytes or the block is larger
+// than the IOP's RAM.
+irx_mem_size :: proc(x: Irx) -> (size: u32, ok: bool) {
+	if x.mem_size < x.file_size {return}
+	n := max(u64(x.text_size) + u64(x.data_size) + u64(x.bss_size), u64(x.mem_size))
+	if n > IOP_RAM_SIZE {return}
+	return u32(n), true
 }
 
 // Applies every SHT_REL section of file `data` to `img`, the module's text

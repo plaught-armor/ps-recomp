@@ -165,6 +165,7 @@ game :: proc(_: rawptr) {
 	test_loader()
 	test_threads()
 	test_failed_paths()
+	test_irx_mem_size()
 	test_thread_budget()
 	test_libc()
 	test_sysclib()
@@ -353,7 +354,8 @@ load_irx :: proc(f: []u8) -> (x: iop.Irx, img: []u8, err: iop.Irx_Error, detail:
 	ok: bool
 	x, ok = iop.irx_parse(f)
 	check(ok, "irx: parses")
-	img = iop.iop_ram[IRX_BASE:][:iop.irx_mem_size(x)]
+	size, _ := iop.irx_mem_size(x)
+	img = iop.iop_ram[IRX_BASE:][:size]
 	copy(img, f[x.file_off:][:x.file_size])
 	for &b in img[x.file_size:] {b = 0}
 	err, detail = iop.irx_relocate(f, img, IRX_BASE)
@@ -406,6 +408,82 @@ test_irx :: proc() {
 	endian.put_u16(f[16:], .Little, 2)
 	_, ok := iop.irx_parse(f)
 	check(!ok, "irx: an executable ELF is no IRX")
+}
+
+// File `f` from build_file with its module info's bss and its p_memsz changed.
+irx_sizes :: proc(f: []u8, bss, memsz: u32) -> []u8 {
+	endian.put_u32(f[0x88:], .Little, bss)
+	endian.put_u32(f[0x68:], .Little, memsz)
+	return f
+}
+
+test_irx_mem_size :: proc() {
+	size_of_file :: proc(bss, memsz: u32) -> (u32, bool) {
+		x, ok := iop.irx_parse(irx_sizes(build_irx(irx_rels[:]), bss, memsz))
+		check(ok, "irx size: parses")
+		return iop.irx_mem_size(x)
+	}
+	TEXT :: 0xc0
+	RAM :: iop.IOP_RAM_SIZE
+	s, ok := size_of_file(0x40, TEXT + 0x40)
+	check(ok && s == TEXT + 0x40, "irx size: info and p_memsz agree")
+	s, ok = size_of_file(0, TEXT + 0x100)
+	check(ok && s == TEXT + 0x100, "irx size: p_memsz over an info with no bss")
+	s, ok = size_of_file(0x40, TEXT)
+	check(ok && s == TEXT + 0x40, "irx size: info over p_memsz")
+	s, ok = size_of_file(0, RAM)
+	check(ok && s == RAM, "irx size: all of RAM fits")
+	_, ok = size_of_file(0, TEXT - 1)
+	check(!ok, "irx size: p_memsz under the file's bytes refused")
+	_, ok = size_of_file(0, RAM + 1)
+	check(!ok, "irx size: p_memsz over RAM refused")
+	_, ok = size_of_file(0, 0xffffffff)
+	check(!ok, "irx size: largest p_memsz refused")
+	_, ok = size_of_file(RAM + 1 - TEXT, TEXT)
+	check(!ok, "irx size: info over RAM refused")
+	_, ok = size_of_file(0xffffff41, TEXT) // wraps to 1 in 32 bits
+	check(!ok, "irx size: info that wraps refused")
+
+	// A load: the block holds p_memsz, zeroed past the file's bytes, a relocation
+	// lands past what the module info says, and the next block starts after it.
+	refs := [?]Rel{{TEXT_MEM + 0x10, 2}}
+	TEXT_MEM :: 8
+	text := [?]u32{JR_RA, 0x24020000}
+	f := irx_sizes(build_file("modsz", text[:], refs[:], 0), 0, TEXT_MEM + 0x100)
+	fresh()
+	for &b in iop.iop_ram[iop.SYS_BASE:][:0x1000] {b = 0xaa}
+	id, _ := iop.iop_load(f, "modsz", nil)
+	check(id > 0, "irx size: loads")
+	base := module_base(id)
+	for m in iop.iop_loader.modules {
+		if i32(m.id) == id {check(m.size == TEXT_MEM + 0x100, "irx size: module block")}
+	}
+	check(iop.iop_u32(base + TEXT_MEM + 0x10)^ == base, "irx size: relocation past the module info")
+	dirty := 0
+	for i in u32(TEXT_MEM) ..< TEXT_MEM + 0x100 {
+		if i &~ 3 != TEXT_MEM + 0x10 && iop.iop_ram[base + i] != 0 {dirty += 1}
+	}
+	check(dirty == 0, "irx size: zeroed to p_memsz")
+	next := iop.sys_alloc(.Low, 0x10)
+	check(next >= base + TEXT_MEM + 0x100, "irx size: next block past p_memsz")
+
+	// A refused one takes the failed load's path and leaves nothing allocated.
+	refuse :: proc(path: string, bss, memsz: u32, what: string) {
+		text := [?]u32{JR_RA, 0x24020000}
+		f := irx_sizes(build_file(path, text[:], nil, 0), bss, memsz)
+		key := core.Compat_Key{.Iop_Fallback, core.compat_name(path), 0}
+		fresh()
+		rows := core.compat.calls[key].n
+		id, _ := iop.iop_load(f, path, nil)
+		check(id == iop.KE_ERROR && core.compat.calls[key].n == rows + 1, fmt.tprintf("irx size: %s fails the load", what))
+		check(len(iop.sys_blocks) == 0 && len(iop.iop_loader.modules) == 0, fmt.tprintf("irx size: %s leaves nothing", what))
+		id, _ = iop.iop_load(f, path, nil)
+		check(id == iop.KE_ERROR, fmt.tprintf("irx size: %s is not tried again", what))
+	}
+	refuse("modsz1", 0, 4, "p_memsz under the file's bytes")
+	refuse("modsz2", 0, iop.IOP_RAM_SIZE + 1, "p_memsz over RAM")
+	refuse("modsz3", iop.IOP_RAM_SIZE, 8, "info over RAM")
+	refuse("modsz4", 0, iop.IOP_RAM_SIZE, "a block over sysmem's range")
 }
 
 // A module's text as it is assembled: words, and their relocations.
