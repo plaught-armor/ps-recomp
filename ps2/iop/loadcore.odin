@@ -598,6 +598,14 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		case 18: // CpuResumeIntr(state)
 			return KE_OK, true
 		}
+	case "usbd":
+		// A class driver registering or dropping its LDD: no USB device ever
+		// attaches here, so its connect and probe are never called and it
+		// never reaches usbd's other calls, which stay gaps.
+		switch fno {
+		case 4, 5: // sceUsbdRegisterLdd(ops), sceUsbdUnregisterLdd(ops)
+			return 0, true
+		}
 	case "thbase":
 		return th_base(fno)
 	case "thsemap":

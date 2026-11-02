@@ -190,6 +190,7 @@ game :: proc(_: rawptr) {
 	test_vblank()
 	test_vblank_handlers()
 	test_fallback()
+	test_usbd()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -2235,6 +2236,27 @@ test_rpc_client :: proc() {
 	check(word(c4, iop.CL_SERVER) == 0, "rpc client: without PS_IRX RPC_END writes nothing")
 }
 
+
+// A USB class driver's start registers its LDD and loads; the rest of usbd
+// needs a device, so a start reaching it does not.
+test_usbd :: proc() {
+	start_calls :: proc(name: string, fno: u32) -> int {
+		fresh()
+		a: Asm
+		f := imports(&a, "usbd", fno)
+		entry := at(&a)
+		prologue(&a)
+		jal(&a, f)
+		put(&a, 0)
+		li(&a, V0, 0)
+		epilogue(&a)
+		id, _ := iop.iop_load(build_mod(name, &a, entry), name, nil)
+		return int(id)
+	}
+	check(start_calls("usb4", 4) > 0, "usbd: a start that calls sceUsbdRegisterLdd loads")
+	check(start_calls("usb5", 5) > 0, "usbd: a start that calls sceUsbdUnregisterLdd loads")
+	check(start_calls("usb6", 6) <= 0, "usbd: a start that calls usbd 6 still fails")
+}
 
 // The calls an audio service's module needs at load and in play: CpuEnableIntr
 // in a start; ReferSemaStatus and iReferSemaStatus by retail's layout, each only
