@@ -601,6 +601,22 @@ sd_core_param :: proc(id, value: u32) -> bool {
 	return true
 }
 
+// sceSdGetParam(id) for a core's EVOLL, EVOLR.
+sd_core_get :: proc(id: u32) -> (u32, bool) {
+	c := id & 1
+	switch id & 0xff00 {
+	case SD_P_EVOLL: return u32(u16(spu.reverb[c].evol[0])), true
+	case SD_P_EVOLR: return u32(u16(spu.reverb[c].evol[1])), true
+	}
+	return 0, false
+}
+
+// A core's EVOLL and EVOLR, as sceSdEffectAttr's two depth halfwords.
+sd_effect_depth :: proc(c: u32) -> u32 {
+	evol := spu.reverb[c].evol
+	return u32(u16(evol[0])) | u32(u16(evol[1])) << 16
+}
+
 // sceSdSetSwitch(id, voice mask) for PMON, NON, the dry mixes VMIXL, VMIXR
 // and the effect mixes VMIXEL, VMIXER: the mask is kept for sceSdGetSwitch,
 // 24 bits as LIBSD 1.5 writes them, and only the effect mixes change what

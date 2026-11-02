@@ -337,6 +337,7 @@ rpc_lost :: proc(req: Iop_Rpc_Req) {
 // request it ran and those queued for it are lost (rpc_lost).
 @(private = "file")
 rpc_gone :: proc(qd: u32) {
+	if cpu.debug >= 1 {fmt.eprintfln("iop: rpc queue %x gone", qd)}
 	if q := rpc_queue(qd); q != nil && q.busy {rpc_lost(q.cur)}
 	rpc_drop_queue(qd)
 }

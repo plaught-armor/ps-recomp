@@ -114,6 +114,7 @@ Iop_Thread :: struct {
 Iop_Sema :: struct {
 	id, attr, option: u32,
 	count, max:       i32,
+	initial:          i32,
 }
 
 // Emulated state, in the emu heap: snapshotted (sif_snap).
@@ -684,7 +685,7 @@ th_semap :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	a0 := r3000.state.r[4]
 	switch fno {
 	case 4: // CreateSema(iop_sema_t *): attr, option, initial, max
-		append(&s.semas, Iop_Sema{s.next_semid, r32(a0), r32(a0 + 4), i32(r32(a0 + 8)), i32(r32(a0 + 12))})
+		append(&s.semas, Iop_Sema{s.next_semid, r32(a0), r32(a0 + 4), i32(r32(a0 + 8)), i32(r32(a0 + 12)), i32(r32(a0 + 8))})
 		s.next_semid += 1
 		return s.next_semid - 1, true
 	case 5: // DeleteSema(semid)
@@ -719,6 +720,19 @@ th_semap :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if m == nil {return ke(KE_UNKNOWN_SEMID), true}
 		if m.count == 0 {return ke(KE_SEMA_ZERO), true}
 		m.count -= 1
+		return KE_OK, true
+	case 11, 12: // ReferSemaStatus(semid, iop_sema_info_t *), iReferSemaStatus: each only in its context
+		if (fno == 12) != s.intr {return ke(KE_ILLEGAL_CONTEXT), true}
+		m := sema_find(a0)
+		if m == nil {return ke(KE_UNKNOWN_SEMID), true}
+		waiters: u32
+		for t in s.threads {
+			if t.status == .Wait && t.sema == m.id {waiters += 1}
+		}
+		info := r3000.state.r[5]
+		for w, i in ([6]u32{m.attr, m.option, u32(m.initial), u32(m.max), u32(m.count), waiters}) {
+			w32(info + 4 * u32(i), w)
+		}
 		return KE_OK, true
 	}
 	return 0, false

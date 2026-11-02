@@ -178,6 +178,7 @@ game :: proc(_: rawptr) {
 	test_rpc_remove()
 	test_rpc_self_remove()
 	test_rpc_client()
+	test_c1_gaps()
 	test_sifman()
 	test_libsd()
 	test_cdvdman()
@@ -2156,6 +2157,70 @@ test_rpc_client :: proc() {
 	check(word(c4, iop.CL_SERVER) == 0, "rpc client: without PS_IRX RPC_END writes nothing")
 }
 
+
+// The calls an audio service's module needs at load and in play: CpuEnableIntr
+// in a start; ReferSemaStatus and iReferSemaStatus by retail's layout, each only
+// in its context; sceSdGetEffectAttr gives back what Set left, delay and
+// feedback only in the echo modes; sceSdGetParam reads EVOL.
+test_c1_gaps :: proc() {
+	fresh()
+	a: Asm
+	ie := imports(&a, "intrman", 9)
+	entry := at(&a)
+	prologue(&a)
+	jal(&a, ie)
+	put(&a, 0)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modg", &a, entry), "modg", nil)
+	check(id > 0, "c1: a start that calls CpuEnableIntr loads")
+
+	P :: 0x00040000
+	r := &r3000.state.r
+	for w, i in ([4]u32{1, 7, 2, 5}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+	r[4] = P
+	semid, ok := iop.th_semap(4)
+	check(ok, "c1: CreateSema")
+	t := iop.th_new(0x1000, 0x2000, 0x100, 0, 10)
+	t.status, t.sema = .Wait, semid
+	r[4], r[5] = semid, P + 0x40
+	v, ok2 := iop.th_semap(11)
+	info :: proc(i: u32) -> u32 {return iop.iop_u32(P + 0x40 + 4 * i)^}
+	check(ok2 && v == 0 && info(0) == 1 && info(1) == 7 && info(2) == 2 && info(3) == 5 && info(4) == 2 && info(5) == 1, "c1: ReferSemaStatus by retail's layout")
+	v, _ = iop.th_semap(12)
+	check(v == neg(-iop.KE_ILLEGAL_CONTEXT), "c1: iReferSemaStatus on a thread is illegal")
+	iop.iop_sched.intr = true
+	v, _ = iop.th_semap(11)
+	check(v == neg(-iop.KE_ILLEGAL_CONTEXT), "c1: ReferSemaStatus in a handler is illegal")
+	iop.iop_u32(P + 0x40 + 16)^ = 0
+	v, _ = iop.th_semap(12)
+	check(v == 0 && info(4) == 2, "c1: iReferSemaStatus in a handler")
+	iop.iop_sched.intr = false
+	r[4] = semid + 100
+	v, _ = iop.th_semap(11)
+	check(v == neg(-iop.KE_UNKNOWN_SEMID), "c1: an unknown semaphore")
+
+	set :: proc(core, mode, depth, delay, feedback: u32) -> u32 {
+		for w, i in ([5]u32{core, mode, depth, delay, feedback}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+		r3000.state.r[4], r3000.state.r[5] = core, P
+		v, _ := iop.libsd_fn(23)
+		return v
+	}
+	get :: proc(core: u32) -> [5]u32 {
+		r3000.state.r[4], r3000.state.r[5] = core, P + 0x40
+		iop.libsd_fn(24)
+		return {info(0), info(1), info(2), info(3), info(4)}
+	}
+	check(set(1, 7 | 0x100, 0x20001000, 40, 50) == 0 && get(1) == [5]u32{1, 7, 0x20001000, 40, 50}, "c1: an echo mode's attributes come back, the clear bit not")
+	check(set(0, 3, 0x30003000, 40, 50) == 0 && get(0) == [5]u32{0, 3, 0x30003000, 0, 0}, "c1: other modes have no delay or feedback")
+	check(get(1) == [5]u32{1, 7, 0x20001000, 40, 50}, "c1: per core")
+	r[4] = 0x0b01
+	v, _ = iop.libsd_fn(6)
+	check(v == 0x1000, "c1: sceSdGetParam reads EVOLL")
+	r[4] = 0x0c80
+	v, _ = iop.libsd_fn(6)
+	check(v == 0x3000, "c1: sceSdGetParam reads EVOLR, the id's other bits aside")
+}
 
 // sceSifInit finds SIF set up, as at boot, and sceSifCheckInit says so.
 test_sifman :: proc() {

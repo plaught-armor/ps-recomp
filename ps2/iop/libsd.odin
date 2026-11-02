@@ -35,6 +35,11 @@ Iop_Sd :: struct {
 	trans:   [2]Sd_Handler, // per channel
 	spu2:    Sd_Handler,
 	pending: u8, // the interrupts raised and not yet run, SD_PENDING_*
+	effect:  [2]Sd_Effect, // per core, as the last sceSdSetEffectAttr left it
+}
+
+Sd_Effect :: struct {
+	mode, delay, feedback: u32,
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -56,6 +61,7 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 6: // sceSdGetParam(entry)
 		v, found := sd_get_param(a0)
+		if !found {v, found = sd_core_get(a0)}
 		if !found {libsd_unknown(fno, a0)}
 		return v, true
 	case 7: // sceSdSetSwitch(entry, value)
@@ -98,7 +104,22 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 23: // sceSdSetEffectAttr(core, sceSdEffectAttr *)
 		e := a1
 		set := spu_effect(int(a0 & 1), r32(e + 4), i16(r32(e + 8)), i16(r32(e + 8) >> 16))
+		if set {
+			// Only the two echo modes take delay and feedback from the caller.
+			mode := r32(e + 4) & 0xff
+			echo := mode == 7 || mode == 8
+			s.effect[a0 & 1] = {mode, r32(e + 12) if echo else 0, r32(e + 16) if echo else 0}
+		}
 		return set ? 0 : ke(-1), true
+	case 24: // sceSdGetEffectAttr(core, sceSdEffectAttr *): depth from EVOL
+		c := a0 & 1
+		fx := s.effect[c]
+		w32(a1, a0)
+		w32(a1 + 4, fx.mode)
+		w32(a1 + 8, sd_effect_depth(c))
+		w32(a1 + 12, fx.delay)
+		w32(a1 + 16, fx.feedback)
+		return 0, true
 	case 25: // sceSdClearEffectWorkArea(core, channel, effect mode)
 		sd_clear_effect(a0)
 		return 0, true

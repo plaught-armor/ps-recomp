@@ -297,6 +297,7 @@ sif_command :: proc(a, pc: u32) {
 		if iop_irx {
 			if sid == SDR_SID {sdr_thread_start()}
 			if iop_rpc_call(a, sid) {return}
+			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc %08x fno %d left to the host", sid, fno)}
 		}
 		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
