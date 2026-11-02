@@ -194,6 +194,8 @@ game :: proc(_: rawptr) {
 	test_sio2_lock()
 	test_sio2_lock_snap()
 	test_sio2_lock_undo()
+	test_sio2_stat()
+	test_ds2()
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
@@ -1691,6 +1693,127 @@ test_sio2_lock_undo :: proc() {
 	for t in s.threads {if t.status == .Lock {waiting += 1}}
 	check(id == -1 && len(s.threads) == n && waiting == 1 && iop.th_find(kept).status == .Lock, "sio2 lock undo: T goes, the earlier waiter stays")
 	check(s.lock == 0, "sio2 lock undo: the lock stays held")
+}
+
+// One sio2man transfer (51) of frames `send`, each to its port in `ports`,
+// as SIO2D builds them: each register sends and gets back its frame's
+// length. The reply bytes of every frame in turn, and stat6c.
+xfer :: proc(ports: []u32, send: ..[]u8) -> (reply: []u8, stat: u32) {
+	TD :: 0x00040000
+	IN :: TD + 0x200
+	OUT :: TD + 0x400
+	for o := u32(0); o < 0x94; o += 4 {iop.iop_u32(TD + o)^ = 0}
+	n: u32
+	for f, i in send {
+		l := u32(len(f))
+		iop.iop_u32(TD + 0x28 + 4 * u32(i))^ = ports[i] | 0x40 | l << 8 | l << 18
+		copy(iop.iop_ram[IN + n:][:l], f)
+		n += l
+	}
+	for i in 0 ..< n {iop.iop_ram[OUT + i] = 0x55}
+	iop.iop_u32(TD + 0x6c)^, iop.iop_u32(TD + 0x70)^ = n, n
+	iop.iop_u32(TD + 0x74)^, iop.iop_u32(TD + 0x78)^ = IN, OUT
+	check(sio2(51, TD) == 1, "sio2: transfer returns 1")
+	check(iop.iop_u32(TD + 0x24)^ == 0xf && iop.iop_u32(TD + 0x68)^ == 0, "sio2: stat70 0xf, stat74 0")
+	return iop.iop_ram[OUT:][:n], iop.iop_u32(TD)^
+}
+
+// A frame to the pad on port 0: 0x01, then command `cmd`, then the bytes
+// after 0x00, padded with zeros to `n` bytes.
+pad_frame :: proc(cmd: u8, args: []u8 = nil, n := 21) -> []u8 {
+	f := make([]u8, n, context.temp_allocator)
+	f[0], f[1] = 0x01, cmd
+	copy(f[3:], args)
+	return f
+}
+
+all_ff :: proc(b: []u8) -> bool {
+	for x in b {if x != 0xff {return false}}
+	return true
+}
+
+// stat6c as PCSX2 builds it: the ports a pad frame opened, the MISSING bits
+// of one no pad answers, DISCONNECTED after a frame to another device; no
+// device answers 0xff.
+test_sio2_stat :: proc() {
+	fresh()
+	iop.pad_init()
+	_, st := xfer({0}, pad_frame(0x42))
+	check(st == iop.SIO2_NO_DEVICES_MISSING | iop.SIO2_ONE_PORT_OPEN, "sio2 stat: one pad frame, 0x1100")
+	_, st = xfer({0, 0}, pad_frame(0x42), pad_frame(0x42))
+	check(st == 0x1200, "sio2 stat: two, 0x1200")
+	r, st2 := xfer({1}, pad_frame(0x42))
+	check(st2 == 0x2d100 && all_ff(r), "sio2 stat: no pad on port 1, its MISSING bits and 0xff")
+	r, st2 = xfer({2}, pad_frame(0x42))
+	check(st2 == 0x1d100 && all_ff(r), "sio2 stat: none on port 2")
+	r, st2 = xfer({0, 2}, pad_frame(0x42), []u8{0x81, 0x11, 0, 0})
+	check(st2 == iop.SIO2_DISCONNECTED && all_ff(r[21:]) && r[1] == iop.DS2_DIGITAL, "sio2 stat: a memory card frame leaves DISCONNECTED, answered 0xff")
+	iop.pads[0].connected = false
+	r, st2 = xfer({0}, pad_frame(0x42))
+	check(st2 == iop.SIO2_DISCONNECTED && all_ff(r), "sio2 stat: a pad pulled out, 0x1d100 and 0xff")
+	iop.pads[0].connected = true
+	r3000.state.r[4] = 0x00040000
+	iop.iop_u32(0x00040000 + 0x7c)^ = 0x1000
+	_, ok := iop.sio2man_fn(51)
+	check(!ok, "sio2: a DMA transfer is not served")
+}
+
+// Each DualShock 2 command against PCSX2's PadDualshock2.cpp.
+test_ds2 :: proc() {
+	fresh()
+	iop.pad_init()
+	defer iop.pad_init()
+	p := &iop.pads[0]
+	p.buttons = {.Cross, .Up}
+	p.axes = {0x10, 0x20, 0x30, 0x40}
+	b := ~transmute(u16)p.buttons
+	r, _ := xfer({0}, pad_frame(0x42))
+	check(r[0] == 0xff && r[1] == iop.DS2_DIGITAL && r[2] == 0x5a, "ds2: digital at first, 0xff 0x41 0x5a")
+	check(r[3] == u8(b) && r[4] == u8(b >> 8) && r[5] == 0x10 && r[8] == 0x40, "ds2 0x42: buttons active low, then the sticks")
+	check(r[11] == 0xff && r[15] == 0xff && r[9] == 0 && r[20] == 0, "ds2 0x42: up's and cross's pressures")
+	r, _ = xfer({0}, pad_frame(0x41, n = 9))
+	check(r[3] == 0 && r[5] == 0 && r[8] == 0, "ds2 0x41: a digital pad's are 0")
+	r, _ = xfer({0}, pad_frame(0x43, {1}, n = 9))
+	check(r[1] == iop.DS2_DIGITAL && r[3] == u8(b), "ds2 0x43: entering config answers as a poll")
+	r, _ = xfer({0}, pad_frame(0x40, n = 9))
+	check(r[1] == iop.DS2_CONFIG && r[5] == 0x02 && r[8] == 0x5a, "ds2 0x40: id 0xf3 in config")
+	r, _ = xfer({0}, pad_frame(0x44, {1, 3}, n = 9))
+	check(r[3] == 0 && iop.ds2.mode == iop.DS2_ANALOG && iop.ds2.analog_locked, "ds2 0x44: analog, locked")
+	r, _ = xfer({0}, pad_frame(0x45, n = 9))
+	check(r[3] == 0x03 && r[4] == 0x02 && r[5] == 1 && r[6] == 0x02 && r[7] == 0x01 && r[8] == 0, "ds2 0x45: standard pad, light on")
+	r, _ = xfer({0}, pad_frame(0x41, n = 9))
+	check(r[3] == 0xff && r[4] == 0xff && r[5] == 0x03 && r[8] == 0x5a, "ds2 0x41: an analog pad's")
+	r, _ = xfer({0}, pad_frame(0x46, {0}, n = 9))
+	check(r[5] == 0x01 && r[6] == 0x02 && r[7] == 0 && r[8] == 0x0a, "ds2 0x46: stage 0")
+	r, _ = xfer({0}, pad_frame(0x46, {1}, n = 9))
+	check(r[5] == 0x01 && r[6] == 0x01 && r[7] == 0x01 && r[8] == 0x14, "ds2 0x46: stage 1")
+	r, _ = xfer({0}, pad_frame(0x47, n = 9))
+	check(r[5] == 0x02 && r[7] == 0x01 && r[8] == 0, "ds2 0x47")
+	r, _ = xfer({0}, pad_frame(0x4c, {0}, n = 9))
+	check(r[6] == 0x04, "ds2 0x4c: stage 0")
+	r, _ = xfer({0}, pad_frame(0x4c, {1}, n = 9))
+	check(r[6] == 0x07, "ds2 0x4c: stage 1")
+	r, _ = xfer({0}, pad_frame(0x4d, {0, 1, 0xff, 0xff, 0xff, 0xff}, n = 9))
+	check(all_ff(r[3:9]), "ds2 0x4d: the map was all 0xff")
+	r, _ = xfer({0}, pad_frame(0x4d, {0, 1, 0xff, 0xff, 0xff, 0xff}, n = 9))
+	check(r[3] == 0 && r[4] == 1 && all_ff(r[5:9]), "ds2 0x4d: each byte answered by the entry it replaces")
+	r, _ = xfer({0}, pad_frame(0x4f, {0xff, 0xff, 0x03}, n = 9))
+	check(r[8] == 0x5a && iop.ds2.mode == iop.DS2_DUALSHOCK2, "ds2 0x4f: 0x3ffff, DualShock 2 mode")
+	r, _ = xfer({0}, pad_frame(0x42))
+	check(r[1] == iop.DS2_CONFIG && r[3] == u8(b), "ds2 0x42: polls in config too")
+	r, _ = xfer({0}, pad_frame(0x43, {0}, n = 9))
+	check(r[1] == iop.DS2_CONFIG && r[3] == 0 && !iop.ds2.config, "ds2 0x43: leaving config answers 0")
+	r, _ = xfer({0}, pad_frame(0x42, {1, 0x80}))
+	check(r[1] == iop.DS2_DUALSHOCK2 && p.small == 1 && p.large == 0x80, "ds2 0x42: id 0x79, the motors as mapped")
+	r, _ = xfer({0}, pad_frame(0x43, {1}, n = 9))
+	r, _ = xfer({0}, pad_frame(0x4f, {0x3f, 0, 0}, n = 9))
+	check(iop.ds2.mode == iop.DS2_ANALOG, "ds2 0x4f: 0x3f, analog mode")
+	r, _ = xfer({0}, pad_frame(0x4f, {0, 0, 0}, n = 9))
+	check(iop.ds2.mode == iop.DS2_DIGITAL, "ds2 0x4f: any other mask, digital")
+	r, _ = xfer({0}, pad_frame(0x44, {0, 0}, n = 9))
+	check(iop.ds2.mode == iop.DS2_DIGITAL && !iop.ds2.analog_locked && iop.ds2.analog_light == 0, "ds2 0x44: digital, unlocked")
+	r, _ = xfer({0}, pad_frame(0x42, n = 5))
+	check(len(r) == 5 && r[4] == u8(b >> 8), "ds2: a short frame gets its own bytes")
 }
 
 // sceSifSetCmdBuffer and sceSifAddCmdHandler fill the module's table and the

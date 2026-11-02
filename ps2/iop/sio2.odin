@@ -90,8 +90,9 @@ sio2_transfer :: proc(td: u32) {
 	w32(td + TD_STAT74, SIO2_FIFO_STAT)
 }
 
-// One frame to port `port`: its reply bytes, and stat6c after it. No device
-// answers: the reply is all 0xff.
+// One frame to port `port`: its reply bytes, and stat6c after it. Player
+// 1's pad, when connected, answers a pad frame on port 0; no device answers
+// anything else, and the reply is all 0xff.
 @(private = "file")
 sio2_frame :: proc(port: u32, send, reply: []u8, stat: u32) -> u32 {
 	for &b in reply {b = 0xff}
@@ -103,6 +104,156 @@ sio2_frame :: proc(port: u32, send, reply: []u8, stat: u32) -> u32 {
 		stat |= SIO2_ONE_PORT_OPEN
 	}
 	stat |= SIO2_NO_DEVICES_MISSING
-	stat |= SIO2_PORT_1_MISSING if port & 1 == 0 else SIO2_PORT_2_MISSING
+	if port != 0 || !pads[0].connected {
+		return stat | (SIO2_PORT_1_MISSING if port & 1 == 0 else SIO2_PORT_2_MISSING)
+	}
+	for tx, i in send[1:] {
+		rx := ds2_byte(i + 1, tx)
+		if i + 1 < len(reply) {reply[i + 1] = rx}
+	}
 	return stat
+}
+
+// ------------------------------------------------------------- the pad
+
+// A DualShock 2 on the wire, after PCSX2's PadDualshock2.cpp: byte 0 of a
+// frame addresses the pad (answered 0xff by the SIO2), byte 1 is the
+// command, answered by the mode's id, byte 2 is answered 0x5a, and each
+// later byte by the command's data. The pad starts digital; 0x44 and 0x4f
+// change its mode, 0x43 enters and leaves config mode (id 0xf3).
+DS2_DIGITAL :: 0x41
+DS2_ANALOG :: 0x73
+DS2_DUALSHOCK2 :: 0x79
+DS2_CONFIG :: 0xf3
+// 0x4f's mask of the poll bytes the pad sends (PadTypes.h ResponseBytes):
+// the analog set, the DualShock 2 set with pressures; any other is digital.
+@(private = "file") DS2_RESPONSE_ANALOG :: 0x3f
+@(private = "file") DS2_RESPONSE_DUALSHOCK2 :: 0x3ffff
+// Motor map entries (0x4d): which motor a poll argument byte drives.
+@(private = "file") DS2_MOTOR_SMALL :: 0x00
+@(private = "file") DS2_MOTOR_LARGE :: 0x01
+
+// Player 1's pad's protocol state. Emulated state: snapshotted (pad_snap).
+ds2: struct {
+	mode:          u8, // DS2_DIGITAL, DS2_ANALOG or DS2_DUALSHOCK2
+	config:        bool,
+	analog_light:  u8, // 0x44's first argument
+	analog_locked: bool,
+	stage:         bool, // 0x46's and 0x4c's selector
+	cmd:           u8, // the current frame's command
+	cmd_config:    bool, // whether it came in config mode
+	response:      u32, // 0x4f's mask
+	motor_map:     [6]u8,
+}
+
+ds2_reset :: proc() {
+	ds2 = {mode = DS2_DIGITAL, motor_map = 0xff}
+}
+
+// The pad's answer to byte i of a frame, `tx`.
+@(private = "file")
+ds2_byte :: proc(i: int, tx: u8) -> u8 {
+	d := &ds2
+	switch i {
+	case 1:
+		d.cmd, d.cmd_config = tx, d.config
+		return DS2_CONFIG if d.config else d.mode
+	case 2:
+		return 0x5a
+	}
+	switch d.cmd {
+	case 0x40:
+		switch i {
+		case 5: return 0x02
+		case 8: return 0x5a
+		}
+	case 0x41: // the poll bytes it sends, of a pad not digital
+		if d.mode == DS2_DIGITAL {return 0}
+		switch i {
+		case 3, 4: return 0xff
+		case 5: return 0x03
+		case 8: return 0x5a
+		}
+	case 0x42:
+		return ds2_poll(i, tx)
+	case 0x43: // config mode: outside it, a poll as well, as the PS1 pad's (psx/bios/sio.odin)
+		if i == 3 {d.config = tx != 0}
+		if !d.cmd_config {return ds2_poll(i, tx, motors = false)}
+	case 0x44: // mode switch: analog light, then 3 to lock the mode
+		switch i {
+		case 3:
+			d.analog_light = tx
+			d.mode = DS2_ANALOG if tx != 0 else DS2_DIGITAL
+		case 4:
+			d.analog_locked = tx == 3
+		}
+	case 0x45: // status: a standard pad, the analog light
+		switch i {
+		case 3: return 0x03
+		case 4, 6: return 0x02
+		case 5: return d.analog_light
+		case 7: return 0x01
+		}
+	case 0x46:
+		switch i {
+		case 3: d.stage = tx != 0
+		case 5: return 0x01
+		case 6: return 0x01 if d.stage else 0x02
+		case 7: return 0x01 if d.stage else 0x00
+		case 8: return 0x14 if d.stage else 0x0a
+		}
+	case 0x47:
+		switch i {
+		case 5: return 0x02
+		case 7: return 0x01
+		}
+	case 0x4c:
+		switch i {
+		case 3: d.stage = tx != 0
+		case 6: return 0x07 if d.stage else 0x04
+		}
+	case 0x4d: // motor map: each byte answered by the entry it replaces
+		if i < 3 || i >= 3 + len(d.motor_map) {return 0xff}
+		old := d.motor_map[i - 3]
+		d.motor_map[i - 3] = tx
+		return old
+	case 0x4f: // the poll bytes to send, which set the mode
+		switch i {
+		case 3, 4:
+			d.response = d.response &~ (0xff << (8 * u32(i - 3))) | u32(tx) << (8 * u32(i - 3))
+		case 5:
+			d.response = d.response & 0xffff | u32(tx) << 16
+			switch d.response {
+			case DS2_RESPONSE_ANALOG: d.mode, d.analog_light = DS2_ANALOG, 1
+			case DS2_RESPONSE_DUALSHOCK2: d.mode, d.analog_light = DS2_DUALSHOCK2, 1
+			case: d.mode, d.analog_light = DS2_DIGITAL, 0
+			}
+		case 8:
+			return 0x5a
+		}
+	}
+	return 0
+}
+
+// Poll byte i: the buttons, active low, then the sticks rx, ry, lx, ly, then
+// the pressures in PRESSURE's order, 0xff for a button held. With
+// `motors`, argument byte k drives the motor the map gives it: the small one
+// on or off (bit 0), the large one a speed.
+@(private = "file")
+ds2_poll :: proc(i: int, tx: u8, motors := true) -> u8 {
+	p := &pads[0]
+	if k := i - 3; motors && k >= 0 && k < len(ds2.motor_map) {
+		switch ds2.motor_map[k] {
+		case DS2_MOTOR_SMALL: p.small = tx & 1
+		case DS2_MOTOR_LARGE: p.large = tx
+		}
+	}
+	b := ~transmute(u16)p.buttons
+	switch i {
+	case 3: return u8(b)
+	case 4: return u8(b >> 8)
+	case 5 ..= 8: return p.axes[i - 5]
+	case 9 ..< 9 + len(PRESSURE): return 0xff if PRESSURE[i - 9] in p.buttons else 0
+	}
+	return 0
 }

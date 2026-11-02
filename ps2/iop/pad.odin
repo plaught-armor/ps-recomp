@@ -69,7 +69,7 @@ PAD_MODE_DUALSHOCK :: 0x73 // id 7, 3 halfwords of data
 
 // Pressure bytes 8..19 in order: right, left, up, down, triangle, circle,
 // cross, square, L1, R1, L2, R2.
-@(private = "file")
+@(private)
 PRESSURE := [12]Pad_Button{.Right, .Left, .Up, .Down, .Triangle, .Circle, .Cross, .Square, .L1, .R1, .L2, .R2}
 
 @(private = "file")
@@ -79,6 +79,7 @@ pad_init :: proc() {
 	for &p in pads {p.axes = {0x80, 0x80, 0x80, 0x80}}
 	pads[0].connected = true
 	for &a in act_align {a = 0xff}
+	ds2_reset()
 }
 
 // The multitap is plugged in while more than one player is.
@@ -230,4 +231,5 @@ pad_snap :: proc() {
 	core.snap_add(&act_align)
 	core.snap_add(&mtap)
 	core.snap_add(&pad_frame)
+	core.snap_add(&ds2)
 }
