@@ -704,16 +704,21 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 // Emit a branch's condition into `tk` and its target into `tg`, plus the
 // link register.
 @(private = "file")
-emit_branch :: proc(sb: ^strings.Builder, lw, pc, mask: u32) {
+emit_branch :: proc(sb: ^strings.Builder, lw, pc, mask: u32, delayed: bool) {
 	it, is := (lw >> 16) & 15, (lw >> 11) & 15
+	a, b := fmt.tprintf("vi[%d]", it), fmt.tprintf("vi[%d]", is)
+	if delayed { // delay_pairs
+		a = fmt.tprintf("vu.vi_branch(v, %d, 0x%04x)", it, pc)
+		b = fmt.tprintf("vu.vi_branch(v, %d, 0x%04x)", is, pc)
+	}
 	switch lw >> 25 {
 	case 0x20, 0x21, 0x24, 0x25: fmt.sbprintln(sb, "\t\t\ttk := true")
-	case 0x28: fmt.sbprintfln(sb, "\t\t\ttk := vi[%d] == vi[%d]", it, is)
-	case 0x29: fmt.sbprintfln(sb, "\t\t\ttk := vi[%d] != vi[%d]", it, is)
-	case 0x2c: fmt.sbprintfln(sb, "\t\t\ttk := i16(vi[%d]) < 0", is)
-	case 0x2d: fmt.sbprintfln(sb, "\t\t\ttk := i16(vi[%d]) > 0", is)
-	case 0x2e: fmt.sbprintfln(sb, "\t\t\ttk := i16(vi[%d]) <= 0", is)
-	case 0x2f: fmt.sbprintfln(sb, "\t\t\ttk := i16(vi[%d]) >= 0", is)
+	case 0x28: fmt.sbprintfln(sb, "\t\t\ttk := %s == %s", a, b)
+	case 0x29: fmt.sbprintfln(sb, "\t\t\ttk := %s != %s", a, b)
+	case 0x2c: fmt.sbprintfln(sb, "\t\t\ttk := i16(%s) < 0", b)
+	case 0x2d: fmt.sbprintfln(sb, "\t\t\ttk := i16(%s) > 0", b)
+	case 0x2e: fmt.sbprintfln(sb, "\t\t\ttk := i16(%s) <= 0", b)
+	case 0x2f: fmt.sbprintfln(sb, "\t\t\ttk := i16(%s) >= 0", b)
 	}
 	switch lw >> 25 {
 	case 0x24, 0x25: fmt.sbprintfln(sb, "\t\t\ttg := u32(vi[%d]) * 8 & 0x%x", is, mask)
@@ -777,6 +782,7 @@ emit_wait_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow:
 emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, entries: []u32, unit: Unit, status: bool, slow: ^map[string]int) {
 	mask := MASK[unit]
 	pairs, target := analyze(words, ext, entries, unit, status)
+	delayed, enter := delay_pairs(pairs, ext)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
 	// A pair reached only by falling through from one whose known lanes
 	// are not KNOWN_NONE gets no case label, so the lanes carry into it.
@@ -808,9 +814,15 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", pc)
 		case branch:
 			emit_wait_pair(sb, p, pc, unit, slow, k, p.waits)
-			emit_branch(sb, p.lw, pc, mask)
+			emit_branch(sb, p.lw, pc, mask, delayed[i])
 			emit_wait_pair(sb, next, pc + 8, unit, slow, k, waits_after(p, p.waits))
 			fmt.sbprintln(sb, "\t\t\tif tk {")
+			// The interpreter's jumps clear Vu.vih: where a delayed branch
+			// can look back (delay_pairs).
+			t := int(branch_target(p.lw, pc, mask) / 8)
+			if p.branch == .Reg || (t < len(pairs) && (delayed[t] || enter[t])) {
+				fmt.sbprintln(sb, "\t\t\t\tv.vih = {}")
+			}
 			fmt.sbprintln(sb, "\t\t\t\tbudget^ -= 1")
 			fmt.sbprintln(sb, "\t\t\t\tif budget^ <= 0 {return tg, .Leave}")
 			fmt.sbprintln(sb, "\t\t\t\tpc = tg")
@@ -823,6 +835,14 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 			emit_wait_pair(sb, next, pc + 8, unit, slow, k, waits_after(p, p.waits))
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .End", (pc + 16) & mask)
 		case:
+			if enter[i] { // delay_pairs
+				e := vih_entry(p.uw, p.lw)
+				if e & VIH_WRITE != 0 {
+					fmt.sbprintfln(sb, "\t\t\tv.vih = {{0x%x | u32(vi[%d]), v.vih[0], v.vih[1], v.vih[2]}", e, (e >> 16) & 15)
+				} else {
+					fmt.sbprintfln(sb, "\t\t\tv.vih = {{0x%x, v.vih[0], v.vih[1], v.vih[2]}", e)
+				}
+			}
 			emit_wait_pair(sb, p, pc, unit, slow, k, p.waits)
 			if i + 1 < len(pairs) && in_ext(ext, i + 1) {
 				fell = true

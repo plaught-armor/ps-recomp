@@ -39,6 +39,7 @@ Imp :: enum u8 {
 	Run_Pc,
 	Run_Budget,
 	Scratch, // SCRATCH_SIZE bytes, 16-byte aligned
+	Branch_Vi, // proc(lw, pc: u32): the VIs a delayed branch compares, at Scratch (vu.vu0_branch_vi)
 }
 
 @(private, rodata)
@@ -58,6 +59,7 @@ IMPORTS := [Unit][Imp]string {
 		.Run_Pc = "vu.run_pc",
 		.Run_Budget = "vu.run_budget",
 		.Scratch = "vu.scratch",
+		.Branch_Vi = "vu.branch_vi",
 	},
 	.VU1 = {
 		.Vf = "vu1.vf",
@@ -74,6 +76,7 @@ IMPORTS := [Unit][Imp]string {
 		.Run_Pc = "vu1.run_pc",
 		.Run_Budget = "vu1.run_budget",
 		.Scratch = "vu1.scratch",
+		.Branch_Vi = "vu1.branch_vi",
 	},
 }
 
@@ -99,6 +102,8 @@ VU_VI :: 512
 VU_ACC, VU_Q, VU_P, VU_I, VU_CLIP, VU_STATUS, VU_MAC :: 544, 560, 564, 568, 576, 580, 584
 @(private = "file")
 VU_Q_NEXT, VU_Q_WAIT, VU_P_NEXT, VU_P_WAIT, VU_Q_FLAGS, VU_Q_DUE :: 624, 628, 632, 636, 640, 644
+@(private = "file")
+VU_VIH :: 648
 // Each flag's three older values (old_mac and the rest), as [Flag].
 @(private = "file", rodata)
 VU_OLD := [Flag]u32 {
@@ -1208,19 +1213,37 @@ micro_wait_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[st
 }
 
 // T = whether branch lw is taken, as 0 or 1, or for JR and JALR its
-// target; then the link register. As emit_branch.
+// target; then the link register. As emit_branch: a delayed branch
+// (delay_pairs) reads its VIs through vu.vi_branch.
 @(private = "file")
-micro_branch :: proc(a: ^native.Asm, u: Unit, lw, pc, mask: u32) {
+micro_branch :: proc(a: ^native.Asm, u: Unit, lw, pc, mask: u32, delayed: bool) {
 	it, is := (lw >> 16) & 15, (lw >> 11) & 15
-	switch lw >> 25 {
+	op := lw >> 25
+	get := proc(a: ^native.Asm, u: Unit, r: native.Reg, n: u32, delayed: bool, signed := false) {
+		if delayed {
+			native.imp_load(a, r, IMPORTS[u][.Scratch], 0 if r == .A else 2, .B16, signed)
+		} else {
+			vi_get(a, u, r, n, signed)
+		}
+	}
+	if delayed && op >= 0x28 {
+		native.mov_imm(a, .A, lw)
+		native.mov_imm(a, .B, pc)
+		native.call(a, IMPORTS[u][.Branch_Vi], .A, .B)
+	}
+	switch op {
 	case 0x28, 0x29: // IBEQ, IBNE
-		vi_get(a, u, .A, it)
-		vi_get(a, u, .B, is)
+		get(a, u, .A, it, delayed)
+		get(a, u, .B, is, delayed)
 		native.set_cond(a, native.Cond.Eq if lw >> 25 == 0x28 else native.Cond.Ne, .A, .B)
 		native.mov(a, .T, .A)
 	case 0x2c ..= 0x2f: // IBLTZ, IBGTZ, IBLEZ, IBGEZ
 		CONDS := [4]native.Cond{.Lt, .Gt, .Le, .Ge}
-		vi_get(a, u, .A, is, signed = true)
+		if delayed {
+			native.imp_load(a, .A, IMPORTS[u][.Scratch], 2, .B16, true)
+		} else {
+			vi_get(a, u, .A, is, signed = true)
+		}
 		native.set_cond_imm(a, CONDS[(lw >> 25) - 0x2c], .A, 0)
 		native.mov(a, .T, .A)
 	case 0x24, 0x25: // JR, JALR
@@ -1252,6 +1275,7 @@ count_slow :: proc(slow: ^map[string]int, key: string) {
 native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32, u: Unit, status: bool, slow: ^map[string]int = nil) -> int {
 	mask := MASK[u]
 	pairs, target := analyze(words, ext, entries, u, u == .VU0 || status)
+	delayed, enter := delay_pairs(pairs, ext)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
 	run_pc := IMPORTS[u][.Run_Pc]
 	// No EE fields are cached here: the code reaches no EE state, and its
@@ -1311,12 +1335,18 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 		case branch:
 			op := p.lw >> 25
 			micro_wait_pair(a, u, p, pc, slow, k, p.waits)
-			micro_branch(a, u, p.lw, pc, mask)
+			micro_branch(a, u, p.lw, pc, mask, delayed[i])
 			micro_wait_pair(a, u, next, pc + 8, slow, k, waits_after(p, p.waits))
 			not_taken, go := native.new_label(a), native.new_label(a)
 			cond := op >= 0x28
 			reg := op == 0x24 || op == 0x25
 			if cond {native.br_zero(a, .T, not_taken)}
+			// As emit_program: the interpreter's jumps clear Vu.vih.
+			t := int(branch_target(p.lw, pc, mask) / 8)
+			if reg || (t < len(pairs) && (delayed[t] || enter[t])) {
+				native.mov_imm(a, .A, 0)
+				for off in u32(0) ..< 4 {native.imp_store(a, IMPORTS[u][.Vf], .A, VU_VIH + 4 * off)}
+			}
 			// The budget counts taken branches; out of it, leave at the
 			// target.
 			budget := IMPORTS[u][.Run_Budget]
@@ -1342,6 +1372,22 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 			micro_wait_pair(a, u, next, pc + 8, slow, k, waits_after(p, p.waits))
 			leave(a, exit, (pc + 16) & mask, end = true)
 		case:
+			if enter[i] { // delay_pairs: as emit_program
+				vf := IMPORTS[u][.Vf]
+				for off := u32(8); ; off -= 4 {
+					native.imp_load(a, .A, vf, VU_VIH + off)
+					native.imp_store(a, vf, .A, VU_VIH + off + 4)
+					if off == 0 {break}
+				}
+				e := vih_entry(p.uw, p.lw)
+				if e & VIH_WRITE != 0 {
+					vi_get(a, u, .A, (e >> 16) & 15)
+					native.alu_imm(a, .Or, .A, e)
+				} else {
+					native.mov_imm(a, .A, e)
+				}
+				native.imp_store(a, vf, .A, VU_VIH)
+			}
 			micro_wait_pair(a, u, p, pc, slow, k, p.waits)
 			if i + 1 >= len(pairs) || !in_ext(ext, i + 1) {
 				leave(a, exit, (pc + 8) & mask)

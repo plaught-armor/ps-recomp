@@ -71,6 +71,82 @@ leave_pair :: proc(pairs: []Pair, i: int) -> bool {
 	return i + 1 >= len(pairs) || !plain(pairs[i + 1]) || (branch && p.ebit)
 }
 
+// The branch VI delay's history entries, as the runtime's (VIH_PAIR and
+// the rest in ps2/vu/vu.odin, which says what they hold).
+@(private)
+VIH_WRITE :: 1 << 20
+@(private)
+VIH_FLAGS :: 1 << 21
+@(private)
+VIH_PAIR :: 1 << 22
+
+// Pair (uw, lw)'s VIH entry, without the old value. As the runtime's
+// vih_entry.
+@(private)
+vih_entry :: proc(uw, lw: u32) -> u32 {
+	if uw & (1 << 31) != 0 {return VIH_PAIR}
+	it, is := (lw >> 16) & 15, (lw >> 11) & 15
+	n, flags := u32(0), false
+	switch lw >> 25 {
+	case 0x04, 0x08, 0x09: n = it // ILW, IADDIU, ISUBIU
+	case 0x10, 0x12, 0x13: n, flags = 1, true // FCEQ, FCAND, FCOR
+	case 0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c: n, flags = it, true // FS*, FM*, FCGET
+	case 0x40:
+		switch lw & 63 {
+		case 0x30, 0x31, 0x34, 0x35: n = (lw >> 6) & 31 // IADD, ISUB, IAND, IOR: fd
+		case 0x32: n = (lw >> 16) & 31 // IADDI
+		case 0x3c ..= 0x3f:
+			switch ((lw >> 4) & 0x7c) | (lw & 3) {
+			case 0x34, 0x36: n = is // LQI, LQD
+			case 0x35, 0x37, 0x3c, 0x3e: n = it // SQI, SQD, MTIR, ILWR
+			}
+		}
+	}
+	if n == 0 {return VIH_PAIR}
+	return VIH_PAIR | VIH_WRITE | (n & 15) << 16 | (flags ? VIH_FLAGS : 0)
+}
+
+// The branch VI delay in compiled code (the runtime's vi_branch): delayed
+// marks the conditional branches that read their VIs through vu.vi_branch,
+// those where the pair before can write one; enter marks the pairs that
+// enter themselves into Vu.vih before they run, the four before each of
+// those. A branch compiled code leaves to the interpreter (leave_pair)
+// counts as delayed, so the interpreter finds the pairs before it, and so
+// does a pair compiled code leaves out after one that writes a VI. Any
+// other branch stops at the pair before it, which wrote no VI it reads, or
+// was run by the interpreter, which enters every pair. A jump to a pair either marks clears Vu.vih, as the
+// interpreter's jumps do, and so does every JR and JALR. Both are in the
+// temp allocator.
+@(private)
+delay_pairs :: proc(pairs: []Pair, ext: []bool) -> (delayed, enter: []bool) {
+	n := len(pairs)
+	delayed = make([]bool, n, context.temp_allocator)
+	enter = make([]bool, n, context.temp_allocator)
+	for p, i in pairs {
+		before := (i + n - 1) % n
+		e := vih_entry(pairs[before].uw, pairs[before].lw)
+		if ext != nil && !ext[i] {
+			// The interpreter runs a pair compiled code leaves out, whatever
+			// words it holds by then, and can branch looking back into it.
+			if ext[before] && e & VIH_WRITE != 0 {
+				for k in 1 ..= 4 {enter[(i + n - k) % n] = true}
+			}
+			continue
+		}
+		if p.ibit || p.branch != .Cond {continue}
+		it, is := (p.lw >> 16) & 15, (p.lw >> 11) & 15
+		if p.lw >> 25 >= 0x2c {it = 0} // IBLTZ and on read only is
+		r := (e >> 16) & 15
+		writes := e & VIH_WRITE != 0 && r != 0 && (r == it || r == is)
+		// A pair compiled code leaves out can hold other words at run time.
+		if ext != nil && !ext[before] {writes = true}
+		if !writes && !leave_pair(pairs, i) {continue}
+		delayed[i] = true
+		for k in 1 ..= 4 {enter[(i + n - k) % n] = true}
+	}
+	return
+}
+
 // How a pair's halves are ordered against the interpreter's vu_pair.
 @(private)
 Mode :: enum u8 {

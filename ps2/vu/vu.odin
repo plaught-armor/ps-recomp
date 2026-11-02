@@ -67,6 +67,10 @@ Vu :: struct {
 	// Nonzero: Q's wait has reached VU_Q_FLAGS and its I and D bits are not
 	// yet in status; the next pair sets them (vu_q_due).
 	q_due:   u32,
+	// The pairs a branch's VI delay looks back over (vi_branch), newest
+	// first, as VIH entries; 0 where control arrived by a jump or the
+	// microprogram started.
+	vih:    [4]u32,
 	fbrst:  u32,
 	tpc:    u32,
 	cmsar:  u32,
@@ -812,6 +816,7 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc = addr & mask
 	vu_flags_seed(v)
+	v.vih = {}
 	if t.stop_gen != gen^ {
 		t.stop_gen = gen^
 		t.stop = t.compiled
@@ -898,6 +903,8 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		when VU_STALL_COUNT {vu_stall_count(v, uw, lw)}
 		vu_before(v, uw, lw)
 		pre := [3]u32{v.mac, v.status, v.clip}
+		e := info.vih
+		if e & VIH_WRITE != 0 {e |= u32(v.vi[(e >> 16) & 15])}
 		vu_q_due(v)
 		if info.serial {
 			vu_op(v, uw)
@@ -907,9 +914,11 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		}
 		vu_flags_shift(v, pre)
 		vu_tick(v)
+		v.vih = {e, v.vih[0], v.vih[1], v.vih[2]}
 		if jumping { // that was the delay slot
 			next = target & mask
 			jumping = false
+			v.vih = {}
 		}
 		if taken {
 			jumping = true
@@ -1194,6 +1203,99 @@ vu1_pair :: proc(uw, lw, pc: u32) {
 // s stall cycles before a pair, for compiled code: as vu_before stalls.
 vu1_wait :: proc(s: u32) {vu_wait(&vu1, s)}
 
+// The branch VI delay (PCSX2 microVU's analyzeBranchVI): when the pair
+// right before an IBEQ, IBNE, IBLTZ, IBGTZ, IBLEZ or IBGEZ writes one of
+// its VI sources other than vi0, the branch reads that VI as it was before
+// the earliest pair to write it among the up to four pairs before the
+// branch. Pairs that leave the VI alone do not end the look back. A pair
+// that writes it from the flags (FSAND and the other flag reads, FCGET)
+// ends it, keeping the value found so far, and right before the branch
+// means no delay. So does the start of a block: the microprogram's start, a
+// pair control reaches by a jump, and the pair after a branch's delay
+// slot. JR and JALR read the newest VI. Unlike microVU, nothing carries
+// over from the block before.
+//
+// Every backend keeps the pairs it runs in Vu.vih, newest first, as VIH
+// entries: VIH_PAIR, plus for a pair whose lower op writes a VI, VIH_WRITE,
+// the VI's number at bit 16, its value before the pair in the low 16 bits,
+// and VIH_FLAGS for a flag read. A jump or the microprogram's start clears
+// it. The interpreter enters every pair; compiled code only the ones a
+// branch it compiles can look back to (recomp/vu's delay_pairs), as no
+// other branch reads them.
+VIH_WRITE :: 1 << 20
+VIH_FLAGS :: 1 << 21
+VIH_PAIR :: 1 << 22
+
+// Pair (uw, lw)'s VIH entry, without the old value. As recomp/vu's
+// vih_entry.
+@(private)
+vih_entry :: proc "contextless" (uw, lw: u32) -> u32 {
+	if uw & (1 << 31) != 0 {return VIH_PAIR}
+	it, is := (lw >> 16) & 15, (lw >> 11) & 15
+	n, flags := u32(0), false
+	switch lw >> 25 {
+	case 0x04, 0x08, 0x09: n = it // ILW, IADDIU, ISUBIU
+	case 0x10, 0x12, 0x13: n, flags = 1, true // FCEQ, FCAND, FCOR
+	case 0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c: n, flags = it, true // FS*, FM*, FCGET
+	case 0x40:
+		switch lw & 63 {
+		case 0x30, 0x31, 0x34, 0x35: n = (lw >> 6) & 31 // IADD, ISUB, IAND, IOR: fd
+		case 0x32: n = (lw >> 16) & 31 // IADDI
+		case 0x3c ..= 0x3f:
+			switch ((lw >> 4) & 0x7c) | (lw & 3) {
+			case 0x34, 0x36: n = is // LQI, LQD
+			case 0x35, 0x37, 0x3c, 0x3e: n = it // SQI, SQD, MTIR, ILWR
+			}
+		}
+	}
+	if n == 0 {return VIH_PAIR}
+	return VIH_PAIR | VIH_WRITE | (n & 15) << 16 | (flags ? VIH_FLAGS : 0)
+}
+
+// The value of vi[reg] the conditional branch at pc compares, from v.vih.
+// Every backend's conditional branches read their VIs through it.
+vi_branch :: proc "contextless" (v: ^Vu, reg, pc: u32) -> u16 #no_bounds_check {
+	n := reg & 15
+	x := v.vi[n]
+	mask := u32(len(v.micro) - 1) &~ 7
+	if n == 0 || vu_after_slot(v, pc, mask) {return x}
+	for k in u32(0) ..< 4 {
+		e := v.vih[k]
+		if e & VIH_PAIR == 0 {break} // a jump or the start
+		if e & VIH_WRITE != 0 && (e >> 16) & 15 == n {
+			if e & VIH_FLAGS != 0 {break}
+			x = u16(e)
+		} else if k == 0 {
+			break
+		}
+		if vu_after_slot(v, pc - 8 * (k + 1), mask) {break}
+	}
+	return x
+}
+
+// Whether the pair at pc follows a branch's delay slot: two pairs before it
+// in micro memory is a branch, which starts a block where it runs.
+@(private)
+vu_after_slot :: proc "contextless" (v: ^Vu, pc, mask: u32) -> bool #no_bounds_check {
+	at := (pc - 16) & mask
+	if (^u32)(&v.micro[at + 4])^ & (1 << 31) != 0 {return false} // I bit
+	switch (^u32)(&v.micro[at])^ >> 25 {
+	case 0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c ..= 0x2f: return true
+	}
+	return false
+}
+
+// For native code, whose calls return nothing: the values of vi[it] and
+// vi[is] conditional branch lw at pc compares (vi_branch), as u16s at the
+// unit's Native_Run scratch offsets 0 and 2.
+vu0_branch_vi :: proc(lw, pc: u32) {vu_branch_vi(&vu0, 0, lw, pc)}
+vu1_branch_vi :: proc(lw, pc: u32) {vu_branch_vi(&vu1, 1, lw, pc)}
+@(private)
+vu_branch_vi :: proc(v: ^Vu, u: int, lw, pc: u32) {
+	s := (^[2]u16)(&native_run[u].scratch)
+	s^ = {vi_branch(v, lw >> 16, pc), vi_branch(v, lw >> 11, pc)}
+}
+
 // What decoding a pair tells the interpreter, cached per micro address and
 // tagged with the words so uploads need no invalidation.
 @(private)
@@ -1201,6 +1303,7 @@ Vu_Pair_Info :: struct {
 	uw, lw: u32,
 	valid:  bool,
 	serial: bool, // running upper then lower gives the same result as vu_pair
+	vih:    u32, // vih_entry
 }
 
 @(private)
@@ -1213,7 +1316,7 @@ vu1_pairs: [len(vu1_micro) / 8]Vu_Pair_Info
 // nothing else the lower reads (VI, Q, P and R belong to the lower side).
 @(private)
 vu_pair_info :: proc(uw, lw: u32) -> Vu_Pair_Info {
-	info := Vu_Pair_Info{uw = uw, lw = lw, valid = true}
+	info := Vu_Pair_Info{uw = uw, lw = lw, valid = true, vih = vih_entry(uw, lw)}
 	if uw & (1 << 31) != 0 {return info} // I bit: vu_pair's own path
 	ud := vu_upper_dest(uw)
 	ft, fs := (lw >> 16) & 31, (lw >> 11) & 31
@@ -1334,12 +1437,12 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 		if capture_of(v).file != nil {vu_capture(v, t)}
 		set_vi(vi, it, u16((pc + 16) / 8))
 		return true, t
-	case 0x28: return vi[it] == vi[is], branch // IBEQ
-	case 0x29: return vi[it] != vi[is], branch // IBNE
-	case 0x2c: return i16(vi[is]) < 0, branch // IBLTZ
-	case 0x2d: return i16(vi[is]) > 0, branch // IBGTZ
-	case 0x2e: return i16(vi[is]) <= 0, branch // IBLEZ
-	case 0x2f: return i16(vi[is]) >= 0, branch // IBGEZ
+	case 0x28: return vi_branch(v, it, pc) == vi_branch(v, is, pc), branch // IBEQ
+	case 0x29: return vi_branch(v, it, pc) != vi_branch(v, is, pc), branch // IBNE
+	case 0x2c: return i16(vi_branch(v, is, pc)) < 0, branch // IBLTZ
+	case 0x2d: return i16(vi_branch(v, is, pc)) > 0, branch // IBGTZ
+	case 0x2e: return i16(vi_branch(v, is, pc)) <= 0, branch // IBLEZ
+	case 0x2f: return i16(vi_branch(v, is, pc)) >= 0, branch // IBGEZ
 	case 0x40: vu_op(v, w)
 	case:
 		cpu.fatal("vu%d: unknown lower op %08x at %04x", v == &vu1 ? 1 : 0, w, pc)

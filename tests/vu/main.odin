@@ -34,6 +34,9 @@
 //
 // Then VU0's window onto VU1's registers, read and written by LQ and SQ.
 //
+// Last, the branch VI delay: a conditional branch right after a pair that
+// writes its VI reads it from before that write (tests/vu_programs DELAY).
+//
 //   odin run tests/vu -collection:ps=.
 package main
 
@@ -43,6 +46,7 @@ import "core:slice"
 import gs "ps:ps2/gs"
 import "ps:ps2/mem"
 import "ps:ps2/vu"
+import "ps:tests/vu_programs"
 
 @(private = "file")
 fail :: proc(what: string, args: ..any) -> ! {
@@ -454,11 +458,14 @@ stalls :: proc() {
 	// A loop of three runs: each DIV after the first stalls 3 cycles to
 	// land the one before, 1 / 2, 1 / 4 and 1 / 8 as the ADD in its pair
 	// doubles vf6; ADDq sums Q three times a run: 3 3 3, 1/2 x3, 1/4 x3.
+	// The IBNE reads vi1 from before the IADDI (the branch VI delay), so
+	// it counts from 2 to 0, leaving vi1 -1; the IADDIU is out of its
+	// reach.
 	ADDQ :: 0xf << 21 | 3 << 11 | 3 << 6 | 0x20 // ADDq.xyzw vf3, vf3, Q
-	put_pairs(0xb00, {0x08 << 25 | 1 << 16 | 3, NOP_U}, {DIV_2, add(6, 6, 6)}, {0x40 << 25 | 1 << 16 | 1 << 11 | 0x1f << 6 | 0x32, ADDQ},
+	put_pairs(0xb00, {0x08 << 25 | 1 << 16 | 2, NOP_U}, nops, nops, {DIV_2, add(6, 6, 6)}, {0x40 << 25 | 1 << 16 | 1 << 11 | 0x1f << 6 | 0x32, ADDQ},
 		{0x29 << 25 | 1 << 16 | 0x7fd, ADDQ}, {NOP_L, ADDQ}, {NOP_L, 0xf << 21 | 5 << 6 | 0x1c | E}, nops)
 	call(0xb00)
-	if v.vf[3].f.x != 11.25 || v.vf[5].f.w != 0.25 || v.q != 0.125 || v.vi[1] != 0 {fail("Q loop: sum %v MULq %v Q %v vi1 %d, want 11.25 0.25 0.125 0", v.vf[3].f.x, v.vf[5].f.w, v.q, v.vi[1])}
+	if v.vf[3].f.x != 11.25 || v.vf[5].f.w != 0.25 || v.q != 0.125 || v.vi[1] != 0xffff {fail("Q loop: sum %v MULq %v Q %v vi1 %x, want 11.25 0.25 0.125 ffff", v.vf[3].f.x, v.vf[5].f.w, v.q, v.vi[1])}
 
 	// VU1's EFU: each op, then MFP at issue + latency - 1 (the old P) and
 	// + latency (the new).
@@ -651,6 +658,26 @@ window :: proc() {
 	if !slice.equal(v.mem, before) {fail("window LQ or SQ touched VU0 memory")}
 }
 
+// tests/vu_programs DELAY at micro address 0, which the earlier tests are
+// done with, then a jump into the middle of a window.
+@(private = "file")
+branch_delay :: proc() {
+	v := &vu.vu0
+	for w, k in vu_programs.DELAY {put(u32(k) * 4, w)}
+	v.vi = {}
+	v.status = 0
+	vu.vu_op(v, 0x4a000038) // VCALLMS 0
+	want := [16]u16{0, 6, 6, 4, 0, 10, 0, 7, 1, 1, 0xd0 / 8, 0, 3, 2, 1, 0}
+	if v.vi != want {fail("branch VI delay: vi %v, want %v", v.vi, want)}
+	// Started at 0x60, inside the window: the program's start ends the
+	// look back, so the IBEQ compares vi5 from before 0x60, 8, against 7,
+	// and is not taken.
+	v.vi = {}
+	v.vi[5], v.vi[7] = 8, 7
+	vu.vu_op(v, 0x4a000038 | (0x60 / 8) << 6)
+	if v.vi[5] != 10 || v.vi[6] != 1 {fail("branch VI delay from 0x60: vi5 %d vi6 %d, want 10 1", v.vi[5], v.vi[6])}
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -676,5 +703,6 @@ main :: proc() {
 	ibit()
 	gif_paths()
 	window()
+	branch_delay()
 	fmt.println("vu: ok")
 }

@@ -229,9 +229,10 @@ PROGRAMS_VU0 := [?][]u32 {
 	},
 }
 // Clamp elision. Clamped results (ADD, MUL, ITOF, and MAX of two) feed
-// later operands; MOVE.xy and FTOI make lanes unclamped again. vi1
-// counts the loop back to 0x10 three times; 0x48 is a second entry, a
-// label the elision must keep.
+// later operands; MOVE.xy and FTOI make lanes unclamped again. The loop
+// back to 0x10 runs four times, as its IBNE reads vi1 from before the
+// IADDI (the branch VI delay); 0x48 is a second entry, a label the elision
+// must keep.
 MUL :: 0x2a
 MADD :: 0x29
 ADDx :: 0x00
@@ -353,7 +354,9 @@ Q_BRANCH := []u32 {
 	NOP_L, mulq(7) | E_BIT,
 	NOP_L, mulq(8),
 }
-// A loop run three times whose DIV issues with the last iteration's pending.
+// A loop whose DIV issues with the last iteration's pending. Its IBNE
+// reads vi1 from before the IADDI, and on the first run from before the
+// IADDIU too (the branch VI delay).
 Q_LOOP := []u32 {
 	lower_op(IADDIU, 0, 1, 0, 3), NOP_U,
 	Q_DIV, mulq(3), // 0x08, the loop
@@ -426,6 +429,64 @@ P_STALL := []u32 {
 Q_STALL_PCS := []u32{0, 0x18, 0x38}
 P_STALL_PCS := []u32{0, 0x10, 0x28}
 
+// The branch VI delay (ps2/vu vi_branch). Each part's branch skips the
+// pair after its delay slot when taken; vi3 counts the delay slots run.
+//   0x38: IADDIU vi1 += 1, then IBNE vi1, vi2 (6): taken on the old 5.
+//   0x58: three IADDIU vi5 += 1 from 7, then IBEQ vi5, vi7 (7): taken on
+//         the value before the first, at a jump target.
+//   0x88: FSAND vi9, then IADDIU vi9 += 1, then IBNE vi9, vi0: the FSAND
+//         ends the look back at its 0, so not taken; vi8 = 1.
+//   0xb0: vi10 = 0xd0 / 8, then JR vi10: JR reads the new value; the old
+//         one, set at the start, would run the pair at 0xc8, which sets
+//         vi11. Entered past the start, the target is still 0xd0.
+//   0xd0: vi12 = 1, then B over a pair whose delay slot adds 1, then
+//         IADDIU vi12 += 1 and IBNE vi12, vi13 (2): the jump starts a
+//         block, so the slot's write is not looked back to: not taken on
+//         2; vi14 = 1.
+IBEQ :: 0x28
+JR :: 0x24
+DELAY := []u32 {
+	lower_op(IADDIU, 0, 1, 0, 5), NOP_U,
+	lower_op(IADDIU, 0, 2, 0, 6), NOP_U,
+	lower_op(IADDIU, 0, 5, 0, 7), NOP_U,
+	lower_op(IADDIU, 0, 7, 0, 7), NOP_U,
+	lower_op(IADDIU, 0, 9, 0, 3), NOP_U,
+	lower_op(IADDIU, 0, 13, 0, 2), NOP_U,
+	lower_op(IADDIU, 0, 10, 0, 0xd0 / 8 - 1), NOP_U,
+	lower_op(IADDIU, 0, 1, 1, 1), NOP_U, // 0x38
+	lower_op(IBNE, 0, 1, 2, 2), NOP_U,
+	lower_op(IADDIU, 0, 3, 0, 1), NOP_U,
+	lower_op(IADDIU, 0, 4, 0, 1), NOP_U,
+	lower_op(IADDIU, 0, 5, 5, 1), NOP_U, // 0x58
+	lower_op(IADDIU, 0, 5, 5, 1), NOP_U,
+	lower_op(IADDIU, 0, 5, 5, 1), NOP_U,
+	lower_op(IBEQ, 0, 5, 7, 2), NOP_U,
+	lower_op(IADDIU, 0, 3, 3, 1), NOP_U,
+	lower_op(IADDIU, 0, 6, 0, 1), NOP_U,
+	fs_op(FSAND, 9, 0), NOP_U, // 0x88
+	lower_op(IADDIU, 0, 9, 9, 1), NOP_U,
+	lower_op(IBNE, 0, 9, 0, 2), NOP_U,
+	lower_op(IADDIU, 0, 3, 3, 1), NOP_U,
+	lower_op(IADDIU, 0, 8, 0, 1), NOP_U,
+	lower_op(IADDIU, 0, 10, 0, 0xd0 / 8), NOP_U, // 0xb0
+	lower_op(JR, 0, 0, 10, 0), NOP_U,
+	NOP_L, NOP_U,
+	lower_op(IADDIU, 0, 11, 0, 1), NOP_U,
+	lower_op(IADDIU, 0, 12, 0, 1), NOP_U, // 0xd0
+	lower_op(B, 0, 0, 0, 2), NOP_U,
+	lower_op(IADDIU, 0, 12, 12, 1), NOP_U,
+	lower_op(IADDIU, 0, 12, 12, 5), NOP_U,
+	NOP_L, NOP_U,
+	lower_op(IADDIU, 0, 12, 12, 1), NOP_U,
+	lower_op(IBNE, 0, 12, 13, 2), NOP_U,
+	lower_op(IADDIU, 0, 3, 3, 1), NOP_U,
+	lower_op(IADDIU, 0, 14, 0, 1), NOP_U,
+	NOP_L, NOP_U | E_BIT,
+	NOP_L, NOP_U,
+}
+// Entries at each part, and inside the first two windows.
+DELAY_PCS := []u32{0, 0x38, 0x48, 0x58, 0x60, 0x88, 0xb0, 0xd0, 0xf8}
+
 // Every program, on each unit it runs on.
 programs :: proc() -> (progs: [dynamic]Prog) {
 	for w in PROGRAMS {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
@@ -434,7 +495,7 @@ programs :: proc() -> (progs: [dynamic]Prog) {
 	// entered at each pc.
 	late := [?]struct {
 		words, pcs: []u32,
-	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}, {Q_LAT, Q_LAT_PCS}, {Q_BRANCH, Q_BRANCH_PCS}, {Q_LOOP, AT_0}, {Q_STALL, Q_STALL_PCS}, {P_STALL, P_STALL_PCS}, {FS_READ, FS_READ_PCS}}
+	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}, {Q_LAT, Q_LAT_PCS}, {Q_BRANCH, Q_BRANCH_PCS}, {Q_LOOP, AT_0}, {Q_STALL, Q_STALL_PCS}, {P_STALL, P_STALL_PCS}, {FS_READ, FS_READ_PCS}, {DELAY, DELAY_PCS}}
 	for l in late {
 		for u in vu.Unit {append(&progs, Prog{l.words, u, nil, l.pcs, nil}, Prog{l.words, u, l.pcs, l.pcs, nil})}
 	}

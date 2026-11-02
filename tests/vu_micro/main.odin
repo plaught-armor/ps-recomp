@@ -190,6 +190,7 @@ main :: proc() {
 			init.q_next, init.q_wait = transmute(f32)rnd(), 0 // as a microprogram starts: no Q pending
 			init.q_flags, init.q_due = rand.uint32() & 0x30, 0 // a stale DIV's bits, none due
 			init.p_next, init.p_wait = transmute(f32)rnd(), 0 // nor P
+			init.vih = {} // nor a pair run before it (the branch VI delay's history)
 			init.p = transmute(f32)rnd()
 			init.mac = rand.uint32() & 0xffff
 			init.status = rand.uint32() & 0xfcf // I and D clear, so the control counts the program's

@@ -52,6 +52,7 @@ import vu "vu"
 #assert(offset_of(vu.Vu, p_wait) - offset_of(vu.Vu, vf) == 636)
 #assert(offset_of(vu.Vu, q_flags) - offset_of(vu.Vu, vf) == 640)
 #assert(offset_of(vu.Vu, q_due) - offset_of(vu.Vu, vf) == 644)
+#assert(offset_of(vu.Vu, vih) - offset_of(vu.Vu, vf) == 648)
 
 // bc_cond for native code, which reads a 32-bit result.
 @(private = "file")
@@ -307,6 +308,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.run_pc"] = p(&vu.native_run[0].pc)
 	m["vu.run_budget"] = p(&vu.native_run[0].budget)
 	m["vu.scratch"] = p(&vu.native_run[0].scratch)
+	m["vu.branch_vi"] = p(rawptr(vu.vu0_branch_vi))
 	m["vu1.vf"] = p(&vu.vu1.vf)
 	// Old microprogram imports: they reach these through vu1.vf
 	// now. Kept so older blobs still load; drop at the next NATIVE_VERSION.
@@ -328,6 +330,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu1.run_pc"] = p(&vu.native_run[1].pc)
 	m["vu1.run_budget"] = p(&vu.native_run[1].budget)
 	m["vu1.scratch"] = p(&vu.native_run[1].scratch)
+	m["vu1.branch_vi"] = p(rawptr(vu.vu1_branch_vi))
 	m["ps2.bc_cond"] = p(rawptr(native_bc_cond))
 	m["cpu.fpu_slow"] = p(rawptr(native_fpu_slow))
 	m["vu.efu"] = p(rawptr(native_efu))
