@@ -83,6 +83,7 @@ sif_init :: proc() {
 	sif.sreg[0] = IOP_CMDBUF // SIF_SYSREG_SUBADDR
 	sif.next_dma = 1
 	sif.loadfile_version = loadfile_version("")
+	sif_bind_retries = {}
 	pad_init()
 	sif.servers[0x80000006] = loadfile_server
 	sif.servers[0x80000001] = fileio_server
@@ -242,6 +243,38 @@ sif_unknown :: proc(pc: u32, kind: core.Compat_Call, id: u32, sub: u32 = 0, clie
 	core.compat_unknown(kind, id, sub, pc = pc, ra = u32(cpu.state.r[31].d[0]), client = client)
 }
 
+SIF_BIND_SIDS :: 16
+
+// The sids binds were answered server 0 (sif_bind_unserved), first come, and
+// how often the EE bound each again. Host diagnostics, not emulated state:
+// fixed size, so counting never allocates.
+sif_bind_retries: struct {
+	sid:  [SIF_BIND_SIDS]u32,
+	n:    [SIF_BIND_SIDS]u64,
+	used: int,
+}
+
+// A bind to sid answered server 0: the first a row and a line; the EE's
+// binds again only counted, a line at debug 1 when the count is a power of
+// two, so a disc stuck binding shows without flooding the log. A sid past
+// the table is counted by its row alone, with no line.
+@(private = "file")
+sif_bind_unserved :: proc(pc, sid, client: u32) {
+	t := &sif_bind_retries
+	for i in 0 ..< t.used {
+		if t.sid[i] != sid {continue}
+		t.n[i] += 1
+		n := t.n[i]
+		if cpu.debug >= 1 && n & (n - 1) == 0 {fmt.eprintfln("sif: bind to %08x retried %d times, no server yet", sid, n)}
+		return
+	}
+	sif_unknown(pc, .Sif_Bind, sid, client = client)
+	if t.used == SIF_BIND_SIDS {return}
+	t.sid[t.used], t.n[t.used] = sid, 0
+	t.used += 1
+	fmt.eprintfln("sif: bind to %08x: no server registered, answered server 0", sid)
+}
+
 @(private)
 sif_command :: proc(a, pc: u32) {
 	cid := iop_u32(a + 8)^
@@ -279,6 +312,15 @@ sif_command :: proc(a, pc: u32) {
 	case SIF_CMD_RPC_BIND:
 		rec_id, pkt, rpc_id, client, sid := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3), arg(a, 4)
 		sd, ok := sif.bound[sid]
+		// With PS_IRX=1 a sid no module serves and no HLE server takes gets
+		// server 0, as retail answers a bind to a sid nobody registered: the
+		// EE binds again until a module registers it. A sid the HLE serves
+		// gets its descriptor as without PS_IRX, module or not.
+		if !ok && iop_irx && sid not_in sif.servers && rpc_server(sid) < 0 {
+			sif_bind_unserved(pc, sid, client)
+			sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_BIND, 0, 0, 0})
+			return
+		}
 		if !ok {
 			sd = IOP_SERVERS + u32(len(sif.bound)) * 0x10000
 			sif.bound[sid] = sd

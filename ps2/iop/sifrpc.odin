@@ -5,8 +5,10 @@
 // then the EE gets its reply and RPC_END.
 //
 // The EE binds a server id as without PS_IRX (sif_command): to the HLE's
-// descriptor, which holds the id. A call is routed by that id when it
-// arrives, so a bind made before the module registered reaches the module
+// descriptor, which holds the id. A sid neither a module nor the HLE serves
+// gets server 0, as on retail, and the EE binds again until a module
+// registers it. A call is routed by the id when it arrives, so a bind to a
+// sid the HLE serves, made before a module registered it, reaches the module
 // all the same. The EE's request, which it sent to the HLE descriptor's
 // buffer, is copied to the server's buffer then, as retail's EE writes that
 // buffer when it calls.

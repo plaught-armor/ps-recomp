@@ -175,6 +175,7 @@ game :: proc(_: rawptr) {
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
+	test_rpc_bind()
 	test_rpc()
 	test_rpc_remove()
 	test_rpc_self_remove()
@@ -1582,12 +1583,49 @@ snap5_loaded: bool // not emulated state
 RPC_SID :: 0x4321
 RPC_SID2 :: 0x4322 // registered by a load that fails
 
-// Conditions: a bind made before the module registers reaches its server;
+// With PS_IRX=1 a bind to a sid the HLE serves gets its descriptor, module
+// or not, and no row; a sid nobody serves gets server 0 and one row, however
+// often the EE binds again, and the table past SIF_BIND_SIDS sids counts by
+// rows alone. Without PS_IRX an unknown sid gets a descriptor and a row.
+test_rpc_bind :: proc() {
+	drop_replies()
+	defer drop_replies()
+	iop.sif_bind_retries = {}
+	HLE_SID :: 0x80000003 // the HLE's IOP heap server
+	UNK :: 0x5a5a0000
+	iop.iop_irx = true
+	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, HLE_SID)
+	sd := reply_word(0, 9)
+	check(sd != 0 && iop.iop_u32(sd)^ == HLE_SID && core.compat.calls[{.Sif_Bind, HLE_SID, 0}].n == 0, "bind: a sid the HLE serves gets its descriptor with PS_IRX=1, no row")
+	check(iop.sif_bind_retries.used == 0, "bind: and is not counted as a retry")
+	drop_replies()
+	for i in u32(0) ..< 5 {send_pkt(iop.SIF_CMD_RPC_BIND, 2 + i, 0, 0, 0, UNK)}
+	zero := true
+	for i in 0 ..< 5 {zero &&= reply_word(i, 9) == 0}
+	t := &iop.sif_bind_retries
+	check(zero && core.compat.calls[{.Sif_Bind, UNK, 0}].n == 1 && t.n[0] == 4 && UNK not_in iop.sif.bound, "bind: an unserved sid gets server 0 five times, one row, four retries")
+	drop_replies()
+	for i in u32(1) ..= iop.SIF_BIND_SIDS {send_pkt(iop.SIF_CMD_RPC_BIND, 10, 0, 0, 0, UNK + i)}
+	last := u32(UNK + iop.SIF_BIND_SIDS)
+	send_pkt(iop.SIF_CMD_RPC_BIND, 11, 0, 0, 0, last)
+	check(t.used == iop.SIF_BIND_SIDS && core.compat.calls[{.Sif_Bind, last, 0}].n == 2, "bind: a sid past the table counts by its row")
+	drop_replies()
+	iop.iop_irx = false
+	send_pkt(iop.SIF_CMD_RPC_BIND, 12, 0, 0, 0, UNK)
+	sd = reply_word(0, 9)
+	check(sd != 0 && iop.iop_u32(sd)^ == UNK && core.compat.calls[{.Sif_Bind, UNK, 0}].n == 2, "bind: without PS_IRX an unknown sid gets a descriptor and a row")
+	delete_key(&iop.sif.bound, UNK)
+	delete_key(&iop.sif.bound, HLE_SID)
+	iop.sif_bind_retries = {}
+}
+
+// Conditions: a bind made before the module registers answers server 0, one
+// made after reaches its server;
 // the EE's request and reply are bounded by the server's buffer and EE
 // RAM; calls are served first come first, one queued while the function
 // waits is kept, and both survive a snapshot; a request whose RPC_END never
 // comes leaves a row; a queue whose thread a failed load's undo killed is
-// dropped, its server's call left to the HLE; of two servers for one id,
+// dropped, a bind to its server answered server 0; of two servers for one id,
 // the first registered takes the calls, and dropping it leaves the other.
 test_rpc :: proc() {
 	fresh()
@@ -1595,6 +1633,7 @@ test_rpc :: proc() {
 	defer iop.iop_irx = false
 	drop_replies()
 	defer drop_replies()
+	iop.sif_bind_retries = {}
 	cpu.state.cycles = 0
 	cpu.next_event = 1 << 40
 	// "modr": thread R serves RPC_SID with func, which logs fno and size;
@@ -1653,10 +1692,15 @@ test_rpc :: proc() {
 	li(&a, V0, 0)
 	epilogue(&a)
 
-	// The bind comes first: the HLE's descriptor, as without a server.
+	// The bind comes first: server 0, as retail answers a sid nobody
+	// registered; the EE's bind again is only counted.
 	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, RPC_SID)
-	hsd := reply_word(0, 9)
-	check(len(iop.sif.replies) == 1 && iop.iop_u32(hsd)^ == RPC_SID, "rpc: a bind before the module answers the HLE's descriptor")
+	check(len(iop.sif.replies) == 1 && reply_word(0, 8) == iop.SIF_CMD_RPC_BIND && reply_word(0, 9) == 0 && reply_word(0, 10) == 0, "rpc: a bind before the module answers server 0")
+	drop_replies()
+	send_pkt(iop.SIF_CMD_RPC_BIND, 2, 0, 0, 0, RPC_SID)
+	t := &iop.sif_bind_retries
+	check(len(iop.sif.replies) == 1 && reply_word(0, 9) == 0 && RPC_SID not_in iop.sif.bound, "rpc: a bind again before the module answers server 0, nothing bound")
+	check(t.used == 1 && t.sid[0] == RPC_SID && t.n[0] == 1 && core.compat.calls[{.Sif_Bind, RPC_SID, 0}].n == 1, "rpc: the bind again is counted, one row for the sid")
 	drop_replies()
 	id, r := iop.iop_load(build_mod("modr", &a, entry), "modr", nil)
 	b := module_base(id)
@@ -1664,11 +1708,10 @@ test_rpc :: proc() {
 	check(id > 0 && r == 0 && s.n_servers == 1 && s.servers[0] == {RPC_SID, b + sd, b + qd}, "rpc: R registers its server")
 	check(iop.iop_u32(b + sd)^ == RPC_SID && iop.iop_u32(b + sd + 4)^ == b + fn && iop.iop_u32(b + sd + 8)^ == b + buf && iop.iop_u32(b + sd + 0x40)^ == b + qd, "rpc: RegisterRpc fills the descriptor")
 	check(iop.iop_u32(b + qd)^ == iop.iop_u32(b + th)^ && s.n_queues == 1 && !s.queues[0].busy, "rpc: SetRpcQueue names R, which sleeps")
-	check(core.compat.calls[{.Sif_Bind, RPC_SID, 0}].n == 1, "rpc: the bind before the module leaves a row")
-	delete_key(&iop.sif.bound, RPC_SID)
 	send_pkt(iop.SIF_CMD_RPC_BIND, 3, 0, 0, 0, RPC_SID)
 	check(core.compat.calls[{.Sif_Bind, RPC_SID, 0}].n == 1, "rpc: a bind to a sid a module serves leaves no row")
-	hsd = reply_word(0, 9)
+	hsd := reply_word(0, 9)
+	check(len(iop.sif.replies) == 1 && hsd != 0 && iop.iop_u32(hsd)^ == RPC_SID && t.n[0] == 1, "rpc: once the module registers, the bind gets the HLE's descriptor")
 	drop_replies()
 
 	// A call reaches func with the request copied in; the reply is the
@@ -1722,8 +1765,8 @@ test_rpc :: proc() {
 
 	// A failed load whose threads registered RPC_SID2, and RPC_SID again,
 	// their descriptors and queues in modr's resident memory: the undo kills
-	// the threads, their queues and servers go, and a call to RPC_SID2 is the
-	// HLE's; RPC_SID is still R's.
+	// the threads, their queues and servers go, and a bind to RPC_SID2 gets
+	// server 0; RPC_SID is still R's.
 	q: Asm
 	qtb := imports(&q, "thbase", 4, 6, 20)
 	qsc := imports(&q, "sifcmd", 14, 17, 19, 22)
@@ -1753,11 +1796,7 @@ test_rpc :: proc() {
 	drop_replies()
 	drop_replies()
 	send_pkt(iop.SIF_CMD_RPC_BIND, 2, 0, 0, 0, RPC_SID2)
-	hsd2 := reply_word(0, 9)
-	drop_replies()
-	check(core.compat.calls[{.Sif_Bind, RPC_SID2, 0}].n == 1, "rpc: a bind to the dropped server leaves a row")
-	call(30, 5, 0, 0, 0, hsd2)
-	check(core.compat.calls[{.Sif_Rpc, RPC_SID2, 5}].n == 1 && call_ends(hsd2, 30), "rpc: a call to the dropped server is the HLE's, a row and RPC_END")
+	check(reply_word(0, 9) == 0 && core.compat.calls[{.Sif_Bind, RPC_SID2, 0}].n == 1, "rpc: a bind to the dropped server answers server 0, a row")
 	drop_replies()
 
 	// "modp" loads and registers RPC_SID again, with a func that logs
