@@ -3,8 +3,15 @@
 //
 // Programs are VU1 .vutext programs and the extents of captured micro
 // images (vu.odin's header). Each is classified pair by pair: branches, the
-// order of its halves against the interpreter's vu_pair, where MAC is live,
-// and the pairs a run can enter at other than by falling through.
+// order of its halves against the interpreter's vu_pair, which flag values
+// a later read or an exit can see, and the pairs a run can enter at other
+// than by falling through.
+//
+// A micro-mode flag read sees the flags after the pair four back (the
+// runtime's vu/vu.odin): Vu keeps each flag's three older values, and the
+// interpreter shifts them after every pair. Compiled code shifts only the
+// ones demand_flags finds a later read or an exit can see, which gives the
+// reads what the interpreter's full shift gives them.
 package vu
 
 import "core:fmt"
@@ -32,9 +39,29 @@ Pair :: struct {
 	ibit, ebit: bool,
 	branch:     Branch,
 	mode:       Mode,
-	mac_rd:     bool, // reads MAC before writing it
-	mac_wr:     bool, // the upper op sets MAC
-	mac_live:   bool, // MAC after this pair can be read
+	reads:      [Flag]u8, // the depths of each flag the pair reads (Depths)
+	kills:      bit_set[Flag], // the flags the pair sets whole
+	out:        [Flag]u8, // the depths of each flag after the pair that can be seen
+}
+
+// The flags a micro-mode read sees late.
+@(private)
+Flag :: enum u8 {Mac, Status, Clip}
+
+// A demand on a flag's values, as bits: DEPTH_NOW the newest, then Vu's
+// old_<flag>[0], [1] and [2], the value a read sees (DEPTH_READ).
+@(private)
+DEPTH_NOW, DEPTH_READ, DEPTH_ALL :: u8(1), u8(8), u8(15)
+
+// A pair compiled code leaves at for the interpreter: a branch or E bit
+// in a delay slot, or code running past the program.
+@(private)
+leave_pair :: proc(pairs: []Pair, i: int) -> bool {
+	plain :: proc(p: Pair) -> bool {return !p.ebit && (p.ibit || p.branch == .None)}
+	p := pairs[i]
+	branch := !p.ibit && p.branch != .None
+	if !branch && !p.ebit {return false}
+	return i + 1 >= len(pairs) || !plain(pairs[i + 1]) || (branch && p.ebit)
 }
 
 // How a pair's halves are ordered against the interpreter's vu_pair.
@@ -122,7 +149,8 @@ upper_dest :: proc(uw: u32) -> u32 {
 @(private)
 classify :: proc(lw, uw: u32) -> Pair {
 	p := Pair{lw = lw, uw = uw, ibit = uw & (1 << 31) != 0, ebit = uw & (1 << 30) != 0}
-	p.mac_wr = upper_writes_mac(uw)
+	if upper_writes_mac(uw) {p.kills += {.Mac}}
+	if uw & 0x7ff == 0x1ff {p.reads[.Clip] = DEPTH_NOW} // CLIP shifts the newest clip
 	if p.ibit {return p}
 	switch lw >> 25 {
 	case 0x20, 0x21: p.branch = .Uncond
@@ -140,10 +168,16 @@ classify :: proc(lw, uw: u32) -> Pair {
 	case 0x04, 0x05, 0x08, 0x09, 0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c ..= 0x2f:
 		p.mode = .Serial
 	case 0x11: // FCSET: unless CLIP also writes the clip flags
-		if uw & 0x7ff != 0x1ff {p.mode = .Serial}
-	case 0x10, 0x12, 0x13, 0x1c, 0x18, 0x1a, 0x1b: // FCEQ/FCAND/FCOR/FCGET, FMEQ/FMAND/FMOR
+		if uw & 0x7ff != 0x1ff {
+			p.mode = .Serial
+			p.kills += {.Clip}
+		}
+	case 0x10, 0x12, 0x13, 0x1c: // FCEQ/FCAND/FCOR/FCGET
 		p.mode = .Lower_First
-		p.mac_rd = lw >> 25 >= 0x18 && lw >> 25 <= 0x1b
+		p.reads[.Clip] |= DEPTH_READ
+	case 0x18, 0x1a, 0x1b: // FMEQ/FMAND/FMOR
+		p.mode = .Lower_First
+		p.reads[.Mac] |= DEPTH_READ
 	case 0x40:
 		if lw & 63 < 0x3c {
 			p.mode = .Serial
@@ -156,39 +190,55 @@ classify :: proc(lw, uw: u32) -> Pair {
 		case: p.mode = touches ? .Hazard : .Serial
 		}
 	}
-	if p.mode == .Slow {p.mac_rd = true} // vu_pair merges against the old flags
+	if p.mode == .Slow { // vu_pair reads any flag, newest or late
+		for &r in p.reads {r = DEPTH_NOW | DEPTH_READ}
+		p.kills = {}
+	}
 	return p
 }
 
-// Backward dataflow: MAC after pair n is live when a successor reads it
-// before setting it, or control can leave compiled code.
+// Backward dataflow: the depths of each flag after pair n (out) that a
+// later read or an exit can see. A pair's shift moves depth k to depth k+1
+// (the newest into old[0]); the newest passes through unless the pair sets
+// that flag whole. Leaving for the interpreter needs every depth, which it
+// shifts and reads itself; an E bit only the newest, which the EE can read
+// and the next program starts from. Status counts only on VU0: VU1 code
+// never computes it.
 @(private)
-mac_liveness :: proc(pairs: []Pair, ext: []bool, mask: u32) {
+demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
 	n := len(pairs)
-	live_in := make([]bool, n, context.temp_allocator)
-	at :: proc(live_in, ext: []bool, pc: int) -> bool {
+	din := make([][Flag]u8, n, context.temp_allocator)
+	ALL :: [Flag]u8{.Mac = DEPTH_ALL, .Status = DEPTH_ALL, .Clip = DEPTH_ALL}
+	at :: proc(din: [][Flag]u8, ext: []bool, pc: int) -> [Flag]u8 {
 		i := pc / 8
-		return i >= len(live_in) || (ext != nil && !ext[i]) ? true : live_in[i]
+		return i >= len(din) || (ext != nil && !ext[i]) ? ALL : din[i]
 	}
 	for changed := true; changed; {
 		changed = false
 		for i := n - 1; i >= 0; i -= 1 {
 			p := &pairs[i]
-			out := at(live_in, ext, (i + 1) * 8)
+			out := at(din, ext, (i + 1) * 8)
 			if i > 0 && !pairs[i - 1].ibit { // a delay slot also goes to the target
 				prev := pairs[i - 1]
 				switch prev.branch {
 				case .None:
-				case .Reg: out = true
-				case .Uncond, .Cond: out ||= at(live_in, ext, int(branch_target(prev.lw, u32(i - 1) * 8, mask)))
+				case .Reg: out = ALL
+				case .Uncond, .Cond: out |= at(din, ext, int(branch_target(prev.lw, u32(i - 1) * 8, mask)))
 				}
-				if prev.ebit {out = true}
 			}
-			if p.ebit && i + 1 < n {pairs[i + 1].mac_live = true}
-			out ||= p.mac_live
-			inn := p.mac_rd || (!p.mac_wr && out)
-			if out != p.mac_live || inn != live_in[i] {changed = true}
-			p.mac_live, live_in[i] = out, inn
+			if i > 0 && pairs[i - 1].ebit { // the E bit's delay slot
+				for &o in out {o |= DEPTH_NOW}
+			}
+			if unit == .VU1 {out[.Status] = 0}
+			inn := ALL
+			if !leave_pair(pairs, i) {
+				for f in Flag {
+					inn[f] = p.reads[f] | out[f] >> 1 | (f in p.kills ? 0 : out[f] & DEPTH_NOW)
+				}
+			}
+			if unit == .VU1 {inn[.Status] = 0}
+			if out != p.out || inn != din[i] {changed = true}
+			p.out, din[i] = out, inn
 		}
 	}
 }
@@ -383,7 +433,7 @@ load_programs :: proc(img: mips.Image, capture: string, unit: Unit) -> (progs: [
 	return progs, true
 }
 
-// A program's pairs, classified, with MAC liveness over the pairs ext
+// A program's pairs, classified, with flag demand over the pairs ext
 // compiles (nil: all), and the dispatch targets for its entries. Both are
 // in the temp allocator.
 @(private)
@@ -391,6 +441,6 @@ analyze :: proc(words: []u32, ext: []bool, entries: []u32, unit: Unit) -> (pairs
 	mask := MASK[unit]
 	pairs = make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
-	mac_liveness(pairs, ext, mask)
+	demand_flags(pairs, ext, mask, unit)
 	return pairs, dispatch_targets(pairs, mask, entries)
 }

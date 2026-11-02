@@ -93,6 +93,19 @@ VU_NORM :: 448
 VU_VI :: 512
 @(private = "file")
 VU_ACC, VU_Q, VU_P, VU_I, VU_CLIP, VU_STATUS, VU_MAC :: 544, 560, 564, 568, 576, 580, 584
+// Each flag's three older values (old_mac and the rest), as [Flag].
+@(private = "file", rodata)
+VU_OLD := [Flag]u32 {
+	.Mac    = 588,
+	.Status = 600,
+	.Clip   = 612,
+}
+@(private = "file", rodata)
+VU_NOW := [Flag]u32 {
+	.Mac    = VU_MAC,
+	.Status = VU_STATUS,
+	.Clip   = VU_CLIP,
+}
 
 // The bytes of import scratch, and what they hold: a VF register before and
 // after a hazard pair's upper op, a quadword of data memory for ILW and ISW,
@@ -841,32 +854,34 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		vi_get(a, u, .A, is)
 		native.alu_imm(a, native.Alu.Add if lw >> 25 == 0x08 else native.Alu.Sub, .A, imm15)
 		vi_put(a, u, it)
+	// The flag reads see the flags four pairs late (program.odin), in
+	// old_clip[2] and old_mac[2].
 	case 0x10: // FCEQ
-		native.imp_load(a, .A, vf, VU_CLIP)
+		native.imp_load(a, .A, vf, VU_OLD[.Clip] + 8)
 		native.alu_imm(a, .And, .A, 0xffffff)
 		vi_test(a, u, 1, .Eq, imm24)
 	case 0x11: // FCSET
 		native.mov_imm(a, .A, imm24)
 		native.imp_store(a, vf, .A, VU_CLIP)
 	case 0x12: // FCAND
-		native.imp_load(a, .A, vf, VU_CLIP)
+		native.imp_load(a, .A, vf, VU_OLD[.Clip] + 8)
 		native.alu_imm(a, .And, .A, imm24)
 		vi_test(a, u, 1, .Ne, 0)
 	case 0x13: // FCOR
-		native.imp_load(a, .A, vf, VU_CLIP)
+		native.imp_load(a, .A, vf, VU_OLD[.Clip] + 8)
 		native.alu_imm(a, .Or, .A, imm24)
 		native.alu_imm(a, .And, .A, 0xffffff)
 		vi_test(a, u, 1, .Eq, 0xffffff)
 	case 0x18: // FMEQ
 		if it == 0 {return}
-		native.imp_load(a, .A, vf, VU_MAC)
+		native.imp_load(a, .A, vf, VU_OLD[.Mac] + 8)
 		native.alu_imm(a, .And, .A, 0xffff)
 		vi_get(a, u, .B, is)
 		native.set_cond(a, .Eq, .A, .B)
 		vi_put(a, u, it)
 	case 0x1a, 0x1b: // FMAND, FMOR
 		if it == 0 {return}
-		native.imp_load(a, .A, vf, VU_MAC)
+		native.imp_load(a, .A, vf, VU_OLD[.Mac] + 8)
 		vi_get(a, u, .B, is)
 		if lw >> 25 == 0x1a {
 			native.alu(a, .And, .A, .B)
@@ -878,7 +893,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		}
 	case 0x1c: // FCGET
 		if it == 0 {return}
-		native.imp_load(a, .A, vf, VU_CLIP)
+		native.imp_load(a, .A, vf, VU_OLD[.Clip] + 8)
 		native.alu_imm(a, .And, .A, 0xfff)
 		vi_put(a, u, it)
 	case 0x40:
@@ -939,7 +954,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 @(private = "file")
 micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair, slow: ^map[string]int, known: ^[32]u8) {
 	flags := Flags.Mac_Status
-	if u == .VU1 {flags = Flags.Mac if p.mac_live else Flags.None}
+	if u == .VU1 {flags = Flags.Mac if p.out[.Mac] & DEPTH_NOW != 0 else Flags.None}
 	fn := p.uw & 63
 	inline := fn < 0x30 || (fn >= 0x3c && ((p.uw >> 4) & 0x7c) | (p.uw & 3) < 0x30)
 	if inline && op(a, u, p.uw, flags, known) {return}
@@ -959,6 +974,20 @@ micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair, slow: ^map[string]int, kno
 @(private = "file")
 micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]int, known: ^[32]u8) {
 	vf, scratch := IMPORTS[u][.Vf], IMPORTS[u][.Scratch]
+	// The flag shift, after a flag-reading lower and before the rest, as
+	// emit_pair's.
+	shift :: proc(a: ^native.Asm, u: Unit, p: Pair) {
+		vf := IMPORTS[u][.Vf]
+		for f in Flag {
+			o := p.out[f]
+			for k := 2; k >= 0; k -= 1 {
+				if o & (2 << u32(k)) == 0 {continue}
+				native.imp_load(a, .A, vf, k == 0 ? VU_NOW[f] : VU_OLD[f] + 4 * u32(k - 1))
+				native.imp_store(a, vf, .A, VU_OLD[f] + 4 * u32(k))
+			}
+		}
+	}
+	if p.mode != .Slow && p.mode != .Lower_First {shift(a, u, p)}
 	if p.ibit { // the upper still reads the old I
 		micro_upper(a, u, p, slow, known)
 		native.mov_imm(a, .A, p.lw)
@@ -1011,6 +1040,7 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]
 		if p.branch == .None {lower(a, u, p, pc, merge, slow, known)}
 	case .Lower_First:
 		lower(a, u, p, pc, merge, slow, known)
+		shift(a, u, p)
 		upper(a, u, p, merge, slow, known)
 	case .Hazard:
 		// As vu_pair: the lower reads the upper's dest from before the
@@ -1126,7 +1156,6 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 	}
 	native.imp_load(a, .T, run_pc)
 	native.jmp(a, dispatch)
-	plain :: proc(p: Pair) -> bool {return !p.ebit && (p.ibit || p.branch == .None)}
 	for p, i in pairs {
 		if !in_ext(ext, i) {continue}
 		pc := u32(i) * 8
@@ -1140,8 +1169,7 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 		fell = false
 		branch := !p.ibit && p.branch != .None
 		switch {
-		case branch && (p.ebit || i + 1 >= len(pairs) || !plain(next)),
-		     !branch && p.ebit && (i + 1 >= len(pairs) || !plain(next)):
+		case leave_pair(pairs, i):
 			leave(a, exit, pc)
 		case branch:
 			op := p.lw >> 25

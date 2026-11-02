@@ -61,6 +61,8 @@ random_state :: proc(init: ^vu.Vu, mem: []u32) {
 	init.mac = rand.uint32() & 0xffff
 	init.clip = rand.uint32() & 0xffffff
 	init.status = rand.uint32() & 0xfcf
+	// As a microprogram starts: every older flag the newest.
+	init.old_mac, init.old_status, init.old_clip = init.mac, init.status, init.clip
 	for &w in mem {w = rnd()}
 }
 

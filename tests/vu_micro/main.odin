@@ -35,6 +35,13 @@
 // setting the loop count. The pair at 0x38, the loop's delay slot, is a
 // hazard: its MOVE reads the ADD's dest.
 //
+// The late-flag programs read MAC (FMAND) and clip (FCGET, FCAND) at each
+// depth behind their writes, which a read sees four pairs late, and branch
+// over a pair into that window, so the delay slot's shift alone carries the
+// value the target reads. Each runs from pcs inside the window too, where
+// the run starts with every older value equal to the newest, every pair
+// labelled and as a captured image entered at those pcs.
+//
 //   odin run tests/vu_micro -collection:ps=.
 package main
 
@@ -160,6 +167,8 @@ main :: proc() {
 			init.p = transmute(f32)rnd()
 			init.mac = rand.uint32() & 0xffff
 			init.status = rand.uint32() & 0xfcf // I and D clear, so the control counts the program's
+			// As a microprogram starts: every older flag the newest.
+			init.old_mac, init.old_status, init.old_clip = init.mac, init.status, init.clip
 			for &w in mem_init {w = rnd()}
 			v^ = init
 			copy(mem, mem_init)

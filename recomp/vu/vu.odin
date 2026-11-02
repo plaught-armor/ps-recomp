@@ -22,7 +22,8 @@
 // the interpreter.
 //
 // On VU1, MAC flags are computed only where a later FMAND/FMEQ/FMOR or an
-// exit can see them. Status flags are never computed: no program reads them
+// exit can see them, and on either unit each pair shifts only the older
+// flag values that a later read or an exit can see (program.odin). Status flags are never computed: no program reads them
 // (no FSEQ/FSAND/FSOR/FSSET), and the EE cannot read VU1 status. On VU0 the
 // EE reads MAC and status with CFC2 after a program, so both are always
 // computed, as for macro instructions.
@@ -412,14 +413,16 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 	case 0x05: isw(sb, L, it, fmt.tprintf("vi[%d] + 0x%x", is, imm11), mem) // ISW
 	case 0x08: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = vi[%d] + 0x%x", it, is, imm15)} // IADDIU
 	case 0x09: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = vi[%d] - 0x%x", it, is, imm15)} // ISUBIU
-	case 0x10: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16(v.clip & 0xffffff == 0x%x)", imm24) // FCEQ
+	// The flag reads see the flags four pairs late (program.odin), in
+	// old_clip[2] and old_mac[2].
+	case 0x10: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16(v.old_clip[2] & 0xffffff == 0x%x)", imm24) // FCEQ
 	case 0x11: fmt.sbprintfln(sb, "\t\t\tv.clip = 0x%x", imm24) // FCSET
-	case 0x12: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16(v.clip & 0x%x != 0)", imm24) // FCAND
-	case 0x13: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16((v.clip | 0x%x) & 0xffffff == 0xffffff)", imm24) // FCOR
-	case 0x18: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(v.mac & 0xffff == u32(vi[%d]))", it, is)} // FMEQ
-	case 0x1a: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(v.mac) & vi[%d]", it, is)} // FMAND
-	case 0x1b: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16((v.mac | u32(vi[%d])) & 0xffff == 0xffff)", it, is)} // FMOR
-	case 0x1c: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(v.clip & 0xfff)", it)} // FCGET
+	case 0x12: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16(v.old_clip[2] & 0x%x != 0)", imm24) // FCAND
+	case 0x13: fmt.sbprintfln(sb, "\t\t\tvi[1] = u16((v.old_clip[2] | 0x%x) & 0xffffff == 0xffffff)", imm24) // FCOR
+	case 0x18: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(v.old_mac[2] & 0xffff == u32(vi[%d]))", it, is)} // FMEQ
+	case 0x1a: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(v.old_mac[2]) & vi[%d]", it, is)} // FMAND
+	case 0x1b: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16((v.old_mac[2] | u32(vi[%d])) & 0xffff == 0xffff)", it, is)} // FMOR
+	case 0x1c: if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(v.old_clip[2] & 0xfff)", it)} // FCGET
 	case 0x40:
 		if lw & 63 < 0x3c {
 			switch lw & 63 {
@@ -534,6 +537,13 @@ lower_writes_vf :: proc(lw: u32) -> bool {
 	return true
 }
 
+@(private = "file", rodata)
+FLAG_NAME := [Flag]string {
+	.Mac    = "mac",
+	.Status = "status",
+	.Clip   = "clip",
+}
+
 // Emit pair p at pc, without its branch. Counts the halves that call the
 // interpreter in slow, by opcode. known, when not nil, tracks the clamped
 // lanes past it.
@@ -551,7 +561,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 	upper :: proc(sb: ^strings.Builder, p: Pair, unit: Unit, merge: bool, slow: ^map[string]int, known: ^Known) {
 		defer if merge {fmt.sbprintln(sb, "\t\t\tust := v.status\n\t\t\tv.status = st0")}
 		flags := Flags.Mac_Status
-		if unit == .VU1 {flags = p.mac_live ? .Mac : .None}
+		if unit == .VU1 {flags = p.out[.Mac] & DEPTH_NOW != 0 ? .Mac : .None}
 		if !emit_upper(sb, p.uw, flags, known) {return}
 		if known != nil {forget(known)}
 		fmt.sbprintfln(sb, "\t\t\tvu.vu%d_upper(0x%08x)", int(unit), p.uw)
@@ -587,6 +597,16 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 			count(slow, fmt.tprintf("lower 40 special %02x", ((p.lw >> 4) & 0x7c) | (p.lw & 3)))
 		}
 	}
+	// The flag shift, after a flag-reading lower and before the rest.
+	shift :: proc(sb: ^strings.Builder, p: Pair) {
+		for f in Flag {
+			o, name := p.out[f], FLAG_NAME[f]
+			if o & 8 != 0 {fmt.sbprintfln(sb, "\t\t\tv.old_%s[2] = v.old_%s[1]", name, name)}
+			if o & 4 != 0 {fmt.sbprintfln(sb, "\t\t\tv.old_%s[1] = v.old_%s[0]", name, name)}
+			if o & 2 != 0 {fmt.sbprintfln(sb, "\t\t\tv.old_%s[0] = v.%s", name, name)}
+		}
+	}
+	if p.mode != .Slow && p.mode != .Lower_First {shift(sb, p)}
 	if p.ibit { // the upper still reads the old I
 		upper(sb, p, unit, false, slow, known)
 		fmt.sbprintfln(sb, "\t\t\tv.i = transmute(f32)u32(0x%08x)", p.lw)
@@ -602,6 +622,7 @@ emit_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map
 		if p.branch == .None {lower(sb, p, pc, unit, merge, slow, known)}
 	case .Lower_First:
 		lower(sb, p, pc, unit, merge, slow, known)
+		shift(sb, p)
 		upper(sb, p, unit, merge, slow, known)
 	case .Hazard:
 		// As vu_pair: the lower reads the upper's dest from before the
@@ -672,7 +693,6 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 	fmt.sbprintln(sb, "\tpc := pc")
 	fmt.sbprintln(sb, "\tfor {")
 	fmt.sbprintln(sb, "\t\tswitch pc {")
-	plain :: proc(p: Pair) -> bool {return !p.ebit && (p.ibit || p.branch == .None)}
 	for p, i in pairs {
 		if !in_ext(ext, i) {continue}
 		pc := u32(i) * 8
@@ -685,8 +705,7 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 		fell = false
 		branch := !p.ibit && p.branch != .None
 		switch {
-		case branch && (p.ebit || i + 1 >= len(pairs) || !plain(next)),
-		     !branch && p.ebit && (i + 1 >= len(pairs) || !plain(next)):
+		case leave_pair(pairs, i):
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", pc)
 		case branch:
 			emit_pair(sb, p, pc, unit, slow, k)

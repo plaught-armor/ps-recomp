@@ -185,10 +185,70 @@ ELIDE_PCS := []u32{0, 0x48, 0x50}
 ELIDE_LEAVES := []u32{0x08, 0x50}
 AT_0 := []u32{0}
 
+// Late flags: a flag read sees the flags after the pair four back. vi15 =
+// 0x7fff masks MAC; MUL writes a MAC other than ADD's. Each read lands at
+// another depth behind the writes, so each sees another value.
+CLIP :: 0x1f
+B :: 0x20
+fmand :: proc "contextless" (t: u32) -> u32 {return 0x1a << 25 | t << 16 | 15 << 11}
+fcget :: proc "contextless" (t: u32) -> u32 {return 0x1c << 25 | t << 16}
+VI15 :: 0x08 << 25 | 0xf << 21 | 15 << 16 | 0x7ff // IADDIU vi15, vi0, 0x7fff
+FCAND_ALL :: 0x12 << 25 | 0xfff // FCAND vi1, 0xfff
+// MAC written in pairs 0 and 1, read in pairs 1 to 6.
+LATE_MAC := []u32 {
+	VI15, upper(ADD, 3, 1, 2),
+	fmand(3), upper(MUL, 4, 1, 2),
+	fmand(4), NOP_U,
+	fmand(5), NOP_U,
+	fmand(6), NOP_U,
+	fmand(7), NOP_U,
+	fmand(8), NOP_U | E_BIT,
+	NOP_L, NOP_U,
+}
+// Clip written by the CLIPs in pairs 0 and 1, read beside them first.
+LATE_CLIP := []u32 {
+	fcget(3), upper_sp(CLIP, XYZ, 2, 1),
+	fcget(4), upper_sp(CLIP, XYZ, 1, 2),
+	fcget(5), NOP_U,
+	fcget(6), NOP_U,
+	FCAND_ALL, NOP_U,
+	fcget(7), NOP_U,
+	fcget(8), NOP_U | E_BIT,
+	NOP_L, NOP_U,
+}
+// A branch over pair 4 into the window: the delay counts the pairs run,
+// so the target's read sees pair 0's MAC, which only the shift in the
+// delay slot moves to where it reads (the fall-through reads nothing).
+LATE_BRANCH := []u32 {
+	VI15, upper(ADD, 3, 1, 2),
+	NOP_L, NOP_U,
+	lower_op(B, 0, 0, 0, 2), upper(MUL, 4, 1, 2),
+	fmand(3), NOP_U,
+	NOP_L, upper(ADD, 5, 1, 1),
+	fmand(5), NOP_U,
+	fmand(6), NOP_U,
+	fmand(7), NOP_U,
+	fmand(8), NOP_U | E_BIT,
+	NOP_L, NOP_U,
+}
+// Entries inside the window, between the writes and the reads: the run
+// starts with every older value equal to the newest.
+LATE_MAC_PCS := []u32{0, 0x08, 0x10, 0x18}
+LATE_CLIP_PCS := []u32{0, 0x08, 0x10, 0x20}
+LATE_BRANCH_PCS := []u32{0, 0x18, 0x20, 0x28}
+
 // Every program, on each unit it runs on.
 programs :: proc() -> (progs: [dynamic]Prog) {
 	for w in PROGRAMS {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
 	for w in PROGRAMS_VU0 {append(&progs, Prog{w, .VU0, nil, AT_0, nil})}
+	// The late-flag programs, every pair labelled and as captured images
+	// entered at each pc.
+	late := [?]struct {
+		words, pcs: []u32,
+	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}}
+	for l in late {
+		for u in vu.Unit {append(&progs, Prog{l.words, u, nil, l.pcs, nil}, Prog{l.words, u, l.pcs, l.pcs, nil})}
+	}
 	for u in vu.Unit {
 		captured := Prog{ELIDE, u, ELIDE_ENTRIES, ELIDE_ENTRIES, ELIDE_LEAVES}
 		if !vu.VU_CLAMP_ELIDE {captured.pcs, captured.leaves = ELIDE_PCS, nil} // every pair labelled
