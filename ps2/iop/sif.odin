@@ -303,6 +303,7 @@ sif_command :: proc(a, pc: u32) {
 		fmt.eprintfln("sif: IOP reset \"%s\"", path)
 		sif.loadfile_version = loadfile_version(string(path))
 		clear(&sif.bound)
+		sif_bind_retries = {}
 		sif.ee_buf = 0
 		clear(&sif.replies)
 	case SIF_CMD_IOP_INTR:
@@ -314,9 +315,12 @@ sif_command :: proc(a, pc: u32) {
 		sd, ok := sif.bound[sid]
 		// With PS_IRX=1 a sid no module serves and no HLE server takes gets
 		// server 0, as retail answers a bind to a sid nobody registered: the
-		// EE binds again until a module registers it. A sid the HLE serves
-		// gets its descriptor as without PS_IRX, module or not.
-		if !ok && iop_irx && sid not_in sif.servers && rpc_server(sid) < 0 {
+		// EE binds again until a module registers it. That holds for a sid
+		// bound while a module served it and dropped since: its descriptor
+		// stays its own, handed out again once a module serves it, so no
+		// other sid takes the slot an earlier client may still call. A sid
+		// the HLE serves gets its descriptor as without PS_IRX, module or not.
+		if iop_irx && sid not_in sif.servers && rpc_server(sid) < 0 {
 			sif_bind_unserved(pc, sid, client)
 			sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_BIND, 0, 0, 0})
 			return
@@ -335,6 +339,17 @@ sif_command :: proc(a, pc: u32) {
 	case SIF_CMD_RPC_CALL:
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		fno, send_size, receive, recv_size, server := arg(a, 4), arg(a, 5), arg(a, 6), arg(a, 7), arg(a, 9)
+		// A server that is no descriptor a bind handed out: 0, from a client
+		// that called without binding again after server 0, or any other.
+		// Nothing runs and no RPC_END comes, as with any call no server takes:
+		// the EE waits, and the row shows it.
+		if slot := server - IOP_SERVERS; slot % 0x10000 != 0 || slot / 0x10000 >= u32(len(sif.bound)) {
+			sif_unknown(pc, .Sif_Rpc, server, fno, client = client)
+			if core.compat.calls[core.Compat_Key{.Sif_Rpc, server, fno}].n == 1 {
+				fmt.eprintfln("sif: rpc fno %d to %08x, no server descriptor: no RPC_END", fno, server)
+			}
+			return
+		}
 		sid := iop_u32(server)^
 		if iop_irx {
 			if sid == SDR_SID {sdr_thread_start()}

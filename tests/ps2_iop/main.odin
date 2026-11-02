@@ -1610,6 +1610,18 @@ test_rpc_bind :: proc() {
 	send_pkt(iop.SIF_CMD_RPC_BIND, 11, 0, 0, 0, last)
 	check(t.used == iop.SIF_BIND_SIDS && core.compat.calls[{.Sif_Bind, last, 0}].n == 2, "bind: a sid past the table counts by its row")
 	drop_replies()
+
+	// A call with server 0, as a client that did not bind again sends it,
+	// or a server word past the descriptors handed out: a row, nothing run,
+	// no RPC_END, IOP memory untouched.
+	low := iop.iop_u32(0x100)^
+	far := iop.IOP_SERVERS + 0x10000 * u32(len(iop.sif.bound))
+	send_pkt(iop.SIF_CMD_RPC_CALL, 13, 0, 0, 0, 7, 8, 0x00100400, 8, 0, 0)
+	send_pkt(iop.SIF_CMD_RPC_CALL, 14, 0, 0, 0, 7, 8, 0x00100400, 8, 0, 0)
+	send_pkt(iop.SIF_CMD_RPC_CALL, 15, 0, 0, 0, 7, 8, 0x00100400, 8, 0, far)
+	send_pkt(iop.SIF_CMD_RPC_CALL, 16, 0, 0, 0, 7, 8, 0x00100400, 8, 0, sd + 4)
+	check(len(iop.sif.replies) == 0 && core.compat.calls[{.Sif_Rpc, 0, 7}].n == 2 && core.compat.calls[{.Sif_Rpc, far, 7}].n == 1 && core.compat.calls[{.Sif_Rpc, sd + 4, 7}].n == 1, "bind: a call to no descriptor is a row and gets no RPC_END")
+	check(iop.iop_u32(0x100)^ == low, "bind: and touches no IOP memory")
 	iop.iop_irx = false
 	send_pkt(iop.SIF_CMD_RPC_BIND, 12, 0, 0, 0, UNK)
 	sd = reply_word(0, 9)
@@ -2057,6 +2069,11 @@ test_rpc_self_remove :: proc() {
 	drop_replies()
 	send_pkt(iop.SIF_CMD_RPC_CALL, 3, 0, 0, 0, 4, 0, 0, 0, 0, hsd)
 	check(core.compat.calls[{.Sif_Rpc, RPC_SID3, 4}].n == 1 && call_ends(hsd, 3), "rpc self remove: the next call is the HLE's, a row and RPC_END")
+	drop_replies()
+	// Bound while served, the server gone: a bind again answers server 0,
+	// the sid keeping its descriptor for when a module serves it again.
+	send_pkt(iop.SIF_CMD_RPC_BIND, 4, 0, 0, 0, RPC_SID3)
+	check(len(iop.sif.replies) == 1 && reply_word(0, 9) == 0 && iop.sif.bound[RPC_SID3] == hsd, "rpc self remove: a bind after the server went answers server 0")
 }
 
 // A module's RPC client, the EE faked. Conditions: a blocking bind or call

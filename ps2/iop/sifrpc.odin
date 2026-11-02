@@ -351,6 +351,10 @@ rpc_exec :: proc(req: Iop_Rpc_Req) {
 			fmt.eprintfln("iop: rpc %08x fno %d: %d bytes from %x to %x out of range", req.sid, req.fno, req.rsize, res, req.receive)
 		}
 	}
+	// The queue is free before the EE hears the call ended, so its next call
+	// never finds the server busy with this one (rpc_busy_check), whatever
+	// runs first.
+	if q := rpc_queue(req.qd); q != nil {q.busy = false}
 	sif_reply(SIF_CMD_RPC_END, 0, {req.rec_id, req.pkt, req.rpc_id, req.client, SIF_CMD_RPC_CALL, req.server, 0, 0})
 }
 
