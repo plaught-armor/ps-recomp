@@ -145,6 +145,7 @@ iop_sched: struct {
 	next_thid, next_semid: u32,
 	next_evfid:           u32,
 	lock:                 i32, // sio2man's transfer lock, a semaphore's count
+	lock_holder:          u32, // the thread that last took it, 0 when given back
 	head, tail:           i64, // the next seq at a queue's head, at its tail
 	cur:                  u32, // the running thread, 0 on the loader
 	resched:              bool, // a thread of better priority than cur became ready
@@ -623,14 +624,17 @@ th_undo :: proc(m: Th_Mark) {
 		ordered_remove(&s.threads, i)
 	}
 	for t in s.threads {assert(t.id < thid, "iop: a failed load's thread left queued")}
+	if s.lock_holder >= thid {th_unlock()}
 	s.resched = false
 }
 
 // sio2man's transfer lock: the semaphore its start makes {FIFO, initial 1,
 // max 0x40}, which pad2_transfer_init and mc2_transfer_init wait on and
 // transfer_reset3 signals (sio2.odin). Not a numbered semaphore: no guest
-// code names it. A failed load's waiter goes with its thread (th_undo); the
-// count stays, as an earlier semaphore's does.
+// code names it. A failed load is the HLE's, not retail's, so th_undo gives
+// the lock back when that load's thread was the last to take it, and a
+// waiter of that load goes with its thread; the lock taken by a thread from
+// before the load stays held.
 SIO2_LOCK_MAX :: 0x40
 
 // The running thread takes the lock, waiting for it if it is held.
@@ -638,6 +642,7 @@ th_lock :: proc() -> u32 {
 	s := &iop_sched
 	if s.lock > 0 {
 		s.lock -= 1
+		s.lock_holder = s.cur
 		return KE_OK
 	}
 	return th_wait(.Lock)
@@ -652,10 +657,12 @@ th_unlock :: proc() -> u32 {
 	}
 	if w != nil {
 		th_wake(w, KE_OK)
+		s.lock_holder = w.id
 	} else if s.lock >= SIO2_LOCK_MAX {
 		return ke(KE_SEMA_OVF)
 	} else {
 		s.lock += 1
+		s.lock_holder = 0
 	}
 	return KE_OK
 }
@@ -869,6 +876,7 @@ th_event :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if a1 == 0 {return ke(KE_EVF_ILPAT), true}
 		e := evf_find(a0)
 		if e == nil {return ke(KE_UNKNOWN_EVFID), true}
+		// Retail threadman tests EA_MULTI before the bits, in Wait and Poll alike.
 		if e.attr & EA_MULTI == 0 && evf_waiters(e.id) > 0 {return ke(KE_EVF_MULTI), true}
 		if evf_met(e^, a1, a2) {
 			if a3 != 0 {w32(a3, e.bits)}
@@ -881,6 +889,7 @@ th_event :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 13, 14: // ReferEventFlagStatus(ef, iop_event_info_t *), iReferEventFlagStatus
 		e := evf_find(a0)
 		if e == nil {return ke(KE_UNKNOWN_EVFID), true}
+		// Five words, as retail threadman writes; reserved1/2 are left as they are.
 		for w, i in ([5]u32{e.attr, e.option, e.initial, e.bits, evf_waiters(e.id)}) {
 			w32(a1 + 4 * u32(i), w)
 		}

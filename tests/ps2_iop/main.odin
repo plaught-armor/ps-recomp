@@ -194,6 +194,7 @@ game :: proc(_: rawptr) {
 	test_sio2_lock()
 	test_sio2_lock_snap()
 	test_sio2_lock_undo()
+	test_sio2_lock_undo_held()
 	test_sio2_stat()
 	test_ds2()
 	test_sifcmd()
@@ -1695,6 +1696,29 @@ test_sio2_lock_undo :: proc() {
 	check(s.lock == 0, "sio2 lock undo: the lock stays held")
 }
 
+// A failed load whose start took the lock gives it back: the start's thread
+// goes, and no 62 will come from it.
+test_sio2_lock_undo_held :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	// "modlk": its start takes the lock (61), then calls thevent 12, which the
+	// HLE lacks.
+	a: Asm
+	te := imports(&a, "thevent", 12)
+	sm := imports_v(&a, "sio2man", 0x0204, 61)
+	entry := at(&a)
+	prologue(&a)
+	jal(&a, sm)
+	jal(&a, te)
+	li(&a, V0, 0)
+	epilogue(&a)
+	n := len(s.threads)
+	id, _ := iop.iop_load(build_mod("modlk", &a, entry), "modlk", nil)
+	check(id == -1 && len(s.threads) == n, "sio2 lock undo held: the load fails")
+	check(s.lock == 1 && s.lock_holder == 0, "sio2 lock undo held: the lock is given back")
+	check(sio2(61) == 0 && s.lock == 0, "sio2 lock undo held: and can be taken again")
+}
+
 // One sio2man transfer (51) of frames `send`, each to its port in `ports`,
 // as SIO2D builds them: each register sends and gets back its frame's
 // length. The reply bytes of every frame in turn, and stat6c.
@@ -1745,7 +1769,7 @@ test_sio2_stat :: proc() {
 	r, st2 := xfer({1}, pad_frame(0x42))
 	check(st2 == 0x2d100 && all_ff(r), "sio2 stat: no pad on port 1, its MISSING bits and 0xff")
 	r, st2 = xfer({2}, pad_frame(0x42))
-	check(st2 == 0x1d100 && all_ff(r), "sio2 stat: none on port 2")
+	check(st2 == 0x2d100 && all_ff(r), "sio2 stat: none on port 2, port 2's MISSING bits as on any port but 0")
 	r, st2 = xfer({0, 2}, pad_frame(0x42), []u8{0x81, 0x11, 0, 0})
 	check(st2 == iop.SIO2_DISCONNECTED && all_ff(r[21:]) && r[1] == iop.DS2_DIGITAL, "sio2 stat: a memory card frame leaves DISCONNECTED, answered 0xff")
 	iop.pads[0].connected = false

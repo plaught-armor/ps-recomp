@@ -105,7 +105,7 @@ sio2_frame :: proc(port: u32, send, reply: []u8, stat: u32) -> u32 {
 	}
 	stat |= SIO2_NO_DEVICES_MISSING
 	if port != 0 || !pads[0].connected {
-		return stat | (SIO2_PORT_1_MISSING if port & 1 == 0 else SIO2_PORT_2_MISSING)
+		return stat | (SIO2_PORT_1_MISSING if port == 0 else SIO2_PORT_2_MISSING)
 	}
 	for tx, i in send[1:] {
 		rx := ds2_byte(i + 1, tx)
@@ -120,7 +120,9 @@ sio2_frame :: proc(port: u32, send, reply: []u8, stat: u32) -> u32 {
 // frame addresses the pad (answered 0xff by the SIO2), byte 1 is the
 // command, answered by the mode's id, byte 2 is answered 0x5a, and each
 // later byte by the command's data. The pad starts digital; 0x44 and 0x4f
-// change its mode, 0x43 enters and leaves config mode (id 0xf3).
+// change its mode, 0x43 enters and leaves config mode (id 0xf3). One
+// divergence: PCSX2 answers 0x43 outside config mode with 0x00 from byte 3
+// on; here it answers with the poll bytes (see 0x43 in ds2_byte).
 DS2_DIGITAL :: 0x41
 DS2_ANALOG :: 0x73
 DS2_DUALSHOCK2 :: 0x79
@@ -176,7 +178,7 @@ ds2_byte :: proc(i: int, tx: u8) -> u8 {
 		}
 	case 0x42:
 		return ds2_poll(i, tx)
-	case 0x43: // config mode: outside it, a poll as well, as the PS1 pad's (psx/bios/sio.odin)
+	case 0x43: // config mode: outside it, a poll as well, as the PS1 pad's (psx/bios/sio.odin); PCSX2 answers 0x00
 		if i == 3 {d.config = tx != 0}
 		if !d.cmd_config {return ds2_poll(i, tx, motors = false)}
 	case 0x44: // mode switch: analog light, then 3 to lock the mode
