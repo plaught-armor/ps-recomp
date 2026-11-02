@@ -1179,6 +1179,23 @@ test_sysclib :: proc() {
 	call(30, TOP - 1, B, 100)
 	check(ram[TOP - 1] == 'w', "sysclib: strncpy stops at RAM's end")
 
+	// strstr: the kernel's one pass that never backs up.
+	put_str(A, "cdrom0:\\X.BIN;1")
+	put_str(B, ";1")
+	put_str(C, "")
+	check(call(34, A, B) == A + 13, "sysclib: strstr finds the needle")
+	check(call(34, A, A) == A && call(34, A, A + 14) == A + 14, "sysclib: strstr at the start, a one-character needle")
+	check(call(34, A, C) == 0 && call(34, C, B) == 0, "sysclib: strstr of an empty needle or haystack is 0")
+	put_str(B, ";2")
+	check(call(34, A, B) == 0, "sysclib: strstr miss is 0")
+	put_str(A, "aab")
+	put_str(B, "ab")
+	check(call(34, A, B) == 0, "sysclib: strstr does not back up after a partial match")
+	put_str(A, "xaxab")
+	check(call(34, A, B) == A + 3, "sysclib: strstr restarts the needle after a mismatch")
+	put_str(B, "xaxabc")
+	check(call(34, A, B) == 0, "sysclib: strstr of a needle longer than the haystack is 0")
+
 	// sprintf: return, NUL, null format, RAM's end, the formatter's quirks.
 	put_str(A, "%d-%s")
 	put_str(B, "ok")

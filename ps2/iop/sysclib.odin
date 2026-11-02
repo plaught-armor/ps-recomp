@@ -237,12 +237,34 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		k := copy(dst, src)
 		for &b in dst[k:] {b = 0}
 		return a0, true
+	case 34: // strstr(hay, needle)
+		return iop_strstr(a0, a1), true
 	case 36: // strtol(s, char **end, base)
 		v, end := iop_strtol(a0, a2)
 		if a1 != 0 {w32(a1, end)}
 		return u32(v), true
 	}
 	return 0, false
+}
+
+// strstr as the kernel's sysclib runs it, which is not C's: one pass over
+// `hay` that never backs up. A mismatch restarts the needle at the next
+// character, and that character is not tried against the needle's first, so
+// "aab" does not find "ab". An empty needle matches nothing (0), and null is
+// not checked: it reads from address 0. The match's address, or 0.
+iop_strstr :: proc(hay, needle: u32) -> u32 {
+	h, n := cstr(hay), cstr(needle)
+	if len(n) == 0 {return 0}
+	k := 0 // needle characters matched so far
+	for i in 0 ..< len(h) {
+		if h[i] != n[k] {
+			k = 0
+			continue
+		}
+		k += 1
+		if k == len(n) {return hay + u32(i + 1 - k)}
+	}
+	return 0
 }
 
 // C's strtol over the string at `a`: the value, clamped to an i32, and the
