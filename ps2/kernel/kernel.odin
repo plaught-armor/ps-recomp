@@ -905,6 +905,9 @@ update_next_event :: proc() {
 	for a in k.alarms {n = min(n, a.deadline)}
 	for t in mem.timer_next {n = min(n, t)}
 	n = min(n, iop.iop_wake_ee)
+	// A reply still in flight from the IOP. One already due but held (the
+	// EE buffer busy or unset, interrupts masked) waits on what frees it.
+	if d := iop.sif_next_ee(); d > cpu.state.cycles {n = min(n, d)}
 	cpu.next_event = n
 }
 
@@ -964,8 +967,10 @@ run_events :: proc() {
 // EI: unmask interrupts, and deliver at once any left pending while masked.
 ei :: proc() {
 	cpu.state.cop0[12] |= 0x10000
-	if mem.intc_pending & mem.intc_mask != 0 || mem.dmac_stat & (mem.dmac_stat >> 16) & 0x3ff != 0 || len(iop.sif.replies) != 0 {
+	if mem.intc_pending & mem.intc_mask != 0 || mem.dmac_stat & (mem.dmac_stat >> 16) & 0x3ff != 0 || iop.sif_next_ee() <= cpu.state.cycles {
 		cpu.next_event = cpu.state.cycles
+	} else {
+		cpu.next_event = min(cpu.next_event, iop.sif_next_ee())
 	}
 }
 

@@ -200,6 +200,7 @@ game :: proc(_: rawptr) {
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
+	test_reply_due()
 	test_rpc_bind()
 	test_rpc()
 	test_rpc_remove()
@@ -2015,9 +2016,13 @@ test_cmd_deliver :: proc() {
 	cpu.state.cop0[12] |= 0x10001
 	cpu.state.cycles = iop.iop_wake_ee
 	kernel.run_events()
+	due := iop.sif_next_ee()
+	check(len(iop.sif.replies) == 1 && due > cpu.state.cycles && due <= r3000.state.cycles * 8 && cpu.next_event == due, "tick: the thread's command waits for the IOP clock it was sent at")
+	cpu.state.cycles = due
+	kernel.run_events()
 	cpu.state.cop0[12] = sr
 	t = iop.th_find(iop.iop_u32(b + th)^)
-	check(mem.rd32(EE_BUF) == 16 && mem.rd32(EE_BUF + 8) == 0x10 && len(iop.sif.replies) == 0, "tick: the thread's command is in EE RAM after one pass")
+	check(mem.rd32(EE_BUF) == 16 && mem.rd32(EE_BUF + 8) == 0x10 && len(iop.sif.replies) == 0, "tick: then the thread's command is in EE RAM")
 	check(t.status == .Wait && iop.iop_wake_ee == max(u64) && cpu.next_event == VBLANK, "tick: the thread waits again, no wake")
 	mem.dmac_stat &~= 1 << mem.DMA_SIF0
 
@@ -2038,6 +2043,59 @@ test_cmd_deliver :: proc() {
 	check(coroutines() == base && iop.iop_wake_ee == max(u64), "deliver: the loader's reset kills it")
 }
 
+// A reply reaches the EE no earlier than the IOP clock it was sent at.
+test_reply_due :: proc() {
+	fresh()
+	drop_replies()
+	iop.sif.ee_buf = EE_BUF
+	mem.dmac_stat &~= 1 << mem.DMA_SIF0
+	kernel.k.vblank_start, kernel.k.vblank_end = 1 << 40, 1 << 40
+	pkt: [4]u32 = {16, 0, 0x10, 0}
+	send :: proc(pkt: ^[4]u32, cid: u32) {
+		pkt[2] = cid
+		iop.sif_send_raw(([^]u8)(pkt)[:16])
+	}
+	pumped :: proc(cid: u32) -> bool {
+		ok := mem.dmac_stat & (1 << mem.DMA_SIF0) != 0 && mem.rd32(EE_BUF + 8) == cid
+		mem.dmac_stat &~= 1 << mem.DMA_SIF0
+		mem.wr32(EE_BUF + 8, 0)
+		return ok
+	}
+
+	cpu.state.cycles = 1000
+	r3000.state.cycles = 500
+	cpu.next_event = max(u64)
+	send(&pkt, 0x11)
+	check(iop.sif_next_ee() == 4000 && cpu.next_event == 4000, "reply due: the IOP ahead, due at its clock, the EE's next event")
+	cpu.state.cycles = 3999
+	iop.sif_pump()
+	check(len(iop.sif.replies) == 1 && !pumped(0x11), "reply due: not pumped before its due")
+	kernel.update_next_event()
+	check(cpu.next_event == 4000, "reply due: the next event stays the due")
+	cpu.state.cycles = 4000
+	iop.sif_pump()
+	check(len(iop.sif.replies) == 0 && pumped(0x11) && iop.sif_next_ee() == max(u64), "reply due: pumped at its due")
+
+	r3000.state.cycles = 600
+	send(&pkt, 0x12)
+	r3000.state.cycles = 700
+	send(&pkt, 0x13)
+	check(len(iop.sif.replies) == 2 && iop.sif.replies[0].due == 4800 && iop.sif.replies[1].due == 5600, "reply due: two replies keep their dues")
+	cpu.state.cycles = 5600
+	iop.sif_pump()
+	check(pumped(0x12), "reply due: the first sent goes first")
+	iop.sif_pump()
+	check(pumped(0x13) && len(iop.sif.replies) == 0, "reply due: then the second")
+
+	cpu.state.cycles = 10000
+	r3000.state.cycles = 100
+	send(&pkt, 0x14)
+	check(iop.sif_next_ee() == 10000, "reply due: the IOP behind, due at once")
+	iop.sif_pump()
+	check(pumped(0x14), "reply due: pumped at once")
+	fresh()
+}
+
 // Sends the IOP a packet of command `cid` with payload `args`.
 send_pkt :: proc(cid: u32, args: ..u32) {
 	n := 16 + 4 * u32(len(args))
@@ -2048,12 +2106,9 @@ send_pkt :: proc(cid: u32, args: ..u32) {
 }
 
 // Word w of the IOP's queued packet i.
-reply_word :: proc(i, w: int) -> u32 {return ([^]u32)(raw_data(iop.sif.replies[i]))[w]}
+reply_word :: proc(i, w: int) -> u32 {return ([^]u32)(raw_data(iop.sif.replies[i].p))[w]}
 
-drop_replies :: proc() {
-	for p in iop.sif.replies {delete(p)}
-	clear(&iop.sif.replies)
-}
+drop_replies :: proc() {iop.sif_drop_replies()}
 
 // Whether the IOP's queued packets are, in order, the RPC_ENDs of the calls
 // with rec_id `recs`, made to descriptor sd.

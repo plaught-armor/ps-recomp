@@ -55,11 +55,19 @@ disc_dir := "."
 // buffer, writes its reply into the same buffer.
 Rpc_Server :: proc(fno: u32, buf: []u8, send_size: u32) -> (ok: bool)
 
+// A packet for the EE and the EE cycle it may arrive at: no earlier than
+// the IOP clock when it was sent, so a blocking RPC costs the EE the IOP
+// time its server took.
+Sif_Reply :: struct {
+	due: u64,
+	p:   []u8,
+}
+
 sif: struct {
 	mscom, smcom, msflg, smflg, ctrl, bd6: u32,
 	sreg:      [32]u32,
 	ee_buf:    u32, // EE receive buffer for replies
-	replies:   [dynamic][]u8,
+	replies:   [dynamic]Sif_Reply,
 	servers:   map[u32]Rpc_Server,
 	bound:     map[u32]u32, // sid -> fake server descriptor address
 	next_dma:  i32,
@@ -219,18 +227,31 @@ sif_send_raw :: proc(p: []u8) {
 
 @(private = "file")
 sif_queue :: proc(p: []u8) {
-	append(&sif.replies, p)
-	if !cpu.in_interrupt {cpu.next_event = cpu.state.cycles}
+	due := max(cpu.state.cycles, r3000.state.cycles * IOP_EE_RATIO)
+	if n := len(sif.replies); n != 0 {due = max(due, sif.replies[n - 1].due)} // FIFO
+	append(&sif.replies, Sif_Reply{due, p})
+	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, due)}
 }
 
-// Move the next queued reply into the EE buffer once the EE has consumed
-// the previous one. Called while delivering interrupts.
+// The EE cycle the next queued reply may arrive at, max(u64) with none.
+sif_next_ee :: proc() -> u64 {
+	return max(u64) if len(sif.replies) == 0 else sif.replies[0].due
+}
+
+// Drop every queued reply.
+sif_drop_replies :: proc() {
+	for r in sif.replies {delete(r.p)}
+	clear(&sif.replies)
+}
+
+// Move the next queued reply into the EE buffer once it is due and the EE
+// has consumed the previous one. Called while delivering interrupts.
 sif_pump :: proc() {
-	if len(sif.replies) == 0 || sif.ee_buf == 0 || mem.dmac_stat & (1 << mem.DMA_SIF0) != 0 {return}
-	p := sif.replies[0]
+	if sif_next_ee() > cpu.state.cycles || sif.ee_buf == 0 || mem.dmac_stat & (1 << mem.DMA_SIF0) != 0 {return}
+	r := sif.replies[0]
 	ordered_remove(&sif.replies, 0)
-	copy(mem.ram_slice(sif.ee_buf, u32(len(p))), p)
-	delete(p)
+	copy(mem.ram_slice(sif.ee_buf, u32(len(r.p))), r.p)
+	delete(r.p)
 	mem.dmac_stat |= 1 << mem.DMA_SIF0
 }
 
@@ -305,7 +326,7 @@ sif_command :: proc(a, pc: u32) {
 		clear(&sif.bound)
 		sif_bind_retries = {}
 		sif.ee_buf = 0
-		clear(&sif.replies)
+		sif_drop_replies()
 	case SIF_CMD_IOP_INTR:
 		// Sent with no payload after a game's own transfer, only so its
 		// arrival interrupts the IOP: retail SIFCMD has no handler for it
