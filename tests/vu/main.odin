@@ -190,7 +190,7 @@ div_efu :: proc() {
 	for c in cases {
 		v := c.name == "ESUM" ? &vu.vu1 : &vu.vu0 // the EFU is VU1's
 		v.vf[1].u, v.vf[2].u, v.q, v.p = c.s, c.t, 1, 1
-		vu.vu_op(v, c.w | 2 << 16 | 1 << 11)
+		if c.name == "ESUM" {vu.vu_op(v, c.w | 2 << 16 | 1 << 11)} else {vu.vu0_macro(c.w | 2 << 16 | 1 << 11)}
 		got := transmute(u32)(c.name == "ESUM" ? v.p : v.q)
 		if got != c.want {fail("%s %08x %08x: %08x, want %08x", c.name, c.s.x, c.t.x, got, c.want)}
 	}
@@ -312,6 +312,57 @@ put_pairs :: proc(addr: u32, pairs: ..[2]u32) {
 	}
 }
 
+// Q latency: DIV and SQRT write Q 7 pairs after issue, RSQRT 13. A read
+// before then sees the old Q; a second DIV, SQRT or RSQRT, or WAITQ, lands
+// the pending Q first; the E-bit end drains it; VU0 macro mode sees it at
+// once. MULq vf<n>, vf2 with vf2 all ones reads Q into vf<n>.
+@(private = "file")
+q_latency :: proc() {
+	NOP_L :: 0x8000033c
+	NOP_U :: 0x000002ff
+	E :: 1 << 30
+	DIV :: 0x40 << 25 | 0b0011 << 21 | 1 << 16 | 0x3bc // DIV Q, vf0w, vf1x: 1 / 2
+	SQRT :: 0x40 << 25 | 0b0100 << 21 | 1 << 16 | 0x3bd // SQRT Q, vf1y: sqrt 4
+	RSQRT :: 0x40 << 25 | 0b1111 << 21 | 1 << 16 | 0x3be // RSQRT Q, vf0w, vf1w: 1 / sqrt 16
+	WAITQ :: 0x40 << 25 | 0x3bf
+	mulq :: proc(d: u32) -> u32 {return 0xf << 21 | 2 << 11 | d << 6 | 0x1c}
+	v := &vu.vu0
+	call := proc(v: ^vu.Vu, addr: u32) {
+		v.vf[1].f, v.vf[2].f = {2, 4, 8, 16}, {1, 1, 1, 1}
+		for r in 3 ..< 16 {v.vf[r] = {}}
+		v.q, v.q_wait = 3, 0
+		v.status = 0
+		vu.vu_op(v, 0x4a000038 | (addr / 8) << 6) // VCALLMS
+	}
+	nops :: [2]u32{NOP_L, NOP_U}
+	put_pairs(0x600, {DIV, mulq(3)}, {NOP_L, mulq(4)}, nops, nops, nops, nops, {NOP_L, mulq(5)}, {NOP_L, mulq(6)}, {RSQRT, mulq(7)},
+		nops, nops, nops, nops, nops, nops, nops, nops, nops, nops, nops, {NOP_L, mulq(8)}, {NOP_L, mulq(9)},
+		{SQRT, mulq(10)}, {DIV, mulq(11)}, {WAITQ, mulq(12)}, {RSQRT, mulq(13) | E}, {NOP_L, mulq(14)})
+	call(v, 0x600)
+	// The issuing pair and DIV +1 and +6 see 3, DIV +7 sees 1/2; RSQRT +12
+	// still 1/2, +13 1/4; the DIV after the SQRT lands its 2; WAITQ lands
+	// the DIV's 1/2 for the MULq beside it; the RSQRT before the E bit is
+	// not seen by its delay slot, then lands at the end.
+	want := [?]struct {
+		r: int,
+		q: f32,
+	}{{3, 3}, {4, 3}, {5, 3}, {6, 0.5}, {7, 0.5}, {8, 0.5}, {9, 0.25}, {10, 0.25}, {11, 2}, {12, 0.5}, {13, 0.5}, {14, 0.5}}
+	for w in want {if v.vf[w.r].f.x != w.q {fail("Q latency: vf%d.x = %v, want %v", w.r, v.vf[w.r].f.x, w.q)}}
+	if v.q != 0.25 || v.q_wait != 0 {fail("Q latency: Q %v wait %d at the end, want 0.25 0", v.q, v.q_wait)}
+
+	// B over a pair into the window: the pairs run count, so pair 7 is
+	// DIV +6 and pair 8 DIV +7.
+	B_2 :: 0x20 << 25 | 2 // B +2
+	put_pairs(0x700, {DIV, NOP_U}, {B_2, NOP_U}, nops, {NOP_L, mulq(3)}, nops, nops, nops, {NOP_L, mulq(4)}, {NOP_L, mulq(5) | E}, nops)
+	call(v, 0x700)
+	if v.vf[3].f.x != 0 || v.vf[4].f.x != 3 || v.vf[5].f.x != 0.5 {fail("Q latency over a branch: vf3 %v vf4 %v vf5 %v, want 0 3 0.5", v.vf[3].f.x, v.vf[4].f.x, v.vf[5].f.x)}
+
+	// A macro VDIV is seen by the next macro op.
+	v.vf[1].f.x, v.vf[2].f.x, v.q = 1, 4, 3
+	vu.vu0_macro(0x4a0003bc | 2 << 16 | 1 << 11) // VDIV Q, vf1x, vf2x
+	if v.q != 0.25 || v.q_wait != 0 {fail("macro VDIV: Q %v wait %d, want 0.25 0", v.q, v.q_wait)}
+}
+
 @(private = "file")
 flag_delay :: proc() {
 	NOP_L :: 0x8000033c
@@ -416,6 +467,7 @@ main :: proc() {
 	vu0_compiled()
 	micro_writes()
 	flag_delay()
+	q_latency()
 	ibit()
 	fmt.println("vu: ok")
 }

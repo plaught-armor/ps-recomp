@@ -57,6 +57,7 @@ random_state :: proc(init: ^vu.Vu, mem: []u32) {
 	init.vi[2] = 0xffff
 	init.i = transmute(f32)rnd()
 	init.q = transmute(f32)rnd()
+	init.q_next, init.q_wait = transmute(f32)rnd(), 0 // as a microprogram starts: no Q pending
 	init.p = transmute(f32)rnd()
 	init.mac = rand.uint32() & 0xffff
 	init.clip = rand.uint32() & 0xffffff
@@ -66,12 +67,20 @@ random_state :: proc(init: ^vu.Vu, mem: []u32) {
 	for &w in mem {w = rnd()}
 }
 
+// At the end (pc with END_BIT), a pending Q lands, as vu0_exec and
+// vu1_exec drain it after the run.
+@(private = "file")
+drain :: proc(v: ^vu.Vu, pc: u32) {
+	if pc & END_BIT != 0 && v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}
+}
+
 // Whether got and want hold the same registers, but for the pc.
 @(private = "file")
 same_regs :: proc(got, want: ^vu.Vu, vu0: bool) -> bool {
 	same := got.vi == want.vi && got.acc.u == want.acc.u
 	for r in 0 ..< 32 {same &&= got.vf[r].u == want.vf[r].u}
 	same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p
+	same &&= transmute(u32)got.q_next == transmute(u32)want.q_next && got.q_wait == want.q_wait
 	same &&= transmute(u32)got.i == transmute(u32)want.i && got.r == want.r && got.clip == want.clip && got.mac == want.mac
 	return same && (!vu0 || got.status == want.status)
 }
@@ -134,6 +143,7 @@ main :: proc() {
 				copy(mem, mem_init)
 				nr.pc, nr.budget = i32(pc), BUDGET
 				run()
+				drain(v, u32(nr.pc))
 				got := v^
 				got_pc := u32(nr.pc)
 
@@ -201,6 +211,7 @@ main :: proc() {
 				copy(mem, mem_init)
 				nr.pc, nr.budget = i32(pc), BUDGET
 				run()
+				drain(v, u32(nr.pc))
 				want := v^
 				want_pc := u32(nr.pc) &~ END_BIT
 				copy(mem_want, mem)

@@ -36,6 +36,7 @@
 // program.odin's; this file writes them as Odin.
 package vu
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
@@ -314,7 +315,7 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 		// The micro lower word (opcode 0x40) has the same fields. Its
 		// fallback calls VU0's micro-mode interpreter, never right for a
 		// macro op.
-		if emit_lower(&sb, (w & 0x1ffffff) | 0x40 << 25, 0, "vu.VU0_MEM") {return "", false}
+		if emit_lower(&sb, (w & 0x1ffffff) | 0x40 << 25, 0, "vu.VU0_MEM", "v.q") {return "", false}
 	}
 	body := strings.trim_space(strings.to_string(sb))
 	if body == "" {return "", true}
@@ -348,7 +349,7 @@ lower_unit: int
 
 // Emit a non-branch lower op. mem names the VU's data memory size for mq.
 @(private = "file")
-emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: bool) {
+emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string, q := "v.q_next") -> (slow: bool) {
 	lower_unit = mem == MEM[.VU0] ? 0 : 1
 	dest := (lw >> 21) & 15
 	ft, fs, fd := (lw >> 16) & 31, (lw >> 11) & 31, (lw >> 6) & 31
@@ -469,11 +470,14 @@ emit_lower :: proc(sb: ^strings.Builder, lw, pc: u32, mem: string) -> (slow: boo
 			if lw & 3 == 1 && it != 0 {fmt.sbprintf(sb, "vi[%d] += 1; ", it)}
 			fmt.sbprintln(sb, "vi[0] = 0}")
 		case 0x38: // DIV
-			fmt.sbprintfln(sb, "\t\t\tv.q = fdiv(vf[%d].f[%d], vf[%d].f[%d])", fs, (lw >> 21) & 3, ft, (lw >> 23) & 3)
+			fmt.sbprintfln(sb, "\t\t\t%s = fdiv(vf[%d].f[%d], vf[%d].f[%d])", q, fs, (lw >> 21) & 3, ft, (lw >> 23) & 3)
+			if q == "v.q" {fmt.sbprintln(sb, "\t\t\tv.q_next = v.q")} // as vu0_macro leaves it, drained
 		case 0x39: // SQRT
-			fmt.sbprintfln(sb, "\t\t\tv.q = math.sqrt(abs(fclamp(vf[%d].f[%d])))", ft, (lw >> 23) & 3)
+			fmt.sbprintfln(sb, "\t\t\t%s = math.sqrt(abs(fclamp(vf[%d].f[%d])))", q, ft, (lw >> 23) & 3)
+			if q == "v.q" {fmt.sbprintln(sb, "\t\t\tv.q_next = v.q")} // as vu0_macro leaves it, drained
 		case 0x3a: // RSQRT
-			fmt.sbprintfln(sb, "\t\t\tv.q = frsqrt(vf[%d].f[%d], vf[%d].f[%d])", fs, (lw >> 21) & 3, ft, (lw >> 23) & 3)
+			fmt.sbprintfln(sb, "\t\t\t%s = frsqrt(vf[%d].f[%d], vf[%d].f[%d])", q, fs, (lw >> 21) & 3, ft, (lw >> 23) & 3)
+			if q == "v.q" {fmt.sbprintln(sb, "\t\t\tv.q_next = v.q")} // as vu0_macro leaves it, drained
 		case 0x3b, 0x7b: // WAITQ, WAITP
 		case 0x3c: // MTIR
 			if it != 0 {fmt.sbprintfln(sb, "\t\t\tvi[%d] = u16(vf[%d].u[%d])", it, fs, (lw >> 21) & 3)}
@@ -674,6 +678,34 @@ emit_branch :: proc(sb: ^strings.Builder, lw, pc, mask: u32) {
 	}
 }
 
+// emit_pair, with Q's latency around it for the Q waits it starts with, s
+// (demand_q): before the pair a WAITQ or DIV-family lower lands a pending
+// Q; after it, a DIV-family op starts the wait or a pending one moves on,
+// as the runtime's vu_q_before and vu_q_tick. vu_pair runs both for a Slow
+// pair.
+@(private = "file")
+emit_q_pair :: proc(sb: ^strings.Builder, p: Pair, pc: u32, unit: Unit, slow: ^map[string]int, known: ^Known, s: u16) {
+	slow_pair := p.mode == .Slow && !p.ibit
+	if !slow_pair && q_waits(p) && s != 1 {
+		fmt.sbprintln(sb, s & 1 == 0 ? "\t\t\tv.q, v.q_wait = v.q_next, 0" : "\t\t\tif v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}")
+	}
+	emit_pair(sb, p, pc, unit, slow, known)
+	after := q_after(p, s)
+	switch {
+	case slow_pair:
+	case q_issue(p) != 0: fmt.sbprintfln(sb, "\t\t\tv.q_wait = %d", q_issue(p) - 1)
+	case q_waits(p), s == 1:
+	case s & 1 == 0 && s & (s - 1) == 0: // one wait, known
+		if after == 1 {
+			fmt.sbprintln(sb, "\t\t\tv.q, v.q_wait = v.q_next, 0")
+		} else {
+			fmt.sbprintfln(sb, "\t\t\tv.q_wait = %d", intrinsics.count_trailing_zeros(after))
+		}
+	case:
+		fmt.sbprintln(sb, "\t\t\tif v.q_wait != 0 {v.q_wait -= 1; if v.q_wait == 0 {v.q = v.q_next}}")
+	}
+}
+
 @(private = "file")
 emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, entries: []u32, unit: Unit, slow: ^map[string]int) {
 	mask := MASK[unit]
@@ -708,9 +740,9 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 		case leave_pair(pairs, i):
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .Leave", pc)
 		case branch:
-			emit_pair(sb, p, pc, unit, slow, k)
+			emit_q_pair(sb, p, pc, unit, slow, k, p.q)
 			emit_branch(sb, p.lw, pc, mask)
-			emit_pair(sb, next, pc + 8, unit, slow, k)
+			emit_q_pair(sb, next, pc + 8, unit, slow, k, q_after(p, p.q))
 			fmt.sbprintln(sb, "\t\t\tif tk {")
 			fmt.sbprintln(sb, "\t\t\t\tbudget^ -= 1")
 			fmt.sbprintln(sb, "\t\t\t\tif budget^ <= 0 {return tg, .Leave}")
@@ -720,11 +752,11 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 			fmt.sbprintln(sb, "\t\t\t}")
 			fmt.sbprintln(sb, "\t\t\tcontinue")
 		case p.ebit:
-			emit_pair(sb, p, pc, unit, slow, k)
-			emit_pair(sb, next, pc + 8, unit, slow, k)
+			emit_q_pair(sb, p, pc, unit, slow, k, p.q)
+			emit_q_pair(sb, next, pc + 8, unit, slow, k, q_after(p, p.q))
 			fmt.sbprintfln(sb, "\t\t\treturn 0x%04x, .End", (pc + 16) & mask)
 		case:
-			emit_pair(sb, p, pc, unit, slow, k)
+			emit_q_pair(sb, p, pc, unit, slow, k, p.q)
 			if i + 1 < len(pairs) && in_ext(ext, i + 1) {
 				fell = true
 			} else {

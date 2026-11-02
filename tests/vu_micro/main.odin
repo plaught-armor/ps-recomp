@@ -42,6 +42,16 @@
 // the run starts with every older value equal to the newest, every pair
 // labelled and as a captured image entered at those pcs.
 //
+// The Q programs read Q (MULq) at each depth behind a DIV, SQRT or RSQRT,
+// which writes Q 7 pairs after it issues (RSQRT 13): in the issuing pair, at
+// +1, +6 and +7, at RSQRT +12 and +13; a second DIV and a WAITQ land the
+// pending Q first, and an E-bit end drains it. A branch over a pair into the
+// window counts the pairs run, and a loop issues its DIV while the last
+// iteration's is pending. Each runs from pcs inside the window too, every
+// pair labelled and as a captured image entered at those pcs, so a label
+// reached with Q pending and without both occur. Q, the pending Q and its
+// wait must match.
+//
 //   odin run tests/vu_micro -collection:ps=.
 package main
 
@@ -64,10 +74,11 @@ main :: proc() {
 	fmt.sbprintln(&sb, vu.VU_HELPERS)
 	fmt.sbprintln(&sb, vu.MACRO_HELPERS)
 	fmt.sbprintln(&sb, "Case :: struct {words: []u32, run: vu.Vu_Run, vu0: bool, pc: u32, leave: bool}\n")
-	fmt.sbprintln(&sb, "CASES := [?]Case{")
+	// Appended at run time: a literal this size warns of LLVM trouble.
+	fmt.sbprintln(&sb, "CASES: [dynamic]Case\n\nadd_cases :: proc() {")
 	for p, n in progs {
-		for pc in p.pcs {fmt.sbprintfln(&sb, "\t{{code_%d[:], run_%d, %v, 0x%x, false}},", n, n, p.unit == .VU0, pc)}
-		for pc in p.leaves {fmt.sbprintfln(&sb, "\t{{code_%d[:], run_%d, %v, 0x%x, true}},", n, n, p.unit == .VU0, pc)}
+		for pc in p.pcs {fmt.sbprintfln(&sb, "\tappend(&CASES, Case{{code_%d[:], run_%d, %v, 0x%x, false}})", n, n, p.unit == .VU0, pc)}
+		for pc in p.leaves {fmt.sbprintfln(&sb, "\tappend(&CASES, Case{{code_%d[:], run_%d, %v, 0x%x, true}})", n, n, p.unit == .VU0, pc)}
 	}
 	fmt.sbprintln(&sb, "}\n")
 	elided: map[vu.Unit]string
@@ -144,6 +155,7 @@ rnd :: proc() -> u32 {
 }
 
 main :: proc() {
+	add_cases()
 	rand.reset(SEED)
 	vu.vu_init()
 	fails, flagged, status_set := 0, 0, 0
@@ -164,6 +176,7 @@ main :: proc() {
 			init.vi[2] = 0xffff
 			init.i = transmute(f32)rnd()
 			init.q = transmute(f32)rnd()
+			init.q_next, init.q_wait = transmute(f32)rnd(), 0 // as a microprogram starts: no Q pending
 			init.p = transmute(f32)rnd()
 			init.mac = rand.uint32() & 0xffff
 			init.status = rand.uint32() & 0xfcf // I and D clear, so the control counts the program's
@@ -187,11 +200,14 @@ main :: proc() {
 			copy(mem, mem_init)
 			budget := 1000
 			pc, exit := c.run(c.pc, &budget)
+			// The end drains a pending Q, as vu0_exec and vu1_exec do after the run.
+			if exit == .End && v.q_wait != 0 {v.q, v.q_wait = v.q_next, 0}
 			got := v^
 			if want.mac != init.mac {flagged += 1}
 			if c.vu0 && want.status & 0x30 != 0 {status_set += 1}
 			same := exit == want_exit && pc == want.tpc && got.vi == want.vi && got.acc.u == want.acc.u && got.mac == want.mac
 			same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p && slice.equal(mem, mem_want)
+			same &&= transmute(u32)got.q_next == transmute(u32)want.q_next && got.q_wait == want.q_wait
 			same &&= !c.vu0 || got.status == want.status
 			for k in 0 ..< 32 {same &&= got.vf[k].u == want.vf[k].u}
 			if !same {

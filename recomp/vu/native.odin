@@ -16,6 +16,7 @@
 // the same code.
 package vu
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:strings"
 import "../mips"
@@ -93,6 +94,8 @@ VU_NORM :: 448
 VU_VI :: 512
 @(private = "file")
 VU_ACC, VU_Q, VU_P, VU_I, VU_CLIP, VU_STATUS, VU_MAC :: 544, 560, 564, 568, 576, 580, 584
+@(private = "file")
+VU_Q_NEXT, VU_Q_WAIT :: 624, 628
 // Each flag's three older values (old_mac and the rest), as [Flag].
 @(private = "file", rodata)
 VU_OLD := [Flag]u32 {
@@ -165,13 +168,14 @@ clip :: proc(a: ^native.Asm, u: Unit, w: u32) -> bool {
 }
 
 // DIV (key 0x38), SQRT (0x39) and RSQRT (0x3a) of op w, as vu.vu_op runs
-// them: Q, and with status, status I and D with their sticky bits, as
+// them: Q at offset q (VU_Q in macro mode, the pending VU_Q_NEXT in micro
+// mode), and with status, status I and D with their sticky bits, as
 // vu_div_flags sets them. The results use the host's float divide and
 // square root with its default rounding, as the runtime's f32 code does.
 // Uses A, B, C, LD, V0 and V1, and keeps T, which can hold a branch
 // condition across this op in a delay slot.
 @(private = "file")
-div :: proc(a: ^native.Asm, u: Unit, w, key: u32, status: bool) -> bool {
+div :: proc(a: ^native.Asm, u: Unit, w, key: u32, status: bool, q: u32 = VU_Q) -> bool {
 	fs, fsf, ft, ftf := (w >> 11) & 31, (w >> 21) & 3, (w >> 16) & 31, (w >> 23) & 3
 	native.imp_load(a, .A, IMPORTS[u][.Vf], 16 * fs + 4 * fsf)
 	native.imp_load(a, .B, IMPORTS[u][.Vf], 16 * ft + 4 * ftf)
@@ -213,7 +217,8 @@ div :: proc(a: ^native.Asm, u: Unit, w, key: u32, status: bool) -> bool {
 		native.imp_store(a, IMPORTS[u][.Vf], .C, VU_STATUS)
 	}
 	quotient(a, key)
-	native.imp_store(a, IMPORTS[u][.Vf], .A, VU_Q)
+	native.imp_store(a, IMPORTS[u][.Vf], .A, q)
+	if q == VU_Q {native.imp_store(a, IMPORTS[u][.Vf], .A, VU_Q_NEXT)} // as vu0_macro leaves it, drained
 	return true
 }
 
@@ -908,7 +913,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, status: bool, slow: ^m
 		case 0x30, 0x31, 0x34 ..= 0x37, 0x3b, 0x3d, 0x7b: // MOVE, MR32, LQI-SQD, WAITQ, MFIR, WAITP
 			if key != 0x7b && !op(a, u, lw, .None) {interp(a, u, lw, pc, slow, known)}
 		case 0x38 ..= 0x3a: // DIV, SQRT, RSQRT
-			div(a, u, lw, key, status)
+			div(a, u, lw, key, status, VU_Q_NEXT)
 		case 0x3c: // MTIR
 			if it == 0 {return}
 			native.imp_load(a, .A, vf, 16 * fs + 4 * ((lw >> 21) & 3))
@@ -1071,6 +1076,55 @@ micro_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]
 	}
 }
 
+// micro_pair, with Q's latency around it for the Q waits it starts with,
+// s, as emit_q_pair. Uses A besides, and keeps T.
+@(private = "file")
+micro_q_pair :: proc(a: ^native.Asm, u: Unit, p: Pair, pc: u32, slow: ^map[string]int, known: ^[32]u8, s: u16) {
+	vf := IMPORTS[u][.Vf]
+	land :: proc(a: ^native.Asm, vf: string) {
+		native.imp_load(a, .A, vf, VU_Q_NEXT)
+		native.imp_store(a, vf, .A, VU_Q)
+		native.mov_imm(a, .A, 0)
+		native.imp_store(a, vf, .A, VU_Q_WAIT)
+	}
+	slow_pair := p.mode == .Slow && !p.ibit
+	if !slow_pair && q_waits(p) && s != 1 {
+		none := native.new_label(a)
+		if s & 1 != 0 {
+			native.imp_load(a, .A, vf, VU_Q_WAIT)
+			native.br_zero(a, .A, none)
+		}
+		land(a, vf)
+		native.bind(a, none)
+	}
+	micro_pair(a, u, p, pc, slow, known)
+	after := q_after(p, s)
+	switch {
+	case slow_pair:
+	case q_issue(p) != 0:
+		native.mov_imm(a, .A, q_issue(p) - 1)
+		native.imp_store(a, vf, .A, VU_Q_WAIT)
+	case q_waits(p), s == 1:
+	case s & 1 == 0 && s & (s - 1) == 0: // one wait, known
+		if after == 1 {
+			land(a, vf)
+		} else {
+			native.mov_imm(a, .A, u32(intrinsics.count_trailing_zeros(after)))
+			native.imp_store(a, vf, .A, VU_Q_WAIT)
+		}
+	case:
+		done := native.new_label(a)
+		native.imp_load(a, .A, vf, VU_Q_WAIT)
+		native.br_zero(a, .A, done)
+		native.alu_imm(a, .Sub, .A, 1)
+		native.imp_store(a, vf, .A, VU_Q_WAIT)
+		native.br_zero(a, .A, done, nonzero = true)
+		native.imp_load(a, .A, vf, VU_Q_NEXT)
+		native.imp_store(a, vf, .A, VU_Q)
+		native.bind(a, done)
+	}
+}
+
 // T = whether branch lw is taken, as 0 or 1, or for JR and JALR its
 // target; then the link register. As emit_branch.
 @(private = "file")
@@ -1173,9 +1227,9 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 			leave(a, exit, pc)
 		case branch:
 			op := p.lw >> 25
-			micro_pair(a, u, p, pc, slow, k)
+			micro_q_pair(a, u, p, pc, slow, k, p.q)
 			micro_branch(a, u, p.lw, pc, mask)
-			micro_pair(a, u, next, pc + 8, slow, k)
+			micro_q_pair(a, u, next, pc + 8, slow, k, q_after(p, p.q))
 			not_taken, go := native.new_label(a), native.new_label(a)
 			cond := op >= 0x28
 			reg := op == 0x24 || op == 0x25
@@ -1201,11 +1255,11 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 			native.bind(a, not_taken)
 			if cond {goto(a, labels, exit, (pc + 16) & mask)}
 		case p.ebit:
-			micro_pair(a, u, p, pc, slow, k)
-			micro_pair(a, u, next, pc + 8, slow, k)
+			micro_q_pair(a, u, p, pc, slow, k, p.q)
+			micro_q_pair(a, u, next, pc + 8, slow, k, q_after(p, p.q))
 			leave(a, exit, (pc + 16) & mask, end = true)
 		case:
-			micro_pair(a, u, p, pc, slow, k)
+			micro_q_pair(a, u, p, pc, slow, k, p.q)
 			if i + 1 >= len(pairs) || !in_ext(ext, i + 1) {
 				leave(a, exit, (pc + 8) & mask)
 			} else {

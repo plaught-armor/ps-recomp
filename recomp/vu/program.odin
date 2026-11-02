@@ -12,6 +12,11 @@
 // interpreter shifts them after every pair. Compiled code shifts only the
 // ones demand_flags finds a later read or an exit can see, which gives the
 // reads what the interpreter's full shift gives them.
+//
+// Q lands VU_Q_DIV pairs after a DIV or SQRT and VU_Q_RSQRT after an RSQRT
+// (the runtime's VU_Q_DIV), unless a WAITQ or another of them lands it
+// first. Vu keeps the pending Q and how many pairs are left; compiled code
+// counts them down only on the pairs demand_q finds one can be pending at.
 package vu
 
 import "core:fmt"
@@ -42,6 +47,7 @@ Pair :: struct {
 	reads:      [Flag]u8, // the depths of each flag the pair reads (Depths)
 	kills:      bit_set[Flag], // the flags the pair sets whole
 	out:        [Flag]u8, // the depths of each flag after the pair that can be seen
+	q:          u16, // the Q waits the pair can start with, when not run as a delay slot (demand_q)
 }
 
 // The flags a micro-mode read sees late.
@@ -243,6 +249,81 @@ demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
 	}
 }
 
+// As the runtime's VU_Q_DIV and VU_Q_RSQRT.
+@(private)
+Q_DIV, Q_RSQRT :: 7, 13
+
+// Whether pair p's lower waits for a pending Q (WAITQ, DIV, SQRT, RSQRT),
+// as vu_q_waits.
+@(private)
+q_waits :: proc(p: Pair) -> bool {
+	key := ((p.lw >> 4) & 0x7c) | (p.lw & 3)
+	return !p.ibit && p.lw >> 25 == 0x40 && p.lw & 0x3c == 0x3c && key >= 0x38 && key <= 0x3b
+}
+
+// The pairs until Q lands that pair p's lower starts: Q_DIV, Q_RSQRT, or
+// 0 for none.
+@(private)
+q_issue :: proc(p: Pair) -> u32 {
+	if !q_waits(p) {return 0}
+	switch ((p.lw >> 4) & 0x7c) | (p.lw & 3) {
+	case 0x38, 0x39: return Q_DIV
+	case 0x3a: return Q_RSQRT
+	}
+	return 0
+}
+
+// The Q waits after pair p for those it starts with, s, as bits: bit k for
+// k pairs left, bit 0 for none pending. As the runtime's vu_q_before, the
+// pair's op, then vu_q_tick.
+@(private)
+q_after :: proc(p: Pair, s: u16) -> u16 {
+	if l := q_issue(p); l != 0 {return u16(1) << (l - 1)}
+	if q_waits(p) {return 1}
+	return s & 1 | s >> 1
+}
+
+// Forward dataflow: the Q waits each pair can start with (q). Compiled
+// code is entered only with none pending (the runtime's vu_interp hands
+// over no sooner), so every pair can start with none. A pair also starts
+// with what the pair before it leaves when that falls through, and a
+// branch target with what the branch's delay slot leaves; the delay slot
+// runs inline from what the branch leaves. A JR or JALR can land on any
+// pair. A pair left for the interpreter runs nothing compiled.
+@(private)
+demand_q :: proc(pairs: []Pair, ext: []bool, mask: u32) {
+	for &p in pairs {p.q = 1}
+	add :: proc(pairs: []Pair, ext: []bool, j: int, s: u16) -> bool {
+		if j >= len(pairs) || (ext != nil && !ext[j]) || pairs[j].q | s == pairs[j].q {return false}
+		pairs[j].q |= s
+		return true
+	}
+	jr := u16(1)
+	for changed := true; changed; {
+		changed = false
+		for p, i in pairs {
+			if (ext != nil && !ext[i]) || leave_pair(pairs, i) {continue}
+			s := q_after(p, p.q)
+			branch := !p.ibit && p.branch != .None
+			if !branch && !p.ebit {
+				changed = add(pairs, ext, i + 1, s) || changed
+				continue
+			}
+			if p.ebit {continue} // the program ends after the delay slot
+			s = q_after(pairs[i + 1], s) // leave_pair holds i + 1 in range
+			switch p.branch {
+			case .None:
+			case .Uncond: changed = add(pairs, ext, int(branch_target(p.lw, u32(i) * 8, mask) / 8), s) || changed
+			case .Cond:
+				changed = add(pairs, ext, int(branch_target(p.lw, u32(i) * 8, mask) / 8), s) || changed
+				changed = add(pairs, ext, int(((u32(i) * 8 + 16) & mask) / 8), s) || changed
+			case .Reg: jr |= s
+			}
+		}
+		for _, i in pairs {changed = add(pairs, ext, i, jr) || changed}
+	}
+}
+
 @(private)
 branch_target :: proc(lw, pc, mask: u32) -> u32 {
 	imm11 := i32(i16(u16(lw & 0x7ff) << 5) >> 5)
@@ -433,7 +514,7 @@ load_programs :: proc(img: mips.Image, capture: string, unit: Unit) -> (progs: [
 	return progs, true
 }
 
-// A program's pairs, classified, with flag demand over the pairs ext
+// A program's pairs, classified, with flag and Q demand over the pairs ext
 // compiles (nil: all), and the dispatch targets for its entries. Both are
 // in the temp allocator.
 @(private)
@@ -442,5 +523,6 @@ analyze :: proc(words: []u32, ext: []bool, entries: []u32, unit: Unit) -> (pairs
 	pairs = make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
 	demand_flags(pairs, ext, mask, unit)
+	demand_q(pairs, ext, mask)
 	return pairs, dispatch_targets(pairs, mask, entries)
 }

@@ -143,7 +143,7 @@ main :: proc() {
 			copy(got_mem, vu.vu0.mem)
 			vu.vu0 = init
 			copy(vu.vu0.mem, mem)
-			vu.vu_op(&vu.vu0, c.w)
+			vu.vu0_macro(c.w)
 			mem_ok := slice.equal(got_mem, vu.vu0.mem)
 			if !same(&got, &vu.vu0) || !mem_ok {
 				fails += 1

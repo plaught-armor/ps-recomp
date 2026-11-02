@@ -237,15 +237,69 @@ LATE_MAC_PCS := []u32{0, 0x08, 0x10, 0x18}
 LATE_CLIP_PCS := []u32{0, 0x08, 0x10, 0x20}
 LATE_BRANCH_PCS := []u32{0, 0x18, 0x20, 0x28}
 
+// Q latency: DIV and SQRT write Q 7 pairs after issue, RSQRT 13; MULq
+// vf<n>, vf2 reads it. DIV vf0.w / vf1.x, SQRT vf1.y, RSQRT vf0.w / vf1.w.
+WAITQ :: 0x3b
+Q_DIV := lower_sp(DIV, 0b0011, 1, 0)
+Q_SQRT := lower_sp(SQRT, 0b0100, 1, 0)
+Q_RSQRT := lower_sp(RSQRT, 0b1111, 1, 0)
+mulq :: proc "contextless" (fd: u32) -> u32 {return upper(MULq, fd, 2, 0)}
+// Reads in the issuing pair, at DIV +1, +6 and +7, at RSQRT +12 and +13,
+// with a DIV that lands the SQRT before it, a WAITQ that lands the DIV,
+// and an RSQRT left pending at the E bit.
+Q_LAT := []u32 {
+	Q_DIV, mulq(3),
+	NOP_L, mulq(4),
+	NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U,
+	NOP_L, mulq(5),
+	NOP_L, mulq(6), // 0x38
+	Q_RSQRT, mulq(7),
+	NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U,
+	NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U,
+	NOP_L, mulq(8),
+	NOP_L, mulq(9),
+	Q_SQRT, mulq(10),
+	Q_DIV, mulq(11), // 0xb8
+	lower_sp(WAITQ, 0, 0, 0), mulq(12),
+	Q_RSQRT, mulq(13) | E_BIT,
+	NOP_L, mulq(14),
+}
+// A branch over pair 3 into the window: the target's reads are the pairs
+// run, so pair 7 is DIV +6 and pair 8 DIV +7.
+Q_BRANCH := []u32 {
+	Q_DIV, NOP_U,
+	lower_op(B, 0, 0, 0, 2), NOP_U,
+	NOP_L, mulq(3),
+	NOP_L, mulq(4),
+	NOP_L, mulq(5), // 0x20
+	NOP_L, NOP_U,
+	NOP_L, NOP_U,
+	NOP_L, mulq(6),
+	NOP_L, mulq(7) | E_BIT,
+	NOP_L, mulq(8),
+}
+// A loop run three times whose DIV issues with the last iteration's pending.
+Q_LOOP := []u32 {
+	lower_op(IADDIU, 0, 1, 0, 3), NOP_U,
+	Q_DIV, mulq(3), // 0x08, the loop
+	lower_op(0x40, 0, 1, 1, 0x1f << 6 | IADDI), mulq(4),
+	lower_op(IBNE, 0, 1, 0, 0x7fd), mulq(5),
+	NOP_L, mulq(6),
+	NOP_L, mulq(7) | E_BIT,
+	NOP_L, NOP_U,
+}
+Q_LAT_PCS := []u32{0, 0x08, 0x38, 0xb8}
+Q_BRANCH_PCS := []u32{0, 0x10, 0x20}
+
 // Every program, on each unit it runs on.
 programs :: proc() -> (progs: [dynamic]Prog) {
 	for w in PROGRAMS {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
 	for w in PROGRAMS_VU0 {append(&progs, Prog{w, .VU0, nil, AT_0, nil})}
-	// The late-flag programs, every pair labelled and as captured images
+	// The late-flag and Q programs, every pair labelled and as captured images
 	// entered at each pc.
 	late := [?]struct {
 		words, pcs: []u32,
-	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}}
+	}{{LATE_MAC, LATE_MAC_PCS}, {LATE_CLIP, LATE_CLIP_PCS}, {LATE_BRANCH, LATE_BRANCH_PCS}, {Q_LAT, Q_LAT_PCS}, {Q_BRANCH, Q_BRANCH_PCS}, {Q_LOOP, AT_0}}
 	for l in late {
 		for u in vu.Unit {append(&progs, Prog{l.words, u, nil, l.pcs, nil}, Prog{l.words, u, l.pcs, l.pcs, nil})}
 	}
