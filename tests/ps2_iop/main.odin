@@ -3345,9 +3345,9 @@ test_vblank :: proc() {
 	L :: F / 262
 	iop.ee_vblank_start, iop.ee_vblank_end = &vbl_start, &vbl_end
 	defer iop.ee_vblank_start, iop.ee_vblank_end = nil, nil
-	// "modq": threads A and B (priority 20) wait for the end and log 1 and
-	// 2; C (20) waits for the start and logs 3; handlers h4 and h5 call 4
-	// and 5.
+	// "modq": threads A and B (priority 20) wait for the end by 5 and log 1
+	// and 2; C (20) waits for vblank by 6 and logs 3; handlers h4 and h7 call
+	// 4 and 7.
 	a: Asm
 	VB_FNOS :: [4]u32{4, 5, 6, 7}
 	fnos := VB_FNOS
@@ -3368,16 +3368,16 @@ test_vblank :: proc() {
 	epilogue(&a)
 	ec := at(&a)
 	prologue(&a)
-	jal(&a, vb)
+	jal(&a, vb + 16)
 	log_v(&a, logp, 3)
 	epilogue(&a)
 	h4 := at(&a)
 	prologue(&a)
 	jal(&a, vb)
 	epilogue(&a)
-	h5 := at(&a)
+	h7 := at(&a)
 	prologue(&a)
-	jal(&a, vb + 8)
+	jal(&a, vb + 24)
 	epilogue(&a)
 	params := [3]u32{thread_param(&a, ea, 20), thread_param(&a, eb, 20), thread_param(&a, ec, 20)}
 	entry := at(&a)
@@ -3404,11 +3404,22 @@ test_vblank :: proc() {
 	b := module_base(id)
 	check(id > 0 && r == 0, "vblank: modq loads")
 	check(vb_at(b, vb, 0) == {WAIT, WAIT, WAIT, WAIT} && vb_at(b, vb, F - 22 * L - 8) == {WAIT, WAIT, WAIT, WAIT}, "vblank: before the first start every call waits")
-	check(vb_at(b, vb, F - 22 * L) == {0, WAIT, 0, WAIT} && vb_at(b, vb, F - 8) == {0, WAIT, 0, WAIT}, "vblank: from a start, 4 and 6 at once, 5 and 7 wait")
-	check(vb_at(b, vb, F) == {WAIT, 0, WAIT, 0} && vb_at(b, vb, 2 * F - 22 * L - 8) == {WAIT, 0, WAIT, 0}, "vblank: from an end, 5 and 7 at once, 4 and 6 wait")
-	check(vb_at(b, vb, 10 * F + 1) == {WAIT, 0, WAIT, 0} && vb_at(b, vb, 11 * F - 21 * L) == {0, WAIT, 0, WAIT}, "vblank: the IOP's clock frames past the kernel's next edges")
+	check(vb_at(b, vb, F - 22 * L) == {WAIT, WAIT, 0, WAIT} && vb_at(b, vb, F - 8) == {WAIT, WAIT, 0, WAIT}, "vblank: from a start, 6 at once, 4, 5 and 7 wait")
+	check(vb_at(b, vb, F) == {WAIT, WAIT, WAIT, 0} && vb_at(b, vb, 2 * F - 22 * L - 8) == {WAIT, WAIT, WAIT, 0}, "vblank: from an end, 7 at once, 4, 5 and 6 wait")
+	check(vb_at(b, vb, 10 * F + 1) == {WAIT, WAIT, WAIT, 0} && vb_at(b, vb, 11 * F - 21 * L) == {WAIT, WAIT, 0, WAIT}, "vblank: the IOP's clock frames past the kernel's next edges")
 	vbl_start, vbl_end = 2 * F - 22 * L, 2 * F
-	check(vb_at(b, vb, F + 8) == {WAIT, 0, WAIT, 0}, "vblank: the kernel's next edges, past its last end")
+	check(vb_at(b, vb, F + 8) == {WAIT, WAIT, WAIT, 0}, "vblank: the kernel's next edges, past its last end")
+
+	// A call on an edge's very cycle has missed its pulse: 4 and 5 wait for the
+	// following edge. 6 and 7 are up from that cycle.
+	vbl_start, vbl_end = F - 22 * L, F
+	edge4, set4 := iop.vblank_wait_for(4, F - 22 * L)
+	edge5, set5 := iop.vblank_wait_for(5, F)
+	check(edge4 == 2 * F - 22 * L && !set4, "vblank: 4 on the start's cycle waits for the following start")
+	check(edge5 == 2 * F && !set5, "vblank: 5 on the end's cycle waits for the following end")
+	_, set6 := iop.vblank_wait_for(6, F - 22 * L)
+	_, set7 := iop.vblank_wait_for(7, F)
+	check(set6 && set7, "vblank: 6 and 7 pass on the edge's cycle")
 
 	// modq's threads, started in vblank: C passes, A and B wait for the end.
 	fresh()
@@ -3419,7 +3430,7 @@ test_vblank :: proc() {
 	b = module_base(id)
 	th :: proc(b, ths: u32, i: u32) -> ^iop.Iop_Thread {return iop.th_find(iop.iop_u32(b + ths + 4 * i)^)}
 	WAKE :: (F + 7) / 8
-	check(id > 0 && r == 0 && log_equal(b, logp, {3}), "vblank: in vblank the start waiter passes at once")
+	check(id > 0 && r == 0 && log_equal(b, logp, {3}), "vblank: in vblank a waiter by 6 passes at once")
 	ta, tb2 := th(b, ths, 0), th(b, ths, 1)
 	check(ta.status == .Delay && tb2.status == .Delay && ta.wake_at == WAKE && tb2.wake_at == WAKE, "vblank: the end waiters are delayed to the end")
 	check(iop.iop_wake_ee == WAKE * 8 && iop.iop_wake_ee >= F, "vblank: the IOP's wake is the end, not before it")
@@ -3439,9 +3450,9 @@ test_vblank :: proc() {
 	check(log_equal(b, logp, {3, 1, 2}), "vblank: the restored waiters wake at the end")
 
 	// Out of vblank, a handler is stopped, whether its call would wait (4)
-	// or pass (5).
+	// or pass (7).
 	check(iop.th_intr(b + h4, 0, 0) == .Blocked, "vblank: a handler waiting for the start is stopped")
-	check(iop.th_intr(b + h5, 0, 0) == .Blocked, "vblank: a handler whose call would pass is stopped too")
+	check(iop.th_intr(b + h7, 0, 0) == .Blocked, "vblank: a handler whose call would pass is stopped too")
 
 	// "modz": its thread (priority 5) waits for the end, then its start
 	// fails: the thread and its wait are gone.
@@ -3470,6 +3481,47 @@ test_vblank :: proc() {
 	delayed := 0
 	for t in s.threads {if t.status == .Delay {delayed += 1}}
 	check(idz <= 0 && len(s.threads) == threads && delayed == 0, "vblank: a failed load's waiting thread leaves no waiter")
+
+	// "modw", started in vblank: threads of priority 30, 10 and 20 wait for the
+	// end by 5 and log 1, 2 and 3; one of 40 waits by 4, in vblank already, and
+	// logs 4. The end wakes the three, best priority first, and not the fourth;
+	// the next start wakes it.
+	fresh()
+	vbl_start, vbl_end = 2 * F - 22 * L, F
+	cpu.state.cycles = F - 21 * L
+	r3000.state.cycles = cpu.state.cycles / 8
+	w: Asm
+	wvb := imports(&w, "vblank", 4, 5)
+	wtb := imports(&w, "thbase", 4, 6)
+	wlog := log_words(&w, 5)
+	wth := at(&w)
+	put(&w, 0, 0, 0, 0)
+	WAITERS := [4][3]u32{{8, 1, 30}, {8, 2, 10}, {8, 3, 20}, {0, 4, 40}}
+	wparams: [4]u32
+	for v, i in WAITERS {
+		e := at(&w)
+		prologue(&w)
+		jal(&w, wvb + v[0])
+		log_v(&w, wlog, v[1])
+		epilogue(&w)
+		wparams[i] = thread_param(&w, e, v[2])
+	}
+	entry = at(&w)
+	prologue(&w)
+	for p, i in wparams {
+		call_addr(&w, wtb, p, wth + 4 * u32(i))
+		call_word(&w, wtb + 8, wth + 4 * u32(i))
+	}
+	li(&w, V0, 0)
+	epilogue(&w)
+	id, r = iop.iop_load(build_mod("modw", &w, entry), "modw", nil)
+	b = module_base(id)
+	check(id > 0 && r == 0 && log_equal(b, wlog, {}), "vblank: in vblank 4 waits like 5")
+	check(th(b, wth, 3).wake_at == (2 * F - 22 * L + 7) / 8, "vblank: 4 in vblank is delayed to the next start")
+	iop.iop_tick(F)
+	check(log_equal(b, wlog, {2, 3, 1}), "vblank: waiters on one edge wake in priority order, 4 not among them")
+	iop.iop_tick(2 * F - 22 * L)
+	check(log_equal(b, wlog, {2, 3, 1, 4}), "vblank: the next start wakes the waiter by 4")
 }
 
 // vblank 8 and 9: a list per edge, lowest priority first, equal ones in the

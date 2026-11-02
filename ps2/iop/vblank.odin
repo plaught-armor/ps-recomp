@@ -1,14 +1,17 @@
 // The vblank library's waits and user handlers (PS_IRX=1), as read from the
 // disc copy of VBLANK 1.1. Its start makes an event flag, empty, and hooks the vblank
-// start and end interrupts: at a start its handler sets bits 1 and 2 and
-// clears 4 and 8, at an end sets 4 and 8 and clears 1 and 2. Functions 4
-// to 7 each wait on that flag for one bit, OR mode, and return what the
-// wait returns:
+// start and end interrupts: at a start its handler sets bits 1 and 2, then
+// clears 1 and 8 (mask ~9); at an end sets 4 and 8, then clears 2 and 4 (mask
+// ~6). So bits 1 and 4 are pulses, which wake whoever waits and are gone when
+// the handler returns, and 2 and 8 are levels. Functions 4 to 7 each wait on
+// that flag for one bit, OR mode, no clear, and return what the wait returns:
 //
-//	4 WaitVblankStart, bit 1, and 6 WaitVblank, bit 2: the next start, at
-//	  once while in vblank (the last edge a start);
-//	5 WaitVblankEnd, bit 4, and 7 WaitNonVblank, bit 8: the next end, at
-//	  once while out of it (the last edge an end).
+//	4 WaitVblankStart, bit 1: always the next start;
+//	5 WaitVblankEnd, bit 4: always the next end;
+//	6 WaitVblank, bit 2: the next start, at once while in vblank (the last
+//	  edge a start);
+//	7 WaitNonVblank, bit 8: the next end, at once while out of it (the last
+//	  edge an end).
 //
 // The flag is not kept here: it follows from the EE kernel's vblank
 // schedule, the clock the EE's own vblank interrupts come from, so the two
@@ -102,13 +105,26 @@ vblank_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		vbl_remove(i)
 		return KE_OK, true
 	}
-	now := r3000.state.cycles * IOP_EE_RATIO
-	start, end := vblank_next(ee_vblank_start^, now), vblank_next(ee_vblank_end^, now)
-	inside := end < start // the last edge a start
-	edge, set := end, !inside && start >= cpu.CYCLES_PER_FRAME
-	if fno == 4 || fno == 6 {edge, set = start, inside}
+	edge, set := vblank_wait_for(fno, r3000.state.cycles * IOP_EE_RATIO)
 	if set {return th_wait_until(0), true}
 	return th_wait_until((edge + IOP_EE_RATIO - 1) / IOP_EE_RATIO), true
+}
+
+// What function fno (4 to 7) called at EE cycle `now` waits for: the edge, or
+// `set` when its bit is up and it returns at once. A call on an edge's very
+// cycle has missed that edge's pulse, and waits for the following one.
+vblank_wait_for :: proc(fno: u32, now: u64) -> (edge: u64, set: bool) {
+	start, end := vblank_next(ee_vblank_start^, now), vblank_next(ee_vblank_end^, now)
+	inside := end < start // the last edge a start
+	switch fno {
+	case 4:
+		return start, false
+	case 6:
+		return start, inside
+	case 7:
+		return end, !inside && start >= cpu.CYCLES_PER_FRAME
+	}
+	return end, false
 }
 
 // The first edge after EE cycle `now` of those every frame from `next`, an

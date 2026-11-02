@@ -244,6 +244,7 @@ iop_rpc_call :: proc(a, sid: u32) -> bool {
 	copy(iop_ram_at(buf, req.size), iop_mem(req.server + 0x100, req.size))
 	s.reqs[s.n_reqs] = req
 	s.n_reqs += 1
+	if cpu.debug >= 1 {fmt.eprintfln("iop: rpc %08x fno %d queued for thread %d, busy %v, %d queued", sid, req.fno, q.thread, q.busy, s.n_reqs)}
 	if !q.busy {th_wakeup(q.thread)}
 	iop_sync(cpu.state.cycles)
 	iop_sched.start_done = false
