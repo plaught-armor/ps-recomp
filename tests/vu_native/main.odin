@@ -4,9 +4,10 @@
 // function of its own and loaded with the runtime's imports. From the same
 // random state, the native function and the interpreter must leave the same
 // vf, vi, ACC, Q, P, I, R, CLIP, MAC, the pending DIV's I and D bits
-// (q_flags, q_due), memory and stopping pc; on VU0 status
-// too, as VU0 code computes it. Every native run must end the program, and
-// no program may call the interpreter for an instruction, and a run from
+// (q_flags, q_due), memory and stopping pc; status too on VU0, and on VU1
+// in a program that reads it (FSEQ, FSAND, FSOR), as compiled code computes
+// it there. Every native run must end the program, no program may call
+// the interpreter but for its status reads, and a run from
 // one of a program's leaves must leave at once. A second pass
 // registers the functions as the runtime does (unless VUNATIVE=0) and runs the
 // same trials through vu0_call_micro and vu1_start, which must leave what a
@@ -79,7 +80,7 @@ drain :: proc(v: ^vu.Vu, pc: u32) {
 
 // Whether got and want hold the same registers, but for the pc.
 @(private = "file")
-same_regs :: proc(got, want: ^vu.Vu, vu0: bool) -> bool {
+same_regs :: proc(got, want: ^vu.Vu, status: bool) -> bool {
 	same := got.vi == want.vi && got.acc.u == want.acc.u
 	for r in 0 ..< 32 {same &&= got.vf[r].u == want.vf[r].u}
 	same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p
@@ -87,7 +88,7 @@ same_regs :: proc(got, want: ^vu.Vu, vu0: bool) -> bool {
 	same &&= transmute(u32)got.p_next == transmute(u32)want.p_next && got.p_wait == want.p_wait
 	same &&= transmute(u32)got.i == transmute(u32)want.i && got.r == want.r && got.clip == want.clip && got.mac == want.mac
 	same &&= got.q_flags == want.q_flags && got.q_due == want.q_due
-	return same && (!vu0 || got.status == want.status)
+	return same && (!status || got.status == want.status)
 }
 
 main :: proc() {
@@ -100,8 +101,14 @@ main :: proc() {
 		ranges := make([]native.Blob_Range, 1)
 		ranges[0] = {0, p.words}
 		slow: map[string]int
-		vus[k] = {u32(p.unit), u32(rvu.native_program(&a, p.words, nil, p.entries, p.unit, &slow)), ranges}
+		reads := vu_programs.status_reads(p.words)
+		vus[k] = {u32(p.unit), u32(rvu.native_program(&a, p.words, nil, p.entries, p.unit, reads > 0, &slow)), ranges}
+		if slow["pair"] != reads {
+			fmt.eprintfln("FAIL vu_native: program %d leaves %d status reads of %d to the interpreter", k, slow["pair"], reads)
+			slow_fails += 1
+		}
 		for key, n in slow {
+			if key == "pair" && n == reads {continue}
 			fmt.eprintfln("FAIL vu_native: program %d calls the interpreter for %s (%d)", k, key, n)
 			slow_fails += 1
 		}
@@ -123,6 +130,7 @@ main :: proc() {
 	for p, k in progs {
 		run := cast(proc())rawptr(code.base + uintptr(code.vus[k].off))
 		vu0 := p.unit == .VU0
+		status := vu0 || vu_programs.status_reads(p.words) > 0
 		v := vu0 ? &vu.vu0 : &vu.vu1
 		nr := &vu.native_run[p.unit == .VU0 ? 0 : 1]
 		mem := ([^]u32)(raw_data(v.mem))[:len(v.mem) / 4]
@@ -154,7 +162,7 @@ main :: proc() {
 
 				if want.mac != init.mac {flagged += 1}
 				if vu0 && want.status & 0x30 != 0 {status_set += 1}
-				same := got_pc == want.tpc | END_BIT && same_regs(&got, &want, vu0) && slice.equal(mem, mem_want)
+				same := got_pc == want.tpc | END_BIT && same_regs(&got, &want, status) && slice.equal(mem, mem_want)
 				if !same {
 					fails += 1
 					if fails < 10 {
@@ -180,7 +188,7 @@ main :: proc() {
 			copy(mem, mem_init)
 			nr.pc, nr.budget = i32(pc), BUDGET
 			run()
-			if u32(nr.pc) != pc || !same_regs(v, &init, vu0) || !slice.equal(mem, mem_init) {
+			if u32(nr.pc) != pc || !same_regs(v, &init, status) || !slice.equal(mem, mem_init) {
 				fails += 1
 				fmt.eprintfln("FAIL vu_native program %d (vu%d, from %04x): got pc %08x, want a leave at once", k, vu0 ? 0 : 1, pc, u32(nr.pc))
 			}
@@ -197,6 +205,7 @@ main :: proc() {
 	for p, k in progs {
 		run := cast(proc())rawptr(code.base + uintptr(code.vus[k].off))
 		vu0 := p.unit == .VU0
+		status := vu0 || vu_programs.status_reads(p.words) > 0
 		v := vu0 ? &vu.vu0 : &vu.vu1
 		nr := &vu.native_run[vu0 ? 0 : 1]
 		mem := ([^]u32)(raw_data(v.mem))[:len(v.mem) / 4]
@@ -225,11 +234,11 @@ main :: proc() {
 				copy(mem, mem_init)
 				if vu0 {vu.vu0_call_micro(pc)} else {vu.vu1_start(pc)}
 				got := v^
-				if got.tpc != want_pc || !same_regs(&got, &want, vu0) || !slice.equal(mem, mem_want) {
+				if got.tpc != want_pc || !same_regs(&got, &want, status) || !slice.equal(mem, mem_want) {
 					dispatch_fails += 1
 					if dispatch_fails < 10 {
 						fmt.eprintfln("FAIL vu_native dispatch program %d (vu%d, from %04x): got pc %04x, want %04x; same registers %v, memory %v",
-							k, vu0 ? 0 : 1, pc, got.tpc, want_pc, same_regs(&got, &want, vu0), slice.equal(mem, mem_want))
+							k, vu0 ? 0 : 1, pc, got.tpc, want_pc, same_regs(&got, &want, status), slice.equal(mem, mem_want))
 					}
 					break
 				}

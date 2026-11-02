@@ -533,6 +533,10 @@ Micro_Table :: struct($N: int) {
 	stop:       [N]bool,
 	stop_gen:   u32,
 	nocomp:     bool, // interpret everything (VUNOCOMP, capturing)
+	// A registered program reads status (FSEQ, FSAND, FSOR), so compiled
+	// VU1 code keeps status exact (recomp/vu reads_status); VUCHECK then
+	// compares it on VU1 too.
+	status:     bool,
 }
 
 @(private)
@@ -593,7 +597,14 @@ micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run, nat
 	p.ranges = slice.clone(ranges)
 	p.run = run
 	p.native = native
-	for r in ranges {p.size += len(r.code) / 2}
+	for r in ranges {
+		p.size += len(r.code) / 2
+		// FSEQ, FSAND, FSOR (lower 0x14, 0x16, 0x17), not under an I bit.
+		for k := 0; k + 1 < len(r.code); k += 2 {
+			op := r.code[k] >> 25
+			t.status ||= r.code[k + 1] & (1 << 31) == 0 && (op == 0x14 || op == 0x16 || op == 0x17)
+		}
+	}
 	append(&t.programs, p)
 	for r in ranges {
 		for k in 0 ..< len(r.code) / 2 {
@@ -1015,21 +1026,22 @@ vu_stall_count :: proc(v: ^Vu, uw, lw: u32) {
 @(private)
 vu0_compare :: proc(addr: u32) {
 	@(static) mem0, mem1: [len(vu0_mem)]u8
-	vu_compare(&vu0, vu0_mem[:], mem0[:], mem1[:], vu0_table.programs[:], vu0_lookup(addr & u32(len(vu0_micro) - 1) &~ 7), addr, vu0_exec)
+	vu_compare(&vu0, vu0_mem[:], mem0[:], mem1[:], vu0_table.programs[:], true, vu0_lookup(addr & u32(len(vu0_micro) - 1) &~ 7), addr, vu0_exec)
 }
 @(private)
 vu1_compare :: proc(addr: u32) {
 	@(static) mem0, mem1: [len(vu1_mem)]u8
-	vu_compare(&vu1, vu1_mem[:], mem0[:], mem1[:], vu1_table.programs[:], vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7), addr, vu1_exec)
+	vu_compare(&vu1, vu1_mem[:], mem0[:], mem1[:], vu1_table.programs[:], vu1_table.status, vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7), addr, vu1_exec)
 }
 
 // Run v's program at addr with exec in the interpreter, then compiled from
 // the same state with XGKICK muted, and report differences; mem is v's data
 // memory, mem0 and mem1 scratch of its size, entry the program compiled at
-// addr. Status is compared on VU0 only: compiled VU1 code never computes it.
-// The interpreter's results are kept.
+// addr. Status is compared when status is set: always on VU0, and on VU1
+// only once a program reads it (Micro_Table.status); compiled VU1 code
+// leaves it alone otherwise. The interpreter's results are kept.
 @(private)
-vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, entry: ^Vu_Program, addr: u32, exec: proc(addr: u32, compiled: bool)) {
+vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, status: bool, entry: ^Vu_Program, addr: u32, exec: proc(addr: u32, compiled: bool)) {
 	@(static) reported: int
 	v0 := v^
 	copy(mem0, mem)
@@ -1046,7 +1058,7 @@ vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, entry
 	unit := v == &vu1 ? 1 : 0
 	vf_bad := false
 	for k in 0 ..< 32 {vf_bad ||= v1.vf[k].q != v2.vf[k].q}
-	status_bad := unit == 0 && (v1.status != v2.status || v1.q_flags != v2.q_flags)
+	status_bad := status && (v1.status != v2.status || v1.q_flags != v2.q_flags)
 	mem_bad := !slice.equal(mem, mem1)
 	prog := -1
 	for p, k in programs {if p == entry {prog = k}}

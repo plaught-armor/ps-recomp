@@ -210,10 +210,11 @@ classify :: proc(lw, uw: u32) -> Pair {
 // that flag whole, and a stall before the pair shifts it more (stall).
 // Leaving for the interpreter needs every depth, which it
 // shifts and reads itself; an E bit only the newest, which the EE can read
-// and the next program starts from. Status counts only on VU0: VU1 code
-// never computes it.
+// and the next program starts from. Status counts only with status set
+// (reads_status): no upper op sets it whole, as its sticky bits keep every
+// earlier write, so a demand on it reaches every upper op before.
 @(private)
-demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
+demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, status: bool) {
 	n := len(pairs)
 	din := make([][Flag]u8, n, context.temp_allocator)
 	ALL :: [Flag]u8{.Mac = DEPTH_ALL, .Status = DEPTH_ALL, .Clip = DEPTH_ALL}
@@ -237,7 +238,7 @@ demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
 			if i > 0 && pairs[i - 1].ebit { // the E bit's delay slot
 				for &o in out {o |= DEPTH_NOW}
 			}
-			if unit == .VU1 {out[.Status] = 0}
+			if !status {out[.Status] = 0}
 			inn := ALL
 			if !leave_pair(pairs, i) {
 				for f in Flag {
@@ -253,7 +254,7 @@ demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, unit: Unit) {
 					}
 				}
 			}
-			if unit == .VU1 {inn[.Status] = 0}
+			if !status {inn[.Status] = 0}
 			if out != p.out || inn != din[i] {changed = true}
 			p.out, din[i] = out, inn
 		}
@@ -629,15 +630,36 @@ load_programs :: proc(img: mips.Image, capture: string, unit: Unit) -> (progs: [
 	return progs, true
 }
 
-// A program's pairs, classified, with flag and Q demand over the pairs ext
-// compiles (nil: all), and the dispatch targets for its entries. Both are
-// in the temp allocator.
+// Whether a unit's compiled code computes status: always on VU0, where the
+// EE reads it with CFC2 and macro ops set it; on VU1 only when one of its
+// programs, in any pair, compiled or not, reads it (FSEQ, FSAND, FSOR). VU1
+// status is otherwise never read: the EE has no path to it, and VU0 data
+// memory wraps at its end (the runtime's vu_mem_q) instead of mapping VU1's
+// registers. Code no program covers runs in the interpreter, which computes
+// status itself.
 @(private)
-analyze :: proc(words: []u32, ext: []bool, entries: []u32, unit: Unit) -> (pairs: []Pair, target: []bool) {
+reads_status :: proc(progs: []Prog, unit: Unit) -> bool {
+	if unit == .VU0 {return true}
+	for p in progs {
+		for i := 0; i + 1 < len(p.words); i += 2 {
+			if p.words[i + 1] & (1 << 31) != 0 {continue} // an I-bit pair's lower is the I value
+			switch p.words[i] >> 25 {
+			case 0x14, 0x16, 0x17: return true
+			}
+		}
+	}
+	return false
+}
+
+// A program's pairs, classified, with flag and Q demand over the pairs ext
+// compiles (nil: all), status demanded when status is set (reads_status),
+// and the dispatch targets for its entries. Both are in the temp allocator.
+@(private)
+analyze :: proc(words: []u32, ext: []bool, entries: []u32, unit: Unit, status: bool) -> (pairs: []Pair, target: []bool) {
 	mask := MASK[unit]
 	pairs = make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
 	demand_waits(pairs, ext, mask)
-	demand_flags(pairs, ext, mask, unit)
+	demand_flags(pairs, ext, mask, status)
 	return pairs, dispatch_targets(pairs, mask, entries)
 }

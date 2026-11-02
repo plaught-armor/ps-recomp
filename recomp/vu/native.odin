@@ -971,7 +971,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int,
 @(private = "file")
 micro_upper :: proc(a: ^native.Asm, u: Unit, p: Pair, slow: ^map[string]int, known: ^[32]u8) {
 	flags := Flags.Mac_Status
-	if u == .VU1 {flags = Flags.Mac if p.out[.Mac] & DEPTH_NOW != 0 else Flags.None}
+	if u == .VU1 && p.out[.Status] & DEPTH_NOW == 0 {flags = Flags.Mac if p.out[.Mac] & DEPTH_NOW != 0 else Flags.None}
 	fn := p.uw & 63
 	inline := fn < 0x30 || (fn >= 0x3c && ((p.uw >> 4) & 0x7c) | (p.uw & 3) < 0x30)
 	if inline && op(a, u, p.uw, flags, known) {return}
@@ -1197,10 +1197,11 @@ count_slow :: proc(slow: ^map[string]int, key: string) {
 // address 0, compiling the pairs ext marks (nil: all) and entered at
 // entries, as emit_program compiles it. Returns its code offset. The run
 // ABI is this file's header's. Counts the halves that call the interpreter
-// in slow, by opcode, when it is not nil.
-native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32, u: Unit, slow: ^map[string]int = nil) -> int {
+// in slow, by opcode, when it is not nil. status: VU1 computes status, as
+// when reads_status holds; VU0 always does.
+native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32, u: Unit, status: bool, slow: ^map[string]int = nil) -> int {
 	mask := MASK[u]
-	pairs, target := analyze(words, ext, entries, u)
+	pairs, target := analyze(words, ext, entries, u, u == .VU0 || status)
 	in_ext :: proc(ext: []bool, i: int) -> bool {return ext == nil || ext[i]}
 	run_pc := IMPORTS[u][.Run_Pc]
 	// No EE fields are cached here: the code reaches no EE state, and its
@@ -1314,6 +1315,7 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Unit, vus: ^[dynamic]native.Blob_Vu) -> bool {
 	if u == .VU0 && capture == "" {return true}
 	progs := load_programs(img, capture, u) or_return
+	status := reads_status(progs[:], u)
 	for p in progs {
 		rs: []native.Blob_Range
 		if p.ext == nil {
@@ -1324,7 +1326,7 @@ native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Uni
 			rs = make([]native.Blob_Range, len(spans))
 			for s, k in spans {rs[k] = {u32(s[0]) * 8, p.words[s[0] * 2:s[1] * 2]}}
 		}
-		off := native_program(a, p.words[:], p.ext, p.entries, u)
+		off := native_program(a, p.words[:], p.ext, p.entries, u, status)
 		append(vus, native.Blob_Vu{u32(u), u32(off), rs})
 		free_all(context.temp_allocator)
 	}

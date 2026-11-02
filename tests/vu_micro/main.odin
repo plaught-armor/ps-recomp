@@ -4,8 +4,9 @@
 // program and unit, then runs it with `odin run`. Each program runs from
 // random state, once in the interpreter and once compiled, and must leave
 // vf, vi, ACC, MAC, Q, P, the pending DIV's I and D bits (q_flags, q_due)
-// and memory the same. Every program runs on VU1 and on VU0; on VU0 status
-// must match too, since compiled VU0 code computes it.
+// and memory the same. Every program runs on VU1 and on VU0; status must
+// match too on VU0, and on VU1 in a program that reads it (FSEQ, FSAND,
+// FSOR), where compiled VU1 code computes it.
 // The seed is fixed, so a run is reproducible. cases/ is generated, not
 // checked in.
 //
@@ -24,7 +25,8 @@
 // the upper's dest. Then ILWR and ISWR on each field, at addresses that
 // wrap past the end of VU memory. Then a negative vi and a positive one
 // through MFIR, IBLTZ and IBGEZ, each branch taken on one and not on the
-// other. Every program must compile without a call into the interpreter.
+// other. Every program must compile without a call into the interpreter,
+// but for its status reads.
 //
 // The clamp elision program is a chain of dependent ops on clamped
 // results, with a loop whose branch target is in the middle, compiled twice:
@@ -76,12 +78,13 @@ main :: proc() {
 	fmt.sbprintln(&sb, "_ :: math\n_ :: simd\n_ :: slice\n")
 	fmt.sbprintln(&sb, vu.VU_HELPERS)
 	fmt.sbprintln(&sb, vu.MACRO_HELPERS)
-	fmt.sbprintln(&sb, "Case :: struct {words: []u32, run: vu.Vu_Run, vu0: bool, pc: u32, leave: bool}\n")
+	fmt.sbprintln(&sb, "Case :: struct {words: []u32, run: vu.Vu_Run, vu0: bool, pc: u32, leave, status: bool}\n")
 	// Appended at run time: a literal this size warns of LLVM trouble.
 	fmt.sbprintln(&sb, "CASES: [dynamic]Case\n\nadd_cases :: proc() {")
 	for p, n in progs {
-		for pc in p.pcs {fmt.sbprintfln(&sb, "\tappend(&CASES, Case{{code_%d[:], run_%d, %v, 0x%x, false}})", n, n, p.unit == .VU0, pc)}
-		for pc in p.leaves {fmt.sbprintfln(&sb, "\tappend(&CASES, Case{{code_%d[:], run_%d, %v, 0x%x, true}})", n, n, p.unit == .VU0, pc)}
+		status := vu_programs.status_reads(p.words) > 0
+		for pc in p.pcs {fmt.sbprintfln(&sb, "\tappend(&CASES, Case{{code_%d[:], run_%d, %v, 0x%x, false, %v}})", n, n, p.unit == .VU0, pc, status)}
+		for pc in p.leaves {fmt.sbprintfln(&sb, "\tappend(&CASES, Case{{code_%d[:], run_%d, %v, 0x%x, true, %v}})", n, n, p.unit == .VU0, pc, status)}
 	}
 	fmt.sbprintln(&sb, "}\n")
 	elided: map[vu.Unit]string
@@ -90,9 +93,11 @@ main :: proc() {
 		for w, k in p.words {fmt.sbprintf(&sb, "%s0x%08x", k == 0 ? "" : ", ", w)}
 		fmt.sbprintln(&sb, "}\n")
 		slow: map[string]int
-		code := vu.emit_micro(n, p.words, p.unit, &slow, p.entries)
+		reads := vu_programs.status_reads(p.words)
+		code := vu.emit_micro(n, p.words, p.unit, reads > 0, &slow, p.entries)
 		fmt.sbprintln(&sb, code)
-		for op, count in slow {fail("program %d calls the interpreter for %s (%d)", n, op, count)}
+		for op, count in slow {if op != "pair" || count != reads {fail("program %d calls the interpreter for %s (%d)", n, op, count)}}
+		if slow["pair"] != reads {fail("program %d leaves %d status reads of %d to the interpreter", n, slow["pair"], reads)}
 		// The elision program, compiled with entries and then without: the
 		// first must clamp fewer operands, behind fewer labels.
 		if raw_data(p.words) != raw_data(vu_programs.ELIDE) {continue}
@@ -215,7 +220,7 @@ main :: proc() {
 			same &&= transmute(u32)got.q_next == transmute(u32)want.q_next && got.q_wait == want.q_wait
 			same &&= transmute(u32)got.p_next == transmute(u32)want.p_next && got.p_wait == want.p_wait
 			same &&= got.q_flags == want.q_flags && got.q_due == want.q_due
-			same &&= !c.vu0 || got.status == want.status
+			same &&= !(c.vu0 || c.status) || got.status == want.status
 			for k in 0 ..< 32 {same &&= got.vf[k].u == want.vf[k].u}
 			if !same {
 				fails += 1
