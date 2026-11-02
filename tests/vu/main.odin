@@ -28,11 +28,16 @@
 // stalls the VIF; what follows, in that transfer or later ones, waits until
 // FBRST.STC, then runs. With VIF_ERR.MII set an i-bit does nothing.
 //
+// Last, the GIF paths: an XGKICK (PATH1) between two VIF1 DIRECT codes
+// (PATH2) that split one packet sends its own packet, and the second DIRECT
+// carries on with the first's.
+//
 //   odin run tests/vu -collection:ps=.
 package main
 
 import "core:fmt"
 import "core:os"
+import gs "ps:ps2/gs"
 import "ps:ps2/mem"
 import "ps:ps2/vu"
 
@@ -576,6 +581,30 @@ ibit :: proc() {
 	mem.intc_stat, mem.intc_pending = 0, 0
 }
 
+// One A+D qword: data to GS register reg.
+@(private = "file")
+gif_ad :: proc(reg: u8, data: u32) -> [4]u32 {return {data, 0, u32(reg), 0}}
+
+// A PACKED GIFtag of nloop A+D qwords, with EOP.
+@(private = "file")
+gif_tag :: proc(nloop: u32) -> [4]u32 {return {nloop | 1 << 15, 1 << 28, 0xe, 0}}
+
+@(private = "file")
+gif_paths :: proc() {
+	tag, ad40, ad41, ad42 := gif_tag(2), gif_ad(0x40, 0x1111), gif_ad(0x41, 0x2222), gif_ad(0x42, 0x3333)
+	gs.state.regs[0x40], gs.state.regs[0x41], gs.state.regs[0x42] = 0, 0, 0
+	// DIRECT 2: the tag and the first of its two A+D qwords.
+	feed(&vu.vifs[1], 0x50000002, tag[0], tag[1], tag[2], tag[3], ad40[0], ad40[1], ad40[2], ad40[3])
+	kick := [2][4]u32{gif_tag(1), ad41}
+	copy(vu.vu1_mem[:32], ([^]u8)(&kick)[:32])
+	vu.vu1_xgkick(0)
+	feed(&vu.vifs[1], 0x50000001, ad42[0], ad42[1], ad42[2], ad42[3])
+	r := gs.state.regs
+	if r[0x40] != 0x1111 || r[0x41] != 0x2222 || r[0x42] != 0x3333 {
+		fail("XGKICK inside a split DIRECT packet: GS 40 %x 41 %x 42 %x, want 1111 2222 3333", r[0x40], r[0x41], r[0x42])
+	}
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -599,5 +628,6 @@ main :: proc() {
 	q_latency()
 	stalls()
 	ibit()
+	gif_paths()
 	fmt.println("vu: ok")
 }

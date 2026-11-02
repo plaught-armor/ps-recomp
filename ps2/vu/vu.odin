@@ -1322,7 +1322,7 @@ vu1_xgkick :: proc(addr: u16) {
 	a = start
 	for left := total; left > 0; {
 		seg := min(left, qwords - a)
-		gif.gif_feed(1, vu1_mem[a * 16:][:seg * 16])
+		gif.gif_feed(0, vu1_mem[a * 16:][:seg * 16]) // PATH1
 		a = (a + seg) % qwords
 		left -= seg
 	}
