@@ -452,6 +452,18 @@ th_wait_until :: proc(at: u64) -> u32 {
 	return th_wait(.Delay)
 }
 
+// The running thread waits for its RPC's RPC_END (sifclient.odin), on what
+// retail's sifcmd keeps an event flag for, so no WakeupThread ends it.
+th_rpc_wait :: proc() -> u32 {
+	return th_wait(.Wait)
+}
+
+// Readies thread id if it waits so; else nothing, the flag retail would set
+// being one nobody waits on.
+th_rpc_wake :: proc(id: u32) {
+	if t := th_find(id); t != nil && t.status == .Wait && t.sema == 0 {th_wake(t, KE_OK)}
+}
+
 // WakeupThread(id): readies thread id if it sleeps, else counts a wakeup.
 th_wakeup :: proc(id: u32) -> u32 {
 	t := th_find(id)

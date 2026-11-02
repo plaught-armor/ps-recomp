@@ -248,6 +248,10 @@ sif_command :: proc(a, pc: u32) {
 	if cpu.debug == 2 {fmt.eprintfln("sif: cmd %08x opt %x a0 %08x ee_buf %08x", cid, iop_u32(a + 12)^, iop_u32(a + 16)^, sif.ee_buf)}
 	opt := iop_u32(a + 12)^
 	arg :: proc(a: u32, n: u32) -> u32 {return iop_u32(a + 16 + 4 * n)^}
+	if iop_irx && cid == SIF_CMD_RPC_END && iop_sifcmd.sys[SIF_CMD_RPC_END & 0x7fffffff].handler == 0 {
+		rpc_client_end(a)
+		return
+	}
 	switch cid {
 	case SIF_CMD_CHANGE_SADDR:
 		sif.ee_buf = arg(a, 0)

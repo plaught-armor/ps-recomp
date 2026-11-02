@@ -22,6 +22,8 @@ Iop_Sifcmd :: struct {
 		handler, harg: u32,
 	},
 	dma_id:    u32, // the last DMA id handed out
+	rpc_pool:  u32, // the RPC client's packets, IOP address (sifclient.odin)
+	rpc_id:    u32, // the last rpc_id handed out
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -51,14 +53,11 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		}
 		return 0, true
 	case 12, 13: // sceSifSendCmd, isceSifSendCmd(cid, packet, psize, src, dest, size)
-		pkt, psize, src := a1, max(a2 & 0xff, 16), r[7]
-		dest, size := r32(r[29] + 16), r32(r[29] + 20)
-		if size != 0 {copy(mem.ram_slice(dest, size), iop_ram_at(src, size))}
-		w32(pkt, psize | size << 8)
-		w32(pkt + 4, dest)
-		w32(pkt + 8, a0)
-		sif_send_raw(iop_ram_at(pkt, psize))
-		return sifcmd_dma_id(), true
+		return sifcmd_send(a0, a1, max(a2 & 0xff, 16), r[7], r32(r[29] + 16), r32(r[29] + 20)), true
+	case 15: // sceSifBindRpc(client, sid, mode)
+		return rpc_client_bind(a0, a1, a2), true
+	case 16: // sceSifCallRpc(client, fno, mode, send, ...)
+		return rpc_client_call(a0, a1, a2, r[7]), true
 	case 14, 17, 19, 22, 24, 25:
 		return sifrpc_fn(fno)
 	case 23: // sceSifGetOtherData(rd, src, dest, size, mode): done at once
@@ -120,6 +119,19 @@ sifcmd_undo :: proc(saved: Iop_Sifcmd, tab: []u32, freed: []Sys_Block) {
 		w32(e, old[0])
 		w32(e + 4, old[1])
 	}
+	rpc_client_undo(freed)
+}
+
+// Sends the EE command cid, packet at `pkt`, and `size` bytes from src to dest
+// ahead of it, as retail's DMA list has them. The DMA's id.
+@(private)
+sifcmd_send :: proc(cid, pkt, psize, src, dest, size: u32) -> u32 {
+	if size != 0 {copy(mem.ram_slice(dest, size), iop_ram_at(src, size))}
+	w32(pkt, psize | size << 8)
+	w32(pkt + 4, dest)
+	w32(pkt + 8, cid)
+	sif_send_raw(iop_ram_at(pkt, psize))
+	return sifcmd_dma_id()
 }
 
 // A DMA id, never 0, which a failed transfer returns.

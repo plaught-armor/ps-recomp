@@ -49,7 +49,10 @@ COMPAT_TOP :: 10
 // the disc; Iop_Rpc the server id and function number of an RPC to an IOP
 // module's server that got no RPC_END, or whose request or reply did not
 // fit (function number all ones: a server, or by its descriptor a queue,
-// with no room); Iop_Sdr an EE
+// with no room); or, of an IOP module's RPC client (sifclient.odin), the
+// server id of a bind no EE server answered (function number 0xfffffffe), the
+// client and function number of a call refused, or the client and command of
+// an RPC_END with no packet out; Iop_Sdr an EE
 // sdrdrv RPC whose IOP user command handler is set and was not run, the EE
 // answered 0; Iop_Timer the source and mode of an IOP hardware timer set
 // up to count what is not timed here; Iop_Timer_Intr the address of a timer

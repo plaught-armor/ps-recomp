@@ -177,6 +177,7 @@ game :: proc(_: rawptr) {
 	test_rpc()
 	test_rpc_remove()
 	test_rpc_self_remove()
+	test_rpc_client()
 	test_sifman()
 	test_libsd()
 	test_cdvdman()
@@ -1919,6 +1920,242 @@ test_rpc_self_remove :: proc() {
 	send_pkt(iop.SIF_CMD_RPC_CALL, 3, 0, 0, 0, 4, 0, 0, 0, 0, hsd)
 	check(core.compat.calls[{.Sif_Rpc, RPC_SID3, 4}].n == 1 && call_ends(hsd, 3), "rpc self remove: the next call is the HLE's, a row and RPC_END")
 }
+
+// A module's RPC client, the EE faked. Conditions: a blocking bind or call
+// waits for its RPC_END, and no WakeupThread ends that; the send bytes are in
+// the EE's buffer by the time its packet is; the reply bytes reach recv before
+// RPC_END, so the waiter and the end function read them; two clients in flight
+// end in either order, each with its own end function's argument; an end
+// function that waits is stopped, with a row, and the waiter still wakes; a
+// NOWAIT call with no end function asks no RPC_END and the EE's DMA frees its
+// packet; the 33rd packet out returns -1; an unbound client or a pointer past
+// RAM is refused with a row; a bind no server answers returns 0 with a row; a
+// stray RPC_END and one for a client a failed load freed are rows; without
+// PS_IRX RPC_END is left to sif_command's row, the client untouched.
+test_rpc_client :: proc() {
+	fresh()
+	clear(&core.compat.calls)
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	drop_replies()
+	defer drop_replies()
+	cpu.state.cycles = 0
+	cpu.next_event = 1 << 40
+	EE_SRV :: 0x00100800
+	EE_DATA :: 0x00100c00
+	SID :: 0x200
+
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6, 24)
+	sc := imports(&a, "sifcmd", 15, 16)
+	logp := log_words(&a, 32)
+	cl := [5]u32{}
+	for &c in cl {
+		c = at(&a)
+		for _ in 0 ..< 10 {put(&a, 0)}
+	}
+	send := at(&a)
+	put(&a, 0x5a5a1234)
+	recv := at(&a)
+	put(&a, 0, 0, 0)
+	stack := at(&a)
+	for _ in 0 ..< 12 {put(&a, 0)}
+	thid := at(&a)
+	put(&a, 0)
+	log_reg :: proc(a: ^Asm, logp, rs: u32) {
+		la(a, T0, logp)
+		put(a, 0x8d090000, 0, 0xad200000 | rs << 16, 0x25290004, 0xad090000) // lw t1, 0(t0); nop; sw rs, 0(t1); addiu t1, t1, 4; sw t1, 0(t0)
+	}
+	// Logs its argument, then the word of recv it was told to read.
+	end := at(&a)
+	prologue(&a)
+	log_reg(&a, logp, A0)
+	la(&a, T0, recv)
+	put(&a, 0x00882021, 0x8c840000, 0) // addu a0, a0, t0; lw a0, 0(a0); nop
+	log_reg(&a, logp, A0)
+	epilogue(&a)
+	// An end function that sleeps.
+	bad := at(&a)
+	prologue(&a)
+	jal(&a, tb + 16)
+	put(&a, 0)
+	epilogue(&a)
+	call :: proc(a: ^Asm, sc, client, fno, mode, send, recv, end, param: u32) {
+		la(a, A0, client)
+		li(a, A1, fno)
+		li(a, A2, mode)
+		la(a, A3, send)
+		li(a, T0, 4)
+		put(a, 0xafa80010, 0xafa80018) // sw t0, 16(sp); sw t0, 24(sp)
+		la(a, T0, recv)
+		put(a, 0xafa80014) // sw t0, 20(sp)
+		if end != 0 {la(a, T0, end)} else {li(a, T0, 0)}
+		put(a, 0xafa8001c) // sw t0, 28(sp)
+		li(a, T0, param)
+		put(a, 0xafa80020) // sw t0, 32(sp)
+		jal(a, sc + 8)
+		put(a, 0)
+	}
+	th := at(&a)
+	put(&a, 0x27bdffd0, 0xafbf0028) // addiu sp, sp, -48; sw ra, 40(sp)
+	la(&a, A0, cl[0])
+	li(&a, A1, SID)
+	li(&a, A2, 0)
+	jal(&a, sc)
+	put(&a, 0)
+	log_v(&a, logp, 1)
+	call(&a, sc, cl[0], 1, 0, send, recv, 0, 0)
+	lw_at(&a, A0, recv)
+	log_reg(&a, logp, A0)
+	// Two clients in flight, reply words recv + 4 and recv + 8.
+	call(&a, sc, cl[0], 2, iop.RPC_NOWAIT, send, recv + 4, end, 4)
+	call(&a, sc, cl[1], 3, iop.RPC_NOWAIT, send, recv + 8, end, 8)
+	log_v(&a, logp, 9)
+	put(&a, 0x8fbf0028, JR_RA, 0x27bd0030) // lw ra, 40(sp); jr ra; addiu sp, sp, 48
+	tp := thread_param(&a, th, 10)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, tp, thid)
+	call_word(&a, tb + 8, thid)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modr", &a, entry), "modr", nil)
+	check(id > 0, "rpc client: modr loads")
+	b := module_base(id)
+
+	// The EE's RPC_END with `n` reply bytes ahead of it in one DMA list.
+	ee_end :: proc(client, cid, server, buff, data, dest, n: u32) {
+		e: u32 = 0
+		if n != 0 {
+			mem.wr32(EE_DATA, data)
+			for w, i in ([4]u32{EE_DATA, dest, n, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
+			e = 16
+		}
+		for w, i in ([4]u32{64, 0, iop.SIF_CMD_RPC_END, 0}) {mem.wr32(EE_PKT + 4 * u32(i), w)}
+		for w, i in ([8]u32{0, EE_PKT, 0, client, cid, server, buff, 0}) {mem.wr32(EE_PKT + 16 + 4 * u32(i), w)}
+		for w, i in ([4]u32{EE_PKT, iop.IOP_CMDBUF, 64, 0}) {mem.wr32(EE_LIST + e + 4 * u32(i), w)}
+		iop.sif_set_dma(EE_LIST, 1 if n == 0 else 2, 0)
+	}
+	word :: proc(b, o: u32) -> u32 {return iop.iop_u32(b + o)^}
+	c0, c1 := b + cl[0], b + cl[1]
+	t := iop.th_find(iop.iop_sched.next_thid - 1)
+
+	// The bind waits, and WakeupThread does not end that.
+	check(len(iop.sif.replies) == 1 && reply_word(0, 2) == iop.SIF_CMD_RPC_BIND && reply_word(0, 7) == c0 && reply_word(0, 8) == SID, "rpc client: the bind's packet goes to the EE")
+	check(reply_word(0, 4) & 6 == 6 && reply_word(0, 5) == word(c0, 0) && reply_word(0, 6) != 0 && word(c0, 4) == reply_word(0, 5) + 0x18, "rpc client: its rec_id, address and rpc_id are as retail's")
+	check(t != nil && t.status == .Wait && word(b, logp + 4) == 0, "rpc client: the bind waits")
+	iop.th_wakeup(t.id)
+	check(t.status == .Wait, "rpc client: WakeupThread does not end the wait")
+	drop_replies()
+	iop.iop_u32(c1 + iop.CL_SERVER)^ = 0x8000
+	iop.iop_u32(c1 + iop.CL_BUFF)^ = EE_SRV + 0x40
+
+	// RPC_END of the bind: the server, then the call goes out, its bytes first.
+	ee_end(c0, iop.SIF_CMD_RPC_BIND, 0x7000, EE_SRV, 0, 0, 0)
+	check(word(c0, iop.CL_SERVER) == 0x7000 && word(c0, iop.CL_BUFF) == EE_SRV, "rpc client: RPC_END of the bind writes server and buffer")
+	check(word(b, logp + 4) == 1, "rpc client: the bind's waiter wakes")
+	check(len(iop.sif.replies) == 1 && reply_word(0, 2) == iop.SIF_CMD_RPC_CALL && reply_word(0, 8) == 1 && reply_word(0, 9) == 4 && reply_word(0, 10) == b + recv && reply_word(0, 11) == 4 && reply_word(0, 12) == 1 && reply_word(0, 13) == 0x7000, "rpc client: the call's packet as retail's")
+	check(reply_word(0, 1) == EE_SRV && mem.rd32(EE_SRV) == 0x5a5a1234 && word(b, logp + 8) == 0, "rpc client: the send bytes are in the buffer, the call waits")
+	drop_replies()
+
+	// RPC_END of the call, the reply bytes ahead of it; two calls then in flight.
+	ee_end(c0, iop.SIF_CMD_RPC_CALL, 0, 0, 0xfeed, b + recv, 4)
+	check(word(b, logp + 8) == 0xfeed, "rpc client: the waiter reads the reply")
+	check(word(b, logp + 12) == 9 && len(iop.sif.replies) == 2 && reply_word(0, 12) == 1 && reply_word(1, 7) == c1 && mem.rd32(EE_SRV + 0x40) == 0x5a5a1234, "rpc client: two NOWAIT calls with end functions go out, each to its buffer")
+	drop_replies()
+	ee_end(c1, iop.SIF_CMD_RPC_CALL, 0, 0, 0xb1, b + recv + 8, 4)
+	check(word(b, logp + 16) == 8 && word(b, logp + 20) == 0xb1, "rpc client: the second client's RPC_END first: its end function reads its reply")
+	ee_end(c0, iop.SIF_CMD_RPC_CALL, 0, 0, 0xa1, b + recv + 4, 4)
+	check(word(b, logp + 24) == 4 && word(b, logp + 28) == 0xa1, "rpc client: then the first's")
+	check(word(c0, iop.CL_PKT) == 0 && word(c1, iop.CL_PKT) == 0 && len(core.compat.calls) == 0, "rpc client: the packets are freed, no row")
+
+	// From the loader, which cannot wait.
+	stk := b + stack
+	r := &r3000.state.r
+	saved_sp := r[29]
+	defer r[29] = saved_sp
+	fn_call :: proc(stk, client, fno, mode, s, ssize, recv, rsize, end, param: u32) -> u32 {
+		r := &r3000.state.r
+		r[29] = stk
+		r[4], r[5], r[6], r[7] = client, fno, mode, s
+		for v, i in ([5]u32{ssize, recv, rsize, end, param}) {iop.iop_u32(stk + 16 + 4 * u32(i))^ = v}
+		v, ok := iop.sifcmd_fn(16)
+		check(ok, "rpc client: sceSifCallRpc served")
+		return v
+	}
+	c2, c3 := b + cl[2], b + cl[3]
+	row :: proc(id, sub: u32) -> u64 {return core.compat.calls[core.Compat_Key{.Iop_Rpc, id, sub}].n}
+
+	// Refused: unbound; send, recv or buffer past RAM; a bad client.
+	check(fn_call(stk, c2, 7, 1, b + send, 4, b + recv, 4, 0, 0) == 0xfffffffe && row(c2, 7) == 1 && len(iop.sif.replies) == 0, "rpc client: an unbound client is refused, a row")
+	iop.iop_u32(c2 + iop.CL_SERVER)^ = 0x7100
+	iop.iop_u32(c2 + iop.CL_BUFF)^ = EE_SRV
+	check(fn_call(stk, c2, 8, 1, 0x3ffffc, 8, b + recv, 4, 0, 0) == 0xfffffffe && row(c2, 8) == 1, "rpc client: send past IOP RAM is refused")
+	check(fn_call(stk, c2, 9, 1, b + send, 4, 0x3ffffc, 8, 0, 0) == 0xfffffffe && row(c2, 9) == 1, "rpc client: recv past IOP RAM is refused")
+	iop.iop_u32(c2 + iop.CL_BUFF)^ = 0x70000000
+	check(fn_call(stk, c2, 10, 1, b + send, 4, b + recv, 4, 0, 0) == 0xfffffffe && row(c2, 10) == 1, "rpc client: a buffer outside EE RAM is refused")
+	iop.iop_u32(c2 + iop.CL_BUFF)^ = EE_SRV
+	check(fn_call(stk, c2 + 1, 11, 1, b + send, 4, b + recv, 4, 0, 0) == 0xfffffffe && row(c2 + 1, 11) == 1, "rpc client: a misaligned client is refused")
+	check(len(iop.sif.replies) == 0, "rpc client: nothing refused was sent")
+
+	// NOWAIT with no end function: no RPC_END asked; the EE's DMA frees it.
+	check(fn_call(stk, c2, 3, 1, b + send, 4, b + recv, 4, 0, 0) == 0 && reply_word(0, 12) == 0, "rpc client: NOWAIT with no end function asks no RPC_END")
+	pkt := word(c2, iop.CL_PKT)
+	drop_replies()
+	for i in u32(0) ..< 16 {mem.wr32(EE_PKT + 4 * i, 0)}
+	for w, i in ([4]u32{EE_PKT, pkt, 64, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
+	iop.sif_set_dma(EE_LIST, 1, 0)
+	check(fn_call(stk, c2, 4, 1, b + send, 4, b + recv, 4, end + b, 0) == 0 && word(c2, iop.CL_PKT) == pkt, "rpc client: the EE's DMA freed the packet")
+	drop_replies()
+	ee_end(c2, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+
+	// The pool: 32 out, the 33rd refused; an END frees one.
+	for _ in 0 ..< iop.RPC_PKTS {
+		check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: 32 packets out")
+	}
+	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, b + end, 0) == 0xffffffff, "rpc client: the 33rd returns -1")
+	drop_replies()
+	for _ in 0 ..< iop.RPC_PKTS {ee_end(c2, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)}
+	check(fn_call(stk, c2, 5, 1, b + send, 4, b + recv, 4, 0, 0) == 0, "rpc client: each END frees one")
+	drop_replies()
+	for w, i in ([4]u32{EE_PKT, word(c2, iop.CL_PKT), 64, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
+	iop.sif_set_dma(EE_LIST, 1, 0)
+
+	// A bind no server answers: 0, a row, the client left unbound.
+	r[4], r[5], r[6] = c3, 0x123, 1
+	v, ok := iop.sifcmd_fn(15)
+	check(ok && v == 0 && reply_word(0, 8) == 0x123, "rpc client: NOWAIT bind sent")
+	drop_replies()
+	ee_end(c3, iop.SIF_CMD_RPC_BIND, 0, 0, 0, 0, 0)
+	check(word(c3, iop.CL_SERVER) == 0 && row(0x123, iop.RPC_NO_SERVER) == 1, "rpc client: a bind to no server is 0, with a row")
+
+	// An end function that waits is stopped with a row; the packet is freed.
+	iop.iop_u32(c3 + iop.CL_SERVER)^ = 0x7200
+	iop.iop_u32(c3 + iop.CL_BUFF)^ = EE_SRV
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + bad, 0) == 0, "rpc client: a call with a bad end function")
+	drop_replies()
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	blocked := core.compat.calls[core.Compat_Key{.Iop_Intr, iop.SIF_CMD_RPC_CALL, 0}].n
+	check(blocked == 1 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function that waits is a row, the packet freed")
+
+	// A stray RPC_END; one whose client a failed load freed.
+	before := len(iop.sif.replies)
+	ee_end(0x1234, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(row(0x1234, iop.SIF_CMD_RPC_CALL) == 1 && len(iop.sif.replies) == before, "rpc client: a stray RPC_END is a row")
+	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + end, 0) == 0, "rpc client: a call out when the load fails")
+	drop_replies()
+	log_at := word(b, logp)
+	iop.rpc_client_undo({{addr = c3, size = 0x28}})
+	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(row(c3, iop.SIF_CMD_RPC_CALL) == 1 && word(b, logp) == log_at, "rpc client: RPC_END for a freed client is a row, its end function not run")
+
+	// Without PS_IRX, as before: a row, the client untouched.
+	iop.iop_irx = false
+	c4 := b + cl[4]
+	ee_end(c4, iop.SIF_CMD_RPC_BIND, 0x7300, EE_SRV, 0, 0, 0)
+	check(word(c4, iop.CL_SERVER) == 0, "rpc client: without PS_IRX RPC_END writes nothing")
+}
+
 
 // sceSifInit finds SIF set up, as at boot, and sceSifCheckInit says so.
 test_sifman :: proc() {
