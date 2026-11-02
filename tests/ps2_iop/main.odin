@@ -2625,6 +2625,18 @@ test_libsd :: proc() {
 	check(id > 0 && res == 0 && sd_word(3) == 0 && coroutines() == base + 1, "libsd: the module loads, its thread waits")
 	check(sd_call(4, 0) == 0, "libsd: sceSdInit")
 
+	// After sceSdInit every voice rests stopped on its block at 0x5000,
+	// looping on itself: the IRQ enabled on both cores at IRQA 0, nothing
+	// keyed, no voice raises it.
+	sd_call(9, 0x1f00, 0)
+	sd_call(9, 0x1f01, 0)
+	sd_call(11, 0x4, 1)
+	sd_call(11, 0x5, 1)
+	iop.spu_mix(make([]i32, 64, context.temp_allocator))
+	check(iop.iop_sd.pending == 0 && sd_call(10, 0x2244) == 0x5000 && sd_call(10, 0x2240 | 1 | 23 << 1) == 0x5000, "libsd: after sceSdInit, the IRQ enabled at IRQA 0 with nothing keyed, no voice raises it")
+	sd_call(11, 0x4, 0)
+	sd_call(11, 0x5, 0)
+
 	// sceSdNote2Pitch(center note, center fine, note, fine): 0x1000 at the
 	// center, by semitones and 128ths of one, doubling per octave up to two;
 	// further up it stays at two octaves'. Values as retail libsd 1.5 gives.

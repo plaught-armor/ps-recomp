@@ -285,6 +285,10 @@ spu_ram16 :: #force_inline proc(a: u32) -> i32 {
 	return i32(i16(u16(spu.ram[a]) | u16(spu.ram[a + 1]) << 8))
 }
 
+// Keys v on at its SSA. spu_block checks IRQA against the whole SSA block
+// (~15), an approximation for a pitch-0 key-on: PCSX2 stops such a voice
+// with NextA at SSA+5 halfwords, so an IRQA at bytes SSA+10 to SSA+14 never
+// raises there, while here it does.
 @(private = "file")
 spu_start :: proc(v: ^Spu_Voice) {
 	v.endx = false
@@ -439,9 +443,19 @@ spu_mix :: proc(out: []i32) {
 			// start is that check's every sample.
 			if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(0))}
 			// A stopped voice still sweeps and advances (spu_sample); at
-			// pitch 0 with no sweep it has nothing to do.
+			// pitch 0 with no sweep it has nothing to do. Nor has one
+			// parked, ended and looping back on its own block (as sd_init
+			// leaves every voice): each pass it would enter that same
+			// block again, its state the same, but for the block's IRQ,
+			// any address in it, checked here as spu_block would.
 			sweeping := (v.vol[0].reg | v.vol[1].reg) & 0x8000 != 0
-			if v.phase == .Stopped && v.pitch == 0 && !sweeping {continue}
+			if v.phase == .Stopped && !sweeping {
+				if v.pitch == 0 {continue}
+				if v.endx && v.lsa == v.nax && spu.ram[v.nax + 1] & 3 == 3 {
+					if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(15))}
+					continue
+				}
+			}
 			for n := 0; n < len(out); n += 2 {
 				spu_sweep(&v.vol[0])
 				spu_sweep(&v.vol[1])
@@ -621,9 +635,33 @@ spu_voice_status :: proc(core, voice: int) -> Spu_Status {
 // The id names core and voice in its low bits. Those that return a bool say
 // whether they decoded the id; one they do not changes nothing.
 
-// sceSdInit: every voice off and cleared.
+// sceSdInit's InitVoices (ps2sdk's freesd): it writes a block at
+// SPU_VOICE_PARK that loops on itself, its header 0x07 0x07 (shift 7, end,
+// repeat and loop start), then sets every voice's volumes, ADSR 0, pitch
+// 0x3FFF and start there, and keys every voice on and off. Each is left
+// stopped, cleared, looping on that block, so none rests at an address a
+// game's IRQA may name (sd_irq_check).
 sd_init :: proc() {
-	for &core in spu.voice {for &v in core {v = {}}}
+	park := spu.ram[SPU_VOICE_PARK:][:32]
+	mem.zero_slice(park)
+	mem.set(raw_data(park), 0x07, 16)
+	for &core in spu.voice {for &v in core {
+		spu_voice_reset(&v)
+		v.flags = 0x07
+	}}
+}
+
+// Where every voice starts and rests: PCSX2's V_Core::Init sets each
+// voice's StartA and LoopStartA to 0x2800 (halfwords) and NextA to 0x2801,
+// in the block at byte 0x5000, and freesd's InitVoices keys them all there.
+@(private = "file")
+SPU_VOICE_PARK :: 0x5000
+
+// A voice as reset leaves it: stopped at SPU_VOICE_PARK, pitch 0x3FFF
+// (PCSX2's V_Core::Init and freesd's InitVoices), all else cleared.
+@(private = "file")
+spu_voice_reset :: proc(v: ^Spu_Voice) {
+	v^ = {ssa = SPU_VOICE_PARK, lsa = SPU_VOICE_PARK, nax = SPU_VOICE_PARK, pitch = 0x3fff}
 }
 
 // sceSdSetParam(id, value) for a voice's VOLL, VOLR, PITCH, ADSR1, ADSR2.
@@ -1021,5 +1059,11 @@ spu_snap :: proc() {
 	spu.ram = core.snap_area(SPU_RAM_SIZE)
 	spu.master = {{0x4000, 0x4000}, {0x4000, 0x4000}}
 	spu.in_irq = {max(u64), max(u64)}
+	// Power on, as PCSX2's V_Core::Init: IRQA 0x800 halfwords, the IRQ off,
+	// every voice stopped at SPU_VOICE_PARK, pitch 0x3FFF. Sound RAM is 0,
+	// so until sceSdInit writes its block there the voices run on through
+	// it, as PCSX2's do.
+	spu.irqa = {0x1000, 0x1000}
+	for &core in spu.voice {for &v in core {spu_voice_reset(&v)}}
 	core.snap_add(&spu)
 }

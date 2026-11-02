@@ -28,6 +28,7 @@ import "ps:core"
 import cpu "ps:ps2/cpu"
 import iop "ps:ps2/iop"
 import mem "ps:ps2/mem"
+import r3000 "ps:psx/cpu"
 
 LOOP :: 0x1000 // start, plain, end with repeat
 ONCE :: 0x2000 // plain, end without repeat
@@ -87,6 +88,30 @@ block :: proc(addr: u32, flags: u8, nib: u8) {
 	b[1] = flags
 	for &x in b[2:] {x = nib | nib << 4}
 	check(iop.spu_write(addr, b[:]) == 16, "spu_write block")
+}
+
+// The IRQ at power on (spu_snap, as PCSX2's V_Core::Init): IRQA at byte
+// 0x1000, 0x800 halfwords, in the output area, and every voice stopped at
+// 0x5000, none keyed. Enabled there, no voice raises it, but the output
+// write at IRQA does within 0x200 samples, as PCSX2 means it to; enabled at
+// IRQA 0, where the voices rested before, nothing raises it.
+reset_irq :: proc() {
+	irqa, _ := iop.sd_get_addr_extra(0x1f00)
+	check(irqa == 0x1000, "reset: IRQA 0x800 halfwords, byte 0x1000")
+	iop.sd_core_attr(0x4, 1)
+	mix(0x200)
+	check(iop.iop_sd.pending == 0, "reset: IRQ enabled, nothing keyed: no voice raises it at the default IRQA")
+	now := r3000.state.cycles * iop.IOP_EE_RATIO
+	iop.sd_in_cross(now + (0x200 * cpu.EE_CLOCK + iop.MIX_RATE - 1) / iop.MIX_RATE)
+	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2, "reset: the output write at the default IRQA raises it within 0x200 samples")
+	iop.iop_sd.pending = 0
+	iop.sd_addr_extra(0x1f00 | 1, 0)
+	iop.sd_core_attr(0x4 | 1, 1)
+	mix(0x200)
+	iop.sd_in_cross(max(u64) - 1)
+	check(iop.iop_sd.pending == 0, "reset: IRQ enabled at IRQA 0, nothing keyed: nothing raises it")
+	iop.sd_core_attr(0x4 | 1, 0)
+	iop.sd_addr_extra(0x1f00 | 1, 0x1000)
 }
 
 // Mix n stereo samples into silence.
@@ -597,6 +622,7 @@ block_trans :: proc() {
 }
 
 game :: proc(_: rawptr) {
+	reset_irq()
 	voices()
 	envelope()
 	interp()
