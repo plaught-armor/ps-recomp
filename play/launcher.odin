@@ -3,11 +3,13 @@
 // launcher_step applies one and says what the window must do next.
 //
 // Two screens: the library list, with the selected disc's thumbnail and
-// compatibility result beside it, and the selected disc's settings. A setting
-// changed is saved to the disc's settings.tsv at once, and only as a value
-// the runtime reads (SETTING_CHOICES); the run started reads it there itself
+// compatibility result beside it, and the settings, of the selected disc or
+// of all discs (Scope). A setting changed or cleared is saved to that scope's
+// settings.tsv at once, and only as a value the runtime reads (PS1_CHOICES,
+// PS2_CHOICES, GLOBAL_CHOICES); the run started reads it there itself
 // (settings_apply), so the launcher never puts a setting in its environment.
-// A setting the environment sets is shown locked.
+// Each row says where its value comes from; a setting the environment sets
+// is shown locked and cannot be changed.
 package play
 
 import "core:fmt"
@@ -17,6 +19,12 @@ import "ps:core"
 Screen :: enum {
 	List,
 	Settings,
+}
+
+// Which settings file the settings screen edits.
+Scope :: enum {
+	Disc, // the selected disc's settings.tsv
+	Global, // <data>/settings.tsv, for every disc
 }
 
 Action :: enum {
@@ -30,8 +38,8 @@ Action :: enum {
 	Ok, // list: run the disc; settings: the next choice
 	Launch, // run the disc from either screen
 	Back,
-	Menu, // list: the disc's settings
-	Remove, // take a missing disc out of the library
+	Menu, // list: the disc's settings; settings: the other scope
+	Remove, // list: take a missing disc out of the library; settings: clear
 	Quit,
 }
 
@@ -66,6 +74,16 @@ PS2_CHOICES := [?]Setting_Choice {
 	{.Native, "Code", {"", "0"}, {"default (native)", "interpreted"}},
 }
 
+// The settings of every disc: each system's, each named for its system.
+@(rodata)
+GLOBAL_CHOICES := [?]Setting_Choice {
+	{.Gpu, "PS1 renderer", {"", "vk", "sw"}, {"default", "Vulkan", "software"}},
+	{.Sw, "PS2 renderer", {"", "1"}, {"default (Vulkan)", "software"}},
+	{.Scale, "PS2 scale", {"", "1", "2", "3", "4", "5", "6", "7", "8"}, {"default", "1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x"}},
+	{.Irx, "PS2 IOP modules", {"", "0"}, {"default (run)", "HLE"}},
+	{.Native, "Code", {"", "0"}, {"default (native)", "interpreted"}},
+}
+
 // Where things go on a w x h picture: every size a multiple of the integer
 // scale chosen from the picture size.
 Layout :: struct {
@@ -85,6 +103,7 @@ Launcher :: struct {
 	sel, top:   int,
 	screen:     Screen,
 	row:        int, // the settings screen's selected row
+	scope:      Scope, // the settings screen's file
 	settings:   core.Settings, // the selected disc's settings.tsv
 	global:     core.Settings, // <data>/settings.tsv
 	thumb:      []u8, // the selected disc's thumbnail, nil without one
@@ -149,10 +168,13 @@ launcher_resize :: proc(l: ^Launcher, w, h: int) {
 	keep_visible(l)
 }
 
-// The choices the selected disc's settings screen offers.
+// The choices the settings screen offers in its scope.
 launcher_choices :: proc(l: ^Launcher) -> []Setting_Choice {
 	if len(l.discs) == 0 {
 		return nil
+	}
+	if l.scope == .Global {
+		return GLOBAL_CHOICES[:]
 	}
 	return PS2_CHOICES[:] if l.discs[l.sel].info[.System] == "ps2" else PS1_CHOICES[:]
 }
@@ -193,7 +215,7 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 			if d.missing {
 				launcher_toast(l, "This disc image is missing; Delete or Y removes it.")
 			} else {
-				l.screen, l.row = .Settings, 0
+				l.screen, l.row, l.scope = .Settings, 0, .Disc
 			}
 		case .Remove:
 			if !d.missing {
@@ -216,7 +238,12 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 			change_setting(l, -1)
 		case .Right, .Ok:
 			change_setting(l, 1)
-		case .Back, .Menu:
+		case .Remove:
+			clear_setting(l)
+		case .Menu:
+			l.scope = .Global if l.scope == .Disc else .Disc
+			l.row = 0
+		case .Back:
 			l.screen = .List
 		}
 	}
@@ -308,44 +335,96 @@ keep_visible :: proc(l: ^Launcher) {
 	l.top = clamp(l.top, 0, max(len(l.discs) - rows, 0))
 }
 
-// Step the selected setting's choice by dir and save the disc's settings.
+// The settings file of the settings screen's scope: its settings in l and
+// its path. False when there is no data directory.
 @(private = "file")
-change_setting :: proc(l: ^Launcher, dir: int) {
-	c := launcher_choices(l)[l.row]
+scope_settings :: proc(l: ^Launcher) -> (s: ^core.Settings, path: string, ok: bool) {
+	if l.scope == .Global {
+		path = core.settings_global_path(context.temp_allocator) or_return
+		return &l.global, path, true
+	}
+	dir := core.disc_dir(l.discs[l.sel].id, context.temp_allocator) or_return
+	return &l.settings, core.disc_path(dir, .Settings, context.temp_allocator), true
+}
+
+// The selected choice, unless the environment sets it (then a toast).
+@(private = "file")
+unlocked_choice :: proc(l: ^Launcher) -> (c: Setting_Choice, ok: bool) {
+	c = launcher_choices(l)[l.row]
 	names := core.SETTING_NAMES
 	if _, set := core.env_lookup(names[c.setting]); set {
 		launcher_toast(l, fmt.tprintf("Set by %s in the environment.", core.env_name(names[c.setting])))
+		return c, false
+	}
+	return c, true
+}
+
+// Save the scope's file holding value v ("" removes the row) for setting k.
+@(private = "file")
+save_setting :: proc(l: ^Launcher, k: core.Setting, v: string) {
+	cur, path, ok := scope_settings(l)
+	s: core.Settings
+	if ok {
+		s = cur^
+	}
+	if v == "" {
+		s.set -= {k}
+		s.value[k] = ""
+	} else {
+		s.set += {k}
+		s.value[k] = v
+	}
+	if !ok || !core.settings_save(path, s) {
+		launcher_toast(l, "Cannot save the setting (see the terminal).")
 		return
 	}
+	cur^ = s
+}
+
+// Step the selected setting's choice by dir in the scope's file.
+@(private = "file")
+change_setting :: proc(l: ^Launcher, dir: int) {
+	c, ok := unlocked_choice(l)
+	if !ok {
+		return
+	}
+	cur, _, _ := scope_settings(l)
 	// A value the file holds that is not a choice steps from "".
 	i := 0
 	for v, k in c.values {
-		if c.setting in l.settings.set && v == l.settings.value[c.setting] {
+		if cur != nil && c.setting in cur.set && v == cur.value[c.setting] {
 			i = k
 		}
 	}
 	i = (i + dir + len(c.values)) % len(c.values)
-	s := l.settings
-	if c.values[i] == "" {
-		s.set -= {c.setting}
-		s.value[c.setting] = ""
-	} else {
-		s.set += {c.setting}
-		s.value[c.setting] = c.values[i]
-	}
-	dirpath, ok := core.disc_dir(l.discs[l.sel].id, context.temp_allocator)
-	if !ok || !core.settings_save(core.disc_path(dirpath, .Settings, context.temp_allocator), s) {
-		launcher_toast(l, "Cannot save the setting (see the terminal).")
-		return
-	}
-	l.settings = s
+	save_setting(l, c.setting, c.values[i])
 }
 
-// What the settings screen shows for choice c, and whether the environment
-// sets it.
+// Take the selected setting out of the scope's file; with no row for it
+// there, nothing is written.
+@(private = "file")
+clear_setting :: proc(l: ^Launcher) {
+	c, ok := unlocked_choice(l)
+	if !ok {
+		return
+	}
+	cur, _, _ := scope_settings(l)
+	if cur == nil || c.setting not_in cur.set {
+		launcher_toast(l, "Not set here; nothing to clear.")
+		return
+	}
+	save_setting(l, c.setting, "")
+}
+
+// What the settings screen shows for choice c in its scope: the value that
+// holds and where it comes from, and whether the environment sets it. All
+// discs' settings come from the environment, the global file or the default;
+// a disc's from the environment, its own file, the global file or the
+// default.
 launcher_setting_text :: proc(l: ^Launcher, c: Setting_Choice) -> (text: string, locked: bool) {
 	names := core.SETTING_NAMES
-	value, from := core.settings_resolve(l.settings, l.global)
+	disc := l.settings if l.scope == .Disc else core.Settings{}
+	value, from := core.settings_resolve(disc, l.global)
 	v := value[c.setting]
 	shown := v
 	for cv, k in c.values {
@@ -358,7 +437,9 @@ launcher_setting_text :: proc(l: ^Launcher, c: Setting_Choice) -> (text: string,
 		return fmt.tprintf("%s (set by %s)", shown, core.env_name(names[c.setting])), true
 	case .Global:
 		return fmt.tprintf("%s (all discs)", shown), false
-	case .Disc, .Default:
+	case .Disc:
+		return fmt.tprintf("%s (this disc)", shown), false
+	case .Default:
 	}
 	return shown, false
 }
@@ -402,7 +483,8 @@ launcher_draw :: proc(l: ^Launcher, px: []u32) {
 			}
 			text(px, lo, m, lo.footer_y, "Enter/A play  Tab/X settings  Del/Y remove a missing disc", .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
 		case .Settings:
-			text(px, lo, m, m, fmt.tprintf("Settings: %s", d.info[.Title] if d.info[.Title] != "" else d.id), .Dim, chars)
+			title := "all discs" if l.scope == .Global else d.info[.Title] if d.info[.Title] != "" else d.id
+			text(px, lo, m, m, fmt.tprintf("Settings: %s", title), .Dim, chars)
 			label_w := 16
 			for c, i in launcher_choices(l) {
 				ry := lo.list_y + i * line
@@ -413,7 +495,8 @@ launcher_draw :: proc(l: ^Launcher, px: []u32) {
 				text(px, lo, m + s, ry, c.label, .Text, min(label_w, chars - 1))
 				text(px, lo, m + s + label_w * core.FONT_GLYPH * s, ry, t, .Dim if locked else .Text, chars - 1 - label_w)
 			}
-			text(px, lo, m, lo.footer_y, "Left/Right change  Enter/Start play  Esc/B back", .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
+			other := "this disc" if l.scope == .Global else "all discs"
+			text(px, lo, m, lo.footer_y, fmt.tprintf("Left/Right set  Del/Y clear  Tab/X %s  Esc/B back", other), .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
 		}
 		draw_details(l, px, d)
 	}

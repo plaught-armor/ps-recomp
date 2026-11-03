@@ -1106,7 +1106,10 @@ la :: proc(rt, v: u32) -> [2]u32 {return {lui(rt, v >> 16), ori(rt, rt, v & 0xff
 // stays within the list; Ok runs a disc; the settings screen cycles only the
 // values the runtime reads and saves them to the disc's settings.tsv (the
 // file gone when all are unset), refuses one the environment sets and shows
-// it locked; the picture has the selection bar and the thumbnail, and a
+// it locked; Tab/X switches it to all discs' settings, saved to the global
+// file, which a disc's own value overrides; a clear takes the row out of
+// the scope's file and writes nothing when the file has no such row; the
+// picture has the selection bar and the thumbnail, and a
 // point maps to its row; a missing disc will not run and can be removed; a
 // dropped disc or directory joins the library, a duplicate or a non-disc
 // does not.
@@ -1198,8 +1201,54 @@ test_launcher :: proc() {
 	_ = step(&l, .Down)
 	_ = step(&l, .Left)
 	b_dir, _ := core.disc_dir(l.discs[1].id, context.temp_allocator)
-	check(name, saved(core.disc_path(b_dir, .Settings, context.temp_allocator)) == "SCALE\t8\n", "SCALE 8")
+	b_set := core.disc_path(b_dir, .Settings, context.temp_allocator)
+	check(name, saved(b_set) == "SCALE\t8\n", "SCALE 8")
+
+	// All discs: Tab/X switches the scope. An edit there writes only the
+	// global file; clearing a row a file lacks writes nothing.
+	g_set, _ := core.settings_global_path(context.temp_allocator)
+	_ = step(&l, .Menu)
+	check(name, l.screen == .Settings && l.scope == .Global && l.row == 0 && len(play.launcher_choices(&l)) == 5, "all discs screen")
+	_ = step(&l, .Down)
+	_ = step(&l, .Down)
+	_ = step(&l, .Right)
+	_ = step(&l, .Right)
+	text, _ = play.launcher_setting_text(&l, play.launcher_choices(&l)[2])
+	check(name, saved(g_set) == "SCALE\t2\n" && saved(b_set) == "SCALE\t8\n" && text == "2x (all discs)", fmt.tprintf("all discs SCALE 2: %q %q %q", saved(g_set), saved(b_set), text))
+	_ = step(&l, .Down)
+	_ = step(&l, .Remove)
+	check(name, saved(g_set) == "SCALE\t2\n" && l.row == 3 && l.toast != "", fmt.tprintf("clear an unset IRX: %q %d %q", saved(g_set), l.row, l.toast))
+
+	// The disc's own value wins on its screen; cleared, the global one shows;
+	// cleared again with no file, none is made.
+	_ = step(&l, .Menu)
+	check(name, l.scope == .Disc && l.row == 0, "back to the disc's scope")
+	_ = step(&l, .Down)
+	text, _ = play.launcher_setting_text(&l, play.launcher_choices(&l)[1])
+	check(name, text == "8x (this disc)", fmt.tprintf("disc over global: %q", text))
+	_ = step(&l, .Remove)
+	text, _ = play.launcher_setting_text(&l, play.launcher_choices(&l)[1])
+	check(name, !os.exists(b_set) && text == "2x (all discs)", fmt.tprintf("disc cleared: %v %q", os.exists(b_set), text))
+	_ = step(&l, .Remove)
+	check(name, !os.exists(b_set) && l.toast != "", "clear with no file makes none")
+
+	// Set in the environment: locked on the all discs screen too, neither
+	// changed nor cleared. Then cleared there, the default shows.
+	os.set_env(core.env_name("SCALE"), "3")
+	_ = step(&l, .Menu)
+	_ = step(&l, .Down)
+	_ = step(&l, .Down)
+	_ = step(&l, .Right)
+	check(name, saved(g_set) == "SCALE\t2\n" && strings.contains(l.toast, core.env_name("SCALE")), fmt.tprintf("locked change: %q %q", saved(g_set), l.toast))
+	_ = step(&l, .Remove)
+	text, locked = play.launcher_setting_text(&l, play.launcher_choices(&l)[2])
+	check(name, saved(g_set) == "SCALE\t2\n" && strings.contains(l.toast, core.env_name("SCALE")) && locked && text == fmt.tprintf("3x (set by %s)", core.env_name("SCALE")), fmt.tprintf("locked clear: %q %q %q", saved(g_set), l.toast, text))
+	os.unset_env(core.env_name("SCALE"))
+	_ = step(&l, .Remove)
+	text, locked = play.launcher_setting_text(&l, play.launcher_choices(&l)[2])
+	check(name, !os.exists(g_set) && text == "default" && !locked, fmt.tprintf("all discs cleared: %v %q", os.exists(g_set), text))
 	_ = step(&l, .Back)
+	check(name, l.screen == .List, "Esc/B back to the list")
 
 	// The picture: the bar on the selected row, the thumbnail, rows by point.
 	red := make([]u32, 320 * 240, context.temp_allocator)
