@@ -339,6 +339,9 @@ sif_command :: proc(a, pc: u32) {
 		sif_bind_retries = {}
 		sif.ee_buf = 0
 		sif_drop_replies()
+		// sifman's completion callbacks owed (iop_sifcmd.dma_cb) stay, as
+		// the IOP's other interrupt state (timer, vblank, CD and libsd
+		// handlers) does.
 	case SIF_CMD_IOP_INTR:
 		// Sent with no payload after a game's own transfer, only so its
 		// arrival interrupts the IOP: retail SIFCMD has no handler for it

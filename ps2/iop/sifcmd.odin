@@ -28,10 +28,15 @@ Iop_Sifcmd :: struct {
 	dma_id:    u32, // the last DMA id handed out
 	rpc_pool:  u32, // the RPC client's packets, IOP address (sifclient.odin)
 	rpc_id:    u32, // the last rpc_id handed out
-	dma_cb:    [SIF_DMA_CBS]struct {
-		func, arg: u32,
-	}, // the completion callbacks owed, first owed first
+	dma_cb:    [SIF_DMA_CBS]Sif_Dma_Cb, // the completion callbacks owed, first owed first
 	n_dma_cb:  u32,
+}
+
+// A completion callback owed: func(arg) once its transfer is done, at EE
+// cycle `due`.
+Sif_Dma_Cb :: struct {
+	func, arg: u32,
+	due:       u64,
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -92,7 +97,8 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 5: // sceSifInit: SIF is set up at boot, so retail finds its flag set and returns it
 		return 1, true
 	case 7: // sceSifSetDma(SifDmaTransfer_t *, count): {src, dest, size, attr}
-		return sifman_dma(r[4], r[5]), true
+		id, _, _ := sifman_dma(r[4], r[5])
+		return id, true
 	case 8: // sceSifDmaStat(id): done
 		return ke(-1), true
 	case 29: // sceSifCheckInit: the flag sceSifInit sets, set at boot
@@ -104,9 +110,17 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		s := &iop_sifcmd
 		if r[6] != 0 && s.n_dma_cb == SIF_DMA_CBS {return 0, true}
 		cb, arg := r[6], r[7]
-		id := sifman_dma(r[4], r[5])
+		id, bytes, pkt_due := sifman_dma(r[4], r[5])
 		if cb != 0 {
-			s.dma_cb[s.n_dma_cb] = {cb, arg}
+			// Done once its bytes have crossed, as sif_set_dma times the
+			// other direction, after the transfers owed before it (SIF0
+			// runs one at a time), and at least an IOP cycle on so a
+			// callback that sets another cannot run it in the same tick;
+			// never before a packet it sent the EE is due there.
+			start := max(cpu.state.cycles, r3000.state.cycles * IOP_EE_RATIO)
+			if s.n_dma_cb > 0 {start = max(start, s.dma_cb[s.n_dma_cb - 1].due)}
+			due := max(start + max(bytes * SIF_DMA_CYCLES_PER_BYTE, IOP_EE_RATIO), pkt_due)
+			s.dma_cb[s.n_dma_cb] = {cb, arg, due}
 			s.n_dma_cb += 1
 			iop_wake_set()
 		}
@@ -117,37 +131,53 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 
 // Copies each of the `count` transfers listed at `list`, {src, dest, size,
 // attr}, from IOP RAM to the EE; to the EE's command buffer it is sent as a
-// command. The DMA's id.
+// command. The DMA's id, the bytes it moved and the due of the last packet
+// it queued for the EE (0 when none).
 @(private = "file")
-sifman_dma :: proc(list, count: u32) -> u32 {
+sifman_dma :: proc(list, count: u32) -> (id: u32, bytes: u64, pkt_due: u64) {
 	for n in 0 ..< count {
 		e := list + 16 * n
 		src, dest, size := r32(e), r32(e + 4), r32(e + 8)
 		if dest == sif.ee_buf {
 			sif_send_raw(iop_ram_at(src, size))
+			pkt_due = sif.replies[len(sif.replies) - 1].due
 		} else {
 			copy(mem.ram_slice(dest, size), iop_ram_at(src, size))
 		}
+		bytes += u64(size)
 	}
-	return sifcmd_dma_id()
+	return sifcmd_dma_id(), bytes, pkt_due
 }
 
-// When, in EE cycles, the completion callbacks owed are due: at once (the
-// IOP's clock) while one is; max(u64) when none is.
+// When, in EE cycles, the first completion callback owed is due; max(u64)
+// when none is.
 sif_dma_next_ee :: proc() -> u64 {
-	return max(u64) if iop_sifcmd.n_dma_cb == 0 else r3000.state.cycles * IOP_EE_RATIO
+	t := max(u64)
+	for c in iop_sifcmd.dma_cb[:iop_sifcmd.n_dma_cb] {t = min(t, c.due)}
+	return t
 }
 
-// Runs the completion callbacks owed, first owed first, each with a0 its
-// arg, as retail's SIF0 DMA interrupt does; one that waits is stopped there
-// with a compat row, and the rest still run.
-sif_dma_intr_run :: proc() {
+// Runs the completion callbacks due by EE cycle `now`, first owed first,
+// each with a0 its arg, as retail's SIF0 DMA interrupt does; one that waits
+// is stopped there with a compat row, and the rest still run. Those not yet
+// due, and those the callbacks set, stay owed.
+sif_dma_intr_run :: proc(now: u64) {
 	s := &iop_sifcmd
-	n := s.n_dma_cb
-	if n == 0 {return}
-	cbs := s.dma_cb
-	s.n_dma_cb, s.dma_cb = 0, {}
-	for c in cbs[:n] {
+	run: [SIF_DMA_CBS]Sif_Dma_Cb
+	n_run, n: u32
+	for c in s.dma_cb[:s.n_dma_cb] {
+		if c.due <= now {
+			run[n_run] = c
+			n_run += 1
+		} else {
+			s.dma_cb[n] = c
+			n += 1
+		}
+	}
+	if n_run == 0 {return}
+	for &c in s.dma_cb[n:s.n_dma_cb] {c = {}}
+	s.n_dma_cb = n
+	for c in run[:n_run] {
 		switch th_intr(c.func, c.arg, 0) {
 		case .None:
 		case .Blocked:
@@ -162,7 +192,9 @@ sif_dma_intr_run :: proc() {
 // After a failed load: puts back each handler it left with its handler or
 // harg in `freed`, the memory its undo frees, as it was when the load began
 // (`saved`, and `tab` the words of the user table then), so no command is
-// delivered there. The table too, when it was in `freed`.
+// delivered there. The table too, when it was in `freed`. A callback owed
+// is dropped when its func or its arg is in `freed`: the arg is a scalar to
+// us, so one that only falls in freed memory goes too, as a harg does.
 sifcmd_undo :: proc(saved: Iop_Sifcmd, tab: []u32, freed: []Sys_Block) {
 	s := &iop_sifcmd
 	for &h, i in s.sys {

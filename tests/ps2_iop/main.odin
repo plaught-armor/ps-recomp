@@ -3180,14 +3180,16 @@ snap15: core.Snapshot
 snap15_loaded: bool // not emulated state
 
 // sceSifSetDmaIntr: the copy at once, as sceSifSetDma; the callback owed
-// to the next tick, run there with a0 its arg as retail's SIF0 interrupt
-// does, so a thread it signals runs after.
+// until its transfer's time is up, after those owed before it, and run at
+// the tick then with a0 its arg as retail's SIF0 interrupt does, so a
+// thread it signals runs after. One that sets another runs once per due.
 test_sif_dma_intr :: proc() {
 	fresh()
 	iop.iop_irx = true
 	defer iop.iop_irx = false
 	// "mods": a thread that waits on sem and counts its passes; a callback
-	// that records a0, counts its calls and iSignalSemas sem; one that waits.
+	// that records a0, counts its calls and iSignalSemas sem; one that
+	// waits; one that counts its calls and sets itself again.
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6)
 	ts := imports(&a, "thsemap", 4, 7, 8)
@@ -3200,6 +3202,8 @@ test_sif_dma_intr :: proc() {
 	put(&a, 0, 0, 0, 0)
 	semp := at(&a)
 	put(&a, 0, 0, 0, 64) // attr, option, initial, max
+	rd := at(&a) // the calls of the one that sets itself again
+	put(&a, 0)
 	h := at(&a)
 	prologue(&a)
 	la(&a, T0, d)
@@ -3211,6 +3215,16 @@ test_sif_dma_intr :: proc() {
 	hb := at(&a)
 	prologue(&a)
 	call_word(&a, ts + 16, d + 12)
+	epilogue(&a)
+	hr := at(&a)
+	prologue(&a)
+	la(&a, T0, rd)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	la(&a, A0, dmat)
+	li(&a, A1, 1)
+	la(&a, A2, hr)
+	put(&a, 0x24070000) // li a3, 0
+	jal(&a, sm + 8)
 	epilogue(&a)
 	w := at(&a)
 	call_word(&a, ts + 16, d + 12)
@@ -3246,8 +3260,11 @@ test_sif_dma_intr :: proc() {
 	copy(mem.ram_slice(EE_DEST, 16), make([]u8, 16, context.temp_allocator))
 	id32 := call(b, sm, 32, b + dmat, 1, b + h, 0x55)
 	check(id32 != 0 && id32 != id7 && string(mem.ram_slice(EE_DEST, 16)) == string(iop.iop_mem(b + src, 16)), "sifman 32: the copy is done at the call, a new id")
-	now := r3000.state.cycles * iop.IOP_EE_RATIO
-	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && iop.sif_dma_next_ee() == now && iop.iop_wake_ee == now, "sifman 32: the callback is owed, not run, the wake now")
+	now := max(cpu.state.cycles, r3000.state.cycles * iop.IOP_EE_RATIO)
+	due := now + 16 * iop.SIF_DMA_CYCLES_PER_BYTE
+	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && s.dma_cb[0].due == due && iop.sif_dma_next_ee() == due && iop.iop_wake_ee == due, "sifman 32: the callback is owed, not run, the wake when its bytes have crossed")
+	iop.iop_tick(due - 1)
+	check(word(b, d, 0) == 0 && s.n_dma_cb == 1, "sifman 32: not run before it is due")
 	core.snap_op, core.snap_target = .Save, &snap15
 	core.snap_yield()
 	if !snap15_loaded {
@@ -3257,23 +3274,48 @@ test_sif_dma_intr :: proc() {
 		core.snap_op, core.snap_target = .Load, &snap15
 		core.snap_yield()
 	}
-	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && s.dma_cb[0] == {b + h, 0x55}, "sifman 32: the load puts the owed callback back")
+	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && s.dma_cb[0] == {b + h, 0x55, due}, "sifman 32: the load puts the owed callback back")
 	iop.iop_tick(iop.iop_wake_ee)
 	check(word(b, d, 0) == 1 && word(b, d, 1) == 0x55 && word(b, d, 2) == 1, "sifman 32: the callback gets its arg, the thread it signals runs after")
 	check(s.n_dma_cb == 0 && iop.sif_dma_next_ee() == max(u64), "sifman 32: none owed, no wake")
 
 	ok := true
 	for i in 0 ..< iop.SIF_DMA_CBS {ok &&= call(b, sm, 32, b + dmat, 1, b + h, u32(i)) != 0}
-	check(ok && call(b, sm, 32, b + dmat, 1, b + h, 99) == 0, "sifman 32: one past the callbacks owed returns 0")
+	for c, i in s.dma_cb[1:] {ok &&= c.due == s.dma_cb[i].due + 16 * iop.SIF_DMA_CYCLES_PER_BYTE}
+	check(ok && call(b, sm, 32, b + dmat, 1, b + h, 99) == 0, "sifman 32: one past the callbacks owed returns 0, each due after the one before")
 	check(call(b, sm, 32, b + dmat, 1, 0, 0) != 0, "sifman 32: one with no callback is still sent")
-	iop.iop_tick(iop.iop_wake_ee)
+	iop.iop_tick(s.dma_cb[iop.SIF_DMA_CBS - 1].due)
 	check(word(b, d, 0) == 1 + iop.SIF_DMA_CBS && word(b, d, 1) == iop.SIF_DMA_CBS - 1 && word(b, d, 2) == 1 + iop.SIF_DMA_CBS, "sifman 32: all run first owed first, the thread passing for each")
+
+	// Dues per entry: a short transfer, then a long one; each runs at its own.
+	call(b, sm, 32, b + dmat, 1, b + h, 1)
+	endian.put_u32(t[8:], .Little, 64)
+	call(b, sm, 32, b + dmat, 1, b + h, 2)
+	endian.put_u32(t[8:], .Little, 16)
+	d1, d2 := s.dma_cb[0].due, s.dma_cb[1].due
+	check(d2 == d1 + 64 * iop.SIF_DMA_CYCLES_PER_BYTE && iop.iop_wake_ee == d1, "sifman 32: each owed has its own due, the wake the first")
+	iop.iop_tick(d1)
+	check(word(b, d, 1) == 1 && s.n_dma_cb == 1 && iop.sif_dma_next_ee() == d2 && iop.iop_wake_ee == d2, "sifman 32: the tick runs only the one due, the wake moves to the next")
+	iop.iop_tick(d2)
+	check(word(b, d, 1) == 2 && s.n_dma_cb == 0, "sifman 32: the next runs at its own due")
 
 	key := core.Compat_Key{.Iop_Sif_Intr, b + hb, 0}
 	call(b, sm, 32, b + dmat, 1, b + hb, 0)
 	call(b, sm, 32, b + dmat, 1, b + h, 7)
-	iop.iop_tick(iop.iop_wake_ee)
+	iop.iop_tick(s.dma_cb[1].due)
 	check(core.compat.calls[key].n == 1 && word(b, d, 1) == 7 && s.n_dma_cb == 0, "sifman 32: one that waits is stopped with a row, the next still runs")
+
+	// One that sets itself again, the IOP idle: it runs once per due, and
+	// the next due is later, so the EE's time moves on between them.
+	call(b, sm, 32, b + dmat, 1, b + hr, 0)
+	w1 := iop.iop_wake_ee
+	iop.iop_tick(w1)
+	w2 := iop.iop_wake_ee
+	check(word(b, rd, 0) == 1 && s.n_dma_cb == 1 && w2 > w1, "sifman 32: one that sets itself again runs once, its next due later")
+	iop.iop_tick(w1)
+	check(word(b, rd, 0) == 1, "sifman 32: a second tick at the same time runs nothing")
+	iop.iop_tick(w2)
+	check(word(b, rd, 0) == 2 && iop.iop_wake_ee > w2, "sifman 32: it runs again at its next due")
 	fresh()
 	check(iop.iop_sifcmd.n_dma_cb == 0, "sifman 32: the loader's reset clears the callbacks owed")
 }

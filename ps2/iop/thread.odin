@@ -334,14 +334,14 @@ iop_wake_set :: proc() {
 
 // The EE's events at EE cycle `now`, the IOP's wake due: runs libsd's due
 // interrupt handlers, then the timers' due compare handlers, then cdvdman's
-// pending read callback, then sifman's DMA completion callbacks, then the
+// pending read callback, then sifman's DMA completion callbacks due, then the
 // vblank handlers due, then its threads for a slice.
 iop_tick :: proc(now: u64) {
 	iop_sync(now)
 	sd_intr_run(now)
 	tim_intr_run()
 	cd_intr_run()
-	sif_dma_intr_run()
+	sif_dma_intr_run(now)
 	vbl_intr_run()
 	iop_sched.start_done = false
 	th_schedule(r3000.state.cycles + IOP_SLICE, idle = true)
