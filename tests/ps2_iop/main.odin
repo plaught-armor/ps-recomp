@@ -208,6 +208,7 @@ game :: proc(_: rawptr) {
 	test_rpc_client()
 	test_rpc_pool_kept()
 	test_c1_gaps()
+	test_call_context()
 	test_sifman()
 	test_sif_dma_intr()
 	test_libsd()
@@ -1943,7 +1944,7 @@ test_cmd_deliver :: proc() {
 	defer iop.iop_irx = false
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6, 33)
-	ts := imports(&a, "thsemap", 4, 6, 8)
+	ts := imports(&a, "thsemap", 4, 7, 8)
 	sc := imports(&a, "sifcmd", 8, 10, 12)
 	sem, th, dl := at(&a), at(&a) + 4, at(&a) + 8
 	put(&a, 0, 0, 100)
@@ -1952,7 +1953,8 @@ test_cmd_deliver :: proc() {
 	pkt := at(&a)
 	put(&a, 0, 0, 0, 0)
 	sp := sema_param(&a, 0, 0)
-	// Command 0's handler signals harg, command 1's waits on it.
+	// Command 0's handler iSignalSemas harg, command 1's waits on it, which
+	// a handler may not.
 	h0 := at(&a)
 	prologue(&a)
 	put(&a, 0x00a02025) // or a0, a1, zero
@@ -2035,10 +2037,10 @@ test_cmd_deliver :: proc() {
 
 	key := core.Compat_Key{.Iop_Intr, 1, 0}
 	send_cmd(1)
-	check(core.compat.calls[key].n == 1 && coroutines() == base + 1, "deliver: a handler that waits is stopped, a compat row, its coroutine killed")
+	check(core.compat.calls[key].n == 0 && coroutines() == base + 2, "deliver: WaitSema in a handler is refused, the handler returns, no row")
 	check(!iop.iop_sched.intr && r3000.next_event == iop.IOP_EVENT_OFF, "deliver: the IOP off after it")
 	send_cmd(0)
-	check(coroutines() == base + 2 && iop.iop_sched.semas[0].count == 1 && core.compat.calls[key].n == 1, "deliver: the next delivery makes another and runs")
+	check(coroutines() == base + 2 && iop.iop_sched.semas[0].count == 1, "deliver: the next delivery runs on the same coroutine")
 
 	fresh()
 	check(coroutines() == base && iop.iop_wake_ee == max(u64), "deliver: the loader's reset kills it")
@@ -2951,19 +2953,20 @@ test_rpc_client :: proc() {
 	ee_end(c3, iop.SIF_CMD_RPC_BIND, 0, 0, 0, 0, 0)
 	check(word(c3, iop.CL_SERVER) == 0 && row(0x123, iop.RPC_NO_SERVER) == 1, "rpc client: a bind to no server is 0, with a row")
 
-	// An end function that waits is stopped with a row; the packet is freed.
+	// An end function that sleeps gets -100, as in any handler, and returns:
+	// no row, the packet freed.
 	iop.iop_u32(c3 + iop.CL_SERVER)^ = 0x7200
 	iop.iop_u32(c3 + iop.CL_BUFF)^ = EE_SRV
 	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + bad, 0) == 0, "rpc client: a call with a bad end function")
 	drop_replies()
 	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
 	blocked := core.compat.calls[core.Compat_Key{.Iop_Intr, iop.SIF_CMD_RPC_CALL, 0}].n
-	check(blocked == 1 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function that waits is a row, the packet freed")
+	check(blocked == 0 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function that sleeps is no row, the packet freed")
 	check(fn_call(stk, c3, 6, 1, b + send, 4, b + recv, 4, b + gap, 0) == 0, "rpc client: a call with an end function at a gap")
 	drop_replies()
 	ee_end(c3, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
 	blocked = core.compat.calls[core.Compat_Key{.Iop_Intr, iop.SIF_CMD_RPC_CALL, 0}].n
-	check(blocked == 2 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function at a gap is the same row, the packet freed")
+	check(blocked == 1 && word(c3, iop.CL_PKT) == 0, "rpc client: an end function at a gap is a row, the packet freed")
 
 	// A waited call with no thread: sent, with a row, and nothing waits.
 	check(fn_call(stk, c3, 13, 0, b + send, 4, b + recv, 4, 0, 0) == 0 && row(c3, iop.RPC_NO_THREAD) == 1 && len(iop.sif.replies) == 1, "rpc client: a waited call from the loader is a row")
@@ -3167,6 +3170,72 @@ test_c1_gaps :: proc() {
 	check(v == 0x3000, "c1: sceSdGetParam reads EVOLR, the id's other bits aside")
 }
 
+// Each thbase and thsemap call in the context retail's threadman allows and
+// in the other: in a handler a thread's call gets KE_ILLEGAL_CONTEXT and
+// changes nothing, as an i-variant does on a thread; QueryIntrContext says
+// which context it is.
+test_call_context :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	ill := neg(-iop.KE_ILLEGAL_CONTEXT)
+	dormant := neg(-iop.KE_DORMANT)
+	base :: proc(fno: u32, a0: u32 = 0) -> u32 {
+		r3000.state.r[4] = a0
+		v, ok := iop.th_base(fno)
+		check(ok, "context: a served thbase call")
+		return v
+	}
+	sema :: proc(fno: u32, a0: u32 = 0) -> u32 {
+		r3000.state.r[4] = a0
+		v, ok := iop.th_semap(fno)
+		check(ok, "context: a served thsemap call")
+		return v
+	}
+	query :: proc(stubs: u32) -> u32 {
+		fnos := [?]u32{23}
+		return lib_call(stubs, fnos[:], 23)
+	}
+	count :: proc(id: u32) -> i32 {
+		for m in iop.iop_sched.semas {if m.id == id {return m.count}}
+		return -1
+	}
+
+	a: Asm
+	ie := imports(&a, "intrman", 23)
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("modq", &a, entry), "modq", nil)
+	check(id > 0, "context: a module that imports QueryIntrContext loads")
+	qs := module_base(id) + ie
+
+	P :: 0x00040000
+	for w, i in ([5]u32{0, 0, 0x1000, 0x800, 20}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+	for w, i in ([4]u32{0, 0, 1, 5}) {iop.iop_u32(P + 0x20 + 4 * u32(i))^ = w}
+	check(query(qs) == 0, "context: QueryIntrContext on the loader")
+	tid := base(4, P)
+	semid := sema(4, P + 0x20)
+	check(i32(tid) > 0 && i32(semid) > 0, "context: CreateThread and CreateSema on the loader")
+	check(base(11, tid) == ill && base(26, tid) == ill, "context: iTerminateThread and iWakeupThread on a thread are illegal")
+	check(sema(7, semid) == ill && count(semid) == 1, "context: iSignalSema on a thread is illegal and signals nothing")
+
+	threads, semas := len(s.threads), len(s.semas)
+	s.intr = true
+	check(query(qs) == 1, "context: QueryIntrContext in a handler")
+	for fno in ([10]u32{4, 5, 6, 7, 10, 16, 20, 24, 25, 33}) {check(base(fno, tid) == ill, "context: a thread's thbase call in a handler is illegal")}
+	for fno in ([5]u32{4, 5, 6, 8, 9}) {check(sema(fno, semid) == ill, "context: a thread's thsemap call in a handler is illegal")}
+	t := iop.th_find(tid)
+	check(len(s.threads) == threads && len(s.semas) == semas && t != nil && t.status == .Dormant, "context: a refused call makes, starts and deletes nothing")
+	check(count(semid) == 1 && s.intr_stop == .None, "context: a refused wait or poll takes no count and stops no handler")
+	check(base(11, tid) == dormant && base(26, tid) == dormant, "context: iTerminateThread and iWakeupThread run in a handler")
+	check(sema(7, semid) == 0 && count(semid) == 2, "context: iSignalSema signals in a handler")
+	s.intr = false
+
+	check(sema(9, semid) == 0 && sema(8, semid) == 0 && count(semid) == 0, "context: PollSema and WaitSema take a count on the loader")
+	check(sema(6, semid) == 0 && count(semid) == 1, "context: SignalSema on the loader")
+	check(base(20) == 0 && base(25, tid) == dormant, "context: GetThreadId and WakeupThread run on the loader")
+	check(base(5, tid) == 0 && sema(5, semid) == 0 && len(s.threads) == threads - 1 && len(s.semas) == semas - 1, "context: DeleteThread and DeleteSema on the loader")
+}
+
 // sceSifInit finds SIF set up, as at boot, and sceSifCheckInit says so.
 test_sifman :: proc() {
 	v5, ok5 := iop.sifman_fn(5)
@@ -3303,7 +3372,7 @@ test_sif_dma_intr :: proc() {
 	call(b, sm, 32, b + dmat, 1, b + hb, 0)
 	call(b, sm, 32, b + dmat, 1, b + h, 7)
 	iop.iop_tick(s.dma_cb[1].due)
-	check(core.compat.calls[key].n == 1 && word(b, d, 1) == 7 && s.n_dma_cb == 0, "sifman 32: one that waits is stopped with a row, the next still runs")
+	check(core.compat.calls[key].n == 0 && word(b, d, 1) == 7 && s.n_dma_cb == 0, "sifman 32: one that waits gets -100 and returns, no row, the next runs")
 
 	// One that sets itself again, the IOP idle: it runs once per due, and
 	// the next due is later, so the EE's time moves on between them.
@@ -3363,7 +3432,7 @@ test_libsd :: proc() {
 	// that records a0, a1, counts its calls and signals sem.
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6)
-	ts := imports(&a, "thsemap", 4, 6, 8)
+	ts := imports(&a, "thsemap", 4, 7, 8)
 	lsd := imports(&a, "libsd", ..LIBSD_FNOS[:])
 	d := at(&a)
 	put(&a, 0, 0, 0, 0, 0, 0)
@@ -4095,12 +4164,12 @@ test_cdvdman :: proc() {
 	cd_call(cd, 37, 0)
 	cd_call(cd, 6, 23, 1, b + buf, b + mode)
 	check(iop.iop_cd.n_pending == 0, "cdvdman: no callback set, none due")
-	// A callback that waits is stopped with a row; the next owed still runs.
+	// A callback that sleeps gets -100 and returns, no row; the next owed runs.
 	cd_call(cd, 37, b + cbb)
 	cd_call(cd, 6, 23, 1, b + buf, b + mode)
 	cd_call(cd, 5)
 	iop.iop_tick(r3000.state.cycles * 8)
-	check(core.compat.calls[core.Compat_Key{.Iop_Cd_Intr, b + cbb, 0}].n == 2 && iop.iop_cd.n_pending == 0, "cdvdman: a callback that waits is stopped, a row, each run")
+	check(core.compat.calls[core.Compat_Key{.Iop_Cd_Intr, b + cbb, 0}].n == 0 && iop.iop_cd.n_pending == 0, "cdvdman: a callback that sleeps is no row, each run")
 
 	// "modk" sets its own callback, reads, then fails: modc's put back, the
 	// load's run dropped; a run owed before the load stays.
@@ -4678,7 +4747,8 @@ test_timrman :: proc() {
 	check(word(b + d) == 18 && iop.iop_timr.armed == 0 && iop.tim_next_ee() == max(u64) && tm(t, 24, TIMER5) == neg(156), "timrman: v0 0 stops the timer")
 	check(tm(t, 23, TIMER5) == 0 && iop.iop_timr.armed == 1 << 5 && tm(t, 24, TIMER5) == 0 && iop.iop_timr.armed == 0, "timrman: started again, stopped")
 
-	// Handlers in interrupt context: an allocation is -100; a wait stops it.
+	// Handlers in interrupt context: an allocation is -100, and so is a sleep,
+	// after which the handler's v0 keeps its timer going.
 	tm(t, 20, TIMER5, 100, b + ha, 0)
 	cur := r3000.state.cycles
 	tm(t, 23, TIMER5)
@@ -4688,7 +4758,8 @@ test_timrman :: proc() {
 	cur = r3000.state.cycles
 	tm(t, 23, TIMER5)
 	iop.iop_tick((cur + 100) * 8)
-	check(core.compat.calls[core.Compat_Key{.Iop_Timer_Intr, b + hb, 0}].n == 1 && iop.iop_timr.armed == 0 && iop.iop_timr.t[5].mode == 0, "timrman: a handler that waits is stopped, a row, the timer stopped")
+	check(core.compat.calls[core.Compat_Key{.Iop_Timer_Intr, b + hb, 0}].n == 0 && iop.iop_timr.armed == 1 << 5, "timrman: a handler that sleeps is no row, its v0 100 keeps the timer")
+	check(tm(t, 24, TIMER5) == 0 && iop.iop_timr.armed == 0, "timrman: then stopped")
 
 	// A 16-bit timer: the compare's low 16 bits, 0 a full count, by the prescale.
 	tm(t, 20, TIMER2, 0x12345, b + h, 0)

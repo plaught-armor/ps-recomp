@@ -679,6 +679,47 @@ sema_delete :: proc(i: int) {
 	}
 }
 
+// ------------------------------------------------------------- call context
+
+Fno_Set :: bit_set[0 ..< 64; u64]
+Th_Lib :: enum u8 {Base, Semap, Event}
+
+// The calls of each library retail's threadman checks the context of, of
+// those served here, and which of them are its i-variants.
+@(rodata)
+TH_CHECKED := [Th_Lib]Fno_Set {
+	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 16, 20, 24, 25, 26, 33},
+	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
+	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
+}
+@(rodata)
+TH_IVAR := [Th_Lib]Fno_Set {
+	.Base  = {11, 26},
+	.Semap = {7, 12},
+	.Event = {7, 9, 14},
+}
+
+// The calls refused so far, each shown once under PS_DEBUG; not state.
+@(private = "file")
+th_refused: [Th_Lib]Fno_Set
+
+// Whether call fno of lib runs in the wrong context, as retail's threadman
+// asks QueryIntrContext first: an i-variant only in a handler, its other
+// checked calls only on a thread or the loader. The caller returns
+// KE_ILLEGAL_CONTEXT then, before it touches anything.
+@(private = "file")
+th_wrong_context :: proc(lib: Th_Lib, fno: u32) -> bool {
+	if fno >= 64 || int(fno) not_in TH_CHECKED[lib] || (int(fno) in TH_IVAR[lib]) == iop_sched.intr {return false}
+	if cpu.debug >= 1 && int(fno) not_in th_refused[lib] {
+		th_refused[lib] += {int(fno)}
+		fmt.eprintfln("iop: %v fno %d in the wrong context (intr %v) ra %08x", lib, fno, iop_sched.intr, r3000.state.r[31])
+	}
+	return true
+}
+
+// QueryIntrContext: 1 in a handler, else 0.
+iop_query_intr_context :: proc() -> u32 {return 1 if iop_sched.intr else 0}
+
 // ------------------------------------------------------------- thbase, thsemap
 
 // Function fno of thbase, reading a0..a2; v0, or false when the HLE lacks
@@ -687,6 +728,7 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	s := &iop_sched
 	r := &r3000.state.r
 	a0, a1, a2 := r[4], r[5], r[6]
+	if th_wrong_context(.Base, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
 	switch fno {
 	case 4: // CreateThread(iop_thread_t *): attr, option, entry, stacksize, priority
 		entry, size, prio := r32(a0 + 8), r32(a0 + 12), r32(a0 + 16)
@@ -766,6 +808,7 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 th_semap :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	s := &iop_sched
 	a0 := r3000.state.r[4]
+	if th_wrong_context(.Semap, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
 	switch fno {
 	case 4: // CreateSema(iop_sema_t *): attr, option, initial, max
 		append(&s.semas, Iop_Sema{s.next_semid, r32(a0), r32(a0 + 4), i32(r32(a0 + 8)), i32(r32(a0 + 12)), i32(r32(a0 + 8))})
@@ -804,8 +847,7 @@ th_semap :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if m.count == 0 {return ke(KE_SEMA_ZERO), true}
 		m.count -= 1
 		return KE_OK, true
-	case 11, 12: // ReferSemaStatus(semid, iop_sema_info_t *), iReferSemaStatus: each only in its context
-		if (fno == 12) != s.intr {return ke(KE_ILLEGAL_CONTEXT), true}
+	case 11, 12: // ReferSemaStatus(semid, iop_sema_info_t *), iReferSemaStatus
 		m := sema_find(a0)
 		if m == nil {return ke(KE_UNKNOWN_SEMID), true}
 		waiters: u32
@@ -845,7 +887,7 @@ th_event :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
 	a0, a1, a2, a3 := r[4], r[5], r[6], r[7]
 	if fno < 4 || fno > 14 || fno == 12 {return 0, false}
-	if s.intr != (fno == 7 || fno == 9 || fno == 14) {return ke(KE_ILLEGAL_CONTEXT), true}
+	if th_wrong_context(.Event, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
 	switch fno {
 	case 4: // CreateEventFlag(iop_event_t *): attr, option, bits
 		attr := r32(a0)

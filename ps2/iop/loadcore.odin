@@ -603,6 +603,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 			return KE_OK, true
 		case 18: // CpuResumeIntr(state)
 			return KE_OK, true
+		case 23: // QueryIntrContext
+			return iop_query_intr_context(), true
 		}
 	case "usbd":
 		// A class driver registering or dropping its LDD: no USB device ever
