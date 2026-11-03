@@ -3,6 +3,12 @@
 // reach another's. A game build sets its prefix:
 //
 //   odin build ... -define:ENV_PREFIX=GAME_
+//
+// TTY is an internal hint, not a setting: the launcher sets TTY=1 for a run
+// it starts only when its own stderr is a terminal, since it copies the
+// run's stderr there through a pipe; output written for a terminal (the
+// conversion's progress line) is then written as it would be without the
+// launcher. Unset, only whether stderr is a terminal counts.
 package core
 
 import "core:os"

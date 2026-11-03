@@ -39,6 +39,8 @@
 //   itself, which turns the function table off.
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
+// - launcher: the launcher's steps, settings, picture and runs
+//   (test_launcher), and play.log's plain lines (test_log_strip).
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -100,6 +102,8 @@ main :: proc() {
 	test_compat()
 	test_line_row()
 	test_library()
+	test_log_strip()
+	test_launcher()
 	if os.remove_all(tmp) != nil {
 		check("", false, fmt.tprintf("cannot remove %s", tmp))
 	}
@@ -1097,3 +1101,156 @@ jal :: proc(to: u32) -> u32 {return 0x0c000000 | (to >> 2) & 0x3ffffff}
 // rt = the 32-bit value.
 @(private = "file")
 la :: proc(rt, v: u32) -> [2]u32 {return {lui(rt, v >> 16), ori(rt, rt, v & 0xffff)}}
+
+// The launcher under a DATA of its own, with a PS1 and a PS2 disc: moving
+// stays within the list; Ok runs a disc; the settings screen cycles only the
+// values the runtime reads and saves them to the disc's settings.tsv (the
+// file gone when all are unset), refuses one the environment sets and shows
+// it locked; the picture has the selection bar and the thumbnail, and a
+// point maps to its row; a missing disc will not run and can be removed.
+// run_disc runs a disc to FRAMES with its stderr in play.log, and reports a
+// failed run's last stderr line.
+test_launcher :: proc() {
+	name := "launcher"
+	data, _ := filepath.join({tmp, "launcher_data"}, context.temp_allocator)
+	dir, _ := filepath.join({tmp, "launcher"}, context.temp_allocator)
+	old_data, old_sw, old_gpu := core.env("DATA"), core.env("SW"), core.env("GPU")
+	os.set_env(core.env_name("DATA"), data)
+	os.unset_env(core.env_name("SW"))
+	os.unset_env(core.env_name("GPU"))
+	defer {
+		os.set_env(core.env_name("DATA"), old_data)
+		os.set_env(core.env_name("SW"), old_sw)
+		os.set_env(core.env_name("GPU"), old_gpu)
+	}
+	if os.make_directory(dir) != nil {
+		check(name, false, "cannot make the launcher directory")
+		return
+	}
+	a, _ := filepath.join({dir, "a.iso"}, context.temp_allocator)
+	b, _ := filepath.join({dir, "b.iso"}, context.temp_allocator)
+	if os.write_entire_file(a, labeled(cnf_disc(), "DISC A")) != nil || os.write_entire_file(b, ps2_disc()) != nil {
+		check(name, false, "cannot write the discs")
+		return
+	}
+	_, added := play.library_add(dir)
+	l: play.Launcher
+	defer play.launcher_destroy(&l)
+	if !added || !play.launcher_init(&l) || len(l.discs) != 2 {
+		check(name, false, fmt.tprintf("library of %d", len(l.discs)))
+		return
+	}
+	W, H :: 480, 360
+	play.launcher_resize(&l, W, H)
+	lo := l.layout
+	check(name, lo.scale == 1 && lo.rows > 2, fmt.tprint("layout:", lo))
+	play.launcher_resize(&l, 2 * W + 7, 3 * H)
+	check(name, l.layout.scale == 2, fmt.tprint("scale at 967 x 1080:", l.layout.scale))
+	play.launcher_resize(&l, W, H)
+
+	step :: proc(l: ^play.Launcher, a: play.Action) -> play.Command {return play.launcher_step(l, a)}
+	_ = step(&l, .Down)
+	_ = step(&l, .Page_Down)
+	check(name, l.sel == 1, fmt.tprint("down past the end:", l.sel))
+	_ = step(&l, .Page_Up)
+	check(name, l.sel == 0, fmt.tprint("page up:", l.sel))
+	check(name, step(&l, .Ok) == .Launch && step(&l, .Quit) == .Quit, "ok, quit")
+
+	// PS1 settings: GPU vk, sw, unset; the file holds only what is set.
+	a_dir, _ := core.disc_dir(l.discs[0].id, context.temp_allocator)
+	a_set := core.disc_path(a_dir, .Settings, context.temp_allocator)
+	saved :: proc(path: string) -> string {
+		text, _ := os.read_entire_file(path, context.temp_allocator)
+		return string(text)
+	}
+	_ = step(&l, .Menu)
+	check(name, l.screen == .Settings && len(play.launcher_choices(&l)) == 2, "ps1 settings screen")
+	_ = step(&l, .Right)
+	check(name, saved(a_set) == "GPU\tvk\n", fmt.tprintf("GPU vk: %q", saved(a_set)))
+	_ = step(&l, .Ok)
+	check(name, saved(a_set) == "GPU\tsw\n", fmt.tprintf("GPU sw: %q", saved(a_set)))
+	_ = step(&l, .Right)
+	check(name, !os.exists(a_set) && l.settings.set == {}, "GPU unset leaves no file")
+	_ = step(&l, .Left)
+	check(name, saved(a_set) == "GPU\tsw\n", fmt.tprintf("GPU back to sw: %q", saved(a_set)))
+	// Set in the environment, even to "": locked.
+	os.set_env(core.env_name("NATIVE"), "")
+	_ = step(&l, .Down)
+	_ = step(&l, .Right)
+	text, locked := play.launcher_setting_text(&l, play.launcher_choices(&l)[1])
+	check(name, saved(a_set) == "GPU\tsw\n" && locked && strings.contains(text, core.env_name("NATIVE")), fmt.tprintf("locked: %q %q", text, saved(a_set)))
+	check(name, strings.contains(l.toast, core.env_name("NATIVE")), fmt.tprintf("locked toast %q", l.toast))
+	os.unset_env(core.env_name("NATIVE"))
+	_ = step(&l, .Back)
+	check(name, l.screen == .List && l.toast == "", "back to the list")
+
+	// PS2 settings: SCALE steps back from unset to 8.
+	_ = step(&l, .Down)
+	_ = step(&l, .Menu)
+	check(name, len(play.launcher_choices(&l)) == 4, "ps2 settings screen")
+	_ = step(&l, .Down)
+	_ = step(&l, .Left)
+	b_dir, _ := core.disc_dir(l.discs[1].id, context.temp_allocator)
+	check(name, saved(core.disc_path(b_dir, .Settings, context.temp_allocator)) == "SCALE\t8\n", "SCALE 8")
+	_ = step(&l, .Back)
+
+	// The picture: the bar on the selected row, the thumbnail, rows by point.
+	red := make([]u32, 320 * 240, context.temp_allocator)
+	slice.fill(red, 0xff0000)
+	core.thumb_path = core.disc_path(b_dir, .Thumb, context.temp_allocator)
+	core.thumb_save(red, 320, 320, 240, .Xrgb)
+	core.thumb_path = ""
+	check(name, play.launcher_reload(&l, b) && l.sel == 1 && l.thumb != nil, "reload keeps b with its thumbnail")
+	px := make([]u32, W * H, context.temp_allocator)
+	play.launcher_draw(&l, px)
+	lo = l.layout
+	bar_y := lo.list_y + lo.line
+	check(name, px[bar_y * W + lo.margin] == 0x2c4c70 && px[lo.list_y * W + lo.margin] != 0x2c4c70, "selection bar")
+	check(name, px[lo.list_y * W + lo.panel_x] == 0xff0000 && px[(lo.list_y + core.THUMB_H - 1) * W + lo.panel_x + core.THUMB_W - 1] == 0xff0000, "thumbnail")
+	check(name, play.launcher_row_at(&l, lo.margin, bar_y) == 1 && play.launcher_row_at(&l, lo.margin, lo.list_y + 2 * lo.line) == -1 && play.launcher_row_at(&l, 0, bar_y) == -1, "row at a point")
+
+	// A missing disc: no run, no settings; removed.
+	_ = os.rename(a, fmt.tprint(a, ".gone"))
+	check(name, play.launcher_reload(&l, a) && l.sel == 0 && l.discs[0].missing, "a missing")
+	check(name, step(&l, .Launch) == .None && l.toast != "" && step(&l, .Menu) == .None && l.screen == .List, "a missing runs")
+	_ = step(&l, .Remove)
+	check(name, len(l.discs) == 1 && l.discs[0].info[.Path] == b, fmt.tprint("removed:", len(l.discs)))
+	_ = os.rename(fmt.tprint(a, ".gone"), a)
+
+	// A run: to FRAMES, its stderr in play.log; a failed one's last line.
+	self, _ := os.get_executable_path(context.temp_allocator)
+	ok, last := play.run_disc(self, a, id_of(a))
+	log := saved(core.disc_path(a_dir, .Play_Log, context.temp_allocator))
+	check(name, ok && strings.contains(log, fmt.tprintf("frames: %d reached", FRAMES)), fmt.tprintf("run: %v %q, play.log %q", ok, last, log))
+	not_disc, _ := filepath.join({dir, "c.iso"}, context.temp_allocator)
+	_ = os.write_entire_file(not_disc, transmute([]u8)string("not a disc"))
+	ok, last = play.run_disc(self, not_disc, l.discs[0].id)
+	check(name, !ok && strings.contains(last, "is not a disc image"), fmt.tprintf("failed run: %v %q", ok, last))
+}
+
+// play.log's text: a carriage return a line break, CSI sequences and
+// two-byte ESC sequences dropped, a sequence cut between chunks too.
+test_log_strip :: proc() {
+	cases := [?]struct {
+		chunks: []string,
+		want:   string,
+	} {
+		{{"plain\n"}, "plain\n"},
+		{{"1/3\r\x1b[K2/3\r\x1b[K3/3\n"}, "1/3\n2/3\n3/3\n"},
+		{{"a\x1b[1;31mred\x1b[0m b\r\n"}, "ared b\n\n"},
+		{{"x\x1b", "[2", "Ky"}, "xy"},
+		{{"x\x1b", "7y"}, "xy"},
+		{{"\x1b"}, ""},
+	}
+	for c in cases {
+		esc: play.Log_Escape
+		out := strings.builder_make(context.temp_allocator)
+		for chunk in c.chunks {
+			dst := make([]u8, len(chunk), context.temp_allocator)
+			n := play.log_strip(&esc, transmute([]u8)chunk, dst)
+			strings.write_bytes(&out, dst[:n])
+		}
+		got := strings.to_string(out)
+		check("log_strip", got == c.want, fmt.tprintf("%q gave %q, want %q", c.chunks, got, c.want))
+	}
+}

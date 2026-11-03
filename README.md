@@ -118,6 +118,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 
 Other settings exist, mostly for debugging. They are described in the code
 where each one is read. See [docs/how-it-works.md](docs/how-it-works.md#settings-in-the-code).
+`PS_TTY` is not a setting: the launcher sets it for the games it starts.
 
 ### Where your files go
 

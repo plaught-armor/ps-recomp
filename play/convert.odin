@@ -68,11 +68,12 @@ convert_store :: proc(image, dir: string) -> bool {
 }
 
 // Copy the child's output from r to stderr until it closes; on a terminal
-// each line overwrites the one before. The last non-empty line, temp
-// allocated.
+// (or with TTY=1, which the launcher sets when its stderr is one and it
+// copies a run's stderr there) each line overwrites the one before. The
+// last non-empty line, temp allocated.
 @(private = "file")
 relay :: proc(r: ^os.File) -> string {
-	tty := os.is_tty(os.stderr)
+	tty := os.is_tty(os.stderr) || core.env("TTY") == "1"
 	line, last: [dynamic]u8
 	line.allocator = context.temp_allocator
 	last.allocator = context.temp_allocator

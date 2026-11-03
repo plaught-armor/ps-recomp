@@ -1,6 +1,7 @@
 // play: run a game from its disc image.
 //
-// Usage: play <disc image>
+// Usage: play
+//        play <disc image>
 //        play --compat <disc image | directory> [frames]
 //
 // The disc image (a .cue sheet, or a single-track .bin or .iso) is all it
@@ -11,6 +12,9 @@
 // use it. A dev build (no COMMIT) converts every time. When the conversion
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
+//
+// With no disc image it opens the launcher (launcher_window.odin), a window
+// listing the library's discs to run.
 //
 // --compat runs each disc headless to a vblank count as a compatibility
 // run and keeps a row per disc in compat.tsv under DATA (compat.odin).
@@ -33,6 +37,8 @@ main :: proc() {
 // status: 0 when the game ends, 1 on a failure, 2 on a usage error.
 run :: proc(args: []string) -> int {
 	switch {
+	case len(args) == 1:
+		return launcher(args[0])
 	case len(args) == 4 && args[1] == "--convert":
 		return convert(args[2], args[3])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
@@ -40,7 +46,8 @@ run :: proc(args: []string) -> int {
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
 		return play(args[1])
 	}
-	fmt.eprintln("usage: play <disc image>")
+	fmt.eprintln("usage: play")
+	fmt.eprintln("       play <disc image>")
 	fmt.eprintln("       play --compat <disc image | directory> [frames]")
 	return 2
 }
