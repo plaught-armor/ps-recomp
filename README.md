@@ -73,6 +73,58 @@ the same build start at once.
 If the conversion fails, the game still runs, but slowly. It then runs
 through an interpreter, which works out each instruction as it goes.
 
+## The launcher
+
+Run `play-bin` with no disc to open the launcher:
+
+```sh
+./play-bin
+```
+
+It shows your library of discs. To add one, drag a disc image (`.cue`,
+`.iso` or `.bin`) onto the window, or a folder to add every image in it.
+The launcher remembers where each image is. It never copies or moves the
+file. If you move or delete an image, its disc shows as missing in red;
+you can then take it off the list. Its saves are kept.
+
+The selected disc shows its picture from the last time you quit it, and
+its result from [the compatibility check](#check-which-of-your-games-run).
+Start a disc and the launcher hides until the game ends. If the game
+fails, the launcher shows the last line it printed. Everything it printed
+is also kept in `play.log` (see [Where your files go](#where-your-files-go)).
+
+The settings screen changes [settings](#settings) for the selected disc
+or, after a switch, for all discs. A change is saved at once. Each row
+says where its value comes from:
+
+| Shown | Where the value comes from |
+|---|---|
+| `(set by PS_...)` | An environment variable. It wins over everything, and the launcher cannot change it. |
+| `(this disc)` | This disc's own setting. It wins over all discs. |
+| `(all discs)` | The setting for all discs. |
+| nothing | The default. |
+
+Clearing a row removes the setting from the screen you are on, so the
+next one down holds.
+
+| Action | Keyboard | Controller | Mouse |
+|---|---|---|---|
+| Move up or down | Up / Down | D-pad or left stick | Wheel |
+| Move a page | Page Up / Page Down | L1 / R1 (LB / RB) | |
+| Play the disc (list) | Return | A | Double-click |
+| Play the disc (either screen) | | Start | |
+| Open the settings (list) | Tab | X | |
+| Switch this disc / all discs (settings) | Tab | X | |
+| Change a setting | Left / Right, or Return for the next choice | D-pad or left stick left / right, or A | Double-click the row |
+| Clear a setting (settings) | Delete | Y | |
+| Take a missing disc off the list | Delete | Y | |
+| Back to the list | Esc or Backspace | B | |
+
+The controller column is read from the code. It has not been tried with a
+controller. Dropping a folder has been tested only by the automated tests.
+The launcher has only been run on Linux. On Windows and macOS it is
+untested.
+
 ## Controls
 
 A game controller works with the usual layout. The buttons map by
@@ -115,6 +167,12 @@ PS_GPU=sw ./play-bin path/to/game.cue
 | `PS_SW` | PS2 only. `1` draws in software. Otherwise PS2 games draw with Vulkan. |
 | `PS_SCALE` | PS2 only. The window size, as a multiple of the console's resolution. 1 to 8. The default is 3. |
 | `PS_IRX` | PS2 only. By default, a game's own sound and input/output modules run on an emulated copy of the console's I/O processor. `0` turns that off: each module is answered as loaded, without running it. |
+| `PS_NATIVE` | `0` runs the game through the interpreter instead of as native code. Slower; for checking a bug. |
+
+`PS_GPU`, `PS_SW`, `PS_SCALE`, `PS_IRX` and `PS_NATIVE` can also be set
+in the [launcher](#the-launcher). It keeps them in `settings.tsv` files:
+one for all discs in the data folder, and one in each disc's folder. An
+environment variable always wins over both.
 
 Other settings exist, mostly for debugging. They are described in the code
 where each one is read. See [docs/how-it-works.md](docs/how-it-works.md#settings-in-the-code).
@@ -123,7 +181,11 @@ where each one is read. See [docs/how-it-works.md](docs/how-it-works.md#settings
 ### Where your files go
 
 Saves, memory cards and converted code are kept for each disc in a user
-data folder, under `discs/<disc id>/`:
+data folder, under `discs/<disc id>/`. So are the disc's launcher
+settings (`settings.tsv`), its picture (`thumb.ppm`) and the output of
+its last launcher run (`play.log`). The launcher's list of discs is
+`library.tsv`, and the settings for all discs are `settings.tsv`, both in
+the data folder itself.
 
 | System | Default location |
 |---|---|
