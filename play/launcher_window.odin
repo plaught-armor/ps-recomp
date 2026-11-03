@@ -65,6 +65,7 @@ launcher :: proc(exe: string) -> int {
 		return 1
 	}
 	defer sdl.DestroyWindow(w.win)
+	sdl.SetWindowMinimumSize(w.win, LAYOUT_W, LAYOUT_H)
 	w.renderer = sdl.CreateRenderer(w.win, -1, {})
 	if w.renderer == nil {
 		fmt.eprintln("SDL_CreateRenderer:", sdl.GetError())
@@ -255,11 +256,16 @@ window_wait :: proc(w: ^Window, l: ^Launcher) -> Action {
 		again := r == l.sel
 		launcher_select_row(l, r)
 		return .Ok if again && e.button.clicks >= 2 else .None
+	case .DROPBEGIN:
+		// Every file of one drop, to DROPCOMPLETE, gets one toast.
+		launcher_drop_begin(l)
 	case .DROPFILE:
 		// SDL's copy is ours to free.
 		path := strings.clone_from_cstring(e.drop.file, context.temp_allocator)
 		sdl.free(rawptr(e.drop.file))
 		launcher_add(l, path)
+	case .DROPCOMPLETE:
+		launcher_drop_end(l)
 	case .MOUSEWHEEL:
 		if e.wheel.y > 0 {
 			return .Up

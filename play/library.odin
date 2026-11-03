@@ -101,11 +101,12 @@ library_load :: proc(allocator := context.allocator) -> (discs: [dynamic]Library
 
 // Add the disc image at path, or each one in the directory at path as
 // play --compat finds them, to the library: a row for each new path, the
-// row of a path already there made its disc's again. The number added;
-// false, after a message, without a data directory or when library.tsv
-// cannot be written. A file that is not a disc with an executable, or whose
-// path holds a tab or a line break, is skipped after a message.
-library_add :: proc(path: string) -> (added: int, ok: bool) {
+// row of a path already there made its disc's again. The number added and
+// the number skipped; false, after a message, without a data directory or
+// when library.tsv cannot be written. A file that is not a disc with an
+// executable, or whose path holds a tab or a line break, is skipped after a
+// message.
+library_add :: proc(path: string) -> (added, skipped: int, ok: bool) {
 	context.allocator = context.temp_allocator
 	data := core.data_dir() or_return
 	abs := library_path(path)
@@ -118,14 +119,20 @@ library_add :: proc(path: string) -> (added: int, ok: bool) {
 	for image in compat_images(abs) {
 		if strings.contains_any(image, "\t\r\n") {
 			fmt.eprintln("play: a tab or line break in its path keeps", image, "out of the library")
+			skipped += 1
 			continue
 		}
 		fi, serr := os.stat(image, context.temp_allocator)
 		if serr != nil {
 			fmt.eprintln("play: cannot read", image, serr)
+			skipped += 1
 			continue
 		}
-		id, _ := disc_record(image, fi) or_continue
+		id, _, is_disc := disc_record(image, fi)
+		if !is_disc {
+			skipped += 1
+			continue
+		}
 		put := false
 		for &r in rows {
 			if r.path == image {
@@ -138,7 +145,7 @@ library_add :: proc(path: string) -> (added: int, ok: bool) {
 		added += 1
 	}
 	index_write(index, rows[:]) or_return
-	return added, true
+	return added, skipped, true
 }
 
 // Take the image at path out of the library; its disc's directory, saves

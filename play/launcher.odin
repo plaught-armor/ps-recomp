@@ -4,7 +4,7 @@
 //
 // Two screens: the library list, with the selected disc's thumbnail and
 // compatibility result beside it, and the settings, of the selected disc or
-// of all discs (Scope). A setting changed or cleared is saved to that scope's
+// of all discs (Scope), across the whole width. A setting changed or cleared is saved to that scope's
 // settings.tsv at once, and only as a value the runtime reads (PS1_CHOICES,
 // PS2_CHOICES, GLOBAL_CHOICES); the run started reads it there itself
 // (settings_apply), so the launcher never puts a setting in its environment.
@@ -14,6 +14,7 @@ package play
 
 import "core:fmt"
 import "core:mem/virtual"
+import "core:strings"
 import "ps:core"
 
 Screen :: enum {
@@ -93,9 +94,24 @@ Layout :: struct {
 	margin:      int,
 	list_y:      int, // the first list row's top
 	list_w:      int, // the list's width, from margin
+	wide_w:      int, // the settings rows' width, from margin (no panel)
 	rows:        int, // list rows that fit
 	panel_x:     int, // the details panel's left edge
 	footer_y:    int,
+}
+
+// The settings screen's label column, in characters.
+@(private = "file")
+LABEL_W :: 16
+
+// What the paths of one drop did, from its first path to its last: the
+// discs new to the library, those already there, the files skipped as not
+// disc images, whether the library could not be written, and the first new
+// disc's row (-1 before one).
+Drop_Tally :: struct {
+	added, already, skipped: int,
+	failed:                  bool,
+	first:                   int,
 }
 
 Launcher :: struct {
@@ -103,6 +119,9 @@ Launcher :: struct {
 	sel, top:   int,
 	screen:     Screen,
 	row:        int, // the settings screen's selected row
+	row_top:    int, // the settings screen's first row shown
+	drop:       Drop_Tally, // the drop under way, or the last one
+	dropping:   bool, // between launcher_drop_begin and launcher_drop_end
 	scope:      Scope, // the settings screen's file
 	settings:   core.Settings, // the selected disc's settings.tsv
 	global:     core.Settings, // <data>/settings.tsv
@@ -152,9 +171,14 @@ launcher_reload :: proc(l: ^Launcher, path: string) -> bool {
 	return true
 }
 
+// The picture size each integer scale is a multiple of; the window is never
+// made smaller.
+LAYOUT_W :: 480
+LAYOUT_H :: 360
+
 // Set the picture size the launcher draws.
 launcher_resize :: proc(l: ^Launcher, w, h: int) {
-	s := max(1, min(w / 480, h / 360))
+	s := max(1, min(w / LAYOUT_W, h / LAYOUT_H))
 	lo := l.layout
 	lo.w, lo.h, lo.scale = w, h, s
 	lo.line = (core.FONT_GLYPH + 2) * s
@@ -162,6 +186,7 @@ launcher_resize :: proc(l: ^Launcher, w, h: int) {
 	lo.list_y = lo.margin + 2 * lo.line
 	lo.panel_x = w - lo.margin - core.THUMB_W * s
 	lo.list_w = max(lo.panel_x - 2 * lo.margin, 0)
+	lo.wide_w = max(w - 2 * lo.margin, 0)
 	lo.footer_y = h - lo.margin - lo.line
 	lo.rows = max((lo.footer_y - lo.line - lo.list_y) / lo.line, 1)
 	l.layout = lo
@@ -215,7 +240,7 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 			if d.missing {
 				launcher_toast(l, "This disc image is missing; Delete or Y removes it.")
 			} else {
-				l.screen, l.row, l.scope = .Settings, 0, .Disc
+				l.screen, l.row, l.row_top, l.scope = .Settings, 0, 0, .Disc
 			}
 		case .Remove:
 			if !d.missing {
@@ -234,6 +259,10 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 			l.row = (l.row + n - 1) % n
 		case .Down:
 			l.row = (l.row + 1) % n
+		case .Page_Up:
+			l.row = max(l.row - l.layout.rows, 0)
+		case .Page_Down:
+			l.row = min(l.row + l.layout.rows, n - 1)
 		case .Left:
 			change_setting(l, -1)
 		case .Right, .Ok:
@@ -242,37 +271,85 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 			clear_setting(l)
 		case .Menu:
 			l.scope = .Global if l.scope == .Disc else .Disc
-			l.row = 0
+			l.row, l.row_top = 0, 0
 		case .Back:
 			l.screen = .List
 		}
+		keep_visible(l)
 	}
 	return .None
 }
 
 // Add the disc image at path, or each one in the directory at path, to the
 // library (library_add: the file stays where it is), back on the list
-// screen with the first disc new to the library selected, else the image at
-// path. A toast says how many were added, or why none was.
+// screen with the first disc new to the drop selected, else the image at
+// path. Between launcher_drop_begin and launcher_drop_end every path counts
+// toward one drop; otherwise path is a drop of its own. A toast says what
+// the drop has done so far.
 launcher_add :: proc(l: ^Launcher, path: string) {
-	l.toast = ""
+	if !l.dropping {
+		l.drop = {first = -1}
+	}
+	t := &l.drop
 	before := len(l.discs)
-	added, ok := library_add(path)
+	added, skipped, ok := library_add(path)
 	if !ok || !launcher_reload(l, path) {
-		launcher_toast(l, "Cannot write the library (see the terminal).")
-		return
+		t.failed = true
+	} else {
+		l.screen = .List
+		fresh := max(len(l.discs) - before, 0)
+		t.added += fresh
+		t.already += max(added - fresh, 0)
+		// A path with nothing found in it is itself not a disc image.
+		t.skipped += skipped if added + skipped > 0 else 1
+		if fresh > 0 && t.first < 0 {
+			t.first = before
+		}
+		if t.first >= 0 {
+			launcher_select_row(l, t.first)
+		}
 	}
-	l.screen = .List
-	fresh := len(l.discs) - before
+	launcher_toast(l, drop_text(t^))
+}
+
+// A drop of several paths begins: they count as one. A drop begun before
+// and never ended counts no more.
+launcher_drop_begin :: proc(l: ^Launcher) {
+	l.drop, l.dropping = {first = -1}, true
+}
+
+launcher_drop_end :: proc(l: ^Launcher) {
+	l.dropping = false
+}
+
+// The toast for drop t: what its paths came to, by count.
+@(private = "file")
+drop_text :: proc(t: Drop_Tally) -> string {
 	switch {
-	case added == 0:
-		launcher_toast(l, "No disc image there (see the terminal).")
-	case fresh <= 0:
-		launcher_toast(l, "Already in the library.")
-	case:
-		launcher_select_row(l, before)
-		launcher_toast(l, fmt.tprintf("Added %d disc%s.", fresh, "" if fresh == 1 else "s"))
+	case t.failed:
+		return "Cannot write the library (see the terminal)."
+	case t.already == 0 && t.skipped == 0:
+		return fmt.tprintf("Added %d disc%s.", t.added, "" if t.added == 1 else "s")
+	case t.added == 0 && t.skipped == 0:
+		return "Already in the library."
+	case t.added == 0 && t.already == 0:
+		return "No disc image there (see the terminal)."
 	}
+	b := strings.builder_make(context.temp_allocator)
+	sep := ""
+	if t.added > 0 {
+		fmt.sbprintf(&b, "Added %d disc%s", t.added, "" if t.added == 1 else "s")
+		sep = ", "
+	}
+	if t.already > 0 {
+		fmt.sbprintf(&b, "%s%d already in the library", sep, t.already)
+		sep = ", "
+	}
+	if t.skipped > 0 {
+		fmt.sbprintf(&b, "%s%d %s (see the terminal)", sep, t.skipped, "not a disc image" if t.skipped == 1 else "not disc images")
+	}
+	strings.write_byte(&b, '.')
+	return strings.to_string(b)
 }
 
 // Show message t until the next action, cut to fit toast_buf.
@@ -294,14 +371,18 @@ launcher_select_row :: proc(l: ^Launcher, row: int) {
 // (x, y), or -1.
 launcher_row_at :: proc(l: ^Launcher, x, y: int) -> int {
 	lo := l.layout
-	if x < lo.margin || x >= lo.margin + lo.list_w || y < lo.list_y {
+	w := lo.wide_w if l.screen == .Settings else lo.list_w
+	if x < lo.margin || x >= lo.margin + w || y < lo.list_y {
 		return -1
 	}
 	r := (y - lo.list_y) / lo.line
-	if l.screen == .Settings {
-		return r if r < len(launcher_choices(l)) else -1
+	if r >= lo.rows {
+		return -1
 	}
-	if r >= lo.rows || l.top + r >= len(l.discs) {
+	if l.screen == .Settings {
+		return l.row_top + r if l.row_top + r < len(launcher_choices(l)) else -1
+	}
+	if l.top + r >= len(l.discs) {
 		return -1
 	}
 	return l.top + r
@@ -328,11 +409,31 @@ launcher_select :: proc(l: ^Launcher) {
 	l.thumb = core.thumb_load(core.disc_path(dir, .Thumb, context.temp_allocator), alloc)
 }
 
+// Scroll the list and the settings rows so each one's selected row shows.
 @(private = "file")
 keep_visible :: proc(l: ^Launcher) {
 	rows := max(l.layout.rows, 1)
 	l.top = clamp(l.top, max(l.sel - rows + 1, 0), l.sel)
 	l.top = clamp(l.top, 0, max(len(l.discs) - rows, 0))
+	l.row_top = clamp(l.row_top, max(l.row - rows + 1, 0), l.row)
+	l.row_top = clamp(l.row_top, 0, max(len(launcher_choices(l)) - rows, 0))
+}
+
+// The characters the settings screen's value column holds.
+launcher_value_chars :: proc(l: ^Launcher) -> int {
+	return l.layout.wide_w / (core.FONT_GLYPH * l.layout.scale) - 1 - LABEL_W
+}
+
+// str cut to n characters, its last three "..." when it is cut, so a cut
+// shows.
+launcher_fit :: proc(str: string, n: int) -> string {
+	if len(str) <= n {
+		return str
+	}
+	if n < 3 {
+		return str[:max(n, 0)]
+	}
+	return strings.concatenate({str[:n - 3], "..."}, context.temp_allocator)
 }
 
 // The settings file of the settings screen's scope: its settings in l and
@@ -484,21 +585,27 @@ launcher_draw :: proc(l: ^Launcher, px: []u32) {
 			text(px, lo, m, lo.footer_y, "Enter/A play  Tab/X settings  Del/Y remove a missing disc", .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
 		case .Settings:
 			title := "all discs" if l.scope == .Global else d.info[.Title] if d.info[.Title] != "" else d.id
-			text(px, lo, m, m, fmt.tprintf("Settings: %s", title), .Dim, chars)
-			label_w := 16
-			for c, i in launcher_choices(l) {
-				ry := lo.list_y + i * line
+			// The rows take the panel's width too, so a value and where it
+			// comes from fit in the smallest window.
+			wide := lo.wide_w / (core.FONT_GLYPH * s)
+			text(px, lo, m, m, fmt.tprintf("Settings: %s", title), .Dim, wide)
+			choices := launcher_choices(l)
+			vc := launcher_value_chars(l)
+			for i in l.row_top ..< min(l.row_top + lo.rows, len(choices)) {
+				ry := lo.list_y + (i - l.row_top) * line
 				if i == l.row {
-					fill(px, lo.w, m, ry - s, lo.list_w, line, .Select)
+					fill(px, lo.w, m, ry - s, lo.wide_w, line, .Select)
 				}
-				t, locked := launcher_setting_text(l, c)
-				text(px, lo, m + s, ry, c.label, .Text, min(label_w, chars - 1))
-				text(px, lo, m + s + label_w * core.FONT_GLYPH * s, ry, t, .Dim if locked else .Text, chars - 1 - label_w)
+				t, locked := launcher_setting_text(l, choices[i])
+				text(px, lo, m + s, ry, choices[i].label, .Text, min(LABEL_W, wide - 1))
+				text(px, lo, m + s + LABEL_W * core.FONT_GLYPH * s, ry, launcher_fit(t, vc), .Dim if locked else .Text, vc)
 			}
 			other := "this disc" if l.scope == .Global else "all discs"
 			text(px, lo, m, lo.footer_y, fmt.tprintf("Left/Right set  Del/Y clear  Tab/X %s  Esc/B back", other), .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
 		}
-		draw_details(l, px, d)
+		if l.screen == .List {
+			draw_details(l, px, d)
+		}
 	}
 	if l.toast != "" {
 		ty := lo.footer_y - line - s

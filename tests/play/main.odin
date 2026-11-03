@@ -726,9 +726,9 @@ test_library :: proc() {
 		check(name, false, "cannot write compat.tsv")
 	}
 
-	added, ok := play.library_add(dir)
+	added, _, ok := play.library_add(dir)
 	check(name, ok && added == 2, fmt.tprintf("added %d, %v", added, ok))
-	added, ok = play.library_add(a)
+	added, _, ok = play.library_add(a)
 	check(name, ok && added == 1, "adding a again")
 	discs, loaded := play.library_load(context.temp_allocator)
 	check(name, loaded && len(discs) == 2, fmt.tprintf("%d discs", len(discs)))
@@ -1142,7 +1142,7 @@ test_launcher :: proc() {
 	// directory is under /var).
 	a_real, _ := filepath.abs(a, context.temp_allocator)
 	b_real, _ := filepath.abs(b, context.temp_allocator)
-	_, added := play.library_add(dir)
+	_, _, added := play.library_add(dir)
 	l: play.Launcher
 	defer play.launcher_destroy(&l)
 	if !added || !play.launcher_init(&l) || len(l.discs) != 2 {
@@ -1293,8 +1293,112 @@ test_launcher :: proc() {
 	play.launcher_add(&l, junk)
 	check(name, len(l.discs) == 2 && l.sel == 1 && strings.has_prefix(l.toast, "No disc image"), fmt.tprintf("dropped junk: %d %q", len(l.discs), l.toast))
 	play.launcher_add(&l, drop)
-	check(name, len(l.discs) == 4 && l.sel == 2 && l.discs[2].info[.Path] == c_real && l.toast == "Added 2 discs.", fmt.tprintf("dropped a directory: %d %d %q", len(l.discs), l.sel, l.toast))
+	check(name, len(l.discs) == 4 && l.sel == 2 && l.discs[2].info[.Path] == c_real && l.toast == "Added 2 discs, 1 not a disc image (see the terminal).", fmt.tprintf("dropped a directory: %d %d %q", len(l.discs), l.sel, l.toast))
 	check(name, step(&l, .Down) == .None && l.toast == "", "the toast goes with the next action")
+
+	// One drop of several paths: one toast for them all, the first new disc
+	// selected. A drop begun and never ended counts no more once another
+	// begins; a path dropped after an end is a drop of its own.
+	burst, _ := filepath.join({tmp, "launcher_burst"}, context.temp_allocator)
+	f, _ := filepath.join({burst, "f.iso"}, context.temp_allocator)
+	g, _ := filepath.join({burst, "g.iso"}, context.temp_allocator)
+	if os.make_directory(burst) != nil || os.write_entire_file(f, labeled(cnf_disc(), "DISC F")) != nil || os.write_entire_file(g, labeled(cnf_disc(), "DISC G")) != nil {
+		check(name, false, "cannot write the burst's discs")
+		return
+	}
+	f_real, _ := filepath.abs(f, context.temp_allocator)
+	n := len(l.discs)
+	play.launcher_drop_begin(&l)
+	play.launcher_add(&l, f)
+	play.launcher_add(&l, a)
+	play.launcher_add(&l, junk)
+	play.launcher_add(&l, g)
+	play.launcher_drop_end(&l)
+	check(name, len(l.discs) == n + 2 && l.sel == n && l.discs[n].info[.Path] == f_real && l.toast == "Added 2 discs, 1 already in the library, 1 not a disc image (see the terminal).", fmt.tprintf("a burst: %d %d %q", len(l.discs), l.sel, l.toast))
+	play.launcher_drop_begin(&l)
+	play.launcher_add(&l, f)
+	play.launcher_drop_begin(&l)
+	play.launcher_add(&l, junk)
+	check(name, l.toast == "No disc image there (see the terminal).", fmt.tprintf("a burst never ended: %q", l.toast))
+	play.launcher_drop_end(&l)
+	play.launcher_add(&l, g)
+	check(name, l.toast == "Already in the library.", fmt.tprintf("a drop after the end: %q", l.toast))
+
+	// At the smallest window each value a choice can take, from wherever it
+	// comes, fits the settings' value column whole, across the panel's
+	// width; a value from the environment that is no choice ends in "..."
+	// where it is cut.
+	vc := play.launcher_value_chars(&l)
+	worst := ""
+	setting_names := core.SETTING_NAMES
+	for row in 0 ..< 2 {
+		play.launcher_select_row(&l, row)
+		for scope in play.Scope {
+			l.scope = scope
+			for c in play.launcher_choices(&l) {
+				for v in c.values {
+					for from in 0 ..< 3 {
+						l.settings, l.global = {}, {}
+						switch from {
+						case 0:
+							l.settings.set, l.settings.value[c.setting] = {c.setting}, v
+						case 1:
+							l.global.set, l.global.value[c.setting] = {c.setting}, v
+						case 2:
+							when ODIN_OS == .Windows {
+								if v == "" {continue}
+							}
+							os.set_env(core.env_name(setting_names[c.setting]), v)
+						}
+						t, _ := play.launcher_setting_text(&l, c)
+						if len(t) > vc {
+							worst = t
+						}
+						os.unset_env(core.env_name(setting_names[c.setting]))
+					}
+				}
+			}
+		}
+	}
+	check(name, vc > 0 && worst == "", fmt.tprintf("a value cut at %d: %q", vc, worst))
+	l.scope = .Global
+	os.set_env(core.env_name("SCALE"), "a value no choice has, set by hand")
+	text, _ = play.launcher_setting_text(&l, play.GLOBAL_CHOICES[2])
+	cut := play.launcher_fit(text, vc)
+	check(name, len(text) > vc && len(cut) == vc && strings.has_suffix(cut, "...") && strings.has_prefix(text, cut[:vc - 3]), fmt.tprintf("a long value cut: %q", cut))
+	os.unset_env(core.env_name("SCALE"))
+	check(name, play.launcher_reload(&l, "") && step(&l, .Menu) == .None, "back to the disc's settings")
+	play.launcher_draw(&l, px)
+	lo = l.layout
+	check(name, px[lo.list_y * W + lo.margin + lo.wide_w - 1] == 0x2c4c70 && px[lo.list_y * W + lo.panel_x] == 0x2c4c70, "the settings rows take the panel's width")
+	_ = step(&l, .Back)
+
+	// A window too short for every row: the list and the settings scroll to
+	// keep the selected row in view, and a point maps through the scroll.
+	play.launcher_resize(&l, W, lo.list_y + 4 * lo.line + lo.margin)
+	lo = l.layout
+	check(name, lo.rows == 2 && len(l.discs) >= 6, fmt.tprintf("a short window: %d rows, %d discs", lo.rows, len(l.discs)))
+	play.launcher_select_row(&l, 0)
+	_ = step(&l, .Down)
+	_ = step(&l, .Down)
+	_ = step(&l, .Down)
+	check(name, l.sel == 3 && l.top == 2 && play.launcher_row_at(&l, lo.margin, lo.list_y) == 2 && play.launcher_row_at(&l, lo.margin, lo.list_y + lo.line) == 3 && play.launcher_row_at(&l, lo.margin, lo.list_y + 2 * lo.line) == -1, fmt.tprintf("list scrolled: sel %d top %d", l.sel, l.top))
+	_ = step(&l, .Page_Up)
+	check(name, l.sel == 1 && l.top == 1, fmt.tprintf("list page up: sel %d top %d", l.sel, l.top))
+	_ = step(&l, .Menu)
+	_ = step(&l, .Menu)
+	_ = step(&l, .Down)
+	_ = step(&l, .Down)
+	_ = step(&l, .Down)
+	check(name, l.scope == .Global && l.row == 3 && l.row_top == 2 && play.launcher_row_at(&l, lo.margin, lo.list_y + lo.line) == 3, fmt.tprintf("settings scrolled: row %d top %d", l.row, l.row_top))
+	for _ in 0 ..< 4 {
+		_ = step(&l, .Up)
+	}
+	check(name, l.row == 4 && l.row_top == 3, fmt.tprintf("settings up past the top: row %d top %d", l.row, l.row_top))
+	_ = step(&l, .Page_Up)
+	check(name, l.row == 2 && l.row_top == 2, fmt.tprintf("settings page up: row %d top %d", l.row, l.row_top))
+	_ = step(&l, .Back)
+	play.launcher_resize(&l, W, H)
 
 	// A run: to FRAMES, its stderr in play.log; a failed one's last line.
 	self, _ := os.get_executable_path(context.temp_allocator)
