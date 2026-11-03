@@ -62,6 +62,7 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 		case 0xe010:
 			mem.dmac_stat &~= w & 0xffff
 			mem.dmac_stat ~= w & 0xffff0000
+			iop.sif_wake()
 			return
 		case 0xf000:
 			mem.intc_stat &~= w

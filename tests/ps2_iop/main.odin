@@ -2093,6 +2093,65 @@ test_reply_due :: proc() {
 	check(iop.sif_next_ee() == 10000, "reply due: the IOP behind, due at once")
 	iop.sif_pump()
 	check(pumped(0x14), "reply due: pumped at once")
+
+	// The FIFO tail: a reply sent while the IOP is behind waits for the
+	// earlier one still in flight.
+	cpu.state.cycles = 1000
+	r3000.state.cycles = 500
+	send(&pkt, 0x15)
+	r3000.state.cycles = 50
+	send(&pkt, 0x16)
+	check(iop.sif.replies[0].due == 4000 && iop.sif.replies[1].due == 4000, "reply due: a later reply waits for the one in flight")
+	drop_replies()
+
+	// A reply the EE side builds is due at EE now, whatever the IOP clock:
+	// r3000 idles up to a slice past it.
+	cpu.next_event = max(u64)
+	send_pkt(iop.SIF_CMD_INIT_CMD)
+	check(len(iop.sif.replies) == 2 && iop.sif.replies[0].due == 1000 && iop.sif.replies[1].due == 1000 && cpu.next_event == 1000, "reply due: an EE-side reply is due at EE now, the IOP ahead")
+	// And behind an IOP reply in flight it keeps the order.
+	drop_replies()
+	r3000.state.cycles = 500
+	send(&pkt, 0x17)
+	send_pkt(iop.SIF_CMD_INIT_CMD)
+	check(len(iop.sif.replies) == 3 && iop.sif.replies[2].due == 4000, "reply due: an EE-side reply behind one in flight waits for it")
+
+	// The SIF reset drops the queued replies.
+	send_pkt(iop.SIF_CMD_RESET, 0, 0, 0) // an empty path at +24
+	check(len(iop.sif.replies) == 0 && iop.sif_next_ee() == max(u64), "reply due: SIF reset drops the queue")
+	iop.sif.ee_buf = EE_BUF
+
+	// Held while due: update_next_event leaves it out; what frees it wakes the EE.
+	cpu.state.cycles = 4000
+	send(&pkt, 0x18)
+	mem.dmac_stat |= 1 << mem.DMA_SIF0
+	kernel.update_next_event()
+	check(cpu.next_event == 1 << 40, "reply due: a due reply held by SIF0 busy is no next event")
+	mem.dmac_stat &~= 1 << mem.DMA_SIF0
+	iop.sif_wake()
+	check(cpu.next_event == 4000, "reply due: clearing SIF0's D_STAT bit wakes the EE")
+	iop.sif_pump()
+	check(pumped(0x18), "reply due: then it is pumped")
+	send(&pkt, 0x19)
+	iop.sif.ee_buf = 0
+	kernel.update_next_event()
+	check(cpu.next_event == 1 << 40, "reply due: a due reply with no receive buffer is no next event")
+	send_pkt(iop.SIF_CMD_CHANGE_SADDR, EE_BUF)
+	check(iop.sif.ee_buf == EE_BUF && cpu.next_event == 4000, "reply due: CHANGE_SADDR wakes the EE")
+	iop.sif_pump()
+	check(pumped(0x19), "reply due: then it is pumped")
+
+	// Due under DI: not delivered, no next event; EI delivers it at once.
+	sr := cpu.state.cop0[12]
+	cpu.state.cop0[12] = (sr | 1) &~ 0x10000
+	send(&pkt, 0x1a)
+	kernel.run_events()
+	check(len(iop.sif.replies) == 1 && cpu.next_event == 1 << 40, "reply due: held under DI, no next event")
+	kernel.ei()
+	check(cpu.next_event == 4000, "reply due: EI sets the next event to now")
+	kernel.run_events()
+	cpu.state.cop0[12] = sr
+	check(pumped(0x1a) && len(iop.sif.replies) == 0, "reply due: then it is pumped")
 	fresh()
 }
 

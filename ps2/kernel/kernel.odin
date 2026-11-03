@@ -969,8 +969,6 @@ ei :: proc() {
 	cpu.state.cop0[12] |= 0x10000
 	if mem.intc_pending & mem.intc_mask != 0 || mem.dmac_stat & (mem.dmac_stat >> 16) & 0x3ff != 0 || iop.sif_next_ee() <= cpu.state.cycles {
 		cpu.next_event = cpu.state.cycles
-	} else {
-		cpu.next_event = min(cpu.next_event, iop.sif_next_ee())
 	}
 }
 

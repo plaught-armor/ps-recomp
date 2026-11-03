@@ -209,28 +209,39 @@ sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 }
 
 // Queue a packet for the EE: header {psize | dsize << 8, dest, cid, opt}.
+// One built while the EE runs (a command's synchronous reply, an HLE server)
+// is due at EE now; one an IOP thread sends (from_iop) is due no earlier
+// than the IOP clock, which runs up to a slice past EE now while it idles.
 @(private)
-sif_reply :: proc(cid: u32, opt: u32, payload: []u32) {
+sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false) {
 	p := make([]u8, 16 + 4 * len(payload))
 	w := ([^]u32)(raw_data(p))
 	w[0] = u32(len(p))
 	w[2] = cid
 	w[3] = opt
 	for v, i in payload {w[4 + i] = v}
-	sif_queue(p)
+	sif_queue(p, from_iop)
 }
 
-// Queue a copy of packet `p`, its header filled in, for the EE.
+// Queue a copy of packet `p`, its header filled in, sent by an IOP thread
+// (SifSendCmd), for the EE.
 sif_send_raw :: proc(p: []u8) {
-	sif_queue(slice.clone(p))
+	sif_queue(slice.clone(p), true)
 }
 
 @(private = "file")
-sif_queue :: proc(p: []u8) {
-	due := max(cpu.state.cycles, r3000.state.cycles * IOP_EE_RATIO)
+sif_queue :: proc(p: []u8, from_iop: bool) {
+	due := cpu.state.cycles
+	if from_iop {due = max(due, r3000.state.cycles * IOP_EE_RATIO)}
 	if n := len(sif.replies); n != 0 {due = max(due, sif.replies[n - 1].due)} // FIFO
 	append(&sif.replies, Sif_Reply{due, p})
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, due)}
+}
+
+// The EE freed what held a due reply (SIF0's D_STAT bit, the receive
+// buffer): deliver it now, not at the next event.
+sif_wake :: proc() {
+	if !cpu.in_interrupt && sif_next_ee() <= cpu.state.cycles {cpu.next_event = cpu.state.cycles}
 }
 
 // The EE cycle the next queued reply may arrive at, max(u64) with none.
@@ -309,6 +320,7 @@ sif_command :: proc(a, pc: u32) {
 	switch cid {
 	case SIF_CMD_CHANGE_SADDR:
 		sif.ee_buf = arg(a, 0)
+		sif_wake()
 	case SIF_CMD_SET_SREG:
 		sif.sreg[arg(a, 0) & 31] = arg(a, 1)
 	case SIF_CMD_INIT_CMD:

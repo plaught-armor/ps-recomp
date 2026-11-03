@@ -355,7 +355,7 @@ rpc_exec :: proc(req: Iop_Rpc_Req) {
 	// never finds the server busy with this one (rpc_busy_check), whatever
 	// runs first.
 	if q := rpc_queue(req.qd); q != nil {q.busy = false}
-	sif_reply(SIF_CMD_RPC_END, 0, {req.rec_id, req.pkt, req.rpc_id, req.client, SIF_CMD_RPC_CALL, req.server, 0, 0})
+	sif_reply(SIF_CMD_RPC_END, 0, {req.rec_id, req.pkt, req.rpc_id, req.client, SIF_CMD_RPC_CALL, req.server, 0, 0}, from_iop = true)
 }
 
 // A request that gets no RPC_END, which the EE waits on: a compat row.
