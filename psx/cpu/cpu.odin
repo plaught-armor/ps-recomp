@@ -258,19 +258,32 @@ call_slow :: proc(addr: u32) {
 		e.fn()
 		return
 	}
+	if run_learned(addr) {
+		return
+	}
 	report_once(addr, "interpreting")
 	interpret(addr)
 }
 
+// Run the learned function at addr, if one is loaded and current; false
+// when there is none. Its code is native, so it is not reported as
+// interpreted.
+@(private)
+run_learned :: proc(addr: u32) -> bool {
+	if !learned_loaded {
+		return false
+	}
+	fn := learned_resolve(addr)
+	if fn == nil {
+		return false
+	}
+	learned_hits += 1
+	fn()
+	return true
+}
+
 @(private)
 interpret :: proc(addr: u32) {
-	if learned_loaded {
-		if fn := learned_resolve(addr); fn != nil {
-			learned_hits += 1
-			fn()
-			return
-		}
-	}
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	when core.COMPAT_COUNT {core.compat_entry(addr)}
 	if !core.learn.on {
@@ -319,6 +332,9 @@ jump_unknown :: proc(func, pc: u32) {
 		return
 	}
 	when FALLBACK_COUNT {fallback_jump[{func, pc, .Interp}] += 1}
+	if run_learned(pc) {
+		return
+	}
 	report_once(pc, "unlabelled jump target, interpreting")
 	interpret(pc)
 }

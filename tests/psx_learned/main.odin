@@ -8,7 +8,8 @@
 //     large one, nor a duplicate, nor another processor's.
 //   - A blob that cannot be loaded (no file, not a blob, one with functions)
 //     registers nothing, and calls interpret.
-//   - A loop, compiled, leaves the registers the interpreter does.
+//   - A loop, compiled, leaves the registers the interpreter does, and
+//     running it is not reported as interpreting.
 //   - Code whose first words match a learned function's and whose body
 //     does not interprets; a second function for the same entry, compiled
 //     from the words RAM holds, runs native.
@@ -175,8 +176,11 @@ main :: proc() {
 
 	// The loop and the body as compiled, whose words RAM does not hold.
 	check(psx_native.load_learned(write(tmp, "a.bin", blob({{LOOP, LOOP, loop[:]}, {BODY, BODY, body[:]}}))), "load")
+	// The interpreted runs above reported the loop; forget that.
+	delete_key(&cpu.dispatch.reported, LOOP)
 	got, native_ran = run(LOOP, 3, 5)
 	check(native_ran, "learned loop not run")
+	check(!cpu.dispatch.reported[LOOP], "learned loop reported as interpreting")
 	check(same(got, want_loop), fmt.tprintf("learned loop left %v, want %v", got, want_loop))
 	got, native_ran = run(BODY, 4, 9)
 	check(same(got, want_body) && !native_ran, "other body ran native")
