@@ -32,6 +32,10 @@
 // (PATH2) that split one packet sends its own packet, and the second DIRECT
 // carries on with the first's.
 //
+// Then a GIF source chain with TTE set: the tags' upper halves stay out of
+// PATH3, so the packet in the chain and one sent after it reach the GS. The
+// same chain into scratchpad puts each whole tag ahead of its data.
+//
 // Then VU0's window onto VU1's registers, read and written by LQ and SQ.
 //
 // Last, the branch VI delay: a conditional branch right after a pair that
@@ -43,6 +47,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "ps:ps2/dma"
 import gs "ps:ps2/gs"
 import "ps:ps2/mem"
 import "ps:ps2/vu"
@@ -615,6 +620,43 @@ gif_paths :: proc() {
 	}
 }
 
+// A GIF chain with CHCR.TTE: cnt with a nonzero upper half, then end. Then a
+// normal transfer whose packet must start on a tag. Then the chain into
+// scratchpad, which takes the tags whole.
+@(private = "file")
+gif_tte :: proc() {
+	if mem.ram == nil {mem.mem_init()}
+	gs.state.regs[0x40], gs.state.regs[0x41] = 0, 0
+	pkt := [2][4]u32{gif_tag(1), gif_ad(0x40, 0x1111)}
+	mem.wr64(0x1000, 1 << 28 | 2) // cnt, 2 qwords
+	mem.wr64(0x1008, 0x0102030405060708)
+	copy(mem.ram[0x1010:][:32], ([^]u8)(&pkt)[:32])
+	mem.wr64(0x1030, 7 << 28) // end, no data
+	mem.wr64(0x1038, 0x1112131415161718)
+	mem.dma_reg(mem.DMA_GIF, 0x00)^ = 0x145 // STR, TTE, chain
+	mem.dma_reg(mem.DMA_GIF, 0x20)^ = 0
+	mem.dma_reg(mem.DMA_GIF, 0x30)^ = 0x1000
+	dma.dma_gif()
+	pkt = {gif_tag(1), gif_ad(0x41, 0x2222)}
+	copy(mem.ram[0x2000:][:32], ([^]u8)(&pkt)[:32])
+	mem.dma_reg(mem.DMA_GIF, 0x00)^ = 0x101 // STR, normal
+	mem.dma_reg(mem.DMA_GIF, 0x10)^ = 0x2000
+	mem.dma_reg(mem.DMA_GIF, 0x20)^ = 2
+	dma.dma_gif()
+	r := gs.state.regs
+	if r[0x40] != 0x1111 || r[0x41] != 0x2222 {fail("GIF chain with TTE: GS 40 %x 41 %x, want 1111 2222", r[0x40], r[0x41])}
+	// The same chain into scratchpad: each whole tag goes ahead of its data.
+	mem.spr = {}
+	mem.dma_reg(mem.DMA_TO_SPR, 0x00)^ = 0x145
+	mem.dma_reg(mem.DMA_TO_SPR, 0x20)^ = 0
+	mem.dma_reg(mem.DMA_TO_SPR, 0x30)^ = 0x1000
+	mem.dma_reg(mem.DMA_TO_SPR, 0x80)^ = 0
+	dma.dma_to_spr()
+	if !slice.equal(mem.spr[:64], mem.ram[0x1000:][:64]) || mem.dma_reg(mem.DMA_TO_SPR, 0x80)^ != 64 {
+		fail("toSPR chain with TTE: SADR %x, want the 4 quadwords at 1000 and 40", mem.dma_reg(mem.DMA_TO_SPR, 0x80)^)
+	}
+}
+
 // VU0's window onto VU1's registers: a VU0 LQ or SQ at a quadword address
 // with bit 0x400 set reads and writes VU1's VF, VI and control registers,
 // not VU0 memory, mirrored every 0x40 quadwords. The stores to VF0, VI0
@@ -702,6 +744,7 @@ main :: proc() {
 	stalls()
 	ibit()
 	gif_paths()
+	gif_tte()
 	window()
 	branch_delay()
 	fmt.println("vu: ok")

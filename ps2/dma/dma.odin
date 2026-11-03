@@ -14,8 +14,8 @@ import vu "../vu"
 
 // ------------------------------------------------------------- DMA source
 
-// Bytes a source-chain or normal transfer delivers, including the upper
-// half of each tag when TTE is set (VIF channels).
+// Bytes a source-chain or normal transfer delivers, including the tags when
+// TTE is set (the upper half into a VIF, the whole tag into scratchpad).
 @(private)
 dma_gather :: proc(ch: u32, out: ^[dynamic]u8) {
 	chcr := mem.dma_reg(ch, 0x00)
@@ -40,7 +40,17 @@ dma_gather :: proc(ch: u32, out: ^[dynamic]u8) {
 		data(out, madr^, qwc^ & 0xffff)
 		qwc^ = 0
 	}
-	tte := chcr^ & 0x40 != 0
+	// TTE sends the tag ahead of its data into a VIF and into scratchpad: a
+	// VIF gets the upper half, as VIF codes, and toSPR the whole quadword
+	// (PCSX2's SPR.cpp, _SPR1chain: SPR1transfer(ptag, 1)). The GIF takes
+	// the tag for MADR and QWC alone, as PCSX2's GIF chain does (Gif.cpp has
+	// no TTE case): appended there, the tag would shift the PATH3 stream
+	// off its quadwords.
+	tte_lo, tte_hi: bool
+	if chcr^ & 0x40 != 0 {
+		tte_hi = ch == mem.DMA_VIF0 || ch == mem.DMA_VIF1 || ch == mem.DMA_TO_SPR
+		tte_lo = ch == mem.DMA_TO_SPR
+	}
 	tie := chcr^ & 0x80 != 0
 	for _ in 0 ..< 1 << 20 {
 		t := tadr^
@@ -50,7 +60,10 @@ dma_gather :: proc(ch: u32, out: ^[dynamic]u8) {
 		id := (lo >> 28) & 7
 		addr := u32(lo >> 32) & 0xfffffff0
 		chcr^ = (chcr^ & 0xffff) | u32(lo >> 16) << 16
-		if tte {
+		if tte_lo {
+			for i in 0 ..< 8 {append(out, u8(lo >> (8 * u32(i))))}
+		}
+		if tte_hi {
 			for i in 0 ..< 8 {append(out, u8(hi >> (8 * u32(i))))}
 		}
 		done := false
