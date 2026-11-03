@@ -478,17 +478,22 @@ sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> [4]i32 {
 	return sample_level(t, 0, u, v, bil)
 }
 
+// 2^-n for level n: multiplying by it gives the same correctly rounded
+// value as dividing by 2^n.
+@(private, rodata)
+level_scale := [7]f32{1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625}
+
 // A sample of level n, nearest or bilinear, through the texture cache.
 @(private)
-sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 {
-	u, v := tu / f32(u32(1) << n), tv / f32(u32(1) << n)
+sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 #no_bounds_check {
+	u, v := tu * level_scale[n], tv * level_scale[n]
 	w, h := max(t.w >> n, 1), max(t.h >> n, 1)
 	minu, maxu, minv, maxv := t.minu, t.maxu, t.minv, t.maxv
 	if t.wms == 2 {minu, maxu = minu >> n, maxu >> n}
 	if t.wmt == 2 {minv, maxv = minv >> n, maxv >> n}
 	if !bilinear {
-		x := wrap(i32(math.floor(u)), t.wms, w, minu, maxu)
-		y := wrap(i32(math.floor(v)), t.wmt, h, minv, maxv)
+		x := wrap(i32(floor_exact(u)), t.wms, w, minu, maxu)
+		y := wrap(i32(floor_exact(v)), t.wmt, h, minv, maxv)
 		return unpack(texel(t, n, x, y))
 	}
 	// Round the 1/256 weights rather than truncate: the GPU's float
@@ -496,18 +501,41 @@ sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 {
 	// both sides keeps the two renderers equal (shaders/prim.frag).
 	UV_EPS :: 1.0 / 512
 	u, v = u - 0.5 + UV_EPS, v - 0.5 + UV_EPS
-	fu, fv := math.floor(u), math.floor(v)
+	fu, fv := floor_exact(u), floor_exact(v)
 	iu, iv := i32(fu), i32(fv)
 	au, av := i32((u - fu) * 256), i32((v - fv) * 256)
 	x0 := wrap(iu, t.wms, w, minu, maxu)
 	x1 := wrap(iu + 1, t.wms, w, minu, maxu)
 	y0 := wrap(iv, t.wmt, h, minv, maxv)
 	y1 := wrap(iv + 1, t.wmt, h, minv, maxv)
-	c00, c10 := unpack(texel(t, n, x0, y0)), unpack(texel(t, n, x1, y0))
-	c01, c11 := unpack(texel(t, n, x0, y1)), unpack(texel(t, n, x1, y1))
+	// The four taps in one decoded tile (most of them): one tile lookup.
+	// Tested on the wrapped coordinates, as wrap can split or join them.
+	c00, c10, c01, c11: [4]i32
+	if p := x0 >> 4 == x1 >> 4 && y0 >> 4 == y1 >> 4 ? tile_at(t, n, x0, y0, max(x0, x1), max(y0, y1)) : nil; p != nil {
+		r0, r1 := (y0 & 15) << 4, (y1 & 15) << 4
+		c00, c10 = unpack(p[r0 | (x0 & 15)]), unpack(p[r0 | (x1 & 15)])
+		c01, c11 = unpack(p[r1 | (x0 & 15)]), unpack(p[r1 | (x1 & 15)])
+	} else {
+		c00, c10 = unpack(texel(t, n, x0, y0)), unpack(texel(t, n, x1, y0))
+		c01, c11 = unpack(texel(t, n, x0, y1)), unpack(texel(t, n, x1, y1))
+	}
 	top := c00 + ((c10 - c00) * au) / 256
 	bot := c01 + ((c11 - c01) * au) / 256
 	return top + ((bot - top) * av) / 256
+}
+
+// math.floor, exactly, without its soft-float path: below 2^23 a float
+// truncates to an i32 and back, one less when that rounded up (x in (-1, 0)
+// gives -1, an exact negative integer itself). From 2^23 up a float is
+// integral, and NaN and inf come back as they are, as from math.floor. The
+// one difference, +0 for -0, is invisible once the result is an integer or
+// subtracted from x.
+floor_exact :: #force_inline proc "contextless" (x: f32) -> f32 {
+	if abs(x) < 8388608 {
+		t := f32(i32(x))
+		return t > x ? t - 1 : t
+	}
+	return x
 }
 
 @(private)

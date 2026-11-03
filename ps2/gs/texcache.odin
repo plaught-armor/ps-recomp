@@ -107,24 +107,35 @@ tc_wpages: Page_Set
 @(private)
 tc_wready: bool
 
-// Level n's texel (x, y), as fetch returns it. Unchecked: n <= 6 (mxl is
-// clamped), a resolved tc_lvl is an entry index, x < cw and y < ch keep the
-// tile index under tw * 64 <= TC_MAP, and a nonzero tile is a slot + 1.
+// Level n's decoded 16x16 tile holding texel (x, y), or nil where the
+// texel comes from fetch: an unresolved or bypassed level, or (xe, ye)
+// outside the entry (a caller using the tile for several texels passes
+// their largest coordinates). Unchecked: n <= 6 (mxl is clamped), a
+// resolved tc_lvl is an entry index, x < cw and y < ch keep the tile index
+// under tw * 64 <= TC_MAP, and a nonzero tile is a slot + 1.
 @(private)
-texel :: #force_inline proc(t: ^Tex, n, x, y: u32) -> u32 #no_bounds_check {
+tile_at :: #force_inline proc(t: ^Tex, n, x, y, xe, ye: u32) -> ^[256]u32 #no_bounds_check {
 	l := tc_lvl[n]
 	if l < 0 {
 		if l == TC_UNRESOLVED {
 			l = tc_resolve(t, n)
 			tc_lvl[n] = l
 		}
-		if l < 0 {return fetch(t, n, x, y)}
+		if l < 0 {return nil}
 	}
 	e := &tc_e[l]
-	if x >= e.key.cw || y >= e.key.ch {return fetch(t, n, x, y)}
+	if xe >= e.key.cw || ye >= e.key.ch {return nil}
 	s := u32(e.tile[(y >> 4) * e.tw + (x >> 4)])
 	if s == 0 {s = tc_decode(e, u32(l), t, n, x >> 4, y >> 4)}
-	return tc_pool[s - 1][(y & 15) << 4 | (x & 15)]
+	return &tc_pool[s - 1]
+}
+
+// Level n's texel (x, y), as fetch returns it.
+@(private)
+texel :: #force_inline proc(t: ^Tex, n, x, y: u32) -> u32 #no_bounds_check {
+	p := tile_at(t, n, x, y, x, y)
+	if p == nil {return fetch(t, n, x, y)}
+	return p[(y & 15) << 4 | (x & 15)]
 }
 
 // A new context: every level resolves again on its first sample.
