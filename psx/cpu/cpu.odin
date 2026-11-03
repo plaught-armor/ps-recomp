@@ -264,6 +264,13 @@ call_slow :: proc(addr: u32) {
 
 @(private)
 interpret :: proc(addr: u32) {
+	if learned_loaded {
+		if fn := learned_resolve(addr); fn != nil {
+			learned_hits += 1
+			fn()
+			return
+		}
+	}
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	when core.COMPAT_COUNT {core.compat_entry(addr)}
 	if !core.learn.on {

@@ -62,6 +62,7 @@ watch_code :: proc() {
 // in every store helper that inlines it.
 ram_armed_write :: #force_no_inline proc(p: u32) #no_bounds_check {
 	ram_armed[p] = false
+	learned_gen[p] += 1
 	if code_pages[p] {
 		code_demote(p)
 	}

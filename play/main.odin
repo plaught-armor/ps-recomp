@@ -13,6 +13,14 @@
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
 //
+// LEARN=1 records the code a PS1 game interprets in learn/psx.bin in the
+// disc's directory (core/learn.odin; a path records there instead). While
+// that file has records, each run compacts it and runs native code for
+// them: compiled in a child (`play --learned <records> <out>`) when the
+// stored learned blob is not for these records, this build and blob
+// format (always, for a dev build), and loaded beside the native blob.
+// Code that is not in RAM as it was recorded is interpreted, and learned.
+//
 // With no disc image it opens the launcher (launcher_window.odin), a window
 // listing the library's discs to run.
 //
@@ -21,6 +29,7 @@
 package play
 
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -41,6 +50,8 @@ run :: proc(args: []string) -> int {
 		return launcher(args[0])
 	case len(args) == 4 && args[1] == "--convert":
 		return convert(args[2], args[3])
+	case len(args) == 4 && args[1] == "--learned":
+		return compile_learned(args[2], args[3])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
@@ -62,6 +73,56 @@ native_key: string
 native_failed :: proc() {
 	os.remove(native_key)
 	fmt.eprintln("play: the stored native code would not load; it is converted again next run")
+}
+
+// The same for the learned blob.
+@(private = "file")
+learned_key: string
+
+@(private = "file")
+learned_failed :: proc() {
+	os.remove(learned_key)
+	fmt.eprintln("play: the stored learned code would not load; it is compiled again next run")
+}
+
+// The learned blob for the records in learn/psx.bin of the disc directory
+// dir, after the file is compacted (core.learn_compact); compiled when the
+// stored one is not for them. "" when there are none, or no blob.
+@(private = "file")
+learned_blob :: proc(dir: string) -> string {
+	records := learn_records(dir, "psx.bin")
+	if !os.exists(records) {
+		return ""
+	}
+	data, err := os.read_entire_file(records, context.temp_allocator)
+	if err != nil {
+		fmt.eprintln("play: cannot read", records, err)
+		return ""
+	}
+	compact, n := core.learn_compact(data)
+	defer delete(compact)
+	if n == 0 {
+		return ""
+	}
+	if string(compact) != string(data) {
+		if werr := core.write_file_atomic(records, compact); werr != nil {
+			fmt.eprintln("play: cannot write", records, werr)
+			return ""
+		}
+	}
+	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(compact))
+	if !core.blob_cached(dir, core.COMMIT, .Learned, set) && !learned_store(records, dir, set) {
+		return ""
+	}
+	return core.disc_path(dir, .Learned)
+}
+
+// The path of the file name in the disc directory dir's learn directory,
+// temp allocated.
+@(private = "file")
+learn_records :: proc(dir, name: string) -> string {
+	path, _ := filepath.join({core.disc_path(dir, .Learn, context.temp_allocator), name}, context.temp_allocator)
+	return path
 }
 
 // The disc image's id and SYSTEM.CNF, and its PSX.EXE when it has no
@@ -111,6 +172,23 @@ play :: proc(image: string) -> int {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
+	// Learned code runs on a PS1 game unless NATIVE=0; found before LEARN
+	// opens the records, which compacting rewrites.
+	learned: string
+	if !cnf.ps2 && core.env("NATIVE") != "0" {
+		learned = learned_blob(dir)
+	}
+	learned_key = core.disc_path(dir, .Learned_Key)
+	if core.env("LEARN") == "1" {
+		learn := core.disc_path(dir, .Learn)
+		if err := os.make_directory_all(learn); err != nil && !(err == .Exist && os.is_dir(learn)) {
+			fmt.eprintln("play: cannot make", learn, err)
+			return 1
+		}
+		if !core.learn_open_path(learn_records(dir, "ps2.bin" if cnf.ps2 else "psx.bin")) {
+			return 1
+		}
+	}
 	// The picture a run ends on (a quit, a COMPAT run's last vblank), for
 	// the launcher.
 	core.thumb_path = core.disc_path(dir, .Thumb)
@@ -126,11 +204,13 @@ play :: proc(image: string) -> int {
 		return 1
 	}
 	b := psx.Boot {
-		disc          = image,
-		exe           = exe,
-		title         = title,
-		native        = native,
-		native_failed = native_failed,
+		disc           = image,
+		exe            = exe,
+		title          = title,
+		native         = native,
+		native_failed  = native_failed,
+		learned        = learned,
+		learned_failed = learned_failed,
 	}
 	for &c, i in b.cards {
 		c, _ = filepath.join({cards, fmt.tprintf("slot%d.mcd", i + 1)})

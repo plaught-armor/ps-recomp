@@ -80,8 +80,17 @@ test_blob :: proc(dir: string) {
 	check(core.blob_store(dir, blob(V, core.NATIVE_ARCH), "abc"), "store")
 	check(os.remove(core.disc_path(dir, .Native_Key, context.temp_allocator)) == nil, "remove key")
 	check(!core.blob_cached(dir, "abc"), "blob with no key")
+	// A learned blob is cached for the records it was compiled from too,
+	// apart from the native one.
+	check(core.blob_store(dir, blob(V, core.NATIVE_ARCH), "abc", .Learned, "r1"), "store learned")
+	check(core.blob_cached(dir, "abc", .Learned, "r1"), "learned blob cached")
+	check(!core.blob_cached(dir, "abc", .Learned, "r2"), "learned blob of other records")
+	check(!core.blob_cached(dir, "abd", .Learned, "r1"), "learned blob of another commit")
+	check(!core.blob_cached(dir, "abc"), "learned blob taken for the native one")
+	key, err = os.read_entire_file(core.disc_path(dir, .Learned_Key, context.temp_allocator), context.temp_allocator)
+	check(err == nil && string(key) == fmt.tprintf("%d abc r1\n", V), "learned key")
 	files, _ := os.read_all_directory_by_path(dir, context.temp_allocator)
-	check(len(files) == 1, "files left")
+	check(len(files) == 3, "files left")
 	for f in files {
 		check(!strings.has_suffix(f.name, core.ATOMIC_TMP), fmt.tprintf("left %s", f.name))
 	}

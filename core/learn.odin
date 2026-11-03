@@ -35,6 +35,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
+import "core:slice"
 
 Learn_Cpu :: enum u8 {
 	Psx,
@@ -149,13 +150,18 @@ LEARN_CPU_NAMES := [Learn_Cpu]string {
 }
 
 // Open the LEARN file, once; false when LEARN is unset or the file cannot
-// be opened (after a message).
+// be opened (after a message). LEARN=1 is play's (play/main.odin).
 learn_open :: proc() -> bool {
 	if learn.on {
 		return true
 	}
 	path := env("LEARN")
 	if path == "" {
+		return false
+	}
+	if path == "1" {
+		// play opens the disc directory's records before the run.
+		fmt.eprintln("learn: LEARN=1 records into a disc's directory, which only play knows; name a file")
 		return false
 	}
 	return learn_open_path(path)
@@ -400,6 +406,82 @@ learn_read :: proc(data: []u8, allocator := context.allocator) -> (recs: [dynami
 		})
 	}
 	return recs, bad
+}
+
+// The records in data each once, without bad ones, sorted by cpu, entry,
+// lo, words, hash and flags: a LEARN file's bytes compacted, which a
+// rewrite of the file bounds growth across runs with. In context.allocator;
+// n is the records it holds.
+learn_compact :: proc(data: []u8) -> (out: []u8, n: int) {
+	recs, _ := learn_read(data, context.temp_allocator)
+	seen := make(map[Learn_Key]bool, context.temp_allocator)
+	keep := make([dynamic]Learn_Record, context.temp_allocator)
+	size := 0
+	for r in recs {
+		key := Learn_Key{r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash}
+		if key in seen {continue}
+		seen[key] = true
+		append(&keep, r)
+		size += LEARN_HEADER + 4 * len(r.words)
+	}
+	slice.sort_by(keep[:], learn_less)
+	buf := make([]u8, size)
+	at := 0
+	for r in keep {
+		learn_header(buf[at:][:LEARN_HEADER], r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash)
+		at += LEARN_HEADER
+		copy(buf[at:], ([^]u8)(raw_data(r.words))[:4 * len(r.words)])
+		at += 4 * len(r.words)
+	}
+	return buf, len(keep)
+}
+
+@(private = "file")
+learn_less :: proc(a, b: Learn_Record) -> bool {
+	if a.cpu != b.cpu {return a.cpu < b.cpu}
+	if a.entry != b.entry {return a.entry < b.entry}
+	if a.lo != b.lo {return a.lo < b.lo}
+	if len(a.words) != len(b.words) {return len(a.words) > len(b.words)}
+	if a.hash != b.hash {return a.hash < b.hash}
+	return transmute(u8)a.flags < transmute(u8)b.flags
+}
+
+// The records of cpu in recs that native code can stand for, each entry
+// and words once: those of runs that kept their words (not .Large) and
+// never stored into them. An entry and words that any run stored into
+// (.Smc), or may have (.Smc_Unknown), is left out, as a copy of its words
+// would not see the stores. .Open runs are kept. Also how many records
+// are left out as .Large and as stored into. In allocator; the words are
+// recs'.
+learn_compilable :: proc(recs: []Learn_Record, cpu: Learn_Cpu, allocator := context.allocator) -> (out: [dynamic]Learn_Record, large, smc: int) {
+	Code :: struct {
+		entry, lo, n: u32,
+		hash:         u64,
+	}
+	stored := make(map[Code]bool, context.temp_allocator)
+	for r in recs {
+		if r.cpu == cpu && r.flags & {.Smc, .Smc_Unknown} != {} {
+			stored[{r.entry, r.lo, u32(len(r.words)), r.hash}] = true
+		}
+	}
+	taken := make(map[Code]bool, context.temp_allocator)
+	out = make([dynamic]Learn_Record, allocator)
+	for r in recs {
+		if r.cpu != cpu {continue}
+		if .Large in r.flags {
+			large += 1
+			continue
+		}
+		c := Code{r.entry, r.lo, u32(len(r.words)), r.hash}
+		if stored[c] {
+			smc += 1
+			continue
+		}
+		if len(r.words) == 0 || taken[c] {continue}
+		taken[c] = true
+		append(&out, r)
+	}
+	return
 }
 
 // Under LEARN, write each run still in progress as an .Open record, then

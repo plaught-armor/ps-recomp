@@ -27,8 +27,9 @@ RAM_PAGE :: 1 << RAM_PAGE_SHIFT
 RAM_PAGES :: RAM_SIZE / RAM_PAGE
 
 // Pages whose next write calls ram_armed_write (watch.odin): it demotes the
-// page's recompiled code, and ram_keep (checkpoint.odin) saves the page into
-// the running pass's checkpoint and gives it a new version. Every RAM writer
+// page's recompiled code, bumps its learned generation (learned.odin), and
+// ram_keep (checkpoint.odin) saves the page into the running pass's
+// checkpoint and gives it a new version. Every RAM writer
 // goes through ram_guard or ram_touch.
 ram_armed: [RAM_PAGES]bool
 

@@ -9,6 +9,7 @@ import bios "bios"
 import cpu "cpu"
 import host "host"
 import io "io"
+import native "native"
 import spu "spu"
 
 // What run needs from the port.
@@ -32,6 +33,10 @@ Boot :: struct {
 	// Called when a standalone blob cannot be loaded, before run returns
 	// false; nil none.
 	native_failed: proc(),
+	// A blob of learned functions ("" none; native.load_learned), and what to call
+	// when it cannot be loaded (nil none); the game then runs without it.
+	learned:        string,
+	learned_failed: proc(),
 	// The memory card images (bios.card_files); left empty, the runtime's.
 	cards:         [2]string,
 	// The port's own steps, each stopping the boot on false: `setup` before
@@ -72,6 +77,9 @@ run :: proc(b: Boot) -> bool {
 	}
 	if standalone && b.native == "" {
 		fmt.eprintln("psx: no native code, interpreting everything")
+	}
+	if b.learned != "" && !native.load_learned(b.learned) && b.learned_failed != nil {
+		b.learned_failed()
 	}
 	if b.hooks != nil {b.hooks() or_return}
 	cpu.watch_code()

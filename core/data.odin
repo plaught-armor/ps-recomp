@@ -5,6 +5,8 @@
 //     disc.tsv             what the player knows of the disc
 //     native.<arch>.bin    native code compiled for it (recomp/native)
 //     native.<arch>.key    the blob format and build that wrote it
+//     learned.<arch>.bin   native code for the runs learn/ holds (play LEARN)
+//     learned.<arch>.key   the blob format, build and learn/psx.bin it is for
 //     cards/  saves/  settings.tsv  compat.log  learn/
 //     thumb.ppm            the picture a run last showed (thumb.odin)
 //     play.log             what the last run the launcher started printed
@@ -30,6 +32,8 @@ Disc_File :: enum {
 	Info,
 	Native,
 	Native_Key,
+	Learned,
+	Learned_Key,
 	Cards,
 	Saves,
 	Settings,
@@ -41,17 +45,19 @@ Disc_File :: enum {
 }
 
 DISC_FILES :: [Disc_File]string {
-	.Info       = "disc.tsv",
-	.Native     = "native." + NATIVE_ARCH_NAME + ".bin",
-	.Native_Key = "native." + NATIVE_ARCH_NAME + ".key",
-	.Cards      = "cards",
-	.Saves      = "saves",
-	.Settings   = "settings.tsv",
-	.Compat_Log = "compat.log",
-	.Learn      = "learn",
-	.Press      = "press.txt",
-	.Thumb      = "thumb.ppm",
-	.Play_Log   = "play.log",
+	.Info        = "disc.tsv",
+	.Native      = "native." + NATIVE_ARCH_NAME + ".bin",
+	.Native_Key  = "native." + NATIVE_ARCH_NAME + ".key",
+	.Learned     = "learned." + NATIVE_ARCH_NAME + ".bin",
+	.Learned_Key = "learned." + NATIVE_ARCH_NAME + ".key",
+	.Cards       = "cards",
+	.Saves       = "saves",
+	.Settings    = "settings.tsv",
+	.Compat_Log  = "compat.log",
+	.Learn       = "learn",
+	.Press       = "press.txt",
+	.Thumb       = "thumb.ppm",
+	.Play_Log    = "play.log",
 }
 
 // The data directory, created if missing. False, after a message, when it
@@ -101,19 +107,33 @@ disc_path :: proc(dir: string, f: Disc_File, allocator := context.allocator) -> 
 	return path
 }
 
+// A disc directory's blobs: the executable's native code, and the learned
+// functions (play's LEARN), whose key also names the records they are from.
+Blob_Kind :: enum {
+	Native,
+	Learned,
+}
+
+@(private = "file")
+BLOB_FILES :: [Blob_Kind][2]Disc_File {
+	.Native  = {.Native, .Native_Key},
+	.Learned = {.Learned, .Learned_Key},
+}
+
 // Whether the disc directory holds a blob this build can run: its key names
-// this blob format and commit, and its header this format and host arch.
-// Never for a dev build.
-blob_cached :: proc(dir: string, commit := COMMIT) -> bool {
+// this blob format and commit (and for .Learned the records, set), and its
+// header this format and host arch. Never for a dev build.
+blob_cached :: proc(dir: string, commit := COMMIT, kind := Blob_Kind.Native, set := "") -> bool {
 	if commit == "dev" {
 		return false
 	}
-	key, err := os.read_entire_file(disc_path(dir, .Native_Key, context.temp_allocator), context.temp_allocator)
-	if err != nil || string(key) != blob_key(commit) {
+	files := BLOB_FILES
+	key, err := os.read_entire_file(disc_path(dir, files[kind][1], context.temp_allocator), context.temp_allocator)
+	if err != nil || string(key) != blob_key(commit, set) {
 		return false
 	}
 	f: ^os.File
-	if f, err = os.open(disc_path(dir, .Native, context.temp_allocator)); err != nil {
+	if f, err = os.open(disc_path(dir, files[kind][0], context.temp_allocator)); err != nil {
 		return false
 	}
 	defer os.close(f)
@@ -134,13 +154,14 @@ blob_valid :: proc(blob: []u8) -> bool {
 	return word(blob[0:]) == NATIVE_MAGIC && word(blob[4:]) == NATIVE_VERSION && word(blob[8:]) == NATIVE_ARCH
 }
 
-// Store a blob in the disc directory with its key. The old key goes first
-// and the new one last, each file written whole, so a crash or a failed
-// write leaves no key naming a blob it does not match. False, after a
-// message, on a failure.
-blob_store :: proc(dir: string, blob: []u8, commit := COMMIT) -> bool {
-	key_path := disc_path(dir, .Native_Key, context.temp_allocator)
-	path := disc_path(dir, .Native, context.temp_allocator)
+// Store a blob in the disc directory with its key (blob_cached). The old
+// key goes first and the new one last, each file written whole, so a crash
+// or a failed write leaves no key naming a blob it does not match. False,
+// after a message, on a failure.
+blob_store :: proc(dir: string, blob: []u8, commit := COMMIT, kind := Blob_Kind.Native, set := "") -> bool {
+	files := BLOB_FILES
+	key_path := disc_path(dir, files[kind][1], context.temp_allocator)
+	path := disc_path(dir, files[kind][0], context.temp_allocator)
 	if err := os.remove(key_path); err != nil && os.exists(key_path) {
 		fmt.eprintln("cannot remove", key_path, err)
 		return false
@@ -149,7 +170,7 @@ blob_store :: proc(dir: string, blob: []u8, commit := COMMIT) -> bool {
 		fmt.eprintln("cannot write", path, err)
 		return false
 	}
-	if err := write_file_atomic(key_path, transmute([]u8)blob_key(commit)); err != nil {
+	if err := write_file_atomic(key_path, transmute([]u8)blob_key(commit, set)); err != nil {
 		fmt.eprintln("cannot write", key_path, err)
 		return false
 	}
@@ -157,8 +178,11 @@ blob_store :: proc(dir: string, blob: []u8, commit := COMMIT) -> bool {
 }
 
 @(private = "file")
-blob_key :: proc(commit: string) -> string {
-	return fmt.tprintf("%d %s\n", NATIVE_VERSION, commit)
+blob_key :: proc(commit, set: string) -> string {
+	if set == "" {
+		return fmt.tprintf("%d %s\n", NATIVE_VERSION, commit)
+	}
+	return fmt.tprintf("%d %s %s\n", NATIVE_VERSION, commit, set)
 }
 
 @(private = "file")

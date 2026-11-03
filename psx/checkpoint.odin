@@ -193,6 +193,8 @@ checkpoint_restore :: proc(cp: ^Checkpoint) {
 	// unchanged since: the saved versions name them all.
 	cpu.ram_ver = cp.ram_ver
 	cpu.ram_armed = true
+	// ram_put_back wrote behind the guard: compare learned code again.
+	cpu.learned_epoch += 1
 	cpu.scratch = cp.scratch
 	render.vram = cp.vram
 	if cp.pass.hi_swapped && render.hi_saved(&cp.pass) {

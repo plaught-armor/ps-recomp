@@ -19,6 +19,7 @@ odin run tests/psx_fallback -collection:ps=.
 odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/psx_codewatch -collection:ps=.
 odin run tests/psx_codewatch -collection:ps=. -define:FALLBACK_COUNT=true
+odin run tests/psx_learned -collection:ps=.
 odin run tests/psx_unaligned -collection:ps=.
 odin run tests/psx_gte -collection:ps=.
 odin run tests/psx_cover -collection:ps=.
@@ -62,6 +63,7 @@ here.
 | `psx_cover` | Which R3000 encodings each PS1 backend does inline |
 | `psx_fallback` | The PS1 ways out of recompiled code and their counts |
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |
+| `psx_learned` | Learned PS1 runs compiled, run native only while RAM holds their code |
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
