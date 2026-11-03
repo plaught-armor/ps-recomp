@@ -103,12 +103,10 @@ spu: struct {
 }
 
 // The most voice samples spu_catch_up renders ahead of spu_mix. The host
-// mixes 800 a vblank (ps2/host/audio.odin's AUDIO_FRAME, MIX_RATE / 60), but
-// between two mixes the IOP's clock runs more than that: the vblank is NTSC's
-// 59.94 Hz (cpu.CYCLES_PER_FRAME), 800.8 samples of the input clock, and the
+// mixes a vblank of the input clock (vblank_samples, 800 or 801), but the
 // mix reads the IOP's clock where its threads left it, up to a slice
 // (IOP_SLICE, 48 samples) past the EE's, or further while a thread runs on
-// past its slice. Two vblanks' bound both, so only a mixer truly behind
+// past its slice. Two vblanks bound that, so only a mixer truly behind
 // starts the frame again; a vblank's cap did so most frames, a call there
 // rendering nothing, and a key on's ENVX read in that stretch read 0.
 @(private = "file")
@@ -267,6 +265,14 @@ SPU_OUT_BASE :: 0x800
 @(private = "file")
 spu_in_sample :: proc(t: u64) -> u64 {
 	return t * MIX_RATE / cpu.EE_CLOCK
+}
+
+// The samples the host mixes at vblank v, counted from 1: the input clock's
+// samples between vblanks v - 1 and v. A vblank is NTSC's 59.94 Hz, 800.8
+// samples, so this is 800 or 801 and the mix stays within a sample of the
+// clock that the voices, the input area and the streams run on.
+vblank_samples :: proc(v: u64) -> int {
+	return int(spu_in_sample(v * cpu.CYCLES_PER_FRAME) - spu_in_sample((v - 1) * cpu.CYCLES_PER_FRAME))
 }
 
 // Sets core c's in_irq, the cycle of the first input read or output write

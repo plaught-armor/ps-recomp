@@ -212,6 +212,7 @@ game :: proc(_: rawptr) {
 	test_sifman()
 	test_sif_dma_intr()
 	test_libsd()
+	test_vblank_samples()
 	test_cdvdman()
 	test_cdvd_search_server()
 	test_sdrdrv()
@@ -3438,6 +3439,17 @@ snap4: core.Snapshot
 snap4_loaded: bool // not emulated state
 snap12: core.Snapshot
 snap12_loaded: bool // not emulated state
+
+// The host's mix per vblank follows the input clock, 800.8 samples a
+// vblank at 59.94 Hz, so the mixed total never drifts from it.
+test_vblank_samples :: proc() {
+	want := [?]int{800, 801, 801, 801, 800, 801, 801, 801, 801, 800}
+	for n, i in want {check(iop.vblank_samples(u64(i + 1)) == n, "vblank_samples: 800 or 801, 800.8 on average")}
+	sum: u64
+	for v in u64(1) ..= 60000 {sum += u64(iop.vblank_samples(v))}
+	check(sum == 60000 * cpu.CYCLES_PER_FRAME * iop.MIX_RATE / cpu.EE_CLOCK, "vblank_samples: 60000 vblanks mix the input clock's samples")
+	check(sum == 48047998, "vblank_samples: 60000 vblanks, 1001 seconds less 2 samples")
+}
 
 SD_HALF :: 0x1000 * cpu.EE_CLOCK / (48000 * 4) // EE cycles to move half of a 0x2000-byte buffer
 

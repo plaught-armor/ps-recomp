@@ -1,6 +1,6 @@
 // Host window: presents the GS read circuit each vblank and paces the game
-// to 60 Hz. platform_init sets kernel.vblank_hook, so a game's main calls it
-// once after ps2.init and before running the ELF.
+// to NTSC's 59.94 Hz. platform_init sets kernel.vblank_hook, so a game's
+// main calls it once after ps2.init and before running the ELF.
 package ps2_host
 
 import "core:fmt"
@@ -30,7 +30,7 @@ hw: bool // the Vulkan GS draws and presents
 @(private)
 last: time.Tick
 @(private)
-pace := 60 // frames a second; 0 for unpaced
+pace := 60 // frames a second, at NTSC's 1000 / 1001 (59.94 Hz); 0 for unpaced
 // Presented frames: vblanks whose GS read circuit showed a picture, so a
 // game's boot vblanks with the display off do not count. PRESS, SHOT,
 // SNAPTEST, RBTEST and DUMP all count these, unlike psx/host, whose PRESS
@@ -172,7 +172,7 @@ vblank_frame :: proc() {
 	if core.net_hash_due() {
 		core.net_hash(xxhash.XXH3_64_with_seed(iop.iop_hle, xxhash.XXH3_64_with_seed(iop.iop_ram, xxhash.XXH3_64_default(mem.ram))))
 	}
-	audio_frame(!rerun)
+	audio_frame(vblank, !rerun)
 	gs.skip_present = rerun
 	w, h := gs.scanout()
 	core.compat_vblank(u64(vblank), w > 0 && h > 0, mem.ram)
@@ -228,7 +228,8 @@ vblank_frame :: proc() {
 	if core.frames_done(u64(vblank)) {quit(0)}
 	if pace == 0 || rerun {return}
 	// Netplay time sync stretches the frame while this host is ahead.
-	length := time.Second / time.Duration(pace)
+	// NTSC's vblank: pace * 1000 / 1001 Hz, as the guest's clock runs.
+	length := time.Second * 1001 / time.Duration(pace * 1000)
 	length += time.Duration(f64(length) * f64(core.net_stretch()))
 	// An absolute deadline: sleep overshoot must not add up, or the game runs
 	// under 60 Hz and the sound queue drains. Far behind, start again from now.

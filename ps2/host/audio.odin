@@ -1,15 +1,14 @@
 // Host audio (ps:core audio.odin): the FMOD, SPU2 and ADX mixers fill one
-// vblank of sound, which core queues on the SDL device. WAV=<file> also
-// records the mix, for headless checks; core keeps the file valid at every
-// second, since a timed-out run never exits cleanly.
+// vblank of sound, 800 or 801 samples (iop.vblank_samples), which core
+// queues on the SDL device. WAV=<file> also records the mix, for headless
+// checks; core keeps the file valid at every second, since a timed-out run
+// never exits cleanly.
 package ps2_host
 
 import "ps:core"
 import cpu "../cpu"
 import iop "../iop"
 
-@(private)
-AUDIO_FRAME :: iop.MIX_RATE / 60 // stereo frames per vblank
 @(private)
 LATENCY_MS :: 50
 
@@ -21,14 +20,17 @@ audio_init :: proc(headless: bool) {
 	if !headless {core.audio_apply(LATENCY_MS)}
 }
 
-// Mix exactly one vblank: the game polls voice positions, so how far the
-// voices advance must not depend on the host. Core pads or drops on the
-// device side instead. A netplay rerun mixes without pushing.
+// Mix exactly vblank v (from 1): the game polls voice positions, so how far
+// the voices advance must not depend on the host. Its length follows the
+// input clock, 800.8 samples a vblank on average, so the mix does not fall
+// behind the voices the IOP's clock reads. Core pads or drops on the device
+// side instead. A netplay rerun mixes without pushing.
 @(private)
-audio_frame :: proc(push: bool) {
-	buf := make([][2]i16, AUDIO_FRAME, context.temp_allocator)
+audio_frame :: proc(v: int, push: bool) {
+	n := iop.vblank_samples(u64(v))
+	buf := make([][2]i16, n, context.temp_allocator)
 	t := cpu.prof_start()
-	mix_frame(([^]i16)(raw_data(buf))[:AUDIO_FRAME * 2])
+	mix_frame(([^]i16)(raw_data(buf))[:n * 2])
 	cpu.prof_end(.MIX, t)
 	if push {core.audio_push(buf)}
 }

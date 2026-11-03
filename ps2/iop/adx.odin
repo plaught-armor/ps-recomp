@@ -385,9 +385,10 @@ adx_mix :: proc(out: []i32) {
 		if hi - min(o.pos >> 32, hi) > ADX_RING - 4 {o.pos = (hi - ADX_RING / 2) << 32}
 		if !o.primed && have - min(o.pos >> 32, have) < u64(r.rate) / 30 {continue}
 		o.primed = true
-		// Each call mixes one vblank: eat what a vblank consumes, rate times
-		// CYCLES_PER_FRAME / EE_CLOCK samples, or the ring creeps.
-		step := u64((u128(r.rate) << 32) * cpu.CYCLES_PER_FRAME / (cpu.EE_CLOCK * u128(len(out) / 2)))
+		// The mix runs on the input clock (vblank_samples), so a stream
+		// steps rate / MIX_RATE a sample and eats what the game's clock
+		// consumes, or the ring creeps.
+		step := u64((u128(r.rate) << 32) / MIX_RATE)
 		for n := 0; n < len(out); n += 2 {
 			i := o.pos >> 32
 			if i + 3 > have {o.primed = false; break} // gauss reads i-1 .. i+2
