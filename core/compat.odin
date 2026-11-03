@@ -15,17 +15,25 @@
 // implement returns 0 and the game goes on, where it would stop the game,
 // and one JSON line tagged `compat:` goes to stderr when the run ends at
 // FRAMES, on an exit and on a fatal error. A run that ends with no line
-// crashed.
+// crashed. With COMPAT_PROGRESS=<path> as well (play --compat sets it), the
+// vblank count goes to that file, an 8-byte little-endian u64 at offset 0,
+// at vblank 1 and every COMPAT_PROGRESS_EVERY vblanks after, so the parent
+// can tell a slow run from a hung one.
 package core
 
 import "base:runtime"
+import "core:encoding/endian"
 import "core:encoding/json"
 import "core:fmt"
 import "core:hash/xxhash"
+import "core:os"
 import "core:slice"
 import "core:strings"
 
 COMPAT_COUNT :: #config(COMPAT_COUNT, true)
+
+// The vblanks between writes of the count to COMPAT_PROGRESS.
+COMPAT_PROGRESS_EVERY :: 60
 
 // How many interpreter entries the line lists, hottest first.
 COMPAT_TOP :: 10
@@ -179,6 +187,8 @@ compat: struct {
 	// sets; -1 until it does.
 	lit:           i64,
 	reported:      bool,
+	// COMPAT_PROGRESS, open under COMPAT; nil without it.
+	progress:      ^os.File,
 }
 
 // Read COMPAT, for the host's console, its cycle counter, the cycles its
@@ -191,6 +201,13 @@ compat_init :: proc(system: string, cycles: ^u64, cycles_per_insn: u64, idle: ^u
 	compat.idle = idle
 	compat.lit = -1
 	compat.cpi = cycles_per_insn
+	if path := env("COMPAT_PROGRESS"); compat.on && path != "" && compat.progress == nil {
+		f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
+		if err != nil {
+			fmt.eprintln("compat: cannot open", env_name("COMPAT_PROGRESS"), path, err)
+		}
+		compat.progress = f
+	}
 }
 
 // Count an interpreter entry at pc.
@@ -231,8 +248,15 @@ compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0, pc: u32 = 0, ra
 }
 
 // Count vblank n, with the display on or not, with main RAM as it
-// stands. Under COMPAT, vblank FRAMES/2 hashes RAM. Call once a vblank.
+// stands. Under COMPAT, vblank FRAMES/2 hashes RAM, and vblank 1 and every
+// COMPAT_PROGRESS_EVERY go to COMPAT_PROGRESS. Call once a vblank.
 compat_vblank :: proc(n: u64, shown: bool, ram: []u8) {
+	// Outside COMPAT_COUNT: the parent's hang check needs it either way.
+	if compat.progress != nil && (n == 1 || n % COMPAT_PROGRESS_EVERY == 0) {
+		b: [8]u8
+		endian.unchecked_put_u64le(b[:], n)
+		_, _ = os.write_at(compat.progress, b[:], 0)
+	}
 	when COMPAT_COUNT {
 		if shown {
 			compat.shown += 1

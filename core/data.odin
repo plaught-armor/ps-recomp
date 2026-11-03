@@ -38,6 +38,7 @@ Disc_File :: enum {
 	Saves,
 	Settings,
 	Compat_Log,
+	Compat_Progress,
 	Learn,
 	Press,
 	Thumb,
@@ -45,19 +46,20 @@ Disc_File :: enum {
 }
 
 DISC_FILES :: [Disc_File]string {
-	.Info        = "disc.tsv",
-	.Native      = "native." + NATIVE_ARCH_NAME + ".bin",
-	.Native_Key  = "native." + NATIVE_ARCH_NAME + ".key",
-	.Learned     = "learned." + NATIVE_ARCH_NAME + ".bin",
-	.Learned_Key = "learned." + NATIVE_ARCH_NAME + ".key",
-	.Cards       = "cards",
-	.Saves       = "saves",
-	.Settings    = "settings.tsv",
-	.Compat_Log  = "compat.log",
-	.Learn       = "learn",
-	.Press       = "press.txt",
-	.Thumb       = "thumb.ppm",
-	.Play_Log    = "play.log",
+	.Info            = "disc.tsv",
+	.Native          = "native." + NATIVE_ARCH_NAME + ".bin",
+	.Native_Key      = "native." + NATIVE_ARCH_NAME + ".key",
+	.Learned         = "learned." + NATIVE_ARCH_NAME + ".bin",
+	.Learned_Key     = "learned." + NATIVE_ARCH_NAME + ".key",
+	.Cards           = "cards",
+	.Saves           = "saves",
+	.Settings        = "settings.tsv",
+	.Compat_Log      = "compat.log",
+	.Compat_Progress = "compat.progress",
+	.Learn           = "learn",
+	.Press           = "press.txt",
+	.Thumb           = "thumb.ppm",
+	.Play_Log        = "play.log",
 }
 
 // The data directory, created if missing. False, after a message, when it

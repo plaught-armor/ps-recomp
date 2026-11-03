@@ -4,11 +4,14 @@
 // the latest run of each disc id, kept in place, new ids appended.
 //
 // The child's output goes to the disc's compat.log. Its compat line names
-// the result; a child that ends without one crashed, and one still running
-// after COMPAT_WAIT seconds (default 600) is stopped and hung. A disc that
-// fails in its child is a row, never a failure of the run. The conversion
-// runs here first (convert_store, in its own child), so COMPAT_WAIT times
-// the game alone; a disc whose conversion fails runs interpreted.
+// the result; a child that ends without one crashed. The child writes its
+// vblank count to the disc's compat.progress (COMPAT_PROGRESS, core/compat);
+// one whose count has not moved for COMPAT_WAIT seconds (default 120), or
+// for COMPAT_BOOT_FACTOR times that before its first vblank, is stopped and
+// hung, however long it has run. A disc that fails in its child is a row,
+// never a failure of the run. The conversion runs here first (convert_store,
+// in its own child), so neither window counts it; a disc whose conversion
+// fails runs interpreted.
 //
 // The disc's press.txt, when there is one and PRESS is unset, is the
 // child's PRESS script.
@@ -17,6 +20,7 @@ package play
 import "base:runtime"
 import "core:bufio"
 import "core:bytes"
+import "core:encoding/endian"
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
@@ -33,9 +37,24 @@ import "ps:core/disc"
 @(private = "file")
 COMPAT_FRAMES :: 3600
 
-// Seconds a child runs before it counts as hung, without COMPAT_WAIT.
+// Seconds a child's vblank count may stay the same before it counts as
+// hung, without COMPAT_WAIT. The child writes the count once a second of
+// game time (COMPAT_PROGRESS_EVERY vblanks), so this is about 6 times the
+// gap of an interpreted disc at 3 to 5 frames a second on a loaded machine.
+// No cap on the whole run: a count that keeps moving reaches FRAMES.
 @(private = "file")
-COMPAT_WAIT :: 600
+COMPAT_WAIT :: 120
+
+// The window before vblank 1, as a multiple of COMPAT_WAIT: the child may
+// first compile learned code (play --learned), load a native blob and boot
+// the console, none of which writes a count. 5 times the default is the
+// 600 s the whole run had before the count.
+@(private = "file")
+COMPAT_BOOT_FACTOR :: 5
+
+// How often the parent reads a running child's count.
+@(private = "file")
+COMPAT_POLL :: 250 * time.Millisecond
 
 // The longest line of a child's output read, in bytes.
 @(private = "file")
@@ -49,8 +68,9 @@ FATAL_MAX :: 200
 // with no progress: the display never on, nothing drawn on the last frame, or
 // main RAM unchanged from FRAMES/2), fallback (FRAMES reached with progress,
 // but an IOP module's load failed and the HLE stood in for it), exit (the
-// game ended), fatal, crash (no compat line), hang (stopped at COMPAT_WAIT), spawn (no child); status: the
-// child's exit status (the signal of a crash on POSIX), 1 for stalled as for
+// game ended), fatal, crash (no compat line), hang (stopped with no new
+// vblank in a window, COMPAT_WAIT), spawn (no child); status: the child's
+// exit status (the signal of a crash on POSIX), 1 for stalled as for
 // fatal though the child exits 0, "" for hang and spawn; native: whether the
 // run had the disc's native code; interp_share: interp_insns *
 // cycles_per_insn / cycles, at most 1; entries: the hottest interpreter
@@ -252,19 +272,24 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 		row[.Result], row[.Fatal] = "spawn", fmt.tprint("cannot create", log_path, lerr)
 		return
 	}
+	progress_path := core.disc_path(dir, .Compat_Progress)
+	// Empty: a count from an earlier run is not progress of this one.
+	progress, gerr := os.open(progress_path, {.Read, .Write, .Create, .Trunc}, os.Permissions_Default_File)
+	if gerr != nil {
+		os.close(log)
+		row[.Result], row[.Fatal] = "spawn", fmt.tprint("cannot create", progress_path, gerr)
+		return
+	}
+	defer os.close(progress)
 	start := time.tick_now()
-	p, perr := os.process_start({command = {self, image}, env = child_env(dir, frames, native), stdout = log, stderr = log})
+	p, perr := os.process_start({command = {self, image}, env = child_env(dir, frames, native, progress_path), stdout = log, stderr = log})
 	os.close(log)
 	if perr != nil {
 		row[.Result], row[.Fatal] = "spawn", fmt.tprint("cannot start the child:", perr)
 		return
 	}
-	state, werr := os.process_wait(p, time.Duration(wait) * time.Second)
-	hang := werr == os.General_Error.Timeout
-	if hang {
-		_ = os.process_kill(p)
-		state, werr = os.process_wait(p)
-	}
+	stall := time.Duration(wait) * time.Second
+	state, werr, hang := compat_wait(p, progress, COMPAT_BOOT_FACTOR * stall, stall)
 	row[.Wall_S] = fmt.tprintf("%.1f", time.duration_seconds(time.tick_since(start)))
 	if werr == nil {
 		row[.User_S] = fmt.tprintf("%.1f", time.duration_seconds(state.user_time))
@@ -289,15 +314,45 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	return
 }
 
-// The child's environment: this one with HEADLESS, COMPAT and FRAMES set,
-// NATIVE=0 without native code (so the child does not convert again), and
-// PRESS from the disc's press.txt when PRESS is unset.
+// Wait for the child p to end, reading its vblank count from progress each
+// COMPAT_POLL. hang: the count stayed at 0 (no vblank yet) for boot, or at
+// any later value for stall, so p was killed (and waited for).
 @(private = "file")
-child_env :: proc(dir: string, frames: u64, native: bool) -> []string {
+compat_wait :: proc(p: os.Process, progress: ^os.File, boot, stall: time.Duration) -> (state: os.Process_State, err: os.Error, hang: bool) {
+	last: u64
+	since := time.tick_now()
+	for {
+		state, err = os.process_wait(p, COMPAT_POLL)
+		if err != os.General_Error.Timeout {
+			return
+		}
+		// A short read (an empty file, no vblank yet) is 0. A torn read
+		// of a write in flight is a new value too, so at worst it counts
+		// as progress once: harmless.
+		b: [8]u8
+		n, _ := os.read_at(progress, b[:], 0)
+		v := endian.unchecked_get_u64le(b[:]) if n == len(b) else 0
+		if v != last {
+			last, since = v, time.tick_now()
+		} else if time.tick_since(since) >= (boot if last == 0 else stall) {
+			_ = os.process_kill(p)
+			state, err = os.process_wait(p)
+			return state, err, true
+		}
+	}
+}
+
+// The child's environment: this one with HEADLESS, COMPAT and FRAMES set,
+// COMPAT_PROGRESS the file for its vblank count, NATIVE=0 without native
+// code (so the child does not convert again), and PRESS from the disc's
+// press.txt when PRESS is unset.
+@(private = "file")
+child_env :: proc(dir: string, frames: u64, native: bool, progress: string) -> []string {
 	set := make([dynamic]string)
 	append(&set, fmt.tprintf("%s=1", core.env_name("HEADLESS")))
 	append(&set, fmt.tprintf("%s=1", core.env_name("COMPAT")))
 	append(&set, fmt.tprintf("%s=%d", core.env_name("FRAMES"), frames))
+	append(&set, fmt.tprintf("%s=%s", core.env_name("COMPAT_PROGRESS"), progress))
 	if !native {
 		append(&set, fmt.tprintf("%s=0", core.env_name("NATIVE")))
 	}

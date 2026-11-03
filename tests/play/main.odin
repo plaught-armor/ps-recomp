@@ -26,8 +26,11 @@
 //   row past 0.95 only for the one that sleeps). Each disc whose display
 //   was on, and no fatal one, leaves a thumb.ppm (lit for the PS2 one that
 //   draws). The looping PS1 disc run
-//   again with a vblank count it cannot reach in COMPAT_WAIT is a hang, and
-//   once more to FRAMES stalled, each time in place. Three PS1 discs load a
+//   again to FRAMES is stalled, in place, and leaves vblank 1 in
+//   compat.progress. Its child replaced by a fake one (PLAY_TEST_CHILD,
+//   fake_child) under a 1 s COMPAT_WAIT: one whose count stops is a hang, as
+//   is one that writes none within the 5 s boot window; one that starts
+//   after 2 s and keeps counting for 4.8 s is not. Three PS1 discs load a
 //   second executable no native code covers: LoadExec of it, over the boot
 //   executable, checks its argc, stack and BSS; LoadExec of a missing file
 //   runs the boot executable again; Load and Exec of it return to the boot
@@ -52,6 +55,7 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import "ps:core"
 import "ps:core/disc"
 import "ps:play"
@@ -75,7 +79,47 @@ check :: proc(name: string, ok: bool, what: string, loc := #caller_location) {
 @(private = "file")
 tmp: string
 
+// Set, a disc run (play <image>) is fake_child in that mode instead.
+@(private = "file")
+PLAY_TEST_CHILD :: "PS_PLAY_TEST_CHILD"
+
+// A compat child that writes vblank counts to COMPAT_PROGRESS as a game
+// would, then ends with no compat line. "stuck": vblank 1, then nothing for
+// 60 s; "boot": nothing for 60 s; "slow": vblanks 1 to 12, 0.4 s apart,
+// after 2 s.
+@(private = "file")
+fake_child :: proc(mode: string) -> ! {
+	f, err := os.open(core.env("COMPAT_PROGRESS"), {.Write})
+	if err != nil {
+		fmt.eprintln("fake child: no COMPAT_PROGRESS:", err)
+		os.exit(1)
+	}
+	put :: proc(f: ^os.File, n: u64) {
+		b: [8]u8
+		endian.unchecked_put_u64le(b[:], n)
+		_, _ = os.write_at(f, b[:], 0)
+	}
+	switch mode {
+	case "stuck":
+		put(f, 1)
+		time.sleep(60 * time.Second)
+	case "boot":
+		time.sleep(60 * time.Second)
+	case "slow":
+		time.sleep(2 * time.Second)
+		for n in u64(1) ..= 12 {
+			put(f, n)
+			time.sleep(400 * time.Millisecond)
+		}
+		fmt.eprintln("fake child: done")
+	}
+	os.exit(0)
+}
+
 main :: proc() {
+	if mode := os.get_env(PLAY_TEST_CHILD, context.temp_allocator); mode != "" && len(os.args) == 2 {
+		fake_child(mode)
+	}
 	if len(os.args) > 1 {
 		os.exit(play.run(os.args))
 	}
@@ -938,17 +982,6 @@ test_compat :: proc() {
 		}
 	}
 
-	os.set_env(core.env_name("COMPAT_WAIT"), "2")
-	out, errs, ok = run_compat(name, {loop, "1000000000"})
-	os.unset_env(core.env_name("COMPAT_WAIT"))
-	rows = compat_rows(name)
-	check(name, ok && len(rows) == len(fixtures) + 1, fmt.tprintf("hang run: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
-	if row, found := compat_row(rows, ids[0]); found {
-		check(name, row[.Result] == "hang" && row[.Status] == "" && row[.Fatal] == "", fmt.tprintf("hang: %v", row))
-	} else {
-		check(name, false, "hang: no row")
-	}
-
 	out, errs, ok = run_compat(name, {loop, fmt.tprint(FRAMES)})
 	rows = compat_rows(name)
 	check(name, ok && len(rows) == len(fixtures) + 1, fmt.tprintf("rerun: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
@@ -957,6 +990,33 @@ test_compat :: proc() {
 	} else {
 		check(name, false, "rerun: no row")
 	}
+	if ddir, has := core.disc_dir(ids[0], context.temp_allocator); has {
+		b, err := os.read_entire_file(core.disc_path(ddir, .Compat_Progress, context.temp_allocator), context.temp_allocator)
+		check(name, err == nil && len(b) == 8 && endian.unchecked_get_u64le(b) == 1, fmt.tprintf("rerun: compat.progress %v %v", b, err))
+	}
+
+	// Fake children, timed by the parent's progress windows.
+	os.set_env(core.env_name("COMPAT_WAIT"), "1")
+	Wait_Case :: struct {
+		mode, result: string,
+		// Bounds of the row's wall_s.
+		lo, hi:       f64,
+	}
+	for c in ([]Wait_Case{{"stuck", "hang", 1, 4}, {"boot", "hang", 5, 8}, {"slow", "crash", 6.5, 10}}) {
+		os.set_env(PLAY_TEST_CHILD, c.mode)
+		out, errs, ok = run_compat(name, {loop})
+		os.unset_env(PLAY_TEST_CHILD)
+		rows = compat_rows(name)
+		what := fmt.tprintf("%s child: stdout:\n%s\nstderr:\n%s", c.mode, out, errs)
+		row, found := compat_row(rows, ids[0])
+		check(name, ok && found, what)
+		wall, has_wall := strconv.parse_f64(row[.Wall_S])
+		what = fmt.tprintf("%s child: %v", c.mode, row)
+		check(name, row[.Result] == c.result && has_wall && wall >= c.lo && wall < c.hi, what)
+		check(name, row[.Status] == ("" if c.result == "hang" else "0"), what)
+		check(name, c.result == "hang" ? row[.Fatal] == "" : row[.Fatal] == "fake child: done", what)
+	}
+	os.unset_env(core.env_name("COMPAT_WAIT"))
 }
 
 // The disc's id; "" on a failure.

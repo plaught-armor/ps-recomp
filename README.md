@@ -228,7 +228,7 @@ one of these:
 | `exit` | The game ended. |
 | `fatal` | The program stopped on a fatal error. |
 | `crash` | The run crashed. It ended without writing its result. |
-| `hang` | Still not finished after `PS_COMPAT_WAIT` seconds (default 600). |
+| `hang` | Stopped because no new vblank came for `PS_COMPAT_WAIT` seconds (default 120), or for 5 times that before the first vblank. A slow game that keeps going is never stopped. |
 | `spawn` | The game's process could not be started. |
 
 Each game's output goes to `compat.log`, in its `discs/<disc id>/` folder.
