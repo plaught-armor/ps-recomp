@@ -352,6 +352,11 @@ master :: proc() {
 	iop.spu_master(1, 0x8000, 0x3fff)
 	out = mix(28)
 	check(out[54] == i32(i64(full) * 0x3fff >> 14), "a sweeping MVOLL is taken at full scale")
+	// A core's parameter sent through sdrdrv (sceSdSetParam, 0x8010) lands
+	// as libsd's does: MVOLL of core 1.
+	sdr_call(0x8010, 0x0901, 0x2000)
+	out = mix(28)
+	check(out[54] == i32(i64(full) * 0x2000 >> 14), "MVOLL sent through sdrdrv scales the output")
 
 	// Every voice of a core at full level and volume: the sum times the
 	// master volume saturates, it does not wrap.

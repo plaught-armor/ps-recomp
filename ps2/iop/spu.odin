@@ -1130,7 +1130,7 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	spu_catch_up()
 	switch fno {
 	case 0x8000: sd_init()
-	case 0x8010: sd_set_param(w[1], w[2])
+	case 0x8010: if !sd_set_param(w[1], w[2]) {sd_core_param(w[1], w[2])} // as libsd's sceSdSetParam
 	case 0x8030: sd_set_switch(w[1], w[2])
 	case 0x8050: sd_set_addr(w[1], w[2])
 	case 0x8060: r, _ = sd_get_addr(w[1])
