@@ -9,6 +9,9 @@
 // switched back to.
 // A function an interpreted jal calls sees the jal and its delay slot
 // charged, as recompiled code charges them before the call.
+// An event that falls due in a long straight-line run is run where
+// recompiled code checks, at the branch back that ends the run, with the
+// whole block charged; not partway through it.
 package main
 
 import "core:fmt"
@@ -57,6 +60,17 @@ FN_CYCLES :: 0x80001400
 @(private = "file")
 entry_cycles: u64
 
+// li t0, 1; loop: addiu t0, t0, -1; LOOP_NOPS nops; bgez t0, loop; nop;
+// jr ra; nop.
+@(private = "file")
+LOOP :: 0x80001500
+@(private = "file")
+LOOP_NOPS :: 100
+
+// The cycles at each run_events call.
+@(private = "file")
+event_cycles: [dynamic]u64
+
 // Interpret the stub for vector vec and function fn with a0 and a1; v0.
 @(private = "file")
 stub :: proc(vec, fn: u32, a0: u32 = 0, a1: u32 = 0) -> u32 {
@@ -81,6 +95,8 @@ main :: proc() {
 				}
 			}}, {FN_CYCLES, proc() {entry_cycles = cpu.state.cycles}}})
 	bios.bios_init()
+	// No machine runs here, so no event is ever due but the loop's own.
+	cpu.next_event = max(u64)
 	for vec in ([?]u32{0xa0, 0xb0, 0xc0}) {
 		cpu.w32(vec, 0xffffffff)
 	}
@@ -113,8 +129,36 @@ main :: proc() {
 	cpu.call(JAL_CYCLES)
 	check("cycles at a jal's callee", u32(entry_cycles - start), 3 * cpu.CYCLES_PER_INSN)
 
+	// The nops are RAM's zeros, which an earlier part may have overwritten.
+	for k in u32(0) ..< LOOP_NOPS + 6 {
+		cpu.w32(LOOP + 4 * k, 0)
+	}
+	cpu.w32(LOOP, 0x24080001)
+	cpu.w32(LOOP + 4, 0x2508ffff)
+	tail := u32(LOOP + 8 + 4 * LOOP_NOPS)
+	cpu.w32(tail, 0x05010000 | (transmute(u32)i32(-(LOOP_NOPS + 2)) & 0xffff))
+	cpu.w32(tail + 8, 0x03e00008)
+	saved_events := cpu.run_events
+	cpu.run_events = proc() {
+		append(&event_cycles, cpu.state.cycles)
+		cpu.next_event = max(u64)
+	}
+	r[31] = RA
+	start = cpu.state.cycles
+	cpu.next_event = start + 8 * cpu.CYCLES_PER_INSN
+	cpu.call(LOOP)
+	cpu.run_events = saved_events
+	check("run_events calls in a loop", u32(len(event_cycles)), 1)
+	if len(event_cycles) == 1 {
+		check(
+			"cycles at a loop's event",
+			u32(event_cycles[0] - start),
+			(LOOP_NOPS + 4) * cpu.CYCLES_PER_INSN,
+		)
+	}
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_interp: jr to the A0, B0 and C0 vectors runs the function and returns to $ra; syscall 3 switches threads; a jal's callee sees the jal charged")
+	fmt.println("ok psx_interp: jr to the A0, B0 and C0 vectors runs the function and returns to $ra; syscall 3 switches threads; a jal's callee sees the jal charged; a due event runs at the branch back")
 }

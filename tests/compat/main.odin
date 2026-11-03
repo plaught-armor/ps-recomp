@@ -145,6 +145,8 @@ child :: proc(name: string) -> ! {
 		if !psx_cpu.trace_init() || !psx_host.platform_init("compat") {os.exit(2)}
 		vblank = psx_host.platform_frame
 		psx_cpu.register_funcs(nil)
+		// No machine runs here, so no event is ever due.
+		psx_cpu.next_event = max(u64)
 		if name == "psx_fatal" {
 			psx_cpu.bad_insn(PSX_FUNC, 0xffffffff)
 		}

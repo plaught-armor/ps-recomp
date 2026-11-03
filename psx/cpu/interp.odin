@@ -6,12 +6,23 @@
 // which is what the PS1 and the IOP both set interp_run to.
 // Plain jumps stay inside the interpreter unless they land on a function the
 // dispatcher knows, in which case they become a tail call.
+//
+// Cycles and events go as in recompiled code (recomp/r3000/lower.odin), so
+// a run that interprets a function and one that runs it learned (native
+// code compiled from the same words) see the same cycles everywhere:
+//   - instructions are charged when their block ends: at a branch or jump,
+//     after its delay slot and before anything follows it (a call, a tail
+//     call, a return, the target). An access, a syscall or a cop0 move in
+//     the block sees the cycles of the block's start.
+//   - due events run on entry, on a taken branch or jump back (its target
+//     at or before it) and on a jump through a register other than $ra.
+//     Every loop has such a jump or a call, and a call's callee checks on
+//     its entry, so events are never starved.
+// One difference is left: recompiled code also charges when a block falls
+// through into a label, which the interpreter cannot see.
 package psx_cpu
 
 import "ps:core"
-
-@(private)
-INTERP_EVENT_STRIDE :: 64
 
 @(private)
 Interp :: struct {
@@ -20,9 +31,8 @@ Interp :: struct {
 	target:  u32,
 	taken:   bool,
 	done:    bool,
-	// The instruction being run was charged already: a branch or jump
-	// charges itself with its delay slot (branch).
-	charged: bool,
+	// Instructions run since the last charge.
+	pending: u64,
 	// The run's LEARN frame (core/learn.odin); nil without LEARN.
 	learn:   ^core.Learn_Frame,
 }
@@ -32,51 +42,55 @@ interp_loop :: proc(start: u32) {
 		pc    = start,
 		learn = core.learn_take(learn_cpu),
 	}
-	budget := 0
+	events_due()
 	for !st.done {
 		w := lw(st.pc)
 		pc := st.pc
 		st.pc += 4
+		st.pending += 1
 		if st.learn != nil {core.learn_fetch(st.learn, pc)}
 		if .Interp in core.trace.active && core.trace_pc_ok(pc) {
 			core.tracef(.Interp, "%08x %08x", pc, w)
 		}
 		interp_exec(&st, pc, w)
 		state.r[0] = 0
-		if st.charged {
-			st.charged = false
-		} else {
-			state.cycles += CYCLES_PER_INSN
-		}
-		budget += 1
-		if budget >= INTERP_EVENT_STRIDE {
-			budget = 0
-			if state.cycles >= next_event {
-				run_events()
-			}
-		}
+	}
+	charge(&st)
+}
+
+// Charge the instructions run since the last charge.
+@(private)
+charge :: #force_inline proc(st: ^Interp) {
+	state.cycles += st.pending * CYCLES_PER_INSN
+	st.pending = 0
+}
+
+// Run the events that are due, as recompiled code does at its check points.
+@(private)
+events_due :: #force_inline proc() {
+	if state.cycles >= next_event {
+		run_events()
 	}
 }
 
 // Execute the delay slot at st.pc, then follow a taken branch to target.
-// The branch and its slot are charged before anything follows them (a call,
-// a tail call, the target), as recompiled code charges a block before its
-// control transfer (recomp/r3000/lower.odin): a callee sees the cycles of
-// the instructions that called it.
+// The block, branch and slot included, is charged first; a taken branch
+// back runs the events that are due.
 @(private)
 branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	slot := st.pc
 	w := lw(slot)
 	st.pc += 4
+	st.pending += 1
 	if st.learn != nil {core.learn_fetch(st.learn, slot)}
 	if .Interp in core.trace.active && core.trace_pc_ok(slot) {
 		core.tracef(.Interp, "%08x %08x (delay)", slot, w)
 	}
 	interp_exec(st, slot, w)
 	state.r[0] = 0
-	state.cycles += 2 * CYCLES_PER_INSN
-	st.charged = true
+	charge(st)
 	if taken {
+		if target <= slot - 4 {events_due()}
 		goto_target(st, target)
 	}
 }
@@ -212,6 +226,7 @@ interp_special :: proc(st: ^Interp, pc, w: u32) {
 		if rs == 31 || t == frame_ret {
 			st.done = true
 		} else {
+			events_due()
 			goto_target(st, t)
 		}
 	case 0x09:
