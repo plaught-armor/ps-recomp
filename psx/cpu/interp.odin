@@ -15,13 +15,16 @@ INTERP_EVENT_STRIDE :: 64
 
 @(private)
 Interp :: struct {
-	pc:     u32,
+	pc:      u32,
 	// Branch target pending after the current delay slot, if any.
-	target: u32,
-	taken:  bool,
-	done:   bool,
+	target:  u32,
+	taken:   bool,
+	done:    bool,
+	// The instruction being run was charged already: a branch or jump
+	// charges itself with its delay slot (branch).
+	charged: bool,
 	// The run's LEARN frame (core/learn.odin); nil without LEARN.
-	learn:  ^core.Learn_Frame,
+	learn:   ^core.Learn_Frame,
 }
 
 interp_loop :: proc(start: u32) {
@@ -40,7 +43,11 @@ interp_loop :: proc(start: u32) {
 		}
 		interp_exec(&st, pc, w)
 		state.r[0] = 0
-		state.cycles += CYCLES_PER_INSN
+		if st.charged {
+			st.charged = false
+		} else {
+			state.cycles += CYCLES_PER_INSN
+		}
 		budget += 1
 		if budget >= INTERP_EVENT_STRIDE {
 			budget = 0
@@ -52,6 +59,10 @@ interp_loop :: proc(start: u32) {
 }
 
 // Execute the delay slot at st.pc, then follow a taken branch to target.
+// The branch and its slot are charged before anything follows them (a call,
+// a tail call, the target), as recompiled code charges a block before its
+// control transfer (recomp/r3000/lower.odin): a callee sees the cycles of
+// the instructions that called it.
 @(private)
 branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	slot := st.pc
@@ -63,7 +74,8 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	}
 	interp_exec(st, slot, w)
 	state.r[0] = 0
-	state.cycles += CYCLES_PER_INSN
+	state.cycles += 2 * CYCLES_PER_INSN
+	st.charged = true
 	if taken {
 		goto_target(st, target)
 	}

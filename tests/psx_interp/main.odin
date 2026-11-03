@@ -7,6 +7,8 @@
 // An interpreted syscall 3 to a TCB switches threads as ChangeTh does, and
 // the interpreted code goes on past it with v0 1 when the main thread is
 // switched back to.
+// A function an interpreted jal calls sees the jal and its delay slot
+// charged, as recompiled code charges them before the call.
 package main
 
 import "core:fmt"
@@ -44,6 +46,17 @@ FN_THREAD :: 0x80001200
 @(private = "file")
 turns: int
 
+// nop; jal FN_CYCLES; nop; jr ra; nop.
+@(private = "file")
+JAL_CYCLES :: 0x80001300
+
+// Records the cycles at its entry.
+@(private = "file")
+FN_CYCLES :: 0x80001400
+
+@(private = "file")
+entry_cycles: u64
+
 // Interpret the stub for vector vec and function fn with a0 and a1; v0.
 @(private = "file")
 stub :: proc(vec, fn: u32, a0: u32 = 0, a1: u32 = 0) -> u32 {
@@ -66,7 +79,7 @@ main :: proc() {
 					turns += 1
 					stub(0xb0, 0x10, 0xff000000)
 				}
-			}}})
+			}}, {FN_CYCLES, proc() {entry_cycles = cpu.state.cycles}}})
 	bios.bios_init()
 	for vec in ([?]u32{0xa0, 0xb0, 0xc0}) {
 		cpu.w32(vec, 0xffffffff)
@@ -92,8 +105,16 @@ main :: proc() {
 		check("thread turns after syscall 3", u32(turns), u32(want))
 	}
 
+	for w, k in ([?]u32{0, 0x0c000000 | (FN_CYCLES & 0x3ffffff) >> 2, 0, 0x03e00008, 0}) {
+		cpu.w32(JAL_CYCLES + 4 * u32(k), w)
+	}
+	r[31] = RA
+	start := cpu.state.cycles
+	cpu.call(JAL_CYCLES)
+	check("cycles at a jal's callee", u32(entry_cycles - start), 3 * cpu.CYCLES_PER_INSN)
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_interp: jr to the A0, B0 and C0 vectors runs the function and returns to $ra; syscall 3 switches threads")
+	fmt.println("ok psx_interp: jr to the A0, B0 and C0 vectors runs the function and returns to $ra; syscall 3 switches threads; a jal's callee sees the jal charged")
 }
