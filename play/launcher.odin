@@ -12,7 +12,6 @@ package play
 
 import "core:fmt"
 import "core:mem/virtual"
-import "core:strings"
 import "ps:core"
 
 Screen :: enum {
@@ -109,10 +108,11 @@ launcher_destroy :: proc(l: ^Launcher) {
 	l^ = {}
 }
 
-// Load the library again and select the disc at path, else the row selected
-// before, now kept within the list. False as launcher_init.
+// Load the library again and select the disc at path (spelled any way:
+// matched as library.tsv keeps it), else the row selected before, now kept
+// within the list. False as launcher_init.
 launcher_reload :: proc(l: ^Launcher, path: string) -> bool {
-	keep := strings.clone(path, context.temp_allocator)
+	keep := library_path(path) if path != "" else ""
 	free_all(virtual.arena_allocator(&l.lib_arena))
 	l.discs = {}
 	discs, ok := library_load(virtual.arena_allocator(&l.lib_arena))

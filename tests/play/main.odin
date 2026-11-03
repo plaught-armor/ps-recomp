@@ -1133,6 +1133,9 @@ test_launcher :: proc() {
 		check(name, false, "cannot write the discs")
 		return
 	}
+	// The library keeps a path with its symlinks resolved (a macOS temp
+	// directory is under /var).
+	b_real, _ := filepath.abs(b, context.temp_allocator)
 	_, added := play.library_add(dir)
 	l: play.Launcher
 	defer play.launcher_destroy(&l)
@@ -1173,8 +1176,9 @@ test_launcher :: proc() {
 	check(name, !os.exists(a_set) && l.settings.set == {}, "GPU unset leaves no file")
 	_ = step(&l, .Left)
 	check(name, saved(a_set) == "GPU\tsw\n", fmt.tprintf("GPU back to sw: %q", saved(a_set)))
-	// Set in the environment, even to "": locked.
-	os.set_env(core.env_name("NATIVE"), "")
+	// Set in the environment, even to "": locked. Windows has no empty
+	// variable (setting one to "" removes it), so there it is "1".
+	os.set_env(core.env_name("NATIVE"), "1" when ODIN_OS == .Windows else "")
 	_ = step(&l, .Down)
 	_ = step(&l, .Right)
 	text, locked := play.launcher_setting_text(&l, play.launcher_choices(&l)[1])
@@ -1214,7 +1218,7 @@ test_launcher :: proc() {
 	check(name, play.launcher_reload(&l, a) && l.sel == 0 && l.discs[0].missing, "a missing")
 	check(name, step(&l, .Launch) == .None && l.toast != "" && step(&l, .Menu) == .None && l.screen == .List, "a missing runs")
 	_ = step(&l, .Remove)
-	check(name, len(l.discs) == 1 && l.discs[0].info[.Path] == b, fmt.tprint("removed:", len(l.discs)))
+	check(name, len(l.discs) == 1 && l.discs[0].info[.Path] == b_real, fmt.tprint("removed:", len(l.discs)))
 	_ = os.rename(fmt.tprint(a, ".gone"), a)
 
 	// A run: to FRAMES, its stderr in play.log; a failed one's last line.

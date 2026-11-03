@@ -164,7 +164,7 @@ library_remove :: proc(path: string) -> bool {
 // macOS temp directory is under the /var symlink). A file that is gone has
 // its directory resolved instead, and a path whose directory is gone too
 // is taken as it is, so a missing image is still found by its stored path.
-@(private = "file")
+@(private)
 library_path :: proc(path: string) -> string {
 	if abs, err := filepath.abs(path, context.temp_allocator); err == nil {
 		return abs
