@@ -3636,8 +3636,18 @@ test_libsd :: proc() {
 	sd_call(5, 0x0300, 0x000f)
 	sd_call(5, 0x0400, 0)
 	check(sd_call(6, 0x0200) == 0x1000 && sd_call(6, 0x0000) == 0x3fff && sd_call(6, 0x0300) == 0x000f, "libsd: GetParam returns what SetParam set")
-	sd_call(7, 0x1500, 1)
+	// A call sees the voices at its own IOP cycle, not the last mix's: ENVX
+	// read at the key on's sample is 0, and two samples (768 IOP cycles
+	// each) on, the attack at rate 0 has stepped twice, 0x3800 a sample.
+	// The mix first takes the samples rendered ahead, and the clock moves to
+	// a sample's start.
 	out = make([]i32, 2 * 800, context.temp_allocator)
+	iop.spu_mix(out)
+	r3000.state.cycles = (r3000.state.cycles / 768 + 1) * 768
+	sd_call(7, 0x1500, 1)
+	check(sd_call(6, 0x0500) == 0, "libsd: ENVX read at the key on's sample is 0")
+	r3000.state.cycles += 2 * 768
+	check(sd_call(6, 0x0500) == 0x7000, fmt.tprintf("libsd: ENVX two samples after the key on is 0x7000, got %x", sd_call(6, 0x0500)))
 	iop.spu_mix(out)
 	st := iop.spu_voice_status(0, 0)
 	check(st.on && sd_call(6, 0x0500) == 0x7fff && sd_call(10, 0x2240) &~ 15 == st.nax, "libsd: the keyed voice plays, ENVX at full, NAX")
@@ -3767,6 +3777,11 @@ test_libsd :: proc() {
 	IN_DUE :: 0xb101 * SAMPLE
 	check(r3000.state.cycles <= 0x2100000 && cpu.state.cycles <= 0x10800000, "libsd: the clocks are before the input IRQ test's")
 	r3000.state.cycles, cpu.state.cycles = 0x2100000, 0x10800000
+	// The voices are silenced here, at the jump: the calls catch them up to
+	// the IOP's cycle, so the samples up to the input area's mix below are
+	// rendered from now on, at these volumes.
+	vols := [?]u32{0x0000, 0x0100, 0x0001, 0x0101}
+	for v in vols {sd_call(5, v, 0)}
 	sd_call(9, 0x1f01, 0x4e00)
 	sd_call(11, 0x5, 1)
 	check(iop.iop_wake_ee == IN_DUE, "libsd: an enabled IRQA in the input area's right half wakes the IOP at the read there")
@@ -3795,9 +3810,7 @@ test_libsd :: proc() {
 	// The input area plays at its core's BVOL: core 1's, filled 2(i + 1) at
 	// left position i and the negative at right, at BVOL 0x4000 plays i + 1.
 	// Mixed at IN_DUE, its last sample is the read at IRQA, position 0x100.
-	// The voices are silenced.
-	vols := [?]u32{0x0000, 0x0100, 0x0001, 0x0101}
-	for v in vols {sd_call(5, v, 0)}
+	// The voices are silent (above).
 	inp := iop.iop_mem(b + buf, 0x800)
 	for i in 0 ..< 512 {
 		endian.put_u16(inp[i * 2:], .Little, u16(2 * (i + 1)))

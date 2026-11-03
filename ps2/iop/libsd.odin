@@ -50,6 +50,7 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
 	a0, a1, a2, a3 := r[4], r[5], r[6], r[7]
 	s := &iop_sd
+	spu_catch_up() // the voices as they are at this call's cycle
 	switch fno {
 	case 4: // sceSdInit(flag)
 		sd_init()

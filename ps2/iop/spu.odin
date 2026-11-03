@@ -11,9 +11,12 @@
 // taken at full scale.
 //
 // Voices advance by the samples spu_mix renders, the same clock the FMOD
-// voices run on. A block transfer (a PCM stream into a core) through sdrdrv
-// only keeps the time: the game polls where it reads to refill its ring, and
-// that address moves with EE time.
+// voices run on, and between its passes by those spu_catch_up renders ahead
+// of it at each libsd and sdrdrv call, so a call sees its voices as they are
+// at its IOP cycle (an ENVX read just after a key on reads the attack under
+// way) and its writes take effect from that sample on. A block transfer (a
+// PCM stream into a core) through sdrdrv only keeps the time: the game polls
+// where it reads to refill its ring, and that address moves with EE time.
 //
 // libsd as an IOP module imports it (libsd.odin, PS_IRX=1) takes the same
 // voice calls and more: core volumes, effect, IRQA and the cores' IRQ, and
@@ -88,7 +91,21 @@ spu: struct {
 	in_irq: [2]u64,
 	bvol:   [2][2]i32, // BVOLL, BVOLR, the input area's volume, per core (libsd)
 	switches: [2][Spu_Switch]u32, // the voice masks sd_switch_extra keeps, 24 bits, per core
+	// The voice samples spu_catch_up rendered ahead of spu_mix, per core:
+	// the voices' sums and their effect send, interleaved stereo, early_n
+	// samples of them, which the next spu_mix outputs first.
+	early_acc:  [2][2 * SPU_AHEAD]i32,
+	early_send: [2][2 * SPU_AHEAD]i32,
+	early_n:    u32,
+	// The input clock's sample (spu_in_sample) the samples ahead start at:
+	// early_n samples rendered is the voices' state at frame_s + early_n.
+	frame_s: u64,
 }
+
+// The most voice samples spu_catch_up renders ahead of spu_mix: a vblank's,
+// the length the host mixes at once (ps2/host/audio.odin's AUDIO_FRAME).
+@(private = "file")
+SPU_AHEAD :: MIX_RATE / 60
 
 // The voice masks sceSdSetSwitch writes and sceSdGetSwitch reads back.
 @(private = "file")
@@ -421,60 +438,108 @@ spu_sample :: proc(v: ^Spu_Voice) -> i32 {
 	return s
 }
 
+// Adds core c's voices to the interleaved stereo acc, each a sample on per
+// stereo pair, and those in the effect send to send too unless it is nil:
+// one pass.
+@(private = "file")
+spu_voices :: proc(c: int, acc, send: []i32) {
+	for &v in spu.voice[c] {
+		// Every sample, every voice's block start at IRQA raises the IRQ,
+		// stopped or at pitch 0 (PCSX2's UpdateBlockHeader). IRQA and the
+		// IRQ enables change only between passes (each libsd call catches
+		// the voices up first, spu_catch_up), an IRQ raised only clears its
+		// enable, and a voice changes block only by entering one (spu_block
+		// checks it), so one check at the pass's start is that check's
+		// every sample.
+		if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(0))}
+		// A stopped voice still sweeps and advances (spu_sample); at pitch
+		// 0 with no sweep it has nothing to do. Nor has one parked, ended
+		// and looping back on its own block (as sd_init leaves every
+		// voice): each pass it would enter that same block again, its
+		// state the same, but for the block's IRQ, any address in it,
+		// checked here as spu_block would.
+		sweeping := (v.vol[0].reg | v.vol[1].reg) & 0x8000 != 0
+		if v.phase == .Stopped && !sweeping {
+			if v.pitch == 0 {continue}
+			if v.endx && v.lsa == v.nax && spu.ram[v.nax + 1] & 3 == 3 {
+				if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(15))}
+				continue
+			}
+		}
+		for n := 0; n + 1 < len(acc); n += 2 {
+			spu_sweep(&v.vol[0])
+			spu_sweep(&v.vol[1])
+			s := spu_sample(&v)
+			// An end without repeat in this sample stopped it, silent.
+			if v.phase == .Stopped {continue}
+			// The sample takes the envelope's level after this sample's
+			// step, as PCSX2's MixVoice: 0 if the step stopped it.
+			spu_envelope(&v)
+			s = s * v.level >> 15
+			sl, sr := s * v.vol[0].cur >> 15, s * v.vol[1].cur >> 15
+			acc[n] += sl
+			acc[n + 1] += sr
+			if send != nil && !v.dry {
+				send[n] += sl
+				send[n + 1] += sr
+			}
+		}
+	}
+}
+
+// Renders the voices ahead of spu_mix up to the IOP's clock, so a libsd or
+// sdrdrv call, which calls this first, reads and changes them as they are
+// at its cycle, not as the last vblank's mix left them. The invariant: the
+// voices' state is that after frame_s + early_n samples of the input clock
+// (spu_in_sample), and every voice read or write, IRQA and IRQ enable
+// change goes through a call that has caught them up, so each lands between
+// the samples at its time and a voice's IRQ at IRQA raises at its own
+// sample, as the input area's read and the output areas' write do on that
+// same clock (sd_in_arm, sd_input_mix), not at the next vblank. At most
+// SPU_AHEAD samples are rendered ahead; past that the mixer is behind (a
+// stall, or tests mixing by hand), and the frame starts again at now with
+// the samples ahead kept, the time between not rendered, as before the
+// catch-up.
+spu_catch_up :: proc() {
+	s := spu_in_sample(r3000.state.cycles * IOP_EE_RATIO)
+	due := s - min(s, spu.frame_s)
+	if due > SPU_AHEAD {
+		spu.frame_s = s - min(s, u64(spu.early_n))
+		return
+	}
+	if due <= u64(spu.early_n) {return}
+	from, to := 2 * int(spu.early_n), 2 * int(due)
+	for c in 0 ..< 2 {
+		acc, send := spu.early_acc[c][from:to], spu.early_send[c][from:to]
+		mem.zero_slice(acc)
+		mem.zero_slice(send)
+		spu_voices(c, acc, send)
+	}
+	spu.early_n = u32(due)
+	if iop_sd.pending != 0 {iop_wake_set()}
+}
+
 // Add the voices to interleaved stereo at MIX_RATE, the SPU2 output rate.
 // Each core sums its voices and reverb return wide and saturates once, at its
 // output, so voices that cancel do not clip on the way. Core 1's sum takes
-// CRI ADX's streams too (adx_mix).
+// CRI ADX's streams too (adx_mix). The voice samples spu_catch_up rendered
+// ahead come first, the rest rendered here; any past out's length (only a
+// mix shorter than a vblank's) stay ahead for the next.
 spu_mix :: proc(out: []i32) {
 	acc := make([]i32, len(out), context.temp_allocator)
-	for &core, c in spu.voice {
+	early := 2 * min(int(spu.early_n), len(out) / 2)
+	for c in 0 ..< 2 {
 		mem.zero_slice(acc)
 		// A core runs its reverb only with effects enabled and a mode set.
 		w := &spu.reverb[c]
 		wet := spu.effect[c] && w.mode != 0
 		send: []i32
-		if wet {send = make([]i32, len(out), context.temp_allocator)}
-		for &v in core {
-			// Every sample, every voice's block start at IRQA raises the
-			// IRQ, stopped or at pitch 0 (PCSX2's UpdateBlockHeader). IRQA
-			// and the IRQ enables change only between passes, an IRQ raised
-			// only clears its enable, and a voice changes block only by
-			// entering one (spu_block checks it), so one check at the pass's
-			// start is that check's every sample.
-			if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(0))}
-			// A stopped voice still sweeps and advances (spu_sample); at
-			// pitch 0 with no sweep it has nothing to do. Nor has one
-			// parked, ended and looping back on its own block (as sd_init
-			// leaves every voice): each pass it would enter that same
-			// block again, its state the same, but for the block's IRQ,
-			// any address in it, checked here as spu_block would.
-			sweeping := (v.vol[0].reg | v.vol[1].reg) & 0x8000 != 0
-			if v.phase == .Stopped && !sweeping {
-				if v.pitch == 0 {continue}
-				if v.endx && v.lsa == v.nax && spu.ram[v.nax + 1] & 3 == 3 {
-					if spu.irq_watch != 0 {sd_irq_check(&v, ~u32(15))}
-					continue
-				}
-			}
-			for n := 0; n < len(out); n += 2 {
-				spu_sweep(&v.vol[0])
-				spu_sweep(&v.vol[1])
-				s := spu_sample(&v)
-				// An end without repeat in this sample stopped it, silent.
-				if v.phase == .Stopped {continue}
-				// The sample takes the envelope's level after this sample's
-				// step, as PCSX2's MixVoice: 0 if the step stopped it.
-				spu_envelope(&v)
-				s = s * v.level >> 15
-				sl, sr := s * v.vol[0].cur >> 15, s * v.vol[1].cur >> 15
-				acc[n] += sl
-				acc[n + 1] += sr
-				if wet && !v.dry {
-					send[n] += sl
-					send[n + 1] += sr
-				}
-			}
-		}
+		copy(acc, spu.early_acc[c][:early])
+		if wet {
+			send = make([]i32, len(out), context.temp_allocator)
+			copy(send, spu.early_send[c][:early])
+			spu_voices(c, acc[early:], send[early:])
+		} else {spu_voices(c, acc[early:], nil)}
 		// A block transfer playing into the core fills its input area, which
 		// it plays from IOP memory here; else the area plays from sound RAM.
 		// Either plays at the core's BVOL, dry, MMIX's gates not modelled.
@@ -491,6 +556,14 @@ spu_mix :: proc(out: []i32) {
 		m := spu.master[c]
 		for x, i in acc {out[i] += i32(clamp(i64(x) * i64(m[i & 1]) >> 14, -32768, 32767))}
 	}
+	left := 2 * int(spu.early_n) - early
+	for c in 0 ..< 2 {
+		copy(spu.early_acc[c][:], spu.early_acc[c][early:][:left])
+		copy(spu.early_send[c][:], spu.early_send[c][early:][:left])
+	}
+	spu.early_n = u32(left / 2)
+	s := spu_in_sample(r3000.state.cycles * IOP_EE_RATIO)
+	spu.frame_s = s - min(s, u64(spu.early_n))
 	if iop_sd.pending != 0 {iop_wake_set()}
 }
 
@@ -1032,6 +1105,7 @@ sd_next_ee :: proc() -> u64 {
 sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	r: u32 = 0
+	spu_catch_up()
 	switch fno {
 	case 0x8000: sd_init()
 	case 0x8010: sd_set_param(w[1], w[2])
