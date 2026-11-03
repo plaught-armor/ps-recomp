@@ -144,7 +144,8 @@ IOP_LOAD_FAILS :: 3
 // to find what else it lacks, but one looping on a call is stopped here.
 IOP_START_GAPS :: 64
 
-// PS_IRX=1: LOADFILE runs the modules it loads. Host setting, read at init.
+// On by default: LOADFILE runs the modules it loads. PS_IRX=0 turns it
+// off (every module answered as loaded, none run). Host setting, read at init.
 iop_irx: bool
 
 // The first id of a module run here: LOADFILE has always answered 2 for a
@@ -153,7 +154,7 @@ iop_irx: bool
 IOP_FIRST_ID :: 3
 
 iop_loader_init :: proc() {
-	iop_irx = core.env("IRX") == "1"
+	iop_irx = core.env("IRX") != "0"
 	clear(&iop_loader.libs)
 	clear(&iop_loader.pending)
 	clear(&iop_loader.stubs)

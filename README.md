@@ -114,7 +114,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 | `PS_DATA` | The user data directory. |
 | `PS_GPU` | PS1 only: `vk` draws with Vulkan (the default), `sw` in software. |
 | `PS_SCALE` | PS2 only: window size as a multiple of the console's resolution, 1 to 8 (default 3 in a window). |
-| `PS_IRX` | PS2 only: `1` runs a game's own sound and I/O modules on an emulated copy of the console's I/O processor. **Off by default and not ready for general use.** |
+| `PS_IRX` | PS2 only: a game's own sound and I/O modules run on an emulated copy of the console's I/O processor (the default). `0` turns that off and answers every module as loaded without running it. |
 
 The full list is wherever each setting is read; see `core/env.odin` for how
 names are built. A port chooses its own prefix when it is built
