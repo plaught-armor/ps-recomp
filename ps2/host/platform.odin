@@ -44,6 +44,8 @@ frame: int
 shots: [dynamic]int
 @(private)
 next_shot: int // index into shots
+@(private)
+SHOT_WARMUP :: 10 // vblanks the GS draws everything before a picture is read
 // Every vblank, unlike frame (presented frames): netplay's frame count,
 // SHOT and FRAMES.
 @(private)
@@ -175,6 +177,7 @@ vblank_frame :: proc() {
 	audio_frame(vblank, !rerun)
 	gs.skip_present = rerun
 	gs.skip_readout = core.headless && !readout_due()
+	gs.skip_wanted = core.headless && !draw_due()
 	w, h := gs.scanout()
 	core.compat_vblank(u64(vblank), w > 0 && h > 0, mem.ram)
 	if w > 0 && h > 0 {
@@ -326,12 +329,20 @@ rbtest_frame :: proc() {
 
 // Whether this vblank's picture is read: a shot is due, or under COMPAT the
 // FRAMES vblank, which lit_pixels counts. A headless run reads no other
-// picture; the GS still draws every frame, since a game may draw a screen
-// once and show it for many.
+// picture.
 @(private)
 readout_due :: proc() -> bool {
 	if next_shot < len(shots) && shots[next_shot] == vblank {return true}
 	return core.compat.on && core.frames > 0 && u64(vblank) == core.frames
+}
+
+// Whether a picture is read within SHOT_WARMUP vblanks (a shot, or under
+// COMPAT the FRAMES vblank): the GS then draws everything, so a game that
+// fills its buffers over several frames has them full when read.
+@(private)
+draw_due :: proc() -> bool {
+	if next_shot < len(shots) && shots[next_shot] - vblank <= SHOT_WARMUP {return true}
+	return core.compat.on && core.frames > 0 && u64(vblank) + SHOT_WARMUP >= core.frames
 }
 
 // The non-black pixels of the picture on screen, w x h when drawn in

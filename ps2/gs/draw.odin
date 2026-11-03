@@ -65,6 +65,7 @@ Ctx :: struct {
 	ztst:                    u32,
 	a, b, c, d, fix:         u32,
 	pabe, fba, colclamp:     bool,
+	on_display:              bool, // FRAME FBP is a shown buffer
 	fogcol:                  [3]i32,
 	tex:                     Tex,
 }
@@ -151,6 +152,7 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 	c.fbw = u32(frame >> 16) & 0x3f
 	c.fpsm = u32(frame >> 24) & 0x3f
 	c.fbmsk = u32(frame >> 32)
+	for e in shown[:n_shown] {c.on_display = c.on_display || e.fbp == c.fbp}
 	zbuf := r[0x4e + n]
 	c.zbp = u32(zbuf & 0x1ff) * 32
 	c.zpsm = (u32(zbuf >> 24) & 0xf) | 0x30
@@ -209,6 +211,7 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 			k        = i32(u32(t1 >> 32) << 20) >> 20,
 		}
 		c.tex.mtbp[0], c.tex.mtbw[0] = c.tex.tbp, c.tex.tbw
+		shown_read(c.tex.tbp)
 		for i in u32(1) ..= 6 {
 			m := mip[(i - 1) / 3] >> (((i - 1) % 3) * 20)
 			c.tex.mtbp[i], c.tex.mtbw[i] = u32(m) & 0x3fff, u32(m >> 14) & 0x3f
@@ -233,6 +236,7 @@ draw :: proc(kind, prim: u64) {
 	key := [2]u64{ctx_gen, prim & CTX_PRIM}
 	if key != ctx_key {ctx_cur, ctx_key = decode_ctx(prim), key}
 	c := &ctx_cur
+	if skip_on && c.on_display {return} // headless: a shown buffer, redrawn before it is read
 	if c.zte && c.ztst == 0 {return} // NEVER
 	if hw_on {
 		hw_draw(c, kind)

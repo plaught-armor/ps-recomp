@@ -11,12 +11,121 @@ screen: [DISP_W * DISP_H]u32
 // Headless with no picture wanted this vblank: scanout returns the size
 // without filling `screen`. VRAM and GS state are untouched either way.
 skip_readout: bool
+// Set by the host each vblank: headless, with no picture due soon (a shot
+// or the COMPAT lit count). Draws are then skipped only into a buffer the
+// display has shown, while the game flips, and while no draw or transfer has
+// read a shown buffer back; see track_display.
+skip_wanted: bool
 @(private)
 disp_logged: u64
+
+// Buffers the display has shown since the last reset. A draw whose FRAME
+// FBP is one of them (exact base) is the picture itself, redrawn every
+// frame while the game flips; a draw to any other FBP builds something the
+// picture is made from (a texture, an offscreen buffer) and always runs.
+@(private)
+Shown :: struct {
+	fbp, fbw, psm, h: u32, // fbp in blocks
+}
+@(private)
+SHOWN_MAX :: 4
+@(private)
+shown: [SHOWN_MAX]Shown
+@(private)
+n_shown: int
+// DISPFB FBP per circuit at the last vblank, to see flips.
+@(private)
+last_fbp := [2]u32{max(u32), max(u32)}
+// Vblanks since a circuit's DISPFB FBP last changed. Within FLIP_WINDOW the
+// game is flipping (20 fps and up); past it the screen is held, and a held
+// screen may be drawn only once, so nothing is skipped.
+@(private)
+since_flip: u32 = FLIP_WINDOW + 1
+@(private)
+FLIP_WINDOW :: 2
+// A draw textured from, or a transfer read, a shown buffer: its content is
+// read, so skipping draws into it is no longer safe until the display resets.
+@(private)
+feedback: bool
+// Whether draw skips draws into shown buffers now (decode_ctx sets
+// Ctx.on_display; draw checks both).
+@(private)
+skip_on: bool
+
+// Clear the shown buffers and the feedback latch: CSR RESET and snapshot
+// loads.
+display_reset :: proc() {
+	n_shown, feedback, skip_on = 0, false, false
+	last_fbp = {max(u32), max(u32)}
+	since_flip = FLIP_WINDOW + 1
+	ctx_gen += 1
+}
+
+// Once per vblank, before the read circuit: note each enabled circuit's
+// DISPFB in the shown set, see whether the game flips, and decide skip_on.
+// The set resets when a buffer's width, format or height changes, or a
+// fifth base appears (the game moved its buffers).
+@(private)
+track_display :: proc(pmode: u64) {
+	flipped := false
+	for circ in u32(0) ..< 2 {
+		if pmode & (1 << circ) == 0 {continue}
+		dispfb := gs_priv(0x70 + circ * 0x20)
+		display := gs_priv(0x80 + circ * 0x20)
+		b := Shown {
+			fbp = u32(dispfb & 0x1ff) * 32,
+			fbw = u32(dispfb >> 9) & 0x3f,
+			psm = u32(dispfb >> 15) & 0x1f,
+			h   = (u32(display >> 44) & 0x7ff + 1) / (u32(display >> 27) & 3 + 1),
+		}
+		if b.fbp != last_fbp[circ] {
+			flipped = flipped || last_fbp[circ] != max(u32)
+			last_fbp[circ] = b.fbp
+		}
+		found, changed := false, false
+		for e in shown[:n_shown] {
+			if e.fbw != b.fbw || e.psm != b.psm || e.h != b.h {changed = true}
+			if e == b {found = true}
+		}
+		if found && !changed {continue}
+		if changed || n_shown == SHOWN_MAX {n_shown = 0}
+		shown[n_shown] = b
+		n_shown += 1
+		ctx_gen += 1
+	}
+	since_flip = flipped ? 0 : min(since_flip + 1, FLIP_WINDOW + 1)
+	on := skip_wanted && since_flip <= FLIP_WINDOW && !feedback
+	if on != skip_on && skip_wanted {
+		fmt.eprintfln("gs: headless skip of shown-buffer draws %s (%d shown)", on ? "on" : "off", n_shown)
+	}
+	skip_on = on
+}
+
+// Whether block address bp lies in a shown buffer.
+@(private)
+in_shown :: proc(bp: u32) -> bool {
+	for e in shown[:n_shown] {
+		rows: u32 = psm_bits(e.psm) == 16 ? 64 : 32 // a page's height
+		if bp >= e.fbp && bp < e.fbp + e.fbw * ((e.h + rows - 1) / rows) * 32 {return true}
+	}
+	return false
+}
+
+// A draw or transfer reads block address bp: if that is a shown buffer,
+// stop skipping until the display resets.
+@(private)
+shown_read :: proc(bp: u32) {
+	if feedback || !in_shown(bp) {return}
+	feedback, skip_on = true, false
+	if skip_wanted {
+		fmt.eprintfln("gs: shown buffer at block %x read back; headless draw skip off until the display resets", bp)
+	}
+}
 
 // Copy the active read circuit into `screen`; returns the visible size.
 scanout :: proc() -> (w, h: int) {
 	pmode := gs_priv(0x00)
+	track_display(pmode)
 	circ: u32 = pmode & 1 != 0 ? 0 : 1
 	if pmode & 3 == 0 {
 		if hw_on {hw_frame(0, 0, 0, 0, 0, 0, 0)}

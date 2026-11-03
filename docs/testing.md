@@ -9,6 +9,7 @@ odin run tests/ee_native -collection:ps=.
 odin run tests/fpu -collection:ps=.
 odin run tests/lower -collection:ps=.
 odin run tests/vu -collection:ps=.
+odin run tests/gs -collection:ps=.
 odin run tests/vu_macro -collection:ps=.
 odin run tests/vu_micro -collection:ps=.
 odin run tests/vu_native -collection:ps=.

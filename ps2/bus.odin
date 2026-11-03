@@ -7,6 +7,7 @@ import "core:fmt"
 import cpu "cpu"
 import dma "dma"
 import gif "gif"
+import gs "gs"
 import iop "iop"
 import ipu "ipu"
 import mem "mem"
@@ -110,6 +111,7 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 		switch o &~ 7 {
 		case 0x1000:
 			mem.gs_csr &~= u32(v) & 0x1f // write 1 clears interrupt bits
+			if v & 0x200 != 0 {gs.display_reset()} // RESET
 			return
 		case 0x1010:
 			mem.gs_imr = u32(v)

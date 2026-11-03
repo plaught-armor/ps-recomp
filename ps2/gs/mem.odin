@@ -250,6 +250,7 @@ xfer_start :: proc(dir: u32) {
 			out    = dir & 3 == 1,
 		}
 		if xfer.w == 0 || xfer.h == 0 {xfer.active = false}
+		if xfer.active && xfer.out {shown_read(xfer.bp)}
 		// The pixels are those local memory holds once the commands before
 		// TRXDIR have run.
 		if xfer.active && xfer.out && hw_on {hw_download()}
@@ -259,6 +260,7 @@ xfer_start :: proc(dir: u32) {
 		sx, sy := u32(pos) & 0x7ff, u32(pos >> 16) & 0x7ff
 		dx, dy := u32(pos >> 32) & 0x7ff, u32(pos >> 48) & 0x7ff
 		w, h := u32(reg) & 0xfff, u32(reg >> 32) & 0xfff
+		shown_read(sbp)
 		if hw_on {
 			hw_copy(sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h)
 			return
