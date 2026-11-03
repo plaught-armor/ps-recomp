@@ -37,6 +37,8 @@
 //   memory and scratchpad cleared; LoadExecPS2 of a missing file, fatal; and
 //   a program that changes a word of its recompiled text and ExecPS2s into
 //   itself, which turns the function table off.
+// - library: play.library_add, library_load and library_remove
+//   (test_library).
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -97,6 +99,7 @@ main :: proc() {
 	test_settings()
 	test_compat()
 	test_line_row()
+	test_library()
 	if os.remove_all(tmp) != nil {
 		check("", false, fmt.tprintf("cannot remove %s", tmp))
 	}
@@ -510,9 +513,10 @@ test_interpreted :: proc() {
 @(private = "file")
 test_settings :: proc() {
 	name := "settings"
-	// Parse, save and load: unknown, malformed and over-long rows dropped.
+	// Parse, save and load: unknown, malformed and over-long rows dropped, the
+	// first of two rows with one name kept.
 	long := strings.repeat("x", core.SETTING_MAX + 1, context.temp_allocator)
-	text := strings.concatenate({"NATIVE\t0\r\nDATA\t/nowhere\nSCALE\nGPU\t", long, "\nSW\t1\n"}, context.temp_allocator)
+	text := strings.concatenate({"NATIVE\t0\r\nDATA\t/nowhere\nSCALE\nGPU\t", long, "\nSW\t1\nSW\t2\n"}, context.temp_allocator)
 	s := core.settings_parse(text, context.temp_allocator)
 	check(name, s.set == {.Native, .Sw} && s.value[.Native] == "0" && s.value[.Sw] == "1", fmt.tprint("parsed", s))
 	file, _ := filepath.join({tmp, "settings_unit.tsv"}, context.temp_allocator)
@@ -630,6 +634,146 @@ run :: proc(name, path: string, status := 0) -> (errs: string, ok: bool) {
 		return errs, false
 	}
 	return errs, true
+}
+
+// img with label as its volume identifier, space padded.
+@(private = "file")
+labeled :: proc(img: []u8, label: string) -> []u8 {
+	field := img[16 * disc.DATA + 40:][:32]
+	slice.fill(field, ' ')
+	copy(field, label)
+	return img
+}
+
+// The disc id of the image at path; "" when it has none.
+@(private = "file")
+id_of :: proc(path: string) -> string {
+	d, ok := disc.open(path, context.temp_allocator)
+	if !ok {
+		return ""
+	}
+	defer disc.close(&d)
+	return disc.id(&d, context.temp_allocator) or_else ""
+}
+
+// The library under a DATA of its own: a directory of a PS1 disc, a PS2 one
+// and a file that is not a disc adds the two, each with its id, serial,
+// system and volume label (the title too), and its compat.tsv row found by
+// header name; adding again adds no row. A disc.tsv whose path, size and
+// mtime match is used as it is, the title kept; an image grown by a sector
+// is scanned again, its title kept; one replaced by another disc is that
+// disc's now in library.tsv; one gone is missing with what was known of it,
+// until it is removed. All of it goes through a symlink to the discs'
+// directory (where one can be made), and library.tsv holds the resolved
+// paths.
+@(private = "file")
+test_library :: proc() {
+	name := "library"
+	data, _ := filepath.join({tmp, "library_data"}, context.temp_allocator)
+	old_data := core.env("DATA")
+	os.set_env(core.env_name("DATA"), data)
+	defer os.set_env(core.env_name("DATA"), old_data)
+	// The discs are added, changed and removed through a symlink to their
+	// directory; the library keeps the resolved path. Windows makes a
+	// symlink only in Developer Mode or as an administrator: without one
+	// the discs are used where they are.
+	real_dir, _ := filepath.join({tmp, "library_real"}, context.temp_allocator)
+	dir, _ := filepath.join({tmp, "library"}, context.temp_allocator)
+	if os.make_directory(real_dir) != nil {
+		check(name, false, "cannot make the library directory")
+		return
+	}
+	linked := os.symlink(real_dir, dir) == nil
+	if !linked {
+		when ODIN_OS == .Windows {
+			fmt.println("skip play library: no symlink on this system, the discs used where they are")
+			dir = real_dir
+		} else {
+			check(name, false, "cannot make the library directory's symlink")
+			return
+		}
+	}
+	resolved, rerr := filepath.abs(real_dir, context.temp_allocator)
+	check(name, rerr == nil, "cannot resolve the library directory")
+	in_real :: proc(dir, file: string) -> string {
+		path, _ := filepath.join({dir, file}, context.temp_allocator)
+		return path
+	}
+	a_real, b_real := in_real(resolved, "a.iso"), in_real(resolved, "b.iso")
+	check(name, !linked || a_real != in_real(dir, "a.iso"), "the symlink spelling is the resolved one")
+	put :: proc(dir, file: string, img: []u8) -> string {
+		path, _ := filepath.join({dir, file}, context.temp_allocator)
+		if os.write_entire_file(path, img) != nil {
+			check("library", false, fmt.tprintf("cannot write %s", path))
+		}
+		return path
+	}
+	a := put(dir, "a.iso", labeled(cnf_disc(), "DISC A"))
+	b := put(dir, "b.iso", labeled(ps2_disc(), " DISC\tB "))
+	_ = put(dir, "c.iso", transmute([]u8)string("not a disc"))
+	a_id, b_id := id_of(a), id_of(b)
+	check(name, a_id != "" && b_id != "" && a_id != b_id, "no disc ids")
+
+	// Each column by its name, in another order and one missing.
+	compat, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
+	_ = os.make_directory_all(data)
+	tsv := fmt.tprintf("result\tid\tfatal\nok\t%s\t\nfatal\tother\tx\n", a_id)
+	if os.write_entire_file(compat, transmute([]u8)tsv) != nil {
+		check(name, false, "cannot write compat.tsv")
+	}
+
+	added, ok := play.library_add(dir)
+	check(name, ok && added == 2, fmt.tprintf("added %d, %v", added, ok))
+	added, ok = play.library_add(a)
+	check(name, ok && added == 1, "adding a again")
+	discs, loaded := play.library_load(context.temp_allocator)
+	check(name, loaded && len(discs) == 2, fmt.tprintf("%d discs", len(discs)))
+	if len(discs) != 2 {
+		return
+	}
+	da, db := discs[0], discs[1]
+	check(name, da.id == a_id && da.info[.Path] == a_real && da.info[.System] == "ps1" && da.info[.Serial] == "", fmt.tprint("a:", da))
+	check(name, da.info[.Label] == "DISC A" && da.info[.Title] == "DISC A" && !da.missing, fmt.tprint("a label:", da.info))
+	check(name, da.compat[.Result] == "ok" && da.compat[.Id] == a_id && da.compat[.Lit] == "", fmt.tprint("a compat:", da.compat))
+	check(name, db.id == b_id && db.info[.System] == "ps2" && db.info[.Serial] == "SLUS-12345", fmt.tprint("b:", db))
+	check(name, db.info[.Label] == "DISC B" && db.compat[.Result] == "", fmt.tprint("b label:", db.info, db.compat))
+
+	// The cached info is used while the file is unchanged.
+	b_dir, _ := core.disc_dir(b_id, context.temp_allocator)
+	b_info := core.disc_path(b_dir, .Info, context.temp_allocator)
+	text, _ := os.read_entire_file(b_info, context.temp_allocator)
+	edited, _ := strings.replace_all(string(text), "label\tDISC B\n", "label\tCACHED\n", context.temp_allocator)
+	edited, _ = strings.replace_all(edited, "title\tDISC B\n", "title\tMine\n", context.temp_allocator)
+	check(name, edited != string(text), fmt.tprintf("disc.tsv %q", text))
+	_ = os.write_entire_file(b_info, transmute([]u8)edited)
+	discs, _ = play.library_load(context.temp_allocator)
+	check(name, len(discs) == 2 && discs[1].info[.Label] == "CACHED" && discs[1].info[.Title] == "Mine", "cached info not used")
+
+	// A sector more: scanned again, the same disc, its title kept.
+	grown := make([]u8, len(ps2_disc()) + disc.DATA, context.temp_allocator)
+	copy(grown, labeled(ps2_disc(), " DISC\tB "))
+	_ = put(dir, "b.iso", grown)
+	discs, _ = play.library_load(context.temp_allocator)
+	check(name, len(discs) == 2 && discs[1].id == b_id && discs[1].info[.Label] == "DISC B" && discs[1].info[.Title] == "Mine", fmt.tprint("grown b:", discs[1]))
+
+	// Another disc in a's place, larger so its size differs.
+	other := make([]u8, len(cnf_disc()) + disc.DATA, context.temp_allocator)
+	copy(other, labeled(cnf_disc("", 0, 0, 0x1000ffff, 0), "DISC C"))
+	_ = put(dir, "a.iso", other)
+	c_id := id_of(a)
+	discs, _ = play.library_load(context.temp_allocator)
+	check(name, c_id != "" && c_id != a_id && len(discs) == 2 && discs[0].id == c_id && discs[0].info[.Title] == "DISC C", fmt.tprint("replaced a:", discs[0]))
+	index, _ := filepath.join({data, "library.tsv"}, context.temp_allocator)
+	rows, _ := os.read_entire_file(index, context.temp_allocator)
+	check(name, string(rows) == fmt.tprintf("%s\t%s\n%s\t%s\n", a_real, c_id, b_real, b_id), fmt.tprintf("library.tsv %q", rows))
+
+	// Gone: missing with what was known, until removed.
+	_ = os.remove(a)
+	discs, _ = play.library_load(context.temp_allocator)
+	check(name, len(discs) == 2 && discs[0].missing && discs[0].info[.Label] == "DISC C" && !discs[1].missing, "a not missing")
+	check(name, play.library_remove(a), "remove failed")
+	discs, _ = play.library_load(context.temp_allocator)
+	check(name, len(discs) == 1 && discs[0].id == b_id, fmt.tprint("after remove:", discs))
 }
 
 // The result of a run that reached FRAMES with progress and a fallen-back

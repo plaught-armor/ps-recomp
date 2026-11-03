@@ -1,7 +1,8 @@
 // Saved settings: the runtime settings (env.odin) a player keeps for one disc
 // in its directory's settings.tsv (data.odin) and for every disc in
 // <data>/settings.tsv, one `NAME<TAB>value` row each. Only the names in
-// SETTING_NAMES are read; any other row, or one with no tab, is skipped.
+// SETTING_NAMES are read; any other row, or one with no tab, is skipped, and
+// of two rows with one name the first counts.
 //
 // A setting's value comes from, first to last: the environment (set there at
 // all, even to "", it wins), the disc's file, the global file; else it is
@@ -57,7 +58,7 @@ settings_parse :: proc(text: string, allocator := context.allocator) -> (s: Sett
 			continue
 		}
 		for n, k in names {
-			if n == name {
+			if n == name && k not_in s.set {
 				s.value[k] = strings.clone(value, allocator)
 				s.set += {k}
 			}

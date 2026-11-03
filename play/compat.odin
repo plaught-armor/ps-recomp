@@ -178,7 +178,7 @@ compat_settings :: proc(frames_arg: string) -> (frames, wait: u64, ok: bool) {
 
 // The path, or the .cue, .iso and .bin files in the directory at path in
 // name order, leaving out the .bin files its cue sheets name.
-@(private = "file")
+@(private)
 compat_images :: proc(path: string) -> []string {
 	if !os.is_dir(path) {
 		return slice.clone([]string{path})

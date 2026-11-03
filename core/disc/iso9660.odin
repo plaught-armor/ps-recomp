@@ -308,6 +308,21 @@ system_cnf :: proc(d: ^Disc, allocator := context.allocator) -> (c: System_Cnf, 
 	return c, true
 }
 
+// The volume identifier of the primary volume descriptor in sector 16
+// (bytes 40-71), trimmed, each byte other than printable ASCII a space; ""
+// when sector 16 holds no primary volume descriptor. Allocated.
+volume_label :: proc(d: ^Disc, allocator := context.allocator) -> string {
+	sector: [DATA]u8
+	if !read(d, 16, sector[:]) || sector[0] != 1 || string(sector[1:6]) != "CD001" {
+		return ""
+	}
+	b: [32]u8
+	for c, i in sector[40:72] {
+		b[i] = c > ' ' && c < 0x7f ? c : ' '
+	}
+	return strings.clone(strings.trim_space(string(b[:])), allocator)
+}
+
 // SLUS_123.45 as SLUS-12345: four letters, `_`, then digits with one `.`.
 @(private = "file")
 serial :: proc(name: string, allocator := context.allocator) -> string {
