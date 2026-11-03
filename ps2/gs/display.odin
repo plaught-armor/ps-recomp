@@ -8,6 +8,9 @@ DISP_W :: 640
 DISP_H :: 512
 
 screen: [DISP_W * DISP_H]u32
+// Headless with no picture wanted this vblank: scanout returns the size
+// without filling `screen`. VRAM and GS state are untouched either way.
+skip_readout: bool
 @(private)
 disp_logged: u64
 
@@ -46,7 +49,7 @@ scanout :: proc() -> (w, h: int) {
 		hw_frame(psm, fbp, fbw, dbx, dby, w, h)
 		return
 	}
-	if skip_draw {return} // headless, no shot due: the size is enough
+	if skip_readout {return} // headless, no picture due: the size is enough
 	for y in 0 ..< h {
 		row := screen[y * DISP_W:]
 		for x in 0 ..< w {

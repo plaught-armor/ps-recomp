@@ -32,20 +32,22 @@ last: time.Tick
 @(private)
 pace := 60 // frames a second, at NTSC's 1000 / 1001 (59.94 Hz); 0 for unpaced
 // Presented frames: vblanks whose GS read circuit showed a picture, so a
-// game's boot vblanks with the display off do not count. PRESS, SHOT,
-// SNAPTEST, RBTEST and DUMP all count these, unlike psx/host, whose PRESS
-// counts every vblank (cpu.presents).
+// game's boot vblanks with the display off do not count. PRESS, SNAPTEST,
+// RBTEST and DUMP all count these, unlike psx/host, whose PRESS counts every
+// vblank (cpu.presents).
 @(private)
 frame: int
+// SHOT=<vblank>,...: write shot_<vblank>.ppm at each, ascending. Shots count
+// vblanks, as FRAMES and the compat lit count do, so a shot at FRAMES is
+// the picture lit counts.
 @(private)
-shots: [dynamic]int // SHOT=<frame>,...: write shot_<frame>.ppm at each, ascending
+shots: [dynamic]int
 @(private)
 next_shot: int // index into shots
-// Every vblank, unlike frame (presented frames): netplay's frame count.
+// Every vblank, unlike frame (presented frames): netplay's frame count,
+// SHOT and FRAMES.
 @(private)
 vblank: int
-@(private)
-SHOT_WARMUP :: 10 // frames drawn before a headless shot, to fill both buffers
 // PRESS=Start@600,Cross@900: scripted taps, held for PRESS_FRAMES, so a
 // headless run can get past the title screen. A ":n" suffix (Start@900:2)
 // presses on player n instead of player 1, a "+n" suffix (Left@900+120)
@@ -135,7 +137,6 @@ platform_init :: proc(title: cstring) -> bool {
 		}
 		slice.sort(shots[:])
 	}
-	shot_skip_update()
 	if !core.input_script_load(PRESS_FRAMES) {return false}
 	return true
 }
@@ -158,7 +159,6 @@ vblank_frame :: proc() {
 	// with every DMA transfer gathered into it.
 	free_all(context.temp_allocator)
 	vblank += 1
-	if core.compat.on && u64(vblank) + SHOT_WARMUP == core.frames {shot_skip_update()}
 	ev: sdl.Event
 	for sdl.PollEvent(&ev) {
 		if ev.type == .QUIT {quit(0)}
@@ -174,6 +174,7 @@ vblank_frame :: proc() {
 	}
 	audio_frame(vblank, !rerun)
 	gs.skip_present = rerun
+	gs.skip_readout = core.headless && !readout_due()
 	w, h := gs.scanout()
 	core.compat_vblank(u64(vblank), w > 0 && h > 0, mem.ram)
 	if w > 0 && h > 0 {
@@ -185,26 +186,6 @@ vblank_frame :: proc() {
 			sdl.RenderPresent(ren)
 		}
 		frame += 1
-		for next_shot < len(shots) && frame >= shots[next_shot] {
-			if frame == shots[next_shot] {
-				name := fmt.tprintf("shot_%d.ppm", frame)
-				if hw {
-					px, sw, sh := gs.hw_screen()
-					write_ppm(name, px, sw, sw, sh)
-				} else {
-					write_ppm(name, gs.screen[:], gs.DISP_W, w, h)
-				}
-				fmt.eprintfln("shot: frame %d", frame)
-			}
-			next_shot += 1
-			// A headless run with shots is done once the last one is taken.
-			if core.headless && next_shot == len(shots) && (snaptest[1] == 0 || snaptest_loaded) {
-				// A netplay peer may still need this host's input to get here.
-				if !net_on {quit(0)}
-				if quit_at == 0 {quit_at = vblank + NET_LINGER}
-			}
-		}
-		shot_skip_update()
 		snaptest_frame()
 		if rbtest[1] > 0 {rbtest_frame()}
 		if stats && frame % STATS_FRAMES == 0 {print_stats()}
@@ -217,6 +198,29 @@ vblank_frame :: proc() {
 			core.dump_put("ram", "bin", u64(frame), mem.ram)
 			core.dump_put("iop", "bin", u64(frame), iop.iop_ram)
 			core.dump_put("iophle", "bin", u64(frame), iop.iop_hle)
+		}
+	}
+	for next_shot < len(shots) && vblank >= shots[next_shot] {
+		if vblank == shots[next_shot] {
+			name := fmt.tprintf("shot_%d.ppm", vblank)
+			switch {
+			case w <= 0 || h <= 0: fmt.eprintfln("shot: vblank %d, display off, none written", vblank)
+			case hw:
+				px, sw, sh := gs.hw_screen()
+				write_ppm(name, px, sw, sw, sh)
+				fmt.eprintfln("shot: vblank %d", vblank)
+			case:
+				write_ppm(name, gs.screen[:], gs.DISP_W, w, h)
+				fmt.eprintfln("shot: vblank %d", vblank)
+			}
+		}
+		next_shot += 1
+		// A headless run without FRAMES is done once its last shot is
+		// taken; with FRAMES it runs on to FRAMES.
+		if core.headless && core.frames == 0 && next_shot == len(shots) && (snaptest[1] == 0 || snaptest_loaded) {
+			// A netplay peer may still need this host's input to get here.
+			if !net_on {quit(0)}
+			if quit_at == 0 {quit_at = vblank + NET_LINGER}
 		}
 	}
 	if net_on && vblank % 600 == 0 {print_net()}
@@ -320,12 +324,14 @@ rbtest_frame :: proc() {
 	}
 }
 
-// Headless runs skip rasterizing until shortly before the next shot, and
-// under COMPAT before the last frame, which lit_pixels counts.
+// Whether this vblank's picture is read: a shot is due, or under COMPAT the
+// FRAMES vblank, which lit_pixels counts. A headless run reads no other
+// picture; the GS still draws every frame, since a game may draw a screen
+// once and show it for many.
 @(private)
-shot_skip_update :: proc() {
-	last := core.compat.on && core.frames > 0 && u64(vblank) + SHOT_WARMUP >= core.frames
-	gs.skip_draw = core.headless && !last && (next_shot >= len(shots) || frame < shots[next_shot] - SHOT_WARMUP)
+readout_due :: proc() -> bool {
+	if next_shot < len(shots) && shots[next_shot] == vblank {return true}
+	return core.compat.on && core.frames > 0 && u64(vblank) == core.frames
 }
 
 // The non-black pixels of the picture on screen, w x h when drawn in

@@ -20,9 +20,6 @@ Vertex :: struct {
 	fog:     f32,
 }
 
-// Headless runs with no screenshot due skip rasterisation; uploads,
-// registers and FINISH/SIGNAL still happen.
-skip_draw: bool
 // Frames rerun after a netplay rollback are drawn but not shown.
 skip_present: bool
 
@@ -233,7 +230,6 @@ ctx_key: [2]u64
 
 @(private)
 draw :: proc(kind, prim: u64) {
-	if skip_draw {return}
 	key := [2]u64{ctx_gen, prim & CTX_PRIM}
 	if key != ctx_key {ctx_cur, ctx_key = decode_ctx(prim), key}
 	c := &ctx_cur
