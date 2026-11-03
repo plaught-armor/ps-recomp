@@ -39,8 +39,8 @@
 //   itself, which turns the function table off.
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
-// - launcher: the launcher's steps, settings, picture and runs
-//   (test_launcher), and play.log's plain lines (test_log_strip).
+// - launcher: the launcher's steps, settings, picture, dropped files and
+//   runs (test_launcher), and play.log's plain lines (test_log_strip).
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -1107,7 +1107,9 @@ la :: proc(rt, v: u32) -> [2]u32 {return {lui(rt, v >> 16), ori(rt, rt, v & 0xff
 // values the runtime reads and saves them to the disc's settings.tsv (the
 // file gone when all are unset), refuses one the environment sets and shows
 // it locked; the picture has the selection bar and the thumbnail, and a
-// point maps to its row; a missing disc will not run and can be removed.
+// point maps to its row; a missing disc will not run and can be removed; a
+// dropped disc or directory joins the library, a duplicate or a non-disc
+// does not.
 // run_disc runs a disc to FRAMES with its stderr in play.log, and reports a
 // failed run's last stderr line.
 test_launcher :: proc() {
@@ -1135,6 +1137,7 @@ test_launcher :: proc() {
 	}
 	// The library keeps a path with its symlinks resolved (a macOS temp
 	// directory is under /var).
+	a_real, _ := filepath.abs(a, context.temp_allocator)
 	b_real, _ := filepath.abs(b, context.temp_allocator)
 	_, added := play.library_add(dir)
 	l: play.Launcher
@@ -1220,6 +1223,29 @@ test_launcher :: proc() {
 	_ = step(&l, .Remove)
 	check(name, len(l.discs) == 1 && l.discs[0].info[.Path] == b_real, fmt.tprint("removed:", len(l.discs)))
 	_ = os.rename(fmt.tprint(a, ".gone"), a)
+
+	// Dropped on the window: a disc, selected and back on the list; the
+	// same again; a file that is not a disc; a directory of two more.
+	_ = step(&l, .Menu)
+	play.launcher_add(&l, a)
+	check(name, len(l.discs) == 2 && l.sel == 1 && l.discs[1].info[.Path] == a_real && l.screen == .List && l.toast == "Added 1 disc.", fmt.tprintf("dropped a: %d %d %q", len(l.discs), l.sel, l.toast))
+	play.launcher_select_row(&l, 0)
+	play.launcher_add(&l, a)
+	check(name, len(l.discs) == 2 && l.sel == 1 && l.toast == "Already in the library.", fmt.tprintf("dropped a again: %d %d %q", len(l.discs), l.sel, l.toast))
+	drop, _ := filepath.join({tmp, "launcher_drop"}, context.temp_allocator)
+	c, _ := filepath.join({drop, "c.iso"}, context.temp_allocator)
+	e, _ := filepath.join({drop, "e.iso"}, context.temp_allocator)
+	junk, _ := filepath.join({drop, "junk.iso"}, context.temp_allocator)
+	if os.make_directory(drop) != nil || os.write_entire_file(c, labeled(cnf_disc(), "DISC C")) != nil || os.write_entire_file(e, labeled(cnf_disc(), "DISC E")) != nil || os.write_entire_file(junk, transmute([]u8)string("not a disc")) != nil {
+		check(name, false, "cannot write the dropped discs")
+		return
+	}
+	c_real, _ := filepath.abs(c, context.temp_allocator)
+	play.launcher_add(&l, junk)
+	check(name, len(l.discs) == 2 && l.sel == 1 && strings.has_prefix(l.toast, "No disc image"), fmt.tprintf("dropped junk: %d %q", len(l.discs), l.toast))
+	play.launcher_add(&l, drop)
+	check(name, len(l.discs) == 4 && l.sel == 2 && l.discs[2].info[.Path] == c_real && l.toast == "Added 2 discs.", fmt.tprintf("dropped a directory: %d %d %q", len(l.discs), l.sel, l.toast))
+	check(name, step(&l, .Down) == .None && l.toast == "", "the toast goes with the next action")
 
 	// A run: to FRAMES, its stderr in play.log; a failed one's last line.
 	self, _ := os.get_executable_path(context.temp_allocator)

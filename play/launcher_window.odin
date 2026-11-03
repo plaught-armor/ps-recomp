@@ -1,12 +1,14 @@
 // The launcher's window: `play` with no disc image. Keyboard, controller and
-// mouse each become an Action (launcher.odin); a disc launched runs as a
+// mouse each become an Action (launcher.odin), and a file or directory
+// dropped on the window joins the library in place; a disc launched runs as a
 // child `play <disc image>` with this process's environment unchanged but
 // for the TTY hint (core/env.odin), while the window hides. Its stderr
 // reaches the terminal as it would without the launcher and is copied to
 // the disc's play.log as plain lines; a run that fails shows its last
 // stderr line.
 //
-// Hiding the window while a run plays is untested off Linux.
+// Hiding the window while a run plays, and dropping a file on it, are
+// untested off Linux.
 package play
 
 import "core:fmt"
@@ -253,6 +255,11 @@ window_wait :: proc(w: ^Window, l: ^Launcher) -> Action {
 		again := r == l.sel
 		launcher_select_row(l, r)
 		return .Ok if again && e.button.clicks >= 2 else .None
+	case .DROPFILE:
+		// SDL's copy is ours to free.
+		path := strings.clone_from_cstring(e.drop.file, context.temp_allocator)
+		sdl.free(rawptr(e.drop.file))
+		launcher_add(l, path)
 	case .MOUSEWHEEL:
 		if e.wheel.y > 0 {
 			return .Up

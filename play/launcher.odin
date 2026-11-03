@@ -223,6 +223,31 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 	return .None
 }
 
+// Add the disc image at path, or each one in the directory at path, to the
+// library (library_add: the file stays where it is), back on the list
+// screen with the first disc new to the library selected, else the image at
+// path. A toast says how many were added, or why none was.
+launcher_add :: proc(l: ^Launcher, path: string) {
+	l.toast = ""
+	before := len(l.discs)
+	added, ok := library_add(path)
+	if !ok || !launcher_reload(l, path) {
+		launcher_toast(l, "Cannot write the library (see the terminal).")
+		return
+	}
+	l.screen = .List
+	fresh := len(l.discs) - before
+	switch {
+	case added == 0:
+		launcher_toast(l, "No disc image there (see the terminal).")
+	case fresh <= 0:
+		launcher_toast(l, "Already in the library.")
+	case:
+		launcher_select_row(l, before)
+		launcher_toast(l, fmt.tprintf("Added %d disc%s.", fresh, "" if fresh == 1 else "s"))
+	}
+}
+
 // Show message t until the next action, cut to fit toast_buf.
 launcher_toast :: proc(l: ^Launcher, t: string) {
 	n := copy(l.toast_buf[:], t)
@@ -360,7 +385,7 @@ launcher_draw :: proc(l: ^Launcher, px: []u32) {
 	m, s, line := lo.margin, lo.scale, lo.line
 	chars := lo.list_w / (core.FONT_GLYPH * s)
 	if len(l.discs) == 0 {
-		text(px, lo, m, lo.list_y, "The library is empty.", .Text, chars)
+		text(px, lo, m, lo.list_y, "The library is empty: drop a disc image here.", .Text, chars)
 	} else {
 		d := l.discs[l.sel]
 		switch l.screen {
