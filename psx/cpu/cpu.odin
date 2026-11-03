@@ -266,8 +266,20 @@ call_slow :: proc(addr: u32) {
 interpret :: proc(addr: u32) {
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	when core.COMPAT_COUNT {core.compat_entry(addr)}
+	if !core.learn.on {
+		interp_run(addr)
+		return
+	}
+	f := core.learn_begin(learn_cpu, addr)
+	core.learn_handoff[learn_cpu] = &f
 	interp_run(addr)
+	core.learn_handoff[learn_cpu] = nil
+	core.learn_end(&f, proc(a: u32) -> u32 {return lw(a)})
 }
+
+// Which processor this package is for LEARN (core/learn.odin): the PS1's,
+// or the IOP's once iop_cpu_init has run.
+learn_cpu: core.Learn_Cpu = .Psx
 
 report_once :: proc(addr: u32, what: string) {
 	if !dispatch.reported[addr] {
@@ -355,6 +367,7 @@ fatal :: proc(format: string, args: ..any) -> ! {
 	msg := fmt.tprintf(format, ..args)
 	fmt.eprintln("fatal:", msg)
 	ram_dump_env()
+	core.learn_report()
 	core.compat_report(msg)
 	os.exit(1)
 }

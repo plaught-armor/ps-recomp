@@ -20,17 +20,21 @@ Interp :: struct {
 	target: u32,
 	taken:  bool,
 	done:   bool,
+	// The run's LEARN frame (core/learn.odin); nil without LEARN.
+	learn:  ^core.Learn_Frame,
 }
 
 interp_loop :: proc(start: u32) {
 	st := Interp {
-		pc = start,
+		pc    = start,
+		learn = core.learn_take(learn_cpu),
 	}
 	budget := 0
 	for !st.done {
 		w := lw(st.pc)
 		pc := st.pc
 		st.pc += 4
+		if st.learn != nil {core.learn_fetch(st.learn, pc)}
 		if .Interp in core.trace.active && core.trace_pc_ok(pc) {
 			core.tracef(.Interp, "%08x %08x", pc, w)
 		}
@@ -53,6 +57,7 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	slot := st.pc
 	w := lw(slot)
 	st.pc += 4
+	if st.learn != nil {core.learn_fetch(st.learn, slot)}
 	if .Interp in core.trace.active && core.trace_pc_ok(slot) {
 		core.tracef(.Interp, "%08x %08x (delay)", slot, w)
 	}
@@ -91,6 +96,12 @@ interp_exec :: proc(st: ^Interp, pc, w: u32) {
 	rt := (w >> 16) & 31
 	imm := signed_imm(w)
 	addr := r[rs] + imm
+	if st.learn != nil {
+		switch w >> 26 {
+		case 0x28, 0x29, 0x2a, 0x2b, 0x2e, 0x3a: // SB SH SWL SW SWR SWC2
+			core.learn_store(st.learn, addr)
+		}
+	}
 	switch w >> 26 {
 	case 0x00:
 		interp_special(st, pc, w)

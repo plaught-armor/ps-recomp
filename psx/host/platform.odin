@@ -227,6 +227,9 @@ platform_init :: proc(title: cstring) -> bool {
 	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	core.headless_init() or_return
 	core.compat_init("ps1", &cpu.state.cycles, cpu.CYCLES_PER_INSN)
+	// LEARN=<file>: record the code the interpreter runs (core/learn.odin).
+	core.learn_open()
+	core.learn_cpu(.Psx, &cpu.state.cycles, cpu.CYCLES_PER_INSN)
 	subsystems := sdl.InitFlags{.VIDEO, .EVENTS, .GAMECONTROLLER}
 	if core.headless {subsystems -= {.GAMECONTROLLER}}
 	if sdl.Init(subsystems) != 0 {
@@ -933,6 +936,7 @@ platform_frame :: proc() {
 		thumb_save()
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
+		core.learn_report()
 		core.compat_report()
 		os.exit(0)
 	}

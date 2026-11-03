@@ -42,9 +42,10 @@ branch_taken :: proc(i: r5900.Insn) -> bool {
 // The delay slot at pc. A jump there is undefined on the R5900; exec_insn
 // stops on it.
 @(private = "file")
-delay_slot :: proc(pc: u32) {
+delay_slot :: proc(pc: u32, lf: ^core.Learn_Frame) {
 	cpu.state.cycles += cpu.CYCLES_PER_INSN
 	i := r5900.decode(pc, mem.rd32(pc))
+	if lf != nil {learn_note(lf, i)}
 	if i.kind == .Bad {cpu.bad_insn(pc, i.w)}
 	exec_insn(i)
 }
@@ -78,9 +79,34 @@ interp_call :: proc(entry: u32) {
 	}
 	if kernel.trace_on {kernel.trace_call(entry)}
 	if c.cycles >= cpu.next_event {kernel.run_events()}
+	if !core.learn.on {
+		interp_body(entry, nil)
+		return
+	}
+	f := core.learn_begin(.Ee, entry)
+	interp_body(entry, &f)
+	core.learn_end(&f, proc(a: u32) -> u32 {return mem.rd32(a)})
+}
+
+// Note for LEARN (core/learn.odin) that the run fetched i, and where i
+// stores if it is a store.
+@(private = "file")
+learn_note :: proc(f: ^core.Learn_Frame, i: r5900.Insn) {
+	core.learn_fetch(f, i.pc)
+	#partial switch i.op {
+	case .SB, .SH, .SW, .SD, .SQ, .SWC1, .SQC2, .SWL, .SWR, .SDL, .SDR:
+		core.learn_store(f, u32(cpu.state.r[i.rs].d[0]) + u32(r5900.sx16(i.imm)))
+	}
+}
+
+// The run from entry; lf is its LEARN frame, nil without LEARN.
+@(private = "file")
+interp_body :: proc(entry: u32, lf: ^core.Learn_Frame) {
+	c := &cpu.state
 	pc := entry
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
+		if lf != nil {learn_note(lf, i)}
 		c.cycles += cpu.CYCLES_PER_INSN
 		ret := pc + 8
 		switch i.kind {
@@ -96,7 +122,7 @@ interp_call :: proc(entry: u32) {
 		case .Branch:
 			taken := branch_taken(i)
 			if i.link {c.r[31].d[0] = u64(ret)}
-			if !i.likely || taken {delay_slot(pc + 4)}
+			if !i.likely || taken {delay_slot(pc + 4, lf)}
 			if !taken {
 				pc = ret
 			} else if i.link {
@@ -107,23 +133,23 @@ interp_call :: proc(entry: u32) {
 				pc = i.target
 			}
 		case .Jump:
-			delay_slot(pc + 4)
+			delay_slot(pc + 4, lf)
 			if goto_pc(pc, i.target) {return}
 			pc = i.target
 		case .Call:
 			c.r[31].d[0] = u64(ret)
-			delay_slot(pc + 4)
+			delay_slot(pc + 4, lf)
 			cpu.call(i.target)
 			pc = ret
 		case .Jalr:
 			t := u32(c.r[i.rs].d[0])
 			if i.rd != 0 {c.r[i.rd].d[0] = u64(ret)}
-			delay_slot(pc + 4)
+			delay_slot(pc + 4, lf)
 			cpu.call(t)
 			pc = ret
 		case .Jr:
 			t := u32(c.r[i.rs].d[0])
-			delay_slot(pc + 4)
+			delay_slot(pc + 4, lf)
 			if i.rs == 31 {return}
 			if c.cycles >= cpu.next_event {kernel.run_events()}
 			if goto_pc(pc, t) {return}

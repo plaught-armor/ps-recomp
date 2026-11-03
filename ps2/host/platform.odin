@@ -73,6 +73,10 @@ platform_init :: proc(title: cstring) -> bool {
 	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	if !core.headless_init() {return false}
 	core.compat_init("ps2", &cpu.state.cycles, cpu.CYCLES_PER_INSN, &kernel.idle_cycles)
+	// LEARN=<file>: record the code the interpreters run (core/learn.odin);
+	// the IOP names its counter in iop_cpu_init.
+	core.learn_open()
+	core.learn_cpu(.Ee, &cpu.state.cycles, cpu.CYCLES_PER_INSN)
 	stats = core.env("STATS") == "1"
 	// PACE=<hz> paces a headless run too (netplay tests; a different
 	// rate on each peer stands in for clock drift).
@@ -158,6 +162,7 @@ quit :: proc(code: int) -> ! {
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
 	vu.vu_stats_print()
 	cpu.unmapped_print()
+	core.learn_report()
 	core.compat_report()
 	os.exit(code)
 }

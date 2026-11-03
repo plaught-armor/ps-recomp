@@ -34,6 +34,7 @@ odin run tests/host_frames -collection:ps=.
 odin run tests/data -collection:ps=.
 odin run tests/psx_interp -collection:ps=.
 odin run tests/compat -collection:ps=.
+odin run tests/learn -collection:ps=.
 odin run tests/play -collection:ps=. -define:COMMIT=test
 ```
 

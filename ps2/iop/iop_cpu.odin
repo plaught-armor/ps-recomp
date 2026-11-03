@@ -19,6 +19,8 @@ IOP_EVENT_OFF :: max(u64)
 // binary that links psx too has had them set to the PS1's at init.
 iop_cpu_init :: proc() {
 	r3000.state = {}
+	r3000.learn_cpu = .Iop
+	core.learn_cpu(.Iop, &r3000.state.cycles, r3000.CYCLES_PER_INSN)
 	r3000.cop0 = {}
 	r3000.scratch = {}
 	r3000.next_event = IOP_EVENT_OFF
