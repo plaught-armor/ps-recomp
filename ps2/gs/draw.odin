@@ -236,7 +236,10 @@ ctx_key: [2]u64
 @(private)
 draw :: proc(kind, prim: u64) {
 	key := [2]u64{ctx_gen, prim & CTX_PRIM}
-	if key != ctx_key {ctx_cur, ctx_key = decode_ctx(prim), key}
+	if key != ctx_key {
+		ctx_cur, ctx_key = decode_ctx(prim), key
+		tc_ctx()
+	}
 	c := &ctx_cur
 	if skip_on && c.on_display {return} // headless: a shown buffer, redrawn before it is read
 	if c.zte && c.ztst == 0 {return} // NEVER
@@ -244,6 +247,7 @@ draw :: proc(kind, prim: u64) {
 		hw_draw(c, kind)
 		return
 	}
+	tc_draw(c, kind)
 	switch kind {
 	case 0: draw_point(c, &queue[0])
 	case 1, 2: draw_line(c, &queue[0], &queue[1])
@@ -465,7 +469,7 @@ sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> [4]i32 {
 	return sample_level(t, 0, u, v, bil)
 }
 
-// A sample of level n, nearest or bilinear.
+// A sample of level n, nearest or bilinear, through the texture cache.
 @(private)
 sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 {
 	u, v := tu / f32(u32(1) << n), tv / f32(u32(1) << n)
@@ -476,7 +480,7 @@ sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 {
 	if !bilinear {
 		x := wrap(i32(math.floor(u)), t.wms, w, minu, maxu)
 		y := wrap(i32(math.floor(v)), t.wmt, h, minv, maxv)
-		return unpack(fetch(t, n, x, y))
+		return unpack(texel(t, n, x, y))
 	}
 	// Round the 1/256 weights rather than truncate: the GPU's float
 	// barycentrics land a hair under exact texel positions, and rounding on
@@ -490,8 +494,8 @@ sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 {
 	x1 := wrap(iu + 1, t.wms, w, minu, maxu)
 	y0 := wrap(iv, t.wmt, h, minv, maxv)
 	y1 := wrap(iv + 1, t.wmt, h, minv, maxv)
-	c00, c10 := unpack(fetch(t, n, x0, y0)), unpack(fetch(t, n, x1, y0))
-	c01, c11 := unpack(fetch(t, n, x0, y1)), unpack(fetch(t, n, x1, y1))
+	c00, c10 := unpack(texel(t, n, x0, y0)), unpack(texel(t, n, x1, y0))
+	c01, c11 := unpack(texel(t, n, x0, y1)), unpack(texel(t, n, x1, y1))
 	top := c00 + ((c10 - c00) * au) / 256
 	bot := c01 + ((c11 - c01) * au) / 256
 	return top + ((bot - top) * av) / 256

@@ -91,5 +91,8 @@ gs_priv :: proc(off: u32) -> u64 #no_bounds_check {
 // Emulated state, saved and restored by snapshots (snap.odin).
 gs_snap :: proc() {
 	core.snap_add(&state)
-	append(&core.snap_hooks, core.Snap_Hook{save = proc(_: int) {}, load = proc(_: int) {ctx_gen += 1}})
+	append(&core.snap_hooks, core.Snap_Hook{save = proc(_: int) {}, load = proc(_: int) {
+		ctx_gen += 1
+		tc_flush() // local memory and the CLUT are restored
+	}})
 }

@@ -265,6 +265,7 @@ xfer_start :: proc(dir: u32) {
 			hw_copy(sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h)
 			return
 		}
+		tc_write_rect(dbp, dbw, dpsm, dx, dy, w, h)
 		for y in 0 ..< h {
 			for x in 0 ..< w {
 				v := read_raw(spsm, sbp, sbw, (sx + x) & 2047, (sy + y) & 2047)
@@ -353,6 +354,7 @@ readback :: proc(dst: []u8) {
 
 @(private)
 transfer_cpu :: proc(data: []u8) {
+	tc_write_rect(xfer.bp, xfer.bw, xfer.psm, xfer.x0, xfer.y0, xfer.w, xfer.h)
 	bpp := psm_bits(xfer.psm)
 	// A pixel split across calls goes through the bit queue; whole pixels
 	// take the fast loops.
@@ -506,6 +508,7 @@ clut_load :: proc(tex0: u64) #no_bounds_check {
 		hw_clut(cpsm, cbp, cbw, cou, cov, csm2, n, base)
 		return
 	}
+	clut_gen += 1
 	if csm2 {
 		for i in 0 ..< n {
 			clut[(base + i) & 511] = #force_inline read_raw(cpsm, cbp, cbw, cou * 16 + i, cov)
