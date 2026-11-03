@@ -29,8 +29,13 @@
 // FBRST.STC, then runs. With VIF_ERR.MII set an i-bit does nothing.
 //
 // Last, the GIF paths: an XGKICK (PATH1) between two VIF1 DIRECT codes
-// (PATH2) that split one packet sends its own packet, and the second DIRECT
-// carries on with the first's.
+// (PATH2) that split one packet waits for the second DIRECT to end the
+// packet, then sends its own. A PATH3 IMAGE packet gives the GIF to a
+// waiting XGKICK after its first 8-qword slice with GIF_MODE.IMT set, and
+// only at its end without; an XGKICK that arrives mid-IMAGE goes in at once
+// with IMT. A DIRECTHL stalls VIF1 until the IMAGE ends. GIF_CTRL.RST
+// frees a held GIF, drops a waiting XGKICK and lets a held DIRECT in;
+// FBRST.RST drops what a VIF holds.
 //
 // Then a GIF source chain with TTE set: the tags' upper halves stay out of
 // PATH3, so the packet in the chain and one sent after it reach the GS. The
@@ -48,6 +53,7 @@ import "core:fmt"
 import "core:os"
 import "core:slice"
 import "ps:ps2/dma"
+import gif "ps:ps2/gif"
 import gs "ps:ps2/gs"
 import "ps:ps2/mem"
 import "ps:ps2/vu"
@@ -613,11 +619,153 @@ gif_paths :: proc() {
 	kick := [2][4]u32{gif_tag(1), ad41}
 	copy(vu.vu1_mem[:32], ([^]u8)(&kick)[:32])
 	vu.vu1_xgkick(0)
+	if gs.state.regs[0x41] != 0 {fail("XGKICK inside a split DIRECT packet went in before the packet's end")}
 	feed(&vu.vifs[1], 0x50000001, ad42[0], ad42[1], ad42[2], ad42[3])
 	r := gs.state.regs
 	if r[0x40] != 0x1111 || r[0x41] != 0x2222 || r[0x42] != 0x3333 {
 		fail("XGKICK inside a split DIRECT packet: GS 40 %x 41 %x 42 %x, want 1111 2222 3333", r[0x40], r[0x41], r[0x42])
 	}
+	gif_slices(true)
+	gif_slices(false)
+	gif_directhl()
+	gif_rst()
+}
+
+// What each host-to-local transfer carried: its bytes, and GS register
+// 0x41 (written by the test's XGKICK) when it came.
+@(private = "file")
+Gif_Image :: struct {
+	bytes: int,
+	r41:   u64,
+}
+
+@(private = "file")
+gif_images: [dynamic]Gif_Image
+
+@(private = "file")
+gif_image_log :: proc(d: []u8) {append(&gif_images, Gif_Image{len(d), gs.state.regs[0x41]})}
+
+// An IMAGE GIFtag of nloop qwords, with EOP, then the image qwords.
+@(private = "file")
+gif_image :: proc(nloop: u32) -> []u8 {
+	b := make([]u8, 16 * (1 + int(nloop)), context.temp_allocator)
+	w := ([^]u32)(raw_data(b))
+	w[0], w[1] = nloop | 1 << 15, 2 << 26
+	return b
+}
+
+// Put the XGKICK packet (A+D 0x2222 to 0x41) in VU1 memory and kick it.
+@(private = "file")
+gif_kick :: proc() {
+	kick := [2][4]u32{gif_tag(1), gif_ad(0x41, 0x2222)}
+	copy(vu.vu1_mem[:32], ([^]u8)(&kick)[:32])
+	vu.vu1_xgkick(0)
+}
+
+@(private = "file")
+gif_clear :: proc() {
+	gs.state.regs[0x40], gs.state.regs[0x41], gs.state.regs[0x42] = 0, 0, 0
+	mem.hw_reg(0x3010)^ = 0 // GIF_MODE
+	clear(&gif_images)
+}
+
+// PATH3 holds the GIF in an open PACKED tag, so an XGKICK waits; the next
+// PATH3 feed ends that tag and sends a 32-qword IMAGE, which with IMT
+// stops after 8 qwords for the XGKICK.
+@(private = "file")
+gif_slices :: proc(imt: bool) {
+	gif_clear()
+	gs.state.transfer = gif_image_log
+	defer gs.state.transfer = nil
+	if imt {mem.hw_reg(0x3010)^ = 4}
+	open := [2][4]u32{{1, 1 << 28, 0xe, 0}, gif_ad(0x40, 0x1111)} // no EOP
+	gif.gif_feed(2, ([^]u8)(&open)[:32])
+	gif_kick()
+	if gs.state.regs[0x41] != 0 {fail("XGKICK went in while PATH3 held the GIF (imt %v)", imt)}
+	gif.gif_feed(2, gif_image(32))
+	g := gif_images[:]
+	if gs.state.regs[0x41] != 0x2222 {fail("XGKICK still waits after PATH3's packet (imt %v)", imt)}
+	if imt {
+		if len(g) != 2 || g[0] != {128, 0} || g[1] != {384, 0x2222} {fail("IMT slice: transfers %v, want 128 bytes before the XGKICK and 384 after", g)}
+	} else if len(g) != 1 || g[0] != {512, 0} {
+		fail("no IMT: transfers %v, want 512 bytes before the XGKICK", g)
+	}
+	// IMT: an XGKICK during an IMAGE fed in two parts goes in between them.
+	if !imt {return}
+	gif_clear()
+	mem.hw_reg(0x3010)^ = 4
+	img := gif_image(32)
+	gif.gif_feed(2, img[:256])
+	gif_kick()
+	if gs.state.regs[0x41] != 0x2222 {fail("IMT: XGKICK between two parts of an IMAGE waited")}
+	gif.gif_feed(2, img[256:])
+	if len(gif_images) != 2 || gif_images[1] != {272, 0x2222} {fail("IMT: IMAGE's second part %v", gif_images[:])}
+}
+
+// A DIRECTHL during a PATH3 IMAGE stalls VIF1, IMT or not, and goes in
+// once the IMAGE ends.
+@(private = "file")
+gif_directhl :: proc() {
+	gif_clear()
+	mem.hw_reg(0x3010)^ = 4
+	img := gif_image(32)
+	gif.gif_feed(2, img[:256])
+	tag, ad42 := gif_tag(1), gif_ad(0x42, 0x3333)
+	feed(&vu.vifs[1], 0x51000002, tag[0], tag[1], tag[2], tag[3], ad42[0], ad42[1], ad42[2], ad42[3])
+	if gs.state.regs[0x42] != 0 || !vu.vifs[1].gif_wait {fail("DIRECTHL during a PATH3 IMAGE: GS 42 %x, VIF1 waiting %v", gs.state.regs[0x42], vu.vifs[1].gif_wait)}
+	gif.gif_feed(2, img[256:])
+	if gs.state.regs[0x42] != 0x3333 || vu.vifs[1].gif_wait {fail("DIRECTHL after the IMAGE: GS 42 %x, VIF1 waiting %v", gs.state.regs[0x42], vu.vifs[1].gif_wait)}
+	gif_clear()
+}
+
+// GIF_CTRL.RST while PATH3 is inside a packet, an XGKICK waits and VIF1
+// holds a DIRECT: the XGKICK is dropped, the DIRECT goes in, and PATH3's
+// next qword is a tag. Then VIF1's FBRST.RST while it holds a DIRECT: the
+// DIRECT and the code after it are dropped, and the end of PATH3's packet
+// lets nothing in. Last, VIF0's FBRST.RST drops a code waiting out an
+// i-bit stall.
+@(private = "file")
+gif_rst :: proc() {
+	gif_clear()
+	held := [2][4]u32{{2 | 1 << 15, 1 << 28, 0xe, 0}, gif_ad(0x40, 0x1111)} // 2 loops, 1 sent
+	tag, ad42 := gif_tag(1), gif_ad(0x42, 0x3333)
+	gif.gif_feed(2, ([^]u8)(&held)[:32])
+	gif_kick()
+	feed(&vu.vifs[1], 0x50000002, tag[0], tag[1], tag[2], tag[3], ad42[0], ad42[1], ad42[2], ad42[3])
+	if gs.state.regs[0x42] != 0 || !vu.vifs[1].gif_wait {fail("DIRECT while PATH3 holds the GIF: GS 42 %x, VIF1 waiting %v", gs.state.regs[0x42], vu.vifs[1].gif_wait)}
+	gif.gif_reset()
+	r := gs.state.regs
+	if r[0x41] != 0 || r[0x42] != 0x3333 || vu.vifs[1].gif_wait {
+		fail("GIF_CTRL.RST: GS 41 %x 42 %x, VIF1 waiting %v, want 0 3333 false", r[0x41], r[0x42], vu.vifs[1].gif_wait)
+	}
+	pkt := [2][4]u32{gif_tag(1), gif_ad(0x40, 0x4444)}
+	gif.gif_feed(2, ([^]u8)(&pkt)[:32])
+	if gs.state.regs[0x40] != 0x4444 {fail("GIF_CTRL.RST: PATH3 did not start again on a tag: GS 40 %x", gs.state.regs[0x40])}
+
+	gif_clear()
+	gif.gif_feed(2, ([^]u8)(&held)[:32])
+	feed(&vu.vifs[1], 0x50000002, tag[0], tag[1], tag[2], tag[3], ad42[0], ad42[1], ad42[2], ad42[3], 0x01000404)
+	cl := vu.vifs[1].cl
+	vu.vif_fbrst(1, 1)
+	if len(vu.vifs[1].pending) != 0 || vu.vifs[1].gif_wait {fail("VIF1 FBRST.RST: %d bytes pending, waiting %v", len(vu.vifs[1].pending), vu.vifs[1].gif_wait)}
+	end := gif_ad(0x41, 0x5555)
+	gif.gif_feed(2, ([^]u8)(&end)[:16])
+	r = gs.state.regs
+	if r[0x41] != 0x5555 || r[0x42] != 0 || vu.vifs[1].cl != cl {
+		fail("VIF1 FBRST.RST: GS 41 %x 42 %x, CL %d, want 5555 0 %d", r[0x41], r[0x42], vu.vifs[1].cl, cl)
+	}
+
+	cl = vu.vifs[0].cl
+	feed(&vu.vifs[0], 0x80000000, 0x01000404) // NOP with the i-bit, then STCYCL 4,4
+	if !vu.vifs[0].stalled {fail("VIF0 i-bit did not stall")}
+	vu.vif_fbrst(0, 1)
+	vu.vif_fbrst(0, 8)
+	stat := mem.hw_reg(vu.VIF0_STAT)^
+	if vu.vifs[0].stalled || len(vu.vifs[0].pending) != 0 || stat & vu.VIF_STAT_STALL != 0 || vu.vifs[0].cl != cl {
+		fail("VIF0 FBRST.RST: stalled %v, %d bytes pending, STAT %x, CL %d, want CL %d", vu.vifs[0].stalled, len(vu.vifs[0].pending), stat, vu.vifs[0].cl, cl)
+	}
+	mem.intc_stat, mem.intc_pending = 0, 0
+	gif_clear()
 }
 
 // A GIF chain with CHCR.TTE: cnt with a nonzero upper half, then end. Then a

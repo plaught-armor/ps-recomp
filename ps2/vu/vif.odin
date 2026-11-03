@@ -20,6 +20,8 @@ Vif :: struct {
 	dbf:         bool,
 	// Stalled by a code's i-bit until FBRST.STC (vif_fbrst).
 	stalled:     bool,
+	// VIF1 stalled on a DIRECT until the GIF is free (vif1_gif_resume).
+	gif_wait:    bool,
 	pending:     [dynamic]u8, // a command split across transfers, or what waits out a stall
 }
 
@@ -37,17 +39,28 @@ vifs: [2]Vif
 vif_init :: proc() {
 	vifs[0] = {id = 0, vu = &vu0, cl = 1, wl = 1}
 	vifs[1] = {id = 1, vu = &vu1, cl = 1, wl = 1}
+	gif.gif_init(vif1_gif_resume)
+}
+
+// The GIF is free for the DIRECT VIF1 stalled on: run on unless an i-bit
+// stall still holds it.
+@(private)
+vif1_gif_resume :: proc() {
+	v := &vifs[1]
+	v.gif_wait = false
+	if !v.stalled {vif_feed(v, nil)}
 }
 
 @(private)
 vif_warned: map[u32]bool
 
 // Feed a transfer's words to a VIF; an incomplete trailing command waits
-// for the next transfer, and while the VIF is stalled every word waits.
+// for the next transfer, and while the VIF is stalled (an i-bit, or a
+// DIRECT waiting for the GIF) every word waits.
 // DMA has already gathered the whole chain and finished the channel, so a
 // stall holds the chain's rest here instead of in the channel.
 vif_feed :: proc(v: ^Vif, data: []u8) {
-	if v.stalled {
+	if v.stalled || v.gif_wait {
 		append(&v.pending, ..data)
 		return
 	}
@@ -112,8 +125,11 @@ vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 			src := ([^]u8)(&arg[0])[:len(arg) * 4]
 			for b, j in src {v.vu.micro[(dst + u32(j)) % u32(len(v.vu.micro))] = b}
 			if v.vu == &vu1 {vu1_micro_touch()} else {vu0_micro_touch()}
-		case 0x50, 0x51: // DIRECT, DIRECTHL
-			gif.gif_feed(1, ([^]u8)(&arg[0])[:len(arg) * 4])
+		case 0x50, 0x51: // DIRECT, DIRECTHL: stall before the code while another path holds the GIF
+			if !gif.gif_feed(1, ([^]u8)(&arg[0])[:len(arg) * 4], cmd == 0x51) {
+				v.gif_wait = true
+				return i
+			}
 		case 0x60 ..= 0x7f:
 			vif_unpack(v, cmd, imm, num, arg)
 		case:
@@ -135,16 +151,25 @@ vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 	return i
 }
 
-// A write to VIF id's FBRST: STC clears the stall and its STAT bits, and
-// the codes that waited run on. RST, FBK and STP are ignored, and the write
-// is not stored: FBRST reads back 0.
+// A write to VIF id's FBRST: RST drops the codes the VIF holds (a split
+// command, what waits out a stall or for the GIF) and clears the stall and
+// its STAT bits. STC clears the stall and its STAT bits, and the codes that
+// waited run on. FBK and STP are ignored, and the write is not stored:
+// FBRST reads back 0.
 vif_fbrst :: proc(id: int, w: u32) {
-	if w & 8 == 0 {return}
 	v := &vifs[id]
+	if w & 1 != 0 {
+		clear(&v.pending)
+		v.stalled, v.gif_wait = false, false
+		if id == 1 {gif.gif_p2_drop()}
+		mem.hw_reg(VIF0_STAT + 0x400 * u32(id))^ &~= VIF_STAT_STALL
+		return
+	}
+	if w & 8 == 0 {return}
 	mem.hw_reg(VIF0_STAT + 0x400 * u32(id))^ &~= VIF_STAT_STALL
 	if !v.stalled {return}
 	v.stalled = false
-	vif_feed(v, nil)
+	vif_feed(v, nil) // held still while a DIRECT waits for the GIF
 }
 
 @(private)

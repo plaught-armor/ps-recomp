@@ -74,6 +74,8 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 		case 0x2000 ..= 0x203c:
 			if o & 0xf == 0 {ipu.ipu_write(o, w)}
 			return
+		case 0x3000: // GIF_CTRL: RST, then stored as before
+			if w & 1 != 0 {gif.gif_reset()}
 		case 0x3810, 0x3c10: // VIF0/VIF1 FBRST
 			vu.vif_fbrst(int(o >> 10) & 1, w)
 			return
