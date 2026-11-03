@@ -93,6 +93,11 @@ play :: proc(image: string) -> int {
 	if !has_dir {
 		return 1
 	}
+	// The player's saved settings for this disc, then for every disc; not
+	// for a COMPAT run, whose result comes from the environment alone.
+	if core.env("COMPAT") != "1" && !core.settings_apply(dir) {
+		return 1
+	}
 	// NATIVE=0 runs the game interpreted.
 	native := core.disc_path(dir, .Native)
 	if core.env("NATIVE") == "0" || (!core.blob_cached(dir) && !convert_store(image, dir)) {

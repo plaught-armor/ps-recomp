@@ -92,6 +92,7 @@ main :: proc() {
 	test_native("native", cnf_disc())
 	test_bad_blob(test_native("psx_exe", exe_disc()))
 	test_interpreted()
+	test_settings()
 	test_compat()
 	test_line_row()
 	if os.remove_all(tmp) != nil {
@@ -500,6 +501,86 @@ test_interpreted :: proc() {
 	check("interpreted", strings.contains(errs, "psx: no native code, interpreting everything"), "not interpreted")
 	check("interpreted", !os.exists(core.disc_path(dir, .Native, context.temp_allocator)), "a blob")
 	check("interpreted", !os.exists(core.disc_path(dir, .Native_Key, context.temp_allocator)), "a key")
+}
+
+// Saved settings: none leaves a run as before; the disc's file applies, only
+// for names it may set; the environment beats it, it beats the global file.
+@(private = "file")
+test_settings :: proc() {
+	name := "settings"
+	// Parse, save and load: unknown, malformed and over-long rows dropped.
+	long := strings.repeat("x", core.SETTING_MAX + 1, context.temp_allocator)
+	text := strings.concatenate({"NATIVE\t0\r\nDATA\t/nowhere\nSCALE\nGPU\t", long, "\nSW\t1\n"}, context.temp_allocator)
+	s := core.settings_parse(text, context.temp_allocator)
+	check(name, s.set == {.Native, .Sw} && s.value[.Native] == "0" && s.value[.Sw] == "1", fmt.tprint("parsed", s))
+	file, _ := filepath.join({tmp, "settings_unit.tsv"}, context.temp_allocator)
+	ok_save := core.settings_save(file, s)
+	saved, _ := os.read_entire_file(file, context.temp_allocator)
+	check(name, ok_save && string(saved) == "SW\t1\nNATIVE\t0\n", fmt.tprintf("saved %q", saved))
+	back := core.settings_load(file, context.temp_allocator)
+	check(name, back.set == s.set && back.value == s.value, "load after save differs")
+	check(name, core.settings_save(file, {}) && !os.exists(file), "saving nothing leaves the file")
+	check(name, core.settings_load(file, context.temp_allocator).set == {}, "a missing file has settings")
+
+	path := write(name, cnf_disc("TCB = 6\n"))
+	dir := disc_dir(name, path)
+	global, has_global := core.settings_global_path(context.temp_allocator)
+	check(name, has_global, "no global settings path")
+	if dir == "" || !has_global {
+		return
+	}
+	interpreted :: "psx: no native code, interpreting everything"
+	// No files: converted, then the stored blob runs.
+	errs := run(name, path) or_else ""
+	check(name, strings.contains(errs, "converting") && !strings.contains(errs, interpreted), "no settings changed the run")
+	errs = run(name, path) or_else ""
+	check(name, !strings.contains(errs, interpreted), "no settings: not native")
+	disc_file := core.disc_path(dir, .Settings, context.temp_allocator)
+	put :: proc(name, file, text: string) {
+		if os.write_entire_file(file, text) != nil {
+			check(name, false, fmt.tprintf("cannot write %s", file))
+		}
+	}
+	// DATA is not a setting the file may set: the run still finds its blob.
+	put(name, disc_file, "NATIVE\t0\nDATA\t/nowhere\n")
+	errs = run(name, path) or_else ""
+	check(name, strings.contains(errs, interpreted), "the disc's NATIVE=0 not applied")
+	check(name, !strings.contains(errs, "converting"), "DATA taken from the file")
+	os.set_env(core.env_name("NATIVE"), "1")
+	errs = run(name, path) or_else ""
+	os.unset_env(core.env_name("NATIVE"))
+	check(name, !strings.contains(errs, interpreted), "the file beat the environment")
+	_ = os.remove(disc_file)
+	put(name, global, "NATIVE\t0\n")
+	errs = run(name, path) or_else ""
+	check(name, strings.contains(errs, interpreted), "the global NATIVE=0 not applied")
+	put(name, disc_file, "NATIVE\t1\n")
+	errs = run(name, path) or_else ""
+	check(name, !strings.contains(errs, interpreted), "the global file beat the disc's")
+	// --compat reads neither file: its row is the one the environment alone
+	// gives, whatever the player saved.
+	_ = os.remove(disc_file)
+	_ = os.remove(global)
+	id := disc_id(name, path)
+	run_compat(name, {path, fmt.tprint(FRAMES)})
+	bare, has_bare := compat_row(compat_rows(name), id)
+	put(name, disc_file, "NATIVE\t0\n")
+	put(name, global, "NATIVE\t0\n")
+	run_compat(name, {path, fmt.tprint(FRAMES)})
+	saved_row, has_saved := compat_row(compat_rows(name), id)
+	check(name, has_bare && has_saved, "no compat row for the disc")
+	for c in play.Column {
+		if c != .Wall_S && c != .User_S && c != .When {
+			check(name, bare[c] == saved_row[c], fmt.tprintf("compat %v: %q with no settings, %q with them", c, bare[c], saved_row[c]))
+		}
+	}
+	log, _ := os.read_entire_file(core.disc_path(dir, .Compat_Log, context.temp_allocator), context.temp_allocator)
+	check(name, len(log) > 0 && !strings.contains(string(log), interpreted), "--compat applied the saved NATIVE=0")
+	_ = os.remove(disc_file)
+	_ = os.remove(global)
+	data, _ := core.data_dir(context.temp_allocator)
+	tsv, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
+	_ = os.remove(tsv)
 }
 
 @(private = "file")
