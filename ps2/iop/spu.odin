@@ -102,10 +102,22 @@ spu: struct {
 	frame_s: u64,
 }
 
-// The most voice samples spu_catch_up renders ahead of spu_mix: a vblank's,
-// the length the host mixes at once (ps2/host/audio.odin's AUDIO_FRAME).
+// The most voice samples spu_catch_up renders ahead of spu_mix. The host
+// mixes 800 a vblank (ps2/host/audio.odin's AUDIO_FRAME, MIX_RATE / 60), but
+// between two mixes the IOP's clock runs more than that: the vblank is NTSC's
+// 59.94 Hz (cpu.CYCLES_PER_FRAME), 800.8 samples of the input clock, and the
+// mix reads the IOP's clock where its threads left it, up to a slice
+// (IOP_SLICE, 48 samples) past the EE's, or further while a thread runs on
+// past its slice. Two vblanks' bound both, so only a mixer truly behind
+// starts the frame again; a vblank's cap did so most frames, a call there
+// rendering nothing, and a key on's ENVX read in that stretch read 0.
 @(private = "file")
-SPU_AHEAD :: MIX_RATE / 60
+SPU_AHEAD :: MIX_RATE / 30
+
+// Whether spu_catch_up has said once, under cpu.debug, that it started the
+// frame again. Host-side diagnostics, not snapshotted.
+@(private = "file")
+spu_restart_logged: bool
 
 // The voice masks sceSdSetSwitch writes and sceSdGetSwitch reads back.
 @(private = "file")
@@ -504,6 +516,10 @@ spu_catch_up :: proc() {
 	s := spu_in_sample(r3000.state.cycles * IOP_EE_RATIO)
 	due := s - min(s, spu.frame_s)
 	if due > SPU_AHEAD {
+		if cpu.debug >= 1 && !spu_restart_logged {
+			spu_restart_logged = true
+			fmt.eprintfln("spu: catch-up %d samples past the last mix, over %d: the frame starts again (logged once)", due, SPU_AHEAD)
+		}
 		spu.frame_s = s - min(s, u64(spu.early_n))
 		return
 	}

@@ -3652,6 +3652,20 @@ test_libsd :: proc() {
 	st := iop.spu_voice_status(0, 0)
 	check(st.on && sd_call(6, 0x0500) == 0x7fff && sd_call(10, 0x2240) &~ 15 == st.nax, "libsd: the keyed voice plays, ENVX at full, NAX")
 	check(sd_call(6, 0x0600) == 0x7ffe && sd_call(6, 0x0700) == 0x7ffe, "libsd: VOLX is the volume, twice VOL's level, apart from the envelope")
+	// The IOP's clock runs a few samples past the vblank a mix takes (800.8
+	// samples a vblank, the IOP's slice ahead of the EE) with a whole
+	// vblank's 800 already rendered ahead: a key on there still renders, and
+	// ENVX two samples on reads the attack. Two mixes then leave none ahead.
+	r3000.state.cycles = (r3000.state.cycles / 768 + 1) * 768
+	iop.spu_mix(out)
+	r3000.state.cycles += 800 * 768
+	check(sd_call(6, 0x0500) == 0x7fff, "libsd: ENVX a vblank on, rendered ahead, at full")
+	r3000.state.cycles += 3 * 768
+	sd_call(7, 0x1500, 1)
+	r3000.state.cycles += 2 * 768
+	check(sd_call(6, 0x0500) == 0x7000, fmt.tprintf("libsd: ENVX two samples after a key on past a vblank ahead is 0x7000, got %x", sd_call(6, 0x0500)))
+	iop.spu_mix(out)
+	iop.spu_mix(out)
 	// A linear decrease at rate 0x30 steps by 8 every second sample, from
 	// where the volume is; VOLL reads back without bit 15.
 	sd_call(5, 0x0000, 0xa030)
