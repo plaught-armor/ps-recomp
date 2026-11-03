@@ -198,6 +198,7 @@ pause_wait :: proc() {
 		poll_events()
 	}
 	pacing_rebase()
+	core.audio_settle()
 }
 
 // Draw the current texture (or a held picture, and after the hold that

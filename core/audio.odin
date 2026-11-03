@@ -8,7 +8,11 @@
 // back. On the way to the device:
 // - the queue is kept at a target set by the latency setting; up to
 //   AUDIO_RATE_MAX faster or slower playback (cubic resampling) absorbs
-//   drift between the emulated clock and the sound card's;
+//   drift between the emulated clock and the sound card's. A steady
+//   difference (a display's vsync setting emulated time, a sound card's
+//   crystal) is learnt as `drift`, the integral of the queue's error, so
+//   the queue holds its target instead of sitting off it far enough for the
+//   proportional part to make up the difference;
 // - below speed 1 the sound is stretched to fill real time, playing lower
 //   and slower in step with the picture;
 // - a queue past the target plus two frames of slack drops the batch, and
@@ -35,6 +39,11 @@ AUDIO_RATE_MAX :: 0.005
 audio_rate_fits :: proc(ratio: f64) -> bool {
 	return abs(ratio - 1) <= AUDIO_RATE_MAX - 0.001
 }
+
+// Seconds over which a steady queue error moves drift by its own size times
+// AUDIO_RATE_MAX: slow beside the proportional part (about 8 s at a 50 ms
+// latency), so the two do not ring.
+AUDIO_DRIFT_S :: 10.0
 
 // Slowest emulated speed audio_push stretches for.
 AUDIO_MIN_SPEED :: 0.25
@@ -68,6 +77,8 @@ Audio_Stats :: struct {
 	dropped: int,
 	// The lowest the queue was when a batch came, in ms (0 with none).
 	low_ms:  f64,
+	// The learnt rate difference at the time of the report (audio.rate_ctl.drift).
+	drift:   f64,
 }
 
 audio: struct {
@@ -79,6 +90,8 @@ audio: struct {
 	target:       int,
 	stats:        Audio_Stats,
 	low:          int,
+	// The rate correction's state.
+	rate_ctl:     Audio_Rate,
 	// Resampling state: output position within the chunk being read (in
 	// input frames), and the last three input frames of the previous chunk,
 	// oldest first.
@@ -179,12 +192,53 @@ audio_push :: proc(frames: [][2]i16, speed: f64 = 1, pace: Audio_Pace = .Paced) 
 			audio_queue(audio.silence[:min(n, len(audio.silence))])
 		}
 	}
-	// Input frames per output frame.
-	error := f64(queued - audio.target) / f64(max(audio.target, 1))
-	step := min(speed, 1) * (1 + AUDIO_RATE_MAX * clamp(error, -1, 1))
+	step := audio_step(&audio.rate_ctl, queued, audio.target, len(frames), audio.rate, speed)
 	for i := 0; i < len(frames); i += AUDIO_CHUNK {
 		audio_queue(audio_resample(frames[i:][:min(AUDIO_CHUNK, len(frames) - i)], step))
 	}
+}
+
+// The rate correction's state, carried from batch to batch.
+Audio_Rate :: struct {
+	// Learnt steady rate difference: the playback speed-up, beyond the
+	// proportional correction, that holds the queue at its target.
+	drift:  f64,
+	// Frames of sound still to push before drift learns again.
+	settle: int,
+}
+
+// Input frames per output frame for a batch of n frames with `queued`
+// frames waiting against `target`. The correction is the proportional part
+// plus drift, at most AUDIO_RATE_MAX either way. Drift integrates the
+// queue's error per second of sound, so batch size does not matter. It
+// holds while the queue says nothing about the clocks: under a quarter of
+// its target, for a second of sound after it ran dry (a load, a slow frame,
+// a debugger stop; slowness that keeps it running dry keeps drift held) or
+// after audio_settle, and off speed 1: past it the step stays 1 and the
+// excess is dropped, under it the host's speed is no clock's. It also holds
+// while the correction is already past AUDIO_RATE_MAX the way the error
+// pushes it (conditional integration): the step is at its bound, so more
+// drift would only wind up and overshoot once the error is gone.
+audio_step :: proc(r: ^Audio_Rate, queued, target, n, rate: int, speed: f64) -> f64 {
+	if queued == 0 {
+		r.settle = rate
+	}
+	error := clamp(f64(queued - target) / f64(max(target, 1)), -1, 1)
+	correction := r.drift + AUDIO_RATE_MAX * error
+	saturated := correction * error > 0 && abs(correction) > AUDIO_RATE_MAX
+	if r.settle <= 0 && speed == 1 && queued >= target / 4 && !saturated {
+		r.drift = clamp(r.drift + AUDIO_RATE_MAX * error * f64(n) / (f64(rate) * AUDIO_DRIFT_S), -AUDIO_RATE_MAX, AUDIO_RATE_MAX)
+	}
+	r.settle = max(r.settle - n, 0)
+	return min(speed, 1) * (1 + clamp(correction, -AUDIO_RATE_MAX, AUDIO_RATE_MAX))
+}
+
+// Hold drift for a second of sound: emulated time was rebased on real time
+// (a pause ended, fast-forward stopped, pacing fell behind), or the host
+// took over 1.25 vblanks for one, so the queue's error until it settles is
+// not the clocks'. A host that stays slow keeps drift held.
+audio_settle :: proc() {
+	audio.rate_ctl.settle = audio.rate
 }
 
 // Sound waiting in the queue.
@@ -199,6 +253,7 @@ audio_queued_ms :: proc() -> f64 {
 audio_take_stats :: proc() -> Audio_Stats {
 	s := audio.stats
 	s.low_ms = audio.low == max(int) ? 0 : f64(audio.low) * 1000 / f64(audio.rate)
+	s.drift = audio.rate_ctl.drift
 	audio.stats = {}
 	audio.low = max(int)
 	return s

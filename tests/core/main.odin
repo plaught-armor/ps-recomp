@@ -90,6 +90,7 @@ main :: proc() {
 	_ = os.remove(atomic_path)
 	fmt.println("ok write_file_atomic")
 	test_load_elf()
+	test_audio_step()
 	core.snap_init(1 << 20)
 	core.snap_add(&frame)
 	ram = core.snap_area(32 * 4096)

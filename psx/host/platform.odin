@@ -376,6 +376,8 @@ set_speed :: proc(speed: f64) {
 	last_due := time.tick_add(host.start, time.Duration(vblank_due_ns(last)))
 	host.speed = speed
 	host.start = time.tick_add(last_due, -time.Duration(vblank_due_ns(last)))
+	// The queue's error until the new speed settles is the rebase's.
+	core.audio_settle()
 }
 
 // Most display refreshes per emulated vblank (240 Hz).
@@ -647,7 +649,7 @@ perf_report :: proc() {
 	secs := time.duration_seconds(time.tick_diff(host.perf_mark, now))
 	audio := core.audio_take_stats()
 	mixed_hz := f64(audio.mixed) * io.CPU_HZ * f64(io.clock_mul) / f64(max(cpu.state.cycles - host.perf_cycles, 1))
-	core.tracef(.Perf, "%d presents in %.3f s (%.1f/s), %d cycles, audio mixed %.1f Hz, queued %.1f ms (lowest %.1f), ran dry %d, dropped %d", PERF_PERIOD, secs, f64(PERF_PERIOD) / secs, cpu.state.cycles, mixed_hz, core.audio_queued_ms(), audio.low_ms, audio.dry, audio.dropped)
+	core.tracef(.Perf, "%d presents in %.3f s (%.1f/s), %d cycles, audio mixed %.1f Hz, queued %.1f ms (lowest %.1f), ran dry %d, dropped %d, drift %+.3f%%", PERF_PERIOD, secs, f64(PERF_PERIOD) / secs, cpu.state.cycles, mixed_hz, core.audio_queued_ms(), audio.low_ms, audio.dry, audio.dropped, audio.drift * 100)
 	render.sync_perf()
 	host.perf_cycles = cpu.state.cycles
 	host.perf_mark = now
@@ -880,6 +882,7 @@ fast_forward :: proc() -> bool {
 		}
 		host.fast = false
 		pacing_rebase()
+		core.audio_settle()
 	}
 	return false
 }
@@ -900,11 +903,17 @@ platform_frame :: proc() {
 		present_hook()
 	}
 	present()
-	// Before the pause wait, which is not work.
-	if .Perf in core.trace.active {
+	// Before the pause wait, which is not work. With vsync, work includes
+	// the wait for the display.
+	if host.work_mark != {} {
 		work := time.tick_since(host.work_mark)
-		if host.work_mark != {} && work > time.Duration(io.cycles_ns(io.video.last)) && !host.vsync {
+		field := time.Duration(io.cycles_ns(io.video.last))
+		if work > field && !host.vsync && .Perf in core.trace.active {
 			core.tracef(.Perf, "late vblank: %.1f ms of work", time.duration_milliseconds(work))
+		}
+		// The host is behind: the queue drains at its speed, not the clocks'.
+		if work > field * 5 / 4 {
+			core.audio_settle()
 		}
 	}
 	pause_wait()
@@ -943,6 +952,7 @@ platform_frame :: proc() {
 	if i64(time.tick_since(host.start)) > vblank_due_ns(io.video.elapsed + 6 * io.video.field) {
 		// Fell behind (slow frame or debugger stop): resync instead of racing.
 		pacing_rebase()
+		core.audio_settle()
 	}
 }
 

@@ -242,9 +242,15 @@ vblank_frame :: proc() {
 	length += time.Duration(f64(length) * f64(core.net_stretch()))
 	// An absolute deadline: sleep overshoot must not add up, or the game runs
 	// under 60 Hz and the sound queue drains. Far behind, start again from now.
+	// A quarter vblank late or more (the host took over 1.25 vblanks), the
+	// queue drains at the host's speed, not the clocks': hold the sound's
+	// drift learning, as at the resync.
 	now := time.tick_now()
 	last = time.tick_add(last, length)
-	if time.tick_diff(last, now) > length {last = now}
+	if late := time.tick_diff(last, now); late > length / 4 {
+		core.audio_settle()
+		if late > length {last = now}
+	}
 	if d := time.tick_diff(now, last); d > 0 {time.sleep(d)}
 }
 
