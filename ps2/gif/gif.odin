@@ -84,6 +84,10 @@ GIF_MODE_M3R :: 1
 @(private)
 GIF_MODE_IMT :: 4
 
+// The GIF FIFO: 16 qwords.
+@(private)
+GIF_FIFO_BYTES :: 16 * 16
+
 // The GIF_STAT bits that show a path or a queue busy: IP3, P3Q, P2Q, P1Q,
 // OPH, APATH and FQC.
 GIF_STAT_BUSY :: 0x1f000fe0
@@ -145,10 +149,12 @@ gif_mskpath3 :: proc(on: bool) {
 }
 
 // A GIF DMA transfer was fed: whether its channel stays started (STR set)
-// because PATH3 data waits in gif_q3. The channel finishes once the queue
-// has run (gif_arbitrate) or the GIF is reset.
+// because more PATH3 data waits in gif_q3 than the 16-qword GIF FIFO holds;
+// a smaller transfer completes on hardware with its data still in the FIFO.
+// A held channel finishes once the queue has run (gif_arbitrate) or the GIF
+// is reset.
 gif_dma_hold :: proc() -> bool {
-	gif_arb.dma_hold = len(gif_q3) != 0
+	gif_arb.dma_hold = len(gif_q3) - gif_arb.q3_head > GIF_FIFO_BYTES
 	return gif_arb.dma_hold
 }
 
@@ -162,7 +168,7 @@ gif_stat :: proc(ra: u32) -> u32 {
 	q3 := len(gif_q3) - a.q3_head
 	s := mode & GIF_MODE_M3R | u32(a.m3p) << 1 | mode & GIF_MODE_IMT | mem.hw_reg(GIF_CTRL)^ & GIF_CTRL_PSE
 	s |= u32(a.ip3) << 5 | u32(q3 != 0) << 6 | u32(a.p2_wait) << 7 | u32(len(gif_q1) != 0) << 8
-	s |= u32(a.apath != 0) << 9 | a.apath << 10 | u32(min(q3 / 16, 16)) << 24
+	s |= u32(a.apath != 0) << 9 | a.apath << 10 | u32(min(q3, GIF_FIFO_BYTES) / 16) << 24
 	gif_stat_guard(s, q3, ra)
 	return s
 }
@@ -178,9 +184,11 @@ gif_stat_guard :: proc(s: u32, q3: int, ra: u32) {
 	gif_stat_last = r
 }
 
-// VIF1 was reset: the DIRECT it held no longer waits for the GIF.
-gif_p2_drop :: proc() {
+// VIF1 was reset: the DIRECT it held no longer waits for the GIF, and its
+// MSKPATH3 mask clears, so a PATH3 packet it held back runs.
+gif_vif1_reset :: proc() {
 	gif_arb.p2_wait, gif_arb.p2_hl = false, false
+	gif_mskpath3(false)
 }
 
 @(private)

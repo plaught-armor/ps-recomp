@@ -153,8 +153,8 @@ vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 }
 
 // A write to VIF id's FBRST: RST drops the codes the VIF holds (a split
-// command, what waits out a stall or for the GIF) and clears the stall and
-// its STAT bits. STC clears the stall and its STAT bits, and the codes that
+// command, what waits out a stall or for the GIF), clears the stall and its
+// STAT bits, and for VIF1 lifts its MSKPATH3 mask. STC clears the stall and its STAT bits, and the codes that
 // waited run on. FBK and STP are ignored, and the write is not stored:
 // FBRST reads back 0.
 vif_fbrst :: proc(id: int, w: u32) {
@@ -162,7 +162,7 @@ vif_fbrst :: proc(id: int, w: u32) {
 	if w & 1 != 0 {
 		clear(&v.pending)
 		v.stalled, v.gif_wait = false, false
-		if id == 1 {gif.gif_p2_drop()}
+		if id == 1 {gif.gif_vif1_reset()}
 		mem.hw_reg(VIF0_STAT + 0x400 * u32(id))^ &~= VIF_STAT_STALL
 		return
 	}

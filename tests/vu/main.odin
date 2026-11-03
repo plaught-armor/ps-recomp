@@ -815,35 +815,62 @@ gif_stat_bits :: proc() {
 	gif_clear()
 }
 
-// Start a GIF DMA (normal mode) of a 1-loop A+D packet writing data to GS
-// register reg, as dma_start does; returns whether STR stays set.
+// Start a GIF DMA (normal mode) of an A+D packet of `loops` qwords, each
+// writing data to GS register reg, as dma_start does; returns whether STR
+// stays set.
 @(private = "file")
-gif_dma :: proc(reg: u8, data: u32) -> bool {
+gif_dma :: proc(reg: u8, data: u32, loops: u32 = 1) -> bool {
 	if mem.ram == nil {mem.mem_init()}
-	pkt := [2][4]u32{gif_tag(1), gif_ad(reg, data)}
-	copy(mem.ram[0x2000:][:32], ([^]u8)(&pkt)[:32])
+	pkt: [GIF_BIG + 1][4]u32
+	pkt[0] = gif_tag(loops)
+	for i in 1 ..= loops {pkt[i] = gif_ad(reg, data)}
+	n := int(loops + 1) * 16
+	copy(mem.ram[0x2000:][:n], ([^]u8)(&pkt)[:n])
 	mem.dma_reg(mem.DMA_GIF, 0x00)^ = 0x101 // STR, normal
 	mem.dma_reg(mem.DMA_GIF, 0x10)^ = 0x2000
-	mem.dma_reg(mem.DMA_GIF, 0x20)^ = 2
+	mem.dma_reg(mem.DMA_GIF, 0x20)^ = loops + 1
 	dma.dma_gif()
 	if !gif.gif_dma_hold() {mem.dma_finish(mem.DMA_GIF)}
 	return mem.dma_reg(mem.DMA_GIF, 0x00)^ & 0x100 != 0
 }
 
-// MSKPATH3 before a PATH3 packet: the GIF DMA's packet waits (M3P, P3Q,
-// FQC 2) with STR set, and MSKPATH3 off runs it and finishes the channel.
+// Loops in a GIF DMA packet bigger than the 16-qword GIF FIFO.
+@(private = "file")
+GIF_BIG :: 20
+
+// MSKPATH3 before a PATH3 packet: a packet that fits the GIF FIFO waits
+// (M3P, P3Q, FQC 2) and its DMA finishes; MSKPATH3 off runs it. A bigger
+// one waits with STR set (FQC 16), and MSKPATH3 off runs it and finishes
+// the channel.
 // MSKPATH3 inside a packet: the packet runs to its EOP, and the next waits.
 // GIF_MODE.M3R masks it the same with MSKPATH3 off.
 @(private = "file")
 gif_mask :: proc() {
 	gif_clear()
 	feed(&vu.vifs[1], 0x06008000) // MSKPATH3 on
-	if !gif_dma(0x40, 0x1111) || gs.state.regs[0x40] != 0 {fail("masked PATH3: STR %v, GS 40 %x, want STR set and 0", mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0, gs.state.regs[0x40])}
+	if gif_dma(0x40, 0x1111) || gs.state.regs[0x40] != 0 {fail("masked small PATH3: STR %v, GS 40 %x, want STR clear and 0", mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0, gs.state.regs[0x40])}
 	if s := gif.gif_stat(0); s != M3P | P3Q | fqc(2) {fail("GIF_STAT with masked PATH3 waiting %x, want %x", s, M3P | P3Q | fqc(2))}
 	feed(&vu.vifs[1], 0x06000000) // MSKPATH3 off
+	if gs.state.regs[0x40] != 0x1111 || gif.gif_stat(0) != 0 {fail("MSKPATH3 off: GS 40 %x, GIF_STAT %x, want 1111 and 0", gs.state.regs[0x40], gif.gif_stat(0))}
+
+	gif_clear()
+	feed(&vu.vifs[1], 0x06008000)
+	if !gif_dma(0x40, 0x1111, GIF_BIG) || gs.state.regs[0x40] != 0 {fail("masked PATH3: STR %v, GS 40 %x, want STR set and 0", mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0, gs.state.regs[0x40])}
+	if s := gif.gif_stat(0); s != M3P | P3Q | fqc(16) {fail("GIF_STAT with a big masked PATH3 waiting %x, want %x", s, M3P | P3Q | fqc(16))}
+	feed(&vu.vifs[1], 0x06000000)
 	if gs.state.regs[0x40] != 0x1111 || mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0 || gif.gif_stat(0) != 0 {
 		fail("MSKPATH3 off: GS 40 %x, CHCR %x, GIF_STAT %x, want 1111, STR clear, 0", gs.state.regs[0x40], mem.dma_reg(mem.DMA_GIF, 0)^, gif.gif_stat(0))
 	}
+
+	// VIF1 FBRST.RST lifts MSKPATH3: the held packet runs, the channel finishes.
+	gif_clear()
+	feed(&vu.vifs[1], 0x06008000)
+	if !gif_dma(0x40, 0x5555, GIF_BIG) {fail("VIF1 RST: masked big GIF DMA did not hold STR")}
+	vu.vif_fbrst(1, 1)
+	if gs.state.regs[0x40] != 0x5555 || mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0 || gif.gif_stat(0) != 0 {
+		fail("VIF1 RST: GS 40 %x, CHCR %x, GIF_STAT %x, want 5555, STR clear, 0", gs.state.regs[0x40], mem.dma_reg(mem.DMA_GIF, 0)^, gif.gif_stat(0))
+	}
+	mem.dmac_stat = 0
 
 	gif_clear()
 	open := [2][4]u32{{2 | 1 << 15, 1 << 28, 0xe, 0}, gif_ad(0x40, 0x1111)} // 2 loops, 1 sent
@@ -873,7 +900,7 @@ gif_mask_rst :: proc() {
 	feed(&vu.vifs[1], 0x06008000)
 	mem.hw_reg(0x3010)^ = 1
 	gif.gif_mask_changed()
-	if !gif_dma(0x40, 0x1111) {fail("GIF_CTRL.RST: masked GIF DMA did not hold STR")}
+	if !gif_dma(0x40, 0x1111, GIF_BIG) {fail("GIF_CTRL.RST: masked GIF DMA did not hold STR")}
 	gif.gif_reset()
 	if mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0 || mem.hw_reg(0x3010)^ != 0 || gif.gif_stat(0) != 0 || gs.state.regs[0x40] != 0 {
 		fail("GIF_CTRL.RST with masks: CHCR %x, GIF_MODE %x, GIF_STAT %x, GS 40 %x", mem.dma_reg(mem.DMA_GIF, 0)^, mem.hw_reg(0x3010)^, gif.gif_stat(0), gs.state.regs[0x40])
