@@ -134,6 +134,7 @@ main :: proc() {
 	}
 	path :: CASES_DIR + "/main.odin"
 	if err := os.write_entire_file(path, sb.buf[:]); err != nil {fail("write %s: %v", path, err)}
+	unit_packages()
 
 	// odin exits 0 on some build errors (an -out: without .exe on Windows), so a
 	// missing binary afterwards fails the test. Remove any stale one first;
@@ -146,6 +147,39 @@ main :: proc() {
 	if werr != nil {fail("odin run: %v", werr)}
 	if !st.success {fail("cases failed (exit %d)", st.exit_code)}
 	if !os.exists(out) {fail("cases not built: %s", out)}
+}
+
+// The cases share one package and both units' helpers. Here each unit's
+// code stands alone, under emit_head as generate writes it: a DIV, an RSQRT
+// and a SQRT, whose I and D bits need div_bits, must check.
+@(private = "file")
+unit_packages :: proc() {
+	words := []u32 {
+		vu_programs.lower_sp(vu_programs.DIV, 0b0011, 1, 0), vu_programs.NOP_U,
+		vu_programs.lower_sp(vu_programs.RSQRT, 0b1111, 1, 0), vu_programs.NOP_U,
+		vu_programs.lower_sp(vu_programs.SQRT, 0b0100, 1, 0), vu_programs.NOP_U | vu_programs.E_BIT,
+		vu_programs.NOP_L, vu_programs.NOP_U,
+	}
+	for unit in vu.Unit {
+		sb := strings.builder_make()
+		vu.emit_head(&sb, unit, "ps:ps2/vu")
+		fmt.sbprintln(&sb, "_ :: math\n_ :: simd\n")
+		slow: map[string]int
+		fmt.sbprintln(&sb, vu.emit_micro(0, words, unit, false, &slow))
+		if len(slow) != 0 {fail("%v DIV program calls the interpreter: %v", unit, slow)}
+		dir := fmt.tprintf("%s/vu%d", CASES_DIR, int(unit))
+		if !os.exists(dir) {
+			if err := os.make_directory(dir); err != nil {fail("mkdir %s: %v", dir, err)}
+		}
+		path := fmt.tprintf("%s/code.odin", dir)
+		if err := os.write_entire_file(path, sb.buf[:]); err != nil {fail("write %s: %v", path, err)}
+		p, err := os.process_start({command = {"odin", "check", dir, "-no-entry-point", "-collection:ps=" + DIR + "/../.."}, stdout = os.stdout, stderr = os.stderr})
+		if err != nil {fail("odin check: %v", err)}
+		st, werr := os.process_wait(p)
+		if werr != nil {fail("odin check: %v", werr)}
+		if !st.success {fail("%v code alone does not check (exit %d)", unit, st.exit_code)}
+	}
+	fmt.println("ok vu_micro unit packages")
 }
 
 @(private = "file")
