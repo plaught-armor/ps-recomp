@@ -141,6 +141,10 @@ hw_write128 :: proc(addr: u32, v: u128) {
 // Start a DMA transfer. Channels without an implementation complete at once.
 dma_start :: proc(ch: u32) {
 	if cpu.debug == 2 {fmt.eprintfln("dma: start ch %d chcr %08x tadr %08x", ch, mem.dma_reg(ch, 0)^, mem.dma_reg(ch, 0x30)^)}
+	if dma.mfifo_owns(ch) {
+		if dma.mfifo_start(ch) {mem.dma_finish(ch)}
+		return
+	}
 	switch ch {
 	case mem.DMA_VIF0, mem.DMA_VIF1: dma.dma_vif(ch)
 	case mem.DMA_GIF:

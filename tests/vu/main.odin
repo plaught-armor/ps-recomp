@@ -972,6 +972,58 @@ gif_tte :: proc() {
 	}
 }
 
+// The GIF draining an MFIFO ring of 16 quadwords at 0x100000 that fromSPR
+// fills: the drain stops on an empty ring with STR set and MEIS raised, a
+// cnt tag's data wraps at the ring's top mid-transfer, each fromSPR transfer
+// restarts the drain, and an end tag finishes it.
+@(private = "file")
+mfifo :: proc() {
+	if mem.ram == nil {mem.ram = make([]u8, mem.RAM_SIZE)}
+	BASE :: 0x100000
+	gif_chcr := mem.dma_reg(mem.DMA_GIF, 0x00)
+	spr_madr := mem.dma_reg(mem.DMA_FROM_SPR, 0x10)
+	mem.hw_reg(dma.D_RBOR)^, mem.hw_reg(dma.D_RBSR)^ = BASE, 0xf0
+	mem.hw_reg(dma.D_CTRL)^ = 3 << 2 // MFD: GIF
+	spr_madr^ = BASE + 0xe0
+	mem.dma_reg(mem.DMA_GIF, 0x20)^, mem.dma_reg(mem.DMA_GIF, 0x30)^ = 0, BASE + 0xe0
+	mem.dmac_stat = 0
+	gs.state.regs[0x40], gs.state.regs[0x41], gs.state.regs[0x42] = 0, 0, 0
+	defer {
+		mem.hw_reg(dma.D_CTRL)^ = 0
+		mem.dmac_stat = 0
+	}
+	gif_chcr^ = 0x105 // source chain, STR
+	if !dma.mfifo_owns(mem.DMA_GIF) {fail("mfifo: GIF does not own the ring under MFD 3")}
+	if dma.mfifo_start(mem.DMA_GIF) || mem.dmac_stat & dma.D_STAT_MEIS == 0 {
+		fail("mfifo: the drain of an empty ring did not stop with MEIS (stat %08x)", mem.dmac_stat)
+	}
+	from_spr :: proc(qws: [][4]u32) {
+		copy(mem.spr[:], slice.to_bytes(qws))
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x00)^ = 0x100
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x20)^ = u32(len(qws))
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x80)^ = 0
+		dma.dma_from_spr()
+	}
+	// cnt of 3 at 0x1000e0: its data runs 0x1000f0, then 0x100000 and 0x100010.
+	mem.dmac_stat = 0
+	part1 := [?][4]u32{{3 | 1 << 28, 0, 0, 0}, gif_tag(2), gif_ad(0x40, 0x1111), gif_ad(0x41, 0x2222)}
+	from_spr(part1[:])
+	r := gs.state.regs
+	if r[0x40] != 0x1111 || r[0x41] != 0x2222 {fail("mfifo: data wrapped mid-transfer: GS 40 %x 41 %x, want 1111 2222", r[0x40], r[0x41])}
+	if spr_madr^ != BASE + 0x20 {fail("mfifo: fromSPR MADR %08x, want %08x", spr_madr^, BASE + 0x20)}
+	if gif_chcr^ & 0x100 == 0 || mem.dmac_stat & dma.D_STAT_MEIS == 0 {
+		fail("mfifo: drain ran dry at 0x100020 but CHCR %08x stat %08x", gif_chcr^, mem.dmac_stat)
+	}
+	// end of 2 at 0x100020: the chain ends and the channel finishes.
+	mem.dmac_stat = 0
+	part2 := [?][4]u32{{2 | 7 << 28, 0, 0, 0}, gif_tag(1), gif_ad(0x42, 0x3333)}
+	from_spr(part2[:])
+	if gs.state.regs[0x42] != 0x3333 {fail("mfifo: GS 42 %x after the end tag, want 3333", gs.state.regs[0x42])}
+	if gif_chcr^ & 0x100 != 0 || mem.dmac_stat & (1 << mem.DMA_GIF) == 0 || mem.dmac_stat & dma.D_STAT_MEIS != 0 {
+		fail("mfifo: end tag did not finish GIF: CHCR %08x stat %08x", gif_chcr^, mem.dmac_stat)
+	}
+}
+
 // VU0's window onto VU1's registers: a VU0 LQ or SQ at a quadword address
 // with bit 0x400 set reads and writes VU1's VF, VI and control registers,
 // not VU0 memory, mirrored every 0x40 quadwords. The stores to VF0, VI0
@@ -1060,6 +1112,7 @@ main :: proc() {
 	ibit()
 	gif_paths()
 	gif_tte()
+	mfifo()
 	window()
 	branch_delay()
 	fmt.println("vu: ok")
