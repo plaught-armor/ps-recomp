@@ -173,7 +173,8 @@ ring_avail :: proc(a: u32) -> u32 {
 }
 
 // Start the drain channel ch (mfifo_owns). True when it finished at once;
-// false when it stopped on an empty ring with STR still set.
+// false when STR stays set: it stopped on an empty ring, or its GIF data is
+// held (gif_dma_hold).
 mfifo_start :: proc(ch: u32) -> bool {
 	mfifo_last = (mem.dma_reg(ch, 0x00)^ >> 2) & 3 != 1 // normal mode: QWC only
 	return mfifo_run(ch)
@@ -240,8 +241,13 @@ mfifo_run :: proc(ch: u32) -> bool {
 			vu.vif_feed(&vu.vifs[ch], dma_buf[:])
 		}
 	}
-	if mfifo_stalled {mem.dmac_stat |= D_STAT_MEIS}
-	return !mfifo_stalled
+	if mfifo_stalled {
+		mem.dmac_stat |= D_STAT_MEIS
+		return false
+	}
+	// A finished GIF drain keeps STR set while PATH3 data waits past the
+	// GIF FIFO; gif_arbitrate finishes it once the queue has run.
+	return !(ch == mem.DMA_GIF && gif.gif_dma_hold())
 }
 
 // ------------------------------------------------------------ scratchpad

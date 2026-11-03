@@ -1024,6 +1024,42 @@ mfifo :: proc() {
 	}
 }
 
+// An MFIFO GIF drain that reaches its end tag with more PATH3 data held
+// behind MSKPATH3 than the GIF FIFO takes keeps STR set, as a GIF DMA from
+// memory does; MSKPATH3 off runs the packet and finishes the channel.
+@(private = "file")
+mfifo_hold :: proc() {
+	gif_clear()
+	BASE :: 0x100000
+	gif_chcr := mem.dma_reg(mem.DMA_GIF, 0x00)
+	mem.hw_reg(dma.D_RBOR)^, mem.hw_reg(dma.D_RBSR)^ = BASE, 0x3f0 // 64 quadwords
+	mem.hw_reg(dma.D_CTRL)^ = 3 << 2
+	defer {
+		mem.hw_reg(dma.D_CTRL)^ = 0
+		mem.dmac_stat = 0
+		gif_clear()
+	}
+	// end of GIF_BIG + 1 at the ring's base, with its data behind it.
+	pkt: [GIF_BIG + 2][4]u32
+	pkt[0] = {(GIF_BIG + 1) | 7 << 28, 0, 0, 0}
+	pkt[1] = gif_tag(GIF_BIG)
+	for i in 2 ..< GIF_BIG + 2 {pkt[i] = gif_ad(0x40, 0x6666)}
+	copy(mem.ram[BASE:][:size_of(pkt)], slice.to_bytes(pkt[:]))
+	mem.dma_reg(mem.DMA_FROM_SPR, 0x10)^ = BASE + size_of(pkt)
+	mem.dma_reg(mem.DMA_GIF, 0x20)^, mem.dma_reg(mem.DMA_GIF, 0x30)^ = 0, BASE
+	mem.dmac_stat = 0
+	feed(&vu.vifs[1], 0x06008000) // MSKPATH3 on
+	gif_chcr^ = 0x105
+	if dma.mfifo_start(mem.DMA_GIF) || gs.state.regs[0x40] != 0 {
+		fail("mfifo hold: masked big drain finished at once (GS 40 %x), want STR held", gs.state.regs[0x40])
+	}
+	if mem.dmac_stat & dma.D_STAT_MEIS != 0 {fail("mfifo hold: a drain that reached its end tag raised MEIS")}
+	feed(&vu.vifs[1], 0x06000000) // MSKPATH3 off
+	if gs.state.regs[0x40] != 0x6666 || gif_chcr^ & 0x100 != 0 || mem.dmac_stat & (1 << mem.DMA_GIF) == 0 {
+		fail("mfifo hold: MSKPATH3 off: GS 40 %x, CHCR %08x, stat %08x, want 6666, STR clear, GIF done", gs.state.regs[0x40], gif_chcr^, mem.dmac_stat)
+	}
+}
+
 // VU0's window onto VU1's registers: a VU0 LQ or SQ at a quadword address
 // with bit 0x400 set reads and writes VU1's VF, VI and control registers,
 // not VU0 memory, mirrored every 0x40 quadwords. The stores to VF0, VI0
@@ -1113,6 +1149,7 @@ main :: proc() {
 	gif_paths()
 	gif_tte()
 	mfifo()
+	mfifo_hold()
 	window()
 	branch_delay()
 	fmt.println("vu: ok")
