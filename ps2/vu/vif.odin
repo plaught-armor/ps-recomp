@@ -113,7 +113,8 @@ vif_run :: proc(v: ^Vif, w: []u32) -> int #no_bounds_check {
 		case 0x03: v.base = imm & 0x3ff
 		case 0x04: v.itops = imm & 0x3ff
 		case 0x05: v.mode = imm & 3
-		case 0x06, 0x07: // MSKPATH3, MARK
+		case 0x06: gif.gif_mskpath3(imm & 0x8000 != 0) // MSKPATH3
+		case 0x07: // MARK
 		case 0x10, 0x11, 0x13: // FLUSHE/FLUSH/FLUSHA: the VU runs synchronously
 		case 0x14, 0x15: vif_mscal(v, imm * 8)
 		case 0x17: vif_mscal(v, v.vu.tpc)

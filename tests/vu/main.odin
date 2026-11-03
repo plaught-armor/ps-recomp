@@ -37,6 +37,13 @@
 // frees a held GIF, drops a waiting XGKICK and lets a held DIRECT in;
 // FBRST.RST drops what a VIF holds.
 //
+// GIF_STAT shows who owns the GIF and who waits: a split DIRECT packet,
+// an XGKICK queued behind it, a DIRECT held behind PATH3. MSKPATH3 holds a
+// PATH3 packet that has not started (and its DMA's STR) until unmask, lets
+// one in flight end, and GIF_MODE.M3R does the same; GIF_CTRL.RST clears
+// the masks and finishes the held DMA. A busy GIF_STAT read again with
+// nothing moved is a compat row.
+//
 // Then a GIF source chain with TTE set: the tags' upper halves stay out of
 // PATH3, so the packet in the chain and one sent after it reach the GS. The
 // same chain into scratchpad puts each whole tag ahead of its data.
@@ -52,6 +59,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "ps:core"
 import "ps:ps2/dma"
 import gif "ps:ps2/gif"
 import gs "ps:ps2/gs"
@@ -629,6 +637,10 @@ gif_paths :: proc() {
 	gif_slices(false)
 	gif_directhl()
 	gif_rst()
+	gif_stat_bits()
+	gif_mask()
+	gif_mask_rst()
+	gif_guard()
 }
 
 // What each host-to-local transfer carried: its bytes, and GS register
@@ -666,6 +678,7 @@ gif_kick :: proc() {
 gif_clear :: proc() {
 	gs.state.regs[0x40], gs.state.regs[0x41], gs.state.regs[0x42] = 0, 0, 0
 	mem.hw_reg(0x3010)^ = 0 // GIF_MODE
+	gif.gif_mskpath3(false)
 	clear(&gif_images)
 }
 
@@ -765,6 +778,133 @@ gif_rst :: proc() {
 		fail("VIF0 FBRST.RST: stalled %v, %d bytes pending, STAT %x, CL %d, want CL %d", vu.vifs[0].stalled, len(vu.vifs[0].pending), stat, vu.vifs[0].cl, cl)
 	}
 	mem.intc_stat, mem.intc_pending = 0, 0
+	gif_clear()
+}
+
+// GIF_STAT bits as named, for the checks below.
+@(private = "file")
+M3R, M3P, P3Q, P2Q, P1Q, OPH :: 1, 2, 1 << 6, 1 << 7, 1 << 8, 1 << 9
+
+@(private = "file")
+apath :: proc(p: u32) -> u32 {return p << 10 | OPH}
+
+@(private = "file")
+fqc :: proc(n: u32) -> u32 {return n << 24}
+
+// GIF_STAT while a DIRECT holds the GIF in a split packet (APATH 2), with
+// an XGKICK queued behind it (P1Q), then while PATH3 holds it in an open
+// packet and VIF1 holds a DIRECT (APATH 3, P2Q). Idle, it reads 0.
+@(private = "file")
+gif_stat_bits :: proc() {
+	gif_clear()
+	tag, ad40, ad41, ad42 := gif_tag(2), gif_ad(0x40, 0x1111), gif_ad(0x41, 0x2222), gif_ad(0x42, 0x3333)
+	feed(&vu.vifs[1], 0x50000002, tag[0], tag[1], tag[2], tag[3], ad40[0], ad40[1], ad40[2], ad40[3])
+	if s := gif.gif_stat(0); s != apath(2) {fail("GIF_STAT in a split DIRECT packet %x, want %x", s, apath(2))}
+	gif_kick()
+	if s := gif.gif_stat(0); s != apath(2) | P1Q {fail("GIF_STAT with an XGKICK queued %x, want %x", s, apath(2) | P1Q)}
+	feed(&vu.vifs[1], 0x50000001, ad42[0], ad42[1], ad42[2], ad42[3])
+	if s := gif.gif_stat(0); s != 0 || gs.state.regs[0x41] != 0x2222 {fail("GIF_STAT after the DIRECT and XGKICK %x, GS 41 %x", s, gs.state.regs[0x41])}
+
+	held := [2][4]u32{{2 | 1 << 15, 1 << 28, 0xe, 0}, ad40} // 2 loops, 1 sent
+	gif.gif_feed(2, ([^]u8)(&held)[:32])
+	t1 := gif_tag(1)
+	feed(&vu.vifs[1], 0x50000002, t1[0], t1[1], t1[2], t1[3], ad41[0], ad41[1], ad41[2], ad41[3])
+	if s := gif.gif_stat(0); s != apath(3) | P2Q {fail("GIF_STAT with a DIRECT held behind PATH3 %x, want %x", s, apath(3) | P2Q)}
+	gif.gif_feed(2, ([^]u8)(&ad42)[:16])
+	if s := gif.gif_stat(0); s != 0 || vu.vifs[1].gif_wait {fail("GIF_STAT after PATH3's packet %x, VIF1 waiting %v", s, vu.vifs[1].gif_wait)}
+	gif_clear()
+}
+
+// Start a GIF DMA (normal mode) of a 1-loop A+D packet writing data to GS
+// register reg, as dma_start does; returns whether STR stays set.
+@(private = "file")
+gif_dma :: proc(reg: u8, data: u32) -> bool {
+	if mem.ram == nil {mem.mem_init()}
+	pkt := [2][4]u32{gif_tag(1), gif_ad(reg, data)}
+	copy(mem.ram[0x2000:][:32], ([^]u8)(&pkt)[:32])
+	mem.dma_reg(mem.DMA_GIF, 0x00)^ = 0x101 // STR, normal
+	mem.dma_reg(mem.DMA_GIF, 0x10)^ = 0x2000
+	mem.dma_reg(mem.DMA_GIF, 0x20)^ = 2
+	dma.dma_gif()
+	if !gif.gif_dma_hold() {mem.dma_finish(mem.DMA_GIF)}
+	return mem.dma_reg(mem.DMA_GIF, 0x00)^ & 0x100 != 0
+}
+
+// MSKPATH3 before a PATH3 packet: the GIF DMA's packet waits (M3P, P3Q,
+// FQC 2) with STR set, and MSKPATH3 off runs it and finishes the channel.
+// MSKPATH3 inside a packet: the packet runs to its EOP, and the next waits.
+// GIF_MODE.M3R masks it the same with MSKPATH3 off.
+@(private = "file")
+gif_mask :: proc() {
+	gif_clear()
+	feed(&vu.vifs[1], 0x06008000) // MSKPATH3 on
+	if !gif_dma(0x40, 0x1111) || gs.state.regs[0x40] != 0 {fail("masked PATH3: STR %v, GS 40 %x, want STR set and 0", mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0, gs.state.regs[0x40])}
+	if s := gif.gif_stat(0); s != M3P | P3Q | fqc(2) {fail("GIF_STAT with masked PATH3 waiting %x, want %x", s, M3P | P3Q | fqc(2))}
+	feed(&vu.vifs[1], 0x06000000) // MSKPATH3 off
+	if gs.state.regs[0x40] != 0x1111 || mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0 || gif.gif_stat(0) != 0 {
+		fail("MSKPATH3 off: GS 40 %x, CHCR %x, GIF_STAT %x, want 1111, STR clear, 0", gs.state.regs[0x40], mem.dma_reg(mem.DMA_GIF, 0)^, gif.gif_stat(0))
+	}
+
+	gif_clear()
+	open := [2][4]u32{{2 | 1 << 15, 1 << 28, 0xe, 0}, gif_ad(0x40, 0x1111)} // 2 loops, 1 sent
+	gif.gif_feed(2, ([^]u8)(&open)[:32])
+	feed(&vu.vifs[1], 0x06008000)
+	if s := gif.gif_stat(0); s != M3P | apath(3) {fail("MSKPATH3 inside a packet: GIF_STAT %x, want %x", s, M3P | apath(3))}
+	rest := [3][4]u32{gif_ad(0x41, 0x2222), gif_tag(1), gif_ad(0x42, 0x3333)}
+	gif.gif_feed(2, ([^]u8)(&rest)[:48])
+	r := gs.state.regs
+	if r[0x41] != 0x2222 || r[0x42] != 0 {fail("MSKPATH3 inside a packet: GS 41 %x 42 %x, want 2222 0", r[0x41], r[0x42])}
+	mem.hw_reg(0x3010)^ = 1 // GIF_MODE.M3R
+	gif.gif_mask_changed()
+	feed(&vu.vifs[1], 0x06000000)
+	if s := gif.gif_stat(0); s != M3R | P3Q | fqc(2) || gs.state.regs[0x42] != 0 {fail("GIF_MODE.M3R: GIF_STAT %x, GS 42 %x, want %x and 0", s, gs.state.regs[0x42], M3R | P3Q | fqc(2))}
+	mem.hw_reg(0x3010)^ = 0
+	gif.gif_mask_changed()
+	if s := gif.gif_stat(0); s != 0 || gs.state.regs[0x42] != 0x3333 {fail("GIF_MODE.M3R off: GIF_STAT %x, GS 42 %x, want 0 and 3333", s, gs.state.regs[0x42])}
+	gif_clear()
+}
+
+// GIF_CTRL.RST with MSKPATH3 and M3R set and a masked GIF DMA held: the
+// packet is dropped, the channel finishes, the masks clear, and the next
+// PATH3 packet goes in.
+@(private = "file")
+gif_mask_rst :: proc() {
+	gif_clear()
+	feed(&vu.vifs[1], 0x06008000)
+	mem.hw_reg(0x3010)^ = 1
+	gif.gif_mask_changed()
+	if !gif_dma(0x40, 0x1111) {fail("GIF_CTRL.RST: masked GIF DMA did not hold STR")}
+	gif.gif_reset()
+	if mem.dma_reg(mem.DMA_GIF, 0)^ & 0x100 != 0 || mem.hw_reg(0x3010)^ != 0 || gif.gif_stat(0) != 0 || gs.state.regs[0x40] != 0 {
+		fail("GIF_CTRL.RST with masks: CHCR %x, GIF_MODE %x, GIF_STAT %x, GS 40 %x", mem.dma_reg(mem.DMA_GIF, 0)^, mem.hw_reg(0x3010)^, gif.gif_stat(0), gs.state.regs[0x40])
+	}
+	if gif_dma(0x40, 0x4444) || gs.state.regs[0x40] != 0x4444 {fail("GIF_CTRL.RST: PATH3 still masked, GS 40 %x", gs.state.regs[0x40])}
+	mem.dmac_stat = 0
+	gif_clear()
+}
+
+// A busy GIF_STAT read again with nothing fed in between is one compat row
+// by the reader's return address, and reads the honest value; a feed in
+// between, or an idle GIF, is no row.
+@(private = "file")
+gif_guard :: proc() {
+	row :: proc(ra: u32) -> u64 {return core.compat.calls[{.Gif_Stat_Busy, ra, 0}].n}
+	gif_clear()
+	open := [2][4]u32{{4 | 1 << 15, 1 << 28, 0xe, 0}, gif_ad(0x40, 0x1111)} // 4 loops, 1 sent
+	gif.gif_feed(2, ([^]u8)(&open)[:32])
+	gif.gif_stat(0x1000)
+	if row(0x1000) != 0 {fail("guard: a first busy GIF_STAT read was a compat row")}
+	if s := gif.gif_stat(0x1000); s != apath(3) || row(0x1000) != 1 {fail("guard: busy read with no progress: GIF_STAT %x, row %d, want %x and 1", s, row(0x1000), apath(3))}
+	ad := gif_ad(0x41, 0x2222)
+	for _ in 0 ..< 2 {
+		gif.gif_feed(2, ([^]u8)(&ad)[:16])
+		gif.gif_stat(0x2000)
+	}
+	if row(0x2000) != 0 {fail("guard: a busy read after a feed was a compat row")}
+	gif.gif_feed(2, ([^]u8)(&ad)[:16]) // the packet's last loop
+	gif.gif_stat(0x3000)
+	gif.gif_stat(0x3000)
+	if row(0x3000) != 0 {fail("guard: an idle GIF_STAT read was a compat row")}
 	gif_clear()
 }
 

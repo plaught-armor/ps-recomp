@@ -13,6 +13,10 @@
 // (the VIF keeps the rest of its stream). Arbitration is at the boundaries
 // of the data each feed brings, and for PATH3 also at its own EOPs and
 // slices: a DIRECT's data always goes in whole.
+//
+// GIF_MODE.M3R and VIF1's MSKPATH3 mask PATH3 between packets: a packet
+// that has not started waits in gif_q3 until the mask is lifted, and one in
+// flight runs to its EOP. GIF_STAT is computed from this state (gif_stat).
 package ps2_gif
 
 import "ps:core"
@@ -42,6 +46,8 @@ Gif_Arb :: struct {
 	p2_hl:    bool, // and it is a DIRECTHL
 	q3_head:  int, // bytes of gif_q3 already run
 	draining: bool, // gif_arbitrate is running further up the stack
+	m3p:      bool, // VIF1 MSKPATH3 masks PATH3 (GIF_STAT.M3P)
+	dma_hold: bool, // the GIF DMA channel keeps STR set until gif_q3 has run
 }
 
 @(private)
@@ -66,11 +72,36 @@ gif_q1, gif_q3: [dynamic]u8
 @(private)
 gif_p2_resume: proc()
 
-// GIF_MODE, by hardware register offset.
+// GIF_CTRL and GIF_MODE, by hardware register offset, and their bits.
+@(private)
+GIF_CTRL :: 0x3000
+@(private)
+GIF_CTRL_PSE :: 8
 @(private)
 GIF_MODE :: 0x3010
 @(private)
+GIF_MODE_M3R :: 1
+@(private)
 GIF_MODE_IMT :: 4
+
+// The GIF_STAT bits that show a path or a queue busy: IP3, P3Q, P2Q, P1Q,
+// OPH, APATH and FQC.
+GIF_STAT_BUSY :: 0x1f000fe0
+
+// What one GIF_STAT read saw, with gif_moves at the time (gif_stat_guard).
+@(private)
+Gif_Stat_Read :: struct {
+	stat:   u32,
+	q1, q3: int, // bytes waiting in gif_q1 and gif_q3
+	moves:  u64,
+}
+
+// Host diagnostics, not emulated state: the last GIF_STAT read, and a count
+// of the calls that may move the GIF on (feeds, mask changes, resets).
+@(private)
+gif_stat_last: Gif_Stat_Read
+@(private)
+gif_moves: u64
 
 // Take the VIF's resume proc; once, before the first feed.
 gif_init :: proc(p2_resume: proc()) {
@@ -85,14 +116,66 @@ gif_q_free :: proc(q: ^[dynamic]u8) {
 }
 
 // GIF_CTRL.RST: every path drops its packet and the waiting PATH1 and PATH3
-// data, and the GIF is free. A DIRECT VIF1 holds goes in now, from its start.
+// data, GIF_MODE and the MSKPATH3 mask clear, and the GIF is free. A GIF
+// DMA held for its dropped data finishes. A DIRECT VIF1 holds goes in now,
+// from its start.
 gif_reset :: proc() {
-	wait := gif_arb.p2_wait
+	wait, hold := gif_arb.p2_wait, gif_arb.dma_hold
+	gif_moves += 1
 	gif_paths = {}
 	gif_arb = {draining = gif_arb.draining}
 	gif_q_free(&gif_q1)
 	gif_q_free(&gif_q3)
+	mem.hw_reg(GIF_MODE)^ = 0
+	if hold {mem.dma_finish(mem.DMA_GIF)}
 	if wait {gif_p2_resume()}
+}
+
+// GIF_MODE was written (M3R) or VIF1 ran MSKPATH3: a PATH3 the mask let go
+// runs once the GIF is free.
+gif_mask_changed :: proc() {
+	gif_moves += 1
+	if gif_arb.apath == 0 && !gif_p3_masked() {gif_arbitrate()}
+}
+
+// VIF1 MSKPATH3: on masks PATH3 from its next packet, off lets it run.
+gif_mskpath3 :: proc(on: bool) {
+	gif_arb.m3p = on
+	gif_mask_changed()
+}
+
+// A GIF DMA transfer was fed: whether its channel stays started (STR set)
+// because PATH3 data waits in gif_q3. The channel finishes once the queue
+// has run (gif_arbitrate) or the GIF is reset.
+gif_dma_hold :: proc() -> bool {
+	gif_arb.dma_hold = len(gif_q3) != 0
+	return gif_arb.dma_hold
+}
+
+// GIF_STAT, computed from the arbiter: M3R, M3P, IMT, PSE, IP3, P3Q, P2Q,
+// P1Q, OPH, APATH and FQC (the PATH3 qwords waiting, at most the 16 the
+// FIFO holds). DIR stays 0: GS-to-host transfers do not go through here.
+// ra is the reader's return address, for gif_stat_guard.
+gif_stat :: proc(ra: u32) -> u32 {
+	a := &gif_arb
+	mode := mem.hw_reg(GIF_MODE)^
+	q3 := len(gif_q3) - a.q3_head
+	s := mode & GIF_MODE_M3R | u32(a.m3p) << 1 | mode & GIF_MODE_IMT | mem.hw_reg(GIF_CTRL)^ & GIF_CTRL_PSE
+	s |= u32(a.ip3) << 5 | u32(q3 != 0) << 6 | u32(a.p2_wait) << 7 | u32(len(gif_q1) != 0) << 8
+	s |= u32(a.apath != 0) << 9 | a.apath << 10 | u32(min(q3 / 16, 16)) << 24
+	gif_stat_guard(s, q3, ra)
+	return s
+}
+
+// A read that shows the GIF busy, the same as the last read with nothing
+// fed, masked or reset since, is a wait the synchronous GIF will not end
+// by itself (hardware would be streaming the transfer): a compat row by the
+// reader's return address. The value read stays the honest one.
+@(private)
+gif_stat_guard :: proc(s: u32, q3: int, ra: u32) {
+	r := Gif_Stat_Read{s, len(gif_q1), q3, gif_moves}
+	if s & GIF_STAT_BUSY != 0 && r == gif_stat_last {core.compat_unknown(.Gif_Stat_Busy, ra, ra = ra)}
+	gif_stat_last = r
 }
 
 // VIF1 was reset: the DIRECT it held no longer waits for the GIF.
@@ -103,6 +186,12 @@ gif_p2_drop :: proc() {
 @(private)
 gif_busy :: #force_inline proc(p: ^Gif_Path) -> bool {return p.nloop != 0 || p.open}
 
+// PATH3 is masked (GIF_MODE.M3R or MSKPATH3) and between packets.
+@(private)
+gif_p3_masked :: #force_inline proc() -> bool {
+	return (mem.hw_reg(GIF_MODE)^ & GIF_MODE_M3R != 0 || gif_arb.m3p) && !gif_busy(&gif_paths[2])
+}
+
 // PATH3 is in an IMAGE packet with data still to come.
 @(private)
 gif_p3_image :: #force_inline proc() -> bool {return gif_paths[2].flg >= 2 && gif_paths[2].nloop != 0}
@@ -110,6 +199,7 @@ gif_p3_image :: #force_inline proc() -> bool {return gif_paths[2].flg >= 2 && gi
 // Whether path (0-2) may put data into the GIF now.
 @(private)
 gif_can :: proc(path: int, hl: bool) -> bool {
+	if path == 2 && gif_p3_masked() {return false}
 	a := gif_arb.apath
 	if a == 0 {return !(hl && gif_p3_image())} // DIRECTHL waits for a sliced IMAGE too
 	if a == u32(path) + 1 {return true}
@@ -122,6 +212,7 @@ gif_can :: proc(path: int, hl: bool) -> bool {
 gif_feed :: proc(path: int, data: []u8, hl := false) -> bool {
 	t := cpu.prof_start()
 	defer cpu.prof_end(.GIF, t)
+	gif_moves += 1
 	queued := path == 0 ? len(gif_q1) != 0 : path == 2 && len(gif_q3) != 0
 	if queued || !gif_can(path, hl) {
 		if path == 1 {
@@ -176,11 +267,15 @@ gif_arbitrate :: proc() {
 		case a.p2_wait && gif_can(1, a.p2_hl):
 			a.p2_wait = false
 			gif_p2_resume() // may wait again, behind what it let in
-		case len(gif_q3) != 0:
+		case len(gif_q3) != 0 && !gif_p3_masked():
 			a.q3_head += gif_run(2, gif_q3[a.q3_head:])
 			if a.q3_head == len(gif_q3) {
 				gif_q_free(&gif_q3)
 				a.q3_head = 0
+				if a.dma_hold {
+					a.dma_hold = false
+					mem.dma_finish(mem.DMA_GIF)
+				}
 			}
 		case gif_busy(&gif_paths[2]):
 			a.apath, a.ip3 = 3, false // a sliced PATH3 takes the GIF back for its rest
@@ -192,7 +287,7 @@ gif_arbitrate :: proc() {
 
 // Parse a path's qwords into GS writes; returns the bytes used. Only PATH3
 // stops early, at the end of a packet or an IMAGE slice, when another path
-// waits.
+// waits, or at the end of a packet when it is masked.
 @(private)
 gif_run :: proc(path: int, data: []u8) -> int {
 	p := &gif_paths[path]
@@ -204,7 +299,7 @@ gif_run :: proc(path: int, data: []u8) -> int {
 		lo, hi := q[2 * i], q[2 * i + 1]
 		if p.nloop == 0 {
 			if !p.open {
-				if path == 2 && (len(gif_q1) != 0 || a.p2_wait) {return 16 * i}
+				if path == 2 && (len(gif_q1) != 0 || a.p2_wait || gif_p3_masked()) {return 16 * i}
 				gif_take(path)
 			}
 			p.nloop = u32(lo & 0x7fff)

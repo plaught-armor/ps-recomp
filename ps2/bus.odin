@@ -29,6 +29,9 @@ hw_read :: proc(addr: u32, size: int) -> u64 {
 		case 0xe010:
 			ipu.ipu_pump()
 			return u64(mem.dmac_stat)
+		case 0x3020: // GIF_STAT
+			v := u64(gif.gif_stat(u32(cpu.state.r[31].d[0]))) >> ((u64(o) & 3) * 8)
+			return size == 8 ? v : v & ((u64(1) << (u64(size) * 8)) - 1)
 		case 0xf000: return u64(mem.intc_stat)
 		case 0xf010: return u64(mem.intc_mask)
 		case 0xf200 ..= 0xf260: return u64(iop.sif_reg_read(o))
@@ -76,6 +79,8 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 			return
 		case 0x3000: // GIF_CTRL: RST, then stored as before
 			if w & 1 != 0 {gif.gif_reset()}
+		case 0x3020: // GIF_STAT is read-only
+			return
 		case 0x3810, 0x3c10: // VIF0/VIF1 FBRST
 			vu.vif_fbrst(int(o >> 10) & 1, w)
 			return
@@ -92,6 +97,7 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 		case 4: (^u32)(&mem.hwregs[o])^ = w
 		case 8: (^u64)(&mem.hwregs[o])^ = v
 		}
+		if o &~ 3 == 0x3010 {gif.gif_mask_changed()} // GIF_MODE.M3R
 		// A write to a channel's CHCR with STR set starts it.
 		for base, ch in mem.DMA_BASE {
 			if o == base && w & 0x100 != 0 {
@@ -137,7 +143,9 @@ dma_start :: proc(ch: u32) {
 	if cpu.debug == 2 {fmt.eprintfln("dma: start ch %d chcr %08x tadr %08x", ch, mem.dma_reg(ch, 0)^, mem.dma_reg(ch, 0x30)^)}
 	switch ch {
 	case mem.DMA_VIF0, mem.DMA_VIF1: dma.dma_vif(ch)
-	case mem.DMA_GIF:            dma.dma_gif()
+	case mem.DMA_GIF:
+		dma.dma_gif()
+		if gif.gif_dma_hold() {return} // STR stays set while PATH3 data waits in the GIF
 	case mem.DMA_FROM_SPR:       dma.dma_from_spr()
 	case mem.DMA_TO_SPR:         dma.dma_to_spr()
 	case mem.DMA_FROM_IPU, mem.DMA_TO_IPU:

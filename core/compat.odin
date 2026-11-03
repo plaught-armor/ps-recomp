@@ -72,7 +72,10 @@ COMPAT_TOP :: 10
 // driver does not serve (adx.odin); Irx_Reloc the relocation type;
 // Vu1_Status the reader (the runtime's vu.Vu_Status_Reader: 0 a VU0 window
 // load, 1 an EE macro one, 2 FSEQ, FSAND or FSOR) and micro pc of a read of
-// VU1 status that compiled VU1 code had left stale.
+// VU1 status that compiled VU1 code had left stale; Gif_Stat_Busy the
+// return address of a GIF_STAT read that showed a path or a queue busy,
+// read again with nothing moved since: a wait the synchronous GIF never
+// ends, as hardware would by streaming the rest of a transfer.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -104,6 +107,7 @@ Compat_Call :: enum u8 {
 	Iop_Adx,
 	Irx_Reloc,
 	Vu1_Status,
+	Gif_Stat_Busy,
 }
 
 // The names the IOP's rows carry, by the id compat_name gives them, so a key
@@ -283,6 +287,7 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Vu1_Status:
 		READER := [3]string{"VU0 window", "EE macro", "FS"}
 		return fmt.tprintf("VU1 status stale, read by %s at %04x", READER[min(k.id, 2)], k.sub)
+	case .Gif_Stat_Busy: return fmt.tprintf("GIF_STAT busy with no progress, read from %08x", k.id)
 	}
 	return ""
 }
