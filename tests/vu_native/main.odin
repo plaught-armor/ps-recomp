@@ -98,14 +98,14 @@ main :: proc() {
 	progs := vu_programs.programs()
 	arch := native.Arch(core.NATIVE_ARCH)
 	a := native.make_asm(arch, r5900.native_ram())
-	vus := make([]native.Blob_Vu, len(progs))
+	vus := make([]native.Blob_Span, len(progs))
 	slow_fails := 0
 	for p, k in progs {
 		ranges := make([]native.Blob_Range, 1)
 		ranges[0] = {0, p.words}
 		slow: map[string]int
 		reads := vu_programs.status_reads(p.words)
-		vus[k] = {u32(p.unit), u32(rvu.native_program(&a, p.words, nil, p.entries, p.unit, reads > 0, &slow)), ranges}
+		vus[k] = {p.unit == .VU0 ? .Vu0 : .Vu1, 0, u32(rvu.native_program(&a, p.words, nil, p.entries, p.unit, reads > 0, &slow)), ranges}
 		if slow["pair"] != reads {
 			fmt.eprintfln("FAIL vu_native: program %d leaves %d status reads of %d to the interpreter", k, slow["pair"], reads)
 			slow_fails += 1
@@ -122,8 +122,8 @@ main :: proc() {
 		fmt.eprintln("FAIL vu_native: native_load:", err)
 		os.exit(1)
 	}
-	if len(code.vus) != len(progs) {
-		fmt.eprintfln("FAIL vu_native: %d programs loaded, want %d", len(code.vus), len(progs))
+	if len(code.spans) != len(progs) {
+		fmt.eprintfln("FAIL vu_native: %d programs loaded, want %d", len(code.spans), len(progs))
 		os.exit(1)
 	}
 
@@ -131,7 +131,7 @@ main :: proc() {
 	vu.vu_init()
 	cases, fails, flagged, status_set := 0, 0, 0, 0
 	for p, k in progs {
-		run := cast(proc())rawptr(code.base + uintptr(code.vus[k].off))
+		run := cast(proc())rawptr(code.base + uintptr(code.spans[k].off))
 		vu0 := p.unit == .VU0
 		status := vu0 || vu_programs.status_reads(p.words) > 0
 		v := vu0 ? &vu.vu0 : &vu.vu1
@@ -214,7 +214,7 @@ main :: proc() {
 		fmt.eprintln("FAIL vu_native: no VU1 program without a status read")
 		fails += 1
 	} else {
-		vu.vu_register_native(1, {{0, progs[stale].words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.vus[stale].off)))
+		vu.vu_register_native(1, {{0, progs[stale].words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.spans[stale].off)))
 		if !vu_programs.stale_status(progs[stale].words, progs[stale].pcs[0]) {fails += 1}
 	}
 
@@ -222,12 +222,12 @@ main :: proc() {
 	// for each program's micro memory.
 	for p, k in progs {
 		if k == stale {continue} // registered above
-		vu.vu_register_native(p.unit == .VU0 ? 0 : 1, {{0, p.words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.vus[k].off)))
+		vu.vu_register_native(p.unit == .VU0 ? 0 : 1, {{0, p.words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.spans[k].off)))
 	}
 	rand.reset(SEED)
 	dispatch_fails := 0
 	for p, k in progs {
-		run := cast(proc())rawptr(code.base + uintptr(code.vus[k].off))
+		run := cast(proc())rawptr(code.base + uintptr(code.spans[k].off))
 		vu0 := p.unit == .VU0
 		status := vu0 || vu_programs.status_reads(p.words) > 0
 		v := vu0 ? &vu.vu0 : &vu.vu1

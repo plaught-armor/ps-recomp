@@ -1407,9 +1407,9 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 }
 
 // The native functions of unit u's programs, the ones generate compiles
-// to Odin, appended to a's code and to vus. Their ranges point into the
+// to Odin, appended to a's code and to spans. Their ranges point into the
 // programs' words, which stay allocated.
-native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Unit, vus: ^[dynamic]native.Blob_Vu) -> bool {
+native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Unit, spans: ^[dynamic]native.Blob_Span) -> bool {
 	if u == .VU0 && capture == "" {return true}
 	progs := load_programs(img, capture, u) or_return
 	status := reads_status(progs[:], u)
@@ -1424,7 +1424,7 @@ native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Uni
 			for s, k in spans {rs[k] = {u32(s[0]) * 8, p.words[s[0] * 2:s[1] * 2]}}
 		}
 		off := native_program(a, p.words[:], p.ext, p.entries, u, status)
-		append(vus, native.Blob_Vu{u32(u), u32(off), rs})
+		append(spans, native.Blob_Span{u == .VU0 ? .Vu0 : .Vu1, 0, u32(off), rs})
 		free_all(context.temp_allocator)
 	}
 	return true

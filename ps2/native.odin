@@ -276,10 +276,7 @@ native_imports :: proc() -> map[string]u64 {
 	m["ps2.sdl"] = p(rawptr(sdl))
 	m["ps2.sdr"] = p(rawptr(sdr))
 	m["vu.vf"] = p(&vu.vu0.vf)
-	// vu.acc is an old microprogram import, reached through vu.vf now; the
-	// rest below are still CFC2/CTC2's. Kept so older blobs still load; drop
-	// at the next NATIVE_VERSION.
-	m["vu.acc"] = p(&vu.vu0.acc)
+	// CFC2/CTC2's control registers.
 	m["vu.q"] = p(&vu.vu0.q)
 	m["vu.i"] = p(&vu.vu0.i)
 	m["vu.mac"] = p(&vu.vu0.mac)
@@ -297,9 +294,6 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.ctrl_read"] = p(rawptr(vu.vu0_ctrl_read))
 	m["vu.ctrl_write"] = p(rawptr(vu.vu0_ctrl_write))
 	// The microprograms' (recomp/vu/native.odin): VU0's vu.*, VU1's vu1.*.
-	// vu.p is an old microprogram import, reached through vu.vf now. Kept so
-	// older blobs still load; drop at the next NATIVE_VERSION.
-	m["vu.p"] = p(&vu.vu0.p)
 	m["vu.upper"] = p(rawptr(vu.vu0_upper))
 	m["vu.lower"] = p(rawptr(vu.vu0_lower))
 	m["vu.pair"] = p(rawptr(vu.vu0_pair))
@@ -310,15 +304,6 @@ native_imports :: proc() -> map[string]u64 {
 	m["vu.scratch"] = p(&vu.native_run[0].scratch)
 	m["vu.branch_vi"] = p(rawptr(vu.vu0_branch_vi))
 	m["vu1.vf"] = p(&vu.vu1.vf)
-	// Old microprogram imports: they reach these through vu1.vf
-	// now. Kept so older blobs still load; drop at the next NATIVE_VERSION.
-	m["vu1.acc"] = p(&vu.vu1.acc)
-	m["vu1.q"] = p(&vu.vu1.q)
-	m["vu1.i"] = p(&vu.vu1.i)
-	m["vu1.p"] = p(&vu.vu1.p)
-	m["vu1.mac"] = p(&vu.vu1.mac)
-	m["vu1.status"] = p(&vu.vu1.status)
-	m["vu1.clip"] = p(&vu.vu1.clip)
 	m["vu1.mem"] = p(&vu.vu1_mem)
 	m["vu1.upper"] = p(rawptr(vu.vu1_upper))
 	m["vu1.lower"] = p(rawptr(vu.vu1_lower))
@@ -406,14 +391,17 @@ load_native :: proc(path: string) -> bool {
 // pool, so it is never freed.
 @(private = "file")
 register_vus :: proc(code: ^core.Native_Code) {
-	if len(code.vus) == 0 || core.env("VUNATIVE") == "0" {return}
-	for v in code.vus {
-		ranges := make([]vu.Vu_Range, v.n_ranges, context.temp_allocator)
+	if len(code.spans) == 0 || core.env("VUNATIVE") == "0" {return}
+	n := 0
+	for s in code.spans {
+		if s.kind != .Vu0 && s.kind != .Vu1 {continue} // not this runtime's
+		ranges := make([]vu.Vu_Range, s.n_ranges, context.temp_allocator)
 		for &r, k in ranges {
-			nr := code.ranges[int(v.range_first) + k]
+			nr := code.ranges[int(s.range_first) + k]
 			r = {nr.pc, code.pool[nr.at:][:nr.n_words]}
 		}
-		vu.vu_register_native(int(v.unit), ranges, cast(vu.Vu_Native)rawptr(code.base + uintptr(v.off)))
+		vu.vu_register_native(s.kind == .Vu0 ? 0 : 1, ranges, cast(vu.Vu_Native)rawptr(code.base + uintptr(s.off)))
+		n += 1
 	}
-	fmt.eprintfln("native: %d VU microprograms", len(code.vus))
+	fmt.eprintfln("native: %d VU microprograms", n)
 }

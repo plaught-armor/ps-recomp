@@ -7,22 +7,33 @@ import "core:slice"
 // (core/native.odin has the same layout). All fields are little-endian u32.
 //
 //   header   magic "PSRN", version, arch, n_imports, n_funcs, n_ovls,
-//            n_vus, n_ranges, n_pool, code_size, imports_at
+//            n_spans, n_ranges, n_pool, code_size, imports_at
 //   imports  n_imports names, each a u16 length and the bytes
 //   funcs    n_funcs of {addr, off}
 //   ovls     n_ovls of {addr, slot, id, sig[4], off}
-//   vus      n_vus of {unit, off, range_first, n_ranges}
+//   spans    n_spans of {kind, entry, off, range_first, n_ranges}
 //   ranges   n_ranges of {pc, n_words, at}
 //   pool     n_pool words
 //   code     code_size bytes; the import slots are at imports_at
 //
-// A vu entry is a microprogram's native function (vu/native.odin) for VU
-// unit 0 or 1 at code offset off. It holds only while micro memory has the
-// words it was compiled from: ranges range_first up, each n_words words
-// from byte pc of micro memory, found at word at of the pool. Equal ranges
-// share their pool words. PS1 blobs have no vus.
+// A span is a native function at code offset off that holds only while
+// its memory has the words it was compiled from: ranges range_first up,
+// each n_words words from byte pc, found at word at of the pool. Equal
+// ranges share their pool words. kind (Span_Kind) names the memory and
+// what runs the function: a VU unit's microprogram (vu/native.odin, entry
+// 0, pc in micro memory), or a processor's function entered at entry (pc
+// in its address space).
 BLOB_MAGIC :: 0x4e525350 // "PSRN"
-BLOB_VERSION :: 2
+BLOB_VERSION :: 3
+
+// core/native.odin's Native_Kind.
+Span_Kind :: enum u32 {
+	Vu0,
+	Vu1,
+	Psx,
+	Iop,
+	Ee,
+}
 
 Blob_Func :: struct {
 	addr, off: u32,
@@ -34,25 +45,26 @@ Blob_Ovl :: struct {
 	off:            u32,
 }
 
-// A range of micro memory a vu entry was compiled from.
+// A range of memory a span was compiled from.
 Blob_Range :: struct {
 	pc:    u32,
 	words: []u32,
 }
 
-Blob_Vu :: struct {
-	unit, off: u32,
-	ranges:    []Blob_Range,
+Blob_Span :: struct {
+	kind:       Span_Kind,
+	entry, off: u32,
+	ranges:     []Blob_Range,
 }
 
-write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, vus: []Blob_Vu = nil) -> bool {
-	b := make_blob(a, funcs, ovls, vus)
+write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil) -> bool {
+	b := make_blob(a, funcs, ovls, spans)
 	defer delete(b)
 	return os.write_entire_file(path, b) == nil
 }
 
 // The file's bytes, in context.allocator; finishes a.
-make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, vus: []Blob_Vu = nil) -> []u8 {
+make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil) -> []u8 {
 	code, imports_at := finish(a)
 	// The pool, each distinct range's words once, keyed by their bytes.
 	pool: [dynamic]u32
@@ -60,8 +72,8 @@ make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, vus: []Blob_Vu 
 	at := make(map[string]u32)
 	defer delete(at)
 	n_ranges := 0
-	for v in vus {
-		for r in v.ranges {
+	for s in spans {
+		for r in s.ranges {
 			n_ranges += 1
 			key := string(slice.to_bytes(r.words))
 			if key in at {continue}
@@ -73,7 +85,7 @@ make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, vus: []Blob_Vu 
 	put :: proc(b: ^[dynamic]u8, v: u32) {
 		append(b, u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24))
 	}
-	for v in ([?]u32{BLOB_MAGIC, BLOB_VERSION, u32(a.arch), u32(len(a.imports)), u32(len(funcs)), u32(len(ovls)), u32(len(vus)), u32(n_ranges), u32(len(pool)), u32(len(code)), u32(imports_at)}) {
+	for v in ([?]u32{BLOB_MAGIC, BLOB_VERSION, u32(a.arch), u32(len(a.imports)), u32(len(funcs)), u32(len(ovls)), u32(len(spans)), u32(n_ranges), u32(len(pool)), u32(len(code)), u32(imports_at)}) {
 		put(&b, v)
 	}
 	for name in a.imports {
@@ -92,15 +104,16 @@ make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, vus: []Blob_Vu 
 		put(&b, o.off)
 	}
 	first := 0
-	for v in vus {
-		put(&b, v.unit)
-		put(&b, v.off)
+	for s in spans {
+		put(&b, u32(s.kind))
+		put(&b, s.entry)
+		put(&b, s.off)
 		put(&b, u32(first))
-		put(&b, u32(len(v.ranges)))
-		first += len(v.ranges)
+		put(&b, u32(len(s.ranges)))
+		first += len(s.ranges)
 	}
-	for v in vus {
-		for r in v.ranges {
+	for s in spans {
+		for r in s.ranges {
 			put(&b, r.pc)
 			put(&b, u32(len(r.words)))
 			put(&b, at[string(slice.to_bytes(r.words))])

@@ -19,14 +19,27 @@ Native_Ovl :: struct {
 	off:            u32,
 }
 
-// A VU microprogram's native function, valid while micro memory of VU
-// unit (0 or 1) holds ranges[range_first:][:n_ranges].
-Native_Vu :: struct {
-	unit, off:             u32,
+// What a span's code runs: a VU unit's microprogram, or a processor's
+// function compiled from words it interpreted (core/learn.odin).
+Native_Kind :: enum u32 {
+	Vu0,
+	Vu1,
+	Psx,
+	Iop,
+	Ee,
+}
+
+// A native function valid only while its memory holds the words it was
+// compiled from, ranges[range_first:][:n_ranges]: VU micro memory for a
+// microprogram (entry 0), the processor's address space for a function
+// (entered at entry).
+Native_Span :: struct {
+	kind:                  Native_Kind,
+	entry, off:            u32,
 	range_first, n_ranges: u32,
 }
 
-// n_words words from byte pc of micro memory, at word at of the pool.
+// n_words words from byte pc of the span's memory, at word at of the pool.
 Native_Range :: struct {
 	pc, n_words, at: u32,
 }
@@ -36,13 +49,13 @@ Native_Code :: struct {
 	size:   int, // bytes of code at base, for unmap_code
 	funcs:  []Native_Func,
 	ovls:   []Native_Ovl,
-	vus:    []Native_Vu, // none for PS1
+	spans:  []Native_Span,
 	ranges: []Native_Range,
 	pool:   []u32,
 }
 
 NATIVE_MAGIC :: 0x4e525350 // "PSRN"
-NATIVE_VERSION :: 2
+NATIVE_VERSION :: 3
 // Bytes of the header: magic, version, arch, then the counts and sizes.
 NATIVE_HEADER :: 44
 
@@ -72,7 +85,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		if v, ok = word(blob, &at); !ok {return {}, "short header"}
 	}
 	magic, version, arch, n_imports, n_funcs, n_ovls := h[0], h[1], h[2], h[3], h[4], h[5]
-	n_vus, n_ranges, n_pool, size, imports_at := h[6], h[7], h[8], h[9], h[10]
+	n_spans, n_ranges, n_pool, size, imports_at := h[6], h[7], h[8], h[9], h[10]
 	if magic != NATIVE_MAGIC || version != NATIVE_VERSION {
 		return {}, "not a native code file of this version"
 	}
@@ -88,7 +101,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		name = string(blob[at:at + n])
 		at += n
 	}
-	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_vus) * 16 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
+	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_spans) * 20 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
 		return {}, "bad table sizes"
 	}
 	if imports_at % 16 != 0 || int(imports_at) + 8 * int(n_imports) != int(size) {
@@ -97,7 +110,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	defer if err != "" {
 		delete(code.funcs)
 		delete(code.ovls)
-		delete(code.vus)
+		delete(code.spans)
 		delete(code.ranges)
 		delete(code.pool)
 		code = {}
@@ -117,22 +130,24 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		o.off, _ = word(blob, &at)
 		if o.off >= imports_at {return code, "function outside the code"}
 	}
-	code.vus = make([]Native_Vu, n_vus)
-	for &v in code.vus {
-		v.unit, _ = word(blob, &at)
-		v.off, _ = word(blob, &at)
-		v.range_first, _ = word(blob, &at)
-		v.n_ranges, _ = word(blob, &at)
-		if v.unit > 1 {return code, "bad VU unit"}
-		if v.off >= imports_at {return code, "function outside the code"}
-		if u64(v.range_first) + u64(v.n_ranges) > u64(n_ranges) {return code, "bad VU ranges"}
+	code.spans = make([]Native_Span, n_spans)
+	for &s in code.spans {
+		kind, _ := word(blob, &at)
+		s.entry, _ = word(blob, &at)
+		s.off, _ = word(blob, &at)
+		s.range_first, _ = word(blob, &at)
+		s.n_ranges, _ = word(blob, &at)
+		if kind > u32(max(Native_Kind)) {return code, "bad span kind"}
+		s.kind = Native_Kind(kind)
+		if s.off >= imports_at {return code, "function outside the code"}
+		if u64(s.range_first) + u64(s.n_ranges) > u64(n_ranges) {return code, "bad span ranges"}
 	}
 	code.ranges = make([]Native_Range, n_ranges)
 	for &r in code.ranges {
 		r.pc, _ = word(blob, &at)
 		r.n_words, _ = word(blob, &at)
 		r.at, _ = word(blob, &at)
-		if r.pc % 4 != 0 || u64(r.at) + u64(r.n_words) > u64(n_pool) {return code, "bad VU range"}
+		if r.pc % 4 != 0 || u64(r.at) + u64(r.n_words) > u64(n_pool) {return code, "bad span range"}
 	}
 	code.pool = make([]u32, n_pool)
 	for &w in code.pool {w, _ = word(blob, &at)}
@@ -158,10 +173,10 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 // routines after the last function count as part of it.
 @(private = "file")
 perf_map :: proc(code: Native_Code, end: int) {
-	offs := make([dynamic]int, 0, len(code.funcs) + len(code.ovls) + len(code.vus) + 1, context.temp_allocator)
+	offs := make([dynamic]int, 0, len(code.funcs) + len(code.ovls) + len(code.spans) + 1, context.temp_allocator)
 	for f in code.funcs {append(&offs, int(f.off))}
 	for o in code.ovls {append(&offs, int(o.off))}
-	for v in code.vus {append(&offs, int(v.off))}
+	for s in code.spans {append(&offs, int(s.off))}
 	slice.sort(offs[:])
 	append(&offs, end)
 	sb := strings.builder_make(context.temp_allocator)
@@ -175,10 +190,10 @@ perf_map :: proc(code: Native_Code, end: int) {
 		for offs[next] == int(o.off) {next += 1}
 		fmt.sbprintfln(&sb, "%x %x ovl_%08x", code.base + uintptr(o.off), offs[next] - int(o.off), o.addr)
 	}
-	for v, k in code.vus {
-		next, _ := slice.binary_search(offs[:], int(v.off))
-		for offs[next] == int(v.off) {next += 1}
-		fmt.sbprintfln(&sb, "%x %x vu%d_%d", code.base + uintptr(v.off), offs[next] - int(v.off), v.unit, k)
+	for s, k in code.spans {
+		next, _ := slice.binary_search(offs[:], int(s.off))
+		for offs[next] == int(s.off) {next += 1}
+		fmt.sbprintfln(&sb, "%x %x %v_%d_%08x", code.base + uintptr(s.off), offs[next] - int(s.off), s.kind, k, s.entry)
 	}
 	path := fmt.tprintf("/tmp/perf-%d.map", os.get_pid())
 	if err := os.write_entire_file(path, sb.buf[:]); err != nil {
@@ -191,7 +206,7 @@ native_free :: proc(code: ^Native_Code) {
 	unmap_code(rawptr(code.base), code.size)
 	delete(code.funcs)
 	delete(code.ovls)
-	delete(code.vus)
+	delete(code.spans)
 	delete(code.ranges)
 	delete(code.pool)
 	code^ = {}

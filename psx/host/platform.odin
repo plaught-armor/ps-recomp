@@ -229,7 +229,7 @@ platform_init :: proc(title: cstring) -> bool {
 	core.compat_init("ps1", &cpu.state.cycles, cpu.CYCLES_PER_INSN)
 	// LEARN=<file>: record the code the interpreter runs (core/learn.odin).
 	core.learn_open()
-	core.learn_cpu(.Psx, &cpu.state.cycles, cpu.CYCLES_PER_INSN)
+	core.learn_cpu(.Psx, &cpu.state.cycles, cpu.CYCLES_PER_INSN, proc(a: u32) -> u32 {return cpu.lw(a)}, cpu.RAM_SIZE)
 	subsystems := sdl.InitFlags{.VIDEO, .EVENTS, .GAMECONTROLLER}
 	if core.headless {subsystems -= {.GAMECONTROLLER}}
 	if sdl.Init(subsystems) != 0 {

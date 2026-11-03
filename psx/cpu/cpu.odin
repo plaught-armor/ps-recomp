@@ -271,10 +271,10 @@ interpret :: proc(addr: u32) {
 		return
 	}
 	f := core.learn_begin(learn_cpu, addr)
-	core.learn_handoff[learn_cpu] = &f
+	core.learn_handoff[learn_cpu] = f
 	interp_run(addr)
 	core.learn_handoff[learn_cpu] = nil
-	core.learn_end(&f, proc(a: u32) -> u32 {return lw(a)})
+	if f != nil {core.learn_end(f)}
 }
 
 // Which processor this package is for LEARN (core/learn.odin): the PS1's,

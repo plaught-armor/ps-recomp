@@ -84,8 +84,8 @@ interp_call :: proc(entry: u32) {
 		return
 	}
 	f := core.learn_begin(.Ee, entry)
-	interp_body(entry, &f)
-	core.learn_end(&f, proc(a: u32) -> u32 {return mem.rd32(a)})
+	interp_body(entry, f)
+	if f != nil {core.learn_end(f)}
 }
 
 // Note for LEARN (core/learn.odin) that the run fetched i, and where i

@@ -2,13 +2,19 @@
 // runs written through learn_begin, learn_fetch, learn_store and learn_end
 // read back the same; a repeated run is written once; a store into a run's
 // range marks it .Smc and one outside does not, a store by another run in
-// progress included; stores past the log mark .Smc_Unknown; a range over
-// LEARN_SPAN_MAX is .Large with no words; and a reader drops a truncated
-// record and one whose words do not match its hash. The directory is
-// removed at the end whether the test passes or fails.
+// progress included; stores past the log mark .Smc_Unknown, but not with
+// RAM stamps, which see a store any number of stores back, through RAM's
+// mirrors, and mark a range outside RAM .Smc_Unknown; a repeated store
+// address is seen by a run begun between the two stores; a range over
+// LEARN_SPAN_MAX is .Large with no words; a run begun with every frame in
+// use is not noted; a run still in progress at the report is written
+// .Open; and a reader drops a truncated record, one whose words do not
+// match its hash, and a record of the previous stream version. The
+// directory is removed at the end whether the test passes or fails.
 package main
 
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
 import "ps:core"
@@ -34,9 +40,9 @@ word :: proc(a: u32) -> u32 {
 @(private = "file")
 run :: proc(cpu: core.Learn_Cpu, entry: u32, pcs: []u32, stores: []u32 = nil) {
 	f := core.learn_begin(cpu, entry)
-	for pc in pcs {core.learn_fetch(&f, pc)}
-	for a in stores {core.learn_store(&f, a)}
-	core.learn_end(&f, word)
+	for pc in pcs {core.learn_fetch(f, pc)}
+	for a in stores {core.learn_store(f, a)}
+	core.learn_end(f)
 }
 
 @(private = "file")
@@ -72,7 +78,9 @@ main :: proc() {
 	path, _ := filepath.join({tmp, "learn.bin"}, context.allocator)
 	check(core.learn_open_path(path), "open")
 	cycles: u64 = 1000
-	core.learn_cpu(.Ee, &cycles, 1)
+	core.learn_cpu(.Ee, &cycles, 1, word)
+	core.learn_cpu(.Iop, &cycles, 1, word)
+	core.learn_cpu(.Psx, &cycles, 1, word, 2 * 1024 * 1024)
 
 	run(.Ee, 0x1000, {0x1000, 0x1004, 0x1008, 0x100c}, {0x8000})
 	run(.Ee, 0x1000, {0x1000, 0x1004, 0x1008, 0x100c}, {0x8000}) // a repeat
@@ -85,22 +93,61 @@ main :: proc() {
 	// More stores than the log holds, none in range.
 	{
 		f := core.learn_begin(.Iop, 0x1030)
-		core.learn_fetch(&f, 0x1030)
-		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(&f, 0x9000_0000 + i * 4)}
-		core.learn_end(&f, word)
+		core.learn_fetch(f, 0x1030)
+		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(f, 0x9000_0000 + i * 4)}
+		core.learn_end(f)
 	}
 	// Two runs in progress at once, as guest threads switching mid-run: the
 	// inner one's store into the outer's range marks the outer, and the
 	// inner's end does not lose it.
 	{
 		g := core.learn_begin(.Ee, 0x1100)
-		core.learn_fetch(&g, 0x1100)
+		core.learn_fetch(g, 0x1100)
 		h := core.learn_begin(.Ee, 0x2000)
-		core.learn_fetch(&h, 0x2000)
-		core.learn_store(&h, 0x1104)
-		core.learn_end(&h, word)
-		core.learn_fetch(&g, 0x1108)
-		core.learn_end(&g, word)
+		core.learn_fetch(h, 0x2000)
+		core.learn_store(h, 0x1104)
+		core.learn_end(h)
+		core.learn_fetch(g, 0x1108)
+		core.learn_end(g)
+	}
+	// A store to the address of the store before it, by a run begun between
+	// the two: that run sees it.
+	run(.Iop, 0x1200, {0x1200}, {0x1304})
+	run(.Iop, 0x1300, {0x1300, 0x1304}, {0x1304})
+	// RAM stamps: a store into the range followed by more stores than the
+	// ring holds is still seen, and as many stores elsewhere mark nothing.
+	{
+		f := core.learn_begin(.Psx, 0x4000)
+		core.learn_fetch(f, 0x4000)
+		core.learn_fetch(f, 0x4004)
+		core.learn_store(f, 0x4004)
+		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(f, 0x10_0000 + i * 4)}
+		core.learn_end(f)
+		g := core.learn_begin(.Psx, 0x5000)
+		core.learn_fetch(g, 0x5000)
+		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(g, 0x10_0000 + i * 4)}
+		core.learn_end(g)
+	}
+	// A store through a RAM mirror into a kseg0 range; a range outside RAM.
+	run(.Psx, 0x8000_6000, {0x8000_6000, 0x8000_6004}, {0x0020_6004})
+	run(.Psx, 0x1f80_0000, {0x1f80_0000})
+	// Every frame in use: the next run is not noted, and the others write
+	// one record between them.
+	{
+		live: [core.LEARN_LIVE_MAX]^core.Learn_Frame
+		for &f in live {
+			f = core.learn_begin(.Ee, 0x6000)
+			check(f != nil, "pool: a frame")
+			core.learn_fetch(f, 0x6000)
+		}
+		check(core.learn_begin(.Ee, 0x6100) == nil, "pool: full")
+		for f in live {core.learn_end(f)}
+	}
+	// A run that never returns is written at the report.
+	{
+		f := core.learn_begin(.Psx, 0x7000)
+		core.learn_fetch(f, 0x7000)
+		core.learn_fetch(f, 0x7004)
 	}
 	core.learn_report()
 
@@ -113,6 +160,14 @@ main :: proc() {
 		{.Iop, {.Smc_Unknown}, 0x1030, 0x1030, 1},
 		{.Ee, {}, 0x2000, 0x2000, 1},
 		{.Ee, {.Smc}, 0x1100, 0x1100, 3},
+		{.Iop, {}, 0x1200, 0x1200, 1},
+		{.Iop, {.Smc}, 0x1300, 0x1300, 2},
+		{.Psx, {.Smc}, 0x4000, 0x4000, 2},
+		{.Psx, {}, 0x5000, 0x5000, 1},
+		{.Psx, {.Smc}, 0x8000_6000, 0x8000_6000, 2},
+		{.Psx, {.Smc_Unknown}, 0x1f80_0000, 0x1f80_0000, 1},
+		{.Ee, {}, 0x6000, 0x6000, 1},
+		{.Psx, {.Open}, 0x7000, 0x7000, 2},
 	}
 	data, rerr := os.read_entire_file(path, context.allocator)
 	check(rerr == nil, "read back")
@@ -131,6 +186,17 @@ main :: proc() {
 	recs, bad = core.learn_read(data)
 	check(bad == 1, fmt.tprintf("hash mismatch: %d bad", bad))
 	check_recs(recs[:], want[1:], "hash mismatch")
+
+	// An empty record reads under the stream's tag, and not under the
+	// previous version's ('C').
+	empty: [core.LEARN_HEADER]u8
+	empty[0] = core.LEARN_TAG
+	(^u64le)(&empty[16])^ = u64le(xxhash.XXH3_64_default(empty[core.LEARN_HEADER:]))
+	recs, bad = core.learn_read(empty[:])
+	check(bad == 0 && len(recs) == 1, fmt.tprintf("empty record: %d bad, %d records", bad, len(recs)))
+	empty[0] = 'C'
+	recs, bad = core.learn_read(empty[:])
+	check(bad == 1 && len(recs) == 0, fmt.tprintf("old version: %d bad, %d records", bad, len(recs)))
 
 	if os.remove_all(tmp) != nil {
 		check(false, fmt.tprintf("cannot remove %s", tmp))

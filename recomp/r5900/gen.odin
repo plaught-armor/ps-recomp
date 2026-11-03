@@ -321,7 +321,7 @@ generate :: proc(o: mips.Options) {
 		path := mips.option(o, "native_out")
 		// The VU microprograms too, with native_vu: the runtime runs them
 		// natively once it knows them (ps2/vu).
-		vus: [dynamic]native.Blob_Vu
+		vus: [dynamic]native.Blob_Span
 		if mips.option_or(o, "native_vu", "") == "true" {
 			for unit in vu.Unit {
 				if !vu.native_programs(code, img, vu_capture(o, unit), unit, &vus) {

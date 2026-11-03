@@ -1122,14 +1122,15 @@ main :: proc() {
 	native.func_end(&a)
 
 	ovl := native.Blob_Ovl{addr = 0x80100010, slot = 0x80100000, id = 0x1234, sig = {1, 2, 3, 4}, off = u32(early_at)}
-	// Two VU entries over three ranges, two of them equal: the pool holds
-	// each distinct range once.
+	// Two VU spans and a processor's over four ranges, three of them equal
+	// in pairs: the pool holds each distinct range once.
 	w0, w1 := [?]u32{1, 2, 3, 4}, [?]u32{5, 6}
-	vus := [?]native.Blob_Vu {
-		{unit = 1, off = u32(early_at), ranges = {{pc = 0, words = w0[:]}, {pc = 0x100, words = w0[:]}}},
-		{unit = 0, off = u32(main_at), ranges = {{pc = 8, words = w1[:]}}},
+	spans := [?]native.Blob_Span {
+		{kind = .Vu1, off = u32(early_at), ranges = {{pc = 0, words = w0[:]}, {pc = 0x100, words = w0[:]}}},
+		{kind = .Vu0, off = u32(main_at), ranges = {{pc = 8, words = w1[:]}}},
+		{kind = .Psx, entry = 0x80100044, off = u32(main_at), ranges = {{pc = 0x80100040, words = w1[:]}}},
 	}
-	blob := native.make_blob(&a, {{addr = 0x80010000, off = u32(main_at)}}, {ovl}, vus[:])
+	blob := native.make_blob(&a, {{addr = 0x80010000, off = u32(main_at)}}, {ovl}, spans[:])
 
 	p :: proc(v: rawptr) -> u64 {return u64(uintptr(v))}
 	imports: map[string]u64
@@ -1169,11 +1170,15 @@ main :: proc() {
 		fmt.eprintln("blob tables do not round-trip:", code.funcs, code.ovls)
 		os.exit(1)
 	}
-	want_vus := [?]core.Native_Vu{{1, u32(early_at), 0, 2}, {0, u32(main_at), 2, 1}}
-	want_ranges := [?]core.Native_Range{{0, 4, 0}, {0x100, 4, 0}, {8, 2, 4}}
+	want_spans := [?]core.Native_Span {
+		{.Vu1, 0, u32(early_at), 0, 2},
+		{.Vu0, 0, u32(main_at), 2, 1},
+		{.Psx, 0x80100044, u32(main_at), 3, 1},
+	}
+	want_ranges := [?]core.Native_Range{{0, 4, 0}, {0x100, 4, 0}, {8, 2, 4}, {0x80100040, 2, 4}}
 	want_pool := [?]u32{1, 2, 3, 4, 5, 6}
-	if !slice.equal(code.vus, want_vus[:]) || !slice.equal(code.ranges, want_ranges[:]) || !slice.equal(code.pool, want_pool[:]) {
-		fmt.eprintln("blob VU tables do not round-trip:", code.vus, code.ranges, code.pool)
+	if !slice.equal(code.spans, want_spans[:]) || !slice.equal(code.ranges, want_ranges[:]) || !slice.equal(code.pool, want_pool[:]) {
+		fmt.eprintln("blob span tables do not round-trip:", code.spans, code.ranges, code.pool)
 		os.exit(1)
 	}
 	bad_blobs(blob, imports)
@@ -1239,7 +1244,7 @@ main :: proc() {
 	}
 }
 
-// Each damaged copy of blob, which has VU tables, is refused, not loaded,
+// Each damaged copy of blob, which has span tables, is refused, not loaded,
 // with every import it names bound.
 bad_blobs :: proc(blob: []u8, imports: map[string]u64) {
 	get :: proc(b: []u8, at: int) -> u32 {
@@ -1248,9 +1253,9 @@ bad_blobs :: proc(blob: []u8, imports: map[string]u64) {
 	set :: proc(b: []u8, at: int, v: u32) {
 		for k in 0 ..< 4 {b[at + k] = u8(v >> (8 * uint(k)))}
 	}
-	n_vus, n_ranges, n_pool, size := get(blob, 24), get(blob, 28), get(blob, 32), get(blob, 36)
+	n_spans, n_ranges, n_pool, size := get(blob, 24), get(blob, 28), get(blob, 32), get(blob, 36)
 	ranges_at := len(blob) - int(size) - 4 * int(n_pool) - 12 * int(n_ranges)
-	vus_at := ranges_at - 16 * int(n_vus)
+	spans_at := ranges_at - 20 * int(n_spans)
 	Damage :: struct {
 		at:   int, // -1: the blob one byte short
 		v:    u32,
@@ -1259,11 +1264,11 @@ bad_blobs :: proc(blob: []u8, imports: map[string]u64) {
 	damages := [?]Damage {
 		{-1, 0, "short blob"},
 		{32, n_pool + 1, "pool count past the file"},
-		{24, 0xffffffff, "huge VU count"},
-		{vus_at, 2, "VU unit 2"},
-		{vus_at + 4, get(blob, 40), "VU function at the import slots"},
-		{vus_at + 8, 0xffffffff, "range_first past the ranges"},
-		{vus_at + 12, n_ranges + 1, "n_ranges past the ranges"},
+		{24, 0xffffffff, "huge span count"},
+		{spans_at, u32(max(core.Native_Kind)) + 1, "unknown span kind"},
+		{spans_at + 8, get(blob, 40), "span function at the import slots"},
+		{spans_at + 12, 0xffffffff, "range_first past the ranges"},
+		{spans_at + 16, n_ranges + 1, "n_ranges past the ranges"},
 		{ranges_at + 8, n_pool - 1, "range past the pool"},
 		{ranges_at + 4, 0xffffffff, "huge range"},
 		{ranges_at, 2, "unaligned range pc"},
