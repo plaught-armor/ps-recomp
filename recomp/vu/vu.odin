@@ -25,8 +25,10 @@
 // exit can see them, and on either unit each pair shifts only the older
 // flag values that a later read or an exit can see (program.odin). VU1
 // status is computed the same way, but only when some VU1 program reads it
-// (FSEQ, FSAND or FSOR; program.odin reads_status): nothing else can read
-// it. Its sticky bits keep every write, so then every upper op before a
+// (FSEQ, FSAND or FSOR; program.odin reads_status): nothing else on the
+// gate discs reads it, and the runtime makes a compat row of any read that
+// comes after such code (vu1_status_read). Its sticky bits keep every
+// write, so then every upper op before a
 // read or an exit computes it. On VU0 the EE reads MAC and status with CFC2
 // after a program, so both are always computed, as for macro instructions.
 //
@@ -318,7 +320,7 @@ emit_macro :: proc(w: u32) -> (code: string, ok: bool) {
 		// The micro lower word (opcode 0x40) has the same fields. Its
 		// fallback calls VU0's micro-mode interpreter, never right for a
 		// macro op.
-		if emit_lower(&sb, (w & 0x1ffffff) | 0x40 << 25, 0, "vu.VU0_MEM", "v.q") {return "", false}
+		if emit_lower(&sb, (w & 0x1ffffff) | 0x40 << 25, PC_MACRO, "vu.VU0_MEM", "v.q") {return "", false}
 	}
 	body := strings.trim_space(strings.to_string(sb))
 	if body == "" {return "", true}
@@ -353,6 +355,8 @@ lower_unit: int
 // The bit of a VU0 quadword address that reaches VU1's registers, the
 // runtime's vu.VU0_WINDOW.
 VU0_WINDOW :: 0x400
+// The pc a macro op's window load passes vu.vu0_lower: ps2/vu VU_PC_MACRO.
+PC_MACRO :: max(u32)
 
 // For a lower op lw that loads or stores data memory, the VI register
 // its address comes from and the offset added to it, -1 for the

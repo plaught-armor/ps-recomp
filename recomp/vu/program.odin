@@ -714,6 +714,8 @@ load_programs :: proc(img: mips.Image, capture: string, unit: Unit) -> (progs: [
 // vu0_window_load), at an address with bit 0x400 set that no captured VU0
 // program uses; such a read sees the status VU1 last stored. Code no
 // program covers runs in the interpreter, which computes status itself.
+// Either read after compiled VU1 code ran without status is a compat row
+// (the runtime's vu1_status_read).
 @(private)
 reads_status :: proc(progs: []Prog, unit: Unit) -> bool {
 	if unit == .VU0 {return true}

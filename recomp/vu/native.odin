@@ -333,7 +333,7 @@ quad :: proc(a: ^native.Asm, u: Unit, store: bool, dest, r: u32) {
 // lanes of the quadword from vf[fs]. vi[0] is 0 after. Uses A, B, C and
 // V0-V2.
 @(private = "file")
-lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
+lq_sq :: proc(a: ^native.Asm, u: Unit, w, key, pc: u32) {
 	dest, ft, fs := (w >> 21) & 15, (w >> 16) & 31, (w >> 11) & 31
 	store := key & 1 != 0
 	r := (ft if store else fs) & 15
@@ -356,7 +356,7 @@ lq_sq :: proc(a: ^native.Asm, u: Unit, w, key: u32) {
 	}
 	native.mov_imm(a, .C, 0)
 	native.imp_store(a, IMPORTS[u][.Vf], .C, VU_VI, .B16)
-	window_end(a, win, lw)
+	window_end(a, win, lw, pc)
 }
 
 // Where a VU0 load or store goes, with its quadword address in A and
@@ -383,20 +383,21 @@ window_begin :: proc(a: ^native.Asm, u: Unit) -> Window {
 }
 
 @(private = "file")
-window_end :: proc(a: ^native.Asm, win: Window, lw: u32) {
+window_end :: proc(a: ^native.Asm, win: Window, lw, pc: u32) {
 	if !win.tested {return}
 	done := native.new_label(a)
 	native.jmp(a, done)
 	native.bind(a, win.call)
-	window_call(a, lw)
+	window_call(a, lw, pc)
 	native.bind(a, done)
 }
 
-// vu.vu0_lower of lower op lw, with pc 0: it is not a branch.
+// vu.vu0_lower of lower op lw at pc, PC_MACRO for a macro op: pc names
+// the reader if the op reads VU1 status through the window.
 @(private = "file")
-window_call :: proc(a: ^native.Asm, lw: u32) {
+window_call :: proc(a: ^native.Asm, lw, pc: u32) {
 	native.mov_imm(a, .A, lw)
-	native.mov_imm(a, .B, 0)
+	native.mov_imm(a, .B, pc)
 	native.call(a, IMPORTS[.VU0][.Lower], .A, .B)
 }
 
@@ -522,7 +523,7 @@ fclamp_gpr :: proc(a: ^native.Asm, r, t: native.Reg) {
 // Code for VU0 macro op w as vu.vu_op runs it, or false to leave it there.
 // MAC and status are always computed: CFC2 can read them at any time.
 native_macro :: proc(a: ^native.Asm, w: u32) -> bool {
-	return op(a, .VU0, w, .Mac_Status)
+	return op(a, .VU0, w, .Mac_Status, pc = PC_MACRO)
 }
 
 // Code for op w of unit u as vu.vu_op runs it, or false to leave it there:
@@ -540,7 +541,7 @@ native_macro :: proc(a: ^native.Asm, w: u32) -> bool {
 // vu.odin's Known.lanes: an operand read only from those lanes skips its
 // clamp, and the lanes op writes are updated.
 @(private = "file")
-op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) -> bool {
+op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil, pc: u32 = PC_MACRO) -> bool {
 	Kind :: enum u8 {Add, Sub, Mul, Madd, Msub, Max, Mini, Opmul, Opmsub, Move, Mr32, Nop, Itof, Ftoi, Abs}
 	Src :: enum u8 {Vec, Bc, Q, I}
 	dest, ft, fs, fd, bc := (w >> 21) & 15, (w >> 16) & 31, (w >> 11) & 31, (w >> 6) & 31, w & 3
@@ -582,7 +583,7 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil) 
 	case 0x30: kind = .Move
 	case 0x31: kind = .Mr32
 	case 0x34 ..= 0x37:
-		lq_sq(a, u, w, key)
+		lq_sq(a, u, w, key, pc)
 		return true
 	case 0x38 ..= 0x3a: return div(a, u, w, key, flags == .Mac_Status)
 	case 0x3b: kind = .Nop // WAITQ
@@ -909,17 +910,17 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int,
 		if ft == 0 || dest == 0 {return}
 		win := quad_addr(a, u, is, imm11)
 		quad(a, u, false, dest, ft)
-		window_end(a, win, lw)
+		window_end(a, win, lw, pc)
 	case 0x01: // SQ
 		if dest == 0 {return}
 		win := quad_addr(a, u, it, imm11)
 		quad(a, u, true, dest, fs)
-		window_end(a, win, lw)
+		window_end(a, win, lw, pc)
 	case 0x04, 0x05: // ILW, ISW
 		if dest == 0 || (lw >> 25 == 0x04 && it == 0) {return}
 		win := quad_addr(a, u, is, imm11)
 		ilw_isw(a, u, lw >> 25 == 0x05, dest, it)
-		window_end(a, win, lw)
+		window_end(a, win, lw, pc)
 	case 0x08, 0x09: // IADDIU, ISUBIU
 		if it == 0 {return}
 		vi_get(a, u, .A, is)
@@ -977,7 +978,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int,
 		}
 		switch key {
 		case 0x30, 0x31, 0x34 ..= 0x37, 0x3b, 0x3d, 0x7b: // MOVE, MR32, LQI-SQD, WAITQ, MFIR, WAITP
-			if key != 0x7b && !op(a, u, lw, .None) {interp(a, u, lw, pc, slow, known)}
+			if key != 0x7b && !op(a, u, lw, .None, pc = pc) {interp(a, u, lw, pc, slow, known)}
 		case 0x38 ..= 0x3a: // DIV, SQRT, RSQRT
 			div(a, u, lw, key, true, VU_Q_NEXT, false)
 		case 0x3c: // MTIR
@@ -988,7 +989,7 @@ micro_lower :: proc(a: ^native.Asm, u: Unit, lw, pc: u32, slow: ^map[string]int,
 			if dest == 0 || (key == 0x3e && it == 0) {return}
 			win := quad_addr(a, u, is, 0)
 			ilw_isw(a, u, key == 0x3f, dest, it)
-			window_end(a, win, lw)
+			window_end(a, win, lw, pc)
 		case 0x64: // MFP: no flags, clamped
 			if ft == 0 || dest == 0 {return}
 			native.imp_load(a, .A, vf, VU_P)

@@ -31,6 +31,10 @@
 // other. Every program must compile without a call into the interpreter,
 // but for its status reads.
 //
+// After the trials, one VU1 program with no status read, registered alone,
+// must make each outside read of VU1 status a compat row
+// (vu_programs.stale_status).
+//
 // The clamp elision program is a chain of dependent ops on clamped
 // results, with a loop whose branch target is in the middle, compiled twice:
 // as a captured image entered at 0 and 0x48, which elides operand clamps and
@@ -244,6 +248,20 @@ main :: proc() {
 				break
 			}
 		}
+	}
+	// A VU1 program with no status read, registered alone, so compiled VU1
+	// code does not compute status: its outside readers are compat rows.
+	stale := -1
+	for c, n in CASES {
+		if !c.vu0 && !c.status && !c.leave {stale = n; break}
+	}
+	if stale < 0 {
+		fmt.eprintln("FAIL vu_micro: no VU1 case without a status read")
+		fails += 1
+	} else {
+		c := CASES[stale]
+		vu.vu1_register_ranges({{0, c.words}}, c.run)
+		if !vu_programs.stale_status(c.words, c.pc) {fails += 1}
 	}
 	fmt.printfln("vu_micro: %d cases x %d trials, %d failing, MAC changed in %d, VU0 I or D set in %d", len(CASES), TRIALS, fails, flagged, status_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.

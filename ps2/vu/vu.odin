@@ -183,8 +183,9 @@ vu0_macro :: proc(w: u32) {
 // special 0x30-0x7f lower ops.
 // No bounds checks here or in its nested procs: keep every index masked to
 // its array's length (&31, &15, &3), constant, a 0/1 select, or bounded by
-// a 0 ..< 4 loop.
-vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
+// a 0 ..< 4 loop. pc: a micro-mode lower op's address, VU_PC_MACRO for a
+// macro instruction.
+vu_op :: proc(v: ^Vu, w: u32, pc: u32 = VU_PC_MACRO) #no_bounds_check {
 	dest := (w >> 21) & 15 // x = 8, y = 4, z = 2, w = 1
 	ft := (w >> 16) & 31
 	fs := (w >> 11) & 31
@@ -335,7 +336,7 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 		}
 	case 0x34, 0x36: // VLQI, VLQD
 		if w & 3 == 2 {v.vi[is] -= 1}
-		q := vu_load_q(v, v.vi[is])
+		q := vu_load_q(v, v.vi[is], pc)
 		if ft != 0 {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vf[ft].u[k] = q[k]}}
 		}
@@ -363,7 +364,7 @@ vu_op :: proc(v: ^Vu, w: u32) #no_bounds_check {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vf[ft].u[k] = x}}
 		}
 	case 0x3e: // VILWR
-		q := vu_load_q(v, v.vi[is])
+		q := vu_load_q(v, v.vi[is], pc)
 		if it != 0 {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vi[it] = u16(q[k])}}
 		}
@@ -459,9 +460,10 @@ vu_mem_q :: proc(v: ^Vu, n: u16) -> ^[4]u32 #no_bounds_check {
 }
 
 // The quadword a load at address n reads: VU0's window onto VU1's
-// registers when n has VU0_WINDOW set, else data memory.
-vu_load_q :: proc(v: ^Vu, n: u16) -> [4]u32 {
-	if v == &vu0 && n & VU0_WINDOW != 0 {return vu0_window_load(n)}
+// registers when n has VU0_WINDOW set, else data memory. pc is the
+// loading op's, as vu_op takes it.
+vu_load_q :: proc(v: ^Vu, n: u16, pc: u32) -> [4]u32 {
+	if v == &vu0 && n & VU0_WINDOW != 0 {return vu0_window_load(n, pc)}
 	return vu_mem_q(v, n)^
 }
 
@@ -485,13 +487,15 @@ vu_store_q :: proc(v: ^Vu, n: u16, x: [4]u32, dest: u32) {
 // control registers at VI[16] on.
 VU0_WINDOW :: 0x400
 
-// The quadword of window slot n & 0x3f.
-vu0_window_load :: proc(n: u16) -> (q: [4]u32) {
+// The quadword of window slot n & 0x3f, loaded by the op at pc (vu_op's).
+vu0_window_load :: proc(n: u16, pc: u32) -> (q: [4]u32) {
 	s := n & 0x3f
 	switch s {
 	case 0 ..< 32: q = vu1.vf[s].u
 	case 32 ..< 48: q.x = u32(vu1.vi[s - 32])
-	case 48: q.x = vu1.status
+	case 48:
+		if pc == VU_PC_MACRO {vu1_status_read(.Macro, 0)} else {vu1_status_read(.Window, pc)}
+		q.x = vu1.status
 	case 49: q.x = vu1.mac
 	case 50: q.x = vu1.clip
 	case 52: q.x = 0x3f800000 | vu1.r
@@ -616,6 +620,36 @@ Micro_Table :: struct($N: int) {
 vu0_table: Micro_Table(len(vu0_micro) / 8)
 @(private)
 vu1_table: Micro_Table(len(vu1_micro) / 8)
+
+// vu_op's pc for a macro instruction, which has no micro address.
+VU_PC_MACRO :: max(u32)
+
+// Compiled VU1 code computes status only when a registered VU1 program
+// reads it (Micro_Table.status; recomp/vu reads_status), as nothing else
+// can on the gate discs. Once such code has run, VU1's status, sticky bits
+// and all, is stale until the end of the run: a later read is one the
+// elision did not foresee. It is a compat row (Vu1_Status) on every run,
+// and said once on stderr.
+vu1_status_stale: bool
+@(private)
+vu1_status_warned: bool
+
+// Who read VU1's status after compiled code left it stale: a VU0 micro
+// load through its window onto VU1's registers (VU0_WINDOW), an EE macro
+// load the same way, or FSEQ, FSAND or FSOR in VU1 code the interpreter
+// runs.
+Vu_Status_Reader :: enum u32 {Window, Macro, Fs}
+
+// Note a read of VU1's status by reader at pc (0 for Macro, which has no
+// micro address) when it is stale.
+vu1_status_read :: proc(reader: Vu_Status_Reader, pc: u32) {
+	if !vu1_status_stale {return}
+	core.compat_unknown(.Vu1_Status, u32(reader), pc, pc = pc)
+	if !vu1_status_warned {
+		vu1_status_warned = true
+		fmt.eprintfln("vu1: status read (%v, pc %04x) after compiled code that does not compute it", reader, pc)
+	}
+}
 
 // Bumped on every write path into each VU's micro memory (vu0_micro_touch,
 // vu1_micro_touch); the per-pair choice of program is rechecked when it
@@ -854,6 +888,7 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 					cpu.fallback_vu_unlabelled[{v == &vu0 ? 0 : 1, u32(index), pc}] += 1
 				}
 			}
+			if v == &vu1 && !t.status {vu1_status_stale = true}
 			if exit == .End {return pc, true}
 			if budget <= 0 {break}
 		}
@@ -1398,14 +1433,14 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 	status := (v.old_status[2] & 0x3f) | (v.status & 0xfc0)
 	switch w >> 25 {
 	case 0x00: // LQ
-		q := vu_load_q(v, vi[is] + imm11)
+		q := vu_load_q(v, vi[is] + imm11, pc)
 		if ft != 0 {
 			for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {v.vf[ft].u[k] = q[k]}}
 		}
 	case 0x01: // SQ
 		vu_store_q(v, vi[it] + imm11, v.vf[fs].u, dest)
 	case 0x04: // ILW
-		q := vu_load_q(v, vi[is] + imm11)
+		q := vu_load_q(v, vi[is] + imm11, pc)
 		for k in 0 ..< 4 {if dest & (8 >> u32(k)) != 0 {set_vi(vi, it, u16(q[k]))}}
 	case 0x05: // ISW
 		x := u32(vi[it])
@@ -1416,10 +1451,16 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 	case 0x11: v.clip = imm24 // FCSET
 	case 0x12: vi[1] = u16(clip & imm24 != 0) // FCAND
 	case 0x13: vi[1] = u16((clip | imm24) & 0xffffff == 0xffffff) // FCOR
-	case 0x14: set_vi(vi, it, u16(status & 0xfff == imm12)) // FSEQ
+	case 0x14: // FSEQ
+		if v == &vu1 {vu1_status_read(.Fs, pc)}
+		set_vi(vi, it, u16(status & 0xfff == imm12))
 	case 0x15: v.status = (v.status & 0x3f) | (imm12 & 0xfc0) // FSSET
-	case 0x16: set_vi(vi, it, u16(status & imm12)) // FSAND
-	case 0x17: set_vi(vi, it, u16((status | imm12) & 0xfff == 0xfff)) // FSOR
+	case 0x16: // FSAND
+		if v == &vu1 {vu1_status_read(.Fs, pc)}
+		set_vi(vi, it, u16(status & imm12))
+	case 0x17: // FSOR
+		if v == &vu1 {vu1_status_read(.Fs, pc)}
+		set_vi(vi, it, u16((status | imm12) & 0xfff == 0xfff))
 	case 0x18: set_vi(vi, it, u16(mac & 0xffff == u32(vi[is]))) // FMEQ
 	case 0x1a: set_vi(vi, it, u16(mac) & vi[is]) // FMAND
 	case 0x1b: set_vi(vi, it, u16((mac | u32(vi[is])) & 0xffff == 0xffff)) // FMOR
@@ -1443,7 +1484,7 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 	case 0x2d: return i16(vi_branch(v, is, pc)) > 0, branch // IBGTZ
 	case 0x2e: return i16(vi_branch(v, is, pc)) <= 0, branch // IBLEZ
 	case 0x2f: return i16(vi_branch(v, is, pc)) >= 0, branch // IBGEZ
-	case 0x40: vu_op(v, w)
+	case 0x40: vu_op(v, w, pc)
 	case:
 		cpu.fatal("vu%d: unknown lower op %08x at %04x", v == &vu1 ? 1 : 0, w, pc)
 	}
@@ -1537,6 +1578,7 @@ vu_snap :: proc() {
 	core.snap_add(&vu1_micro)
 	core.snap_add(&vu0_overrun)
 	core.snap_add(&vu1_overrun)
+	core.snap_add(&vu1_status_stale)
 	core.snap_add(&vu0_micro_gen)
 	core.snap_add(&vu1_micro_gen)
 	core.snap_add(&vu0_pairs)

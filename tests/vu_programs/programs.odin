@@ -3,7 +3,9 @@
 // interpreter; tests/vu_micro says what each one checks.
 package vu_programs
 
+import "core:fmt"
 import "core:math/rand"
+import "ps:core"
 import ps2_vu "ps:ps2/vu"
 import "ps:recomp/vu"
 
@@ -505,4 +507,55 @@ programs :: proc() -> (progs: [dynamic]Prog) {
 		append(&progs, captured, Prog{ELIDE, u, nil, ELIDE_PCS, nil})
 	}
 	return
+}
+
+// The outside readers of VU1 status after compiled VU1 code that does not
+// compute it (ps2/vu vu1_status_stale): words, a VU1 program with no
+// status read, is registered compiled and runs from pc through vu1_start.
+// Then a VU0 load through its window (slot 48, status), an EE macro VLQI
+// the same way, and an FSAND in VU1 code the interpreter runs must each be
+// a Vu1_Status compat row, which none is before the run. Says what fails
+// on stderr; false then. Leaves VU1 status no longer stale.
+stale_status :: proc(words: []u32, pc: u32) -> (ok: bool) {
+	ok = true
+	check :: proc(ok: ^bool, cond: bool, what: string) {
+		if !cond {
+			fmt.eprintfln("FAIL stale_status: %s", what)
+			ok^ = false
+		}
+	}
+	row :: proc(reader: ps2_vu.Vu_Status_Reader, pc: u32) -> u64 {return core.compat.calls[{.Vu1_Status, u32(reader), pc}].n}
+	WINDOW_PC, FS_PC :: 0x10, 0x20
+	lq := lower_op(0x00, 15, 1, 1, 0) // LQ vf1, 0(vi1)
+	vlqi := 0x4a000000 | upper_sp(0x34, 15, 1, 1) // VLQI vf1, (vi1++)
+	fsand := fs_op(FSAND, 3, 0xfc0) // FSAND vi3, the sticky bits
+	window :: proc(w: u32) {
+		ps2_vu.vu0.vi[1] = 0x430 // window slot 48, status
+		if w >> 25 == 0x25 {ps2_vu.vu0_macro(w)} else {ps2_vu.vu0_lower(w, WINDOW_PC)}
+	}
+
+	ps2_vu.vu1_status_stale = false
+	window(lq)
+	window(vlqi)
+	ps2_vu.vu1_lower(fsand, FS_PC)
+	check(&ok, row(.Window, WINDOW_PC) + row(.Macro, 0) + row(.Fs, FS_PC) == 0, "a status read before any compiled VU1 code is a row")
+
+	micro := ([^]u32)(&ps2_vu.vu1.micro[0])[:len(ps2_vu.vu1.micro) / 4]
+	for &m in micro {m = 0}
+	copy(micro, words)
+	ps2_vu.vu1_micro_touch()
+	ps2_vu.vu1.q_wait, ps2_vu.vu1.p_wait = 0, 0 // compiled code starts with none pending
+	ps2_vu.vu1.vih = {}
+	ps2_vu.vu1_start(pc)
+	check(&ok, ps2_vu.vu1_status_stale, "compiled VU1 code with no status read leaves status not stale")
+	window(lq)
+	check(&ok, row(.Window, WINDOW_PC) == 1, "a VU0 window load of VU1 status is no row")
+	window(vlqi)
+	check(&ok, row(.Macro, 0) == 1, "an EE macro window load of VU1 status is no row")
+	ps2_vu.vu1_lower(fsand, FS_PC)
+	check(&ok, row(.Fs, FS_PC) == 1, "an interpreted FSAND of VU1 status is no row")
+	window(lq)
+	check(&ok, row(.Window, WINDOW_PC) == 2, "a second window load is not counted")
+	ps2_vu.vu1_status_stale = false
+	return ok
 }

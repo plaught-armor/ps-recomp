@@ -69,7 +69,10 @@ COMPAT_TOP :: 10
 // Iop_Other_Data the EE
 // address and size of an IOP sceSifGetOtherData whose source or destination
 // runs past RAM, nothing copied; Iop_Adx a PS2RNA command CRI ADX's HLE
-// driver does not serve (adx.odin); Irx_Reloc the relocation type.
+// driver does not serve (adx.odin); Irx_Reloc the relocation type;
+// Vu1_Status the reader (the runtime's vu.Vu_Status_Reader: 0 a VU0 window
+// load, 1 an EE macro one, 2 FSEQ, FSAND or FSOR) and micro pc of a read of
+// VU1 status that compiled VU1 code had left stale.
 Compat_Call :: enum u8 {
 	Bios_A,
 	Bios_B,
@@ -100,6 +103,7 @@ Compat_Call :: enum u8 {
 	Iop_Other_Data,
 	Iop_Adx,
 	Irx_Reloc,
+	Vu1_Status,
 }
 
 // The names the IOP's rows carry, by the id compat_name gives them, so a key
@@ -276,6 +280,9 @@ compat_call_name :: proc(k: Compat_Key) -> string {
 	case .Iop_Other_Data: return fmt.tprintf("IOP GetOtherData from %08x size %x out of range", k.id, k.sub)
 	case .Iop_Adx: return fmt.tprintf("IOP ADX RNA command %d", k.id)
 	case .Irx_Reloc: return fmt.tprintf("IRX relocation %d", k.id)
+	case .Vu1_Status:
+		READER := [3]string{"VU0 window", "EE macro", "FS"}
+		return fmt.tprintf("VU1 status stale, read by %s at %04x", READER[min(k.id, 2)], k.sub)
 	}
 	return ""
 }

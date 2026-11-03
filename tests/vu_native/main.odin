@@ -12,7 +12,9 @@
 // registers the functions as the runtime does (unless VUNATIVE=0) and runs the
 // same trials through vu0_call_micro and vu1_start, which must leave what a
 // direct call leaves; after a write into a program's micro memory, they
-// must interpret it instead.
+// must interpret it instead. Before that, one VU1 program with no status
+// read, registered alone, must make each outside read of VU1 status a
+// compat row (vu_programs.stale_status).
 // The seed is fixed, so a run is reproducible.
 //
 //   odin run tests/vu_native -collection:ps=.
@@ -202,9 +204,24 @@ main :: proc() {
 		}
 	}
 
+	// A VU1 program with no status read, registered alone, so compiled VU1
+	// code does not compute status: its outside readers are compat rows.
+	stale := -1
+	for p, k in progs {
+		if p.unit == .VU1 && vu_programs.status_reads(p.words) == 0 {stale = k; break}
+	}
+	if stale < 0 {
+		fmt.eprintln("FAIL vu_native: no VU1 program without a status read")
+		fails += 1
+	} else {
+		vu.vu_register_native(1, {{0, progs[stale].words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.vus[stale].off)))
+		if !vu_programs.stale_status(progs[stale].words, progs[stale].pcs[0]) {fails += 1}
+	}
+
 	// The runtime's dispatch: the same trials, the micro generation moved
 	// for each program's micro memory.
 	for p, k in progs {
+		if k == stale {continue} // registered above
 		vu.vu_register_native(p.unit == .VU0 ? 0 : 1, {{0, p.words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.vus[k].off)))
 	}
 	rand.reset(SEED)
