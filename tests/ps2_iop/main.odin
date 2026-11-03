@@ -3374,6 +3374,23 @@ test_sif_dma_intr :: proc() {
 	iop.iop_tick(s.dma_cb[1].due)
 	check(core.compat.calls[key].n == 0 && word(b, d, 1) == 7 && s.n_dma_cb == 0, "sifman 32: one that waits gets -100 and returns, no row, the next runs")
 
+	// One whose transfer went to the EE's command buffer waits for that
+	// packet's due there, here held back behind one queued later in EE time.
+	ee_cycles := cpu.state.cycles
+	cpu.state.cycles = 1_000_000
+	iop.sif_send_raw(make([]u8, 16, context.temp_allocator))
+	cpu.state.cycles = ee_cycles
+	iop.sif.ee_buf = EE_DEST
+	call(b, sm, 32, b + dmat, 1, b + h, 3)
+	pkt := iop.sif.replies[len(iop.sif.replies) - 1].due
+	check(pkt == 1_000_000 && s.dma_cb[0].due == pkt && iop.iop_wake_ee == pkt, "sifman 32: a callback for a transfer to ee_buf is due no earlier than its packet")
+	iop.iop_tick(pkt - 1)
+	check(word(b, d, 1) == 7 && s.n_dma_cb == 1, "sifman 32: not run before its packet is due")
+	iop.iop_tick(pkt)
+	check(word(b, d, 1) == 3 && s.n_dma_cb == 0, "sifman 32: run once its packet is due")
+	iop.sif_drop_replies()
+	iop.sif.ee_buf = 0
+
 	// One that sets itself again, the IOP idle: it runs once per due, and
 	// the next due is later, so the EE's time moves on between them.
 	call(b, sm, 32, b + dmat, 1, b + hr, 0)
