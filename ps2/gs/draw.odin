@@ -66,6 +66,11 @@ Ctx :: struct {
 	a, b, c, d, fix:         u32,
 	pabe, fba, colclamp:     bool,
 	on_display:              bool, // FRAME FBP is a shown buffer
+	// Whether pixel needs the stored frame pixel (DATE, FBMSK, a blend
+	// reading Cd or Ad, or an alpha fail keeping Ad) and the stored Z
+	// (GEQUAL or GREATER). Skipped reads are dead.
+	dst_read, z_read:        bool,
+	frow, zrow:              Row,
 	fogcol:                  [3]i32,
 	tex:                     Tex,
 }
@@ -177,6 +182,10 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 	c.colclamp = r[0x46] & 1 != 0
 	fc := r[0x3d]
 	c.fogcol = {i32(fc & 0xff), i32((fc >> 8) & 0xff), i32((fc >> 16) & 0xff)}
+	blend_dst := c.a == 1 || c.b == 1 || c.c == 1 || c.d == 1
+	c.dst_read = c.date || c.fbmsk != 0 || (c.abe && blend_dst) || (c.ate && c.afail == 3)
+	c.z_read = c.zte && c.ztst >= 2
+	c.frow, c.zrow = row_init(c.fpsm), row_init(c.zpsm)
 
 	if c.tme {
 		t0 := r[0x06 + n]
@@ -565,7 +574,17 @@ pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fog
 	}
 
 	fb32 := c.fpsm == PSMCT32 || c.fpsm == PSMCT24 || c.fpsm == PSMZ32 || c.fpsm == PSMZ24
-	dst_raw := read_raw(c.fpsm, c.fbp, c.fbw, px, py)
+	// The frame pixel's index, taken once for the read and the write.
+	fr := &c.frow
+	fa: u32
+	if fr.ok {
+		row_seek(fr, c.fbp, c.fbw, py)
+		fa = row_addr(fr, px)
+	}
+	dst_raw: u32
+	if c.dst_read {
+		dst_raw = fr.ok ? row_read(fr, fa) : read_raw(c.fpsm, c.fbp, c.fbw, px, py)
+	}
 	if c.date {
 		bit := fb32 ? dst_raw & 0x80000000 != 0 : dst_raw & 0x8000 != 0
 		if bit != c.datm {return}
@@ -579,13 +598,23 @@ pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fog
 		case PSMZ16, PSMZ16S: zmax = 0xffff
 		}
 		z = min(z, zmax)
-		dz := read_raw(c.zpsm, c.zbp, c.fbw, px, py)
-		switch c.ztst {
-		case 2: if z < dz {return}
-		case 3: if z <= dz {return}
+		zr := &c.zrow
+		za: u32
+		if zr.ok {
+			row_seek(zr, c.zbp, c.fbw, py)
+			za = row_addr(zr, px)
+		}
+		if c.z_read {
+			dz := zr.ok ? row_read(zr, za) : read_raw(c.zpsm, c.zbp, c.fbw, px, py)
+			switch c.ztst {
+			case 2: if z < dz {return}
+			case 3: if z <= dz {return}
+			}
+		}
+		if write_z {
+			if zr.ok {row_write(zr, za, z)} else {write_raw(c.zpsm, c.zbp, c.fbw, px, py, z)}
 		}
 	}
-	if write_z && c.zte {write_raw(c.zpsm, c.zbp, c.fbw, px, py, z)}
 	if !write_fb {return}
 
 	dst: [4]i32
@@ -632,5 +661,6 @@ pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fog
 	if !fb32 {
 		msk = (msk >> 3) & 0x1f | (msk >> 6) & 0x3e0 | (msk >> 9) & 0x7c00 | (msk >> 16) & 0x8000
 	}
-	write_raw(c.fpsm, c.fbp, c.fbw, px, py, (out &~ msk) | (dst_raw & msk))
+	v := (out &~ msk) | (dst_raw & msk)
+	if fr.ok {row_write(fr, fa, v)} else {write_raw(c.fpsm, c.fbp, c.fbw, px, py, v)}
 }

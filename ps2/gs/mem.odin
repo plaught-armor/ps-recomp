@@ -156,6 +156,84 @@ addr4 :: #force_inline proc(bp, bw, x, y: u32) -> u32 #no_bounds_check {
 vram16 :: #force_inline proc() -> [^]u16 {return ([^]u16)(&vram[0])}
 vram8 :: #force_inline proc() -> [^]u8 {return ([^]u8)(&vram[0])}
 
+// One row of a frame or Z buffer in a 32-, 24- or 16-bit format: the parts
+// of addr32 and addr16 that depend only on y, so a pixel along the row
+// costs two table reads and a few adds. A Ctx owns its rows and sets them
+// up in decode_ctx (row_init) from its own PSM; bp and bw come from the
+// same Ctx, so `y` is the whole key: a context change is a new Ctx and
+// starts the rows empty. `ok` is false for the other formats, which take
+// read_raw and write_raw.
+@(private)
+Row :: struct {
+	ok, wide: bool, // wide: 32 or 24 bits, else 16
+	zx:       u32, // block xor: 24 for Z formats
+	mask:     u32, // bits a 32-bit word stores: 0xffffff for 24-bit formats
+	alt:      bool, // 16S block layout
+	y:        u32, // the row held, ROW_NONE before the first
+	base:     u32, // bp plus the block row, in blocks
+	blk, col: [^]u32, // block and column table rows of y
+}
+
+@(private)
+ROW_NONE :: max(u32)
+
+@(private)
+row_init :: proc(psm: u32) -> (r: Row) {
+	switch psm {
+	case PSMCT32, PSMZ32: r = {ok = true, wide = true, mask = 0xffffffff}
+	case PSMCT24, PSMZ24: r = {ok = true, wide = true, mask = 0xffffff}
+	case PSMCT16, PSMZ16: r = {ok = true}
+	case PSMCT16S, PSMZ16S: r = {ok = true, alt = true}
+	}
+	if is_z(psm) {r.zx = 24}
+	r.y = ROW_NONE
+	return
+}
+
+// Points `r` at row y. Only for an `ok` row.
+@(private)
+row_seek :: #force_inline proc(r: ^Row, bp, bw, y: u32) #no_bounds_check {
+	if r.y == y {return}
+	r.y = y
+	if r.wide {
+		r.base = bp + (y >> 5) * bw * 32
+		r.blk = &block32[(y >> 3) & 3][0]
+		r.col = &col32[y & 7][0]
+	} else {
+		r.base = bp + (y >> 6) * bw * 32
+		r.blk = r.alt ? &block16s[(y >> 3) & 7][0] : &block16[(y >> 3) & 7][0]
+		r.col = &col16[y & 7][0]
+	}
+}
+
+// Index of pixel x on the row held: the vram word for a wide row, as
+// addr32 gives it, else the vram16 halfword, as addr16 gives it.
+@(private)
+row_addr :: #force_inline proc(r: ^Row, x: u32) -> u32 #no_bounds_check {
+	if r.wide {
+		blk := r.base + (x >> 6) * 32 + (r.blk[(x >> 3) & 7] ~ r.zx)
+		return ((blk << 6) + r.col[x & 7]) & (VRAM_WORDS - 1)
+	}
+	blk := r.base + (x >> 6) * 32 + (r.blk[(x >> 4) & 3] ~ r.zx)
+	return ((blk << 7) + r.col[x & 15]) & (2 * VRAM_WORDS - 1)
+}
+
+// read_raw and write_raw at a row_addr index.
+@(private)
+row_read :: #force_inline proc(r: ^Row, a: u32) -> u32 #no_bounds_check {
+	return r.wide ? vram[a] & r.mask : u32(vram16()[a])
+}
+
+@(private)
+row_write :: #force_inline proc(r: ^Row, a, v: u32) #no_bounds_check {
+	if r.wide {
+		p := &vram[a]
+		p^ = (p^ &~ r.mask) | (v & r.mask)
+	} else {
+		vram16()[a] = u16(v)
+	}
+}
+
 // Stored value of a pixel: the full word for 32-bit formats, 24 bits for
 // 24-bit ones, the halfword for 16-bit ones and the index for 8/4-bit ones.
 // read_raw and write_raw are unchecked: the addr procs mask every index
