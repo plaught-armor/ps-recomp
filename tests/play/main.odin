@@ -23,7 +23,9 @@
 //   PS1 one that turns it on and loops is stalled with main RAM unchanged;
 //   PS2 ones that turn it on and count with nothing drawn, or sleep their
 //   only thread, are stalled with nothing drawn (the idle_share of every PS2
-//   row past 0.95 only for the one that sleeps). The looping PS1 disc run
+//   row past 0.95 only for the one that sleeps). Each disc whose display
+//   was on, and no fatal one, leaves a thumb.ppm (lit for the PS2 one that
+//   draws). The looping PS1 disc run
 //   again with a vblank count it cannot reach in COMPAT_WAIT is a hang, and
 //   once more to FRAMES stalled, each time in place. Three PS1 discs load a
 //   second executable no native code covers: LoadExec of it, over the boot
@@ -775,6 +777,13 @@ test_compat :: proc() {
 			log, err := os.read_entire_file(core.disc_path(ddir, .Compat_Log, context.temp_allocator), context.temp_allocator)
 			check(name, err == nil && len(log) > 0, fmt.tprintf("%s: the child's output is not in compat.log (%v)", f.file, err))
 			check(name, strings.contains(string(log), f.log), fmt.tprintf("%s: %q not in compat.log", f.file, f.log))
+			// The last vblank's picture, when the display was on, as the
+			// launcher's thumbnail.
+			thumb := core.thumb_load(core.disc_path(ddir, .Thumb, context.temp_allocator), context.temp_allocator)
+			check(name, (thumb != nil) == (f.result != "fatal" && row[.Shown] != "0"), fmt.tprintf("%s: thumb.ppm %v, shown %s", f.file, thumb != nil, row[.Shown]))
+			if f.file == "ps2_show.iso" {
+				check(name, thumb != nil && slice.any_of_proc(thumb, proc(b: u8) -> bool {return b != 0}), "ps2_show.iso: a black thumbnail")
+			}
 		}
 		if k == 0 {
 			first_when = row[.When]

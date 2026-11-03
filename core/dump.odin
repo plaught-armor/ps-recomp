@@ -151,11 +151,7 @@ dump_put :: proc(kind, ext: string, frame: u64, data: []u8) {
 
 // Write a w x h picture of RGB888 pixels, rows top first, as a PPM dump.
 dump_ppm :: proc(kind: string, frame: u64, w, h: int, rgb: []u8) {
-	assert(len(rgb) == w * h * 3)
-	buf := make([dynamic]u8, context.temp_allocator)
-	append(&buf, ..transmute([]u8)fmt.tprintf("P6\n%d %d\n255\n", w, h))
-	append(&buf, ..rgb)
-	dump_put(kind, "ppm", frame, buf[:])
+	dump_put(kind, "ppm", frame, ppm_encode(w, h, rgb))
 }
 
 @(private = "file")

@@ -471,6 +471,17 @@ dump_frame :: proc() {
 	}
 }
 
+// The picture this vblank shows as the disc's thumbnail (core.thumb_save),
+// when the display is on.
+@(private)
+thumb_save :: proc() {
+	if !gpu.display.enabled || gpu.display.w <= 0 || gpu.display.h <= 0 {
+		return
+	}
+	fw, fh := frame_size()
+	core.thumb_save(frame_pixels(), int(fw), int(fw), int(fh), .Xrgb)
+}
+
 // XRGB8888 pixels as tightly packed RGB888 bytes, in temp memory.
 frame_rgb :: proc(px: []u32) -> []u8 {
 	out := make([]u8, len(px) * 3, context.temp_allocator)
@@ -919,6 +930,7 @@ platform_frame :: proc() {
 	pause_wait()
 	core.compat_vblank(cpu.presents, gpu.display.enabled && gpu.display.w > 0 && gpu.display.h > 0, cpu.ram[:])
 	if host.quit || core.frames_done(cpu.presents) {
+		thumb_save()
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
 		core.compat_report()

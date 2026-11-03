@@ -50,6 +50,10 @@ SHOT_WARMUP :: 10 // vblanks the GS draws everything before a picture is read
 // SHOT and FRAMES.
 @(private)
 vblank: int
+// The GS read circuit's picture size at the last vblank (0 x 0 with the
+// display off), for thumb_save.
+@(private)
+shown: [2]int
 // PRESS=Start@600,Cross@900: scripted taps, held for PRESS_FRAMES, so a
 // headless run can get past the title screen. A ":n" suffix (Start@900:2)
 // presses on player n instead of player 1, a "+n" suffix (Left@900+120)
@@ -150,6 +154,7 @@ platform_init :: proc(title: cstring) -> bool {
 // counts when some went unlogged.
 @(private)
 quit :: proc(code: int) -> ! {
+	if code == 0 {thumb_save()}
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
 	vu.vu_stats_print()
 	cpu.unmapped_print()
@@ -181,6 +186,7 @@ vblank_frame :: proc() {
 	gs.skip_readout = core.headless && !readout_due()
 	gs.skip_wanted = core.headless && !draw_due()
 	w, h := gs.scanout()
+	shown = {w, h}
 	core.compat_vblank(u64(vblank), w > 0 && h > 0, mem.ram)
 	if w > 0 && h > 0 {
 		if !core.headless && !hw && !rerun {
@@ -210,12 +216,9 @@ vblank_frame :: proc() {
 			name := fmt.tprintf("shot_%d.ppm", vblank)
 			switch {
 			case w <= 0 || h <= 0: fmt.eprintfln("shot: vblank %d, display off, none written", vblank)
-			case hw:
-				px, sw, sh := gs.hw_screen()
-				write_ppm(name, px, sw, sw, sh)
-				fmt.eprintfln("shot: vblank %d", vblank)
 			case:
-				write_ppm(name, gs.screen[:], gs.DISP_W, w, h)
+				px, stride, pw, ph := screen_picture(w, h)
+				write_ppm(name, px, stride, pw, ph)
 				fmt.eprintfln("shot: vblank %d", vblank)
 			}
 		}
@@ -353,15 +356,32 @@ draw_due :: proc() -> bool {
 	return core.compat.on && core.frames > 0 && u64(vblank) + SHOT_WARMUP >= core.frames
 }
 
+// The picture on screen, w x h when drawn in software: its pixels (XBGR),
+// row stride, width and height.
+@(private)
+screen_picture :: proc(w, h: int) -> (px: []u32, stride, pw, ph: int) {
+	if hw {
+		px, pw, ph = gs.hw_screen()
+		return px, pw, pw, ph
+	}
+	return gs.screen[:], gs.DISP_W, w, h
+}
+
+// The picture on screen as the disc's thumbnail (core.thumb_save), when the
+// display was on at the last vblank and its picture was read: headless,
+// only shots and the COMPAT FRAMES vblank read it.
+@(private)
+thumb_save :: proc() {
+	if shown.x <= 0 || shown.y <= 0 || (core.headless && !readout_due()) {return}
+	px, stride, w, h := screen_picture(shown.x, shown.y)
+	core.thumb_save(px, stride, w, h, .Xbgr)
+}
+
 // The non-black pixels of the picture on screen, w x h when drawn in
 // software.
 @(private)
 lit_pixels :: proc(w, h: int) -> int {
-	px, pw, ph, stride := gs.screen[:], w, h, gs.DISP_W
-	if hw {
-		px, pw, ph = gs.hw_screen()
-		stride = pw
-	}
+	px, stride, pw, ph := screen_picture(w, h)
 	n := 0
 	for y in 0 ..< ph {
 		for c in px[y * stride:][:pw] {

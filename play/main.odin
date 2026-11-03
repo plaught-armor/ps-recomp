@@ -104,6 +104,9 @@ play :: proc(image: string) -> int {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
+	// The picture a run ends on (a quit, a COMPAT run's last vblank), for
+	// the launcher.
+	core.thumb_path = core.disc_path(dir, .Thumb)
 	cards := core.disc_path(dir, .Cards)
 	if err := os.make_directory_all(cards); err != nil && !(err == .Exist && os.is_dir(cards)) {
 		fmt.eprintln("play: cannot make", cards, err)
