@@ -29,6 +29,13 @@ AUDIO_LATENCY_MAX :: 250
 // about 9 cents of pitch.
 AUDIO_RATE_MAX :: 0.005
 
+// Whether the queue can follow sound mixed `ratio` times as fast as it
+// plays (a display clock over the console's): within AUDIO_RATE_MAX, with
+// 0.1% left for the proportional correction.
+audio_rate_fits :: proc(ratio: f64) -> bool {
+	return abs(ratio - 1) <= AUDIO_RATE_MAX - 0.001
+}
+
 // Slowest emulated speed audio_push stretches for.
 AUDIO_MIN_SPEED :: 0.25
 

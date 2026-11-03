@@ -21,9 +21,121 @@ preload_child: bool
 // ---------------------------------------------------------------- timing
 
 CPU_HZ :: 33_868_800
-FRAME_CYCLES :: CPU_HZ / 60
-SCANLINES :: 263
-LINE_CYCLES :: FRAME_CYCLES / SCANLINES
+
+// A length in CPU cycles, num / den: whole for most, a fraction for a
+// scanline.
+Period :: struct {
+	num, den: u64,
+}
+
+// A scanline. The GPU's video clock is 53.693182 MHz (15 × 315/88 MHz) on
+// NTSC and 53.203425 MHz on PAL, and a line is 3413 or 3406 of its cycles
+// (psx-spx): NTSC 3413 × CPU_HZ × 88 / (15 × 315_000_000) and PAL
+// 3406 × CPU_HZ / 53_203_425 cycles, exactly.
+LINE_NTSC :: Period{33_638_528, 15_625}
+LINE_PAL :: Period{1_538_095_104, 709_379}
+
+// A progressive field is 263 lines on NTSC and 314 on PAL, a vblank every
+// 566203.7 cycles (59.817 Hz) or 680823.5 (49.747 Hz). Interlaced fields
+// alternate 263 and 262 lines (NTSC) or 313 and 312 (PAL), 59.931 Hz or
+// 49.986 Hz on average.
+// The shortest NTSC progressive field in whole cycles.
+NTSC_FIELD_CYCLES :: LINE_NTSC.num * 263 / LINE_NTSC.den
+
+// The video timing the vblanks run on.
+Video :: struct {
+	// The line of the mode set (GP1(08) bit 3, PAL), timer 1's hblank.
+	line:    Period,
+	// Fields are whole cycles: the fraction of a cycle left over, in
+	// 1 / line.den cycles, goes to the next one, so vblanks keep the exact
+	// rate with no drift.
+	rem:     u64,
+	// The field running now, in cycles, and the one that ended at the last
+	// vblank.
+	field:   u64,
+	last:    u64,
+	// Cycles of every field ended so far: the console time of the last
+	// vblank, which the host paces on.
+	elapsed: u64,
+}
+
+// NTSC until events_init, so a counter on hblank has a line before then.
+video := Video{line = LINE_NTSC}
+
+// The length of the next field in cycles, from the line and the field's
+// line count.
+@(private)
+video_field :: proc(pal, interlace, odd: bool) -> u64 {
+	lines: u64 = pal ? 314 : 263
+	if interlace {
+		// The odd field is the short one.
+		lines = (pal ? 313 : 263) - (odd ? 1 : 0)
+	}
+	units := video.rem + lines * video.line.num
+	video.rem = units % video.line.den
+	return units / video.line.den
+}
+
+// A mode's average field rate in Hz: progressive fields are all one length,
+// interlaced ones alternate a line apart.
+field_hz :: proc(pal, interlace: bool) -> f64 {
+	line := pal ? LINE_PAL : LINE_NTSC
+	lines: f64 = pal ? 314 : 263
+	if interlace {
+		lines = pal ? 312.5 : 262.5
+	}
+	return f64(CPU_HZ) * f64(line.den) / (lines * f64(line.num))
+}
+
+// Display refreshes per field, up to shows_max, when a display at
+// display_hz can clock the mode's fields: the sound queue absorbs the two
+// clocks' difference (core.audio_rate_fits). 0 when no count fits: PAL
+// progressive at 50 Hz is 0.5% off, past what the queue follows.
+vsync_shows :: proc(display_hz: f64, pal, interlace: bool, shows_max: int) -> int {
+	field := field_hz(pal, interlace)
+	for n in 1 ..= shows_max {
+		if core.audio_rate_fits(display_hz / (f64(n) * field)) {
+			return n
+		}
+	}
+	return 0
+}
+
+// At a vblank: count the field that ended and return the next one's length
+// in cycles, from the video mode GP1(08) holds now: pal (bit 3), interlace
+// (bit 5) and whether the next field is odd. A switch between NTSC and PAL
+// takes effect here, and restarts a counter clocked by hblank on the new
+// line from the count it shows: the part line it was into is lost, up to
+// one line per switch.
+video_vblank :: proc(pal, interlace, odd: bool) -> u64 {
+	video.elapsed += video.field
+	video.last = video.field
+	line := pal ? LINE_PAL : LINE_NTSC
+	if line != video.line {
+		// The remainder is in the old line's units.
+		video.rem = video.rem * line.den / video.line.den
+		video.line = line
+		for n in 0 ..< len(timers) {
+			t := &timers[n]
+			if t.step == timer_rate(n) {
+				continue
+			}
+			// Not before base: a write after the vblank was due, before
+			// run_events reached it.
+			at := max(event_due, t.base)
+			t.value = timer_value_at(n, at)
+			t.base, t.phase, t.step = at, 0, timer_rate(n)
+			timer_reschedule(n, at)
+		}
+	}
+	video.field = video_field(pal, interlace, odd)
+	return video.field
+}
+
+// Console cycles in nanoseconds.
+cycles_ns :: proc(cycles: u64) -> u64 {
+	return u64(u128(cycles) * 1_000_000_000 / CPU_HZ)
+}
 
 Event :: enum {
 	VBlank,
@@ -51,7 +163,7 @@ clock_mul: u64 = 1
 clock_set :: proc(mul: u64) {
 	for n in 0 ..< len(timers) {
 		timers[n].value = timer_value(n)
-		timers[n].base = cpu.state.cycles
+		timers[n].base, timers[n].phase = cpu.state.cycles, 0
 	}
 	clock_mul = mul
 	for n in 0 ..< len(timers) {
@@ -125,7 +237,11 @@ events_init :: proc() {
 	if v, ok := strconv.parse_u64(core.env("CLOCK")); ok && v >= 1 {
 		clock_mul = v
 	}
-	schedule(.VBlank, FRAME_CYCLES)
+	// NTSC progressive until the game sets a mode. elapsed stays: the host
+	// paces on it, and a restart must not move the vblanks it has due.
+	video = Video{line = LINE_NTSC, elapsed = video.elapsed}
+	video.field = video_field(false, false, false)
+	schedule(.VBlank, video.field)
 }
 
 // ---------------------------------------------------------------- interrupts
@@ -177,31 +293,34 @@ irq_check :: proc() {
 Timer :: struct {
 	mode:   u32,
 	target: u32,
-	// Counter value at `base` cycles, and cycles per tick.
+	// Counter value at `base` cycles plus phase / step.den of a cycle, and
+	// cycles per tick. A tick of the hblank clock is a line, a fraction of
+	// cycles: its ticks fall between cycles, and phase keeps where.
 	value:  u32,
 	base:   u64,
-	div:    u64,
+	phase:  u64,
+	step:   Period,
 }
 
 @(private)
 timers: [3]Timer
 
 @(private)
-timer_rate :: proc(n: int) -> u64 {
+timer_rate :: proc(n: int) -> Period {
 	src := (timers[n].mode >> 8) & 3
 	switch n {
 	case 0:
-		return 1 // dot clock approximated by system clock
+		return {1, 1} // dot clock approximated by system clock
 	case 1:
 		if src & 1 != 0 {
-			return LINE_CYCLES
+			return video.line
 		}
 	case 2:
 		if src >= 2 {
-			return 8
+			return {8, 1}
 		}
 	}
-	return 1
+	return {1, 1}
 }
 
 @(private)
@@ -209,11 +328,30 @@ timer_value :: proc(n: int) -> u32 {
 	return timer_value_at(n, cpu.state.cycles)
 }
 
+// Whole ticks of counter n from its base to cycle `at`.
+@(private)
+timer_ticks_at :: proc(n: int, at: u64) -> u64 {
+	t := &timers[n]
+	units := u128(at - t.base) * u128(t.step.den)
+	if units < u128(t.phase) {
+		return 0
+	}
+	return u64((units - u128(t.phase)) / u128(t.step.num * clock_mul))
+}
+
+// The units (1 / step.den cycles) from counter n's base cycle to its
+// tick k.
+@(private)
+timer_tick_units :: proc(n: int, k: u64) -> u128 {
+	t := &timers[n]
+	return u128(t.phase) + u128(k) * u128(t.step.num * clock_mul)
+}
+
 // The counter value at cycle `at`, not before base.
 @(private)
 timer_value_at :: proc(n: int, at: u64) -> u32 {
 	t := &timers[n]
-	ticks := (at - t.base) / (t.div * clock_mul)
+	ticks := timer_ticks_at(n, at)
 	v := u64(t.value) + ticks
 	if timer_resets_at_target(n) {
 		v %= u64(t.target) + 1
@@ -235,7 +373,6 @@ timer_reschedule :: proc(n: int, now: u64) {
 	// Due on a tick boundary counted from base: the part of a tick already
 	// run since the last boundary counts, or a /8 counter would lose it at
 	// every reschedule.
-	step := t.div * clock_mul
 	cur := u64(timer_value_at(n, now))
 	// The counter shows target for a tick, then goes on to 0 (reset at
 	// target: a period of target+1) or counts on through 0xffff. Each IRQ
@@ -255,7 +392,10 @@ timer_reschedule :: proc(n: int, now: u64) {
 	if ticks == max(u64) {
 		return
 	}
-	events[e] = now - (now - t.base) % step + ticks * step
+	// The first whole cycle at or past that tick.
+	units := timer_tick_units(n, timer_ticks_at(n, now) + ticks)
+	den := u128(t.step.den)
+	events[e] = t.base + u64((units + den - 1) / den)
 	cpu.next_event = min(cpu.next_event, events[e])
 }
 
@@ -279,7 +419,11 @@ timer_fire :: proc(n: int) {
 	// long between event checks.
 	t := &timers[n]
 	t.value = timer_value_at(n, event_due)
-	t.base = event_due
+	// On the tick boundary itself, which for the hblank clock falls between
+	// cycles: a base at event_due would gain that fraction at every fire.
+	units := timer_tick_units(n, timer_ticks_at(n, event_due))
+	t.base += u64(units / u128(t.step.den))
+	t.phase = u64(units % u128(t.step.den))
 	if t.target != 0 && t.value == t.target {
 		t.mode |= 0x800
 	}
@@ -299,11 +443,9 @@ timer0_event :: proc() {timer_fire(0)}
 timer1_event :: proc() {timer_fire(1)}
 timer2_event :: proc() {timer_fire(2)}
 
-timers_vblank :: proc() {}
-
 timers_init :: proc() {
 	for &t in timers {
-		t = {div = 1}
+		t = {step = {1, 1}}
 	}
 }
 
@@ -329,12 +471,12 @@ timer_write :: proc(n: int, reg, v: u32) {
 	switch reg {
 	case 0:
 		t.value = v & 0xffff
-		t.base = cpu.state.cycles
+		t.base, t.phase = cpu.state.cycles, 0
 	case 4:
 		t.mode = (v & 0x3ff) | 0x400
 		t.value = 0
-		t.base = cpu.state.cycles
-		t.div = timer_rate(n)
+		t.base, t.phase = cpu.state.cycles, 0
+		t.step = timer_rate(n)
 	case 8:
 		t.target = v & 0xffff
 	}

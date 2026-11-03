@@ -21,8 +21,6 @@ import spu "../spu"
 
 WINDOW_W :: 640
 WINDOW_H :: 480
-// NTSC field rate.
-VBLANK_NS :: 1_000_000_000 / 60
 
 PAD_SELECT :: 0x0100
 PAD_START :: 0x0800
@@ -67,7 +65,8 @@ host: struct {
 	// last one's, -1 when none.
 	frame_mark:  int,
 	last_mark:   int,
-	// Pacing origin: emulated vblank N is due at start + N * VBLANK_NS / speed.
+	// Pacing origin: an emulated vblank is due at start plus the console
+	// time of the fields before it (io.video.elapsed), over speed.
 	start:       time.Tick,
 	// Emulated time per real time; 1 is the console's own speed.
 	speed:       f64,
@@ -93,6 +92,7 @@ host: struct {
 	// When the current fast-forward began, for the perf trace.
 	fast_start:  time.Tick,
 	fast_vblank: u64,
+	fast_cycles: u64,
 	quit:        bool,
 	// Display area (x, y, w, h) at the previous present, to tell a repeated
 	// game frame from a new one.
@@ -352,10 +352,11 @@ poll_events :: proc() {
 	}
 }
 
-// Real nanoseconds from host.start until emulated vblank n is due.
+// Real nanoseconds from host.start until the emulated vblank `cycles`
+// console cycles from boot is due.
 @(private)
-vblank_due_ns :: proc(n: u64) -> i64 {
-	return i64(f64(n) * VBLANK_NS / host.speed)
+vblank_due_ns :: proc(cycles: u64) -> i64 {
+	return i64(f64(io.cycles_ns(cycles)) / host.speed)
 }
 
 // Run emulated time at `speed` times real time from the next vblank on.
@@ -371,18 +372,12 @@ set_speed :: proc(speed: f64) {
 	if .Perf in core.trace.active {
 		core.tracef(.Perf, "speed %v -> %v", host.speed, speed)
 	}
-	last := cpu.presents - min(cpu.presents, 1)
+	last := io.video.elapsed - io.video.last
 	last_due := time.tick_add(host.start, time.Duration(vblank_due_ns(last)))
 	host.speed = speed
 	host.start = time.tick_add(last_due, -time.Duration(vblank_due_ns(last)))
 }
 
-// Refresh rates SDL reports for a display that runs at the console's own
-// field rate (59.94 Hz NTSC timings round down).
-@(private)
-VSYNC_HZ_MIN :: 59
-@(private)
-VSYNC_HZ_MAX :: 60
 // Most display refreshes per emulated vblank (240 Hz).
 @(private)
 VSYNC_SHOWS_MAX :: 4
@@ -392,9 +387,12 @@ VSYNC_SHOWS_MAX :: 4
 // console speed: every emulated vblank then shows for exactly that many
 // display refreshes, with no tearing and no dropped or doubled frame from
 // the two clocks drifting apart. The display clock then sets emulated time;
-// core.audio_push absorbs its small difference from 60 Hz. Any other refresh
+// core.audio_push absorbs its small difference from the console's field
+// rate, and io.vsync_shows refuses a display too far off for it (PAL
+// progressive, 49.747 Hz, at 50 Hz). Any other refresh
 // rate (144 Hz: 2.4 refreshes a vblank) or speed, or no pacing at all (`paced`
-// false), keeps vsync off.
+// false), keeps vsync off. SDL reports whole Hz and rounds 59.94 Hz timings
+// down, so a rate ending in 9 is taken as the 1000/1001 one above it.
 // SDL_RenderSetVSync came in SDL 2.0.18, and the SDL2.dll that ships with
 // Odin (the one Windows builds use) is 2.0.16, so it is looked up when the
 // renderer is made; without it vsync stays off.
@@ -409,11 +407,12 @@ vsync_update :: proc(paced: bool) {
 	mode: sdl.DisplayMode
 	shows := 0
 	if paced && host.speed == 1 && sdl.GetWindowDisplayMode(host.window, &mode) == 0 {
-		for n in 1 ..= VSYNC_SHOWS_MAX {
-			if mode.refresh_rate >= VSYNC_HZ_MIN * i32(n) && mode.refresh_rate <= VSYNC_HZ_MAX * i32(n) {
-				shows = n
-			}
+		hz := f64(mode.refresh_rate)
+		if mode.refresh_rate % 10 == 9 {
+			hz = f64(mode.refresh_rate + 1) * 1000 / 1001
 		}
+		pal := io.video.line == io.LINE_PAL
+		shows = io.vsync_shows(hz, pal, gpu.gp.mode & 0x20 != 0, VSYNC_SHOWS_MAX)
 	}
 	want := shows > 0
 	host.vsync_shows = max(shows, 1)
@@ -433,7 +432,7 @@ vsync_update :: proc(paced: bool) {
 // Make the current vblank due now.
 @(private)
 pacing_rebase :: proc() {
-	host.start = time.tick_add(time.tick_now(), -time.Duration(vblank_due_ns(cpu.presents)))
+	host.start = time.tick_add(time.tick_now(), -time.Duration(vblank_due_ns(io.video.elapsed)))
 }
 
 // A positive present count from the setting `name`, or `def` when it is
@@ -868,6 +867,7 @@ fast_forward :: proc() -> bool {
 			core.tracef(.Perf, "fast-forward on")
 			host.fast_start = time.tick_now()
 			host.fast_vblank = cpu.presents
+			host.fast_cycles = io.video.elapsed
 		}
 		host.fast = true
 		return true
@@ -876,7 +876,7 @@ fast_forward :: proc() -> bool {
 		if .Perf in core.trace.active {
 			ms := time.duration_milliseconds(time.tick_since(host.fast_start))
 			n := cpu.presents - host.fast_vblank
-			core.tracef(.Perf, "fast-forward off: %d vblanks in %.1f ms (%.1f ms at console speed), audio queued %.1f ms", n, ms, f64(n) * VBLANK_NS / 1e6, core.audio_queued_ms())
+			core.tracef(.Perf, "fast-forward off: %d vblanks in %.1f ms (%.1f ms at console speed), audio queued %.1f ms", n, ms, f64(io.cycles_ns(io.video.elapsed - host.fast_cycles)) / 1e6, core.audio_queued_ms())
 		}
 		host.fast = false
 		pacing_rebase()
@@ -903,7 +903,7 @@ platform_frame :: proc() {
 	// Before the pause wait, which is not work.
 	if .Perf in core.trace.active {
 		work := time.tick_since(host.work_mark)
-		if host.work_mark != {} && work > VBLANK_NS && !host.vsync {
+		if host.work_mark != {} && work > time.Duration(io.cycles_ns(io.video.last)) && !host.vsync {
 			core.tracef(.Perf, "late vblank: %.1f ms of work", time.duration_milliseconds(work))
 		}
 	}
@@ -930,7 +930,7 @@ platform_frame :: proc() {
 		pacing_rebase()
 		return
 	}
-	due := vblank_due_ns(cpu.presents)
+	due := vblank_due_ns(io.video.elapsed)
 	for {
 		remaining := due - i64(time.tick_since(host.start))
 		if remaining <= 0 {
@@ -940,7 +940,7 @@ platform_frame :: proc() {
 			time.sleep(time.Duration(remaining - 500_000))
 		}
 	}
-	if i64(time.tick_since(host.start)) > vblank_due_ns(cpu.presents + 6) {
+	if i64(time.tick_since(host.start)) > vblank_due_ns(io.video.elapsed + 6 * io.video.field) {
 		// Fell behind (slow frame or debugger stop): resync instead of racing.
 		pacing_rebase()
 	}

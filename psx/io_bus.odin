@@ -125,11 +125,13 @@ event_handler_table := [io.Event]proc() {
 
 @(private)
 vblank_event :: proc() {
-	io.schedule(.VBlank, io.FRAME_CYCLES)
+	// The next field's parity first, then its length from the mode GP1(08)
+	// set: PAL (bit 3), interlace (bit 5). From the cycle the vblank was due,
+	// so lateness never adds up and vblanks keep the exact rate.
+	gpu.gpu_vblank()
+	io.schedule_period(.VBlank, io.video_vblank(gpu.gp.mode & 0x08 != 0, gpu.gp.mode & 0x20 != 0, gpu.gp.odd))
 	io.irq_raise(.VBlank)
 	bios.bios_pad_vblank()
-	gpu.gpu_vblank()
-	io.timers_vblank()
 	host.platform_frame()
 }
 

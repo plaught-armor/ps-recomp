@@ -365,7 +365,7 @@ main :: proc() {
 	check("TestEvent after WaitEvent", test(ev), 0)
 	io.events_init()
 	io.event_handlers[.VBlank] = proc() {
-		io.schedule_period(.VBlank, io.FRAME_CYCLES)
+		io.schedule_period(.VBlank, io.NTSC_FIELD_CYCLES)
 		deliver_in -= 1
 		if deliver_in == 0 {
 			bios.deliver_event(0xf4000001, 0x0004)
@@ -376,7 +376,7 @@ main :: proc() {
 	deliver_in = 3
 	start := cpu.state.cycles
 	check("WaitEvent until delivered", b(0x0a, ev), 1)
-	if deliver_in != 0 || cpu.state.cycles - start < 3 * io.FRAME_CYCLES {
+	if deliver_in != 0 || cpu.state.cycles - start < 3 * io.NTSC_FIELD_CYCLES {
 		fail("WaitEvent returned after %d cycles, %d vblanks early", cpu.state.cycles - start, deliver_in)
 	}
 	check("TestEvent after the wait", test(ev), 0)
