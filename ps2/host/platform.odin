@@ -128,6 +128,8 @@ platform_init :: proc(title: cstring) -> bool {
 		for i in 0 ..< forced_players {iop.pads[i].connected = true}
 	}
 	if !net_init() {return false}
+	// Snapshot and rollback runs draw every frame (gs.replays).
+	gs.replays = snaptest != {} || rbtest[1] > 0 || net_on
 	gs.state.write = gs.write
 	gs.state.transfer = gs.transfer
 	kernel.vblank_hook = vblank_frame

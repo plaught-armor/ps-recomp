@@ -250,7 +250,7 @@ xfer_start :: proc(dir: u32) {
 			out    = dir & 3 == 1,
 		}
 		if xfer.w == 0 || xfer.h == 0 {xfer.active = false}
-		if xfer.active && xfer.out {shown_read(xfer.bp)}
+		if xfer.active && xfer.out {shown_read(xfer.bp, xfer.bw, xfer.psm, xfer.y0, xfer.h)}
 		// The pixels are those local memory holds once the commands before
 		// TRXDIR have run.
 		if xfer.active && xfer.out && hw_on {hw_download()}
@@ -260,7 +260,7 @@ xfer_start :: proc(dir: u32) {
 		sx, sy := u32(pos) & 0x7ff, u32(pos >> 16) & 0x7ff
 		dx, dy := u32(pos >> 32) & 0x7ff, u32(pos >> 48) & 0x7ff
 		w, h := u32(reg) & 0xfff, u32(reg >> 32) & 0xfff
-		shown_read(sbp)
+		shown_read(sbp, sbw, spsm, sy, h)
 		if hw_on {
 			hw_copy(sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h)
 			return
@@ -500,6 +500,8 @@ clut_load :: proc(tex0: u64) #no_bounds_check {
 	base := csa * 16
 	tc := state.regs[0x1c] // TEXCLUT: CBW, COU, COV
 	cbw, cou, cov := u32(tc) & 0x3f, u32(tc >> 6) & 0x3f, u32(tc >> 12) & 0x3ff
+	// CSM2 reads one row of a cbw-wide buffer; CSM1 at most 4 blocks.
+	if csm2 {shown_read(cbp, cbw, cpsm, cov, 1)} else {shown_read_blocks(cbp, cbp + 4)}
 	if hw_on {
 		hw_clut(cpsm, cbp, cbw, cou, cov, csm2, n, base)
 		return

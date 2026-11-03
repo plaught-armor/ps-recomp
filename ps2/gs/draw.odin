@@ -211,10 +211,12 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 			k        = i32(u32(t1 >> 32) << 20) >> 20,
 		}
 		c.tex.mtbp[0], c.tex.mtbw[0] = c.tex.tbp, c.tex.tbw
-		shown_read(c.tex.tbp)
 		for i in u32(1) ..= 6 {
 			m := mip[(i - 1) / 3] >> (((i - 1) % 3) * 20)
 			c.tex.mtbp[i], c.tex.mtbw[i] = u32(m) & 0x3fff, u32(m >> 14) & 0x3f
+		}
+		for i in u32(0) ..= c.tex.mxl {
+			shown_read(c.tex.mtbp[i], c.tex.mtbw[i], c.tex.psm, 0, c.tex.h >> i)
 		}
 	}
 	return

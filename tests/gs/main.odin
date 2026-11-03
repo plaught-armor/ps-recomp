@@ -1,12 +1,15 @@
 // Headless draw skip: with a flipping display, a draw into a buffer the
 // display has shown is skipped and a draw into any other buffer runs; a
 // textured draw whose TEX0 TBP0 lies in a shown buffer latches the skip off,
-// so later draws into shown buffers run; a held display skips nothing; and
-// display_reset clears the set.
+// so later draws into shown buffers run, and so does a local copy whose
+// rectangle reaches a shown buffer from base 0; a held display skips
+// nothing; display_reset clears the latch and a snapshot load does not; and
+// nothing is skipped while replays is set.
 package main
 
 import "core:fmt"
 import "core:os"
+import "ps:core"
 import "ps:ps2/gs"
 import "ps:ps2/mem"
 
@@ -52,6 +55,24 @@ sprite :: proc(p: u64, col: u64, tbp := -1) {
 	gs.gs_write(0x05, 16 << 4 | (16 << 4) << 16)
 }
 
+// Local copy of 8x8 pixels at row sy of the 64-wide PSMCT32 buffer at
+// block 0 to page C.
+@(private = "file")
+copy_rows :: proc(sy: u64) {
+	gs.gs_write(0x50, 0 | 1 << 16 | (C * 32) << 32 | 1 << 48) // BITBLTBUF: SBP 0, DBP C
+	gs.gs_write(0x51, sy << 16) // TRXPOS: SSAY
+	gs.gs_write(0x52, 8 | 8 << 32) // TRXREG: 8x8
+	gs.gs_write(0x53, 2) // TRXDIR: local copy
+}
+
+// Show A then B (a flip) after a display reset.
+@(private = "file")
+flip :: proc() {
+	gs.display_reset()
+	vblank(A)
+	vblank(B)
+}
+
 @(private = "file")
 px :: proc(p: u32) -> u32 {return gs.read_raw(0, p * 32, 1, 4, 4)}
 
@@ -85,6 +106,28 @@ main :: proc() {
 	vblank(A)
 	sprite(A, 0x77)
 	if px(A) != 0x77 {fail("draw skipped with skip_wanted off: %x", px(A))}
+	gs.skip_wanted = true
+
+	// Rows 0..7 of base 0 (page 0) miss A; rows from A's first row reach it.
+	flip()
+	copy_rows(0)
+	sprite(A, 0x88)
+	if px(A) != 0x77 {fail("a copy outside the shown buffers latched: A %x", px(A))}
+	copy_rows(A * 32) // page A starts at row A * 32 of a 1-page-wide buffer
+	sprite(A, 0x99)
+	if px(A) != 0x99 {fail("a base-0 copy reaching shown buffer A did not latch: A %x", px(A))}
+
+	gs.gs_snap()
+	for h in core.snap_hooks {h.load(0)}
+	vblank(A)
+	vblank(B)
+	sprite(B, 0xaa)
+	if px(B) != 0xaa {fail("a snapshot load cleared the latch: B %x", px(B))}
+
+	gs.replays = true
+	flip()
+	sprite(A, 0xbb)
+	if px(A) != 0xbb {fail("draw skipped with replays set: %x", px(A))}
 
 	if failed > 0 {os.exit(1)}
 	fmt.println("ok gs")

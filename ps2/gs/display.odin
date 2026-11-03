@@ -16,6 +16,10 @@ skip_readout: bool
 // display has shown, while the game flips, and while no draw or transfer has
 // read a shown buffer back; see track_display.
 skip_wanted: bool
+// Set by the host when snapshots or rollback are in use (SNAPTEST, RBTEST,
+// netplay): no draw is skipped, since the shown set and the feedback latch
+// are not in the snapshot and a replay must draw what the first run drew.
+replays: bool
 @(private)
 disp_logged: u64
 
@@ -25,7 +29,7 @@ disp_logged: u64
 // picture is made from (a texture, an offscreen buffer) and always runs.
 @(private)
 Shown :: struct {
-	fbp, fbw, psm, h: u32, // fbp in blocks
+	fbp, fbw, psm, h, dby: u32, // fbp in blocks; h and dby in rows
 }
 @(private)
 SHOWN_MAX :: 4
@@ -51,9 +55,16 @@ feedback: bool
 // Ctx.on_display; draw checks both).
 @(private)
 skip_on: bool
+// Whether the skip has been reported turning off and on, by skip_on: only
+// the first of each is logged.
+@(private)
+skip_logged: [2]bool
 
-// Clear the shown buffers and the feedback latch: CSR RESET and snapshot
-// loads.
+// Clear the shown buffers and the feedback latch: CSR RESET only. A fifth
+// base or a width, format or height change resets the shown set in
+// track_display but keeps the latch, on purpose: a buffer once read back
+// may be read again, so keeping the skip off is the safe side. A snapshot
+// load keeps both (snapshots turn the skip off; see replays).
 display_reset :: proc() {
 	n_shown, feedback, skip_on = 0, false, false
 	last_fbp = {max(u32), max(u32)}
@@ -77,6 +88,7 @@ track_display :: proc(pmode: u64) {
 			fbw = u32(dispfb >> 9) & 0x3f,
 			psm = u32(dispfb >> 15) & 0x1f,
 			h   = (u32(display >> 44) & 0x7ff + 1) / (u32(display >> 27) & 3 + 1),
+			dby = u32(dispfb >> 43) & 0x7ff,
 		}
 		if b.fbp != last_fbp[circ] {
 			flipped = flipped || last_fbp[circ] != max(u32)
@@ -94,31 +106,54 @@ track_display :: proc(pmode: u64) {
 		ctx_gen += 1
 	}
 	since_flip = flipped ? 0 : min(since_flip + 1, FLIP_WINDOW + 1)
-	on := skip_wanted && since_flip <= FLIP_WINDOW && !feedback
-	if on != skip_on && skip_wanted {
-		fmt.eprintfln("gs: headless skip of shown-buffer draws %s (%d shown)", on ? "on" : "off", n_shown)
+	on := skip_wanted && !replays && since_flip <= FLIP_WINDOW && !feedback
+	if on != skip_on && skip_wanted && !skip_logged[int(on)] {
+		skip_logged[int(on)] = true
+		fmt.eprintfln("gs: headless skip of shown-buffer draws %s (%d shown); later toggles not logged", on ? "on" : "off", n_shown)
 	}
 	skip_on = on
 }
 
-// Whether block address bp lies in a shown buffer.
+// The blocks [lo, hi) holding rows y ..< y+h of a buffer at block bp, bw
+// 64-pixel units wide, in format psm: whole rows of pages, so a superset.
 @(private)
-in_shown :: proc(bp: u32) -> bool {
-	for e in shown[:n_shown] {
-		rows: u32 = psm_bits(e.psm) == 16 ? 64 : 32 // a page's height
-		if bp >= e.fbp && bp < e.fbp + e.fbw * ((e.h + rows - 1) / rows) * 32 {return true}
+rows_span :: proc(bp, bw, psm, y, h: u32) -> (lo, hi: u32) {
+	pw, ph: u32 = 64, 32 // a page's size in pixels: 32-bit, and the H formats
+	if psm != PSMT8H && psm != PSMT4HL && psm != PSMT4HH {
+		switch psm_bits(psm) {
+		case 16: ph = 64
+		case 8: pw, ph = 128, 64
+		case 4: pw, ph = 128, 128
+		}
 	}
-	return false
+	y0, y1 := y, y + max(h, 1)
+	if y1 > 2048 {y0, y1 = 0, 2048} // wraps: take every row
+	per_row := max(bw * 64 / pw, 1) * 32 // blocks
+	return bp + y0 / ph * per_row, bp + (y1 + ph - 1) / ph * per_row
 }
 
-// A draw or transfer reads block address bp: if that is a shown buffer,
-// stop skipping until the display resets.
+// A draw or transfer reads rows y ..< y+h of the buffer at block bp: if any
+// of it lies in a shown buffer, stop skipping until the display resets.
 @(private)
-shown_read :: proc(bp: u32) {
-	if feedback || !in_shown(bp) {return}
-	feedback, skip_on = true, false
-	if skip_wanted {
-		fmt.eprintfln("gs: shown buffer at block %x read back; headless draw skip off until the display resets", bp)
+shown_read :: proc(bp, bw, psm, y, h: u32) {
+	if feedback {return}
+	lo, hi := rows_span(bp, bw, psm, y, h)
+	shown_read_blocks(lo, hi)
+}
+
+// A read of blocks [lo, hi): if any lies in a shown buffer, latch.
+@(private)
+shown_read_blocks :: proc(lo, hi: u32) {
+	if feedback {return}
+	for e in shown[:n_shown] {
+		elo, ehi := rows_span(e.fbp, e.fbw, e.psm, e.dby, e.h)
+		if lo < ehi && elo < hi {
+			feedback, skip_on = true, false
+			if skip_wanted {
+				fmt.eprintfln("gs: shown buffer at block %x read back from block %x; headless draw skip off until the display resets", e.fbp, lo)
+			}
+			return
+		}
 	}
 }
 
