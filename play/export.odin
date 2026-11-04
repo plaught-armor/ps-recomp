@@ -307,6 +307,7 @@ main :: proc() {
 			disc = l.image,
 			title = TITLE,
 			learned = learned(l, .Learned_Iop, .Learned_Iop, .Learned_Iop_Key),
+			learned_ee = learned(l, .Learned_Ee, .Learned_Ee, .Learned_Ee_Key),
 			cards = cards(l),
 			hooks = hooks,
 		},

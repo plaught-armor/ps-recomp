@@ -777,7 +777,8 @@ id_of :: proc(path: string) -> string {
 // disc), port/build.sh, port/src/local.odin, port/src/main.odin (psx.run)
 // and tests/run.sh; a PS2 disc with none of them to the same but
 // settings.tsv, press.txt and the thumb, docs/notes.md saying no run yet,
-// recomp.tsv r5900 and main.odin ps2.boot. No file holds a
+// recomp.tsv r5900 and main.odin ps2.boot (with the IOP and EE learned
+// blobs). No file holds a
 // 16-byte run of the executable, nor of the blob, records or card. The
 // .gitignore lists every file but local.tsv. An export into the directory
 // again, or into one holding another file, is refused and changes nothing;
@@ -904,7 +905,9 @@ test_export :: proc() {
 	files = listed(out2)
 	check(name, slice.equal(files, ps2_want), fmt.tprint("PS2 files:", files))
 	check(name, strings.contains(read(out2, "tools/recomp.tsv"), "\nbackend\tr5900\n"), "PS2 recomp.tsv not r5900")
-	check(name, strings.contains(read(out2, "port/src/main.odin"), "ps2.boot("), "PS2 main.odin does not boot ps2")
+	ps2_main := read(out2, "port/src/main.odin")
+	check(name, strings.contains(ps2_main, "ps2.boot("), "PS2 main.odin does not boot ps2")
+	check(name, strings.contains(ps2_main, ".Learned_Iop_Key)") && strings.contains(ps2_main, ".Learned_Ee_Key)"), "PS2 main.odin does not pass both learned blobs")
 	check(name, strings.contains(read(out2, "docs/notes.md"), "No compatibility run yet"), "PS2 notes name a run")
 	readme := read(out2, "README.md")
 	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "- `settings.tsv`"), fmt.tprintf("PS2 README:\n%s", readme))
