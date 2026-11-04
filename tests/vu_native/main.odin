@@ -129,7 +129,7 @@ main :: proc() {
 
 	rand.reset(SEED)
 	vu.vu_init()
-	cases, fails, flagged, status_set := 0, 0, 0, 0
+	cases, fails, flagged, status_set, vu1_set := 0, 0, 0, 0, 0
 	for p, k in progs {
 		run := cast(proc())rawptr(code.base + uintptr(code.spans[k].off))
 		vu0 := p.unit == .VU0
@@ -170,6 +170,7 @@ main :: proc() {
 
 				if want.mac != init.mac {flagged += 1}
 				if vu0 && want.status & 0x30 != 0 {status_set += 1}
+				if !vu0 && status && want.status & 0x30 != 0 {vu1_set += 1}
 				same := got_pc == want.tpc | END_BIT && same_regs(&got, &want, status) && slice.equal(mem, mem_want)
 				same &&= !vu0 || vu_programs.vu1_same(&vu.vu1, &vu1_want)
 				if !same {
@@ -310,8 +311,9 @@ main :: proc() {
 		fmt.eprintln("FAIL vu_native: no program to probe")
 		dispatch_fails += 1
 	}
-	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, %d failing dispatched, MAC changed in %d, VU0 I or D set in %d", arch, cases, TRIALS, fails, dispatch_fails, flagged, status_set)
+	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, %d failing dispatched, MAC changed in %d, VU0 I or D set in %d, VU1 in %d", arch, cases, TRIALS, fails, dispatch_fails, flagged, status_set, vu1_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
+	if vu1_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU1 I or D set in only %d trials", vu1_set); os.exit(1)}
 	if fails > 0 || slow_fails > 0 || dispatch_fails > 0 {os.exit(1)}
 }

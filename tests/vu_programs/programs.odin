@@ -193,19 +193,57 @@ PROGRAMS := [?][]u32 {
 		lower_sp(MFIR, 0b0110, 4, 4), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
 	},
 }
-// VU0 only. DIV vf1.x / vf0.x (I or D) with ADD; SQRT vf1.y with MULq,
-// then RSQRT vf2.z / vf0.y (I or D) with MAX, which leaves status;
-// DIV vf3.z / vf0.y with an E-bit MULq, after the ADD that writes vf3.
-// Then DIV vf1.x / vf0.x (D, or I) with Q's wait reaching four inside the
-// stall of the op after it, a DIV and a WAITQ, which then take its I and D
-// before a DIV vf0.w / vf1.x (neither, but for vf1.x 0) replaces them: the
-// end status keeps only the sticky bit, which a late merge would miss.
-PROGRAMS_VU0 := [?][]u32 {
+// The DIV family's status bits. DIV vf1.x / vf0.x (I or D) with ADD; SQRT
+// vf1.y with MULq, then RSQRT vf2.z / vf0.y (I or D) with MAX, which
+// leaves status; DIV vf3.z / vf0.y with an E-bit MULq, after the ADD that
+// writes vf3. Then DIV vf1.x / vf0.x (D, or I) with Q's wait reaching four
+// inside the stall of the op after it, a DIV and a WAITQ, which then take
+// its I and D before a DIV vf0.w / vf1.x (neither, but for vf1.x 0)
+// replaces them: the end status keeps only the sticky bit, which a late
+// merge would miss. Each runs on VU0 as it is, and on VU1 after an FSAND
+// (status_first), so compiled VU1 code computes status there too.
+PROGRAMS_DIV := [?][]u32 {
 	{lower_sp(DIV, 0, 0, 1), upper(ADD, 3, 1, 2), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
 	{lower_sp(SQRT, 0b0100, 1, 0), upper(MULq, 3, 1, 0), lower_sp(RSQRT, 0b0110, 0, 2), upper(MAX, 4, 1, 2), NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
 	{NOP_L, upper(ADD, 3, 1, 2), lower_sp(DIV, 0b0110, 0, 3), upper(MULq, 3, 3, 0) | E_BIT, NOP_L, upper(ADD, 3, 3, 1)},
 	{lower_sp(DIV, 0, 0, 1), NOP_U, lower_sp(DIV, 0b0011, 1, 0), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U},
 	{lower_sp(DIV, 0, 0, 1), NOP_U, lower_sp(WAITQ, 0, 0, 0), NOP_U, lower_sp(DIV, 0b0011, 1, 0), NOP_U | E_BIT, NOP_L, NOP_U},
+}
+
+// words after an FSAND into vi9, which makes compiled VU1 code compute
+// status (recomp/vu reads_status).
+status_first :: proc(words: []u32) -> []u32 {
+	x := make([]u32, len(words) + 2)
+	x[0], x[1] = fs_op(FSAND, 9, 0xfff), NOP_U
+	copy(x[2:], words)
+	return x
+}
+
+// Status I and D falling due in a compiled pair (recomp/vu set_due), on
+// both units, with status reads around them. DIV vf1.x / vf0.x (I or D)
+// with Q's wait reaching four at DIV +3, whose ADD writes status in the
+// same pair, an FSAND after it and one two pairs later. The same DIV with
+// FSANDs at DIV +3, +4 and +5. RSQRT vf2.z / vf0.y (I or D) with MAX, then
+// a WAITQ with an ADD that stalls through four and takes the bits, an
+// FSAND, and a DIV vf0.w / vf1.x with an ADD, read by an FSAND.
+DIV_DUE := [?][]u32 {
+	{
+		lower_sp(DIV, 0, 0, 1), NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, upper(ADD, 3, 1, 2),
+		fs_op(FSAND, 1, 0xfff), NOP_U, NOP_L, NOP_U, fs_op(FSAND, 2, 0xfff), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
+	},
+	{
+		lower_sp(DIV, 0, 0, 1), NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, fs_op(FSAND, 1, 0xfff), NOP_U,
+		fs_op(FSAND, 2, 0xfff), NOP_U, fs_op(FSAND, 4, 0xfff), NOP_U, NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
+	},
+	{
+		lower_sp(RSQRT, 0b0110, 0, 2), upper(MAX, 4, 1, 2), NOP_L, NOP_U, lower_sp(WAITQ, 0, 0, 0), upper(ADD, 3, 1, 2),
+		fs_op(FSAND, 1, 0xfff), NOP_U, lower_sp(DIV, 0b0011, 1, 0), upper(ADD, 5, 1, 2), fs_op(FSAND, 2, 0xfff), NOP_U,
+		NOP_L, NOP_U | E_BIT, NOP_L, NOP_U,
+	},
+}
+
+// VU0 only.
+PROGRAMS_VU0 := [?][]u32 {
 	// The window onto VU1's registers (ps2/vu vu0_window_load), at
 	// addresses with bit 0x400 set. LQ from vi0 - 0x3fb (0xfc05, slot 5:
 	// VU1's vf5) and SQ to vi0 - 0x3f9 (vf7).
@@ -492,6 +530,8 @@ DELAY_PCS := []u32{0, 0x38, 0x48, 0x58, 0x60, 0x88, 0xb0, 0xd0, 0xf8}
 // Every program, on each unit it runs on.
 programs :: proc() -> (progs: [dynamic]Prog) {
 	for w in PROGRAMS {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
+	for w in PROGRAMS_DIV {append(&progs, Prog{w, .VU0, nil, AT_0, nil}, Prog{status_first(w), .VU1, nil, AT_0, nil})}
+	for w in DIV_DUE {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
 	for w in PROGRAMS_VU0 {append(&progs, Prog{w, .VU0, nil, AT_0, nil})}
 	// The late-flag and Q programs, every pair labelled and as captured images
 	// entered at each pc.

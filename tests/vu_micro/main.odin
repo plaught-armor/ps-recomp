@@ -14,12 +14,15 @@
 // between a MAC write and a flag read must not let the write be dropped.
 // Then hazard pairs, where the lower reads or writes the VF register the
 // upper writes: the lower must read it from before the upper, and its own
-// write must win unless it leaves the register as it was. The VU0-only
+// write must win unless it leaves the register as it was. The DIV
 // programs pair DIV, SQRT and RSQRT with an upper op, so the two status
 // writes merge, with divisors that set I or D on every trial. Two more let
 // Q's wait reach four inside the stall of a DIV or a WAITQ after a DIV that
 // sets D: the stalled pair takes the bits, so the end status keeps sticky D.
-// The last loads and stores through VU0's window onto VU1's registers, at
+// Each runs on VU0, and on VU1 after an FSAND that makes compiled VU1 code
+// compute status. Three more, on both units, let the bits fall due in a
+// compiled pair between status reads. VU1 must set I or D as often as VU0.
+// The VU0-only programs load and stores through VU0's window onto VU1's registers, at
 // addresses with bit 0x400 set, from vi0 and from a vi; VU1 starts each
 // VU0 trial from the same random registers and must end the same.
 //
@@ -207,7 +210,7 @@ main :: proc() {
 	add_cases()
 	rand.reset(SEED)
 	vu.vu_init()
-	fails, flagged, status_set := 0, 0, 0
+	fails, flagged, status_set, vu1_set := 0, 0, 0, 0
 	for c, n in CASES {
 		v := c.vu0 ? &vu.vu0 : &vu.vu1
 		mem := ([^]u32)(raw_data(v.mem))[:len(v.mem) / 4]
@@ -262,6 +265,7 @@ main :: proc() {
 			got := v^
 			if want.mac != init.mac {flagged += 1}
 			if c.vu0 && want.status & 0x30 != 0 {status_set += 1}
+			if !c.vu0 && c.status && want.status & 0x30 != 0 {vu1_set += 1}
 			same := exit == want_exit && pc == want.tpc && got.vi == want.vi && got.acc.u == want.acc.u && got.mac == want.mac
 			same &&= transmute(u32)got.q == transmute(u32)want.q && transmute(u32)got.p == transmute(u32)want.p && slice.equal(mem, mem_want)
 			same &&= transmute(u32)got.q_next == transmute(u32)want.q_next && got.q_wait == want.q_wait
@@ -297,9 +301,10 @@ main :: proc() {
 		vu.vu1_register_ranges({{0, c.words}}, c.run)
 		if !vu_programs.stale_status(c.words, c.pc) {fails += 1}
 	}
-	fmt.printfln("vu_micro: %d cases x %d trials, %d failing, MAC changed in %d, VU0 I or D set in %d", len(CASES), TRIALS, fails, flagged, status_set)
+	fmt.printfln("vu_micro: %d cases x %d trials, %d failing, MAC changed in %d, VU0 I or D set in %d, VU1 in %d", len(CASES), TRIALS, fails, flagged, status_set, vu1_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_micro: VU0 I or D set in only %d trials", status_set); os.exit(1)}
+	if vu1_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_micro: VU1 I or D set in only %d trials", vu1_set); os.exit(1)}
 	if fails > 0 {os.exit(1)}
 }
 `
