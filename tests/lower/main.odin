@@ -81,7 +81,45 @@ main :: proc() {
 		free_all(context.temp_allocator)
 	}
 	likely_cycles()
-	fmt.println("ok lower:", len(r5900_firsts), "r5900 and", len(r3000_firsts), "r3000 branches with a branch in a jump-target delay slot; beql cycles")
+	imports()
+	fmt.println("ok lower:", len(r5900_firsts), "r5900 and", len(r3000_firsts), "r3000 branches with a branch in a jump-target delay slot; beql cycles; import placeholders")
+}
+
+// The function of `words` at `base`, discovered with the r5900 rules.
+@(private = "file")
+func_of :: proc(base: u32, words: []u32) -> ^mips.Func {
+	data := make([]u8, len(words) * 4, context.temp_allocator)
+	for w, k in words {
+		data[4 * k], data[4 * k + 1], data[4 * k + 2], data[4 * k + 3] = u8(w), u8(w >> 8), u8(w >> 16), u8(w >> 24)
+	}
+	f := mips.func_make(base, base + u32(len(data)))
+	mips.discover(r5900.RULES, {base = base, data = data}, f, {})
+	return f
+}
+
+// r5900.drop_imports: in an image with a `jal 0` placeholder, both the
+// function that holds it and a `lui r,0` leaf (a data import) go to the
+// interpreter; in an image without one, the `lui r,0` leaf stays compiled.
+@(private = "file")
+imports :: proc() {
+	call := func_of(0x1000, {0x0c000000, 0, 0x03e00008, 0}) // jal 0; nop; jr ra; nop
+	leaf := func_of(0x2000, {0x3c020000, 0x03e00008, 0x8c420000}) // lui v0,0; jr ra; lw v0,0(v0)
+	plain := func_of(0x3000, {0x03e00008, 0}) // jr ra; nop
+	with: [dynamic]^mips.Func
+	append(&with, call, leaf, plain)
+	if n := r5900.drop_imports(&with, true); n != 2 || len(with) != 1 || with[0] != plain {
+		fmt.eprintfln("FAIL r5900 drop_imports: %d dropped, %d kept, from an image with jal 0", n, len(with))
+		os.exit(1)
+	}
+	without: [dynamic]^mips.Func
+	append(&without, leaf, plain)
+	if n := r5900.drop_imports(&without, true); n != 0 || len(without) != 2 {
+		fmt.eprintfln("FAIL r5900 drop_imports: %d dropped from an image without jal 0", n)
+		os.exit(1)
+	}
+	delete(with)
+	delete(without)
+	free_all(context.temp_allocator)
 }
 
 // A likely branch charges what comes before it and itself on both paths,

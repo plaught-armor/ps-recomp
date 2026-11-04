@@ -153,6 +153,49 @@ starts_function :: proc(img: mips.Image, a: u32) -> bool {
 	return false
 }
 
+// Whether f holds a placeholder a module loader fills when it loads the
+// module that exports the symbol: `jal 0` for a function import, or, when
+// data is true, `lui r,0` (r not $zero) for the high half of a data import,
+// whose low half is the offset of the addiu, load or store after it. A
+// function with only data imports (a getter that loads one global) holds no
+// `jal 0`, so the lui has to count. But `lui r,0` also builds small constants
+// (VU microprogram addresses, low scratch addresses) in images that import
+// nothing, so it counts only in an image where some function holds a `jal 0`.
+@(private = "file")
+holds_import :: proc(f: ^Func, data: bool) -> bool {
+	for _, i in f.insns {
+		if i.w == 0x0c000000 || data && i.w & 0xffe0ffff == 0x3c000000 && i.w >> 16 & 31 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Removes from funcs those a module loader rewrites at run time, and returns
+// how many. They stay in the interpreter, which runs the words in RAM:
+// compiled, they would keep the ELF's.
+drop_imports :: proc(funcs: ^[dynamic]^Func, quiet: bool) -> int {
+	imports := false
+	for f in funcs {
+		imports ||= holds_import(f, false)
+	}
+	if !imports {
+		return 0
+	}
+	n := 0
+	for f in funcs {
+		if !holds_import(f, true) {
+			funcs[n] = f
+			n += 1
+		} else if !quiet {
+			fmt.printfln("%08x: import placeholder, left to the interpreter", f.entry)
+		}
+	}
+	dropped := len(funcs) - n
+	resize(funcs, n)
+	return dropped
+}
+
 generate :: proc(o: mips.Options) {
 	img := mips.load_elf(o)
 	if path := mips.option_or(o, "words", ""); path != "" {
@@ -221,6 +264,7 @@ generate :: proc(o: mips.Options) {
 		mips.table_labels(RULES, img, t[0], t[1], ptrs, pairs[:], entries, &labels)
 		append(&funcs, ..mips.build_module(RULES, img, t[0], t[1], entries, labels, calls, {}, {}))
 	}
+	n_imports := drop_imports(&funcs, mips.option_or(o, "quiet", "") == "true")
 
 	// Assign packages.
 	pkg_of: map[u32]int
@@ -332,6 +376,9 @@ generate :: proc(o: mips.Options) {
 			mips.write_file(mips.join(dir, "code.odin"), sb.buf[:])
 		}
 		strings.builder_destroy(sb)
+	}
+	if n_imports > 0 {
+		fmt.printfln("%d functions with import placeholders left to the interpreter", n_imports)
 	}
 	if out != "" {
 		mips.remove_stale_packages(out, "p", "code.odin", REC_HEADER, len(groups))
