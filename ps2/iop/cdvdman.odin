@@ -14,6 +14,7 @@ package ps2_iop
 import "core:fmt"
 import "core:strings"
 import "ps:core"
+import "ps:core/disc"
 import cpu "../cpu"
 import r3000 "ps:psx/cpu"
 
@@ -28,8 +29,10 @@ CD_FILE :: 0x24
 CD_FUNC_READ :: 1
 CD_FUNC_STANDBY :: 5
 
-// The disk type cdvdman's sceCdGetDiskType and cdvdfsv's GetDiskType answer:
-// a PS2 DVD, for any disc, as nothing reads the type from the disc yet.
+// The disk types cdvdman's sceCdGetDiskType and cdvdfsv's GetDiskType
+// answer (cd_disk_type): a PS2 CD, one with audio tracks, and a PS2 DVD.
+CD_DISK_PS2_CD :: 0x12
+CD_DISK_PS2_CDDA :: 0x13
 CD_DISK_PS2_DVD :: 0x14
 
 // The drive status cdvdman's sceCdStatus and cdvdfsv's S-command Status
@@ -81,14 +84,12 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 1, true
 	case 8: // sceCdGetError: none
 		return 0, true
-	case 10: // sceCdSearchFile(sceCdlFILE *, name): 1 found, 0 not
-		file, found := cdvd_search(cstr(a1))
-		if found {copy(iop_ram_at(a0, CD_FILE), file[:])}
-		return u32(found), true
+	case 10: // sceCdSearchFile(sceCdlFILE *, name): sceCdLayerSearchFile on layer 0
+		return cd_search(a0, a1, 0), true
 	case 11: // sceCdSync(mode): the read is done
 		return 0, true
 	case 12: // sceCdGetDiskType
-		return CD_DISK_PS2_DVD, true
+		return cd_disk_type(), true
 	case 13: // sceCdDiskReady(mode): 2, ready
 		return 2, true
 	case 28: // sceCdStatus
@@ -101,8 +102,47 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 75: // sceCdMmode(media): 1. The media only gates disk type checks, none made here
 		return 1, true
+	case 83: // sceCdReadDvdDualInfo(int *on_dual, u32 *layer1_start): 1
+		on_dual, layer1 := cd_dual_info()
+		iop_u32(a0)^, iop_u32(a1)^ = on_dual, layer1
+		return 1, true
+	case 84: // sceCdLayerSearchFile(sceCdlFILE *, name, layer): 1 found, 0 not
+		return cd_search(a0, a1, a2), true
 	}
 	return 0, false
+}
+
+// sceCdLayerSearchFile: writes the record of file `name` (an IOP address) in
+// `layer`'s volume at `fp` and returns 1, or returns 0 and writes nothing.
+// Any nonzero layer is the second, as for cdvdfsv's SearchFile.
+@(private = "file")
+cd_search :: proc(fp, name, layer: u32) -> u32 {
+	file, found := cdvd_search(cstr(name), u8(layer != 0))
+	if found {copy(iop_ram_at(fp, CD_FILE), file[:])}
+	return u32(found)
+}
+
+// The disk type, by the image's medium (disc.dvd_probe); a PS2 DVD over
+// disc_dir, which has no image to judge, as every disc there so far is one.
+cd_disk_type :: proc() -> u32 {
+	if image.volume == 0 || image.dvd {return CD_DISK_PS2_DVD}
+	for t in image.tracks {
+		if t.audio {return CD_DISK_PS2_CDDA}
+	}
+	return CD_DISK_PS2_CD
+}
+
+// sceCdReadDvdDualInfo's {on_dual, layer1_start}, as cdvdman takes them
+// from the DVD's TOC (cdvdman.c sceCdReadDvdDualInfo): on_dual is 1 for a
+// dual-layer disc (parallel or opposite track alike) and layer1_start the
+// LSN the second layer's volume starts at. A single-layer disc's TOC holds
+// its data area's end there, so it answers on_dual 0 and its sector count;
+// over disc_dir there is no sector count: 0. A CD has no TOC of this kind:
+// cdvdman zeroes both when !cdvdman_isdvd().
+cd_dual_info :: proc() -> (on_dual, layer1: u32) {
+	if cd_disk_type() != CD_DISK_PS2_DVD {return 0, 0}
+	if image.layer1 != 0 {return 1, image.layer1}
+	return 0, disc.end(&image)
 }
 
 // Owes the callback a run with function code `code` for a command just

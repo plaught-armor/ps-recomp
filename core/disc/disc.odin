@@ -45,6 +45,8 @@ Disc :: struct {
 	// The root directory of each layer's volume.
 	root:    Entry,
 	root1:   Entry,
+	// Whether the disc is a DVD, as dvd_probe judges it from the image.
+	dvd:     bool,
 }
 
 // Open a disc image by its extension: .cue, or a single-track .iso, .bin or
@@ -63,6 +65,7 @@ open :: proc(path: string, allocator := context.allocator) -> (d: Disc, ok: bool
 		return {}, false
 	}
 	volume_probe(&d)
+	d.dvd = dvd_probe(&d)
 	return d, true
 }
 

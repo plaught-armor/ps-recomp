@@ -888,28 +888,22 @@ cdvd_init_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	return true
 }
 
-// cdvdfsv S-commands. Everything succeeds; the disc is a ready PS2 DVD.
+// cdvdfsv S-commands. Everything succeeds; the disc is ready, of the type
+// cd_disk_type judges.
 @(private)
 cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	switch fno {
 	case 0x01: // ReadClock {result, clock[8]}
 		w[0], w[1], w[2] = 1, 0, 0
-	case 0x03: w[0] = CD_DISK_PS2_DVD // GetDiskType
+	case 0x03: w[0] = cd_disk_type() // GetDiskType
 	case 0x04: w[0] = 0 // GetError
 	case 0x05: w[0], w[1] = 1, 0 // TrayReq {result, tray check}
 	case 0x0c: w[0] = CD_STAT_PAUSE // Status
 	case 0x16, 0x22, 0x23: w[0] = 1 // Break, MMode, ChangeThreadPriority
-	case 0x27:
-		// ReadDvdDualInfo {result, on_dual, layer1_start}, as cdvdman takes
-		// them from the DVD's TOC: on_dual is 1 for a dual-layer disc
-		// (parallel or opposite track alike) and layer1_start the LSN the
-		// second layer's volume starts at. A single-layer disc's TOC holds
-		// its data area's end there, so it answers on_dual 0 and its sector
-		// count. Over disc_dir there is no sector count: 0. A CD would
-		// answer {1, 0, 0}, but GetDiskType calls every disc a DVD.
-		count := image.layer1 != 0 ? image.layer1 : disc.end(&image)
-		w[0], w[1], w[2] = 1, u32(image.layer1 != 0), count
+	case 0x27: // ReadDvdDualInfo {result, on_dual, layer1_start}
+		on_dual, layer1 := cd_dual_info()
+		w[0], w[1], w[2] = 1, on_dual, layer1
 	case: return false
 	}
 	return true

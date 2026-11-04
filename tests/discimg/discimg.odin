@@ -7,7 +7,8 @@ package discimg
 import "core:encoding/endian"
 import "ps:core/disc"
 
-// The volume: PVD at 16, its terminator at 17, the root at 20, DATA at 21,
+// The volume: PVD at 16, its terminator at 17, with make_iso's udf a UDF
+// BEA01 at 18 and NSR02 at 19, the root at 20, DATA at 21,
 // SYSTEM.CNF at 22, Big.Bin at 23 .. 25, DATA/Sub.Txt at 26; 27 and 28 are
 // left out of every file, and 27 is Form 2 in the Mode 2 image. A sub file
 // (make_iso's sub) over one sector runs on into 27 and 28. A second file in
@@ -49,6 +50,7 @@ make_iso :: proc(
 	sub := SUB,
 	sub2_name := "",
 	sub2 := "",
+	udf := false,
 ) -> []u8 {
 	assert(len(sub) <= (VOLUME - 26) * disc.DATA)
 	volume := VOLUME + (len(sub2) + disc.DATA - 1) / disc.DATA
@@ -61,6 +63,10 @@ make_iso :: proc(
 	term := sector(img, 17)
 	term[0] = 255
 	copy(term[1:6], "CD001")
+	if udf { // a UDF bridge's recognition sequence, as a DVD's (TEA01 left out: 20 is the root)
+		copy(sector(img, 18)[1:6], "BEA01")
+		copy(sector(img, 19)[1:6], "NSR02")
+	}
 	root := sector(img, 20)
 	at := record(root, 20, disc.DATA, true, "\x00")
 	at += record(root[at:], 20, disc.DATA, true, "\x01")

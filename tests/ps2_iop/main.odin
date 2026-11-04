@@ -108,7 +108,9 @@ package main
 import "core:encoding/endian"
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "ps:core"
+import "ps:core/disc"
 import iop "ps:ps2/iop"
 import cpu "ps:ps2/cpu"
 import kernel "ps:ps2/kernel"
@@ -226,6 +228,7 @@ game :: proc(_: rawptr) {
 	test_vblank_samples()
 	test_cdvdman()
 	test_cdvd_search_server()
+	test_cd_type()
 	test_sdrdrv()
 	test_sdr_thread()
 	test_timrman()
@@ -4103,7 +4106,7 @@ test_libsd :: proc() {
 	check(iop.iop_sd == {} && coroutines() == base, "libsd: the loader's reset clears its handlers")
 }
 
-CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 28, 37, 44, 75}
+CDVDMAN_FNOS := [?]u32{4, 5, 6, 8, 10, 11, 12, 13, 28, 37, 44, 75, 83, 84}
 IOMAN_FNOS := [?]u32{4, 5, 6, 8}
 
 // Calls function fno of `fnos`, whose stubs are at `stubs`, with a0 on.
@@ -4133,7 +4136,7 @@ test_cdvd_search_server :: proc() {
 	}
 	defer os.remove_all(dir)
 	V :: discimg.VOLUME
-	iso := discimg.make_iso(discimg.CNF_PS2)
+	iso := discimg.make_iso(discimg.CNF_PS2, udf = true)
 	img := make([]u8, 2 * len(iso), context.temp_allocator)
 	copy(img, iso)
 	copy(img[len(iso):], iso)
@@ -4207,6 +4210,144 @@ dual_info :: proc() -> (on_dual, start: u32) {
 	return w[1], w[2]
 }
 
+// The disk type and the dual-layer info by the image's medium, through
+// cdvdman (exports 12 and 83) and cdvdfsv (S-commands 0x03 and 0x27), which
+// must agree, and sceCdLayerSearchFile (export 84).
+test_cd_type :: proc() {
+	dir, err := os.make_directory_temp("", "ps_iop_cd_type_test_*", context.allocator)
+	if err != nil {
+		check(false, "cd type: no temp directory")
+		return
+	}
+	defer os.remove_all(dir)
+	defer iop.disc_image_close() // before the directory is removed
+
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	a: Asm
+	cdo := imports(&a, "cdvdman", ..CDVDMAN_FNOS[:])
+	big := str_words(&a, "\\BIG.BIN;1")
+	nope := str_words(&a, "\\NOPE.BIN;1")
+	file := at(&a)
+	for _ in 0 ..< iop.CD_FILE / 4 {put(&a, 0)}
+	out := at(&a)
+	put(&a, 0, 0)
+	entry := at(&a)
+	prologue(&a)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, res := iop.iop_load(build_mod("modt", &a, entry), "modt", nil)
+	b := module_base(id)
+	check(id > 0 && res == 0, "cd type: the module loads")
+	cd := b + cdo
+
+	// Writes img as name in dir and opens it as the disc; its path.
+	open_img :: proc(dir, name: string, img: []u8) -> string {
+		path := fmt.tprintf("%s/%s", dir, name)
+		_ = os.write_entire_file(path, img)
+		check(iop.disc_image_open(path), fmt.tprintf("cd type: %s opens", name))
+		return path
+	}
+	// The disk type, the same through both paths.
+	kind :: proc(cd: u32) -> u32 {
+		buf: [64]u8
+		ok := iop.sif.servers[0x80000593](0x03, buf[:], 0)
+		t := endian.unchecked_get_u32le(buf[:])
+		check(ok && t == cd_call(cd, 12), "cd type: GetDiskType and sceCdGetDiskType agree")
+		return t
+	}
+	// sceCdReadDvdDualInfo's outputs, both written over 0xaaaaaaaa, the same
+	// as S-command 0x27's.
+	dual :: proc(cd, out: u32) -> (on_dual, start: u32) {
+		iop.iop_u32(out)^, iop.iop_u32(out + 4)^ = 0xaaaaaaaa, 0xaaaaaaaa
+		check(cd_call(cd, 83, out, out + 4) == 1, "cd type: sceCdReadDvdDualInfo returns 1")
+		on_dual, start = iop.iop_u32(out)^, iop.iop_u32(out + 4)^
+		o, s := dual_info()
+		check(o == on_dual && s == start, "cd type: export 83 and S-command 0x27 agree")
+		return
+	}
+	// sceCdLayerSearchFile's result and the record's lsn, written over
+	// 0xaaaaaaaa.
+	search :: proc(cd, file, name, layer: u32) -> (found, lsn: u32) {
+		iop.iop_u32(file)^ = 0xaaaaaaaa
+		found = cd_call(cd, 84, file, name, layer)
+		return found, iop.iop_u32(file)^
+	}
+
+	V :: discimg.VOLUME
+	udf := discimg.make_iso(discimg.CNF_PS2, udf = true)
+	plain := discimg.make_iso(discimg.CNF_PS2)
+
+	// Dual layer with UDF: a DVD; layer 1, or any nonzero one, the second.
+	two := make([]u8, 2 * len(udf), context.temp_allocator)
+	copy(two, udf)
+	copy(two[len(udf):], udf)
+	open_img(dir, "dl.iso", two)
+	check(kind(cd) == iop.CD_DISK_PS2_DVD, "cd type: a dual-layer UDF image is a PS2 DVD")
+	on_dual, start := dual(cd, b + out)
+	check(on_dual == 1 && start == V, "cd type: a dual-layer DVD's second layer start")
+	found, lsn := search(cd, b + file, b + big, 0)
+	check(found == 1 && lsn == 23, "cd type: LayerSearchFile layer 0")
+	found, lsn = search(cd, b + file, b + big, 1)
+	rec := iop.iop_mem(b + file, iop.CD_FILE)
+	check(found == 1 && lsn == V + 23 && endian.unchecked_get_u32le(rec[4:]) == discimg.BIG && string(rec[8:17]) == "BIG.BIN;1", "cd type: LayerSearchFile layer 1, its record")
+	found, lsn = search(cd, b + file, b + big, 3)
+	check(found == 1 && lsn == V + 23, "cd type: LayerSearchFile, any nonzero layer the second")
+	found, lsn = search(cd, b + file, b + nope, 1)
+	check(found == 0 && lsn == 0xaaaaaaaa, "cd type: LayerSearchFile, a miss returns 0 and writes nothing")
+	iop.iop_u32(b + file)^ = 0xaaaaaaaa
+	check(cd_call(cd, 10, b + file, b + big) == 1 && iop.iop_u32(b + file)^ == 23, "cd type: sceCdSearchFile searches layer 0")
+
+	// One layer with UDF, 11 sectors past its volume: a DVD of that count.
+	one := make([]u8, (V + 11) * SECTOR, context.temp_allocator)
+	copy(one, udf)
+	open_img(dir, "sl.iso", one)
+	check(kind(cd) == iop.CD_DISK_PS2_DVD, "cd type: a single-layer UDF image is a PS2 DVD")
+	on_dual, start = dual(cd, b + out)
+	check(on_dual == 0 && start == V + 11, "cd type: a single-layer DVD's sector count")
+
+	// CD-sized, no UDF, a one-sector root: a CD, no dual info, no second layer.
+	open_img(dir, "cd.iso", plain)
+	check(kind(cd) == iop.CD_DISK_PS2_CD, "cd type: a CD-sized image without UDF, one-sector root, is a PS2 CD")
+	on_dual, start = dual(cd, b + out)
+	check(on_dual == 0 && start == 0, "cd type: a CD's dual info is zeros")
+	found, lsn = search(cd, b + file, b + big, 0)
+	check(found == 1 && lsn == 23, "cd type: LayerSearchFile layer 0 on a CD")
+	found, lsn = search(cd, b + file, b + big, 1)
+	check(found == 0 && lsn == 0xaaaaaaaa, "cd type: a CD has no second layer")
+
+	// The same with a root of two sectors: PCSX2's test fails, so a DVD.
+	wide := slice.clone(plain, context.temp_allocator)
+	endian.put_u32(wide[16 * SECTOR + 156 + 10:][:4], .Little, 2 * SECTOR)
+	open_img(dir, "wide.iso", wide)
+	check(kind(cd) == iop.CD_DISK_PS2_DVD, "cd type: a CD-sized image without UDF, two-sector root, is a PS2 DVD")
+
+	// Without UDF but more sectors than a CD holds: a DVD.
+	path := open_img(dir, "big.iso", plain)
+	if f, ferr := os.open(path, {.Write}); ferr == nil {
+		_ = os.truncate(f, (disc.CD_MAX_SECTORS + 1) * SECTOR)
+		os.close(f)
+	}
+	check(iop.disc_image_open(path) && kind(cd) == iop.CD_DISK_PS2_DVD, "cd type: an image past a CD's sectors is a PS2 DVD")
+
+	// Raw sectors: a CD, UDF or not; with an audio track, one with audio.
+	open_img(dir, "raw.bin", discimg.make_raw(udf, 2))
+	check(kind(cd) == iop.CD_DISK_PS2_CD, "cd type: a raw image is a PS2 CD, UDF or not")
+	_ = os.write_entire_file(fmt.tprintf("%s/m2.bin", dir), discimg.make_raw(plain, 2))
+	_ = os.write_entire_file(fmt.tprintf("%s/a.bin", dir), discimg.make_audio(4)) // small: the emu allocator is bounded
+	open_img(dir, "cdda.cue", transmute([]u8)string("FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\nFILE \"a.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n"))
+	check(kind(cd) == iop.CD_DISK_PS2_CDDA, "cd type: a CD with an audio track is a PS2 CDDA")
+	on_dual, start = dual(cd, b + out)
+	check(on_dual == 0 && start == 0, "cd type: a CDDA's dual info is zeros")
+
+	// disc_dir: no image to judge, a PS2 DVD with no sector count.
+	iop.disc_image_close()
+	check(kind(cd) == iop.CD_DISK_PS2_DVD, "cd type: disc_dir is a PS2 DVD")
+	on_dual, start = dual(cd, b + out)
+	check(on_dual == 0 && start == 0, "cd type: disc_dir's dual info is zeros")
+}
+
 test_cdvdman :: proc() {
 	dir, err := os.make_directory_temp("", "ps_iop_cd_test_*", context.allocator)
 	if err != nil {
@@ -4269,7 +4410,7 @@ test_cdvdman :: proc() {
 	check(cd_call(cd, 13, 0) == 2 && cd_call(cd, 8) == 0 && cd_call(cd, 11, 0) == 0, "cdvdman: DiskReady 2, no error, Sync done")
 	check(cd_call(cd, 4, 0) == 1 && cd_call(cd, 4, 1) == 1 && cd_call(cd, 4, 5) == 1 && cd_call(cd, 4, 0xffffffff) == 1, "cdvdman: sceCdInit returns 1 for every mode")
 	check(cd_call(cd, 75, 1) == 1 && cd_call(cd, 75, 2) == 1 && cd_call(cd, 75, 0xff) == 1, "cdvdman: sceCdMmode returns 1")
-	check(cd_call(cd, 12) == iop.CD_DISK_PS2_DVD, "cdvdman: sceCdGetDiskType is a PS2 DVD")
+	check(cd_call(cd, 12) == iop.CD_DISK_PS2_CD, "cdvdman: sceCdGetDiskType is a PS2 CD on a CD-sized image without UDF")
 	check(cd_call(cd, 28) == 0x0a, "cdvdman: sceCdStatus is paused")
 	check(cd_call(cd, 44) == 0, "cdvdman: sceCdGetReadPos is 0 with no read")
 	check(cd_call(cd, 5) == 1 && iop.iop_cd == {}, "cdvdman: sceCdStandby with no callback returns 1, no run owed")

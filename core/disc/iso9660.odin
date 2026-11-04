@@ -83,6 +83,46 @@ volume_probe :: proc(d: ^Disc) {
 	}
 }
 
+// The most sectors a CD holds: 99 minutes at 75 a second.
+CD_MAX_SECTORS :: 99 * 60 * 75
+
+// Whether the disc is a DVD. The drive tells CD from DVD by the medium
+// itself, which an image does not record, so this judges from the image's
+// contents, in order:
+//  - raw sectors (a .bin or .cue of 2352-byte ones): a CD, as a DVD has no
+//    CD sectors to dump raw;
+//  - a UDF NSR02 or NSR03 descriptor in the volume recognition sequence
+//    after the ISO9660 descriptors: a DVD. DVD-ROMs are mastered as UDF
+//    bridge discs, and every PS2 DVD image seen carries BEA01, NSR02 and
+//    TEA01 there; PS2 CDs are plain ISO9660;
+//  - more sectors than a CD holds: a DVD;
+//  - otherwise a CD only when PCSX2's test also says CD (InputIsoFile.cpp
+//    tryIsoType: the root directory record's data length is 2048, as CD
+//    mastering writes it; Sony's DVD mastering writes the directory's exact
+//    length). That test alone misreads a CD whose root spans more than one
+//    sector, so here it only confirms.
+// Anything not shown to be a CD is a DVD: most PS2 discs are DVDs, a DVD
+// game told it is on a CD may refuse the disc, and that is the worse error.
+@(private)
+dvd_probe :: proc(d: ^Disc) -> bool {
+	for t in d.tracks {
+		if t.raw {
+			return false
+		}
+	}
+	sector: [DATA]u8
+	for lba in u32(16) ..< 32 {
+		if !read(d, lba, sector[:]) {
+			break
+		}
+		id := string(sector[1:6])
+		if id == "NSR02" || id == "NSR03" {
+			return true
+		}
+	}
+	return end(d) > CD_MAX_SECTORS || d.root.size != DATA
+}
+
 // Whether directory dir's first record is its `.`, pointing back at dir.
 @(private = "file")
 self_record :: proc(d: ^Disc, dir: Entry, base, limit: u32) -> bool {
