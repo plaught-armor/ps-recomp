@@ -4780,6 +4780,53 @@ test_sdr_thread :: proc() {
 	check(call_ends(hsd, 5) && string(mem.ram_slice(EE_RECV, 0x80)) == string(host[:]), "sdrdrv thread: a host command's reply bytes are the host path's")
 	drop_replies()
 
+	// Host commands as retail picks them, by fno & 0xfff0. `req` is the EE's
+	// request words; the reply's words come back.
+	clear(&core.compat.calls)
+	host_cmd :: proc(rec, fno, hsd: u32, req: []u32, rsize: u32 = 0x40) -> []u32 {
+		for x, i in req {iop.iop_u32(hsd + 0x100 + u32(i) * 4)^ = x}
+		for i in u32(0) ..< rsize / 4 {mem.wr32(EE_RECV + i * 4, 0xffffffff)}
+		call(rec, fno, 0x40, EE_RECV, rsize, hsd)
+		return ([^]u32)(raw_data(mem.ram_slice(EE_RECV, rsize)))[:rsize / 4]
+	}
+	zero :: proc(w: []u32) -> bool {
+		for x in w {if x != 0 {return false}}
+		return true
+	}
+	// 0x8131: sceSdSetEffectAttr on core 1, the attr the request; 0x8141
+	// reads it back, the attr the reply. Core 0 stays as it was.
+	r := host_cmd(8, 0x8131, hsd, {0, 7, 0x2345_1234, 0x40, 0x50})
+	check(call_ends(hsd, 8) && zero(r), "sdrdrv thread: 0x8131 sets core 1's effect, result 0")
+	drop_replies()
+	r = host_cmd(9, 0x8141, hsd, {})
+	check(call_ends(hsd, 9) && r[0] == 1 && r[1] == 7 && r[2] == 0x2345_1234 && r[3] == 0x40 && r[4] == 0x50 && zero(r[5:]), "sdrdrv thread: 0x8141 answers core 1's effect attr")
+	drop_replies()
+	r = host_cmd(10, 0x8140, hsd, {})
+	check(call_ends(hsd, 10) && r[0] == 0 && r[1] == 0 && r[3] == 0, "sdrdrv thread: 0x8140 answers core 0's, untouched")
+	drop_replies()
+	// 0x8070: sceSdSetCoreAttr {?, entry, value}, entry and value u16: the
+	// high bits are not read. Entry 3 is core 1's effect enable; 0x40 is none,
+	// libsd's row.
+	host_cmd(11, 0x8070, hsd, {0, 0xffff_0003, 0x1_0001})
+	check(call_ends(hsd, 11) && len(core.compat.calls) == 0, "sdrdrv thread: 0x8070 sets a core attr, no row")
+	drop_replies()
+	host_cmd(16, 0x8070, hsd, {0, 0x40, 1})
+	check(call_ends(hsd, 16) && core.compat.calls[{.Iop_Sd, 0x40, 11}].n == 1, "sdrdrv thread: 0x8070 with an entry libsd does not know, its row")
+	drop_replies()
+	clear(&core.compat.calls)
+	// 0x8101: sceSdBlockTransStatus with the half bit, as libsd's.
+	host_cmd(12, 0x80e0, hsd, {0, 1, 0x13, 0x30000, 0x4000, 0x32004})
+	r = host_cmd(13, 0x8101, hsd, {0, 1, 0})
+	check(call_ends(hsd, 12, 13) && r[0] == 0x32004 | 1 << 24 && zero(r[1:]), "sdrdrv thread: 0x8101 answers the position and the half")
+	drop_replies()
+	host_cmd(14, 0x80e0, hsd, {0, 1, 2})
+	drop_replies()
+	// A command sdrdrv does not know: answered 0, and a row.
+	r = host_cmd(15, 0x81e0, hsd, {0, 1, 2})
+	check(call_ends(hsd, 15) && zero(r) && core.compat.calls[{.Sif_Rpc, iop.SDR_SID, 0x81e0}].n == 1, "sdrdrv thread: an unknown command answers 0, a row")
+	drop_replies()
+	clear(&core.compat.calls)
+
 	// During a load nothing starts; the call after does.
 	fresh()
 	iop.iop_irx = true

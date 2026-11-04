@@ -101,25 +101,12 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 19: // sceSdVoiceTransStatus(channel, flag): always done
 		return 1, true
 	case 20: // sceSdBlockTransStatus(channel, flag)
-		return sd_block_status_half(a0), true
+		return sd_block_status(a0), true
 	case 23: // sceSdSetEffectAttr(core, sceSdEffectAttr *)
 		e := a1
-		set := spu_effect(int(a0 & 1), r32(e + 4), i16(r32(e + 8)), i16(r32(e + 8) >> 16))
-		if set {
-			// Only the two echo modes take delay and feedback from the caller.
-			mode := r32(e + 4) & 0xff
-			echo := mode == 7 || mode == 8
-			s.effect[a0 & 1] = {mode, r32(e + 12) if echo else 0, r32(e + 16) if echo else 0}
-		}
-		return set ? 0 : ke(-1), true
-	case 24: // sceSdGetEffectAttr(core, sceSdEffectAttr *): depth from EVOL
-		c := a0 & 1
-		fx := s.effect[c]
-		w32(a1, a0)
-		w32(a1 + 4, fx.mode)
-		w32(a1 + 8, sd_effect_depth(c))
-		w32(a1 + 12, fx.delay)
-		w32(a1 + 16, fx.feedback)
+		return sd_set_effect_attr(a0, {r32(e), r32(e + 4), r32(e + 8), r32(e + 12), r32(e + 16)}), true
+	case 24: // sceSdGetEffectAttr(core, sceSdEffectAttr *)
+		for v, i in sd_get_effect_attr(a0) {w32(a1 + u32(i) * 4, v)}
 		return 0, true
 	case 25: // sceSdClearEffectWorkArea(core, channel, effect mode)
 		sd_clear_effect(a0)
@@ -200,9 +187,33 @@ sd_note_pitch :: proc(center_note, center_fine, note: u16, fine: i16) -> (pitch:
 	return p & 0xffff, true
 }
 
+// sceSdEffectAttr as words: core, mode, depth (L in the low 16 bits, R in
+// the high), delay, feedback.
+Sd_Effect_Attr :: [5]u32
+
+// sceSdSetEffectAttr(core, attr), for libsd and sdrdrv's 0x8130: 0, or
+// KE -1 for a mode spu_effect refuses. The attr's own core is not read.
+sd_set_effect_attr :: proc(core_id: u32, a: Sd_Effect_Attr) -> u32 {
+	c := core_id & 1
+	if !spu_effect(int(c), a[1], i16(a[2]), i16(a[2] >> 16)) {return ke(-1)}
+	// Only the two echo modes take delay and feedback from the caller.
+	mode := a[1] & 0xff
+	echo := mode == 7 || mode == 8
+	iop_sd.effect[c] = {mode, a[3] if echo else 0, a[4] if echo else 0}
+	return 0
+}
+
+// sceSdGetEffectAttr(core), for libsd and sdrdrv's 0x8140: the attr the
+// last set left, the depth read back from EVOL.
+sd_get_effect_attr :: proc(core_id: u32) -> Sd_Effect_Attr {
+	c := core_id & 1
+	fx := iop_sd.effect[c]
+	return {core_id, fx.mode, sd_effect_depth(c), fx.delay, fx.feedback}
+}
+
 // A call's id libsd_fn does not decode: a compat row, and a line under
-// PS_DEBUG.
-@(private = "file")
+// PS_DEBUG. sdrdrv's 0x8070 raises it too, as the libsd call it makes.
+@(private)
 libsd_unknown :: proc(fno, id: u32) {
 	core.compat_unknown(.Iop_Sd, id, sub = fno, pc = r3000.state.r[31])
 	if cpu.debug >= 1 {fmt.eprintfln("iop: libsd fno %d id %04x not decoded", fno, id)}

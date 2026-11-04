@@ -835,14 +835,10 @@ sd_block_trans :: proc(channel, mode, addr, size, start: u32) -> u32 {
 	return 0
 }
 
-// sceSdBlockTransStatus(channel, flag): where it reads now, 24 bits.
+// sceSdBlockTransStatus(channel, flag): where it reads now in the low 24
+// bits, and in bit 24 the half of the buffer it reads now. sdrdrv's 0x8100
+// calls libsd's, so both answer this.
 sd_block_status :: proc(channel: u32) -> u32 {
-	return sdr_block_pos(&spu.block[channel & 1]) & 0xffffff
-}
-
-// sceSdBlockTransStatus as libsd answers it: sd_block_status, and in bit 24
-// the half of the buffer it reads now.
-sd_block_status_half :: proc(channel: u32) -> u32 {
 	b := &spu.block[channel & 1]
 	pos := sdr_block_pos(b)
 	half := u32(pos - b.base >= b.size / 2 && b.size != 0)
@@ -1122,30 +1118,40 @@ sd_next_ee :: proc() -> u64 {
 	return t
 }
 
-// sdrdrv: {?, args...} in, the result in the first word out.
+// sdrdrv: {?, args...} in, the result in the first word out, the rest of
+// the first 64 bytes 0. As retail's, it picks the command by fno & 0xfff0:
+// the low 4 bits are an argument, the core for the effect commands. False
+// for a command it does not know, which it leaves unanswered but 0.
 @(private)
 sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	r: u32 = 0
+	known := true
+	attr: Maybe(Sd_Effect_Attr)
 	spu_catch_up()
-	switch fno {
+	switch fno & 0xfff0 {
 	case 0x8000: sd_init()
 	case 0x8010: if !sd_set_param(w[1], w[2]) {sd_core_param(w[1], w[2])} // as libsd's sceSdSetParam
 	case 0x8030: sd_set_switch(w[1], w[2])
 	case 0x8050: sd_set_addr(w[1], w[2])
 	case 0x8060: r, _ = sd_get_addr(w[1])
+	case 0x8070: // sceSdSetCoreAttr {?, entry, value}, u16 each, as retail reads them
+		if !sd_core_attr(w[1] & 0xffff, w[2] & 0xffff) {libsd_unknown(11, w[1] & 0xffff)}
 	case 0x80d0: r = sd_voice_trans(w[2], w[3], w[4], w[5])
 	case 0x80e0: r = sd_block_trans(w[1], w[2], w[3], w[4], w[5])
 	case 0x80f0: r = 1 // sceSdVoiceTransStatus {channel, flag}: always complete
 	case 0x8100: r = sd_block_status(w[1])
+	case 0x8130: r = sd_set_effect_attr(fno & 0xf, {w[0], w[1], w[2], w[3], w[4]}) // the attr is the buffer
+	case 0x8140: attr = sd_get_effect_attr(fno & 0xf) // the reply is the attr, no result word
 	case:
 		if h := sdr_user_handler(fno); h != 0 {
 			sdr_user_unrun(fno, h, w[:16]) // an IOP module's handler (sdrdrv.odin)
-		} else if cpu.debug >= 1 {fmt.eprintfln("sdr: unhandled fno %x", fno)}
+		} else {known = false}
 	}
 	for &b in buf[:64] {b = 0}
 	w[0] = r
-	return true
+	if a, ok := attr.?; ok {copy(w[:5], a[:])}
+	return known
 }
 
 // Emulated state, saved and restored by snapshots (snap.odin). Sound RAM is

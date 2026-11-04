@@ -110,7 +110,8 @@ sdr_serve :: proc(fno, buf, size: u32) -> u32 {
 	b := iop_ram_at(buf, SDR_BUF)
 	h := sdr_user_handler(fno)
 	if h == 0 {
-		sdr_server(fno, b, size)
+		// The row the host path raises for a command sdr_server does not know.
+		if !sdr_server(fno, b, size) {core.compat_unknown(.Sif_Rpc, SDR_SID, fno, pc = r3000.state.r[31])}
 		return buf
 	}
 	r := &r3000.state.r

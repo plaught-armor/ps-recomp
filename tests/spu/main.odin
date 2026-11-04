@@ -622,7 +622,7 @@ block_trans :: proc() {
 	check(sdr_call(0x8100, 1, 0) == at, "a stopped block transfer stays still")
 	sdr_call(0x80e0, 1, 0x03, BLOCK_BASE, BLOCK_SIZE, at) // one-shot, from there
 	cpu.state.cycles += SECOND
-	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + BLOCK_SIZE, "a one-shot block transfer stops at its end")
+	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + BLOCK_SIZE | 1 << 24, "a one-shot block transfer stops at its end, in the second half")
 	sdr_call(0x80e0, 1, 2)
 }
 
