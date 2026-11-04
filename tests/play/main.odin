@@ -1639,6 +1639,19 @@ test_launcher :: proc() {
 	check(name, px[lo.list_y * W + lo.panel_x] == 0xff0000 && px[(lo.list_y + core.THUMB_H - 1) * W + lo.panel_x + core.THUMB_W - 1] == 0xff0000, "thumbnail")
 	check(name, play.launcher_row_at(&l, lo.margin, bar_y) == 1 && play.launcher_row_at(&l, lo.margin, lo.list_y + 2 * lo.line) == -1 && play.launcher_row_at(&l, 0, bar_y) == -1, "row at a point")
 
+	// A title with runes outside ASCII: each such rune one blank cell, the
+	// ASCII after it at its rune's cell, in the list row and the panel's
+	// title line, and the cell past the last rune blank. Both fit the title.
+	TITLE :: "é中Z-x"
+	l.discs[1].info[.Title] = TITLE
+	play.launcher_draw(&l, px)
+	runes := utf8.rune_count_in_string(TITLE)
+	check(name, lo.list_w / (core.FONT_GLYPH * lo.scale) - 1 > runes && core.THUMB_W / core.FONT_GLYPH > runes, "the title fits both lines")
+	bad := glyph_cells(px, W, lo.margin + lo.scale, bar_y, lo.scale, TITLE)
+	check(name, bad == "", fmt.tprint("list title:", bad))
+	bad = glyph_cells(px, W, lo.panel_x, lo.list_y + core.THUMB_H * lo.scale + lo.line, lo.scale, TITLE)
+	check(name, bad == "", fmt.tprint("panel title:", bad))
+
 	// A missing disc: no run, no settings; removed.
 	_ = os.rename(a, fmt.tprint(a, ".gone"))
 	check(name, play.launcher_reload(&l, a) && l.sel == 0 && l.discs[0].missing, "a missing")
@@ -1789,6 +1802,44 @@ test_launcher :: proc() {
 	_ = os.write_entire_file(not_disc, transmute([]u8)string("not a disc"))
 	ok, last = play.run_disc(self, not_disc, l.discs[0].id)
 	check(name, !ok && strings.contains(last, "is not a disc image"), fmt.tprintf("failed run: %v %q", ok, last))
+}
+
+LAUNCHER_TEXT :: 0xd8d8d8 // the launcher's text color
+GLYPH_CELL :: core.FONT_GLYPH * core.FONT_GLYPH
+
+// Check the launcher text str drawn at (x, y) of a picture stride pixels
+// wide, cell by cell against the font: a rune outside ASCII and the cell
+// past the last rune blank. A pixel is lit when it is the launcher's text
+// color. Returns "" or the first cell that differs.
+glyph_cells :: proc(px: []u32, stride, x, y, scale: int, str: string) -> string {
+	k := 0
+	for r in str {
+		want: [GLYPH_CELL]u32
+		if r < 0x80 {
+			core.font_glyph(want[:], core.FONT_GLYPH, u8(r), 0, 0, LAUNCHER_TEXT)
+		}
+		if !glyph_cell_is(px, stride, x + k * core.FONT_GLYPH * scale, y, scale, want) {
+			return fmt.tprintf("cell %d (%q)", k, r)
+		}
+		k += 1
+	}
+	if !glyph_cell_is(px, stride, x + k * core.FONT_GLYPH * scale, y, scale, {}) {
+		return fmt.tprintf("cell %d past the end", k)
+	}
+	return ""
+}
+
+// One cell of glyph_cells: lit where want is, unlit elsewhere.
+glyph_cell_is :: proc(px: []u32, stride, x, y, scale: int, want: [GLYPH_CELL]u32) -> bool {
+	for row in 0 ..< core.FONT_GLYPH * scale {
+		for col in 0 ..< core.FONT_GLYPH * scale {
+			lit := px[(y + row) * stride + x + col] == LAUNCHER_TEXT
+			if lit != (want[(row / scale) * core.FONT_GLYPH + col / scale] != 0) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // launcher_fit at every width from 0 to past the whole string, of strings of

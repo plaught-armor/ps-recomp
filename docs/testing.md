@@ -80,7 +80,7 @@ here.
 | `host_frames` | Each host, headless, exits at FRAMES |
 | `data` | The user data directory and its cached native code |
 | `compat` | Each host's compat line, and stubbed calls, under COMPAT |
-| `play` | `play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included |
+| `play` | `play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included; the launcher, its picture checked by point and a non-ASCII title cell by cell against the font |
 | `discimg` | The small disc images `disc` and `play` use |
 
 ## CI
