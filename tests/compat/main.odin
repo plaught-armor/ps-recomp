@@ -19,7 +19,10 @@
 // - stretches (in process): a stretch one sample short of
 //   core.COMPAT_STRETCH is not listed and one of exactly it is, for each
 //   kind; frozen needs a lit picture, a black one is not frozen; only
-//   sample vblanks count.
+//   sample vblanks count. Then 32x16 pictures that change by one pixel
+//   are a still stretch, deaf once a scripted press starts in it; a big
+//   change, and a picture of another size, end it; a picture that never
+//   changes is frozen only.
 package main
 
 import "core:encoding/json"
@@ -242,6 +245,44 @@ child :: proc(name: string) -> ! {
 	os.exit(1)
 }
 
+// The still and deaf stretches (see the header), after test_stretches'
+// samples, from vblank n.
+@(private = "file")
+test_still :: proc(n: ^u64, ram: []u8) {
+	name := "still"
+	S :: core.COMPAT_SAMPLE
+	core.compat.stretches_n, core.compat.stretches_other, core.compat.runs = 0, 0, {}
+	gray, white: [32 * 16]u32
+	slice.fill(gray[:], 0x00646464)
+	slice.fill(white[:], 0x00ffffff)
+	gray2, white2 := gray, white
+	gray2[0], white2[0] = 0x00ffffff, 0
+	wide: [48 * 16]u32
+	slice.fill(wide[:], 0x00ffffff)
+	sample :: proc(n: ^u64, ram: []u8, px: []u32, w: int) {
+		n^ += core.COMPAT_SAMPLE
+		ram[0] += 1
+		core.compat_sample(n^, px, w, w, 16)
+	}
+	n0 := n^
+	core.input.script_started = 0
+	// Still: gray at 1, then one pixel on and off 2..7 with no press.
+	sample(n, ram, gray[:], 32)
+	for k in 2 ..= 7 {sample(n, ram, gray2[:] if k % 2 == 0 else gray[:], 32)}
+	// Deaf: white at 8 starts again; a press starts at 10.
+	sample(n, ram, white[:], 32)
+	for k in 9 ..= 14 {
+		if k == 10 {core.input.script_started += 1}
+		sample(n, ram, white2[:] if k % 2 == 0 else white[:], 32)
+	}
+	// A wider picture at 15 ends it; the same picture 16..21 is frozen.
+	for _ in 15 ..= 21 {sample(n, ram, wide[:], 48)}
+	want := []core.Compat_Stretch{{"still", n0 + S, n0 + 7 * S}, {"deaf", n0 + 8 * S, n0 + 14 * S}, {"frozen", n0 + 15 * S, n0 + 21 * S}}
+	l := core.compat_line()
+	check(name, slice.equal(l.stretches, want) && l.stretches_other == 0, fmt.tprint("stretches:", l.stretches, "from", n0))
+	core.input.script_started = 0
+}
+
 // Samples of 4x2 pictures in process: black (display off, or every pixel
 // black), A or B (lit, different), with main RAM moved (fresh) or not.
 @(private = "file")
@@ -282,6 +323,7 @@ test_stretches :: proc() {
 	want := []core.Compat_Stretch{{"black", 8 * S, 14 * S}, {"frozen", 15 * S, 21 * S}, {"ram_still", 34 * S, 40 * S}}
 	l := core.compat_line()
 	check(name, slice.equal(l.stretches, want) && l.stretches_other == 0, fmt.tprint("stretches:", l.stretches, "frames", n))
+	test_still(&n, ram[:])
 	check(name, core.compat_sample_near(S - 10, 10) && !core.compat_sample_near(S - 11, 10) && core.compat_sample_near(S, 10) && !core.compat_sample_due(0), "sample timing")
 	core.compat.on = false
 	check(name, !core.compat_sample_due(S) && !core.compat_sample_near(S, 10), "sampling outside COMPAT")

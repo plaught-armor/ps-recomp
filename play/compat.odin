@@ -88,8 +88,11 @@ FATAL_MAX :: 200
 // waiting on vsync on a light screen idles nearly all the time too; lit: the
 // non-black pixels on the last frame of a run to FRAMES, "" when not counted;
 // stretches: the sampled stretches of at least core.COMPAT_STRETCH vblanks,
-// kind:from-to comma separated (kinds black, frozen, ram_still), then
-// +<n> for those past core.COMPAT_STRETCHES; information only.
+// kind:from-to comma separated (kinds black, frozen, ram_still, and still
+// or deaf for a picture that barely changed: deaf when a press of the
+// loaded PRESS script, the disc's press.txt when PRESS is unset, started
+// in it, still when none did; see core.Compat_Stretch_Kind), then +<n> for
+// those past core.COMPAT_STRETCHES; information only.
 Column :: enum {
 	Id,
 	Serial,

@@ -12,7 +12,8 @@
 // - and under COMPAT, every COMPAT_SAMPLE vblanks, the picture the host
 //   hands over and main RAM, so the line can list the stretches of at least
 //   COMPAT_STRETCH vblanks the picture was black, the picture did not
-//   change, or RAM did not change.
+//   change, the picture barely changed (with or without scripted presses
+//   meanwhile), or RAM did not change.
 // Built with -define:COMPAT_COUNT=false the counters compile away.
 //
 // COMPAT=1 makes a run a compatibility run: a call the HLE does not
@@ -53,19 +54,39 @@ COMPAT_STRETCH :: 1800
 // The most stretches the line lists; later ones count in stretches_other.
 COMPAT_STRETCHES :: 32
 
+// A still stretch's thumbnail: the mean of each COMPAT_BLOCK x COMPAT_BLOCK
+// block of the picture (whole blocks only), at most COMPAT_THUMB of them.
+COMPAT_BLOCK :: 16
+COMPAT_THUMB :: 4096
+
+// The most a picture's thumbnail may differ from its still stretch's first
+// one and the stretch go on: the mean, over the blocks, of the change in
+// block brightness (0..255). A blinking cursor or a pulsing highlight stays
+// under it; a camera move or a walking character goes far past it.
+COMPAT_STILL_DIFF :: 2.0
+
 // What a stretch is: the display off or every pixel black (Black), the
-// same picture as the sample before, not black (Frozen), or main RAM the
-// same as at the sample before (Ram_Still).
+// same picture as the sample before, not black (Frozen), main RAM the same
+// as at the sample before (Ram_Still), or a lit picture that changed but
+// stayed within COMPAT_STILL_DIFF of the stretch's first one (Still when
+// no press of the loaded PRESS script started in it, so the game may wait
+// for input on purpose; Deaf when one did, so the presses changed nothing
+// to see: a soft lock, or a script pressing the wrong thing). A stretch
+// that is frozen throughout is listed as frozen only.
 Compat_Stretch_Kind :: enum u8 {
 	Black,
 	Frozen,
 	Ram_Still,
+	Still, // followed for Deaf too; which it is is decided when listed
+	Deaf,
 }
 
 COMPAT_STRETCH_NAMES :: [Compat_Stretch_Kind]string {
 	.Black     = "black",
 	.Frozen    = "frozen",
 	.Ram_Still = "ram_still",
+	.Still     = "still",
+	.Deaf      = "deaf",
 }
 
 // A stretch in the line: from its first sample's vblank to its last's.
@@ -238,6 +259,16 @@ compat: struct {
 	sample_pic_ok:  bool,
 	sample_ram:     u64,
 	runs:           [Compat_Stretch_Kind]Stretch_Run,
+	// The still stretch: its first picture's thumbnail (thumb_n blocks, of
+	// a w x h picture; 0 blocks: none), the scripted presses started as of
+	// its first sample and its last, and whether the picture changed at
+	// any sample of it.
+	thumb:          [COMPAT_THUMB]f32,
+	thumb_n:        int,
+	thumb_w:        int,
+	thumb_h:        int,
+	still_presses:  [2]u64,
+	still_moved:    bool,
 	stretches:      [COMPAT_STRETCHES]struct {kind: Compat_Stretch_Kind, from, to: u64},
 	stretches_n:    int,
 	stretches_other: u64,
@@ -368,9 +399,11 @@ compat_sample :: proc(n: u64, px: []u32, stride, w, h: int) {
 		}
 		ram := xxhash.XXH3_64_default(compat.ram)
 		prev := compat.sample_at
+		frozen := lit && compat.sample_pic_ok && pic == compat.sample_pic
 		stretch_step(.Black, !lit, n, n)
-		stretch_step(.Frozen, lit && compat.sample_pic_ok && pic == compat.sample_pic, prev, n)
+		stretch_step(.Frozen, frozen, prev, n)
 		stretch_step(.Ram_Still, prev != 0 && ram == compat.sample_ram, prev, n)
+		still_step(n, px, stride, w, h, lit, frozen)
 		compat.sample_at, compat.sample_pic, compat.sample_pic_ok, compat.sample_ram = n, pic, lit, ram
 	}
 }
@@ -387,6 +420,73 @@ stretch_step :: proc(k: Compat_Stretch_Kind, holds: bool, from, n: u64) {
 		stretch_keep(k, r^)
 		r.on = false
 	}
+}
+
+// One sample of the still stretch at vblank n: on while the picture's
+// thumbnail stays within COMPAT_STILL_DIFF of the stretch's first, which a
+// sample that holds it not starts again from. A picture of another size,
+// or a dark one, ends it with no first picture to compare with.
+@(private = "file")
+still_step :: proc(n: u64, px: []u32, stride, w, h: int, lit, frozen: bool) {
+	bw, bh := w / COMPAT_BLOCK, h / COMPAT_BLOCK
+	thumb: [COMPAT_THUMB]f32
+	ok := lit && bw > 0 && bh > 0 && bw * bh <= COMPAT_THUMB
+	if ok {
+		for y in 0 ..< bh * COMPAT_BLOCK {
+			row := px[y * stride:][:bw * COMPAT_BLOCK]
+			t := thumb[y / COMPAT_BLOCK * bw:][:bw]
+			for c, x in row {
+				t[x / COMPAT_BLOCK] += f32(c & 0xff + c >> 8 & 0xff + c >> 16 & 0xff)
+			}
+		}
+		for &v in thumb[:bw * bh] {
+			v /= 3 * COMPAT_BLOCK * COMPAT_BLOCK
+		}
+	}
+	same_size := compat.thumb_n > 0 && w == compat.thumb_w && h == compat.thumb_h
+	near := false
+	if ok && same_size {
+		diff: f32
+		for v, i in thumb[:bw * bh] {
+			diff += abs(v - compat.thumb[i])
+		}
+		near = diff / f32(bw * bh) < COMPAT_STILL_DIFF
+	}
+	r := &compat.runs[.Still]
+	if near {
+		if !r.on {
+			r^ = {true, compat.sample_at, n}
+		}
+		r.last = n
+		compat.still_presses[1] = input.script_started
+		compat.still_moved ||= !frozen
+		return
+	}
+	if r.on {
+		if k := still_kind(); k != .Frozen {
+			stretch_keep(k, r^)
+		}
+		r.on = false
+	}
+	compat.thumb_n = 0
+	if ok {
+		copy(compat.thumb[:], thumb[:bw * bh])
+		compat.thumb_n, compat.thumb_w, compat.thumb_h = bw * bh, w, h
+		compat.still_presses = {input.script_started, input.script_started}
+		compat.still_moved = false
+	}
+}
+
+// What the still stretch is listed as: Still or Deaf, or Frozen, which the
+// frozen stretch over the same samples lists already, when its picture
+// never changed.
+@(private = "file")
+still_kind :: proc() -> Compat_Stretch_Kind {
+	switch {
+	case !compat.still_moved: return .Frozen
+	case compat.still_presses[1] > compat.still_presses[0]: return .Deaf
+	}
+	return .Still
 }
 
 // Keep run r of kind k for the line when it lasted COMPAT_STRETCH vblanks.
@@ -575,6 +675,13 @@ compat_stretches :: proc() -> (list: []Compat_Stretch, other: u64) {
 	for r, k in compat.runs {
 		if !r.on || r.last - r.from < COMPAT_STRETCH {
 			continue
+		}
+		k := k
+		if k == .Still {
+			// Frozen throughout: the frozen run lists it.
+			if k = still_kind(); k == .Frozen {
+				continue
+			}
 		}
 		if len(out) == COMPAT_STRETCHES {
 			other += 1

@@ -142,6 +142,8 @@ input: struct {
 	// Frame until which each button of each player stays held by input_tap.
 	tap_until: [MAX_PLAYERS][Pad_Button]u64,
 	script:    [dynamic]Scripted_Press,
+	// The script's presses that have started as of the last input_poll.
+	script_started: u64,
 	// The kind of device last used, for button prompts.
 	device:    Input_Device,
 	// The family of the controller last used or connected; PlayStation
@@ -518,7 +520,11 @@ input_poll :: proc(now: u64) -> (ps: [MAX_PLAYERS]Player_Input) {
 		p.right = stronger(p.right, {axis(pad, .RIGHTX), axis(pad, .RIGHTY)})
 	}
 	sticks: [MAX_PLAYERS]Stick_Dirs
+	input.script_started = 0
 	for s in input.script {
+		if now >= s.at {
+			input.script_started += 1
+		}
 		if now >= s.at && now < s.at + s.hold {
 			ps[s.player].buttons += s.buttons
 			sticks[s.player] += s.sticks
