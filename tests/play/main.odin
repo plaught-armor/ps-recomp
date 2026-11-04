@@ -1172,7 +1172,8 @@ test_quit :: proc() {
 		append(&vblanks, fmt.tprint(v))
 	}
 	// A window, not headless and not to FRAMES; SDL's dummy drivers need no
-	// display or sound device.
+	// display or sound device. SDL 2's dummy video has no accelerated
+	// renderer, so there the PS1 window takes the software fallback.
 	os.unset_env(core.env_name("HEADLESS"))
 	os.unset_env(core.env_name("FRAMES"))
 	os.set_env("SDL_VIDEODRIVER", "dummy")
@@ -1226,13 +1227,22 @@ test_quit :: proc() {
 			check(name, false, fmt.tprintf("%s: cannot run play: %v", what, perr))
 			continue
 		}
+		// Stops at once if play exits before the picture (a timeout of 0
+		// only polls).
 		start := time.tick_now()
-		for !os.exists(picture(dir, c.picture, QUIT_AFTER)) && time.tick_since(start) < 60 * time.Second {
+		state, werr := os.process_wait(p, 0)
+		for werr == os.General_Error.Timeout && !os.exists(picture(dir, c.picture, QUIT_AFTER)) && time.tick_since(start) < 60 * time.Second {
 			time.sleep(20 * time.Millisecond)
+			state, werr = os.process_wait(p, 0)
+		}
+		if werr != os.General_Error.Timeout {
+			text, _ := os.read_entire_file(log, context.temp_allocator)
+			check(name, false, fmt.tprintf("%s: play quit by itself before picture %d: %v %v, its output: %s", what, QUIT_AFTER, werr, state, text))
+			continue
 		}
 		check(name, os.exists(picture(dir, c.picture, QUIT_AFTER)), fmt.tprintf("%s: no picture %d within 60 s", what, QUIT_AFTER))
 		check(name, sigterm(p.pid), fmt.tprintf("%s: cannot send SIGTERM", what))
-		state, werr := os.process_wait(p, 30 * time.Second)
+		state, werr = os.process_wait(p, 30 * time.Second)
 		if werr != nil {
 			_ = os.process_kill(p)
 			_, _ = os.process_wait(p)
