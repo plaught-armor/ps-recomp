@@ -29,7 +29,7 @@ may still have bugs.
 |---|---|
 | Linux | The only system games have been played on. Automated tests run on x86-64 and arm64. |
 | Windows | Untested with games. Only the automated tests have run here. |
-| macOS | Untested with games. Only the automated tests have run here (arm64, and a subset as x86-64 under Rosetta). |
+| macOS | Untested. The code is type-checked for macOS, but neither games nor the automated tests run there. |
 
 ## What you need
 

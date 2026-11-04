@@ -86,8 +86,8 @@ here.
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
-Windows, and runs the tests on Linux (x86-64, arm64), macOS (arm64; a
-subset as x86-64 under Rosetta) and Windows.
+Windows, and runs the tests on Linux (x86-64, arm64) and Windows. No CI job
+runs the tests on macOS.
 
 Before sending a change, check what it touches as CI does, with vet and
 strict style:

@@ -34,7 +34,8 @@ jobs:
             done
           done
 
-  # Run every test on each host; under Rosetta (darwin_amd64), a subset.
+  # Run every test on each host. macOS has no test job (GitHub's hosted
+  # macOS runners stalled on capacity); darwin is type-checked above only.
   test:
     strategy:
       fail-fast: false
@@ -42,9 +43,6 @@ jobs:
         include:
           - os: ubuntu-24.04
           - os: ubuntu-24.04-arm
-          - os: macos-15
-          - os: macos-15
-            rosetta: true # darwin_amd64, cross-built and run under Rosetta
           - os: windows-2022
     runs-on: ${{ matrix.os }}
     steps:
@@ -59,11 +57,6 @@ jobs:
       - name: install SDL2 (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
-      - name: install SDL2 (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install sdl2
-          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
       - name: check windows packages
         if: runner.os == 'Windows'
         shell: bash
@@ -73,7 +66,6 @@ jobs:
           odin check recomp -collection:ps=. -vet -strict-style
           odin check play -collection:ps=. -vet -strict-style
       - name: test
-        if: ${{ !matrix.rosetta }}
         shell: bash
         run: |
           set -e
@@ -116,33 +108,3 @@ jobs:
           odin run tests/psx_interp -collection:ps=. -out:psx_interp_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/compat -collection:ps=. -out:compat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/play -collection:ps=. -define:COMMIT=test -out:play_test${{ runner.os == 'Windows' && '.exe' || '' }}
-      - name: test (x86-64 under Rosetta)
-        if: ${{ matrix.rosetta }}
-        run: |
-          softwareupdate --install-rosetta --agree-to-license
-          odin build tests/core -collection:ps=. -target:darwin_amd64 -out:core_test
-          arch -x86_64 ./core_test
-          odin build tests/native -collection:ps=. -target:darwin_amd64 -out:native_test
-          arch -x86_64 ./native_test
-          odin build tests/ee_native -collection:ps=. -target:darwin_amd64 -out:ee_native_test
-          arch -x86_64 ./ee_native_test
-          odin build tests/ee_spin -collection:ps=. -target:darwin_amd64 -out:ee_spin_test
-          arch -x86_64 ./ee_spin_test
-          odin build tests/psx_learned -collection:ps=. -target:darwin_amd64 -out:psx_learned_test
-          arch -x86_64 ./psx_learned_test
-          odin build tests/iop_learned -collection:ps=. -target:darwin_amd64 -out:iop_learned_test
-          arch -x86_64 ./iop_learned_test
-          odin build tests/psx_unaligned -collection:ps=. -target:darwin_amd64 -out:psx_unaligned_test
-          arch -x86_64 ./psx_unaligned_test
-          odin build tests/psx_gte -collection:ps=. -target:darwin_amd64 -out:psx_gte_test
-          arch -x86_64 ./psx_gte_test
-          odin build tests/psx_timer -collection:ps=. -target:darwin_amd64 -out:psx_timer_test
-          arch -x86_64 ./psx_timer_test
-          odin build tests/disc -collection:ps=. -target:darwin_amd64 -out:disc_test
-          arch -x86_64 ./disc_test
-          odin build tests/fpu -collection:ps=. -target:darwin_amd64 -out:fpu_test
-          arch -x86_64 ./fpu_test
-          odin build tests/vu -collection:ps=. -target:darwin_amd64 -out:vu_test
-          arch -x86_64 ./vu_test
-          odin build tests/vu_native -collection:ps=. -target:darwin_amd64 -out:vu_native_test
-          arch -x86_64 ./vu_native_test
