@@ -247,6 +247,15 @@ Each game's output goes to `compat.log`, in its `discs/<disc id>/` folder.
 If a `press.txt` file is in that folder, it is used as the game's scripted
 button presses (`PS_PRESS`).
 
+Each game starts on blank memory cards, so a save left by an earlier run
+does not change what the game does. They are kept in `compat-cards` in the
+disc's folder and emptied before each run; the disc's own `cards` are not
+touched. Set `PS_COMPAT_CARDS=keep` to run on the disc's own cards
+instead, as a normal run does, for example to check that a save loads.
+The `cards` column says which: `fresh`, `kept`, or `kept-empty` (kept, but
+the disc's cards held no files). Run one compatibility run of a disc at a
+time: two at once in the same data folder share its `compat-cards`.
+
 A press script is a comma-separated list of `<name>@<frame>` entries, for
 example `Start@600,Cross@900+10,LUp&LRight@1200+300:2`:
 

@@ -273,7 +273,9 @@ play :: proc(image: string) -> int {
 	// The picture a run ends on (a quit, a COMPAT run's last vblank), for
 	// the launcher.
 	core.thumb_path = core.disc_path(dir, .Thumb)
-	cards := core.disc_path(dir, .Cards)
+	// A compat child plays on the cards its parent emptied, unless
+	// COMPAT_CARDS=keep (compat_disc).
+	cards := core.disc_path(dir, .Compat_Cards if compat_child() && core.env("COMPAT_CARDS") != "keep" else .Cards)
 	if err := os.make_directory_all(cards); err != nil && !(err == .Exist && os.is_dir(cards)) {
 		fmt.eprintln("play: cannot make", cards, err)
 		return 1

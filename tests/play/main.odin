@@ -49,6 +49,12 @@
 //   is not tried again in the child, which runs without learned code. A
 //   compile that hangs (a fake one) is stopped after its window, 5 s under
 //   a 1 s COMPAT_WAIT, and the child runs without learned code.
+// - compat_cards: play --compat on a PS1 disc whose cards hold a card of the
+//   wrong size, and whose compat-cards hold a stale file, runs on blank
+//   cards by default: the row says fresh, the child finds no card in
+//   compat-cards, the stale file is gone and the disc's card is untouched.
+//   COMPAT_CARDS=keep runs on the disc's cards (kept, the bad card read);
+//   any other value is an error with no run.
 // - quit: a PS2 disc that draws and a PS1 one that fills VRAM run in a
 //   window (SDL's dummy video driver, software drawing) until a picture is
 //   written (SHOT, DUMP), then get SIGTERM, which SDL turns into the quit
@@ -196,6 +202,7 @@ main :: proc() {
 	test_settings()
 	test_compat()
 	test_compat_learned()
+	test_compat_cards()
 	test_quit()
 	test_line_row()
 	test_library()
@@ -1068,6 +1075,56 @@ test_line_row :: proc() {
 	l.lit, l.fallback = 1, false
 	play.line_row(&row, l)
 	check(name, row[.Result] == "ok", fmt.tprintf("ok: %v", row))
+}
+
+// play --compat with COMPAT_CARDS unset, keep, and a bad value.
+@(private = "file")
+test_compat_cards :: proc() {
+	name := "compat_cards"
+	path := write(name, labeled(cnf_disc(), "COMPAT CARDS"))
+	dir := disc_dir(name, path)
+	if dir == "" {
+		return
+	}
+	cards := core.disc_path(dir, .Cards, context.temp_allocator)
+	fresh := core.disc_path(dir, .Compat_Cards, context.temp_allocator)
+	card, _ := filepath.join({cards, "slot1.mcd"}, context.temp_allocator)
+	stale, _ := filepath.join({fresh, "stale"}, context.temp_allocator)
+	// 10 bytes: a card this short does not load.
+	bad :: "not a card"
+	if os.make_directory_all(cards) != nil || os.make_directory_all(fresh) != nil || os.write_entire_file(card, bad) != nil || os.write_entire_file(stale, "") != nil {
+		check(name, false, "cannot write the cards")
+		return
+	}
+	log_path := core.disc_path(dir, .Compat_Log, context.temp_allocator)
+	id := disc_id(name, path)
+
+	out, errs, ok := run_compat(name, {path, fmt.tprint(FRAMES)})
+	row, found := compat_row(compat_rows(name), id)
+	log, _ := os.read_entire_file(log_path, context.temp_allocator)
+	what := fmt.tprintf("fresh: %v\nstdout:\n%s\nstderr:\n%s\ncompat.log:\n%s", row, out, errs, log)
+	check(name, ok && found && row[.Cards] == "fresh" && row[.Result] == "stalled", what)
+	blank, _ := filepath.join({fresh, "slot1.mcd"}, context.temp_allocator)
+	check(name, strings.contains(string(log), fmt.tprintf("memcard: %s not found, using a blank card", blank)), what)
+	check(name, !os.exists(stale), "the stale compat card kept")
+	kept, _ := os.read_entire_file(card, context.temp_allocator)
+	check(name, string(kept) == bad, fmt.tprintf("the disc's card changed: %q", kept))
+
+	os.set_env(core.env_name("COMPAT_CARDS"), "keep")
+	out, errs, ok = run_compat(name, {path, fmt.tprint(FRAMES)})
+	row, found = compat_row(compat_rows(name), id)
+	log, _ = os.read_entire_file(log_path, context.temp_allocator)
+	what = fmt.tprintf("keep: %v\nstdout:\n%s\nstderr:\n%s\ncompat.log:\n%s", row, out, errs, log)
+	check(name, ok && found && row[.Cards] == "kept", what)
+	check(name, strings.contains(string(log), fmt.tprintf("memcard: %s is 10 bytes, expected", card)), what)
+
+	os.set_env(core.env_name("COMPAT_CARDS"), "old")
+	before := row
+	out, errs, ok = run_compat(name, {path, fmt.tprint(FRAMES)})
+	os.unset_env(core.env_name("COMPAT_CARDS"))
+	row, found = compat_row(compat_rows(name), id)
+	check(name, !ok && strings.contains(errs, "is not fresh or keep: old"), fmt.tprintf("bad value: stdout:\n%s\nstderr:\n%s", out, errs))
+	check(name, found && row == before, fmt.tprintf("bad value ran: %v", row))
 }
 
 // play --compat on a disc with LEARN records: the parent compiles, never

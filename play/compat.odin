@@ -18,6 +18,13 @@
 // fails or is stopped runs without learned code, its child not compiling
 // again.
 //
+// Each child starts on blank memory cards: its parent empties the disc's
+// compat-cards folder first, and the child uses it in place of cards, so a
+// save from an earlier run cannot change the game's route. COMPAT_CARDS=keep
+// runs on the disc's cards instead, as play does, for a run that proves a
+// save loads. One run of a disc at a time is assumed: a parent runs its
+// discs in turn, but two parents in one data folder would share the folder.
+//
 // The disc's press.txt, when there is one and PRESS is unset, is the
 // child's PRESS script.
 package play
@@ -95,7 +102,9 @@ FATAL_MAX :: 200
 // stuck prompt over a moving 3D scene; see core.Compat_Stretch_Kind), then +<n> for
 // those past core.COMPAT_STRETCHES; information only; learned: whether the
 // run had the disc's learned code (a PS2 disc's: its IOP's or EE's), compiled from
-// the records earlier runs left.
+// the records earlier runs left; cards: fresh (the child ran on blank cards,
+// the default), kept (COMPAT_CARDS=keep, on the disc's cards, which held
+// files) or kept-empty (keep, the disc's cards empty or missing).
 Column :: enum {
 	Id,
 	Serial,
@@ -122,6 +131,7 @@ Column :: enum {
 	Lit,
 	Stretches,
 	Learned,
+	Cards,
 }
 
 COLUMNS :: [Column]string {
@@ -150,6 +160,7 @@ COLUMNS :: [Column]string {
 	.Lit           = "lit",
 	.Stretches     = "stretches",
 	.Learned       = "learned",
+	.Cards         = "cards",
 }
 
 Row :: [Column]string
@@ -159,7 +170,7 @@ Row :: [Column]string
 // every disc found has a row, 1 when none was found or compat.tsv cannot
 // be written, 2 on a bad setting.
 compat_mode :: proc(path, frames_arg: string) -> int {
-	frames, wait, ok := compat_settings(frames_arg)
+	frames, wait, keep, ok := compat_settings(frames_arg)
 	if !ok {
 		return 2
 	}
@@ -174,7 +185,7 @@ compat_mode :: proc(path, frames_arg: string) -> int {
 		// Everything one disc needs goes when it is done.
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		context.allocator = context.temp_allocator
-		row, ran := compat_disc(image, frames, wait)
+		row, ran := compat_disc(image, frames, wait, keep)
 		if !ran {
 			continue
 		}
@@ -191,9 +202,10 @@ compat_mode :: proc(path, frames_arg: string) -> int {
 	return 0
 }
 
-// The vblank count and COMPAT_WAIT; false, after a message, for a bad one.
+// The vblank count, COMPAT_WAIT and whether COMPAT_CARDS keeps the disc's
+// cards; false, after a message, for a bad one.
 @(private = "file")
-compat_settings :: proc(frames_arg: string) -> (frames, wait: u64, ok: bool) {
+compat_settings :: proc(frames_arg: string) -> (frames, wait: u64, keep, ok: bool) {
 	frames, wait = COMPAT_FRAMES, COMPAT_WAIT
 	v, name := frames_arg, "frames"
 	if v == "" {
@@ -202,16 +214,24 @@ compat_settings :: proc(frames_arg: string) -> (frames, wait: u64, ok: bool) {
 	if v != "" {
 		if frames, ok = strconv.parse_u64(v, 10); !ok || frames == 0 {
 			fmt.eprintln("play:", name, "is not a vblank count:", v)
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 	}
 	if v = core.env("COMPAT_WAIT"); v != "" {
 		if wait, ok = strconv.parse_u64(v, 10); !ok || wait == 0 {
 			fmt.eprintln("play:", core.env_name("COMPAT_WAIT"), "is not a count of seconds:", v)
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 	}
-	return frames, wait, true
+	switch v = core.env("COMPAT_CARDS"); v {
+	case "", "fresh":
+	case "keep":
+		keep = true
+	case:
+		fmt.eprintln("play:", core.env_name("COMPAT_CARDS"), "is not fresh or keep:", v)
+		return 0, 0, false, false
+	}
+	return frames, wait, keep, true
 }
 
 // The path, or the .cue, .iso and .bin files in the directory at path in
@@ -259,7 +279,7 @@ compat_images :: proc(path: string) -> []string {
 // Run one disc image in a child and make its row; false, after a message,
 // for a file that is not a disc with an executable.
 @(private = "file")
-compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
+compat_disc :: proc(image: string, frames, wait: u64, keep: bool) -> (row: Row, ran: bool) {
 	id, cnf, _, ok := identify(image)
 	if !ok {
 		return
@@ -299,6 +319,19 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	if lerr != nil {
 		row[.Result], row[.Fatal] = "spawn", fmt.tprint("cannot create", log_path, lerr)
 		return
+	}
+	// The child's cards (play's main): blank ones, or the disc's own.
+	if keep {
+		have, _ := os.read_directory_by_path(core.disc_path(dir, .Cards), 1, context.temp_allocator)
+		row[.Cards] = "kept" if len(have) > 0 else "kept-empty"
+	} else {
+		cards := core.disc_path(dir, .Compat_Cards)
+		if err := os.remove_all(cards); err != nil && err != .Not_Exist {
+			os.close(log)
+			row[.Result], row[.Fatal] = "spawn", fmt.tprint("cannot empty", cards, err)
+			return
+		}
+		row[.Cards] = "fresh"
 	}
 	progress_path := core.disc_path(dir, .Compat_Progress)
 	// Empty: a count from an earlier run is not progress of this one.

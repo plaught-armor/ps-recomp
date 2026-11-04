@@ -98,6 +98,14 @@ says whether a run had learned code, so a cold run (no records yet) and a
 warm one are told apart. Set `PS_LEARN=0` for a run with no learned code that records
 nothing.
 
+Each child plays on blank cards: the parent empties the disc's
+`compat-cards` folder before it starts, so a save from an earlier run (a
+cold run's, say) cannot send a warm run down another route.
+`PS_COMPAT_CARDS=keep` runs on the disc's `cards` as play does, for a
+save and reload check; the `cards` column says `fresh`, `kept` or
+`kept-empty`. One run of a disc at a time is assumed: a parent runs its
+discs in turn, but two parents in one `PS_DATA` share `compat-cards`.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
