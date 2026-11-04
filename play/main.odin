@@ -144,16 +144,19 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile: bool, deadline: 
 		fmt.eprintln("play: cannot read", records, err)
 		return ""
 	}
+	// A file of an earlier stream version compacts to nothing and is
+	// emptied, so the runs after record anew rather than append behind
+	// records no reader gets past.
 	compact, n := core.learn_compact(data)
 	defer delete(compact)
-	if n == 0 {
-		return ""
-	}
 	if string(compact) != string(data) {
 		if werr := core.write_file_atomic(records, compact); werr != nil {
 			fmt.eprintln("play: cannot write", records, werr)
 			return ""
 		}
+	}
+	if n == 0 {
+		return ""
 	}
 	// Each record by its code's hash; compacted, they are in one order.
 	Key :: struct #packed {

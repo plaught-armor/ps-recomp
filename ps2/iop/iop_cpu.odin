@@ -20,7 +20,7 @@ IOP_EVENT_OFF :: max(u64)
 iop_cpu_init :: proc() {
 	r3000.state = {}
 	r3000.learn_cpu = .Iop
-	core.learn_cpu(.Iop, &r3000.state.cycles, r3000.CYCLES_PER_INSN, proc(a: u32) -> u32 {return r3000.lw(a)}, r3000.RAM_SIZE)
+	core.learn_cpu(.Iop, &r3000.state.cycles, r3000.CYCLES_PER_INSN, proc(a: u32) -> u32 {return r3000.lw(a)}, r3000.RAM_SIZE, true)
 	r3000.cop0 = {}
 	r3000.scratch = {}
 	r3000.next_event = IOP_EVENT_OFF

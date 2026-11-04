@@ -9,22 +9,32 @@
 // never returns (a guest thread's loop) is noted when the process reports,
 // with what it fetched so far, marked .Open.
 //
+// A run is also marked .Smc when the words it fetched are not the words
+// written: a fetch of a RAM word saw another word than an earlier fetch of
+// it in the run, or than RAM holds when the record is written. That is code
+// changed mid-run by a store no interpreter notes (recompiled code, a DMA,
+// the host): a callee patching its caller's calls, say, and the caller
+// restoring them later. Each RAM word keeps the word last fetched there and
+// when, so the check is exact; a fetch outside RAM (a ROM) is not checked.
+//
 // How stores are checked depends on the processor (learn_cpu). With RAM
-// stamps (the R3000 memory map: PS1), each RAM word keeps the number of the
-// last store into it, so the check is exact for any run length; a range
-// outside RAM cannot be checked and is marked .Smc_Unknown. Without, a ring
-// of the last LEARN_STORES_MAX store addresses is looked back over; a run
-// whose stores outran it is marked .Smc_Unknown, never clean.
+// stamps (PS1, IOP), each RAM word keeps the number of the last store into
+// it, so the check is exact for any run length; a range outside RAM cannot
+// be checked and is marked .Smc_Unknown. Without (EE), a ring of the last
+// LEARN_STORES_MAX store addresses is looked back over; a run whose stores
+// outran it is marked .Smc_Unknown, never clean.
 //
 // The file is a run of records, appended and never rewritten, so several
 // runs can share one file and a run that never reaches its end keeps what it
 // wrote:
-//	'D', cpu: u8, flags: u8, 0: u8, entry: u32, lo: u32, n: u32, hash: u64,
+//	'E', cpu: u8, flags: u8, 0: u8, entry: u32, lo: u32, n: u32, hash: u64,
 //	words: [n]u32
 // lo is the first word's address; hash is the XXH3-64 of the words' bytes,
 // so a reader drops a record whose words do not match it. Integers are
 // little-endian. Records repeat across runs; readers dedupe. The tag is the
-// stream's version: 'C' files (no .Open, ring-only checks) are not read.
+// stream's version: earlier files are not read, as 'C' (no .Open, ring-only
+// checks) and 'D' (fetched words not checked) records may hold code that
+// changed mid-run.
 //
 // Learning is host state, off the emulator heap: snapshots and rollback
 // never roll it back, so a replayed frame is counted again. Without LEARN
@@ -64,7 +74,7 @@ LEARN_STORES_MAX :: 1 << 16
 LEARN_LIVE_MAX :: 1024
 
 LEARN_HEADER :: 24
-LEARN_TAG :: 'D'
+LEARN_TAG :: 'E'
 
 // One interpreted run in progress. Frames live in learn.pool, not on the
 // interpreter's stack: guest threads switch coroutines mid-run, so runs need
@@ -75,7 +85,9 @@ Learn_Frame :: struct {
 	slot:   u16, // its index in learn.pool
 	entry:  u32,
 	lo, hi: u32, // the lowest and highest word fetched
-	log_at: u64, // Learn_Space.seq when the run began
+	log_at:   u64, // Learn_Space.seq when the run began
+	fetch_at: u64, // Learn_Space.insns when the run began
+	changed:  bool, // a fetch saw another word than an earlier one there
 }
 
 Learn_Record :: struct {
@@ -101,7 +113,8 @@ Learn_Space :: struct {
 	cycles:    ^u64, // the processor's cycle counter
 	cpi:       u64, // the cycles its interpreter charges an instruction
 	read:      proc(addr: u32) -> u32, // a word of its memory
-	ram_bytes: u32, // RAM size for stamps, a power of two; 0 for the ring
+	ram_bytes: u32, // RAM size, a power of two: the words fetched and stamped
+	stamped:   bool, // stores are checked by RAM stamps, not the ring
 	insns:     u64, // instructions interpreted, delay slots included
 	runs:      u64, // runs that returned
 	begun:     u64,
@@ -116,6 +129,10 @@ Learn_Space :: struct {
 	// With RAM stamps: per RAM word, the seq of the last store into it (0:
 	// none since learning began).
 	stamps:    []u64,
+	// Per RAM word, the word last fetched there and the insns count of
+	// that fetch (0: none since learning began).
+	fetched:    []u32,
+	fetched_at: []u64,
 	// Without: the store addresses, a ring of LEARN_STORES_MAX; a run looks
 	// back over those since it began. Never cleared, as a run that never
 	// returns must not hold it.
@@ -191,23 +208,25 @@ learn_on :: #force_inline proc(cpu: Learn_Cpu) -> bool {
 }
 
 // Name cpu's cycle counter, the cycles its interpreter charges an
-// instruction (for the summary) and how to read a word of its memory. With
-// ram_bytes (a power of two) its stores are checked by RAM stamps over the
-// R3000 map: RAM and its mirrors below physical 0x800000.
-learn_cpu :: proc(cpu: Learn_Cpu, cycles: ^u64, cycles_per_insn: u64, read: proc(addr: u32) -> u32, ram_bytes: u32 = 0) {
-	assert(ram_bytes & (ram_bytes - 1) == 0)
+// instruction (for the summary), how to read a word of its memory and the
+// size of its RAM, a power of two, at physical 0 with its mirrors below
+// physical max(0x800000, ram_bytes) (the R3000 map; the EE's 32 MB has
+// none). With stamps its stores are checked by RAM stamps, else the ring.
+learn_cpu :: proc(cpu: Learn_Cpu, cycles: ^u64, cycles_per_insn: u64, read: proc(addr: u32) -> u32, ram_bytes: u32, stamps: bool) {
+	assert(ram_bytes != 0 && ram_bytes & (ram_bytes - 1) == 0)
 	s := &learn.space[cpu]
 	s.cycles = cycles
 	s.cpi = cycles_per_insn
 	s.read = read
 	s.ram_bytes = ram_bytes
+	s.stamped = stamps
 }
 
-// The RAM word index of addr in s's stamps; false outside RAM.
+// The RAM word index of addr; false outside RAM.
 @(private = "file")
 ram_word :: #force_inline proc(s: ^Learn_Space, addr: u32) -> (u32, bool) {
 	phys := addr & 0x1fff_ffff
-	if phys >= 0x80_0000 {
+	if phys >= max(0x80_0000, s.ram_bytes) {
 		return 0, false
 	}
 	return (phys & (s.ram_bytes - 1)) >> 2, true
@@ -234,21 +253,42 @@ learn_begin :: proc(cpu: Learn_Cpu, entry: u32) -> ^Learn_Frame {
 	s.begun += 1
 	s.begin_seq = s.seq
 	f := &learn.pool[k]
-	f^ = {cpu = cpu, slot = k, entry = entry, lo = entry, hi = entry, log_at = s.seq}
+	f^ = {cpu = cpu, slot = k, entry = entry, lo = entry, hi = entry, log_at = s.seq, fetch_at = s.insns}
 	return f
 }
 
-// The interpreter fetched the word at pc for f's run.
-learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc: u32) {
+// The interpreter fetched w, the word at pc, for f's run.
+learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) {
 	f.lo = min(f.lo, pc)
 	f.hi = max(f.hi, pc)
-	learn.space[f.cpu].insns += 1
+	s := &learn.space[f.cpu]
+	s.insns += 1
+	k, in_ram := ram_word(s, pc)
+	if !in_ram {
+		return
+	}
+	if s.fetched == nil {
+		learn_fetched_make(s)
+	}
+	if s.fetched_at[k] > f.fetch_at && s.fetched[k] != w {
+		f.changed = true
+	}
+	s.fetched[k] = w
+	s.fetched_at[k] = s.insns
+}
+
+// Untouched pages of the zeroed arrays are never committed: the host keeps
+// only those of the RAM code is fetched from.
+@(private = "file")
+learn_fetched_make :: proc(s: ^Learn_Space) {
+	s.fetched = make([]u32, s.ram_bytes / 4, runtime.heap_allocator())
+	s.fetched_at = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
 }
 
 // f's run stores at addr.
 learn_store :: proc(f: ^Learn_Frame, addr: u32) {
 	s := &learn.space[f.cpu]
-	if s.ram_bytes != 0 {
+	if s.stamped {
 		w, in_ram := ram_word(s, addr)
 		if !in_ram {
 			return
@@ -293,7 +333,7 @@ learn_end :: proc(f: ^Learn_Frame) {
 // well, never missing its own.
 @(private = "file")
 learn_smc :: proc(s: ^Learn_Space, f: ^Learn_Frame) -> Learn_Flags {
-	if s.ram_bytes != 0 {
+	if s.stamped {
 		if f.hi - f.lo + 4 > LEARN_SPAN_MAX {
 			return {} // .Large: no words to check against
 		}
@@ -347,6 +387,9 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 	for &w, i in words {
 		w = u32le(s.read(f.lo + u32(i) * 4))
 	}
+	if n != 0 && learn_refetched(s, f, words) {
+		flags += {.Smc}
+	}
 	hash := u64(xxhash.XXH3_64_default(learn.buf[LEARN_HEADER:]))
 	key := Learn_Key{f.cpu, flags, f.entry, f.lo, n, hash}
 	if key in learn.keys {
@@ -372,6 +415,26 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 	for w, i in words {
 		s.words[u64(f.lo + u32(i) * 4) << 32 | u64(w)] = true
 	}
+}
+
+// Whether f's run fetched other words than words, its range's now: a fetch
+// saw another word than an earlier fetch there, or the last fetch of a word
+// since the run began is not that word.
+@(private = "file")
+learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> bool {
+	if f.changed {
+		return true
+	}
+	if s.fetched == nil {
+		return false
+	}
+	for w, i in words {
+		k, in_ram := ram_word(s, f.lo + u32(i) * 4)
+		if in_ram && s.fetched_at[k] > f.fetch_at && s.fetched[k] != u32(w) {
+			return true
+		}
+	}
+	return false
 }
 
 @(private = "file")

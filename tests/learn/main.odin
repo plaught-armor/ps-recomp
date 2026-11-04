@@ -5,7 +5,11 @@
 // progress included; stores past the log mark .Smc_Unknown, but not with
 // RAM stamps, which see a store any number of stores back, through RAM's
 // mirrors, and mark a range outside RAM .Smc_Unknown; a repeated store
-// address is seen by a run begun between the two stores; a range over
+// address is seen by a run begun between the two stores; code changed
+// mid-run with no store noted (a callee patching its caller) marks the run
+// .Smc, whether RAM no longer holds a word it fetched or a word it fetched
+// twice changed between, and a word an earlier run fetched as another does
+// not; a range over
 // LEARN_SPAN_MAX is .Large with no words; a run begun with every frame in
 // use is not noted; a run still in progress at the report is written
 // .Open; and a reader drops a truncated record, one whose words do not
@@ -40,7 +44,7 @@ word :: proc(a: u32) -> u32 {
 @(private = "file")
 run :: proc(cpu: core.Learn_Cpu, entry: u32, pcs: []u32, stores: []u32 = nil) {
 	f := core.learn_begin(cpu, entry)
-	for pc in pcs {core.learn_fetch(f, pc)}
+	for pc in pcs {core.learn_fetch(f, pc, word(pc))}
 	for a in stores {core.learn_store(f, a)}
 	core.learn_end(f)
 }
@@ -78,9 +82,9 @@ main :: proc() {
 	path, _ := filepath.join({tmp, "learn.bin"}, context.allocator)
 	check(core.learn_open_path(path), "open")
 	cycles: u64 = 1000
-	core.learn_cpu(.Ee, &cycles, 1, word)
-	core.learn_cpu(.Iop, &cycles, 1, word)
-	core.learn_cpu(.Psx, &cycles, 1, word, 2 * 1024 * 1024)
+	core.learn_cpu(.Ee, &cycles, 1, word, 32 * 1024 * 1024, false)
+	core.learn_cpu(.Iop, &cycles, 1, word, 2 * 1024 * 1024, false)
+	core.learn_cpu(.Psx, &cycles, 1, word, 2 * 1024 * 1024, true)
 
 	run(.Ee, 0x1000, {0x1000, 0x1004, 0x1008, 0x100c}, {0x8000})
 	run(.Ee, 0x1000, {0x1000, 0x1004, 0x1008, 0x100c}, {0x8000}) // a repeat
@@ -93,7 +97,7 @@ main :: proc() {
 	// More stores than the log holds, none in range.
 	{
 		f := core.learn_begin(.Iop, 0x1030)
-		core.learn_fetch(f, 0x1030)
+		core.learn_fetch(f, 0x1030, word(0x1030))
 		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(f, 0x9000_0000 + i * 4)}
 		core.learn_end(f)
 	}
@@ -102,12 +106,12 @@ main :: proc() {
 	// inner's end does not lose it.
 	{
 		g := core.learn_begin(.Ee, 0x1100)
-		core.learn_fetch(g, 0x1100)
+		core.learn_fetch(g, 0x1100, word(0x1100))
 		h := core.learn_begin(.Ee, 0x2000)
-		core.learn_fetch(h, 0x2000)
+		core.learn_fetch(h, 0x2000, word(0x2000))
 		core.learn_store(h, 0x1104)
 		core.learn_end(h)
-		core.learn_fetch(g, 0x1108)
+		core.learn_fetch(g, 0x1108, word(0x1108))
 		core.learn_end(g)
 	}
 	// A store to the address of the store before it, by a run begun between
@@ -118,19 +122,43 @@ main :: proc() {
 	// ring holds is still seen, and as many stores elsewhere mark nothing.
 	{
 		f := core.learn_begin(.Psx, 0x4000)
-		core.learn_fetch(f, 0x4000)
-		core.learn_fetch(f, 0x4004)
+		core.learn_fetch(f, 0x4000, word(0x4000))
+		core.learn_fetch(f, 0x4004, word(0x4004))
 		core.learn_store(f, 0x4004)
 		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(f, 0x10_0000 + i * 4)}
 		core.learn_end(f)
 		g := core.learn_begin(.Psx, 0x5000)
-		core.learn_fetch(g, 0x5000)
+		core.learn_fetch(g, 0x5000, word(0x5000))
 		for i in 0 ..= u32(core.LEARN_STORES_MAX) {core.learn_store(g, 0x10_0000 + i * 4)}
 		core.learn_end(g)
 	}
 	// A store through a RAM mirror into a kseg0 range; a range outside RAM.
 	run(.Psx, 0x8000_6000, {0x8000_6000, 0x8000_6004}, {0x0020_6004})
 	run(.Psx, 0x1f80_0000, {0x1f80_0000})
+	// Code changed mid-run where no store is noted, as recompiled code
+	// patching its caller's next call and restoring it: the caller fetched a
+	// word RAM no longer holds at its end. Its callee is clean.
+	{
+		g := core.learn_begin(.Ee, 0x8000)
+		core.learn_fetch(g, 0x8000, word(0x8000))
+		core.learn_fetch(g, 0x8004, word(0x8004))
+		h := core.learn_begin(.Ee, 0x9000)
+		core.learn_fetch(h, 0x9000, word(0x9000))
+		core.learn_end(h)
+		core.learn_fetch(g, 0x8008, word(0x8008) ~ 0xffff)
+		core.learn_end(g)
+	}
+	// A word fetched twice in a run and changed between: RAM holds the
+	// second at the end, but the run began with the first.
+	{
+		f := core.learn_begin(.Psx, 0xa000)
+		core.learn_fetch(f, 0xa000, word(0xa000) ~ 0xffff)
+		core.learn_fetch(f, 0xa004, word(0xa004))
+		core.learn_fetch(f, 0xa000, word(0xa000))
+		core.learn_end(f)
+	}
+	// A word in range fetched as another only by an earlier run: clean.
+	run(.Ee, 0x8004, {0x8004, 0x800c})
 	// Every frame in use: the next run is not noted, and the others write
 	// one record between them.
 	{
@@ -138,7 +166,7 @@ main :: proc() {
 		for &f in live {
 			f = core.learn_begin(.Ee, 0x6000)
 			check(f != nil, "pool: a frame")
-			core.learn_fetch(f, 0x6000)
+			core.learn_fetch(f, 0x6000, word(0x6000))
 		}
 		check(core.learn_begin(.Ee, 0x6100) == nil, "pool: full")
 		for f in live {core.learn_end(f)}
@@ -146,8 +174,8 @@ main :: proc() {
 	// A run that never returns is written at the report.
 	{
 		f := core.learn_begin(.Psx, 0x7000)
-		core.learn_fetch(f, 0x7000)
-		core.learn_fetch(f, 0x7004)
+		core.learn_fetch(f, 0x7000, word(0x7000))
+		core.learn_fetch(f, 0x7004, word(0x7004))
 	}
 	core.learn_report()
 	check(!core.learn_on(.Ee) && !core.learn_on(.Iop), "on after the report")
@@ -176,6 +204,10 @@ main :: proc() {
 		{.Psx, {}, 0x5000, 0x5000, 1},
 		{.Psx, {.Smc}, 0x8000_6000, 0x8000_6000, 2},
 		{.Psx, {.Smc_Unknown}, 0x1f80_0000, 0x1f80_0000, 1},
+		{.Ee, {}, 0x9000, 0x9000, 1},
+		{.Ee, {.Smc}, 0x8000, 0x8000, 3},
+		{.Psx, {.Smc}, 0xa000, 0xa000, 2},
+		{.Ee, {}, 0x8004, 0x8004, 3},
 		{.Ee, {}, 0x6000, 0x6000, 1},
 		{.Psx, {.Open}, 0x7000, 0x7000, 2},
 	}

@@ -53,7 +53,7 @@ interp_loop :: proc(start: u32) {
 		pc := st.pc
 		st.pc += 4
 		st.pending += 1
-		if st.learn != nil {core.learn_fetch(st.learn, pc)}
+		if st.learn != nil {core.learn_fetch(st.learn, pc, w)}
 		if .Interp in core.trace.active && core.trace_pc_ok(pc) {
 			core.tracef(.Interp, "%08x %08x", pc, w)
 		}
@@ -87,7 +87,7 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	w := lw(slot)
 	st.pc += 4
 	st.pending += 1
-	if st.learn != nil {core.learn_fetch(st.learn, slot)}
+	if st.learn != nil {core.learn_fetch(st.learn, slot, w)}
 	if .Interp in core.trace.active && core.trace_pc_ok(slot) {
 		core.tracef(.Interp, "%08x %08x (delay)", slot, w)
 	}

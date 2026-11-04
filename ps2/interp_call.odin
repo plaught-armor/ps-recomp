@@ -99,7 +99,7 @@ interp_call :: proc(entry: u32) {
 // stores if it is a store.
 @(private = "file")
 learn_note :: proc(f: ^core.Learn_Frame, i: r5900.Insn) {
-	core.learn_fetch(f, i.pc)
+	core.learn_fetch(f, i.pc, i.w)
 	#partial switch i.op {
 	case .SB, .SH, .SW, .SD, .SQ, .SWC1, .SQC2, .SWL, .SWR, .SDL, .SDR:
 		core.learn_store(f, u32(cpu.state.r[i.rs].d[0]) + u32(r5900.sx16(i.imm)))

@@ -5,9 +5,8 @@
 // (an overlay a game copies in, a DMA, a snapshot load) is interpreted
 // instead, and runs native again once the words are back. An entry can
 // have several, one per code loaded there. The words are compared on entry
-// only: code a callee changes in the function while it runs (a loader
-// patching its caller's calls) is not seen, and the function goes on with
-// the code it was entered with.
+// only; a run whose code changed while it ran (a loader patching its
+// caller's calls) is recorded .Smc (core/learn.odin) and never compiled.
 package ps2
 
 import "base:runtime"
