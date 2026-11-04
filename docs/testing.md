@@ -11,6 +11,7 @@ odin run tests/lower -collection:ps=.
 odin run tests/vu -collection:ps=.
 odin run tests/gs -collection:ps=.
 odin run tests/gs_tex -collection:ps=.
+odin run tests/gs_pixel -collection:ps=.
 odin run tests/vu_macro -collection:ps=.
 odin run tests/vu_micro -collection:ps=.
 odin run tests/vu_native -collection:ps=.

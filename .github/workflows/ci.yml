@@ -28,7 +28,7 @@ jobs:
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
             echo "== $t play"
             odin check play -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/gs tests/gs_tex tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_iop tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/psx_interp tests/compat tests/learn tests/play; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/gs tests/gs_tex tests/gs_pixel tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_iop tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/psx_interp tests/compat tests/learn tests/play; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -85,6 +85,7 @@ jobs:
           odin run tests/vu -collection:ps=. -out:vu_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/gs -collection:ps=. -out:gs_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/gs_tex -collection:ps=. -out:gs_tex_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/gs_pixel -collection:ps=. -out:gs_pixel_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/vu_macro -collection:ps=. -out:vu_macro_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/vu_micro -collection:ps=. -out:vu_micro_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/vu_native -collection:ps=. -out:vu_native_test${{ runner.os == 'Windows' && '.exe' || '' }}

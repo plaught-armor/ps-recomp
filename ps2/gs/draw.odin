@@ -71,6 +71,7 @@ Ctx :: struct {
 	// (GEQUAL or GREATER). Skipped reads are dead.
 	dst_read, z_read:        bool,
 	frow, zrow:              Row,
+	px:                      Pixel_Proc, // pixel or a fast proc (px_pick)
 	fogcol:                  [3]i32,
 	tex:                     Tex,
 }
@@ -228,6 +229,7 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 			shown_read(c.tex.mtbp[i], c.tex.mtbw[i], c.tex.psm, 0, c.tex.h >> i)
 		}
 	}
+	c.px = px_pick(&c)
 	return
 }
 
@@ -272,7 +274,8 @@ draw_point :: proc(c: ^Ctx, v: ^Vertex) {
 	x, y := i32(math.floor(v.x)), i32(math.floor(v.y))
 	if x < c.sx0 || x > c.sx1 || y < c.sy0 || y > c.sy1 {return}
 	u, tv, lod := tex_coord(c, v.s, v.t, v.q, v.u, v.v)
-	pixel(c, x, y, v.z, v.c, u, tv, lod, v.fog)
+	ctx_seek(c, y)
+	c.px(c, x, y, v.z, v.c, u, tv, lod, v.fog)
 }
 
 @(private)
@@ -286,7 +289,8 @@ draw_line :: proc(c: ^Ctx, a, b: ^Vertex) {
 		x, y := i32(math.floor(v.x)), i32(math.floor(v.y))
 		if x < c.sx0 || x > c.sx1 || y < c.sy0 || y > c.sy1 {continue}
 		u, tv, lod := tex_coord(c, v.s, v.t, v.q, v.u, v.v)
-		pixel(c, x, y, v.z, v.c, u, tv, lod, v.fog)
+		ctx_seek(c, y)
+		c.px(c, x, y, v.z, v.c, u, tv, lod, v.fog)
 	}
 }
 
@@ -348,10 +352,11 @@ draw_sprite :: proc(c: ^Ctx, a, b: ^Vertex) {
 		fy := (f32(y) - y0) / (y1 - y0)
 		vv := va + (vb - va) * fy
 		tt := ta + (tb - ta) * fy
+		ctx_seek(c, y)
 		for x in px0 ..= px1 {
 			fx := (f32(x) - x0) / (x1 - x0)
 			u, v, lod := tex_coord(c, sa + (sb - sa) * fx, tt, b.q, ua + (ub - ua) * fx, vv)
-			pixel(c, x, y, b.z, b.c, u, v, lod, b.fog)
+			c.px(c, x, y, b.z, b.c, u, v, lod, b.fog)
 		}
 	}
 }
@@ -389,6 +394,7 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 	if !c.iip {flat = v2.c}
 	for y in miny ..= maxy {
 		w0, w1, w2 := e0.w, e1.w, e2.w
+		ctx_seek(c, y)
 		for x in minx ..= maxx {
 			defer {w0 -= e0.dy; w1 -= e1.dy; w2 -= e2.dy}
 			if w0 < 0 || w1 < 0 || w2 < 0 {continue}
@@ -409,7 +415,7 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 					a.v * f0 + b.v * f1 + d.v * f2)
 			}
 			fog := a.fog * f0 + b.fog * f1 + d.fog * f2
-			pixel(c, x, y, z, col, u, v, lod, fog)
+			c.px(c, x, y, z, col, u, v, lod, fog)
 		}
 		e0.w += e0.dx
 		e1.w += e1.dx

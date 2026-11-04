@@ -209,24 +209,41 @@ row_seek :: #force_inline proc(r: ^Row, bp, bw, y: u32) #no_bounds_check {
 // Index of pixel x on the row held: the vram word for a wide row, as
 // addr32 gives it, else the vram16 halfword, as addr16 gives it.
 @(private)
-row_addr :: #force_inline proc(r: ^Row, x: u32) -> u32 #no_bounds_check {
-	if r.wide {
+row_addr :: #force_inline proc(r: ^Row, x: u32) -> u32 {
+	return r.wide ? row_addr_w(r, x, true) : row_addr_w(r, x, false)
+}
+
+// row_addr, row_read and row_write for a row known to be wide or not.
+@(private)
+row_addr_w :: #force_inline proc(r: ^Row, x: u32, $WIDE: bool) -> u32 #no_bounds_check {
+	when WIDE {
 		blk := r.base + (x >> 6) * 32 + (r.blk[(x >> 3) & 7] ~ r.zx)
 		return ((blk << 6) + r.col[x & 7]) & (VRAM_WORDS - 1)
+	} else {
+		blk := r.base + (x >> 6) * 32 + (r.blk[(x >> 4) & 3] ~ r.zx)
+		return ((blk << 7) + r.col[x & 15]) & (2 * VRAM_WORDS - 1)
 	}
-	blk := r.base + (x >> 6) * 32 + (r.blk[(x >> 4) & 3] ~ r.zx)
-	return ((blk << 7) + r.col[x & 15]) & (2 * VRAM_WORDS - 1)
 }
 
 // read_raw and write_raw at a row_addr index.
 @(private)
-row_read :: #force_inline proc(r: ^Row, a: u32) -> u32 #no_bounds_check {
-	return r.wide ? vram[a] & r.mask : u32(vram16()[a])
+row_read :: #force_inline proc(r: ^Row, a: u32) -> u32 {
+	return r.wide ? row_read_w(r, a, true) : row_read_w(r, a, false)
 }
 
 @(private)
-row_write :: #force_inline proc(r: ^Row, a, v: u32) #no_bounds_check {
-	if r.wide {
+row_read_w :: #force_inline proc(r: ^Row, a: u32, $WIDE: bool) -> u32 #no_bounds_check {
+	when WIDE {return vram[a] & r.mask} else {return u32(vram16()[a])}
+}
+
+@(private)
+row_write :: #force_inline proc(r: ^Row, a, v: u32) {
+	if r.wide {row_write_w(r, a, v, true)} else {row_write_w(r, a, v, false)}
+}
+
+@(private)
+row_write_w :: #force_inline proc(r: ^Row, a, v: u32, $WIDE: bool) #no_bounds_check {
+	when WIDE {
 		p := &vram[a]
 		p^ = (p^ &~ r.mask) | (v & r.mask)
 	} else {
