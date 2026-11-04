@@ -4,17 +4,18 @@
 //
 // Two screens: the library list, with the selected disc's thumbnail and
 // compatibility result beside it, and the settings, of the selected disc or
-// of all discs (Scope), across the whole width. A setting changed or cleared is saved to that scope's
-// settings.tsv at once, and only as a value the runtime reads (PS1_CHOICES,
-// PS2_CHOICES, GLOBAL_CHOICES); the run started reads it there itself
-// (settings_apply), so the launcher never puts a setting in its environment.
-// Each row says where its value comes from; a setting the environment sets
-// is shown locked and cannot be changed.
+// of all discs (Scope), across the whole width. A setting changed or cleared
+// is saved to that scope's settings.tsv at once, and only as a value the
+// runtime reads (PS1_CHOICES, PS2_CHOICES, GLOBAL_CHOICES); the run started
+// reads it there itself (settings_apply), so the launcher never puts a
+// setting in its environment. Each row says where its value comes from; a
+// setting the environment sets is shown locked and cannot be changed.
 package play
 
 import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
+import "core:unicode/utf8"
 import "ps:core"
 
 Screen :: enum {
@@ -425,15 +426,29 @@ launcher_value_chars :: proc(l: ^Launcher) -> int {
 }
 
 // str cut to n characters, its last three "..." when it is cut, so a cut
-// shows.
+// shows. A character is a rune, as text draws it, and a cut falls between
+// runes.
 launcher_fit :: proc(str: string, n: int) -> string {
-	if len(str) <= n {
+	if utf8.rune_count_in_string(str) <= n {
 		return str
 	}
 	if n < 3 {
-		return str[:max(n, 0)]
+		return str[:rune_offset(str, max(n, 0))]
 	}
-	return strings.concatenate({str[:n - 3], "..."}, context.temp_allocator)
+	return strings.concatenate({str[:rune_offset(str, n - 3)], "..."}, context.temp_allocator)
+}
+
+// The byte offset of str's rune k, or len(str) when str has k runes or fewer.
+@(private = "file")
+rune_offset :: proc(str: string, k: int) -> int {
+	i := 0
+	for _, off in str {
+		if i == k {
+			return off
+		}
+		i += 1
+	}
+	return len(str)
 }
 
 // The settings file of the settings screen's scope: its settings in l and
@@ -662,13 +677,20 @@ compat_text :: proc(r: Row) -> string {
 	return fmt.tprintf("compat: %s at frame %s", r[.Result], r[.Frames])
 }
 
-// Draw str at (x, y), at most max_chars characters, each byte outside
-// printable ASCII taking its place and drawing nothing.
+// Draw str at (x, y), at most max_chars characters. A character is a rune;
+// one outside printable ASCII takes its place and draws nothing.
 @(private = "file")
 text :: proc(px: []u32, lo: Layout, x, ty: int, str: string, c: Color, max_chars: int) {
 	step := core.FONT_GLYPH * lo.scale
-	for i in 0 ..< min(len(str), max(max_chars, 0)) {
-		core.font_glyph(px, lo.w, str[i], x + i * step, ty, u32(c), lo.scale)
+	i := 0
+	for r in str {
+		if i >= max_chars {
+			break
+		}
+		if r < 0x80 {
+			core.font_glyph(px, lo.w, u8(r), x + i * step, ty, u32(c), lo.scale)
+		}
+		i += 1
 	}
 }
 

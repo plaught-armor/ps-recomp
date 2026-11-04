@@ -50,7 +50,8 @@
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
 // - launcher: the launcher's steps, settings, picture, dropped files and
-//   runs (test_launcher), and play.log's plain lines (test_log_strip).
+//   runs (test_launcher), a value cut to its width on a rune boundary
+//   (test_launcher_fit), and play.log's plain lines (test_log_strip).
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -64,6 +65,7 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode/utf8"
 import "ps:core"
 import "ps:core/disc"
 import "ps:play"
@@ -162,6 +164,7 @@ main :: proc() {
 	test_line_row()
 	test_library()
 	test_log_strip()
+	test_launcher_fit()
 	test_launcher()
 	if os.remove_all(tmp) != nil {
 		check("", false, fmt.tprintf("cannot remove %s", tmp))
@@ -1527,6 +1530,12 @@ test_launcher :: proc() {
 	text, _ = play.launcher_setting_text(&l, play.GLOBAL_CHOICES[2])
 	cut := play.launcher_fit(text, vc)
 	check(name, len(text) > vc && len(cut) == vc && strings.has_suffix(cut, "...") && strings.has_prefix(text, cut[:vc - 3]), fmt.tprintf("a long value cut: %q", cut))
+	// A value of 3-byte runes: its cut falls inside a rune's bytes unless it
+	// is made on a rune boundary, and still ends in "...".
+	os.set_env(core.env_name("SCALE"), strings.repeat("€", vc, context.temp_allocator))
+	text, _ = play.launcher_setting_text(&l, play.GLOBAL_CHOICES[2])
+	cut = play.launcher_fit(text, vc)
+	check(name, utf8.rune_count_in_string(text) > vc && utf8.valid_string(cut) && utf8.rune_count_in_string(cut) == vc && strings.has_suffix(cut, "...") && strings.has_prefix(text, cut[:len(cut) - 3]), fmt.tprintf("a long value of 3-byte runes cut: %q", cut))
 	os.unset_env(core.env_name("SCALE"))
 	check(name, play.launcher_reload(&l, "") && step(&l, .Menu) == .None, "back to the disc's settings")
 	play.launcher_draw(&l, px)
@@ -1570,6 +1579,31 @@ test_launcher :: proc() {
 	_ = os.write_entire_file(not_disc, transmute([]u8)string("not a disc"))
 	ok, last = play.run_disc(self, not_disc, l.discs[0].id)
 	check(name, !ok && strings.contains(last, "is not a disc image"), fmt.tprintf("failed run: %v %q", ok, last))
+}
+
+// launcher_fit at every width from 0 to past the whole string, of strings of
+// 1-, 2-, 3- and 4-byte runes and a mix: valid UTF-8, at most the width in
+// runes, the string itself when it fits, else its first runes and "..." (or
+// only its first runes under 3).
+test_launcher_fit :: proc() {
+	name :: "launcher_fit"
+	strs := [?]string{"abcdefgh", "éèêëàâîï", "€₤₹₩₽₴₦₱", "😀😁😂🤣😃😄😅😆", "a€é😀b€é😀c", ""}
+	for str in strs {
+		count := utf8.rune_count_in_string(str)
+		for n in 0 ..= count + 2 {
+			cut := play.launcher_fit(str, n)
+			runes := utf8.rune_count_in_string(cut)
+			ok := utf8.valid_string(cut) && runes <= n
+			if count <= n {
+				ok &&= cut == str
+			} else if n < 3 {
+				ok &&= runes == n && strings.has_prefix(str, cut)
+			} else {
+				ok &&= runes == n && strings.has_suffix(cut, "...") && strings.has_prefix(str, cut[:len(cut) - 3])
+			}
+			check(name, ok, fmt.tprintf("%q cut to %d: %q", str, n, cut))
+		}
+	}
 }
 
 // play.log's text: a carriage return a line break, CSI sequences and
