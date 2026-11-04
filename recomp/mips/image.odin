@@ -12,6 +12,7 @@ Section :: struct {
 	flags: u32,
 }
 
+SHF_WRITE :: 1
 SHF_ALLOC :: 2
 SHF_EXEC :: 4
 SHT_NOBITS :: 8

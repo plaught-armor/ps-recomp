@@ -229,6 +229,23 @@ data_pointers :: proc(img: Image, lo, hi: u32, out: ^Set, pairs: ^[dynamic][2]u3
 	}
 }
 
+// Aligned words in the writable executable sections of img, which hold
+// code and data together, that point into [lo, hi). data_pointers skips
+// these sections: code words can look like addresses too, so the caller
+// keeps only those that pass a stricter test.
+mixed_words :: proc(img: Image, lo, hi: u32, out: ^Set) {
+	for s in img.sections {
+		if s.data == nil || s.addr >= 0x01000000 || s.flags & SHF_EXEC == 0 || s.flags & SHF_WRITE == 0 {
+			continue
+		}
+		for o := 0; o + 4 <= len(s.data); o += 4 {
+			if v := u32le(s.data, o); lo <= v && v < hi && v & 3 == 0 {
+				out[v] = {}
+			}
+		}
+	}
+}
+
 // e follows a `jr $ra`, a `j` or a `b` back to a loop (with its delay slot
 // and any nop padding), or five or more nops of padding: where a function
 // without a prologue can start. Unlike terminator_before, not after a `b`

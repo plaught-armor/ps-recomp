@@ -141,6 +141,18 @@ data_image :: proc(img: mips.Image, a, b: u32) -> mips.Image {
 	return {base = a, data = img.data[a - img.base:b - img.base]}
 }
 
+// Whether a function starts at a: a prologue there, or after the global
+// loads that may come before one.
+@(private = "file")
+starts_function :: proc(img: mips.Image, a: u32) -> bool {
+	for k in u32(0) ..= mips.MAX_PRE_PROLOGUE {
+		if mips.is_prologue(img, a + 4 * k) {
+			return k == 0 || mips.function_start(img, a + 4 * k, a) == a
+		}
+	}
+	return false
+}
+
 generate :: proc(o: mips.Options) {
 	img := mips.load_elf(o)
 	if path := mips.option_or(o, "words", ""); path != "" {
@@ -153,7 +165,7 @@ generate :: proc(o: mips.Options) {
 	ranges, explicit := code_ranges(o, img)
 	lo, hi := ranges[0][0], ranges[len(ranges) - 1][1]
 	// Code addresses in data and built by lui pairs in code.
-	refs, ptrs: mips.Set
+	refs, ptrs, mixed: mips.Set
 	pairs: [dynamic][2]u32
 	calls: mips.Set
 	for t in ranges {
@@ -168,6 +180,7 @@ generate :: proc(o: mips.Options) {
 			mips.data_pointers(data_image(img, from, img.base + u32(len(img.data))), t[0], t[1], &ptrs, &pairs)
 		} else {
 			mips.data_pointers(img, t[0], t[1], &ptrs, &pairs)
+			mips.mixed_words(img, t[0], t[1], &mixed)
 		}
 		for c in ranges {
 			mips.address_constants(RULES, img, c[0], c[1], t[0], t[1], &refs)
@@ -190,6 +203,15 @@ generate :: proc(o: mips.Options) {
 	}
 	for a in ptrs {
 		refs[a] = {}
+	}
+	// Words of sections that hold code and data together: only those that
+	// point at a function's start (a prologue, or the global loads before
+	// one) count, as entries and never as labels. A code word that passes
+	// this points at a function anyway.
+	for a in mixed {
+		if starts_function(img, a) {
+			refs[a] = {}
+		}
 	}
 	funcs: [dynamic]^Func
 	for t in ranges {
