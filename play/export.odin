@@ -484,7 +484,7 @@ export_recomp :: proc(info: [Info]string, psx_exe: bool) -> []u8 {
 }
 
 // The disc's name: its title, else its serial, else its id.
-@(private = "file")
+@(private)
 export_title :: proc(id: string, info: [Info]string) -> string {
 	if info[.Title] != "" {
 		return info[.Title]

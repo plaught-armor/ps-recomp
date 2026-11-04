@@ -13,6 +13,7 @@ package play
 
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "ps:core"
 import sdl "vendor:sdl2"
@@ -109,6 +110,14 @@ launcher :: proc(exe: string) -> int {
 			if !ok {
 				launcher_toast(&l, fmt.tprintf("The run failed: %s", last if last != "" else "(it printed nothing)"))
 			}
+		case .Export:
+			if home, err := os.user_home_dir(context.temp_allocator); err != nil {
+				fmt.eprintln("play: no home directory to export to:", err)
+				launcher_toast(&l, "The export failed (see the terminal).")
+			} else {
+				root, _ := filepath.join({home, "ps-recomp-ports"}, context.temp_allocator)
+				launcher_export(&l, root)
+			}
 		}
 	}
 }
@@ -182,6 +191,8 @@ window_wait :: proc(w: ^Window, l: ^Launcher) -> Action {
 			return .Menu
 		case .DELETE:
 			return .Remove
+		case .X:
+			return .Export
 		}
 	case .CONTROLLERBUTTONDOWN:
 		#partial switch sdl.GameControllerButton(e.cbutton.button) {
@@ -204,7 +215,7 @@ window_wait :: proc(w: ^Window, l: ^Launcher) -> Action {
 		case .X:
 			return .Menu
 		case .Y:
-			return .Remove
+			return launcher_y(l)
 		case .START:
 			return .Launch
 		}

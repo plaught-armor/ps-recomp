@@ -93,6 +93,16 @@ Start a disc and the launcher hides until the game ends. If the game
 fails, the launcher shows the last line it printed. Everything it printed
 is also kept in `play.log` (see [Where your files go](#where-your-files-go)).
 
+Export makes a new git-ready folder for the selected disc, to study the
+game in and tune it by hand. It goes in `ps-recomp-ports` in your home
+folder, named after the disc (with ` 2`, ` 3` and so on added when the
+name is taken), and the launcher says where. The folder holds notes, the
+disc's settings, its last picture and a port of the game to build (see
+[Start from an export](docs/porting.md#start-from-an-export)). The disc
+image stays where it is and is never copied. `./play-bin --export <disc
+image> <folder>` does the same into a folder you name, which must be
+missing or empty.
+
 The settings screen changes [settings](#settings) for the selected disc
 or, after a switch, for all discs. A change is saved at once. Each row
 says where its value comes from:
@@ -117,13 +127,14 @@ next one down holds.
 | Switch this disc / all discs (settings) | Tab | X | |
 | Change a setting | Left / Right, or Return for the next choice | D-pad or left stick left / right, or A | Double-click the row |
 | Clear a setting (settings) | Delete | Y | |
+| Export the disc (list) | X | Y | |
 | Take a missing disc off the list | Delete | Y | |
 | Back to the list | Esc or Backspace | B | |
 
 The controller column is read from the code. It has not been tried with a
 controller. Dropping a folder has been tested only by the automated tests.
 The launcher has only been run on Linux. On Windows and macOS it is
-untested.
+untested, and so is an export and the port it holds.
 
 ## Controls
 

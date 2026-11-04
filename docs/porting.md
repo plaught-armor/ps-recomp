@@ -4,7 +4,8 @@ A port turns one game into its own native program, with its own fixes and
 features. It lives in its own repository. [How it works](how-it-works.md)
 covers the recompiler and its options file.
 
-A port repository holds its `recomp.tsv`, a main package driving the
+The quickest start is an export (below), which writes a working port
+for one disc. A port repository holds its `recomp.tsv`, a main package driving the
 runtime and any hand-written replacements; the game's files come from the
 user's disc. `out` is the generated package's directory: put it inside the
 main package's directory (`port/rec` for a main package in `port/`) so main
@@ -129,3 +130,27 @@ Build with `-define:ENV_PREFIX=GAME_` so settings read `GAME_*`. PS1 cards
 are 128 KiB images, `slot1.mcd` and `slot2.mcd` in the working directory
 (`MCD`, `MCD2`, or `bios.card_files` before `memcard_init`). PS2 cards are
 directories, `memcard0/` and `memcard1/` in the working directory or in `MC`.
+
+## Start from an export
+
+`play --export <disc image> <dir>`, or Export in the launcher, writes a
+repository for the disc into a missing or empty directory. Next to the
+notes, settings and picture it holds a port that builds as it is:
+
+| File | What it is |
+|---|---|
+| `tools/recomp.tsv` | The recompiler's options, `out` set to `port/src/rec`; `setup.sh` adds the disc row. |
+| `setup.sh` | Builds `recomp` from the `ps-recomp` submodule, recompiles the disc `local.tsv` names, then runs `port/build.sh`. |
+| `port/build.sh` | Builds `port/game` with `COMMIT` set to the submodule's commit. |
+| `port/src/main.odin` | Boots the disc with the generated code, as the player does. Change the game here. |
+| `port/src/local.odin` | Reads `local.tsv`: the disc image, the player's data for the disc, its settings, memory cards and learned code. |
+| `tests/run.sh` | A headless compatibility run of `port/game`, `press.txt` as its input, to a frame count (3600 by default). |
+| `local.tsv` | Where the disc image and the player's data are. Git ignores it. |
+
+The README gives the commands: add ps-recomp as a submodule at the
+commit of the player that wrote the export, then `sh setup.sh`. The
+learned code the player compiled for the disc is used only while the
+submodule is at that commit; at another, the port interprets what it
+did not recompile. The generated `port/src/rec` is ignored by git, so a
+fresh clone runs `setup.sh` again. The scripts need a POSIX shell and have
+only been run on Linux; Windows and macOS are untested.

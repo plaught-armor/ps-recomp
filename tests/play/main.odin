@@ -1649,7 +1649,9 @@ la :: proc(rt, v: u32) -> [2]u32 {return {lui(rt, v >> 16), ori(rt, rt, v & 0xff
 // file, which a disc's own value overrides; a clear takes the row out of
 // the scope's file and writes nothing when the file has no such row; the
 // picture has the selection bar and the thumbnail, and a
-// point maps to its row; a missing disc will not run and can be removed; a
+// point maps to its row; Export (X, or Y on the list) asks for an export
+// and launcher_export writes one under a free name; a missing disc will not
+// run or export and can be removed; a
 // dropped disc or directory joins the library, a duplicate or a non-disc
 // does not.
 // run_disc runs a disc to FRAMES with its stderr in play.log, and reports a
@@ -1817,10 +1819,26 @@ test_launcher :: proc() {
 	bad = glyph_cells(px, W, lo.panel_x, lo.list_y + core.THUMB_H * lo.scale + lo.line, lo.scale, TITLE)
 	check(name, bad == "", fmt.tprint("panel title:", bad))
 
-	// A missing disc: no run, no settings; removed.
+	// Export: Y exports on the list and clears on the settings screen; the
+	// disc goes to <root>/<title as a file name>, then to "<name> 2".
+	check(name, play.launcher_y(&l) == .Export && step(&l, .Export) == .Export, "export a disc")
+	_ = step(&l, .Menu)
+	check(name, play.launcher_y(&l) == .Remove, "Y clears in the settings")
+	_ = step(&l, .Back)
+	ports, _ := filepath.join({tmp, "launcher_ports"}, context.temp_allocator)
+	l.discs[l.sel].info[.Title] = " x/y: z. "
+	for want in ([]string{"x_y_ z", "x_y_ z 2"}) {
+		out, _ := filepath.join({ports, want}, context.temp_allocator)
+		readme, _ := filepath.join({out, "README.md"}, context.temp_allocator)
+		play.launcher_export(&l, ports)
+		check(name, l.toast == fmt.tprintf("Exported to %s", out) && os.exists(readme), fmt.tprintf("exported to %q: %q", want, l.toast))
+	}
+
+	// A missing disc: no run, no settings, no export; removed.
 	_ = os.rename(a, fmt.tprint(a, ".gone"))
 	check(name, play.launcher_reload(&l, a) && l.sel == 0 && l.discs[0].missing, "a missing")
 	check(name, step(&l, .Launch) == .None && l.toast != "" && step(&l, .Menu) == .None && l.screen == .List, "a missing runs")
+	check(name, play.launcher_y(&l) == .Remove && step(&l, .Export) == .None && l.toast != "", "a missing exports")
 	_ = step(&l, .Remove)
 	check(name, len(l.discs) == 1 && l.discs[0].info[.Path] == b_real, fmt.tprint("removed:", len(l.discs)))
 	_ = os.rename(fmt.tprint(a, ".gone"), a)

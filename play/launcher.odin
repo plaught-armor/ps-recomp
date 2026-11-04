@@ -10,10 +10,15 @@
 // reads it there itself (settings_apply), so the launcher never puts a
 // setting in its environment. Each row says where its value comes from; a
 // setting the environment sets is shown locked and cannot be changed.
+//
+// Export writes the selected disc's repository (export.odin) under
+// <home>/ps-recomp-ports and shows where.
 package play
 
 import "core:fmt"
 import "core:mem/virtual"
+import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
 import "ps:core"
@@ -42,6 +47,7 @@ Action :: enum {
 	Back,
 	Menu, // list: the disc's settings; settings: the other scope
 	Remove, // list: take a missing disc out of the library; settings: clear
+	Export, // list: export the disc to a repository of its own
 	Quit,
 }
 
@@ -49,6 +55,7 @@ Action :: enum {
 Command :: enum {
 	None,
 	Launch, // run the selected disc
+	Export, // export the selected disc (launcher_export)
 	Quit,
 }
 
@@ -249,6 +256,12 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 			} else if !library_remove(d.info[.Path]) || !launcher_reload(l, "") {
 				launcher_toast(l, "Cannot write the library (see the terminal).")
 			}
+		case .Export:
+			if d.missing {
+				launcher_toast(l, "This disc image is missing; Delete or Y removes it.")
+			} else {
+				return .Export
+			}
 		}
 		if move != 0 {
 			launcher_select_row(l, l.sel + move)
@@ -279,6 +292,57 @@ launcher_step :: proc(l: ^Launcher, a: Action) -> Command {
 		keep_visible(l)
 	}
 	return .None
+}
+
+// What the controller's Y does: on the list, export the selected disc, or
+// remove it when its image is missing; on the settings screen, clear.
+launcher_y :: proc(l: ^Launcher) -> Action {
+	if l.screen == .List && len(l.discs) > 0 && !l.discs[l.sel].missing {
+		return .Export
+	}
+	return .Remove
+}
+
+// Export the selected disc (play --export) to a new directory in root, made
+// if missing: the disc's title (else its serial, else its id) with every
+// character but a letter, a digit, a space and `-_.()` made `_`, and " 2",
+// " 3"... added while that name is taken. A toast gives the path, or says
+// the export failed.
+launcher_export :: proc(l: ^Launcher, root: string) {
+	if len(l.discs) == 0 {
+		return
+	}
+	d := l.discs[l.sel]
+	if err := os.make_directory_all(root); err != nil && !(err == .Exist && os.is_dir(root)) {
+		fmt.eprintln("play: cannot make", root, err)
+		launcher_toast(l, "The export failed (see the terminal).")
+		return
+	}
+	name := export_name(export_title(d.id, d.info))
+	if name == "" {
+		name = d.id
+	}
+	dir, _ := filepath.join({root, name}, context.temp_allocator)
+	for n := 2; os.exists(dir); n += 1 {
+		dir, _ = filepath.join({root, fmt.tprintf("%s %d", name, n)}, context.temp_allocator)
+	}
+	if export(d.info[.Path], dir) != 0 {
+		launcher_toast(l, "The export failed (see the terminal).")
+		return
+	}
+	launcher_toast(l, fmt.tprintf("Exported to %s", dir))
+}
+
+// title as a directory name every system takes, in temp memory; leading and
+// trailing spaces and dots dropped.
+@(private = "file")
+export_name :: proc(title: string) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	for r in title {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.contains_rune(" -_.()", r)
+		strings.write_rune(&b, r if ok else '_')
+	}
+	return strings.trim(strings.to_string(b), " .")
 }
 
 // Add the disc image at path, or each one in the directory at path, to the
@@ -597,7 +661,7 @@ launcher_draw :: proc(l: ^Launcher, px: []u32) {
 				name := e.info[.Title] if e.info[.Title] != "" else e.info[.Serial] if e.info[.Serial] != "" else e.id
 				text(px, lo, m + s, ry, name, .Missing if e.missing else .Text, chars - 1)
 			}
-			text(px, lo, m, lo.footer_y, "Enter/A play  Tab/X settings  Del/Y remove a missing disc", .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
+			text(px, lo, m, lo.footer_y, "Enter/A play  Tab/X settings  X/Y export  Del/Y remove", .Dim, lo.w / (core.FONT_GLYPH * s) - 2)
 		case .Settings:
 			title := "all discs" if l.scope == .Global else d.info[.Title] if d.info[.Title] != "" else d.id
 			// The rows take the panel's width too, so a value and where it
