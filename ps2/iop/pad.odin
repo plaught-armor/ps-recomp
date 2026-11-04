@@ -181,11 +181,19 @@ pad_fill :: proc(p: []u8, frame: u32, player: int, mask: u32) {
 }
 
 // padman: the command is the first word of the request; the result word
-// depends on the command, the fourth for most.
+// depends on the command, the fourth for most. It serves two sids alike,
+// and the row of a command it does not handle carries the sid called.
 PADMAN_SID :: 0x80000100
+PADMAN_SID_101 :: 0x80000101
 
 @(private)
-padman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
+padman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {return padman(PADMAN_SID, buf)}
+
+@(private)
+padman_server_101 :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {return padman(PADMAN_SID_101, buf)}
+
+@(private)
+padman :: proc(sid: u32, buf: []u8) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	cmd := w[0]
 	switch cmd {
@@ -239,7 +247,7 @@ padman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x12: w[3] = 0x400 // GetModuleVersion
 	case:
 		// The command word is padman's function: the row's function number.
-		if !core.compat_unknown(.Sif_Rpc, PADMAN_SID, sub = cmd) {fmt.eprintfln("pad: unhandled command %08x", cmd)}
+		if !core.compat_unknown(.Sif_Rpc, sid, sub = cmd) {fmt.eprintfln("pad: unhandled command %08x", cmd)}
 		w[3] = 0
 	}
 	return true

@@ -1790,6 +1790,16 @@ test_padman :: proc() {
 		for x, i in words {w[i] = x}
 		iop.sif.servers[iop.PADMAN_SID](1, buf, 128)
 	}
+	// A command padman does not handle: its row carries the sid called.
+	r100 := core.Compat_Key{.Sif_Rpc, iop.PADMAN_SID, 0x7f}
+	r101 := core.Compat_Key{.Sif_Rpc, iop.PADMAN_SID_101, 0x7f}
+	n100, n101 := core.compat.calls[r100].n, core.compat.calls[r101].n
+	w[0] = 0x7f
+	iop.sif.servers[iop.PADMAN_SID_101](1, buf[:], 128)
+	check(core.compat.calls[r101].n == n101 + 1 && core.compat.calls[r100].n == n100, "padman: an unhandled 0x80000101 call's row carries 0x80000101")
+	w[0] = 0x7f
+	iop.sif.servers[iop.PADMAN_SID](1, buf[:], 128)
+	check(core.compat.calls[r100].n == n100 + 1 && core.compat.calls[r101].n == n101 + 1, "padman: an unhandled 0x80000100 call's row carries 0x80000100")
 	cmd(buf[:], 0x09, 0, 0)
 	check(w[3] == 0, "padman 0x09: a socket not open, mask 0")
 	cmd(buf[:], 0x0a, 0, 0, 0xfff)
