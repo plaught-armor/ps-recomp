@@ -57,6 +57,9 @@
 //   not on Windows, which has no SIGTERM).
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
+// - export: play --export of a PS1 disc with saved settings, a PRESS script,
+//   a thumb.ppm and a compat.tsv row, and of a PS2 disc with none, under a
+//   DATA of their own (test_export).
 // - launcher: the launcher's steps, settings, picture, dropped files and
 //   runs (test_launcher), a value cut to its width on a rune boundary
 //   (test_launcher_fit), and play.log's plain lines (test_log_strip).
@@ -190,6 +193,7 @@ main :: proc() {
 	test_quit()
 	test_line_row()
 	test_library()
+	test_export()
 	test_log_strip()
 	test_launcher_fit()
 	test_launcher()
@@ -754,6 +758,153 @@ id_of :: proc(path: string) -> string {
 	}
 	defer disc.close(&d)
 	return disc.id(&d, context.temp_allocator) or_else ""
+}
+
+// play --export under a DATA of its own. A PS1 disc whose directory has
+// settings.tsv, press.txt, thumb.ppm, a compat.tsv row (a fatal message with
+// a '|' in it) and a native blob, learn records and a memory card exports to
+// exactly README.md, .gitignore, local.tsv, settings.tsv and press.txt (the
+// same bytes), docs/notes.md (the row, the '|' escaped) and shots/thumb.png
+// (the picture's size); a PS2 disc with none of them to README.md,
+// .gitignore, local.tsv and docs/notes.md (no run yet). No file holds a
+// 16-byte run of the executable, nor of the blob, records or card. The
+// .gitignore lists every file but local.tsv. An export into the directory
+// again, or into one holding another file, is refused and changes nothing;
+// one into an empty directory is written there.
+@(private = "file")
+test_export :: proc() {
+	name := "export"
+	data, _ := filepath.join({tmp, "export_data"}, context.temp_allocator)
+	old_data := core.env("DATA")
+	os.set_env(core.env_name("DATA"), data)
+	defer os.set_env(core.env_name("DATA"), old_data)
+	self, _ := os.get_executable_path(context.temp_allocator)
+	export :: proc(self, image, out: string) -> int {
+		return play.run({self, "--export", image, out})
+	}
+	// What no exported file may hold: each 16-byte run of these, but for
+	// runs of one byte value.
+	Run :: [16]u8
+	forbidden := make(map[Run]bool, context.temp_allocator)
+	forbid :: proc(forbidden: ^map[Run]bool, b: []u8) {
+		for i in 0 ..< max(len(b) - 15, 0) {
+			r: Run
+			copy(r[:], b[i:])
+			if slice.all_of(r[:], r[0]) {continue}
+			forbidden[r] = true
+		}
+	}
+	// The relative paths of the files under dir, sorted.
+	walk :: proc(dir, rel: string, files: ^[dynamic]string) {
+		entries, _ := os.read_all_directory_by_path(dir, context.temp_allocator)
+		for e in entries {
+			sub := e.name if rel == "" else strings.concatenate({rel, "/", e.name}, context.temp_allocator)
+			if e.type == .Directory {
+				walk(e.fullpath, sub, files)
+			} else {
+				append(files, strings.clone(sub, context.temp_allocator))
+			}
+		}
+	}
+	listed :: proc(out: string) -> []string {
+		files := make([dynamic]string, context.temp_allocator)
+		walk(out, "", &files)
+		slice.sort(files[:])
+		return files[:]
+	}
+	read :: proc(out, file: string) -> string {
+		path, _ := filepath.join({out, file}, context.temp_allocator)
+		b, _ := os.read_entire_file(path, context.temp_allocator)
+		return string(b)
+	}
+	clean :: proc(name, out: string, files: []string, forbidden: map[Run]bool) {
+		ignore := read(out, ".gitignore")
+		for f in files {
+			b := transmute([]u8)read(out, f)
+			for i in 0 ..< max(len(b) - 15, 0) {
+				r: Run
+				copy(r[:], b[i:])
+				if r in forbidden {
+					check(name, false, fmt.tprintf("%s holds disc or player bytes at %d", f, i))
+					break
+				}
+			}
+			top, _, _ := strings.partition(f, "/")
+			line := fmt.tprintf("!/%s%s\n", top, "/" if top != f else "")
+			check(name, strings.contains(ignore, line) == (f != "local.tsv"), fmt.tprintf("%s tracked wrong in .gitignore", f))
+		}
+	}
+	put :: proc(name, dir, file: string, b: []u8) {
+		path, _ := filepath.join({dir, file}, context.temp_allocator)
+		_ = os.make_directory_all(filepath.dir(path))
+		if os.write_entire_file(path, b) != nil {
+			check(name, false, fmt.tprintf("cannot write %s", path))
+		}
+	}
+
+	ps1 := write("export_ps1", cnf_disc())
+	ps1_dir := disc_dir(name, ps1)
+	ps2 := write("export_ps2", ps2_disc())
+	if ps1_dir == "" || disc_dir(name, ps2) == "" {
+		return
+	}
+	id := id_of(ps1)
+	forbid(&forbidden, exe())
+	forbid(&forbidden, elf())
+	settings :: "GPU\tsw\n"
+	press :: "Start@100\n"
+	put(name, ps1_dir, "settings.tsv", transmute([]u8)string(settings))
+	put(name, ps1_dir, "press.txt", transmute([]u8)string(press))
+	rgb := [?]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+	put(name, ps1_dir, "thumb.ppm", core.ppm_encode(3, 2, rgb[:]))
+	tsv, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
+	put(name, data, "compat.tsv", transmute([]u8)fmt.tprintf("id\tresult\tfatal\n%s\tfatal\tbad|call\n", id))
+	player := [?]string{core.DISC_FILES[.Native], "learn/psx.bin", "cards/slot1.mcd"}
+	for f, i in player {
+		b := transmute([]u8)fmt.tprintf("player file %d not exported", i)
+		put(name, ps1_dir, f, b)
+		forbid(&forbidden, b)
+	}
+
+	out1, _ := filepath.join({tmp, "export_ps1_repo"}, context.temp_allocator)
+	check(name, export(self, ps1, out1) == 0, "the PS1 export failed")
+	files := listed(out1)
+	want := []string{".gitignore", "README.md", "docs/notes.md", "local.tsv", "press.txt", "settings.tsv", "shots/thumb.png"}
+	check(name, slice.equal(files, want), fmt.tprint("PS1 files:", files))
+	check(name, read(out1, "settings.tsv") == settings && read(out1, "press.txt") == press, "settings or press not copied")
+	png := read(out1, "shots/thumb.png")
+	check(name, len(png) > 24 && endian.unchecked_get_u32be(transmute([]u8)png[16:]) == 3 && endian.unchecked_get_u32be(transmute([]u8)png[20:]) == 2, "thumb.png not 3x2")
+	notes := read(out1, "docs/notes.md")
+	check(name, strings.contains(notes, "| result | fatal |") && strings.contains(notes, "| fatal | bad\\|call |"), fmt.tprintf("notes:\n%s", notes))
+	local := read(out1, "local.tsv")
+	check(name, strings.contains(local, fmt.tprintf("\nid\t%s\n", id)) && strings.contains(local, "\ncommit\ttest\n") && strings.contains(local, "\nsystem\tps1\n"), fmt.tprintf("local.tsv:\n%s", local))
+	clean(name, out1, files, forbidden)
+
+	out2, _ := filepath.join({tmp, "export_ps2_repo"}, context.temp_allocator)
+	check(name, export(self, ps2, out2) == 0, "the PS2 export failed")
+	files = listed(out2)
+	check(name, slice.equal(files, []string{".gitignore", "README.md", "docs/notes.md", "local.tsv"}), fmt.tprint("PS2 files:", files))
+	check(name, strings.contains(read(out2, "docs/notes.md"), "No compatibility run yet"), "PS2 notes name a run")
+	readme := read(out2, "README.md")
+	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "settings.tsv"), fmt.tprintf("PS2 README:\n%s", readme))
+	clean(name, out2, files, forbidden)
+
+	// Refused: the directory again, and one holding another file.
+	before := read(out1, "README.md")
+	check(name, export(self, ps1, out1) == 1, "an export over an export")
+	check(name, read(out1, "README.md") == before && slice.equal(listed(out1), want), "a refused export changed the directory")
+	other, _ := filepath.join({tmp, "export_other"}, context.temp_allocator)
+	put(name, other, "mine.txt", transmute([]u8)string("mine"))
+	check(name, export(self, ps1, other) == 1, "an export into a directory with a file")
+	check(name, slice.equal(listed(other), []string{"mine.txt"}) && read(other, "mine.txt") == "mine", "a refused export changed the other directory")
+	check(name, !os.exists(strings.concatenate({other, ".ps-recomp-export"}, context.temp_allocator)), "a refused export left its directory")
+	// An empty directory is exported into.
+	empty, _ := filepath.join({tmp, "export_empty"}, context.temp_allocator)
+	_ = os.make_directory_all(empty)
+	check(name, export(self, ps2, empty) == 0, "an export into an empty directory failed")
+	got := listed(empty)
+	check(name, slice.equal(got, []string{".gitignore", "README.md", "docs/notes.md", "local.tsv"}), fmt.tprint("files in the empty directory:", got))
+	_ = os.remove(tsv)
 }
 
 // The library under a DATA of its own: a directory of a PS1 disc, a PS2 one

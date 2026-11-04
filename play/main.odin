@@ -3,6 +3,7 @@
 // Usage: play
 //        play <disc image>
 //        play --compat <disc image | directory> [frames]
+//        play --export <disc image> <directory>
 //
 // The disc image (a .cue sheet, or a single-track .bin or .iso) is all it
 // needs. The first run of a disc compiles the executable SYSTEM.CNF names to
@@ -27,6 +28,9 @@
 //
 // --compat runs each disc headless to a vblank count as a compatibility
 // run and keeps a row per disc in compat.tsv under DATA (compat.odin).
+//
+// --export writes a new repository for the disc, to study and hand-tune the
+// game in, into a directory that is missing or empty (export.odin).
 package play
 
 import "core:fmt"
@@ -56,12 +60,15 @@ run :: proc(args: []string) -> int {
 		return compile_learned(.Psx if args[2] == "psx" else .Iop, args[3], args[4])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
+	case len(args) == 4 && args[1] == "--export":
+		return export(args[2], args[3])
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
 		return play(args[1])
 	}
 	fmt.eprintln("usage: play")
 	fmt.eprintln("       play <disc image>")
 	fmt.eprintln("       play --compat <disc image | directory> [frames]")
+	fmt.eprintln("       play --export <disc image> <directory>")
 	return 2
 }
 

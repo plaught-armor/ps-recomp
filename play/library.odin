@@ -235,7 +235,7 @@ index_write :: proc(path: string, rows: []Index_Row) -> bool {
 // after a message, when it is not a disc with an executable or its
 // directory cannot be made. A disc.tsv that cannot be written is only
 // reported: the next load scans the image again.
-@(private = "file")
+@(private)
 disc_record :: proc(path: string, fi: os.File_Info) -> (id: string, info: [Info]string, ok: bool) {
 	d, opened := disc.open(path, context.temp_allocator)
 	if !opened {
@@ -322,7 +322,7 @@ info_save :: proc(path: string, info: [Info]string) {
 // compat.tsv's rows by disc id, in temp memory, each column found by its
 // header name: a file from before columns were added reads with them "".
 // None when it is missing.
-@(private = "file")
+@(private)
 compat_rows :: proc(path: string) -> map[string]Row {
 	rows := make(map[string]Row, context.temp_allocator)
 	text, err := os.read_entire_file(path, context.temp_allocator)
