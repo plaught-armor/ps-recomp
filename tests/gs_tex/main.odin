@@ -4,9 +4,10 @@
 // loads each change what a draw samples; a draw sampling the buffer it
 // writes sees its own earlier primitives, in the same context too; and two textures of 4096 tiles
 // each, sampled tile by tile past the pool's size, read right on every
-// sample and again after their tiles are reused. The sampler matches its
-// pre-SHOT-PERF-E copy below on random textures and coordinates, and
-// floor_exact matches math.floor.
+// sample and again after their tiles are reused. The sampler, by level
+// (sample_level) and through TEX1's filters and level choice (sample, with
+// sample_level inlined), matches its pre-SHOT-PERF-E copy below on random
+// textures, coordinates and LODs, every wrap mode at levels 1 and up too.
 package main
 
 import "core:fmt"
@@ -187,7 +188,6 @@ main :: proc() {
 		for tx in u32(0) ..< 64 {check(tex[0], idx[0], tx * 16 + 15, ty * 16 + 7)}
 	}
 
-	check_floor()
 	check_sampler()
 
 	if failed > 0 {os.exit(1)}
@@ -209,39 +209,14 @@ rnd :: proc() -> u64 {
 @(private = "file")
 rndn :: proc(n: u64) -> u64 {return rnd() % n}
 
-// Equal as math.floor results: both NaN, or ==, which takes -0 as +0.
-@(private = "file")
-same_floor :: proc(a, b: f32) -> bool {return math.is_nan(a) ? math.is_nan(b) : a == b}
-
-@(private = "file")
-check_floor :: proc() {
-	edge := [?]f32 {
-		-0.5, -0.001, -0.999999, -1, -3, -1.5, 0, -0, 0.5, 1, 2.75,
-		8388607.5, 8388608, -8388608, 8388609, -8388609, -8388607.5,
-		1e20, -1e20, math.inf_f32(1), math.inf_f32(-1), math.nan_f32(),
-	}
-	for x in edge {
-		if !same_floor(gs.floor_exact(x), math.floor(x)) {
-			fail("floor_exact(%v): %v, math.floor %v", x, gs.floor_exact(x), math.floor(x))
-		}
-	}
-	if gs.floor_exact(-0.5) != -1 || gs.floor_exact(-3) != -3 {fail("floor_exact: (-1, 0) or a negative integer")}
-	for _ in 0 ..< 1 << 22 {
-		x := transmute(f32)u32(rnd())
-		if !same_floor(gs.floor_exact(x), math.floor(x)) {
-			fail("floor_exact(%v): %v, math.floor %v", x, gs.floor_exact(x), math.floor(x))
-			return
-		}
-	}
-}
-
 // One random texture: what the sampler reads from TEX0, TEX1 and CLAMP.
 @(private = "file")
 Cfg :: struct {
 	w, h:                   u32,
 	wms, wmt:               u32,
 	minu, maxu, minv, maxv: u32,
-	mxl:                    u32,
+	mxl, mmin:              u32,
+	mmag:                   bool, // bilinear
 }
 
 @(private = "file")
@@ -288,6 +263,26 @@ ref_sample_level :: proc(t: ^Cfg, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32
 	return top + ((bot - top) * av) / 256
 }
 
+// The sampler's TEX1 filters and level choice over ref_sample_level, and
+// the highest level it read.
+@(private = "file")
+ref_sample :: proc(t: ^Cfg, u, v: f32, lod: i32) -> ([4]i32, u32) {
+	if lod <= 0 {return ref_sample_level(t, 0, u, v, t.mmag), 0}
+	bil := t.mmin == 1 || t.mmin >= 4
+	switch t.mmin {
+	case 2, 4:
+		n := min(u32((lod + 1 << 22) >> 23), t.mxl)
+		return ref_sample_level(t, n, u, v, bil), n
+	case 3, 5:
+		n := min(u32(lod >> 23), t.mxl)
+		c := ref_sample_level(t, n, u, v, bil)
+		if n == t.mxl {return c, n}
+		f := (lod >> 15) & 0xff
+		return c + ((ref_sample_level(t, n + 1, u, v, bil) - c) * f) / 256, n + 1
+	}
+	return ref_sample_level(t, 0, u, v, bil), 0
+}
+
 // A coordinate for a level-0 extent of size texels: mostly inside or
 // near it, with texel centres, exact integers, values a hair off either,
 // large magnitudes, NaN and inf.
@@ -315,7 +310,9 @@ rnd_coord :: proc(size: u32) -> f32 {
 
 // Random textures in random local memory at pages 0x100.. (every format,
 // CLUTs from it too), each sampled at random levels, coordinates, wrap
-// modes and filters, against ref_sample_level.
+// modes and filters against ref_sample_level, and at random LODs and TEX1
+// filters against ref_sample. Each wrap mode must be sampled at a level
+// above 0 on both paths.
 @(private = "file")
 check_sampler :: proc() {
 	R :: 0x100 // first random page; 256 pages, 1024 x 512 PSMCT32 at width 16
@@ -326,6 +323,8 @@ check_sampler :: proc() {
 	CONFIGS :: 2048
 	SAMPLES :: 512 // 1M in all
 	bad := 0
+	// Samples per path (level, LOD) and wrap mode reading a level above 0.
+	up: [2][4]int
 	for _ in 0 ..< CONFIGS {
 		psm := psms[rndn(len(psms))]
 		tw, th := rndn(11), rndn(11)
@@ -345,7 +344,8 @@ check_sampler :: proc() {
 		csa := rndn(32)
 		t0 := tbp | bw << 14 | psm << 20 | tw << 26 | th << 30 | rndn(2) << 34 | cbp << 37 | cpsm << 51 | csa << 56 | 1 << 61
 		mxl := rndn(7)
-		t1 := mxl << 2
+		mmag, mmin := rndn(2), rndn(8)
+		t1 := mxl << 2 | mmag << 5 | mmin << 6
 		cl := rnd() & 0xfffffffffff // WMS, WMT 2 bits each; MINU..MAXV 10 each
 		ta := rndn(256) | rndn(2) << 15 | rndn(256) << 32
 		gs.gs_write(0x3b, ta) // TEXA
@@ -365,6 +365,8 @@ check_sampler :: proc() {
 			minv = u32(cl >> 24) & 0x3ff,
 			maxv = u32(cl >> 34) & 0x3ff,
 			mxl  = min(u32(mxl), 6),
+			mmin = u32(mmin),
+			mmag = mmag != 0,
 		}
 		for _ in 0 ..< SAMPLES {
 			n := u32(rndn(u64(c.mxl) + 1))
@@ -379,7 +381,26 @@ check_sampler :: proc() {
 				}
 				bad += 1
 			}
+			if n > 0 {up[0][c.wms] += 1; up[0][c.wmt] += 1}
+			// LODs from below 0 to past level 6, fraction bits and all.
+			lod := i32(rndn(9 << 23)) - (1 << 23)
+			got = gs.probe_sample_lod(u, v, lod)
+			top: u32
+			want, top = ref_sample(&c, u, v, lod)
+			if got != want {
+				if bad < 8 {
+					fail("sample psm %x %dx%d wrap %d/%d mmag %v mmin %d mxl %d lod %x (%v, %v): %v, want %v",
+						psm, c.w, c.h, c.wms, c.wmt, c.mmag, c.mmin, c.mxl, lod, u, v, got, want)
+				}
+				bad += 1
+			}
+			if top > 0 {up[1][c.wms] += 1; up[1][c.wmt] += 1}
 		}
 	}
-	if bad > 0 {fail("sampler: %d of %d samples differ", bad, CONFIGS * SAMPLES)}
+	if bad > 0 {fail("sampler: %d of %d samples differ", bad, 2 * CONFIGS * SAMPLES)}
+	for p, i in up {
+		for k, m in p {
+			if k < 10000 {fail("sampler path %d: wrap mode %d at levels 1 and up %d times", i, m, k)}
+		}
+	}
 }

@@ -14,7 +14,13 @@ probe_ctx :: proc(prim: u64) {
 
 // sample_level on the probed context's texture.
 probe_sample :: proc(n: u32, u, v: f32, bilinear: bool) -> [4]i32 {
-	return sample_level(&ctx_cur.tex, n, u, v, bilinear)
+	return transmute([4]i32)sample_level(&ctx_cur.tex, n, u, v, bilinear)
+}
+
+// sample on the probed context's texture: TEX1's filters and level choice
+// with sample_level inlined, the path draws take.
+probe_sample_lod :: proc(u, v: f32, lod: i32) -> [4]i32 {
+	return transmute([4]i32)sample(&ctx_cur.tex, u, v, lod)
 }
 
 // Level n's texel (x, y) of the probed context's texture, through the cache.

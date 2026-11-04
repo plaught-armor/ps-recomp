@@ -10,6 +10,7 @@
 package ps2_gs
 
 import "core:math"
+import "core:simd"
 
 Vertex :: struct {
 	x, y:    f32, // pixels, window-relative
@@ -48,6 +49,15 @@ Tex :: struct {
 	mxl, mmin, l:       u32,
 	k:                  i32, // 1/16ths
 	mtbp, mtbw:         [7]u32,
+	// Level n's wrap, set for levels 0..mxl (tex_wrap).
+	wrap:               [7]Tex_Wrap,
+}
+
+// One level's wrap of the bilinear taps' coordinates (x0, x1, y0, y1),
+// every mode as (min(max(i, lo), hi) & mask) | fix (wrap_axis).
+@(private)
+Tex_Wrap :: struct {
+	lo, hi, mask, fix: #simd[4]i32,
 }
 
 // Drawing state for one primitive, decoded from PRIM and its context.
@@ -228,6 +238,7 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 		for i in u32(0) ..= c.tex.mxl {
 			shown_read(c.tex.mtbp[i], c.tex.mtbw[i], c.tex.psm, 0, c.tex.h >> i)
 		}
+		tex_wrap(&c.tex)
 	}
 	c.px = px_pick(&c)
 	return
@@ -425,14 +436,40 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 
 // --------------------------------------------------------------- texture
 
+// One axis's wrap at level n as (lo, hi, mask, fix), for a level-0 size
+// and CLAMP's MIN and MAX: REPEAT masks with the level's size, CLAMP and
+// REGION_CLAMP clamp (the region scaled to the level), and REGION_REPEAT
+// masks with MIN and sets MAX unscaled at every level. The clamp is
+// max then min, as `clamp`, so a region with MIN > MAX gives MAX.
 @(private)
-wrap :: #force_inline proc(i: i32, mode, size, lo, hi: u32) -> u32 {
+wrap_axis :: proc(mode, size, lo, hi, n: u32) -> [4]i32 {
 	switch mode {
-	case 0: return u32(i) & (size - 1)
-	case 1: return u32(clamp(i, 0, i32(size) - 1))
-	case 2: return u32(clamp(i, i32(lo), i32(hi)))
+	case 0: return {min(i32), max(i32), i32(max(size >> n, 1) - 1), 0}
+	case 1: return {0, i32(max(size >> n, 1)) - 1, -1, 0}
+	case 2: return {i32(lo >> n), i32(hi >> n), -1, 0}
 	}
-	return (u32(i) & lo) | hi // region repeat: MINU is the mask, MAXU the fix
+	return {min(i32), max(i32), i32(lo), i32(hi)}
+}
+
+// Fills t.wrap for levels 0..mxl from WMS, WMT, the size and CLAMP.
+@(private)
+tex_wrap :: proc(t: ^Tex) {
+	for n in u32(0) ..= t.mxl {
+		a := wrap_axis(t.wms, t.w, t.minu, t.maxu, n)
+		b := wrap_axis(t.wmt, t.h, t.minv, t.maxv, n)
+		t.wrap[n] = {
+			lo   = {a[0], a[0], b[0], b[0]},
+			hi   = {a[1], a[1], b[1], b[1]},
+			mask = {a[2], a[2], b[2], b[2]},
+			fix  = {a[3], a[3], b[3], b[3]},
+		}
+	}
+}
+
+// Texel coordinates (x0, x1, y0, y1) wrapped by one level's Tex_Wrap.
+@(private)
+wrap :: #force_inline proc "contextless" (i: #simd[4]i32, w: ^Tex_Wrap) -> #simd[4]i32 {
+	return (simd.min(simd.max(i, w.lo), w.hi) & w.mask) | w.fix
 }
 
 // Texel as RGBA8888 (R in the low byte).
@@ -465,9 +502,9 @@ expand16 :: #force_inline proc(t: ^Tex, c: u32) -> u32 {
 
 // The texel colour at level-0 texel coordinates (u, v) and level of
 // detail `lod`: LOD <= 0 magnifies level 0 with MMAG, otherwise MMIN picks
-// the filter and how levels 0..MXL are used.
+// the filter and how levels 0..MXL are used. RGBA in lanes 0..3.
 @(private)
-sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> [4]i32 {
+sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> #simd[4]i32 {
 	if lod <= 0 {return sample_level(t, 0, u, v, t.bilinear)}
 	bil := t.mmin == 1 || t.mmin >= 4
 	switch t.mmin {
@@ -479,7 +516,7 @@ sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> [4]i32 {
 		c := sample_level(t, n, u, v, bil)
 		if n == t.mxl {return c}
 		f := (lod >> 15) & 0xff
-		return c + ((sample_level(t, n + 1, u, v, bil) - c) * f) / 256
+		return c + div256((sample_level(t, n + 1, u, v, bil) - c) * #simd[4]i32{f, f, f, f})
 	}
 	return sample_level(t, 0, u, v, bil)
 }
@@ -489,59 +526,56 @@ sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> [4]i32 {
 @(private, rodata)
 level_scale := [7]f32{1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625}
 
-// A sample of level n, nearest or bilinear, through the texture cache.
+// A sample of level n, nearest or bilinear, through the texture cache. The
+// two taps of each axis run as one vector (u, u, v, v) from the floor on.
+// Inlined into `sample`, so the colour stays in a vector register.
 @(private)
-sample_level :: proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32 #no_bounds_check {
+sample_level :: #force_inline proc(t: ^Tex, n: u32, tu, tv: f32, bilinear: bool) -> #simd[4]i32 #no_bounds_check {
 	u, v := tu * level_scale[n], tv * level_scale[n]
-	w, h := max(t.w >> n, 1), max(t.h >> n, 1)
-	minu, maxu, minv, maxv := t.minu, t.maxu, t.minv, t.maxv
-	if t.wms == 2 {minu, maxu = minu >> n, maxu >> n}
-	if t.wmt == 2 {minv, maxv = minv >> n, maxv >> n}
 	if !bilinear {
-		x := wrap(i32(floor_exact(u)), t.wms, w, minu, maxu)
-		y := wrap(i32(floor_exact(v)), t.wmt, h, minv, maxv)
-		return unpack(texel(t, n, x, y))
+		xy := wrap(cast(#simd[4]i32)simd.floor(#simd[4]f32{u, u, v, v}), &t.wrap[n])
+		return expand(texel(t, n, u32(simd.extract(xy, 0)), u32(simd.extract(xy, 2))))
 	}
 	// Round the 1/256 weights rather than truncate: the GPU's float
 	// barycentrics land a hair under exact texel positions, and rounding on
 	// both sides keeps the two renderers equal (shaders/prim.frag).
 	UV_EPS :: 1.0 / 512
 	u, v = u - 0.5 + UV_EPS, v - 0.5 + UV_EPS
-	fu, fv := floor_exact(u), floor_exact(v)
-	iu, iv := i32(fu), i32(fv)
-	au, av := i32((u - fu) * 256), i32((v - fv) * 256)
-	x0 := wrap(iu, t.wms, w, minu, maxu)
-	x1 := wrap(iu + 1, t.wms, w, minu, maxu)
-	y0 := wrap(iv, t.wmt, h, minv, maxv)
-	y1 := wrap(iv + 1, t.wmt, h, minv, maxv)
+	uv := #simd[4]f32{u, u, v, v}
+	fl := simd.floor(uv)
+	// Weights (au, au, av, av); taps (x0, x1, y0, y1).
+	a := cast(#simd[4]i32)((uv - fl) * 256)
+	xy := wrap(cast(#simd[4]i32)fl + {0, 1, 0, 1}, &t.wrap[n])
+	x0, x1 := u32(simd.extract(xy, 0)), u32(simd.extract(xy, 1))
+	y0, y1 := u32(simd.extract(xy, 2)), u32(simd.extract(xy, 3))
 	// The four taps in one decoded tile (most of them): one tile lookup.
 	// Tested on the wrapped coordinates, as wrap can split or join them.
-	c00, c10, c01, c11: [4]i32
+	c00, c10, c01, c11: u32
 	if p := x0 >> 4 == x1 >> 4 && y0 >> 4 == y1 >> 4 ? tile_at(t, n, x0, y0, max(x0, x1), max(y0, y1)) : nil; p != nil {
 		r0, r1 := (y0 & 15) << 4, (y1 & 15) << 4
-		c00, c10 = unpack(p[r0 | (x0 & 15)]), unpack(p[r0 | (x1 & 15)])
-		c01, c11 = unpack(p[r1 | (x0 & 15)]), unpack(p[r1 | (x1 & 15)])
+		c00, c10 = p[r0 | (x0 & 15)], p[r0 | (x1 & 15)]
+		c01, c11 = p[r1 | (x0 & 15)], p[r1 | (x1 & 15)]
 	} else {
-		c00, c10 = unpack(texel(t, n, x0, y0)), unpack(texel(t, n, x1, y0))
-		c01, c11 = unpack(texel(t, n, x0, y1)), unpack(texel(t, n, x1, y1))
+		c00, c10 = texel(t, n, x0, y0), texel(t, n, x1, y0)
+		c01, c11 = texel(t, n, x0, y1), texel(t, n, x1, y1)
 	}
-	top := c00 + ((c10 - c00) * au) / 256
-	bot := c01 + ((c11 - c01) * au) / 256
-	return top + ((bot - top) * av) / 256
+	au, av := simd.swizzle(a, 0, 0, 0, 0), simd.swizzle(a, 2, 2, 2, 2)
+	top := expand(c00) + div256((expand(c10) - expand(c00)) * au)
+	bot := expand(c01) + div256((expand(c11) - expand(c01)) * au)
+	return top + div256((bot - top) * av)
 }
 
-// math.floor, exactly, without its soft-float path: below 2^23 a float
-// truncates to an i32 and back, one less when that rounded up (x in (-1, 0)
-// gives -1, an exact negative integer itself). From 2^23 up a float is
-// integral, and NaN and inf come back as they are, as from math.floor. The
-// one difference, +0 for -0, is invisible once the result is an integer or
-// subtracted from x.
-floor_exact :: #force_inline proc "contextless" (x: f32) -> f32 {
-	if abs(x) < 8388608 {
-		t := f32(i32(x))
-		return t > x ? t - 1 : t
-	}
-	return x
+// x / 256 lane by lane, rounded toward 0 as i32 division is: a negative x
+// adds 255 before the arithmetic shift.
+@(private)
+div256 :: #force_inline proc "contextless" (x: #simd[4]i32) -> #simd[4]i32 {
+	return simd.shr(x + (simd.shr(x, 31) & 255), 8)
+}
+
+// An RGBA8888 texel as its four channels, R in lane 0.
+@(private)
+expand :: #force_inline proc "contextless" (c: u32) -> #simd[4]i32 {
+	return cast(#simd[4]i32)transmute(#simd[4]u8)c
 }
 
 @(private)
@@ -562,7 +596,7 @@ pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fog
 	src := [4]i32{i32(col.r + COL_EPS), i32(col.g + COL_EPS), i32(col.b + COL_EPS), i32(col.a + COL_EPS)}
 
 	if c.tme {
-		t := sample(&c.tex, u, v, lod)
+		t := transmute([4]i32)sample(&c.tex, u, v, lod)
 		switch c.tex.tfx {
 		case 0: // MODULATE
 			for k in 0 ..< 3 {src[k] = min((t[k] * src[k]) >> 7, 255)}
