@@ -29,13 +29,20 @@ SDR_PRIO :: 24
 SDR_SERVE :: 0x10000 // the server's function
 // The HLE block of the thread: its two stubs (+0 the thread's entry, which
 // is sceSifRpcLoop, +4 the server's function), the queue at +0x10, the
-// server's descriptor at +0x40 and its buffer, the block's last SDR_BUF
-// bytes, which bound the EE's request (rpc_fits).
-SDR_HEAD :: 0x200
+// server's descriptor at +0x40, its buffer at SDR_BUF_AT, SDR_BUF bytes that
+// bound the EE's request (rpc_fits), and from SDR_RES the result area every
+// reply is read from, the block's last SDR_RET bytes. As retail's
+// m_procbat_returns (int[384]), it is as long as any rsize the EE asks of a
+// command, so no reply reads past it: the result in the first word, then
+// 0s, as no batch command fills the rest here.
 SDR_QD :: 0x10
 SDR_SD :: 0x40
+SDR_BUF_AT :: 0x100
 SDR_BUF :: 0x100
-#assert(SDR_BUF >= 64 && SDR_SD + 0x44 <= SDR_HEAD - SDR_BUF)
+SDR_RES :: 0x200
+SDR_RET :: 0x600
+SDR_HEAD :: SDR_RES + SDR_RET
+#assert(SDR_BUF >= 64 && SDR_SD + 0x44 <= SDR_BUF_AT && SDR_BUF_AT + SDR_BUF <= SDR_RES)
 
 Iop_Sdr :: struct {
 	user:   [SDR_SLOTS]u32, // handler IOP addresses, by slot; 0 is none
@@ -86,7 +93,7 @@ sdr_thread_start :: proc() {
 		fmt.eprintln("iop: no memory or no rpc room for the sdrdrv thread, its user handlers not run")
 		return
 	}
-	qd, sd, buf := head + SDR_QD, head + SDR_SD, head + SDR_HEAD - SDR_BUF
+	qd, sd, buf := head + SDR_QD, head + SDR_SD, head + SDR_BUF_AT
 	hle_host_stub(head, "sifcmd", 22)
 	hle_host_stub(head + 4, "sdrdrv", SDR_SERVE)
 	t := th_new(head, stack, SDR_STACK, 0, SDR_PRIO)
@@ -101,26 +108,27 @@ sdr_thread_start :: proc() {
 }
 
 // The server's function: runs the EE's RPC `fno` from the request at `buf`,
-// then puts the result in the buffer's first word, the rest of its first
-// 64 bytes 0, as sdr_server does, and returns it for the EE's reply. The
-// handler is the one set when the request runs: one cleared since is not
-// called.
+// then puts the reply in the result area, as sdr_server does, and returns
+// the area for the EE's reply. The handler is the one set when the request
+// runs: one cleared since is not called.
 @(private = "file")
 sdr_serve :: proc(fno, buf, size: u32) -> u32 {
-	b := iop_ram_at(buf, SDR_BUF)
+	res := buf - SDR_BUF_AT + SDR_RES
+	out := iop_ram_at(res, SDR_RET)
 	h := sdr_user_handler(fno)
 	if h == 0 {
+		// sdr_server answers in place, over the request it reads.
+		copy(out, iop_ram_at(buf, SDR_BUF))
 		// The row the host path raises for a command sdr_server does not know.
-		if !sdr_server(fno, b, size) {core.compat_unknown(.Sif_Rpc, SDR_SID, fno, pc = r3000.state.r[31])}
-		return buf
+		if !sdr_server(fno, out, size) {core.compat_unknown(.Sif_Rpc, SDR_SID, fno, pc = r3000.state.r[31])}
+		return res
 	}
 	r := &r3000.state.r
 	r[4], r[5] = fno, buf
 	r3000.call(h)
-	res := r[2]
-	for &x in b[:64] {x = 0}
-	w32(buf, res)
-	return buf
+	for &x in out {x = 0}
+	w32(res, r[2])
+	return res
 }
 
 // An EE sdrdrv RPC `fno` whose handler is set and not run: a compat row,

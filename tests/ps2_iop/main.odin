@@ -4786,7 +4786,7 @@ test_sdr_thread :: proc() {
 	host_cmd :: proc(rec, fno, hsd: u32, req: []u32, rsize: u32 = 0x40) -> []u32 {
 		for x, i in req {iop.iop_u32(hsd + 0x100 + u32(i) * 4)^ = x}
 		for i in u32(0) ..< rsize / 4 {mem.wr32(EE_RECV + i * 4, 0xffffffff)}
-		call(rec, fno, 0x40, EE_RECV, rsize, hsd)
+		call(rec, fno, max(0x40, u32(len(req)) * 4), EE_RECV, rsize, hsd)
 		return ([^]u32)(raw_data(mem.ram_slice(EE_RECV, rsize)))[:rsize / 4]
 	}
 	zero :: proc(w: []u32) -> bool {
@@ -4826,6 +4826,24 @@ test_sdr_thread :: proc() {
 	check(call_ends(hsd, 15) && zero(r) && core.compat.calls[{.Sif_Rpc, iop.SDR_SID, 0x81e0}].n == 1, "sdrdrv thread: an unknown command answers 0, a row")
 	drop_replies()
 	clear(&core.compat.calls)
+	// The longest reply the EE asks, retail's int[384]: the result, then 0s,
+	// none of the request's bytes nor any past the area.
+	junk: [iop.SDR_BUF / 4]u32
+	for &x, i in junk {x = 0x5a00_0000 | u32(i)}
+	junk[0] = 0
+	r = host_cmd(17, 0x80f0, hsd, junk[:], iop.SDR_RET)
+	check(call_ends(hsd, 17) && r[0] == 1 && zero(r[1:]), "sdrdrv thread: a reply of SDR_RET bytes is the result, then 0s")
+	drop_replies()
+	// A user command's too, whatever the area held before: 0x9010 waits in
+	// its handler until mod_s loads.
+	res := sbuf - iop.SDR_BUF_AT + iop.SDR_RES
+	for i in u32(0) ..< iop.SDR_RET / 4 {iop.iop_u32(res + i * 4)^ = 0xa5a5_a5a5}
+	for i in u32(0) ..< iop.SDR_RET / 4 {mem.wr32(EE_RECV + i * 4, 0xffffffff)}
+	call(18, 0x9010, 8, EE_RECV, iop.SDR_RET, hsd)
+	ids, _ = iop.iop_load(mod_s(), "mods", nil)
+	r = ([^]u32)(raw_data(mem.ram_slice(EE_RECV, iop.SDR_RET)))[:iop.SDR_RET / 4]
+	check(ids > 0 && call_ends(hsd, 18) && r[0] == 0x5a5a && zero(r[1:]), "sdrdrv thread: a user command's reply of SDR_RET bytes is its result, then 0s")
+	drop_replies()
 
 	// During a load nothing starts; the call after does.
 	fresh()
