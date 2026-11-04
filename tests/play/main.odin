@@ -60,6 +60,12 @@
 // - export: play --export of a PS1 disc with saved settings, a PRESS script,
 //   a thumb.ppm and a compat.tsv row, and of a PS2 disc with none, under a
 //   DATA of their own (test_export).
+// - press: PRESS scripts as input_poll plays them (test_press): one of
+//   buttons only holds them for exactly their frames with both sticks
+//   centred; a held LRight is full deflection right on the left stick for
+//   exactly its frames and centred outside them; LUp&LRight, and LUp and
+//   RDown in entries that overlap, push both axes at once; a name that is
+//   neither a button nor a direction is a bad entry.
 // - launcher: the launcher's steps, settings, picture, dropped files and
 //   runs (test_launcher), a value cut to its width on a rune boundary
 //   (test_launcher_fit), and play.log's plain lines (test_log_strip).
@@ -194,6 +200,7 @@ main :: proc() {
 	test_line_row()
 	test_library()
 	test_export()
+	test_press()
 	test_log_strip()
 	test_launcher_fit()
 	test_launcher()
@@ -2048,6 +2055,44 @@ test_launcher_fit :: proc() {
 			check(name, ok, fmt.tprintf("%q cut to %d: %q", str, n, cut))
 		}
 	}
+}
+
+// PRESS scripts through input_script_load and input_poll (see the header).
+@(private = "file")
+test_press :: proc() {
+	name := "press"
+	defer os.unset_env(core.env_name("PRESS"))
+	load :: proc(spec: string) -> bool {
+		clear(&core.input.script)
+		os.set_env(core.env_name("PRESS"), spec)
+		return core.input_script_load(6)
+	}
+	check(name, load("Cross@10+3,Start@11"), "buttons-only script did not load")
+	for f in u64(0) ..< 20 {
+		p := core.input_poll(f)[0]
+		want: core.Buttons
+		if f >= 10 && f < 13 {
+			want += {.Cross}
+		}
+		if f >= 11 && f < 17 {
+			want += {.Start}
+		}
+		check(name, p.buttons == want, fmt.tprintf("frame %d buttons %v, want %v", f, p.buttons, want))
+		check(name, p.left == {} && p.right == {}, fmt.tprintf("frame %d sticks %v %v with no stick named", f, p.left, p.right))
+	}
+	check(name, load("LRight@5+4"), "LRight did not load")
+	for f in u64(0) ..< 12 {
+		p := core.input_poll(f)[0]
+		want := f >= 5 && f < 9 ? [2]f32{1, 0} : [2]f32{}
+		check(name, p.left == want && p.right == {} && p.buttons == {}, fmt.tprintf("frame %d LRight gives %v %v %v, want left %v", f, p.left, p.right, p.buttons, want))
+	}
+	check(name, load("lup&LRIGHT&Cross@2+2,LUp@7+3,RDown@8+3:2,RDown@8+3"), "combined entries did not load")
+	p := core.input_poll(2)[0]
+	check(name, p.left == {1, -1} && p.buttons == {.Cross}, fmt.tprintf("LUp&LRight&Cross gives %v %v", p.left, p.buttons))
+	ps := core.input_poll(8)
+	check(name, ps[0].left == {0, -1} && ps[0].right == {0, 1} && ps[1].right == {0, 1} && ps[1].left == {}, fmt.tprintf("overlapping LUp, RDown gives %v", ps))
+	check(name, !load("LRight@5,Sideways@6"), "an unknown name loaded")
+	clear(&core.input.script)
 }
 
 // play.log's text: a carriage return a line break, CSI sequences and

@@ -57,7 +57,9 @@ shown: [2]int
 // PRESS=Start@600,Cross@900: scripted taps, held for PRESS_FRAMES, so a
 // headless run can get past the title screen. A ":n" suffix (Start@900:2)
 // presses on player n instead of player 1, a "+n" suffix (Left@900+120)
-// holds for n frames (core.input_script_load). Frames are presented frames
+// holds for n frames, and stick directions (LRight@900+60) or several names
+// joined by "&" (LUp&LRight@900) push the sticks
+// (core.input_script_load). Frames are presented frames
 // (frame). A bad entry stops platform_init.
 @(private)
 PRESS_FRAMES :: 6

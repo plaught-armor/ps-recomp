@@ -35,6 +35,14 @@ Pad_Button :: enum u16 {
 
 Buttons :: bit_set[Pad_Button; u16]
 
+// A stick pushed fully one way, for press scripts: L* the left stick, R* the
+// right.
+Stick_Dir :: enum u8 {
+	LUp, LDown, LLeft, LRight, RUp, RDown, RLeft, RRight,
+}
+
+Stick_Dirs :: bit_set[Stick_Dir; u8]
+
 MAX_PLAYERS :: 4
 
 // One player's pad as sampled by input_poll. Sticks are x right and y down,
@@ -83,11 +91,13 @@ Trigger :: enum {
 	Right,
 }
 
-// A scripted press: `buttons` held on `player` for frames at ..< at + hold.
+// A scripted press: `buttons` held and `sticks` pushed on `player` for
+// frames at ..< at + hold.
 Scripted_Press :: struct {
 	at:      u64,
 	hold:    u64,
 	buttons: Buttons,
+	sticks:  Stick_Dirs,
 	player:  int,
 }
 
@@ -161,6 +171,18 @@ PAD_NAMES := [Pad_Button]string {
 	.Circle   = "circle",
 	.Cross    = "cross",
 	.Square   = "square",
+}
+
+// Stick direction names as used in press scripts.
+STICK_NAMES := [Stick_Dir]string {
+	.LUp    = "lup",
+	.LDown  = "ldown",
+	.LLeft  = "lleft",
+	.LRight = "lright",
+	.RUp    = "rup",
+	.RDown  = "rdown",
+	.RLeft  = "rleft",
+	.RRight = "rright",
 }
 
 // `shared`: one-player game, every controller feeds player 1. Reads the
@@ -245,6 +267,27 @@ pad_button_from_name :: proc(name: string) -> (b: Pad_Button, ok: bool) {
 		}
 	}
 	return {}, false
+}
+
+// The stick direction for a press script name such as "lright".
+stick_dir_from_name :: proc(name: string) -> (d: Stick_Dir, ok: bool) {
+	for n, s in STICK_NAMES {
+		if strings.equal_fold(n, name) {
+			return s, true
+		}
+	}
+	return {}, false
+}
+
+// The stick positions a set of scripted directions makes: each named axis at
+// full deflection, opposite directions cancelling.
+script_sticks :: proc(d: Stick_Dirs) -> (left, right: [2]f32) {
+	pull :: proc(d: Stick_Dirs, neg, pos: Stick_Dir) -> f32 {
+		return f32(int(pos in d)) - f32(int(neg in d))
+	}
+	left = {pull(d, .LLeft, .LRight), pull(d, .LUp, .LDown)}
+	right = {pull(d, .RLeft, .RRight), pull(d, .RUp, .RDown)}
+	return
 }
 
 // The kind of device last used.
@@ -474,9 +517,18 @@ input_poll :: proc(now: u64) -> (ps: [MAX_PLAYERS]Player_Input) {
 		p.left = stronger(p.left, {axis(pad, .LEFTX), axis(pad, .LEFTY)})
 		p.right = stronger(p.right, {axis(pad, .RIGHTX), axis(pad, .RIGHTY)})
 	}
+	sticks: [MAX_PLAYERS]Stick_Dirs
 	for s in input.script {
 		if now >= s.at && now < s.at + s.hold {
 			ps[s.player].buttons += s.buttons
+			sticks[s.player] += s.sticks
+		}
+	}
+	for d, k in sticks {
+		if d != {} {
+			left, right := script_sticks(d)
+			ps[k].left = stronger(ps[k].left, left)
+			ps[k].right = stronger(ps[k].right, right)
 		}
 	}
 	for &taps, k in input.tap_until {
@@ -594,7 +646,10 @@ rumble_send :: proc(k: int, lo, hi: u16, ms: u32) {
 // Add the PRESS setting's script: comma-separated "<button>@<frame>", each
 // held `hold` frames; "+<n>" after the frame holds n frames instead
 // (Left@900+120), ":<n>" at the end presses on player n (Start@900:2).
-// Button names are PAD_NAMES, any case. Returns false on a bad entry.
+// Button names are PAD_NAMES and stick directions STICK_NAMES (LRight@900
+// pushes the left stick fully right), any case. "&" joins several names in
+// one entry (LUp&LRight@900 for a diagonal, Cross&LUp@900); entries that
+// overlap in time also combine. Returns false on a bad entry.
 input_script_load :: proc(hold: u64) -> bool {
 	spec := env("PRESS")
 	if spec == "" {
@@ -602,10 +657,10 @@ input_script_load :: proc(hold: u64) -> bool {
 	}
 	ok := true
 	for item in strings.split(spec, ",", context.temp_allocator) {
-		name, _, rest := strings.partition(item, "@")
+		names, _, rest := strings.partition(item, "@")
 		timing, colon, who := strings.partition(rest, ":")
 		at_s, plus, dur := strings.partition(timing, "+")
-		b, bok := pad_button_from_name(name)
+		buttons, sticks, bok := press_names(names)
 		at, aok := strconv.parse_u64(at_s)
 		player, pok := 1, true
 		if colon != "" {
@@ -620,7 +675,23 @@ input_script_load :: proc(hold: u64) -> bool {
 			ok = false
 			continue
 		}
-		append(&input.script, Scripted_Press{at = at, hold = n, buttons = {b}, player = player - 1})
+		append(&input.script, Scripted_Press{at = at, hold = n, buttons = buttons, sticks = sticks, player = player - 1})
 	}
 	return ok
+}
+
+// The buttons and stick directions an "&"-joined press script name list
+// names; false when one is unknown.
+@(private = "file")
+press_names :: proc(names: string) -> (buttons: Buttons, sticks: Stick_Dirs, ok: bool) {
+	for name in strings.split(names, "&", context.temp_allocator) {
+		if b, bok := pad_button_from_name(name); bok {
+			buttons += {b}
+		} else if d, dok := stick_dir_from_name(name); dok {
+			sticks += {d}
+		} else {
+			return {}, {}, false
+		}
+	}
+	return buttons, sticks, true
 }

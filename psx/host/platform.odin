@@ -286,8 +286,9 @@ platform_init :: proc(title: cstring) -> bool {
 		parse_script(spec)
 	}
 	// PRESS=Start@600,Cross@900: the press script both consoles take
-	// (core.input_script_load), each held SCRIPT_HOLD presents unless
-	// "+n" says otherwise; frames are presents. A bad entry stops
+	// (core.input_script_load, buttons and stick directions), each held
+	// SCRIPT_HOLD presents unless "+n" says otherwise; frames are
+	// presents. A bad entry stops
 	// platform_init.
 	core.input_script_load(SCRIPT_HOLD) or_return
 	if spec := core.env("STICK"); spec != "" {

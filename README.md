@@ -246,6 +246,20 @@ Each game's output goes to `compat.log`, in its `discs/<disc id>/` folder.
 If a `press.txt` file is in that folder, it is used as the game's scripted
 button presses (`PS_PRESS`).
 
+A press script is a comma-separated list of `<name>@<frame>` entries, for
+example `Start@600,Cross@900+10,LUp&LRight@1200+300:2`:
+
+- `<name>` is a button (`Cross`, `Circle`, `Square`, `Triangle`, `Start`,
+  `Select`, `Up`, `Down`, `Left`, `Right`, `L1`, `L2`, `L3`, `R1`, `R2`,
+  `R3`) or a stick pushed fully one way (`LUp`, `LDown`, `LLeft`, `LRight`
+  for the left stick, `RUp`, `RDown`, `RLeft`, `RRight` for the right), in
+  any case. `&` joins several names into one entry, so `LUp&LRight` is a
+  diagonal and `Cross&LRight` presses a button while moving. Entries that
+  overlap in time combine too.
+- `+<n>` after the frame holds the entry for `n` frames instead of a short
+  tap.
+- `:<n>` at the end presses on player `n` instead of player 1.
+
 ## Report a problem
 
 Open an issue on the project's GitHub page. Please include:
