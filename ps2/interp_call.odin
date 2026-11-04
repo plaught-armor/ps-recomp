@@ -3,7 +3,8 @@
 // the recompiler never saw, or a native blob that lacks a function, plays on
 // instead of stopping. It follows the recompiled code's control flow
 // (recomp/r5900/lower.odin): a call is a host call, `jr $ra` returns, and a
-// jump to a registered function is a tail call to it.
+// jump to a registered function is a tail call to it. A learned function
+// whose words RAM holds runs instead (learned.odin).
 package ps2
 
 import "base:runtime"
@@ -64,6 +65,12 @@ goto_pc :: proc(pc, t: u32) -> bool {
 }
 
 interp_call :: proc(entry: u32) {
+	// Learned code for the words RAM holds at entry now runs in place of the
+	// interpreter (learned.odin).
+	if fn := learned_find(entry); fn != nil {
+		fn()
+		return
+	}
 	c := &cpu.state
 	when cpu.FALLBACK_COUNT {
 		if cpu.fallback_ee_calls == nil {

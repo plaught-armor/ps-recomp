@@ -174,6 +174,7 @@ quit :: proc(code: int) -> ! {
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
 	vu.vu_stats_print()
 	cpu.unmapped_print()
+	cpu.learned_print()
 	core.learn_report()
 	core.compat_report()
 	os.exit(code)

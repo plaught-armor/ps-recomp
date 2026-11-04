@@ -9,6 +9,8 @@
 //     learned.<arch>.key   the blob format, build and learn/psx.bin it is for
 //     learned-iop.<arch>.bin  the same for a PS2 game's IOP (learn/ps2.bin)
 //     learned-iop.<arch>.key
+//     learned-ee.<arch>.bin   the same for a PS2 game's EE (learn/ps2.bin)
+//     learned-ee.<arch>.key
 //     cards/  saves/  settings.tsv  compat.log  learn/
 //     thumb.ppm            the picture a run last showed (thumb.odin)
 //     play.log             what the last run the launcher started printed
@@ -38,6 +40,8 @@ Disc_File :: enum {
 	Learned_Key,
 	Learned_Iop,
 	Learned_Iop_Key,
+	Learned_Ee,
+	Learned_Ee_Key,
 	Cards,
 	Saves,
 	Settings,
@@ -57,6 +61,8 @@ DISC_FILES :: [Disc_File]string {
 	.Learned_Key     = "learned." + NATIVE_ARCH_NAME + ".key",
 	.Learned_Iop     = "learned-iop." + NATIVE_ARCH_NAME + ".bin",
 	.Learned_Iop_Key = "learned-iop." + NATIVE_ARCH_NAME + ".key",
+	.Learned_Ee      = "learned-ee." + NATIVE_ARCH_NAME + ".bin",
+	.Learned_Ee_Key  = "learned-ee." + NATIVE_ARCH_NAME + ".key",
 	.Cards           = "cards",
 	.Saves           = "saves",
 	.Settings        = "settings.tsv",
@@ -116,12 +122,13 @@ disc_path :: proc(dir: string, f: Disc_File, allocator := context.allocator) -> 
 }
 
 // A disc directory's blobs: the executable's native code, and the learned
-// functions (play's LEARN) of a PS1 game or of a PS2 game's IOP, whose key
-// also names the records they are from.
+// functions (play's LEARN) of a PS1 game or of a PS2 game's IOP or EE,
+// whose key also names the records they are from.
 Blob_Kind :: enum {
 	Native,
 	Learned,
 	Learned_Iop,
+	Learned_Ee,
 }
 
 @(private = "file")
@@ -129,6 +136,7 @@ BLOB_FILES :: [Blob_Kind][2]Disc_File {
 	.Native      = {.Native, .Native_Key},
 	.Learned     = {.Learned, .Learned_Key},
 	.Learned_Iop = {.Learned_Iop, .Learned_Iop_Key},
+	.Learned_Ee  = {.Learned_Ee, .Learned_Ee_Key},
 }
 
 // Whether the disc directory holds a blob this build can run: its key names

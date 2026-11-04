@@ -27,11 +27,12 @@ convert :: proc(image, out: string) -> int {
 	return 0
 }
 
-// The learned child (`play --learned <psx | iop> <records> <out>`): the
-// runs of the PS1 or IOP processor in the LEARN file at records that native
-// code can stand for (core.learn_compilable), compiled to a blob of learned
-// functions for this host at out (psx/native/learned.odin). Both run the
-// R3000 of psx_cpu, so one compiler serves them.
+// The learned child (`play --learned <psx | iop | ee> <records> <out>`):
+// the runs of the PS1, IOP or EE processor in the LEARN file at records
+// that native code can stand for (core.learn_compilable), compiled to a
+// blob of learned functions for this host at out (psx/native/learned.odin;
+// the EE's, ps2/learned.odin). The PS1 and the IOP both run the R3000 of
+// psx_cpu, so one compiler serves them; the EE's is recomp/r5900.
 compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	data, err := os.read_entire_file(records, context.allocator)
 	if err != nil {
@@ -40,12 +41,18 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	}
 	recs, _ := core.learn_read(data)
 	runs, large, smc := core.learn_compilable(recs[:], cpu)
-	funcs := make([]r3000.Learned, len(runs))
-	for r, k in runs {
-		funcs[k] = {r.entry, r.lo, r.words}
-	}
 	arch, _ := native.parse_arch(mips.HOST_ARCH)
-	if werr := os.write_entire_file(out, r3000.learned_blob(funcs, arch)); werr != nil {
+	blob: []u8
+	if cpu == .Ee {
+		funcs := make([]r5900.Learned, len(runs))
+		for r, k in runs {funcs[k] = {r.entry, r.lo, r.words}}
+		blob = r5900.learned_blob(funcs, arch)
+	} else {
+		funcs := make([]r3000.Learned, len(runs))
+		for r, k in runs {funcs[k] = {r.entry, r.lo, r.words}}
+		blob = r3000.learned_blob(funcs, arch)
+	}
+	if werr := os.write_entire_file(out, blob); werr != nil {
 		fmt.eprintln("learned: cannot write", out, werr)
 		return 1
 	}

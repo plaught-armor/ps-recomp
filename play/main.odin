@@ -58,8 +58,8 @@ run :: proc(args: []string) -> int {
 		return launcher(args[0])
 	case len(args) == 4 && args[1] == "--convert":
 		return convert(args[2], args[3])
-	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop"):
-		return compile_learned(.Psx if args[2] == "psx" else .Iop, args[3], args[4])
+	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
+		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 4 && args[1] == "--export":
@@ -96,9 +96,19 @@ learned_failed :: proc() {
 	fmt.eprintln("play: the stored learned code would not load; it is compiled again next run")
 }
 
+// The same for a PS2 game's EE learned blob.
+@(private = "file")
+learned_ee_key: string
+
+@(private = "file")
+learned_ee_failed :: proc() {
+	os.remove(learned_ee_key)
+	fmt.eprintln("play: the stored learned EE code would not load; it is compiled again next run")
+}
+
 // Where the learned code of cpu is kept: its blob, the blob's file and key,
 // the file its LEARN records are in, and its name on the learned child's
-// command line. Only the PS1's and the IOP's runs are compiled.
+// command line. A PS2 game's IOP and EE keep their records in one file.
 @(private)
 Learned_Files :: struct {
 	kind:          core.Blob_Kind,
@@ -111,9 +121,9 @@ learned_files :: proc(cpu: core.Learn_Cpu) -> Learned_Files {
 	switch cpu {
 	case .Psx: return {.Learned, .Learned, .Learned_Key, "psx.bin", "psx"}
 	case .Iop: return {.Learned_Iop, .Learned_Iop, .Learned_Iop_Key, "ps2.bin", "iop"}
-	case .Ee:
+	case .Ee: return {.Learned_Ee, .Learned_Ee, .Learned_Ee_Key, "ps2.bin", "ee"}
 	}
-	panic("no learned code for the EE")
+	unreachable()
 }
 
 // The learned blob for cpu's records in the disc directory dir's learn
@@ -227,22 +237,25 @@ play :: proc(image: string) -> int {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
-	// Learned code runs on a PS1 game, and on a PS2 game's IOP, unless
-	// NATIVE=0 or LEARN=0; found before LEARN opens the records, which
-	// compacting rewrites. A compat child's parent compiled it already
+	// Learned code runs on a PS1 game, and on a PS2 game's IOP and EE,
+	// unless NATIVE=0 or LEARN=0; found before LEARN opens the records,
+	// which compacting rewrites. A compat child's parent compiled it already
 	// (compat_disc): one that failed there is not tried again here.
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
 	learn_env := core.env("LEARN")
-	learned: string
+	learned, learned_ee: string
 	if core.env("NATIVE") != "0" && learn_env != "0" {
 		learned = learned_blob(dir, learn_cpu, !compat_child(), 0)
+		if cnf.ps2 {learned_ee = learned_blob(dir, .Ee, !compat_child(), 0)}
 	}
 	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
-	// LEARN=1 records every processor's runs; unset, a PS2 game's IOP
-	// alone, whose modules no recompiled code covers. A default that
+	learned_ee_key = core.disc_path(dir, learned_files(.Ee).key)
+	// LEARN=1 records every processor's runs; unset, a PS2 game's IOP,
+	// whose modules no recompiled code covers, and its EE, whose code the
+	// recompiler never saw (loaded at run time, or missed). A default that
 	// cannot open its records runs without them.
 	if learn_env == "1" || (learn_env == "" && cnf.ps2) {
-		cpus := ~core.Learn_Cpus{} if learn_env == "1" else {.Iop}
+		cpus := ~core.Learn_Cpus{} if learn_env == "1" else {.Iop, .Ee}
 		learn := core.disc_path(dir, .Learn)
 		opened := false
 		if err := os.make_directory_all(learn); err != nil && !(err == .Exist && os.is_dir(learn)) {
@@ -273,6 +286,8 @@ play :: proc(image: string) -> int {
 				native_failed = native_failed,
 				learned = learned,
 				learned_failed = learned_failed,
+				learned_ee = learned_ee,
+				learned_ee_failed = learned_ee_failed,
 				cards = cards,
 			},
 		)

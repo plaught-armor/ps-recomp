@@ -25,6 +25,7 @@ odin run tests/psx_codewatch -collection:ps=.
 odin run tests/psx_codewatch -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/psx_learned -collection:ps=.
 odin run tests/iop_learned -collection:ps=.
+odin run tests/ee_learned -collection:ps=.
 odin run tests/psx_unaligned -collection:ps=.
 odin run tests/psx_gte -collection:ps=.
 odin run tests/psx_cover -collection:ps=.
@@ -72,6 +73,7 @@ here.
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |
 | `psx_learned` | Learned PS1 runs compiled, run native only while RAM holds their code |
 | `iop_learned` | Learned IOP runs native only while IOP RAM holds their code, through host writes and snapshot loads |
+| `ee_learned` | Learned EE runs native, where no function is registered, only while RAM holds their code, through host and DMA writes and snapshot loads, one version per code at an entry; runs stored into or too large are not compiled |
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
@@ -88,11 +90,12 @@ here.
 ## Compatibility runs
 
 `play --compat` runs each disc once. A PS2 disc's run records its I/O
-processor code (`learn/ps2.bin` in the disc's folder), as every PS2 run
-does by default; a later run, compat or not, compiles those records and
-runs that code natively. The `learned` column says whether a run had
-learned code, so a cold run (no records yet) and a warm one are told
-apart. Set `PS_LEARN=0` for a run with no learned code that records
+processor code and the EE code it interpreted (`learn/ps2.bin` in the
+disc's folder), as every PS2 run does by default; a later run, compat or
+not, compiles those records and runs that code natively, the EE's only
+while memory holds the code it was compiled from. The `learned` column
+says whether a run had learned code, so a cold run (no records yet) and a
+warm one are told apart. Set `PS_LEARN=0` for a run with no learned code that records
 nothing.
 
 ## CI

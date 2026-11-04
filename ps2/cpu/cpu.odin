@@ -195,6 +195,7 @@ fatal :: proc(format: string, args: ..any) -> ! {
 	fmt.eprintln("ee:", msg)
 	dump_regs()
 	unmapped_print()
+	learned_print()
 	core.learn_report()
 	core.compat_report(msg)
 	os.exit(1)

@@ -32,6 +32,10 @@ Boot :: struct {
 	// (nil none); the IOP then interprets them, and the boot goes on.
 	learned:        string,
 	learned_failed: proc(),
+	// The same for the EE's learned functions (load_learned), which run where
+	// no function is registered while RAM holds their code.
+	learned_ee:        string,
+	learned_ee_failed: proc(),
 	// The directory the memory card directories go in (iop.mc_root); left
 	// empty, the runtime's.
 	cards:          string,
@@ -71,6 +75,9 @@ boot :: proc(b: Boot) -> bool {
 	// After init, which makes the R3000 the IOP (iop.iop_cpu_init).
 	if b.learned != "" && !psx_native.load_learned(b.learned) && b.learned_failed != nil {
 		b.learned_failed()
+	}
+	if b.learned_ee != "" && !load_learned(b.learned_ee) && b.learned_ee_failed != nil {
+		b.learned_ee_failed()
 	}
 	if b.hooks != nil {b.hooks() or_return}
 	entry, ok := mem.load_elf(elf)
