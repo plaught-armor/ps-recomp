@@ -119,8 +119,10 @@ sdr_serve :: proc(fno, buf, size: u32) -> u32 {
 	if h == 0 {
 		// sdr_server answers in place, over the request it reads.
 		copy(out, iop_ram_at(buf, SDR_BUF))
-		// The row the host path raises for a command sdr_server does not know.
-		if !sdr_server(fno, out, size) {core.compat_unknown(.Sif_Rpc, SDR_SID, fno, pc = r3000.state.r[31])}
+		// The row the host path raises for a command sdr_server does not
+		// know, naming the EE client: no pc here names the EE's caller.
+		client := rpc_client(buf - SDR_BUF_AT + SDR_QD)
+		if !sdr_server(fno, out, size, client) {core.compat_unknown(.Sif_Rpc, SDR_SID, fno, client = client)}
 		return res
 	}
 	r := &r3000.state.r
@@ -131,11 +133,11 @@ sdr_serve :: proc(fno, buf, size: u32) -> u32 {
 	return res
 }
 
-// An EE sdrdrv RPC `fno` whose handler is set and not run: a compat row,
-// and on the first such call a line with the request's first `buf` words,
-// what the handler would have read.
-sdr_user_unrun :: proc(fno: u32, handler: u32, buf: []u32) {
-	core.compat_unknown(.Iop_Sdr, fno, pc = handler)
+// An EE sdrdrv RPC `fno` from EE client `client` whose handler is set and
+// not run: a compat row, and on the first such call a line with the
+// request's first `buf` words, what the handler would have read.
+sdr_user_unrun :: proc(fno: u32, handler: u32, client: u32, buf: []u32) {
+	core.compat_unknown(.Iop_Sdr, fno, pc = handler, client = client)
 	if core.compat.calls[core.Compat_Key{.Iop_Sdr, fno, 0}].n == 1 {
 		fmt.eprintfln("iop: sdrdrv command %04x handler %08x not run, buf %08x", fno, handler, buf[:min(len(buf), 8)])
 	}

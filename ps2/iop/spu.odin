@@ -1121,9 +1121,10 @@ sd_next_ee :: proc() -> u64 {
 // sdrdrv: {?, args...} in, the result in the first word out, the rest of
 // the first SDR_RET bytes 0, as retail's result area holds them. As retail's, it picks the command by fno & 0xfff0:
 // the low 4 bits are an argument, the core for the effect commands. False
-// for a command it does not know, which it leaves unanswered but 0.
+// for a command it does not know, which it leaves unanswered but 0. `client`
+// is the EE client of the RPC, for the rows.
 @(private)
-sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
+sdr_server :: proc(fno: u32, buf: []u8, send_size: u32, client: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	r: u32 = 0
 	known := true
@@ -1145,7 +1146,7 @@ sdr_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x8140: attr = sd_get_effect_attr(fno & 0xf) // the reply is the attr, no result word
 	case:
 		if h := sdr_user_handler(fno); h != 0 {
-			sdr_user_unrun(fno, h, w[:16]) // an IOP module's handler (sdrdrv.odin)
+			sdr_user_unrun(fno, h, client, w[:16]) // an IOP module's handler (sdrdrv.odin)
 		} else {known = false}
 	}
 	for &b in buf[:min(len(buf), SDR_RET)] {b = 0}

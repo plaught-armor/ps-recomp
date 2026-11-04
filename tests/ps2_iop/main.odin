@@ -4703,8 +4703,10 @@ test_sdr_thread :: proc() {
 	cpu.state.cycles = 0
 	cpu.next_event = 1 << 40
 	EE_RECV :: 0x00100400
+	// The EE client every call is made from, which the rows name.
+	EE_CLIENT :: 0x00100600
 	call :: proc(rec, fno, size, recv, rsize, sd: u32) {
-		send_pkt(iop.SIF_CMD_RPC_CALL, rec, 0, 0, 0, fno, size, recv, rsize, 0, sd)
+		send_pkt(iop.SIF_CMD_RPC_CALL, rec, 0, 0, EE_CLIENT, fno, size, recv, rsize, 0, sd)
 	}
 	bind :: proc() -> u32 {
 		send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, iop.SDR_SID)
@@ -4823,7 +4825,9 @@ test_sdr_thread :: proc() {
 	drop_replies()
 	// A command sdrdrv does not know: answered 0, and a row.
 	r = host_cmd(15, 0x81e0, hsd, {0, 1, 2})
-	check(call_ends(hsd, 15) && zero(r) && core.compat.calls[{.Sif_Rpc, iop.SDR_SID, 0x81e0}].n == 1, "sdrdrv thread: an unknown command answers 0, a row")
+	unk := core.compat.calls[{.Sif_Rpc, iop.SDR_SID, 0x81e0}]
+	check(call_ends(hsd, 15) && zero(r) && unk.n == 1, "sdrdrv thread: an unknown command answers 0, a row")
+	check(unk.client == EE_CLIENT && unk.pc == 0 && unk.ra == 0, "sdrdrv thread: the row names the EE client, no IOP pc")
 	drop_replies()
 	clear(&core.compat.calls)
 	// The longest reply the EE asks, retail's int[384]: the result, then 0s,
@@ -4855,6 +4859,7 @@ test_sdr_thread :: proc() {
 	call(6, 0x9000, 8, EE_RECV, 4, hsd)
 	iop.iop_loader.loading = 0
 	check(d.thread == 0 && core.compat.calls[row].n == 1 && call_ends(hsd, 6), "sdrdrv thread: not started during a load, the host answers with the row")
+	check(core.compat.calls[row].client == EE_CLIENT && core.compat.calls[row].pc == d.user[0] && iop.sif.call_client == 0, "sdrdrv thread: the host's row names the handler and the EE client, the client cleared after")
 	drop_replies()
 	iop.iop_u32(hsd + 0x104)^ = 0x77 // the host's reply zeroed it
 	call(7, 0x9000, 8, EE_RECV, 4, hsd)

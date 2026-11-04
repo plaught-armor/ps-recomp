@@ -76,6 +76,9 @@ sif: struct {
 	dma_done:  u64,
 	// What LOADFILE answers its version handshake with (loadfile_version).
 	loadfile_version: [4]u8,
+	// The EE client of the RPC a host server is answering, 0 outside one:
+	// set and cleared around the server's call in sif_command's RPC_CALL.
+	call_client: u32,
 }
 
 sif_init :: proc() {
@@ -106,7 +109,7 @@ sif_init :: proc() {
 	sif.servers[PADMAN_SID] = padman_server
 	sif.servers[PADMAN_SID_101] = padman_server_101
 	sif.servers[0x80000900] = mtap_server
-	sif.servers[SDR_SID] = sdr_server
+	sif.servers[SDR_SID] = proc(fno: u32, buf: []u8, size: u32) -> bool {return sdr_server(fno, buf, size, sif.call_client)}
 	sif.servers[0x90000200] = adx_server
 }
 
@@ -404,7 +407,10 @@ sif_command :: proc(a, pc: u32) {
 		}
 		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
-		if !ok || !handler(fno, buf, send_size) {
+		sif.call_client = client
+		served := ok && handler(fno, buf, send_size)
+		sif.call_client = 0
+		if !served {
 			sif_unknown(pc, .Sif_Rpc, sid, fno, client = client)
 			fmt.eprintfln("sif: unhandled rpc %08x fno %d send %d recv %d", sid, fno, send_size, recv_size)
 		}

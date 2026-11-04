@@ -194,6 +194,12 @@ rpc_server :: proc(sid: u32) -> int {
 	return found
 }
 
+// The EE client of the request queue qd's thread runs, 0 for none.
+rpc_client :: proc(qd: u32) -> u32 {
+	q := rpc_queue(qd)
+	return q.cur.client if q != nil && q.busy else 0
+}
+
 @(private = "file")
 rpc_queue :: proc(qd: u32) -> ^Iop_Rpc_Queue {
 	s := &iop_rpc
