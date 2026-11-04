@@ -46,7 +46,9 @@
 //   child's compat.log has no compile but loads the blob the parent
 //   compiled, and neither rewrites the records the first run compacted. A
 //   compile that fails in the parent (a directory in the way of its output)
-//   is not tried again in the child, which runs without learned code.
+//   is not tried again in the child, which runs without learned code. A
+//   compile that hangs (a fake one) is stopped after its window, 5 s under
+//   a 1 s COMPAT_WAIT, and the child runs without learned code.
 // - quit: a PS2 disc that draws and a PS1 one that fills VRAM run in a
 //   window (SDL's dummy video driver, software drawing) until a picture is
 //   written (SHOT, DUMP), then get SIGTERM, which SDL turns into the quit
@@ -103,7 +105,8 @@ PLAY_TEST_CHILD :: "PS_PLAY_TEST_CHILD"
 // would, then ends with no compat line. "stuck": vblank 1, then nothing for
 // 60 s; "boot": nothing for 60 s; "slow": vblanks 1 to 12, 0.4 s apart,
 // after 2 s; "learned": none, its last line whether the disc's learned blob
-// and key were stored before it started.
+// and key were stored before it started; "hang": as "learned", and a learned
+// compile (play --learned) is fake_compile.
 @(private = "file")
 fake_child :: proc(mode: string) -> ! {
 	f, err := os.open(core.env("COMPAT_PROGRESS"), {.Write})
@@ -129,7 +132,7 @@ fake_child :: proc(mode: string) -> ! {
 			time.sleep(400 * time.Millisecond)
 		}
 		fmt.eprintln("fake child: done")
-	case "learned":
+	case "learned", "hang":
 		dir := filepath.dir(core.env("COMPAT_PROGRESS"))
 		blob, _ := os.read_entire_file(core.disc_path(dir, .Learned, context.temp_allocator), context.temp_allocator)
 		stored := core.blob_valid(blob) && os.exists(core.disc_path(dir, .Learned_Key, context.temp_allocator))
@@ -138,9 +141,26 @@ fake_child :: proc(mode: string) -> ! {
 	os.exit(0)
 }
 
+// A learned compile that hangs: it writes its pid to HANG_PID in the
+// directory of its output, then sleeps 60 s and writes nothing.
+@(private = "file")
+fake_compile :: proc(out: string) -> ! {
+	pid_path, _ := filepath.join({filepath.dir(out), HANG_PID}, context.temp_allocator)
+	_ = os.write_entire_file(pid_path, fmt.tprint(os.get_pid()))
+	time.sleep(60 * time.Second)
+	os.exit(0)
+}
+
+// fake_compile's pid file, in the disc directory.
+@(private = "file")
+HANG_PID :: "hang.pid"
+
 main :: proc() {
 	if mode := os.get_env(PLAY_TEST_CHILD, context.temp_allocator); mode != "" && len(os.args) == 2 {
 		fake_child(mode)
+	}
+	if os.get_env(PLAY_TEST_CHILD, context.temp_allocator) == "hang" && len(os.args) == 5 && os.args[1] == "--learned" {
+		fake_compile(os.args[4])
 	}
 	if len(os.args) > 1 {
 		os.exit(play.run(os.args))
@@ -956,6 +976,27 @@ test_compat_learned :: proc() {
 	check(name, strings.contains(string(log), "play: no learned code (not compiled in the compat run)"), what)
 	check(name, !strings.contains(string(log), "learned:"), what)
 	check(name, !os.exists(blob) && !os.exists(key), "a blob from the failed compile")
+
+	// A compile that hangs, stopped after COMPAT_BOOT_FACTOR (5) times a
+	// 1 s COMPAT_WAIT. The fake compile sleeps 60 s: a run that did not
+	// stop it takes that long, and one left running is killed here.
+	pid_path, _ := filepath.join({dir, HANG_PID}, context.temp_allocator)
+	_ = os.remove(pid_path)
+	defer kill_fake_compile(pid_path)
+	os.set_env(core.env_name("COMPAT_WAIT"), "1")
+	os.set_env(PLAY_TEST_CHILD, "hang")
+	start := time.tick_now()
+	out, errs, ok = run_compat(name, {path, fmt.tprint(FRAMES)})
+	took := time.duration_seconds(time.tick_since(start))
+	os.unset_env(PLAY_TEST_CHILD)
+	os.unset_env(core.env_name("COMPAT_WAIT"))
+	row, found = compat_row(compat_rows(name), id)
+	what = fmt.tprintf("hung compile: %.1f s %v\nstdout:\n%s\nstderr:\n%s", took, row, out, errs)
+	check(name, ok && found && row[.Fatal] == "fake child: learned blob missing", what)
+	check(name, os.exists(pid_path), what)
+	check(name, took >= 5 && took < 15, what)
+	check(name, strings.contains(errs, "play: no learned code (the compile took over 5 s, stopped)"), what)
+	check(name, !os.exists(blob) && !os.exists(key) && !os.exists(in_way), "a blob from the hung compile")
 	data, _ := core.data_dir(context.temp_allocator)
 	tsv, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
 	_ = os.remove(tsv)
@@ -1285,6 +1326,24 @@ disc_id :: proc(name, path: string) -> string {
 	id, has_id := disc.id(&d, context.temp_allocator)
 	check(name, has_id, fmt.tprintf("%s has no id", path))
 	return id
+}
+
+// Kill the fake compile whose pid is in the file at path, if it still runs.
+@(private = "file")
+kill_fake_compile :: proc(path: string) {
+	text, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil {
+		return
+	}
+	pid, ok := strconv.parse_int(string(text), 10)
+	if !ok {
+		return
+	}
+	// One already reaped is not found.
+	if p, perr := os.process_open(pid); perr == nil {
+		_ = os.process_kill(p)
+		_, _ = os.process_wait(p)
+	}
 }
 
 // Run play --compat with args: stdout, stderr, and whether it ended with

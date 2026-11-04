@@ -3,6 +3,8 @@ package play
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:thread"
+import "core:time"
 import "ps:core"
 import "ps:recomp/mips"
 import "ps:recomp/native"
@@ -54,10 +56,11 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 // Convert the disc image in a child of this executable and store the blob
 // in the disc directory dir. The child's output goes to stderr as it comes,
 // on a terminal as one line rewritten in place. False, after a message
-// naming the child's last line, when there is no blob.
-convert_store :: proc(image, dir: string) -> bool {
+// naming the child's last line, when there is no blob. A child still
+// running after deadline (0: none) is stopped (child_blob).
+convert_store :: proc(image, dir: string, deadline: time.Duration) -> bool {
 	tmp := strings.concatenate({core.disc_path(dir, .Native, context.temp_allocator), ".convert"}, context.temp_allocator)
-	blob := child_blob({"--convert", image, tmp}, tmp, "native code", "conversion") or_return
+	blob := child_blob({"--convert", image, tmp}, tmp, "native code", "conversion", deadline) or_return
 	defer delete(blob)
 	return core.blob_store(dir, blob)
 }
@@ -66,19 +69,21 @@ convert_store :: proc(image, dir: string) -> bool {
 // convert_store) and store the blob of learned functions in the disc
 // directory dir, its key naming the records by set. False, after a
 // message, when there is no blob.
-learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string) -> bool {
+learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: time.Duration) -> bool {
 	l := learned_files(cpu)
 	tmp := strings.concatenate({core.disc_path(dir, l.blob, context.temp_allocator), ".compile"}, context.temp_allocator)
-	blob := child_blob({"--learned", l.name, records, tmp}, tmp, "learned code", "compile") or_return
+	blob := child_blob({"--learned", l.name, records, tmp}, tmp, "learned code", "compile", deadline) or_return
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, l.kind, set)
 }
 
 // Run this executable with args, which write a blob to tmp, relaying its
 // output. The blob, in context.allocator; false, after a message naming
-// what has none and the child's last line, when it wrote no valid one.
+// what has none and the child's last line, when it wrote no valid one. A
+// child still running after deadline (0: none) is killed, which ends its
+// output too: a hung one never closes the pipe the relay reads.
 @(private = "file")
-child_blob :: proc(args: []string, tmp, what, step: string) -> ([]u8, bool) {
+child_blob :: proc(args: []string, tmp, what, step: string, deadline: time.Duration) -> ([]u8, bool) {
 	self, err := os.get_executable_path(context.temp_allocator)
 	if err != nil {
 		fmt.eprintln("play: cannot find this executable:", err)
@@ -104,8 +109,25 @@ child_blob :: proc(args: []string, tmp, what, step: string) -> ([]u8, bool) {
 		fmt.eprintfln("play: cannot start the %s: %v", step, err)
 		return nil, false
 	}
+	cw := Child_Wait{p = p, deadline = deadline if deadline > 0 else os.TIMEOUT_INFINITE}
+	t := thread.create_and_start_with_poly_data(&cw, child_watch)
+	if t == nil {
+		// Unwatched, it could hang the run: stopped, it fails below.
+		fmt.eprintfln("play: cannot watch the %s", step)
+		_ = os.process_kill(p)
+	}
 	last := relay(r)
-	state, werr := os.process_wait(p)
+	if t != nil {
+		thread.join(t)
+		thread.destroy(t)
+	} else {
+		child_watch(&cw)
+	}
+	if cw.expired {
+		fmt.eprintfln("play: no %s (the %s took over %.0f s, stopped)", what, step, time.duration_seconds(deadline))
+		return nil, false
+	}
+	state, werr := cw.state, cw.err
 	if werr != nil || !state.exited || state.exit_code != 0 {
 		fmt.eprintfln("play: no %s (the %s failed: %s)", what, step, last)
 		return nil, false
@@ -117,6 +139,28 @@ child_blob :: proc(args: []string, tmp, what, step: string) -> ([]u8, bool) {
 		return nil, false
 	}
 	return blob, true
+}
+
+// A child_blob child's wait. Only child_watch waits on p: a wait that
+// returns its end reaps it, and another wait on it fails.
+@(private = "file")
+Child_Wait :: struct {
+	p:        os.Process,
+	deadline: time.Duration,
+	state:    os.Process_State,
+	err:      os.Error,
+	expired:  bool,
+}
+
+// Wait for w.p to end, killing it once w.deadline has passed (expired).
+@(private = "file")
+child_watch :: proc(w: ^Child_Wait) {
+	w.state, w.err = os.process_wait(w.p, w.deadline)
+	if w.err == os.General_Error.Timeout {
+		w.expired = true
+		_ = os.process_kill(w.p)
+		w.state, w.err = os.process_wait(w.p)
+	}
 }
 
 // Copy the child's output from r to stderr until it closes; on a terminal

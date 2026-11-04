@@ -12,9 +12,11 @@
 // never a failure of the run. The conversion runs here first (convert_store,
 // in its own child), and then the compile of the disc's learned code
 // (learned_blob, in its own child too), so neither window counts them and a
-// child hung or killed leaves no compile running; a disc whose conversion
-// fails runs interpreted, and one whose compile fails runs without learned
-// code, its child not compiling again.
+// child hung or killed leaves no compile running. Either one still running
+// after COMPAT_BOOT_FACTOR times COMPAT_WAIT is stopped; a disc whose
+// conversion fails or is stopped runs interpreted, and one whose compile
+// fails or is stopped runs without learned code, its child not compiling
+// again.
 //
 // The disc's press.txt, when there is one and PRESS is unset, is the
 // child's PRESS script.
@@ -260,10 +262,13 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	row[.Vmode] = cnf.vmode
 	row[.Frames_Wanted] = fmt.tprint(frames)
 	row[.When], _ = time.time_to_rfc3339(time.now(), 0, false, context.temp_allocator)
-	native := core.env("NATIVE") != "0" && (core.blob_cached(dir) || convert_store(image, dir))
+	// Each compile gets the child's window before its first vblank: a
+	// hung one is stopped, and the child runs without what it makes.
+	stall := time.Duration(wait) * time.Second
+	native := core.env("NATIVE") != "0" && (core.blob_cached(dir) || convert_store(image, dir, COMPAT_BOOT_FACTOR * stall))
 	// The child finds the blob stored and compiles nothing (compat_child).
 	if native {
-		_ = learned_blob(dir, .Iop if cnf.ps2 else .Psx)
+		_ = learned_blob(dir, .Iop if cnf.ps2 else .Psx, true, COMPAT_BOOT_FACTOR * stall)
 	}
 
 	self, serr := os.get_executable_path(context.temp_allocator)
@@ -295,7 +300,6 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 		row[.Result], row[.Fatal] = "spawn", fmt.tprint("cannot start the child:", perr)
 		return
 	}
-	stall := time.Duration(wait) * time.Second
 	state, werr, hang := compat_wait(p, progress, COMPAT_BOOT_FACTOR * stall, stall)
 	row[.Wall_S] = fmt.tprintf("%.1f", time.duration_seconds(time.tick_since(start)))
 	if werr == nil {
