@@ -83,7 +83,7 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			fmt.eprintfln("iop: GetOtherData of %x bytes from EE %08x to IOP %08x out of range", size, src, dest)
 			return 0, true
 		}
-		copy(iop_ram[i:][:size], mem.ram[e:][:size])
+		copy(iop_mem(i, size), mem.ram[e:][:size])
 		return 0, true
 	}
 	return 0, false

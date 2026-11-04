@@ -12,27 +12,33 @@ import host "host"
 import iop "iop"
 import kernel "kernel"
 import mem "mem"
+import psx_native "ps:psx/native"
 
 // What boot needs.
 Boot :: struct {
 	// The path of the disc image (a .cue sheet, or a single-track .bin or
 	// .iso).
-	disc:          string,
+	disc:           string,
 	// The window's title.
-	title:         cstring,
+	title:          cstring,
 	// A native blob holding all the game's code ("" none: every function is
 	// interpreted). The boot stops if it cannot be loaded.
-	native:        string,
+	native:         string,
 	// Called when the blob cannot be loaded, before boot returns false; nil
 	// none.
-	native_failed: proc(),
+	native_failed:  proc(),
+	// A blob of the IOP's learned functions ("" none;
+	// psx_native.load_learned), and what to call when it cannot be loaded
+	// (nil none); the IOP then interprets them, and the boot goes on.
+	learned:        string,
+	learned_failed: proc(),
 	// The directory the memory card directories go in (iop.mc_root); left
 	// empty, the runtime's.
-	cards:         string,
+	cards:          string,
 	// The port's own steps, each stopping the boot on false: `setup` before
 	// the window opens, `hooks` once the game's functions are registered.
-	setup:         proc() -> bool,
-	hooks:         proc() -> bool,
+	setup:          proc() -> bool,
+	hooks:          proc() -> bool,
 }
 
 // Set up the runtime for the game b describes and run the executable's
@@ -61,6 +67,10 @@ boot :: proc(b: Boot) -> bool {
 		}
 	} else {
 		fmt.eprintln("ps2: no native code, interpreting everything")
+	}
+	// After init, which makes the R3000 the IOP (iop.iop_cpu_init).
+	if b.learned != "" && !psx_native.load_learned(b.learned) && b.learned_failed != nil {
+		b.learned_failed()
 	}
 	if b.hooks != nil {b.hooks() or_return}
 	entry, ok := mem.load_elf(elf)

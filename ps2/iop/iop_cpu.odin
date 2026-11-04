@@ -20,7 +20,7 @@ IOP_EVENT_OFF :: max(u64)
 iop_cpu_init :: proc() {
 	r3000.state = {}
 	r3000.learn_cpu = .Iop
-	core.learn_cpu(.Iop, &r3000.state.cycles, r3000.CYCLES_PER_INSN, proc(a: u32) -> u32 {return r3000.lw(a)})
+	core.learn_cpu(.Iop, &r3000.state.cycles, r3000.CYCLES_PER_INSN, proc(a: u32) -> u32 {return r3000.lw(a)}, r3000.RAM_SIZE)
 	r3000.cop0 = {}
 	r3000.scratch = {}
 	r3000.next_event = IOP_EVENT_OFF
@@ -87,4 +87,6 @@ iop_cpu_snap :: proc() {
 	core.snap_add_bytes(r3000.ram[:])
 	core.snap_add(&iop_io_seen)
 	core.snap_add(&r3000.dispatch.reported) // report_once grows it
+	// RAM put back without the guard: learned functions are compared again.
+	append(&core.snap_hooks, core.Snap_Hook{save = proc(_: int) {}, load = proc(_: int) {r3000.learned_epoch += 1}})
 }

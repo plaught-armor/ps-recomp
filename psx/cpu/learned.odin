@@ -11,7 +11,16 @@
 // not compared again until its pages change.
 //
 // With none loaded (learned_loaded false), interpret does no lookup.
+//
+// -define:LEARNED_CHECK=true compares again on every resolve the last
+// compare's result stands for, and prints each entry whose RAM changed
+// without its pages' generations or the epoch: a write that missed the
+// guard.
 package psx_cpu
+
+@(require) import "core:fmt"
+
+LEARNED_CHECK :: #config(LEARNED_CHECK, false)
 
 Learned_Entry :: struct {
 	lo:       u32, // the first word's address
@@ -84,12 +93,23 @@ learned_resident :: proc(e: ^Learned_Entry) -> bool #no_bounds_check {
 	}
 	// Generations only grow, so an unchanged sum is unchanged pages.
 	if e.epoch == learned_epoch && e.gen == gen {
+		when LEARNED_CHECK {
+			if learned_same(e, o) != e.resident {
+				fmt.eprintfln("learned check: %08x changed behind the guard (resident %v)", e.lo, e.resident)
+			}
+		}
 		return e.resident
 	}
-	e.resident = string(ram[o:][:4 * len(e.words)]) == string(([^]u8)(raw_data(e.words))[:4 * len(e.words)])
+	e.resident = learned_same(e, o)
 	for p in first ..= last {
 		ram_armed[p] = true
 	}
 	e.gen, e.epoch = gen, learned_epoch
 	return e.resident
+}
+
+// Whether RAM at offset o holds e's words.
+@(private = "file")
+learned_same :: #force_inline proc(e: ^Learned_Entry, o: u32) -> bool #no_bounds_check {
+	return string(ram[o:][:4 * len(e.words)]) == string(([^]u8)(raw_data(e.words))[:4 * len(e.words)])
 }

@@ -111,8 +111,18 @@ sif_init :: proc() {
 }
 
 // The bytes at IOP address a, wrapped to IOP_SPACE: at most n of them, cut
-// at the end of RAM or of the HLE area, whichever holds a.
+// at the end of RAM or of the HLE area, whichever holds a. They may be
+// written: RAM's pages are touched first (r3000.ram_touch), so the IOP's
+// learned functions on them are compared again (psx/cpu/learned.odin).
+// Every host write to IOP RAM comes through here.
 iop_mem :: #force_inline proc(a, n: u32) -> []u8 {
+	b := iop_view(a, n)
+	if a & (IOP_SPACE - 1) < IOP_RAM_SIZE {r3000.ram_touch(a & (IOP_RAM_SIZE - 1), u32(len(b)))}
+	return b
+}
+
+// iop_mem's bytes, only read: no page is touched.
+iop_view :: #force_inline proc(a, n: u32) -> []u8 {
 	w := a & (IOP_SPACE - 1)
 	if w < IOP_RAM_SIZE {return iop_ram[w:][:min(n, IOP_RAM_SIZE - w)]}
 	return iop_hle[w - IOP_RAM_SIZE:][:min(n, IOP_SPACE - w)]
@@ -332,7 +342,7 @@ sif_command :: proc(a, pc: u32) {
 		// SIF_SREG_RPCINIT (0), which the IOP sets with a SET_SREG packet.
 		sif_reply(SIF_CMD_SET_SREG, 0, {0, 1})
 	case SIF_CMD_RESET:
-		path := cstring(raw_data(iop_mem(a + 24, IOP_SPACE)))
+		path := cstring(raw_data(iop_view(a + 24, IOP_SPACE)))
 		fmt.eprintfln("sif: IOP reset \"%s\"", path)
 		sif.loadfile_version = loadfile_version(string(path))
 		clear(&sif.bound)
@@ -533,7 +543,7 @@ romdir_file :: proc(img: []u8, name: string) -> (file: []u8, ok: bool) {
 @(private)
 irx_name :: proc(a: u32) -> string {
 	PT_SCE_IOPMOD :: 0x70000080
-	img := iop_mem(a, IOP_SPACE)
+	img := iop_view(a, IOP_SPACE)
 	if len(img) < 0x34 || string(img[:4]) != "\x7fELF" {return ""}
 	ph := (^u32)(&img[0x1c])^
 	if ph > u32(len(img)) - 8 || (^u32)(&img[ph])^ != PT_SCE_IOPMOD {return ""}

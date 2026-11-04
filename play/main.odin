@@ -13,10 +13,11 @@
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
 //
-// LEARN=1 records the code a PS1 game interprets in learn/psx.bin in the
-// disc's directory (core/learn.odin; a path records there instead). While
-// that file has records, each run compacts it and runs native code for
-// them: compiled in a child (`play --learned <records> <out>`) when the
+// LEARN=1 records the code a game interprets in the disc's directory, a PS1
+// game's in learn/psx.bin and a PS2 game's in learn/ps2.bin (core/learn.odin;
+// a path records there instead). While that file has records of the PS1, or
+// of the PS2's IOP, each run compacts it and runs native code for them:
+// compiled in a child (`play --learned <psx | iop> <records> <out>`) when the
 // stored learned blob is not for these records, this build and blob
 // format (always, for a dev build), and loaded beside the native blob.
 // Code that is not in RAM as it was recorded is interpreted, and learned.
@@ -50,8 +51,8 @@ run :: proc(args: []string) -> int {
 		return launcher(args[0])
 	case len(args) == 4 && args[1] == "--convert":
 		return convert(args[2], args[3])
-	case len(args) == 4 && args[1] == "--learned":
-		return compile_learned(args[2], args[3])
+	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop"):
+		return compile_learned(.Psx if args[2] == "psx" else .Iop, args[3], args[4])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
@@ -85,12 +86,35 @@ learned_failed :: proc() {
 	fmt.eprintln("play: the stored learned code would not load; it is compiled again next run")
 }
 
-// The learned blob for the records in learn/psx.bin of the disc directory
-// dir, after the file is compacted (core.learn_compact); compiled when the
-// stored one is not for them. "" when there are none, or no blob.
+// Where the learned code of cpu is kept: its blob, the blob's file and key,
+// the file its LEARN records are in, and its name on the learned child's
+// command line. Only the PS1's and the IOP's runs are compiled.
+@(private)
+Learned_Files :: struct {
+	kind:          core.Blob_Kind,
+	blob, key:     core.Disc_File,
+	records, name: string,
+}
+
+@(private)
+learned_files :: proc(cpu: core.Learn_Cpu) -> Learned_Files {
+	switch cpu {
+	case .Psx: return {.Learned, .Learned, .Learned_Key, "psx.bin", "psx"}
+	case .Iop: return {.Learned_Iop, .Learned_Iop, .Learned_Iop_Key, "ps2.bin", "iop"}
+	case .Ee:
+	}
+	panic("no learned code for the EE")
+}
+
+// The learned blob for cpu's records in the disc directory dir's learn
+// directory, after the file is compacted (core.learn_compact); compiled when
+// the stored one is not for them. Its key names those records alone, so
+// another processor's in the same file do not compile it again. "" when
+// there are none, or no blob.
 @(private = "file")
-learned_blob :: proc(dir: string) -> string {
-	records := learn_records(dir, "psx.bin")
+learned_blob :: proc(dir: string, cpu: core.Learn_Cpu) -> string {
+	l := learned_files(cpu)
+	records := learn_records(dir, l.records)
 	if !os.exists(records) {
 		return ""
 	}
@@ -110,11 +134,25 @@ learned_blob :: proc(dir: string) -> string {
 			return ""
 		}
 	}
-	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(compact))
-	if !core.blob_cached(dir, core.COMMIT, .Learned, set) && !learned_store(records, dir, set) {
+	// Each record by its code's hash; compacted, they are in one order.
+	Key :: struct #packed {
+		flags:        core.Learn_Flags,
+		entry, lo, n: u32,
+		hash:         u64,
+	}
+	recs, _ := core.learn_read(compact, context.temp_allocator)
+	keys := make([dynamic]Key, context.temp_allocator)
+	for r in recs {
+		if r.cpu == cpu {append(&keys, Key{r.flags, r.entry, r.lo, u32(len(r.words)), r.hash})}
+	}
+	if len(keys) == 0 {
 		return ""
 	}
-	return core.disc_path(dir, .Learned)
+	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(([^]u8)(raw_data(keys))[:len(keys) * size_of(Key)]))
+	if !core.blob_cached(dir, core.COMMIT, l.kind, set) && !learned_store(cpu, records, dir, set) {
+		return ""
+	}
+	return core.disc_path(dir, l.blob)
 }
 
 // The path of the file name in the disc directory dir's learn directory,
@@ -172,20 +210,22 @@ play :: proc(image: string) -> int {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
-	// Learned code runs on a PS1 game unless NATIVE=0; found before LEARN
-	// opens the records, which compacting rewrites.
+	// Learned code runs on a PS1 game, and on a PS2 game's IOP, unless
+	// NATIVE=0; found before LEARN opens the records, which compacting
+	// rewrites.
+	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
 	learned: string
-	if !cnf.ps2 && core.env("NATIVE") != "0" {
-		learned = learned_blob(dir)
+	if core.env("NATIVE") != "0" {
+		learned = learned_blob(dir, learn_cpu)
 	}
-	learned_key = core.disc_path(dir, .Learned_Key)
+	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
 	if core.env("LEARN") == "1" {
 		learn := core.disc_path(dir, .Learn)
 		if err := os.make_directory_all(learn); err != nil && !(err == .Exist && os.is_dir(learn)) {
 			fmt.eprintln("play: cannot make", learn, err)
 			return 1
 		}
-		if !core.learn_open_path(learn_records(dir, "ps2.bin" if cnf.ps2 else "psx.bin")) {
+		if !core.learn_open_path(learn_records(dir, learned_files(learn_cpu).records)) {
 			return 1
 		}
 	}
@@ -200,7 +240,17 @@ play :: proc(image: string) -> int {
 	title := strings.clone_to_cstring(cnf.serial if cnf.serial != "" else id)
 	if cnf.ps2 {
 		// ps2.boot returns only on a failure.
-		ps2.boot({disc = image, title = title, native = native, native_failed = native_failed, cards = cards})
+		ps2.boot(
+			{
+				disc = image,
+				title = title,
+				native = native,
+				native_failed = native_failed,
+				learned = learned,
+				learned_failed = learned_failed,
+				cards = cards,
+			},
+		)
 		return 1
 	}
 	b := psx.Boot {

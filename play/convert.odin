@@ -25,18 +25,19 @@ convert :: proc(image, out: string) -> int {
 	return 0
 }
 
-// The learned child (`play --learned <records> <out>`): the runs in the
-// LEARN file at records that native code can stand for
-// (core.learn_compilable), compiled to a blob of learned functions for
-// this host at out (psx/native/learned.odin).
-compile_learned :: proc(records, out: string) -> int {
+// The learned child (`play --learned <psx | iop> <records> <out>`): the
+// runs of the PS1 or IOP processor in the LEARN file at records that native
+// code can stand for (core.learn_compilable), compiled to a blob of learned
+// functions for this host at out (psx/native/learned.odin). Both run the
+// R3000 of psx_cpu, so one compiler serves them.
+compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	data, err := os.read_entire_file(records, context.allocator)
 	if err != nil {
 		fmt.eprintln("learned: cannot read", records, err)
 		return 1
 	}
 	recs, _ := core.learn_read(data)
-	runs, large, smc := core.learn_compilable(recs[:], .Psx)
+	runs, large, smc := core.learn_compilable(recs[:], cpu)
 	funcs := make([]r3000.Learned, len(runs))
 	for r, k in runs {
 		funcs[k] = {r.entry, r.lo, r.words}
@@ -65,11 +66,12 @@ convert_store :: proc(image, dir: string) -> bool {
 // convert_store) and store the blob of learned functions in the disc
 // directory dir, its key naming the records by set. False, after a
 // message, when there is no blob.
-learned_store :: proc(records, dir, set: string) -> bool {
-	tmp := strings.concatenate({core.disc_path(dir, .Learned, context.temp_allocator), ".compile"}, context.temp_allocator)
-	blob := child_blob({"--learned", records, tmp}, tmp, "learned code", "compile") or_return
+learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string) -> bool {
+	l := learned_files(cpu)
+	tmp := strings.concatenate({core.disc_path(dir, l.blob, context.temp_allocator), ".compile"}, context.temp_allocator)
+	blob := child_blob({"--learned", l.name, records, tmp}, tmp, "learned code", "compile") or_return
 	defer delete(blob)
-	return core.blob_store(dir, blob, core.COMMIT, .Learned, set)
+	return core.blob_store(dir, blob, core.COMMIT, l.kind, set)
 }
 
 // Run this executable with args, which write a blob to tmp, relaying its

@@ -171,7 +171,7 @@ fmod_command :: proc(cid, opt, a: u32) {
 	FMOD_INIT :: 0xfffffffe
 	FMOD_VERSION :: 0x03730004 // FMOD 3.73.04; the EE library checks it
 	op, wait := iop_u32(a + 0x14)^, iop_u32(a + 0x18)^
-	p := ([^]u32)(raw_data(iop_mem(a + 0x20, IOP_SPACE))) // payload
+	p := ([^]u32)(raw_data(iop_view(a + 0x20, IOP_SPACE))) // payload
 	fmod_log(op, wait, p)
 	reply: [20]u32 // packet bytes 0x10..0x60
 	info := reply[6:] // 0x30 bytes at +0x28
@@ -397,7 +397,7 @@ source_data :: proc(src, mode, offset, length: u32) -> ([]u8, bool) {
 
 @(private = "file")
 iop_string :: proc(a: u32) -> string {
-	return string(cstring(raw_data(iop_mem(a, IOP_SPACE))))
+	return string(cstring(raw_data(iop_view(a, IOP_SPACE))))
 }
 
 @(private = "file")

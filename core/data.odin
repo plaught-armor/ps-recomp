@@ -7,6 +7,8 @@
 //     native.<arch>.key    the blob format and build that wrote it
 //     learned.<arch>.bin   native code for the runs learn/ holds (play LEARN)
 //     learned.<arch>.key   the blob format, build and learn/psx.bin it is for
+//     learned-iop.<arch>.bin  the same for a PS2 game's IOP (learn/ps2.bin)
+//     learned-iop.<arch>.key
 //     cards/  saves/  settings.tsv  compat.log  learn/
 //     thumb.ppm            the picture a run last showed (thumb.odin)
 //     play.log             what the last run the launcher started printed
@@ -34,6 +36,8 @@ Disc_File :: enum {
 	Native_Key,
 	Learned,
 	Learned_Key,
+	Learned_Iop,
+	Learned_Iop_Key,
 	Cards,
 	Saves,
 	Settings,
@@ -51,6 +55,8 @@ DISC_FILES :: [Disc_File]string {
 	.Native_Key      = "native." + NATIVE_ARCH_NAME + ".key",
 	.Learned         = "learned." + NATIVE_ARCH_NAME + ".bin",
 	.Learned_Key     = "learned." + NATIVE_ARCH_NAME + ".key",
+	.Learned_Iop     = "learned-iop." + NATIVE_ARCH_NAME + ".bin",
+	.Learned_Iop_Key = "learned-iop." + NATIVE_ARCH_NAME + ".key",
 	.Cards           = "cards",
 	.Saves           = "saves",
 	.Settings        = "settings.tsv",
@@ -110,21 +116,24 @@ disc_path :: proc(dir: string, f: Disc_File, allocator := context.allocator) -> 
 }
 
 // A disc directory's blobs: the executable's native code, and the learned
-// functions (play's LEARN), whose key also names the records they are from.
+// functions (play's LEARN) of a PS1 game or of a PS2 game's IOP, whose key
+// also names the records they are from.
 Blob_Kind :: enum {
 	Native,
 	Learned,
+	Learned_Iop,
 }
 
 @(private = "file")
 BLOB_FILES :: [Blob_Kind][2]Disc_File {
-	.Native  = {.Native, .Native_Key},
-	.Learned = {.Learned, .Learned_Key},
+	.Native      = {.Native, .Native_Key},
+	.Learned     = {.Learned, .Learned_Key},
+	.Learned_Iop = {.Learned_Iop, .Learned_Iop_Key},
 }
 
 // Whether the disc directory holds a blob this build can run: its key names
-// this blob format and commit (and for .Learned the records, set), and its
-// header this format and host arch. Never for a dev build.
+// this blob format and commit (and for a learned blob the records, set),
+// and its header this format and host arch. Never for a dev build.
 blob_cached :: proc(dir: string, commit := COMMIT, kind := Blob_Kind.Native, set := "") -> bool {
 	if commit == "dev" {
 		return false

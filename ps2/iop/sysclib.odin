@@ -8,11 +8,19 @@ import "ps:core"
 import cpu "../cpu"
 import r3000 "ps:psx/cpu"
 
-// `n` bytes of IOP RAM from `a`, fewer where RAM ends.
+// `n` bytes of IOP RAM from `a`, fewer where RAM ends, only read.
 @(private = "file")
 ram :: proc(a, n: u32) -> []u8 {
 	w := a & (IOP_RAM_SIZE - 1)
 	return iop_ram[w:][:min(n, IOP_RAM_SIZE - w)]
+}
+
+// ram's bytes, to be written: as iop_mem, their pages are touched first.
+@(private = "file")
+ram_w :: proc(a, n: u32) -> []u8 {
+	b := ram(a, n)
+	r3000.ram_touch(a & (IOP_RAM_SIZE - 1), u32(len(b)))
+	return b
 }
 
 // The NUL-terminated string at `a`, cut where RAM ends.
@@ -135,7 +143,7 @@ iop_format :: proc(format: string, first := 1) -> (out: string, n: u32) {
 			if prec >= 0 && int(prec) < len(body) {body = body[:prec]}
 		case 'n':
 			w := o.n
-			copy(ram(next(&arg), 4), ([^]u8)(&w)[:4])
+			copy(ram_w(next(&arg), 4), ([^]u8)(&w)[:4])
 			continue
 		case:
 			fmt_put(&o, c)
@@ -199,18 +207,18 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 12: // memcpy(dst, src, n)
 		src := ram(a1, a2)
-		copy(ram(a0, u32(len(src))), src)
+		copy(ram_w(a0, u32(len(src))), src)
 		return a0, true
 	case 14: // memset(dst, c, n)
-		for &b in ram(a0, a2) {b = u8(a1)}
+		for &b in ram_w(a0, a2) {b = u8(a1)}
 		return a0, true
 	case 17: // bzero(p, n)
-		for &b in ram(a0, u32(max(i32(a1), 0))) {b = 0}
+		for &b in ram_w(a0, u32(max(i32(a1), 0))) {b = 0}
 		return 0, true
 	case 19: // sprintf(buf, format, ...): the characters it wrote, not counting the NUL
 		if a1 == 0 {return 0, true}
 		out, count := iop_format(cstr(a1), 2)
-		dst := ram(a0, u32(len(out)) + 1)
+		dst := ram_w(a0, u32(len(out)) + 1)
 		n := copy(dst, out)
 		if n < len(dst) {dst[n] = 0}
 		return count, true
@@ -233,7 +241,7 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 30: // strncpy(dst, src, n): dst, 0 when either is null; NUL-pads to n
 		if a0 == 0 || a1 == 0 {return 0, true}
 		src := cstr(a1)
-		dst := ram(a0, u32(max(i32(a2), 0)))
+		dst := ram_w(a0, u32(max(i32(a2), 0)))
 		k := copy(dst, src)
 		for &b in dst[k:] {b = 0}
 		return a0, true
@@ -316,7 +324,7 @@ digit :: proc(c: u8) -> u32 {
 // this stops at that length.
 @(private = "file")
 str_put :: proc(a: u32, src: string) {
-	dst := ram(a, u32(len(src)) + 1)
+	dst := ram_w(a, u32(len(src)) + 1)
 	for i in 0 ..< len(dst) {dst[i] = i < len(src) ? src[i] : 0}
 }
 
