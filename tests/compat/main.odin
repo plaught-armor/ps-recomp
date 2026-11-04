@@ -12,11 +12,13 @@
 // Each unimplemented call is named with where the first was made: ra, the
 // pc of a syscall, and the client data of a SIF bind. Neither run shows a
 // picture, and main RAM is the same at the end as at FRAMES/2.
+// - psx_press: the PSX host takes PRESS, the script both hosts read.
 package main
 
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "ps:core"
 import "ps:ps2"
@@ -77,6 +79,9 @@ main :: proc() {
 		check("psx_fatal", l.result == "fatal" && strings.contains(l.fatal, "reserved instruction"), "result")
 	}
 	run("psx_off", false, 1)
+	os.set_env(core.env_name("PRESS"), "Start@2+3")
+	run("psx_press", true, 0)
+	os.unset_env(core.env_name("PRESS"))
 	if l, ok := run("ps2", true, 0); ok {
 		check("ps2", l.system == "ps2" && l.result == "frames" && l.frames == FRAMES && l.cycles_per_insn == 1, "result")
 		// No picture, and nothing in RAM moved after the call.
@@ -141,6 +146,15 @@ run :: proc(name: string, compat: bool, status: int) -> (l: core.Compat_Line, ok
 child :: proc(name: string) -> ! {
 	vblank: proc()
 	switch name {
+	case "psx_press":
+		if !psx_cpu.trace_init() || !psx_host.platform_init("compat") {os.exit(2)}
+		if !slice.equal(core.input.script[:], []core.Scripted_Press{{at = 2, hold = 3, buttons = {.Start}}}) {
+			fmt.eprintln("PRESS not loaded:", core.input.script)
+			os.exit(3)
+		}
+		vblank = psx_host.platform_frame
+		psx_cpu.register_funcs(nil)
+		psx_cpu.next_event = max(u64)
 	case "psx", "psx_fatal", "psx_off":
 		if !psx_cpu.trace_init() || !psx_host.platform_init("compat") {os.exit(2)}
 		vblank = psx_host.platform_frame
