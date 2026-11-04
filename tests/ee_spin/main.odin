@@ -6,7 +6,9 @@
 // memory, the same frame count and INTC_STAT, and the same alarm handler
 // calls at the same cycles. A loop that leaves everything as it found it
 // (a pure spin, a store of the value already there) must be skipped; one
-// that changes memory (a counter) or reads a register is never skipped.
+// that changes memory (a counter) or reads a register is never skipped,
+// but for INTC_STAT, which only an event or a store changes: a loop that
+// polls it is skipped, one that polls GIF_STAT or a timer is not.
 package main
 
 import "base:runtime"
@@ -29,7 +31,7 @@ HANDLER :: u32(0x00300000) // the alarms' handler, an Odin proc
 // Alarm times, in lines; the vblanks between them are events too.
 ALARMS :: [?]u32{300, 700, 1200, 2000}
 
-// t0 = 8, t1 = 9, t2 = 10, t3 = 11.
+// t0 = 8, t1 = 9, t2 = 10, t3 = 11, t4 = 12.
 lui :: proc(rt, imm: u32) -> u32 {return 0x0f << 26 | rt << 16 | imm}
 addiu :: proc(rt, rs, imm: u32) -> u32 {return 0x09 << 26 | rs << 21 | rt << 16 | imm & 0xffff}
 lw :: proc(rt, off, base: u32) -> u32 {return 0x23 << 26 | base << 21 | rt << 16 | off & 0xffff}
@@ -92,7 +94,9 @@ main :: proc() {
 		// The counter goes up in memory; t1 ends each pass at 0, so only
 		// the store tells the passes apart.
 		{"counter", {lw(9, 0x20, 10), addiu(9, 9, 1), sw(9, 0x20, 10), addiu(9, 0, 0)}, false},
-		{"register load", {lw(9, 0x3020, 11)}, false}, // GIF_STAT
+		{"INTC_STAT load", {lui(12, 0x1001), lw(9, 0xf000, 12)}, true}, // 0x1000f000
+		{"GIF_STAT load", {lw(9, 0x3020, 11)}, false},
+		{"timer load", {lw(9, 0, 11)}, false}, // T0_COUNT
 	}
 
 	arch := native.Arch(core.NATIVE_ARCH)

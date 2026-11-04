@@ -75,7 +75,10 @@ load :: #force_inline proc(a: u32, $T: typeid) -> T #no_bounds_check {
 	if p := slow_addr(a); p != nil {
 		return intrinsics.unaligned_load((^T)(p))
 	}
-	cpu.spin_dirty |= cpu.SPIN_SIDE
+	// A register read is a side effect to the spin probe, but INTC_STAT's:
+	// reading it changes nothing, the value read lands in the state the
+	// probe compares, and only run_events and hw_write change it.
+	if (a & 0x1fffffff) &~ 3 != INTC_STAT {cpu.spin_dirty |= cpu.SPIN_SIDE}
 	return T(hw_read(a, size_of(T)))
 }
 

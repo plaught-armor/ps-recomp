@@ -31,6 +31,7 @@ DMA_BASE := [10]u32{0x8000, 0x9000, 0xa000, 0xb000, 0xb400, 0xc000, 0xc400, 0xc8
 hwregs: [0x10000]u8 // 0x10000000..0x1000ffff
 gsregs: [0x2000]u8 // 0x12000000..0x12001fff
 
+INTC_STAT :: u32(0x1000f000)
 intc_stat, intc_mask: u32
 // Raised but not yet delivered to kernel handlers. Kept apart from
 // INTC_STAT, which only software clears: libraries poll it for VBLANK
