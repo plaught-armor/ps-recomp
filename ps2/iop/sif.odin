@@ -901,11 +901,15 @@ cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x0c: w[0] = CD_STAT_PAUSE // Status
 	case 0x16, 0x22, 0x23: w[0] = 1 // Break, MMode, ChangeThreadPriority
 	case 0x27:
-		// ReadDvdDualInfo {result, on_dual, layer1_start}: layer1_start is
-		// the sector the second layer's volume starts at, counted on from
-		// the first layer's (an LSN, not a physical sector number; unverified
-		// on hardware, as is on_dual for opposite-track discs).
-		w[0], w[1], w[2] = 1, u32(image.layer1 != 0), image.layer1
+		// ReadDvdDualInfo {result, on_dual, layer1_start}, as cdvdman takes
+		// them from the DVD's TOC: on_dual is 1 for a dual-layer disc
+		// (parallel or opposite track alike) and layer1_start the LSN the
+		// second layer's volume starts at. A single-layer disc's TOC holds
+		// its data area's end there, so it answers on_dual 0 and its sector
+		// count. Over disc_dir there is no sector count: 0. A CD would
+		// answer {1, 0, 0}, but GetDiskType calls every disc a DVD.
+		count := image.layer1 != 0 ? image.layer1 : disc.end(&image)
+		w[0], w[1], w[2] = 1, u32(image.layer1 != 0), count
 	case: return false
 	}
 	return true
@@ -1014,16 +1018,24 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 // cdvdfsv SearchFile {file[0x24], path[256], EE address of the request,
 // layer}: the IOP writes the sceCdlFILE {lsn, size, name[16], date[8], flag}
 // back over the start of the EE's request and returns 1 found, 0 not. The
-// layout follows the size sent, as cdvdfsv's does: 0x124 is the old
-// library's {file[0x20], path[256], EE address}, written back without the
-// flag word; 0x128 adds the flag and searches the first layer; 0x12c adds
-// the layer word, any nonzero value the second layer, as cdvdman maps it.
+// layout follows the size sent, as cdvdfsv's switch does: 0x12c adds the
+// layer word; 0x128 has the flag and searches the first layer; any other
+// size is the old library's {file[0x20], path[256], EE address}, written
+// back without the flag word. Any nonzero layer is the second: cdvdfsv
+// passes it on unchecked, and cdvdman's CD_newmedia and CdSearchFileInner
+// add the second layer's start for every nonzero layer.
 @(private)
 cdvd_search_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	if fno != 0 || len(buf) < 0x12c {return false}
-	file_size: u32 = send_size == 0x124 ? 0x20 : CD_FILE
-	layer := send_size >= 0x12c && w[0x128 / 4] != 0
+	file_size: u32 = 0x20
+	layer := false
+	switch send_size {
+	case 0x12c:
+		file_size, layer = CD_FILE, w[0x128 / 4] != 0
+	case 0x128:
+		file_size = CD_FILE
+	}
 	path := buf[file_size:][:0x100]
 	file, found := cdvd_search(strings.truncate_to_byte(string(path), 0), u8(layer))
 	if found {copy(mem.ram_slice(w[(file_size + 0x100) / 4], file_size), file[:file_size])}

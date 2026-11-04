@@ -83,8 +83,11 @@
 // is a compat row.
 //
 // cdvdfsv's SearchFile server, on a dual-layer image: an old 0x124 request
-// reads its path at 0x20 and gets a 0x20 record; 0x128 searches the first
-// layer; any nonzero layer word searches the second; a miss writes nothing.
+// reads its path at 0x20 and gets a 0x20 record, as does any size but 0x128
+// and 0x12c; 0x128 searches the first layer; any nonzero layer word searches
+// the second; a miss writes nothing. ReadDvdDualInfo answers on_dual 1 and
+// the second layer's start there, on a single-layer image on_dual 0 and the
+// image's sector count.
 //
 // padman: GetButtonMask, SetButtonMask, SetVref, GetPortMax and GetSlotMax
 // answer in the result word each uses, 0 for a socket not open; a button
@@ -4174,6 +4177,34 @@ test_cdvd_search_server :: proc() {
 	check(found == 1 && lsn(rec) == V + 23, "search server: any nonzero layer is the second")
 	found, rec = ask(search, 0x12c, 0x24, 0, "\\NOPE.BIN;1")
 	check(found == 0 && lsn(rec) == 0xaaaaaaaa, "search server: a miss returns 0 and writes nothing")
+	found, rec = ask(search, 0x130, 0x20, 1, "\\BIG.BIN;1")
+	check(found == 1 && lsn(rec) == 23 && endian.unchecked_get_u32le(rec[0x20:]) == 0xaaaaaaaa, "search server: another size is an old request")
+
+	on_dual, start := dual_info()
+	check(on_dual == 1 && start == V, "dual info: a dual-layer image's second layer start")
+	// One layer with 11 sectors past its volume: the image's count, not
+	// the volume's.
+	SINGLE :: V + 11
+	one := make([]u8, SINGLE * SECTOR, context.temp_allocator)
+	copy(one, iso)
+	path = fmt.tprintf("%s/sl.iso", dir)
+	_ = os.write_entire_file(path, one)
+	if !iop.disc_image_open(path) {
+		check(false, "dual info: the single-layer image opens")
+		return
+	}
+	on_dual, start = dual_info()
+	check(on_dual == 0 && start == SINGLE, "dual info: a single-layer image's sector count")
+}
+
+// ReadDvdDualInfo through cdvdfsv's S-command server: {result, on_dual,
+// layer1_start}, the result checked to be 1.
+dual_info :: proc() -> (on_dual, start: u32) {
+	buf: [64]u8
+	w := ([^]u32)(raw_data(buf[:]))
+	ok := iop.sif.servers[0x80000593](0x27, buf[:], 0)
+	check(ok && w[0] == 1, "dual info: answers 1")
+	return w[1], w[2]
 }
 
 test_cdvdman :: proc() {
