@@ -47,6 +47,12 @@
 //   compiled, and neither rewrites the records the first run compacted. A
 //   compile that fails in the parent (a directory in the way of its output)
 //   is not tried again in the child, which runs without learned code.
+// - quit: a PS2 disc that draws and a PS1 one that fills VRAM run in a
+//   window (SDL's dummy video driver, software drawing) until a picture is
+//   written (SHOT, DUMP), then get SIGTERM, which SDL turns into the quit
+//   event a closed window sends: play exits with status 0 and the thumb.ppm
+//   it writes is the last picture shrunk, the one last shown (test_quit;
+//   not on Windows, which has no SIGTERM).
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
 // - launcher: the launcher's steps, settings, picture, dropped files and
@@ -161,6 +167,7 @@ main :: proc() {
 	test_settings()
 	test_compat()
 	test_compat_learned()
+	test_quit()
 	test_line_row()
 	test_library()
 	test_log_strip()
@@ -431,6 +438,13 @@ PS2_SLEEP := [?]u32{0x3c081200, 0x24090001, 0xfd090000, 0x24030032, 0x0000000c, 
 @(private = "file")
 ps2_disc :: proc(code: ..u32) -> []u8 {
 	return discimg.make_iso(PS2_CNF, sub_name = "SLUS_123.45;1", sub = string(elf(..code)))
+}
+
+// A PS2 disc that draws PS2_PACKET, turns the display on and counts
+// (PS2_SHOW).
+@(private = "file")
+ps2_show_disc :: proc() -> []u8 {
+	return discimg.make_iso(PS2_CNF, sub_name = "SLUS_123.45;1", sub = string(elf_at({text = 0x00100000, code = PS2_SHOW[:], data = string(slice.to_bytes(PS2_PACKET[:]))})))
 }
 
 // A PS2 disc booting boot, with DATA/SECOND.ELF second when it has code.
@@ -991,7 +1005,7 @@ test_compat :: proc() {
 		{"still.iso", cnf_disc("", ..PS1_STILL[:]), "ps1", "stalled", "1", "", "", "", fmt.tprintf("stalled: main RAM unchanged f%d-f%d", FRAMES / 2, FRAMES)},
 		// A picture drawn, PMODE 1 turns read circuit 1 on, then a word in
 		// RAM counts up.
-		{"ps2_show.iso", discimg.make_iso(PS2_CNF, sub_name = "SLUS_123.45;1", sub = string(elf_at({text = 0x00100000, code = PS2_SHOW[:], data = string(slice.to_bytes(PS2_PACKET[:]))}))), "ps2", "ok", "0", "", "", "", ""},
+		{"ps2_show.iso", ps2_show_disc(), "ps2", "ok", "0", "", "", "", ""},
 		// The same with nothing drawn.
 		{"ps2_dark.iso", ps2_disc(..PS2_DARK[:]), "ps2", "stalled", "1", "", "", "", "stalled: nothing drawn"},
 		{"ps2_sleep.iso", ps2_disc(..PS2_SLEEP[:]), "ps2", "stalled", "1", "", "", "", "stalled: nothing drawn"},
@@ -1121,6 +1135,132 @@ test_compat :: proc() {
 		check(name, c.result == "hang" ? row[.Fatal] == "" : row[.Fatal] == "fake child: done", what)
 	}
 	os.unset_env(core.env_name("COMPAT_WAIT"))
+}
+
+// Presents test_quit writes a picture of, from 1: it sends SIGTERM once
+// picture QUIT_AFTER is written, and the run must quit before the last one.
+@(private = "file")
+QUIT_PICTURES :: 600
+@(private = "file")
+QUIT_AFTER :: 10
+
+// GP1(03000000), the display on; GP0(02ffffff), (0, 0), (320 x 240): VRAM's
+// top left filled white; then the count as PS1_SHOW's.
+@(private = "file")
+PS1_FILL := [?]u32 {
+	0x3c081f80, 0x3c090300, 0xad091814, 0x3c0902ff, 0x3529ffff, 0xad091810, 0xad001810, 0x3c0900f0,
+	0x35290140, 0xad091810, 0x3c0a8002, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0,
+}
+
+test_quit :: proc() {
+	name := "quit"
+	when ODIN_OS == .Windows {
+		return
+	}
+	self, serr := os.get_executable_path(context.temp_allocator)
+	if serr != nil {
+		check(name, false, fmt.tprintf("cannot run play: %v", serr))
+		return
+	}
+	dir, _ := filepath.join({tmp, "quit"}, context.temp_allocator)
+	if os.make_directory(dir) != nil {
+		check(name, false, fmt.tprintf("cannot make %s", dir))
+		return
+	}
+	vblanks := make([dynamic]string, context.temp_allocator)
+	for v in 1 ..= QUIT_PICTURES {
+		append(&vblanks, fmt.tprint(v))
+	}
+	// A window, not headless and not to FRAMES; SDL's dummy drivers need no
+	// display or sound device.
+	os.unset_env(core.env_name("HEADLESS"))
+	os.unset_env(core.env_name("FRAMES"))
+	os.set_env("SDL_VIDEODRIVER", "dummy")
+	os.set_env("SDL_AUDIODRIVER", "dummy")
+	defer {
+		os.set_env(core.env_name("HEADLESS"), "1")
+		os.set_env(core.env_name("FRAMES"), fmt.tprint(FRAMES))
+		os.unset_env("SDL_VIDEODRIVER")
+		os.unset_env("SDL_AUDIODRIVER")
+	}
+	// PS2: SHOT pictures (shot_<vblank>.ppm); PS1: DUMP's (frame_<present,
+	// 5 digits>.ppm), written as the frame is presented.
+	cases := [?]struct {
+		file, setting, value, picture: string,
+		image:                         []u8,
+	} {
+		{"ps2_show.iso", "SHOT", strings.join(vblanks[:], ",", context.temp_allocator), "shot_%d.ppm", ps2_show_disc()},
+		{"fill.iso", "DUMP", dir, "frame_%05d.ppm", cnf_disc("", ..PS1_FILL[:])},
+	}
+	for c in cases {
+		what := c.file
+		iso, _ := filepath.join({dir, c.file}, context.temp_allocator)
+		log, _ := filepath.join({dir, strings.concatenate({c.file, ".log"}, context.temp_allocator)}, context.temp_allocator)
+		if os.write_entire_file(iso, c.image) != nil {
+			check(name, false, fmt.tprintf("%s: cannot write it", what))
+			continue
+		}
+		id := disc_id(name, iso)
+		ddir, has_dir := core.disc_dir(id, context.temp_allocator)
+		if !has_dir {
+			check(name, false, fmt.tprintf("%s: no disc directory", what))
+			continue
+		}
+		// An earlier run of the disc (test_compat's) may have left one.
+		thumb_path := core.disc_path(ddir, .Thumb, context.temp_allocator)
+		_ = os.remove(thumb_path)
+		picture :: proc(dir, format: string, v: int) -> string {
+			path, _ := filepath.join({dir, fmt.tprintf(format, v)}, context.temp_allocator)
+			return path
+		}
+		out, ferr := os.create(log)
+		if ferr != nil {
+			check(name, false, fmt.tprintf("%s: cannot make %s: %v", what, log, ferr))
+			continue
+		}
+		os.set_env(core.env_name(c.setting), c.value)
+		p, perr := os.process_start({command = {self, iso}, working_dir = dir, stdout = out, stderr = out})
+		os.unset_env(core.env_name(c.setting))
+		os.close(out)
+		if perr != nil {
+			check(name, false, fmt.tprintf("%s: cannot run play: %v", what, perr))
+			continue
+		}
+		start := time.tick_now()
+		for !os.exists(picture(dir, c.picture, QUIT_AFTER)) && time.tick_since(start) < 60 * time.Second {
+			time.sleep(20 * time.Millisecond)
+		}
+		check(name, os.exists(picture(dir, c.picture, QUIT_AFTER)), fmt.tprintf("%s: no picture %d within 60 s", what, QUIT_AFTER))
+		check(name, sigterm(p.pid), fmt.tprintf("%s: cannot send SIGTERM", what))
+		state, werr := os.process_wait(p, 30 * time.Second)
+		if werr != nil {
+			_ = os.process_kill(p)
+			_, _ = os.process_wait(p)
+		}
+		text, _ := os.read_entire_file(log, context.temp_allocator)
+		check(name, werr == nil && state.exited && state.exit_code == 0, fmt.tprintf("%s: play %v %v, its output: %s", what, werr, state, text))
+		// The picture of the last present before the quit: the last one
+		// shown.
+		last := 0
+		for v in 1 ..= QUIT_PICTURES {
+			if os.exists(picture(dir, c.picture, v)) {last = v}
+		}
+		check(name, last >= QUIT_AFTER && last < QUIT_PICTURES, fmt.tprintf("%s: last picture %d", what, last))
+		data, _ := os.read_entire_file(picture(dir, c.picture, last), context.temp_allocator)
+		w, h, rgb, ok := core.ppm_parse(data)
+		if !ok {
+			check(name, false, fmt.tprintf("%s: picture %d unread", what, last))
+			continue
+		}
+		px := make([]u32, w * h, context.temp_allocator)
+		for &v, i in px {
+			v = u32(rgb[i * 3]) << 16 | u32(rgb[i * 3 + 1]) << 8 | u32(rgb[i * 3 + 2])
+		}
+		want := core.thumb_make(px, w, w, h, .Xrgb)
+		thumb := core.thumb_load(thumb_path, context.temp_allocator)
+		check(name, thumb != nil && slice.equal(thumb, want), fmt.tprintf("%s: thumb.ppm %v, not picture %d shrunk", what, thumb != nil, last))
+		check(name, slice.any_of_proc(want, proc(b: u8) -> bool {return b != 0}), fmt.tprintf("%s: picture %d is black", what, last))
+	}
 }
 
 // The disc's id; "" on a failure.
