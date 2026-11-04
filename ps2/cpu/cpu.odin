@@ -62,6 +62,17 @@ CYCLES_PER_FRAME :: EE_CLOCK * 1001 / 60000 // NTSC 59.94 Hz
 // waits for them to return instead of ending the current block.
 in_interrupt: bool
 
+// What ran since the spin skip (ps2/spin.odin) armed its probe that a loop
+// at a fixed point must not do: SPIN_SIDE for an effect the snapshot of EE
+// state and RAM cannot show (a register read, a syscall, the interpreter, a
+// read of COP0 Count), SPIN_EVENT for run_events and all its handlers did.
+// Nonzero, the probe does not skip.
+spin_dirty: u32
+SPIN_SIDE :: 1
+SPIN_EVENT :: 2
+// The cycles the spin skip added, for STATS.
+spin_cycles: u64
+
 // DEBUG=1: dump threads every two seconds; 2: also trace syscalls; 3: trace
 // GS register writes. Set by the kernel at init.
 debug: int
@@ -127,6 +138,7 @@ lookup :: proc(addr: u32) -> Func_Proc #no_bounds_check {
 interp_hook: proc(addr: u32)
 
 call :: proc(addr: u32) {
+	spin_dirty |= SPIN_SIDE
 	if fn := lookup(addr); fn != nil {
 		fn()
 		return
@@ -143,6 +155,7 @@ call :: proc(addr: u32) {
 // in what was recompiled as another function: continue there as a tail call
 // (the guest stack frame is shared, and its `jr $ra` returns for us).
 jump_unknown :: proc(fn, pc: u32) {
+	spin_dirty |= SPIN_SIDE
 	if f := lookup(pc); f != nil {
 		f()
 		return
@@ -168,6 +181,7 @@ trap_hook: proc(pc: u32)
 
 trap :: proc(pc: u32) {
 	if trap_hook != nil {
+		spin_dirty |= SPIN_SIDE
 		trap_hook(pc)
 		return
 	}

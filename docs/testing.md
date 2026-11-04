@@ -6,6 +6,7 @@ From the repository root:
 odin run tests/core -collection:ps=.
 odin run tests/native -collection:ps=.
 odin run tests/ee_native -collection:ps=.
+odin run tests/ee_spin -collection:ps=.
 odin run tests/fpu -collection:ps=.
 odin run tests/lower -collection:ps=.
 odin run tests/vu -collection:ps=.
@@ -52,6 +53,7 @@ here.
 | `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading |
 | `native` | The machine-code emitter |
 | `ee_native` | EE instructions through the native backend against the interpreter |
+| `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin and a same-value store are skipped, a counter and a register load are not |
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |
 | `vu` | VU0 microprograms from the EE, macro flags |

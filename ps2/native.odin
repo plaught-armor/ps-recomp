@@ -109,11 +109,12 @@ wr32 :: proc(a, v: u32) {mem.wr32(a, v)}
 // Host pointer for a plain RAM or scratchpad address, else nil: the fast
 // path of recompiled code (recomp/r5900/gen.odin FAST_HELPERS fast), as a
 // call into package mem is not inlined here either. No bounds check, as
-// there.
+// there. With fast_lim 0 (WATCH, or the spin probe armed) the scratchpad
+// takes the mem path too, so its stores reach the checks there.
 @(private = "file")
 fast :: #force_inline proc "contextless" (a: u32) -> rawptr #no_bounds_check {
 	if a < mem.fast_lim {return &mem.ram_base[a]}
-	if a - mem.SPR_BASE < mem.SPR_SIZE {return &mem.spr[a - mem.SPR_BASE]}
+	if a - mem.SPR_BASE < mem.SPR_SIZE && mem.fast_lim != 0 {return &mem.spr[a - mem.SPR_BASE]}
 	return nil
 }
 
@@ -184,6 +185,7 @@ sdr :: proc(a, n: u32) {mem.SDR(a, cpu.state.r[n].d[0])}
 // fields come straight from the word, without decoding it again.
 @(private = "file")
 exec_op :: proc(pc, w, op: u32) {
+	cpu.spin_dirty |= cpu.SPIN_SIDE
 	exec_insn(
 		{
 			pc = pc,
@@ -260,6 +262,9 @@ native_imports :: proc() -> map[string]u64 {
 	m["kernel.trace_on"] = p(&kernel.trace_on)
 	m["kernel.trace_call"] = p(rawptr(kernel.trace_call))
 	m["kernel.run_events"] = p(rawptr(kernel.run_events))
+	m["cpu.spin_dirty"] = p(&cpu.spin_dirty)
+	m["ps2.spin_tick"] = p(&spin_tick)
+	m["ps2.spin_probe"] = p(rawptr(spin_probe))
 	m["ps2.exec_op"] = p(rawptr(exec_op))
 	m["ps2.ld"] = p(rawptr(ld))
 	m["ps2.sd"] = p(rawptr(sd))
@@ -331,6 +336,7 @@ load_native :: proc(path: string) -> bool {
 		if cpu.text_hi == 0 {fmt.eprintln("native: NATIVE=0, and there are no recompiled functions to keep")}
 		return false
 	}
+	spin_on = core.env("SPIN") != "0"
 	if mem.ram_base == nil {
 		fmt.eprintln("native: load_native comes after init, which maps RAM")
 		return false

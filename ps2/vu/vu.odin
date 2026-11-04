@@ -134,6 +134,7 @@ vu0_set_vf :: proc(n: u8, v: u128) #no_bounds_check {
 }
 
 vu0_ctrl_read :: proc(n: u8) -> u32 {
+	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	switch n {
 	case 0 ..< 16: return u32(vu0.vi[n])
 	case 16: return vu0.status
@@ -152,6 +153,7 @@ vu0_ctrl_read :: proc(n: u8) -> u32 {
 }
 
 vu0_ctrl_write :: proc(n: u8, v: u32) {
+	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	switch n {
 	case 1 ..< 16: vu0.vi[n] = u16(v)
 	case 16: vu0.status = v
@@ -172,6 +174,7 @@ vclamp4 :: #force_inline proc(r: [4]f32) -> [4]f32 {return {vclamp(r.x), vclamp(
 
 // VU0 macro instruction (COP2 with CO set).
 vu0_macro :: proc(w: u32) {
+	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0[cpu.cop2_key(w)] += 1}
 	vu_op(&vu0, w)
 	vu_drain(&vu0) // macro mode waits for Q, and sets I and D at once
@@ -1547,6 +1550,7 @@ vu1_xgkick :: proc(addr: u16) {
 // only for a VCALLMS while VU0 still runs or a QMFC2.I/CFC2.I that waits
 // for the end. No state outlives the call but tpc and the registers.
 vu0_call_micro :: proc(addr: u32) {
+	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU0, t)
 	if vu0_cap.file != nil {vu_capture(&vu0, addr)}

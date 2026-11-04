@@ -55,7 +55,7 @@ flush :: proc(l: ^Lowering) {
 @(private = "file")
 goto_ :: proc(l: ^Lowering, src, t: u32) {
 	if t >= l.f.start && t < l.f.end && t in l.f.labels {
-		put(l, {kind = .Goto, target = t, check = t <= src})
+		put(l, {kind = .Goto, target = t, check = t <= src, n = src})
 		return
 	}
 	put(l, {kind = .Call, target = t})

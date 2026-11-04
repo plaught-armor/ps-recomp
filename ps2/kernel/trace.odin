@@ -56,6 +56,7 @@ trace_init :: proc() {
 }
 
 trace_call :: proc(addr: u32) {
+	cpu.spin_dirty |= cpu.SPIN_SIDE // its lines are output
 	if !trace_fns[addr] || k.frame < trace_lo || k.frame > trace_hi {return}
 	fmt.eprintf("trace f_%08x a0 %x a1 %x a2 %x a3 %x", addr,
 		u32(cpu.state.r[4].d[0]), u32(cpu.state.r[5].d[0]), u32(cpu.state.r[6].d[0]), u32(cpu.state.r[7].d[0]))

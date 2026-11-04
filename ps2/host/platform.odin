@@ -263,7 +263,8 @@ vblank_frame :: proc() {
 }
 
 // STATS=1: every STATS_FRAMES presented frames, host frame rate and the
-// share of guest time the kernel skipped with every thread waiting.
+// share of guest time the kernel skipped with every thread waiting, and the
+// share the spin skip (ps2/spin.odin) jumped.
 @(private)
 stats: bool
 @(private)
@@ -272,22 +273,23 @@ STATS_FRAMES :: 300
 @(private)
 print_stats :: proc() {
 	@(static) t0: time.Tick
-	@(static) cyc0, idle0, tsc0: u64
+	@(static) cyc0, idle0, spin0, tsc0: u64
 	@(static) prof0: [cpu.Prof]u64
 	now := time.tick_now()
 	tsc := cpu.prof_start()
 	if t0 != {} {
 		secs := time.duration_seconds(time.tick_diff(t0, now))
 		cyc, idl := cpu.state.cycles - cyc0, kernel.idle_cycles - idle0
-		fmt.eprintf("stats: frame %d  %.1f fps  idle %.0f%%", frame,
-			f64(STATS_FRAMES) / secs, 100 * f64(idl) / f64(max(cyc, 1)))
+		spin := cpu.spin_cycles - spin0
+		fmt.eprintf("stats: frame %d  %.1f fps  idle %.0f%%  spin %.0f%%", frame,
+			f64(STATS_FRAMES) / secs, 100 * f64(idl) / f64(max(cyc, 1)), 100 * f64(spin) / f64(max(cyc, 1)))
 		for p in cpu.Prof {
 			fmt.eprintf("  %v %.0f%%", p, 100 * f64(cpu.prof[p] - prof0[p]) / f64(max(tsc - tsc0, 1)))
 		}
 		a := core.audio_take_stats()
 		fmt.eprintfln("  audio dry %d dropped %d low %.0f ms", a.dry, a.dropped, a.low_ms)
 	}
-	t0, cyc0, idle0, tsc0, prof0 = now, cpu.state.cycles, kernel.idle_cycles, tsc, cpu.prof
+	t0, cyc0, idle0, spin0, tsc0, prof0 = now, cpu.state.cycles, kernel.idle_cycles, cpu.spin_cycles, tsc, cpu.prof
 }
 
 // SNAPTEST=<save>,<load>: save state at presented frame <save>, load it

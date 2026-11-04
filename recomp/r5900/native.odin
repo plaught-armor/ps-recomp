@@ -82,6 +82,23 @@ events :: proc(a: ^native.Asm) {
 	native.bind(a, skip)
 }
 
+// The spin skip (ps2/spin.odin) at the backward branch at pc of a loop of
+// fewer than SPIN_SPAN instructions: count ps2.spin_tick down, and at 0 call
+// ps2.spin_probe with pc.
+@(private = "file")
+SPIN_SPAN :: 64
+
+@(private = "file")
+spin :: proc(a: ^native.Asm, pc: u32) {
+	skip := native.new_label(a)
+	native.imp_load(a, .A, "ps2.spin_tick")
+	native.alu_imm(a, .Sub, .A, 1)
+	native.imp_store(a, "ps2.spin_tick", .A)
+	native.br_zero(a, .A, skip, nonzero = true)
+	call_imm(a, "ps2.spin_probe", pc)
+	native.bind(a, skip)
+}
+
 @(private = "file")
 trace :: proc(a: ^native.Asm, entry: u32) {
 	skip := native.new_label(a)
@@ -961,6 +978,12 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		if rd == 15 {
 			native.mov_imm(a, .A, 0x2e20) // PRId, as the interpreter
 		} else {
+			if rd == 9 {
+				// Count: what a loop reads here is not in the state the spin
+				// probe compares.
+				native.mov_imm(a, .A, 1) // cpu.SPIN_SIDE
+				native.imp_store(a, "cpu.spin_dirty", .A)
+			}
 			native.state_load(a, .A, CYCLES if rd == 9 else COP0 + 4 * u32(rd))
 		}
 		put_sx(a, rt, .A)
@@ -1416,7 +1439,10 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			native.ret(a)
 			leaves = true
 		case .Goto:
-			if s.check {events(a)}
+			if s.check {
+				events(a)
+				if s.n - s.target < SPIN_SPAN * 4 {spin(a, s.n)}
+			}
 			go(a, f, labels, s.target)
 			leaves = true
 		case .Call:

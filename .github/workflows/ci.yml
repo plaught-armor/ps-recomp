@@ -28,7 +28,7 @@ jobs:
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
             echo "== $t play"
             odin check play -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/fpu tests/lower tests/vu tests/gs tests/gs_tex tests/gs_pixel tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/iop_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_iop tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/psx_interp tests/compat tests/learn tests/play; do
+            for p in tests/core tests/native tests/psx_cover tests/ee_native tests/ee_spin tests/fpu tests/lower tests/vu tests/gs tests/gs_tex tests/gs_pixel tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/iop_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_iop tests/ps2_interp tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/psx_interp tests/compat tests/learn tests/play; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -80,6 +80,7 @@ jobs:
           odin run tests/core -collection:ps=. -out:core_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/native -collection:ps=. -out:native_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_native -collection:ps=. -out:ee_native_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ee_spin -collection:ps=. -out:ee_spin_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/fpu -collection:ps=. -out:fpu_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/lower -collection:ps=. -out:lower_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/vu -collection:ps=. -out:vu_test${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -125,6 +126,8 @@ jobs:
           arch -x86_64 ./native_test
           odin build tests/ee_native -collection:ps=. -target:darwin_amd64 -out:ee_native_test
           arch -x86_64 ./ee_native_test
+          odin build tests/ee_spin -collection:ps=. -target:darwin_amd64 -out:ee_spin_test
+          arch -x86_64 ./ee_spin_test
           odin build tests/psx_learned -collection:ps=. -target:darwin_amd64 -out:psx_learned_test
           arch -x86_64 ./psx_learned_test
           odin build tests/iop_learned -collection:ps=. -target:darwin_amd64 -out:iop_learned_test

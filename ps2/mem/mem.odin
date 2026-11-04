@@ -28,6 +28,12 @@ fast_lim: u32
 watch_lo, watch_len: u32 // watch_len 0: no watch
 watch_on: u8 // 1 while watch_len is not 0: the one byte native code tests
 
+// Set while the spin skip (ps2/spin.odin) has its probe armed: every store
+// then compares the value it writes with the one in memory (spin_store).
+// watch_on is set and fast_lim 0 meanwhile, so native and recompiled stores
+// all come here.
+spin_armed: bool
+
 // Handlers in the packages above this one, set by package ps2 at init.
 hw_read: proc(a: u32, size: int) -> u64
 hw_write: proc(a: u32, v: u64, size: int)
@@ -69,12 +75,14 @@ load :: #force_inline proc(a: u32, $T: typeid) -> T #no_bounds_check {
 	if p := slow_addr(a); p != nil {
 		return intrinsics.unaligned_load((^T)(p))
 	}
+	cpu.spin_dirty |= cpu.SPIN_SIDE
 	return T(hw_read(a, size_of(T)))
 }
 
 @(private)
 store :: #force_inline proc(a: u32, v: $T) #no_bounds_check {
 	if (a & 0x0fffffff) - watch_lo < watch_len {trace_store(a, u128(v))}
+	if spin_armed {spin_store(a, u128(v), size_of(T))}
 	if a < RAM_SIZE {
 		intrinsics.unaligned_store((^T)(&ram[a]), v)
 		return
@@ -99,12 +107,14 @@ rd128 :: proc(addr: u32) -> u128 #no_bounds_check {
 	a := addr &~ 15
 	if a < RAM_SIZE {return (^u128)(&ram[a])^}
 	if p := slow_addr(a); p != nil {return intrinsics.unaligned_load((^u128)(p))}
+	cpu.spin_dirty |= cpu.SPIN_SIDE
 	return hw_read128(a)
 }
 
 wr128 :: proc(addr: u32, v: u128) #no_bounds_check {
 	a := addr &~ 15
 	if watch_len != 0 && (a & 0x0fffffff) + 16 > watch_lo && (a & 0x0fffffff) < watch_lo + watch_len {trace_store(a, v)}
+	if spin_armed {spin_store(a, v, 16)}
 	if a < RAM_SIZE {
 		(^u128)(&ram[a])^ = v
 		return
@@ -114,6 +124,24 @@ wr128 :: proc(addr: u32, v: u128) #no_bounds_check {
 		return
 	}
 	hw_write128(a, v)
+}
+
+// A store of the low n bytes of v at a while the spin probe is armed: one
+// that changes memory, or reaches a register, is a side effect.
+@(private)
+spin_store :: proc(a: u32, v: u128, n: int) {
+	p := ([^]u8)(slow_addr(a))
+	if p == nil {
+		cpu.spin_dirty |= cpu.SPIN_SIDE
+		return
+	}
+	b := transmute([16]u8)v
+	for i in 0 ..< n {
+		if p[i] != b[i] {
+			cpu.spin_dirty |= cpu.SPIN_SIDE
+			return
+		}
+	}
 }
 
 // Host slice over guest RAM, for kernel and DMA code.

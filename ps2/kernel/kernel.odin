@@ -184,6 +184,7 @@ ROM_ONLY_SYSCALLS := [0x83]string {
 }
 
 syscall :: proc(pc: u32) {
+	cpu.spin_dirty |= cpu.SPIN_SIDE
 	c := &cpu.state
 	n := i32(i16(c.r[3].d[0]))
 	a0 := u32(c.r[4].d[0])
@@ -917,6 +918,9 @@ run_events :: proc() {
 	if cpu.in_interrupt {return}
 	cpu.in_interrupt = true
 	cpu.next_event = max(u64) // handlers run without re-entering
+	// What the handlers do is the event's doing: the spin probe sees one
+	// flag for all of it (ps2/spin.odin).
+	dirty := cpu.spin_dirty
 
 	now := cpu.state.cycles
 	if now >= k.vblank_start {
@@ -957,6 +961,7 @@ run_events :: proc() {
 	deliver_interrupts()
 
 	cpu.in_interrupt = false
+	cpu.spin_dirty = dirty | cpu.SPIN_EVENT
 	update_next_event()
 	// A handler may have readied a thread that outranks the current one.
 	if t := pick_thread(); t != nil && t != k.current && t.prio < k.current.prio {
@@ -966,6 +971,7 @@ run_events :: proc() {
 
 // EI: unmask interrupts, and deliver at once any left pending while masked.
 ei :: proc() {
+	cpu.spin_dirty |= cpu.SPIN_SIDE
 	cpu.state.cop0[12] |= 0x10000
 	if mem.intc_pending & mem.intc_mask != 0 || mem.dmac_stat & (mem.dmac_stat >> 16) & 0x3ff != 0 || iop.sif_next_ee() <= cpu.state.cycles {
 		cpu.next_event = cpu.state.cycles
