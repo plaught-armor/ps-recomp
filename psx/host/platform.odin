@@ -252,7 +252,9 @@ platform_init :: proc(title: cstring) -> bool {
 	// Focus that arrived before the first event poll; later changes come as
 	// window events.
 	mouse.focused = .INPUT_FOCUS in sdl.GetWindowFlags(host.window)
-	host.renderer = sdl.CreateRenderer(host.window, -1, core.headless ? {.SOFTWARE} : {.ACCELERATED})
+	// No flags when windowed: SDL takes an accelerated renderer first and
+	// falls back to software where none is (as the launcher's window does).
+	host.renderer = sdl.CreateRenderer(host.window, -1, core.headless ? {.SOFTWARE} : {})
 	if host.renderer == nil {
 		fmt.eprintln("SDL_CreateRenderer:", sdl.GetError())
 		return false

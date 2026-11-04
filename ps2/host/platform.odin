@@ -123,6 +123,9 @@ platform_init :: proc(title: cstring) -> bool {
 	} else {
 		ren = sdl.CreateRenderer(win, -1, {.ACCELERATED})
 		tex = sdl.CreateTexture(ren, .ABGR8888, .STREAMING, gs.DISP_W, gs.DISP_H)
+		if ren == nil || tex == nil {
+			fmt.eprintln("SDL renderer or texture not made, the window shows nothing:", sdl.GetError())
+		}
 	}
 	gs.snap_regions(core.snap_add_bytes)
 	if hw {append(&core.snap_hooks, core.Snap_Hook{gs.hw_snap_save, gs.hw_snap_load})}
