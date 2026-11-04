@@ -790,12 +790,16 @@ sd_set_switch :: proc(id, mask: u32) -> bool {
 	return true
 }
 
-// sceSdSetAddr(id, address) for a voice's SSA and LSAX.
+// sceSdSetAddr(id, address) for a voice's SSA, LSAX and NAX: a NAX set
+// enters that block at once, its first sample next.
 sd_set_addr :: proc(id, addr: u32) -> bool {
 	v := spu_voice(id)
 	switch id & 0xff00 {
 	case SD_VA_SSA & 0xff00: v.ssa = addr & (SPU_RAM_SIZE - 16)
 	case SD_VA_LSAX & 0xff00: v.lsa = addr & (SPU_RAM_SIZE - 16)
+	case SD_VA_NAX & 0xff00:
+		v.nax, v.idx = addr & (SPU_RAM_SIZE - 16), 0
+		spu_block(v)
 	case: return false
 	}
 	return true

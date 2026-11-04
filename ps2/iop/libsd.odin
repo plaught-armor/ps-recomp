@@ -15,6 +15,7 @@ import "core:fmt"
 import "core:math"
 import "ps:core"
 import cpu "../cpu"
+import mem "../mem"
 import r3000 "ps:psx/cpu"
 
 // iop_sd.pending bits: a channel's transfer done, from bit 0; a core's IRQ,
@@ -57,32 +58,12 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		sd_lib_init()
 		s^ = {}
 		return 0, true
-	case 5: // sceSdSetParam(entry, value)
-		if !sd_set_param(a0, a1) && !sd_core_param(a0, a1) {libsd_unknown(fno, a0)}
-		return 0, true
-	case 6: // sceSdGetParam(entry)
-		v, found := sd_get_param(a0)
-		if !found {v, found = sd_core_get(a0)}
-		if !found {libsd_unknown(fno, a0)}
-		return v, true
-	case 7: // sceSdSetSwitch(entry, value)
-		if !sd_set_switch(a0, a1) && !sd_switch_extra(a0, a1) {libsd_unknown(fno, a0)}
-		return 0, true
-	case 8: // sceSdGetSwitch(entry)
-		v, found := sd_get_switch(a0)
-		if !found {libsd_unknown(fno, a0)}
-		return v, true
-	case 9: // sceSdSetAddr(entry, value)
-		if !sd_set_addr(a0, a1) && !sd_addr_extra(a0, a1) {libsd_unknown(fno, a0)}
-		return 0, true
-	case 10: // sceSdGetAddr(entry)
-		v, found := sd_get_addr(a0)
-		if !found {v, found = sd_get_addr_extra(a0)}
-		if !found {libsd_unknown(fno, a0)}
-		return v, true
-	case 11: // sceSdSetCoreAttr(entry, value)
-		if !sd_core_attr(a0, a1) {libsd_unknown(fno, a0)}
-		return 0, true
+	case 5 ..= 11: // sceSdSet/GetParam, Switch, Addr, SetCoreAttr(entry[, value])
+		return sd_entry(fno, a0, a1), true
+	case 15: // sceSdProcBatch(sceSdBatch *, returns, count)
+		return sd_proc_batch(a0, a1, a2), true
+	case 16: // sceSdProcBatchEx(sceSdBatch *, returns, count, voice mask)
+		return sd_proc_batch_ex(a0, a1, a2, a3), true
 	case 13: // sceSdNote2Pitch(center note, center fine, note, fine)
 		p, found := sd_note_pitch(u16(a0), u16(a1), u16(a2), i16(a3))
 		if !found {libsd_unknown(fno, a3 & 0xffff)}
@@ -129,6 +110,141 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return s.trans[a0].arg, true
 	}
 	return 0, false
+}
+
+// libsd's set and get calls on one entry, for libsd_fn and the batches:
+// sceSdSetParam (fno 5), GetParam (6), SetSwitch (7), GetSwitch (8),
+// SetAddr (9), GetAddr (10), SetCoreAttr (11) and GetCoreAttr (12, which
+// only a batch reaches). What a get reads, 0 for a set.
+@(private = "file")
+sd_entry :: proc(fno, entry, value: u32) -> u32 {
+	v, found := u32(0), true
+	switch fno {
+	case 5: found = sd_set_param(entry, value) || sd_core_param(entry, value)
+	case 6:
+		v, found = sd_get_param(entry)
+		if !found {v, found = sd_core_get(entry)}
+	case 7: found = sd_set_switch(entry, value) || sd_switch_extra(entry, value)
+	case 8: v, found = sd_get_switch(entry)
+	case 9: found = sd_set_addr(entry, value) || sd_addr_extra(entry, value)
+	case 10:
+		v, found = sd_get_addr(entry)
+		if !found {v, found = sd_get_addr_extra(entry)}
+	case 11: found = sd_core_attr(entry, value)
+	case: found = false
+	}
+	if !found {libsd_unknown(fno, entry)}
+	return v
+}
+
+// A sceSdBatch's func: 1 to 4 set (SetParam, SetSwitch, SetAddr,
+// SetCoreAttr), 17 to 20 the matching get; 5 writes the entry to the IOP
+// word at value; 6 sends it, a word, to EE address value, and 7 `entry`
+// bytes from the returns array, both by SIF DMA, done at once. Param and
+// CoreAttr values, and what their gets read, are 16 bits.
+@(private = "file")
+SD_BATCH_IOP_WRITE :: 5
+@(private = "file")
+SD_BATCH_EE_WRITE :: 6
+@(private = "file")
+SD_BATCH_EE_RETURNS :: 7
+
+// Batch entry i at `batch`: {u16 func, u16 entry, u32 value}.
+@(private = "file")
+sd_batch_entry :: proc(batch, i: u32) -> (func, entry, value: u32) {
+	w := r32(batch + 8 * i)
+	return w & 0xffff, w >> 16, r32(batch + 8 * i + 4)
+}
+
+// Runs batch func `func` on entry and value as ProcBatch does: what goes
+// to its returns slot, and false for a func retail does not know.
+@(private = "file")
+sd_batch_one :: proc(func, entry, value, returns: u32) -> (v: u32, ok: bool) {
+	switch func {
+	case 1, 4: return sd_entry(func * 2 + 3, entry, value & 0xffff), true
+	case 2, 3: return sd_entry(func * 2 + 3, entry, value), true
+	case 17, 20: return sd_entry(func * 2 - 28, entry, 0) & 0xffff, true
+	case 18, 19: return sd_entry(func * 2 - 28, entry, 0), true
+	case SD_BATCH_IOP_WRITE: w32(value, entry)
+	case SD_BATCH_EE_WRITE:
+		w := entry
+		copy(mem.ram_slice(value, 4), ([^]u8)(&w)[:4])
+	case SD_BATCH_EE_RETURNS: copy(mem.ram_slice(value, entry), iop_ram_at(returns, entry))
+	case: return 0, false
+	}
+	return 0, true
+}
+
+// sceSdProcBatch(batch, returns, count): runs count entries in order,
+// each one's result to returns[i] when returns is not 0; count, or ~i for
+// an entry i whose func retail does not know, which ends the batch there.
+@(private = "file")
+sd_proc_batch :: proc(batch, returns, count: u32) -> u32 {
+	for i in 0 ..< count {
+		func, entry, value := sd_batch_entry(batch, i)
+		v, ok := sd_batch_one(func, entry, value, returns)
+		if !ok {
+			libsd_unknown(15, func)
+			return ~i
+		}
+		if returns != 0 {w32(returns + 4 * i, v)}
+	}
+	return count
+}
+
+// sceSdProcBatchEx(batch, returns, count, voice mask): as ProcBatch, but a
+// SetParam or GetParam whose entry has voice bits 0x3e all set, or a SetAddr
+// or GetAddr with 0x7e all set, runs on each voice of the 24 in mask
+// instead, the voice in place of bits 1 to 5. Slot n of returns counts the
+// results written, as retail's does: a set on k voices takes k slots, 0 in
+// the last; GetParam writes all 24, a voice not in mask the read before (0
+// at first), then the last again; GetAddr one per voice in mask, then the
+// last again. The number of slots, or ~i as ProcBatch.
+@(private = "file")
+sd_proc_batch_ex :: proc(batch, returns, count, mask: u32) -> u32 {
+	n: u32
+	put :: proc(returns, n, v: u32) {if returns != 0 {w32(returns + 4 * n, v)}}
+	for i in 0 ..< count {
+		func, entry, value := sd_batch_entry(batch, i)
+		all: bool
+		switch func {
+		case 1, 17: all = entry & 0x3e == 0x3e
+		case 3, 19: all = entry & 0x7e == 0x7e
+		}
+		v: u32
+		if all {
+			for voice in u32(0) ..< 24 {
+				in_mask := mask & (1 << voice) != 0
+				e := entry & 0xffc1 | voice << 1
+				switch func {
+				case 1, 3:
+					if !in_mask {continue}
+					n += 1
+					sd_batch_one(func, e, value, returns)
+				case 17:
+					if in_mask {v, _ = sd_batch_one(func, e, value, returns)}
+					put(returns, n, v)
+					n += 1
+				case 19:
+					if !in_mask {continue}
+					v, _ = sd_batch_one(func, e, value, returns)
+					put(returns, n, v)
+					n += 1
+				}
+			}
+			n -= 1 // retail's: the last slot is written again below
+		} else {
+			ok: bool
+			v, ok = sd_batch_one(func, entry, value, returns)
+			if !ok {
+				libsd_unknown(16, func)
+				return ~i
+			}
+		}
+		put(returns, n, v)
+		n += 1
+	}
+	return n
 }
 
 // After a failed load: puts back each handler it left with its func or arg

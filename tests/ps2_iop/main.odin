@@ -3512,7 +3512,7 @@ test_sif_dma_intr :: proc() {
 }
 
 // libsd's functions, in the order "modl" imports them.
-LIBSD_FNOS := [?]u32{4, 5, 6, 7, 8, 9, 10, 11, 13, 17, 18, 19, 20, 23, 25, 26, 27, 28}
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 17, 18, 19, 20, 23, 25, 26, 27, 28}
 
 // "modl" as loaded: its base, the offsets of its libsd stubs, its data
 // (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
@@ -4106,6 +4106,47 @@ test_libsd :: proc() {
 	input := true
 	for n := 0; n < len(out); n += 2 {input &&= out[n] == 0xfff && out[n + 1] == -0x800}
 	check(input, "libsd: the input area plays at BVOL, left and right")
+
+	// sceSdProcBatch: each {func, entry, value} in order, its result to
+	// returns: SetAddr and GetAddr of SSA and of NAX (16-byte blocks), a word
+	// written to IOP memory and one sent to the EE.
+	EE_WORD :: 0x100000
+	bat, ret, word := b + buf, b + buf + 0x100, b + buf + 0x200
+	batch :: proc(at: u32, e: ..[3]u32) {
+		for x, i in e {
+			iop.iop_u32(at + 8 * u32(i))^ = x[0] | x[1] << 16
+			iop.iop_u32(at + 8 * u32(i) + 4)^ = x[2]
+		}
+	}
+	rets :: proc(at: u32) -> []u32 {return ([^]u32)(raw_data(iop.iop_mem(at, 4 * 32)))[:32]}
+	slice.fill(rets(ret), 0xffffffff)
+	mem.wr32(EE_WORD, 0)
+	batch(bat, {3, 0x2044, 0x6000}, {19, 0x2044, 0}, {3, 0x2244, 0x7008}, {19, 0x2244, 0}, {5, 0x1234, word}, {6, 0xbeef, EE_WORD})
+	n := sd_call(15, bat, ret, 6)
+	r := rets(ret)
+	check(n == 6 && slice.equal(r[:7], []u32{0, 0x6000, 0, 0x7000, 0, 0, 0xffffffff}), "libsd: sceSdProcBatch runs each entry, its result to returns")
+	check(sd_call(10, 0x2044) == 0x6000 && sd_call(10, 0x2244) == 0x7000 && iop.iop_u32(word)^ == 0x1234 && mem.rd32(EE_WORD) == 0xbeef, "libsd: sceSdProcBatch's sets land; NAX in blocks; the IOP and EE writes")
+	check(sd_call(15, bat, 0, 2) == 2, "libsd: sceSdProcBatch without returns")
+	slice.fill(rets(ret), 0xffffffff)
+	batch(bat, {19, 0x2044, 0}, {8, 0, 0}, {19, 0x2244, 0})
+	n = sd_call(15, bat, ret, 3)
+	check(n == ~u32(1) && r[0] == 0x6000 && r[1] == 0xffffffff && r[2] == 0xffffffff, "libsd: sceSdProcBatch stops at an unknown func, ~its index")
+
+	// sceSdProcBatchEx: an entry for all voices (0x3e in a param's, 0x7e in
+	// an address's) runs on the voices of the mask, 3 and 5. A set takes a
+	// slot per voice, 0 in the last; GetAddr one per voice in the mask;
+	// GetParam all 24, a voice not in it the read before; each get's last
+	// written again.
+	slice.fill(rets(ret), 0xffffffff)
+	batch(bat, {3, 0x207e, 0x8000}, {19, 0x207e, 0})
+	n = sd_call(16, bat, ret, 2, 1 << 3 | 1 << 5)
+	check(n == 4 && slice.equal(r[:5], []u32{0xffffffff, 0, 0x8000, 0x8000, 0xffffffff}), "libsd: sceSdProcBatchEx SetAddr and GetAddr on the mask's voices")
+	check(sd_call(10, 0x2046) == 0x8000 && sd_call(10, 0x204a) == 0x8000 && sd_call(10, 0x2048) != 0x8000, "libsd: sceSdProcBatchEx sets only the mask's voices")
+	slice.fill(rets(ret), 0xffffffff)
+	batch(bat, {1, 0x023e, 0x1234}, {17, 0x023e, 0})
+	n = sd_call(16, bat, ret, 2, 1 << 3 | 1 << 5)
+	check(n == 26 && r[1] == 0 && slice.equal(r[2:5], []u32{0, 0, 0}) && r[5] == 0x1234 && r[6] == 0x1234 && r[25] == 0x1234 && r[26] == 0xffffffff, "libsd: sceSdProcBatchEx GetParam fills all 24 slots")
+	check(sd_call(6, 0x0206) == 0x1234 && sd_call(6, 0x020a) == 0x1234 && sd_call(6, 0x0208) != 0x1234, "libsd: sceSdProcBatchEx SetParam only on the mask's voices")
 
 	// An id libsd_fn does not decode raises a compat row.
 	sd_call(5, 0x3f00, 0)
