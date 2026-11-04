@@ -763,10 +763,14 @@ id_of :: proc(path: string) -> string {
 // play --export under a DATA of its own. A PS1 disc whose directory has
 // settings.tsv, press.txt, thumb.ppm, a compat.tsv row (a fatal message with
 // a '|' in it) and a native blob, learn records and a memory card exports to
-// exactly README.md, .gitignore, local.tsv, settings.tsv and press.txt (the
-// same bytes), docs/notes.md (the row, the '|' escaped) and shots/thumb.png
-// (the picture's size); a PS2 disc with none of them to README.md,
-// .gitignore, local.tsv and docs/notes.md (no run yet). No file holds a
+// exactly README.md (ps-recomp pinned to the player's commit), .gitignore
+// (port/src/rec left out), local.tsv, settings.tsv and press.txt (the same
+// bytes), docs/notes.md (the row, the '|' escaped), shots/thumb.png (the
+// picture's size) and the port: setup.sh, tools/recomp.tsv (r3000, no
+// disc), port/build.sh, port/src/local.odin, port/src/main.odin (psx.run)
+// and tests/run.sh; a PS2 disc with none of them to the same but
+// settings.tsv, press.txt and the thumb, docs/notes.md saying no run yet,
+// recomp.tsv r5900 and main.odin ps2.boot. No file holds a
 // 16-byte run of the executable, nor of the blob, records or card. The
 // .gitignore lists every file but local.tsv. An export into the directory
 // again, or into one holding another file, is refused and changes nothing;
@@ -869,7 +873,10 @@ test_export :: proc() {
 	out1, _ := filepath.join({tmp, "export_ps1_repo"}, context.temp_allocator)
 	check(name, export(self, ps1, out1) == 0, "the PS1 export failed")
 	files := listed(out1)
-	want := []string{".gitignore", "README.md", "docs/notes.md", "local.tsv", "press.txt", "settings.tsv", "shots/thumb.png"}
+	port := []string{"port/build.sh", "port/src/local.odin", "port/src/main.odin"}
+	tools := []string{"tests/run.sh", "tools/recomp.tsv"}
+	want := slice.concatenate([][]string{{".gitignore", "README.md", "docs/notes.md", "local.tsv"}, port, {"press.txt", "settings.tsv", "setup.sh", "shots/thumb.png"}, tools}, context.temp_allocator)
+	ps2_want := slice.concatenate([][]string{{".gitignore", "README.md", "docs/notes.md", "local.tsv"}, port, {"setup.sh"}, tools}, context.temp_allocator)
 	check(name, slice.equal(files, want), fmt.tprint("PS1 files:", files))
 	check(name, read(out1, "settings.tsv") == settings && read(out1, "press.txt") == press, "settings or press not copied")
 	png := read(out1, "shots/thumb.png")
@@ -878,15 +885,22 @@ test_export :: proc() {
 	check(name, strings.contains(notes, "| result | fatal |") && strings.contains(notes, "| fatal | bad\\|call |"), fmt.tprintf("notes:\n%s", notes))
 	local := read(out1, "local.tsv")
 	check(name, strings.contains(local, fmt.tprintf("\nid\t%s\n", id)) && strings.contains(local, "\ncommit\ttest\n") && strings.contains(local, "\nsystem\tps1\n"), fmt.tprintf("local.tsv:\n%s", local))
+	recomp := read(out1, "tools/recomp.tsv")
+	check(name, strings.contains(recomp, "\nbackend\tr3000\n") && strings.contains(recomp, "\nout\tport/src/rec\n") && !strings.contains(recomp, "\ndisc\t"), fmt.tprintf("PS1 recomp.tsv:\n%s", recomp))
+	check(name, strings.contains(read(out1, "port/src/main.odin"), "psx.run(b)"), "PS1 main.odin does not run psx")
+	check(name, strings.contains(read(out1, ".gitignore"), "\n/port/src/rec/\n"), ".gitignore tracks port/src/rec")
+	check(name, strings.contains(read(out1, "README.md"), "git -C ps-recomp checkout test\n"), "README does not pin ps-recomp to the player's commit")
 	clean(name, out1, files, forbidden)
 
 	out2, _ := filepath.join({tmp, "export_ps2_repo"}, context.temp_allocator)
 	check(name, export(self, ps2, out2) == 0, "the PS2 export failed")
 	files = listed(out2)
-	check(name, slice.equal(files, []string{".gitignore", "README.md", "docs/notes.md", "local.tsv"}), fmt.tprint("PS2 files:", files))
+	check(name, slice.equal(files, ps2_want), fmt.tprint("PS2 files:", files))
+	check(name, strings.contains(read(out2, "tools/recomp.tsv"), "\nbackend\tr5900\n"), "PS2 recomp.tsv not r5900")
+	check(name, strings.contains(read(out2, "port/src/main.odin"), "ps2.boot("), "PS2 main.odin does not boot ps2")
 	check(name, strings.contains(read(out2, "docs/notes.md"), "No compatibility run yet"), "PS2 notes name a run")
 	readme := read(out2, "README.md")
-	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "settings.tsv"), fmt.tprintf("PS2 README:\n%s", readme))
+	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "- `settings.tsv`"), fmt.tprintf("PS2 README:\n%s", readme))
 	clean(name, out2, files, forbidden)
 
 	// Refused: the directory again, and one holding another file.
@@ -903,7 +917,7 @@ test_export :: proc() {
 	_ = os.make_directory_all(empty)
 	check(name, export(self, ps2, empty) == 0, "an export into an empty directory failed")
 	got := listed(empty)
-	check(name, slice.equal(got, []string{".gitignore", "README.md", "docs/notes.md", "local.tsv"}), fmt.tprint("files in the empty directory:", got))
+	check(name, slice.equal(got, ps2_want), fmt.tprint("files in the empty directory:", got))
 	_ = os.remove(tsv)
 }
 
