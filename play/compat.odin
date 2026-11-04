@@ -91,7 +91,8 @@ FATAL_MAX :: 200
 // kind:from-to comma separated (kinds black, frozen, ram_still, and still
 // or deaf for a picture that barely changed: deaf when a press of the
 // loaded PRESS script, the disc's press.txt when PRESS is unset, started
-// in it, still when none did; see core.Compat_Stretch_Kind), then +<n> for
+// in it, still when none did; only a picture static as a whole, not a
+// stuck prompt over a moving 3D scene; see core.Compat_Stretch_Kind), then +<n> for
 // those past core.COMPAT_STRETCHES; information only.
 Column :: enum {
 	Id,

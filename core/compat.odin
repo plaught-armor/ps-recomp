@@ -72,7 +72,10 @@ COMPAT_STILL_DIFF :: 2.0
 // no press of the loaded PRESS script started in it, so the game may wait
 // for input on purpose; Deaf when one did, so the presses changed nothing
 // to see: a soft lock, or a script pressing the wrong thing). A stretch
-// that is frozen throughout is listed as frozen only.
+// that is frozen throughout is listed as frozen only. Still and Deaf only
+// flag a picture that is static as a whole: a stuck prompt drawn over a
+// moving 3D scene (a camera orbiting behind a save prompt changes the
+// thumbnail by 8 to 17) is not flagged.
 Compat_Stretch_Kind :: enum u8 {
 	Black,
 	Frozen,
