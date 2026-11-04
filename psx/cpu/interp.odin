@@ -5,7 +5,9 @@
 // become host calls through `call`, and `jr $ra` returns from interp_loop,
 // which is what the PS1 and the IOP both set interp_run to.
 // Plain jumps stay inside the interpreter unless they land on a function the
-// dispatcher knows, in which case they become a tail call.
+// dispatcher knows, in which case they become a tail call. A `j` at a run's
+// first word is a tail call too: that is an import stub patched to
+// `j export; nop`, and its run must not go on into another module.
 //
 // Cycles and events go as in recompiled code (recomp/r3000/lower.odin), so
 // a run that interprets a function and one that runs it learned (native
@@ -27,6 +29,8 @@ import "ps:core"
 @(private)
 Interp :: struct {
 	pc:      u32,
+	// The run's first word.
+	start:   u32,
 	// Branch target pending after the current delay slot, if any.
 	target:  u32,
 	taken:   bool,
@@ -40,6 +44,7 @@ Interp :: struct {
 interp_loop :: proc(start: u32) {
 	st := Interp {
 		pc    = start,
+		start = start,
 		learn = core.learn_take(learn_cpu),
 	}
 	events_due()
@@ -95,6 +100,28 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	}
 }
 
+// Tail calls from a `j` at a run's first word now in progress on the host
+// stack. Runs that each start with a `j` to the next (`X: j X; nop`, or two
+// that jump to each other) would nest without end; past TAIL_DEPTH_MAX the
+// `j` stays inside the run instead.
+tail_depth: int
+TAIL_DEPTH_MAX :: 16
+
+// A `j` at pc to target: at the run's first word a tail call (as above),
+// else a jump inside the run.
+@(private)
+jump :: proc(st: ^Interp, pc, target: u32) {
+	if pc != st.start || tail_depth >= TAIL_DEPTH_MAX {
+		branch(st, true, target)
+		return
+	}
+	branch(st, false, 0)
+	tail_depth += 1
+	call(target)
+	tail_depth -= 1
+	st.done = true
+}
+
 // A jump to a function, or to a BIOS vector or table stub (no guest code
 // there to step), is a tail call: call it, and its return is this code's.
 @(private)
@@ -134,7 +161,7 @@ interp_exec :: proc(st: ^Interp, pc, w: u32) {
 	case 0x01:
 		interp_regimm(st, pc, w)
 	case 0x02:
-		branch(st, true, (pc & 0xf0000000) | ((w & 0x3ffffff) << 2))
+		jump(st, pc, (pc & 0xf0000000) | ((w & 0x3ffffff) << 2))
 	case 0x03:
 		r[31] = pc + 8
 		branch(st, false, 0)

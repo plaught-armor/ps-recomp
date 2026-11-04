@@ -12,6 +12,11 @@
 // An event that falls due in a long straight-line run is run where
 // recompiled code checks, at the branch back that ends the run, with the
 // whole block charged; not partway through it.
+// A `j` at a run's first word (an import stub, `j export; nop`) is a tail
+// call: the target starts its own run, which checks events on entry, and
+// returns to the stub's caller. A run that starts with `j` to itself ends
+// once its word changes, with the tail calls nested at most
+// TAIL_DEPTH_MAX deep.
 package main
 
 import "core:fmt"
@@ -66,6 +71,22 @@ entry_cycles: u64
 LOOP :: 0x80001500
 @(private = "file")
 LOOP_NOPS :: 100
+
+// j J_EXPORT; nop.
+@(private = "file")
+J_STUB :: 0x80001800
+
+// addiu v0, zero, 7; jr ra; nop. No function is registered here.
+@(private = "file")
+J_EXPORT :: 0x80001900
+
+// j J_SELF; nop, until the events turn it into jr ra; nop.
+@(private = "file")
+J_SELF :: 0x80001a00
+
+// The deepest tail_depth any run_events call saw.
+@(private = "file")
+deepest: int
 
 // The cycles at each run_events call.
 @(private = "file")
@@ -147,7 +168,6 @@ main :: proc() {
 	start = cpu.state.cycles
 	cpu.next_event = start + 8 * cpu.CYCLES_PER_INSN
 	cpu.call(LOOP)
-	cpu.run_events = saved_events
 	check("run_events calls in a loop", u32(len(event_cycles)), 1)
 	if len(event_cycles) == 1 {
 		check(
@@ -157,8 +177,48 @@ main :: proc() {
 		)
 	}
 
+	cpu.w32(J_STUB, 0x08000000 | (J_EXPORT & 0x3ffffff) >> 2)
+	cpu.w32(J_STUB + 4, 0)
+	cpu.w32(J_EXPORT, 0x24020007)
+	cpu.w32(J_EXPORT + 4, 0x03e00008)
+	cpu.w32(J_EXPORT + 8, 0)
+	clear(&event_cycles)
+	cpu.run_events = proc() {append(&event_cycles, cpu.state.cycles)} // always due
+	r[2], r[31] = 0xdead, RA
+	start = cpu.state.cycles
+	cpu.next_event = start
+	cpu.call(J_STUB)
+	cpu.next_event = max(u64)
+	check("v0 after a j stub", r[2], 7)
+	check("$ra after a j stub", r[31], RA)
+	// One check at the stub's entry and one at the export's.
+	check("run_events calls through a j stub", u32(len(event_cycles)), 2)
+	if len(event_cycles) == 2 {
+		check("cycles at a j stub's target", u32(event_cycles[1] - start), 2 * cpu.CYCLES_PER_INSN)
+	}
+
+	cpu.w32(J_SELF, 0x08000000 | (J_SELF & 0x3ffffff) >> 2)
+	cpu.w32(J_SELF + 4, 0)
+	clear(&event_cycles)
+	cpu.run_events = proc() {
+		append(&event_cycles, cpu.state.cycles)
+		deepest = max(deepest, cpu.tail_depth)
+		if len(event_cycles) == 100 {
+			cpu.w32(J_SELF, 0x03e00008) // jr ra
+		}
+	}
+	r[31] = RA
+	cpu.next_event = cpu.state.cycles
+	cpu.call(J_SELF)
+	cpu.next_event = max(u64)
+	cpu.run_events = saved_events
+	check("run_events calls in a j self run", u32(len(event_cycles)), 100)
+	check("deepest tail call in a j self run", u32(deepest), cpu.TAIL_DEPTH_MAX)
+	check("tail_depth after a j self run", u32(cpu.tail_depth), 0)
+	check("$ra after a j self run", r[31], RA)
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_interp: jr to the A0, B0 and C0 vectors runs the function and returns to $ra; syscall 3 switches threads; a jal's callee sees the jal charged; a due event runs at the branch back")
+	fmt.println("ok psx_interp: jr to the A0, B0 and C0 vectors runs the function and returns to $ra; syscall 3 switches threads; a jal's callee sees the jal charged; a due event runs at the branch back; a j at a run's start is a bounded tail call")
 }
