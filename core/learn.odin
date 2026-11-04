@@ -122,8 +122,11 @@ Learn_Space :: struct {
 	log:       []u32,
 }
 
+Learn_Cpus :: bit_set[Learn_Cpu;u8]
+
 learn: struct {
 	on:      bool, // LEARN is set and its file open
+	cpus:    Learn_Cpus, // the processors whose runs are noted while on
 	file:    ^os.File,
 	written: int, // bytes this process wrote
 	capped:  bool,
@@ -149,14 +152,14 @@ LEARN_CPU_NAMES := [Learn_Cpu]string {
 	.Iop = "iop",
 }
 
-// Open the LEARN file, once; false when LEARN is unset or the file cannot
-// be opened (after a message). LEARN=1 is play's (play/main.odin).
+// Open the LEARN file, once; false when LEARN is unset or 0, or the file
+// cannot be opened (after a message). LEARN=1 is play's (play/main.odin).
 learn_open :: proc() -> bool {
 	if learn.on {
 		return true
 	}
 	path := env("LEARN")
-	if path == "" {
+	if path == "" || path == "0" {
 		return false
 	}
 	if path == "1" {
@@ -167,7 +170,9 @@ learn_open :: proc() -> bool {
 	return learn_open_path(path)
 }
 
-learn_open_path :: proc(path: string) -> bool {
+// Open path as the LEARN file, noting the runs of the processors in cpus
+// alone (default: all); false after a message when it cannot be opened.
+learn_open_path :: proc(path: string, cpus := ~Learn_Cpus{}) -> bool {
 	context.allocator = runtime.heap_allocator()
 	f, err := os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
 	if err != nil {
@@ -176,7 +181,13 @@ learn_open_path :: proc(path: string) -> bool {
 	}
 	learn.file = f
 	learn.on = true
+	learn.cpus = cpus
 	return true
+}
+
+// Whether cpu's interpreter notes its runs: LEARN is open, for cpu.
+learn_on :: #force_inline proc(cpu: Learn_Cpu) -> bool {
+	return cpu in learn.cpus
 }
 
 // Name cpu's cycle counter, the cycles its interpreter charges an
@@ -519,4 +530,5 @@ learn_report :: proc() {
 	}
 	os.close(learn.file)
 	learn.on = false
+	learn.cpus = {}
 }

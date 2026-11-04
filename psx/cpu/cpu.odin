@@ -286,7 +286,7 @@ run_learned :: proc(addr: u32) -> bool {
 interpret :: proc(addr: u32) {
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	when core.COMPAT_COUNT {core.compat_entry(addr)}
-	if !core.learn.on {
+	if !core.learn_on(learn_cpu) {
 		interp_run(addr)
 		return
 	}

@@ -150,6 +150,16 @@ main :: proc() {
 		core.learn_fetch(f, 0x7004)
 	}
 	core.learn_report()
+	check(!core.learn_on(.Ee) && !core.learn_on(.Iop), "on after the report")
+
+	// Opened for the IOP alone, as play's default: only the IOP notes runs.
+	{
+		iop_path, _ := filepath.join({tmp, "iop.bin"}, context.allocator)
+		check(core.learn_open_path(iop_path, {.Iop}), "open for the IOP")
+		check(core.learn_on(.Iop) && !core.learn_on(.Ee) && !core.learn_on(.Psx), "IOP alone")
+		core.learn_report()
+		check(!core.learn_on(.Iop), "IOP on after the report")
+	}
 
 	want := []Want {
 		{.Ee, {}, 0x1000, 0x1000, 4},

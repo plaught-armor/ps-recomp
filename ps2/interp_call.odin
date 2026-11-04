@@ -79,7 +79,7 @@ interp_call :: proc(entry: u32) {
 	}
 	if kernel.trace_on {kernel.trace_call(entry)}
 	if c.cycles >= cpu.next_event {kernel.run_events()}
-	if !core.learn.on {
+	if !core.learn_on(.Ee) {
 		interp_body(entry, nil)
 		return
 	}

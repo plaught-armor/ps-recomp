@@ -83,6 +83,16 @@ here.
 | `play` | `play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included; the launcher, its picture checked by point and a non-ASCII title cell by cell against the font |
 | `discimg` | The small disc images `disc` and `play` use |
 
+## Compatibility runs
+
+`play --compat` runs each disc once. A PS2 disc's run records its I/O
+processor code (`learn/ps2.bin` in the disc's folder), as every PS2 run
+does by default; a later run, compat or not, compiles those records and
+runs that code natively. The `learned` column says whether a run had
+learned code, so a cold run (no records yet) and a warm one are told
+apart. Set `PS_LEARN=0` for a run with no learned code that records
+nothing.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on

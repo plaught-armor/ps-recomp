@@ -93,7 +93,9 @@ FATAL_MAX :: 200
 // loaded PRESS script, the disc's press.txt when PRESS is unset, started
 // in it, still when none did; only a picture static as a whole, not a
 // stuck prompt over a moving 3D scene; see core.Compat_Stretch_Kind), then +<n> for
-// those past core.COMPAT_STRETCHES; information only.
+// those past core.COMPAT_STRETCHES; information only; learned: whether the
+// run had the disc's learned code (a PS2 disc's: its IOP's), compiled from
+// the records earlier runs left.
 Column :: enum {
 	Id,
 	Serial,
@@ -119,6 +121,7 @@ Column :: enum {
 	Idle_Share,
 	Lit,
 	Stretches,
+	Learned,
 }
 
 COLUMNS :: [Column]string {
@@ -146,6 +149,7 @@ COLUMNS :: [Column]string {
 	.Idle_Share    = "idle_share",
 	.Lit           = "lit",
 	.Stretches     = "stretches",
+	.Learned       = "learned",
 }
 
 Row :: [Column]string
@@ -276,8 +280,10 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	stall := time.Duration(wait) * time.Second
 	native := core.env("NATIVE") != "0" && (core.blob_cached(dir) || convert_store(image, dir, COMPAT_BOOT_FACTOR * stall))
 	// The child finds the blob stored and compiles nothing (compat_child).
-	if native {
-		_ = learned_blob(dir, .Iop if cnf.ps2 else .Psx, true, COMPAT_BOOT_FACTOR * stall)
+	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
+	learned: string
+	if native && core.env("LEARN") != "0" {
+		learned = learned_blob(dir, learn_cpu, true, COMPAT_BOOT_FACTOR * stall)
 	}
 
 	self, serr := os.get_executable_path(context.temp_allocator)
@@ -320,6 +326,8 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	// A stored blob the child could not load is removed, and the run
 	// was interpreted.
 	row[.Native] = "yes" if native && core.blob_cached(dir) else "no"
+	// The same for the learned blob, whose key the child removes.
+	row[.Learned] = "yes" if learned != "" && os.exists(core.disc_path(dir, learned_files(learn_cpu).key)) else "no"
 
 	line, last := log_lines(log_path)
 	l: core.Compat_Line

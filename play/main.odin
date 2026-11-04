@@ -16,7 +16,9 @@
 //
 // LEARN=1 records the code a game interprets in the disc's directory, a PS1
 // game's in learn/psx.bin and a PS2 game's in learn/ps2.bin (core/learn.odin;
-// a path records there instead). While that file has records of the PS1, or
+// a path records there instead). Without LEARN a PS2 game's IOP code is
+// recorded there all the same; LEARN=0 records nothing and runs no learned
+// code. While that file has records of the PS1, or
 // of the PS2's IOP, each run compacts it and runs native code for them:
 // compiled in a child (`play --learned <psx | iop> <records> <out>`) when the
 // stored learned blob is not for these records, this build and blob
@@ -226,22 +228,29 @@ play :: proc(image: string) -> int {
 	}
 	native_key = core.disc_path(dir, .Native_Key)
 	// Learned code runs on a PS1 game, and on a PS2 game's IOP, unless
-	// NATIVE=0; found before LEARN opens the records, which compacting
-	// rewrites. A compat child's parent compiled it already (compat_disc):
-	// one that failed there is not tried again here.
+	// NATIVE=0 or LEARN=0; found before LEARN opens the records, which
+	// compacting rewrites. A compat child's parent compiled it already
+	// (compat_disc): one that failed there is not tried again here.
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
+	learn_env := core.env("LEARN")
 	learned: string
-	if core.env("NATIVE") != "0" {
+	if core.env("NATIVE") != "0" && learn_env != "0" {
 		learned = learned_blob(dir, learn_cpu, !compat_child(), 0)
 	}
 	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
-	if core.env("LEARN") == "1" {
+	// LEARN=1 records every processor's runs; unset, a PS2 game's IOP
+	// alone, whose modules no recompiled code covers. A default that
+	// cannot open its records runs without them.
+	if learn_env == "1" || (learn_env == "" && cnf.ps2) {
+		cpus := ~core.Learn_Cpus{} if learn_env == "1" else {.Iop}
 		learn := core.disc_path(dir, .Learn)
+		opened := false
 		if err := os.make_directory_all(learn); err != nil && !(err == .Exist && os.is_dir(learn)) {
 			fmt.eprintln("play: cannot make", learn, err)
-			return 1
+		} else {
+			opened = core.learn_open_path(learn_records(dir, learned_files(learn_cpu).records), cpus)
 		}
-		if !core.learn_open_path(learn_records(dir, learned_files(learn_cpu).records)) {
+		if !opened && learn_env == "1" {
 			return 1
 		}
 	}

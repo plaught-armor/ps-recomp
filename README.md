@@ -179,6 +179,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 | `PS_SCALE` | PS2 only. The window size, as a multiple of the console's resolution. 1 to 8. The default is 3. |
 | `PS_IRX` | PS2 only. By default, a game's own sound and input/output modules run on an emulated copy of the console's I/O processor. `0` turns that off: each module is answered as loaded, without running it. |
 | `PS_NATIVE` | `0` runs the game through the interpreter instead of as native code. Slower; for checking a bug. |
+| `PS_LEARN` | By default, a PS2 game's I/O processor code (its own modules, loaded from the disc) is recorded in the disc's folder as it runs, and later runs use native code compiled from it. `1` records the code every processor interprets. `0` records nothing and uses no learned code. |
 
 `PS_GPU`, `PS_SW`, `PS_SCALE`, `PS_IRX` and `PS_NATIVE` can also be set
 in the [launcher](#the-launcher). It keeps them in `settings.tsv` files:
