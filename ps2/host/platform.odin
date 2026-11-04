@@ -121,10 +121,17 @@ platform_init :: proc(title: cstring) -> bool {
 	if hw {
 		if !gs.hw_init(core.headless ? nil : win, u32(scale)) {return false}
 	} else {
-		ren = sdl.CreateRenderer(win, -1, {.ACCELERATED})
+		// No flags when windowed: SDL takes an accelerated renderer first and
+		// falls back to software where none is (as psx/host's window does).
+		ren = sdl.CreateRenderer(win, -1, core.headless ? {.SOFTWARE} : {})
+		if ren == nil {
+			fmt.eprintln("SDL_CreateRenderer:", sdl.GetError())
+			return false
+		}
 		tex = sdl.CreateTexture(ren, .ABGR8888, .STREAMING, gs.DISP_W, gs.DISP_H)
-		if ren == nil || tex == nil {
-			fmt.eprintln("SDL renderer or texture not made, the window shows nothing:", sdl.GetError())
+		if tex == nil {
+			fmt.eprintln("SDL_CreateTexture:", sdl.GetError())
+			return false
 		}
 	}
 	gs.snap_regions(core.snap_add_bytes)

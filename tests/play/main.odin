@@ -1214,7 +1214,8 @@ test_quit :: proc() {
 	}
 	// A window, not headless and not to FRAMES; SDL's dummy drivers need no
 	// display or sound device. SDL 2's dummy video has no accelerated
-	// renderer, so there the PS1 window takes the software fallback.
+	// renderer, so there the PS1 window and the PS2 software GS's take the
+	// software fallback (play quits when its renderer is not made).
 	os.unset_env(core.env_name("HEADLESS"))
 	os.unset_env(core.env_name("FRAMES"))
 	os.set_env("SDL_VIDEODRIVER", "dummy")
