@@ -284,7 +284,7 @@ draw :: proc(kind, prim: u64) {
 draw_point :: proc(c: ^Ctx, v: ^Vertex) {
 	x, y := i32(math.floor(v.x)), i32(math.floor(v.y))
 	if x < c.sx0 || x > c.sx1 || y < c.sy0 || y > c.sy1 {return}
-	u, tv, lod := tex_coord(c, v.s, v.t, v.q, v.u, v.v)
+	u, tv, lod := tex_coord(c, {v.s, v.t, v.u, v.v}, v.q)
 	ctx_seek(c, y)
 	c.px(c, x, y, v.z, v.c, u, tv, lod, v.fog)
 }
@@ -299,7 +299,7 @@ draw_line :: proc(c: ^Ctx, a, b: ^Vertex) {
 		if !c.iip {v.c = b.c}
 		x, y := i32(math.floor(v.x)), i32(math.floor(v.y))
 		if x < c.sx0 || x > c.sx1 || y < c.sy0 || y > c.sy1 {continue}
-		u, tv, lod := tex_coord(c, v.s, v.t, v.q, v.u, v.v)
+		u, tv, lod := tex_coord(c, {v.s, v.t, v.u, v.v}, v.q)
 		ctx_seek(c, y)
 		c.px(c, x, y, v.z, v.c, u, tv, lod, v.fog)
 	}
@@ -320,14 +320,28 @@ lerp_vertex :: proc(a, b: ^Vertex, f: f32) -> (v: Vertex) {
 	return
 }
 
-// Texel-space coordinates from STQ or UV, and the level of detail.
+// Texel-space coordinates from stuv = {S, T, U, V} and Q, and the level of
+// detail. All four lanes take part in the divide and the scale (U and V
+// as /1*1, exact), so no lane holds leftover data. Do not narrow this to
+// two-lane scalar math: LLVM then packs s/q and t/q into a vector divide
+// whose undefined upper lanes hold the sampler's leftover integers, which
+// read as denormal floats, and the denormal assist on undefined lanes costs
+// a microcode assist per pixel (over 20% of the software GS's wall time).
 @(private)
-tex_coord :: #force_inline proc(c: ^Ctx, s, t, q, u, v: f32) -> (f32, f32, i32) {
+tex_coord :: #force_inline proc(c: ^Ctx, stuv: #simd[4]f32, q: f32) -> (f32, f32, i32) {
 	if !c.tme {return 0, 0, 0}
-	if c.fst {return u, v, tex_lod(&c.tex, 1)}
-	lod := tex_lod(&c.tex, q)
-	if q == 0 {return s * f32(c.tex.w), t * f32(c.tex.h), lod}
-	return s / q * f32(c.tex.w), t / q * f32(c.tex.h), lod
+	d, sc := f32(1), #simd[4]f32{1, 1, 1, 1}
+	lod: i32
+	if c.fst {
+		lod = tex_lod(&c.tex, 1)
+	} else {
+		lod = tex_lod(&c.tex, q)
+		if q != 0 {d = q}
+		sc = {f32(c.tex.w), f32(c.tex.h), 1, 1}
+	}
+	r := stuv / #simd[4]f32{d, d, 1, 1} * sc
+	if c.fst {return simd.extract(r, 2), simd.extract(r, 3), lod}
+	return simd.extract(r, 0), simd.extract(r, 1), lod
 }
 
 // LOD = log2(1/|Q|) * 2^L + K in 1/2^23ths, the log taken as the float's
@@ -366,7 +380,7 @@ draw_sprite :: proc(c: ^Ctx, a, b: ^Vertex) {
 		ctx_seek(c, y)
 		for x in px0 ..= px1 {
 			fx := (f32(x) - x0) / (x1 - x0)
-			u, v, lod := tex_coord(c, sa + (sb - sa) * fx, tt, b.q, ua + (ub - ua) * fx, vv)
+			u, v, lod := tex_coord(c, {sa + (sb - sa) * fx, tt, ua + (ub - ua) * fx, vv}, b.q)
 			c.px(c, x, y, b.z, b.c, u, v, lod, b.fog)
 		}
 	}
@@ -403,6 +417,9 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 	inv := 1 / area
 	flat := a.c
 	if !c.iip {flat = v2.c}
+	sa := #simd[4]f32{a.s, a.t, a.u, a.v}
+	sb := #simd[4]f32{b.s, b.t, b.u, b.v}
+	sd := #simd[4]f32{d.s, d.t, d.u, d.v}
 	for y in miny ..= maxy {
 		w0, w1, w2 := e0.w, e1.w, e2.w
 		ctx_seek(c, y)
@@ -419,11 +436,8 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 			lod: i32
 			if c.tme {
 				u, v, lod = tex_coord(c,
-					a.s * f0 + b.s * f1 + d.s * f2,
-					a.t * f0 + b.t * f1 + d.t * f2,
-					a.q * f0 + b.q * f1 + d.q * f2,
-					a.u * f0 + b.u * f1 + d.u * f2,
-					a.v * f0 + b.v * f1 + d.v * f2)
+					sa * f0 + sb * f1 + sd * f2,
+					a.q * f0 + b.q * f1 + d.q * f2)
 			}
 			fog := a.fog * f0 + b.fog * f1 + d.fog * f2
 			c.px(c, x, y, z, col, u, v, lod, fog)

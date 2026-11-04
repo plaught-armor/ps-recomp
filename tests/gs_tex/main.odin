@@ -7,7 +7,8 @@
 // sample and again after their tiles are reused. The sampler, by level
 // (sample_level) and through TEX1's filters and level choice (sample, with
 // sample_level inlined), matches its pre-SHOT-PERF-E copy below on random
-// textures, coordinates and LODs, every wrap mode at levels 1 and up too.
+// textures, coordinates and LODs, every wrap mode at levels 1 and up too. A
+// sprite with STQ coordinates samples the texels of its UV twin.
 package main
 
 import "core:fmt"
@@ -53,25 +54,45 @@ fill :: proc(p, x, y, w, h: u64, col: u32) {
 	upload(p, 1, PSMCT32, x, y, w, h, slice.to_bytes(px))
 }
 
-// A sprite (x0, y0)..(x1, y1) into the 64-wide PSMCT32 buffer at page fbp,
-// UV (u0, v0)..(u1, v1) in texels, from TEX0 tex0 when it is not 0 (DECAL).
+// Context and PRIM for a sprite into the 64-wide PSMCT32 buffer at page
+// fbp, from TEX0 tex0 when it is not 0 (DECAL); UV coordinates when fst.
 @(private = "file")
-sprite :: proc(fbp, tex0: u64, x0, y0, x1, y1: u64, u0, v0, u1, v1: u64, col: u64 = 0x80000000) {
+sprite_prim :: proc(fbp, tex0: u64, fst: bool) {
 	gs.gs_write(0x4c, fbp | 1 << 16) // FRAME_1: FBW 1, PSMCT32
 	gs.gs_write(0x4e, 0x100 | 1 << 32) // ZBUF_1: ZMSK
 	gs.gs_write(0x40, 63 << 16 | 63 << 48) // SCISSOR_1: 0..63
 	gs.gs_write(0x18, 0) // XYZOFFSET_1
 	gs.gs_write(0x1a, 1) // PRMODECONT
-	prim: u64 = 6 | 1 << 8 // SPRITE, FST
+	prim: u64 = 6 // SPRITE
+	if fst {prim |= 1 << 8}
 	if tex0 != 0 {
 		gs.gs_write(0x06, tex0)
 		prim |= 1 << 4
 	}
 	gs.gs_write(0x00, prim)
+}
+
+// A sprite (x0, y0)..(x1, y1) into the 64-wide PSMCT32 buffer at page fbp,
+// UV (u0, v0)..(u1, v1) in texels, from TEX0 tex0 when it is not 0 (DECAL).
+@(private = "file")
+sprite :: proc(fbp, tex0: u64, x0, y0, x1, y1: u64, u0, v0, u1, v1: u64, col: u64 = 0x80000000) {
+	sprite_prim(fbp, tex0, true)
 	gs.gs_write(0x01, col)
 	gs.gs_write(0x03, u0 << 4 | (v0 << 4) << 16)
 	gs.gs_write(0x05, x0 << 4 | (y0 << 4) << 16)
 	gs.gs_write(0x03, u1 << 4 | (v1 << 4) << 16)
+	gs.gs_write(0x05, x1 << 4 | (y1 << 4) << 16)
+}
+
+// The same sprite with STQ coordinates: (s0, t0)..(s1, t1), and Q q at both
+// vertices.
+@(private = "file")
+sprite_stq :: proc(fbp, tex0: u64, x0, y0, x1, y1: u64, s0, t0, s1, t1, q: f32) {
+	sprite_prim(fbp, tex0, false)
+	gs.gs_write(0x01, 0x80000000 | u64(transmute(u32)q) << 32) // RGBAQ
+	gs.gs_write(0x02, u64(transmute(u32)s0) | u64(transmute(u32)t0) << 32) // ST
+	gs.gs_write(0x05, x0 << 4 | (y0 << 4) << 16)
+	gs.gs_write(0x02, u64(transmute(u32)s1) | u64(transmute(u32)t1) << 32)
 	gs.gs_write(0x05, x1 << 4 | (y1 << 4) << 16)
 }
 
@@ -111,6 +132,17 @@ main :: proc() {
 	tt := tex0(T, 1, PSMCT32, 6)
 	sprite(F, tt, 0, 0, 16, 16, 0, 0, 16, 16)
 	if at(F, 5, 9) != 0x400905 {fail("first sample: %x", at(F, 5, 9))}
+	// STQ: S/Q and T/Q scaled by the 64-texel size give the same texels as
+	// UV 0..16 (Q 2, all powers of two, so exact); every pixel checked.
+	sprite_stq(F, tt, 0, 0, 16, 16, 0, 0, 0.5, 0.5, 2)
+	stq: for y in u32(0) ..< 16 {
+		for x in u32(0) ..< 16 {
+			if at(F, x, y) != x | y << 8 | 0x40 << 16 {
+				fail("STQ sample (%d, %d): %x", x, y, at(F, x, y))
+				break stq
+			}
+		}
+	}
 
 	fill(T, 0, 0, 8, 16, 0x111111)
 	sprite(F, tt, 0, 0, 16, 16, 0, 0, 16, 16)
