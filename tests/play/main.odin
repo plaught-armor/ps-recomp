@@ -40,6 +40,13 @@
 //   memory and scratchpad cleared; LoadExecPS2 of a missing file, fatal; and
 //   a program that changes a word of its recompiled text and ExecPS2s into
 //   itself, which turns the function table off.
+// - compat_learned: play --compat on a PS1 disc with LEARN records (one of
+//   them twice) compiles its learned code before the child starts: a fake
+//   child finds the blob and key stored. Then, the blob removed, the real
+//   child's compat.log has no compile but loads the blob the parent
+//   compiled, and neither rewrites the records the first run compacted. A
+//   compile that fails in the parent (a directory in the way of its output)
+//   is not tried again in the child, which runs without learned code.
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
 // - launcher: the launcher's steps, settings, picture, dropped files and
@@ -50,6 +57,7 @@ package main
 
 import "core:encoding/endian"
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
@@ -86,7 +94,8 @@ PLAY_TEST_CHILD :: "PS_PLAY_TEST_CHILD"
 // A compat child that writes vblank counts to COMPAT_PROGRESS as a game
 // would, then ends with no compat line. "stuck": vblank 1, then nothing for
 // 60 s; "boot": nothing for 60 s; "slow": vblanks 1 to 12, 0.4 s apart,
-// after 2 s.
+// after 2 s; "learned": none, its last line whether the disc's learned blob
+// and key were stored before it started.
 @(private = "file")
 fake_child :: proc(mode: string) -> ! {
 	f, err := os.open(core.env("COMPAT_PROGRESS"), {.Write})
@@ -112,6 +121,11 @@ fake_child :: proc(mode: string) -> ! {
 			time.sleep(400 * time.Millisecond)
 		}
 		fmt.eprintln("fake child: done")
+	case "learned":
+		dir := filepath.dir(core.env("COMPAT_PROGRESS"))
+		blob, _ := os.read_entire_file(core.disc_path(dir, .Learned, context.temp_allocator), context.temp_allocator)
+		stored := core.blob_valid(blob) && os.exists(core.disc_path(dir, .Learned_Key, context.temp_allocator))
+		fmt.eprintln("fake child: learned blob", "stored" if stored else "missing")
 	}
 	os.exit(0)
 }
@@ -144,6 +158,7 @@ main :: proc() {
 	test_interpreted()
 	test_settings()
 	test_compat()
+	test_compat_learned()
 	test_line_row()
 	test_library()
 	test_log_strip()
@@ -841,6 +856,92 @@ test_line_row :: proc() {
 	l.lit, l.fallback = 1, false
 	play.line_row(&row, l)
 	check(name, row[.Result] == "ok", fmt.tprintf("ok: %v", row))
+}
+
+// play --compat on a disc with LEARN records: the parent compiles, never
+// the child.
+@(private = "file")
+test_compat_learned :: proc() {
+	name := "compat_learned"
+	path := write(name, labeled(cnf_disc(), "COMPAT LEARNED"))
+	dir := disc_dir(name, path)
+	if dir == "" {
+		return
+	}
+	learn := core.disc_path(dir, .Learn, context.temp_allocator)
+	records, _ := filepath.join({learn, "psx.bin"}, context.temp_allocator)
+	// jr ra; nop at 0x80010000, written twice: compacting keeps one.
+	words := [?]u32{0x03e00008, 0}
+	rec: [core.LEARN_HEADER + size_of(words)]u8
+	rec[0], rec[1] = core.LEARN_TAG, u8(core.Learn_Cpu.Psx)
+	endian.put_u32(rec[4:], .Little, 0x80010000)
+	endian.put_u32(rec[8:], .Little, 0x80010000)
+	endian.put_u32(rec[12:], .Little, len(words))
+	copy(rec[core.LEARN_HEADER:], slice.to_bytes(words[:]))
+	endian.put_u64(rec[16:], .Little, u64(xxhash.XXH3_64_default(rec[core.LEARN_HEADER:])))
+	twice := slice.concatenate([][]u8{rec[:], rec[:]}, context.temp_allocator)
+	if os.make_directory_all(learn) != nil || os.write_entire_file(records, twice) != nil {
+		check(name, false, "cannot write the records")
+		return
+	}
+	blob := core.disc_path(dir, .Learned, context.temp_allocator)
+	key := core.disc_path(dir, .Learned_Key, context.temp_allocator)
+	log_path := core.disc_path(dir, .Compat_Log, context.temp_allocator)
+	id := disc_id(name, path)
+	// The compile's own line; a child loading the blob prints
+	// "learned: <n> functions from <path>".
+	compiled :: "records (not compiled:"
+
+	os.set_env(PLAY_TEST_CHILD, "learned")
+	out, errs, ok := run_compat(name, {path, fmt.tprint(FRAMES)})
+	os.unset_env(PLAY_TEST_CHILD)
+	row, found := compat_row(compat_rows(name), id)
+	what := fmt.tprintf("fake child: %v\nstdout:\n%s\nstderr:\n%s", row, out, errs)
+	check(name, ok && found && row[.Fatal] == "fake child: learned blob stored", what)
+	check(name, strings.contains(errs, compiled), what)
+	compact, _ := os.read_entire_file(records, context.temp_allocator)
+	check(name, string(compact) == string(rec[:]), "the records not compacted")
+	before, serr := os.stat(records, context.temp_allocator)
+	check(name, serr == nil, fmt.tprintf("cannot stat %s: %v", records, serr))
+
+	// The real child.
+	_ = os.remove(blob)
+	_ = os.remove(key)
+	out, errs, ok = run_compat(name, {path, fmt.tprint(FRAMES)})
+	row, found = compat_row(compat_rows(name), id)
+	log, _ := os.read_entire_file(log_path, context.temp_allocator)
+	what = fmt.tprintf("real child: %v\nstderr:\n%s\ncompat.log:\n%s", row, errs, log)
+	check(name, ok && found && row[.Result] == "stalled" && row[.Native] == "yes", what)
+	check(name, strings.contains(errs, compiled) && !strings.contains(string(log), compiled), what)
+	check(name, strings.contains(string(log), "learned: 1 functions from"), what)
+	check(name, !strings.contains(string(log), "play: no learned code"), what)
+	b, _ := os.read_entire_file(blob, context.temp_allocator)
+	check(name, core.blob_valid(b) && os.exists(key), "no blob after the real child")
+	after, aerr := os.stat(records, context.temp_allocator)
+	check(name, aerr == nil && serr == nil && after.modification_time == before.modification_time, "the compacted records rewritten")
+
+	// A compile that fails: its output's path is a directory.
+	_ = os.remove(blob)
+	_ = os.remove(key)
+	in_way := strings.concatenate({blob, ".compile"}, context.temp_allocator)
+	in_way_file, _ := filepath.join({in_way, "in the way"}, context.temp_allocator)
+	if os.make_directory(in_way) != nil || os.write_entire_file(in_way_file, "") != nil {
+		check(name, false, "cannot block the compile")
+		return
+	}
+	out, errs, ok = run_compat(name, {path, fmt.tprint(FRAMES)})
+	_ = os.remove_all(in_way)
+	row, found = compat_row(compat_rows(name), id)
+	log, _ = os.read_entire_file(log_path, context.temp_allocator)
+	what = fmt.tprintf("failed compile: %v\nstderr:\n%s\ncompat.log:\n%s", row, errs, log)
+	check(name, ok && found && row[.Result] == "stalled", what)
+	check(name, strings.contains(errs, "play: no learned code (the compile failed"), what)
+	check(name, strings.contains(string(log), "play: no learned code (not compiled in the compat run)"), what)
+	check(name, !strings.contains(string(log), "learned:"), what)
+	check(name, !os.exists(blob) && !os.exists(key), "a blob from the failed compile")
+	data, _ := core.data_dir(context.temp_allocator)
+	tsv, _ := filepath.join({data, "compat.tsv"}, context.temp_allocator)
+	_ = os.remove(tsv)
 }
 
 // play --compat on a directory, then twice on its looping disc.

@@ -109,10 +109,11 @@ learned_files :: proc(cpu: core.Learn_Cpu) -> Learned_Files {
 // The learned blob for cpu's records in the disc directory dir's learn
 // directory, after the file is compacted (core.learn_compact); compiled when
 // the stored one is not for them. Its key names those records alone, so
-// another processor's in the same file do not compile it again. "" when
-// there are none, or no blob.
-@(private = "file")
-learned_blob :: proc(dir: string, cpu: core.Learn_Cpu) -> string {
+// another processor's in the same file do not compile it again. Without
+// compile a blob not stored is not compiled either. "" when there are none,
+// or no blob.
+@(private)
+learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile := true) -> string {
 	l := learned_files(cpu)
 	records := learn_records(dir, l.records)
 	if !os.exists(records) {
@@ -149,8 +150,14 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu) -> string {
 		return ""
 	}
 	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(([^]u8)(raw_data(keys))[:len(keys) * size_of(Key)]))
-	if !core.blob_cached(dir, core.COMMIT, l.kind, set) && !learned_store(cpu, records, dir, set) {
-		return ""
+	if !core.blob_cached(dir, core.COMMIT, l.kind, set) {
+		if !compile {
+			fmt.eprintln("play: no learned code (not compiled in the compat run)")
+			return ""
+		}
+		if !learned_store(cpu, records, dir, set) {
+			return ""
+		}
 	}
 	return core.disc_path(dir, l.blob)
 }
@@ -212,11 +219,12 @@ play :: proc(image: string) -> int {
 	native_key = core.disc_path(dir, .Native_Key)
 	// Learned code runs on a PS1 game, and on a PS2 game's IOP, unless
 	// NATIVE=0; found before LEARN opens the records, which compacting
-	// rewrites.
+	// rewrites. A compat child's parent compiled it already (compat_disc):
+	// one that failed there is not tried again here.
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
 	learned: string
 	if core.env("NATIVE") != "0" {
-		learned = learned_blob(dir, learn_cpu)
+		learned = learned_blob(dir, learn_cpu, !compat_child())
 	}
 	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
 	if core.env("LEARN") == "1" {

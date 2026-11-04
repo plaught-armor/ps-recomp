@@ -10,8 +10,11 @@
 // for COMPAT_BOOT_FACTOR times that before its first vblank, is stopped and
 // hung, however long it has run. A disc that fails in its child is a row,
 // never a failure of the run. The conversion runs here first (convert_store,
-// in its own child), so neither window counts it; a disc whose conversion
-// fails runs interpreted.
+// in its own child), and then the compile of the disc's learned code
+// (learned_blob, in its own child too), so neither window counts them and a
+// child hung or killed leaves no compile running; a disc whose conversion
+// fails runs interpreted, and one whose compile fails runs without learned
+// code, its child not compiling again.
 //
 // The disc's press.txt, when there is one and PRESS is unset, is the
 // child's PRESS script.
@@ -45,9 +48,9 @@ COMPAT_FRAMES :: 3600
 @(private = "file")
 COMPAT_WAIT :: 120
 
-// The window before vblank 1, as a multiple of COMPAT_WAIT: the child may
-// first compile learned code (play --learned), load a native blob and boot
-// the console, none of which writes a count. 5 times the default is the
+// The window before vblank 1, as a multiple of COMPAT_WAIT: the child first
+// loads a native blob and its learned code and boots the console, none of
+// which writes a count. 5 times the default is the
 // 600 s the whole run had before the count.
 @(private = "file")
 COMPAT_BOOT_FACTOR :: 5
@@ -258,6 +261,10 @@ compat_disc :: proc(image: string, frames, wait: u64) -> (row: Row, ran: bool) {
 	row[.Frames_Wanted] = fmt.tprint(frames)
 	row[.When], _ = time.time_to_rfc3339(time.now(), 0, false, context.temp_allocator)
 	native := core.env("NATIVE") != "0" && (core.blob_cached(dir) || convert_store(image, dir))
+	// The child finds the blob stored and compiles nothing (compat_child).
+	if native {
+		_ = learned_blob(dir, .Iop if cnf.ps2 else .Psx)
+	}
 
 	self, serr := os.get_executable_path(context.temp_allocator)
 	if serr != nil {
@@ -340,6 +347,13 @@ compat_wait :: proc(p: os.Process, progress: ^os.File, boot, stall: time.Duratio
 			return state, err, true
 		}
 	}
+}
+
+// Whether this run is a compat child: COMPAT_PROGRESS is set only by the
+// compat parent (child_env).
+@(private)
+compat_child :: proc() -> bool {
+	return core.env("COMPAT_PROGRESS") != ""
 }
 
 // The child's environment: this one with HEADLESS, COMPAT and FRAMES set,
