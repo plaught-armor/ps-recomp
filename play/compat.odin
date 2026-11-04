@@ -86,7 +86,10 @@ FATAL_MAX :: 200
 // cycles, the share of the run with every guest thread waiting (0 for a
 // console whose kernel skips no idle time); information only, as a game
 // waiting on vsync on a light screen idles nearly all the time too; lit: the
-// non-black pixels on the last frame of a run to FRAMES, "" when not counted.
+// non-black pixels on the last frame of a run to FRAMES, "" when not counted;
+// stretches: the sampled stretches of at least core.COMPAT_STRETCH vblanks,
+// kind:from-to comma separated (kinds black, frozen, ram_still), then
+// +<n> for those past core.COMPAT_STRETCHES; information only.
 Column :: enum {
 	Id,
 	Serial,
@@ -111,6 +114,7 @@ Column :: enum {
 	Shown,
 	Idle_Share,
 	Lit,
+	Stretches,
 }
 
 COLUMNS :: [Column]string {
@@ -137,6 +141,7 @@ COLUMNS :: [Column]string {
 	.Shown         = "shown",
 	.Idle_Share    = "idle_share",
 	.Lit           = "lit",
+	.Stretches     = "stretches",
 }
 
 Row :: [Column]string
@@ -476,6 +481,14 @@ line_row :: proc(row: ^Row, l: core.Compat_Line) {
 	if l.lit >= 0 {
 		row[.Lit] = fmt.tprint(l.lit)
 	}
+	b = strings.builder_make()
+	for st, i in l.stretches {
+		fmt.sbprintf(&b, "%s%s:%d-%d", "," if i > 0 else "", st.kind, st.from, st.to)
+	}
+	if l.stretches_other > 0 {
+		fmt.sbprintf(&b, "%s+%d", "," if len(l.stretches) > 0 else "", l.stretches_other)
+	}
+	row[.Stretches] = strings.to_string(b)
 	row[.Build] = l.build
 }
 

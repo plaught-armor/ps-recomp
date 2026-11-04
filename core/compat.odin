@@ -7,8 +7,12 @@
 //   made;
 // - once a vblank, whether the display was on and, under COMPAT, a hash of
 //   main RAM halfway to FRAMES, so the line can say a run made no progress;
-// - and under COMPAT, from the host, how much of the last frame of a run to
-//   FRAMES was drawn.
+// - under COMPAT, from the host, how much of the last frame of a run to
+//   FRAMES was drawn;
+// - and under COMPAT, every COMPAT_SAMPLE vblanks, the picture the host
+//   hands over and main RAM, so the line can list the stretches of at least
+//   COMPAT_STRETCH vblanks the picture was black, the picture did not
+//   change, or RAM did not change.
 // Built with -define:COMPAT_COUNT=false the counters compile away.
 //
 // COMPAT=1 makes a run a compatibility run: a call the HLE does not
@@ -37,6 +41,46 @@ COMPAT_PROGRESS_EVERY :: 60
 
 // How many interpreter entries the line lists, hottest first.
 COMPAT_TOP :: 10
+
+// Under COMPAT, the vblanks between samples of the picture and main RAM
+// (5 s at 60 Hz).
+COMPAT_SAMPLE :: 300
+
+// The shortest stretch the line lists, in vblanks (30 s at 60 Hz): the
+// first sample of it to the last.
+COMPAT_STRETCH :: 1800
+
+// The most stretches the line lists; later ones count in stretches_other.
+COMPAT_STRETCHES :: 32
+
+// What a stretch is: the display off or every pixel black (Black), the
+// same picture as the sample before, not black (Frozen), or main RAM the
+// same as at the sample before (Ram_Still).
+Compat_Stretch_Kind :: enum u8 {
+	Black,
+	Frozen,
+	Ram_Still,
+}
+
+COMPAT_STRETCH_NAMES :: [Compat_Stretch_Kind]string {
+	.Black     = "black",
+	.Frozen    = "frozen",
+	.Ram_Still = "ram_still",
+}
+
+// A stretch in the line: from its first sample's vblank to its last's.
+Compat_Stretch :: struct {
+	kind: string,
+	from: u64,
+	to:   u64,
+}
+
+// A stretch being followed: on while each sample since `from` showed it.
+@(private = "file")
+Stretch_Run :: struct {
+	on:         bool,
+	from, last: u64,
+}
 
 // The kinds of call the HLE may not implement. Id and sub per kind:
 // Bios_A/B/C the function number; Syscall the syscall number (as an i32);
@@ -186,6 +230,17 @@ compat: struct {
 	// The non-black pixels of the picture at vblank FRAMES, which the host
 	// sets; -1 until it does.
 	lit:           i64,
+	// The samples (compat_sample): the last one's vblank (0: none yet), the
+	// hashes it took (pic_ok: its picture was not black), the stretches
+	// being followed, and those ended long enough to list.
+	sample_at:      u64,
+	sample_pic:     u64,
+	sample_pic_ok:  bool,
+	sample_ram:     u64,
+	runs:           [Compat_Stretch_Kind]Stretch_Run,
+	stretches:      [COMPAT_STRETCHES]struct {kind: Compat_Stretch_Kind, from, to: u64},
+	stretches_n:    int,
+	stretches_other: u64,
 	reported:      bool,
 	// COMPAT_PROGRESS, open under COMPAT; nil without it.
 	progress:      ^os.File,
@@ -268,6 +323,86 @@ compat_vblank :: proc(n: u64, shown: bool, ram: []u8) {
 	}
 }
 
+// Whether vblank n is a sample (compat_sample): under COMPAT, every
+// COMPAT_SAMPLE vblanks from COMPAT_SAMPLE. Outside COMPAT never, so a
+// host draws and reads what it did without it.
+compat_sample_due :: proc(n: u64) -> bool {
+	when COMPAT_COUNT {
+		return compat.on && n > 0 && n % COMPAT_SAMPLE == 0
+	} else {
+		return false
+	}
+}
+
+// Whether a sample is due within `within` vblanks after n, or at n: a host
+// that draws only the pictures it reads draws from then.
+compat_sample_near :: proc(n, within: u64) -> bool {
+	d := (COMPAT_SAMPLE - n % COMPAT_SAMPLE) % COMPAT_SAMPLE
+	return d <= within && compat_sample_due(n + d)
+}
+
+// At a sample vblank n, after compat_vblank, take the picture on screen
+// (w x h pixels, rows stride apart, 0xffffff the color bits; w or h 0 with
+// the display off) and main RAM, and follow the stretches. Any other
+// vblank, or a vblank not after the last sample, does nothing.
+compat_sample :: proc(n: u64, px: []u32, stride, w, h: int) {
+	when COMPAT_COUNT {
+		if !compat_sample_due(n) || n <= compat.sample_at {
+			return
+		}
+		lit := false
+		pic: u64
+		if w > 0 && h > 0 {
+			for y in 0 ..< h {
+				row := px[y * stride:][:w]
+				if !lit {
+					for c in row {
+						if c & 0xffffff != 0 {
+							lit = true
+							break
+						}
+					}
+				}
+				pic = xxhash.XXH3_64_with_seed(slice.to_bytes(row), pic)
+			}
+		}
+		ram := xxhash.XXH3_64_default(compat.ram)
+		prev := compat.sample_at
+		stretch_step(.Black, !lit, n, n)
+		stretch_step(.Frozen, lit && compat.sample_pic_ok && pic == compat.sample_pic, prev, n)
+		stretch_step(.Ram_Still, prev != 0 && ram == compat.sample_ram, prev, n)
+		compat.sample_at, compat.sample_pic, compat.sample_pic_ok, compat.sample_ram = n, pic, lit, ram
+	}
+}
+
+// One sample of stretch k at vblank n: it holds (since `from` when it
+// starts) or not, which ends it.
+@(private = "file")
+stretch_step :: proc(k: Compat_Stretch_Kind, holds: bool, from, n: u64) {
+	r := &compat.runs[k]
+	switch {
+	case holds && !r.on: r^ = {true, from, n}
+	case holds: r.last = n
+	case r.on:
+		stretch_keep(k, r^)
+		r.on = false
+	}
+}
+
+// Keep run r of kind k for the line when it lasted COMPAT_STRETCH vblanks.
+@(private = "file")
+stretch_keep :: proc(k: Compat_Stretch_Kind, r: Stretch_Run) {
+	if r.last - r.from < COMPAT_STRETCH {
+		return
+	}
+	if compat.stretches_n == COMPAT_STRETCHES {
+		compat.stretches_other += 1
+		return
+	}
+	compat.stretches[compat.stretches_n] = {k, r.from, r.last}
+	compat.stretches_n += 1
+}
+
 // The name a call has in the line, temp allocated.
 compat_call_name :: proc(k: Compat_Key) -> string {
 	switch k.kind {
@@ -344,7 +479,10 @@ Compat_Name :: struct {
 // not count); ram_still_since: the vblank from which main RAM was the same at
 // the end, else 0 (also when not checked: no FRAMES, or the run ended before
 // FRAMES/2); fallback: an IOP module's load failed and the HLE stood in for
-// it (an Iop_Fallback row); build: the ps-recomp commit (COMMIT).
+// it (an Iop_Fallback row); build: the ps-recomp commit (COMMIT);
+// stretches: the sampled stretches of at least COMPAT_STRETCH vblanks
+// (compat_sample), by first vblank, those still on at the end included,
+// and stretches_other the ones past COMPAT_STRETCHES.
 Compat_Line :: struct {
 	system:               string,
 	result:               string,
@@ -362,6 +500,8 @@ Compat_Line :: struct {
 	ram_still_since:      u64,
 	fallback:             bool,
 	build:                string,
+	stretches:            []Compat_Stretch,
+	stretches_other:      u64,
 }
 
 // The line as it stands, temp allocated.
@@ -417,7 +557,35 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 		return a.n > b.n || a.n == b.n && a.name < b.name
 	})
 	l.unimplemented = calls
+	l.stretches, l.stretches_other = compat_stretches()
 	return l
+}
+
+// The line's stretches: those ended, then those still on that are long
+// enough, within COMPAT_STRETCHES, by first vblank; and how many did not
+// fit. Temp allocated; the runs go on.
+@(private = "file")
+compat_stretches :: proc() -> (list: []Compat_Stretch, other: u64) {
+	names := COMPAT_STRETCH_NAMES
+	out := make([dynamic]Compat_Stretch, 0, COMPAT_STRETCHES, context.temp_allocator)
+	for s in compat.stretches[:compat.stretches_n] {
+		append(&out, Compat_Stretch{names[s.kind], s.from, s.to})
+	}
+	other = compat.stretches_other
+	for r, k in compat.runs {
+		if !r.on || r.last - r.from < COMPAT_STRETCH {
+			continue
+		}
+		if len(out) == COMPAT_STRETCHES {
+			other += 1
+			continue
+		}
+		append(&out, Compat_Stretch{names[k], r.from, r.last})
+	}
+	slice.sort_by(out[:], proc(a, b: Compat_Stretch) -> bool {
+		return a.from < b.from || a.from == b.from && a.kind < b.kind
+	})
+	return out[:], other
 }
 
 // Under COMPAT, print the compat line once; fatal is the fatal error's

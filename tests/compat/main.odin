@@ -12,7 +12,14 @@
 // Each unimplemented call is named with where the first was made: ra, the
 // pc of a syscall, and the client data of a SIF bind. Neither run shows a
 // picture, and main RAM is the same at the end as at FRAMES/2.
-// - psx_press: the PSX host takes PRESS, the script both hosts read.
+// - psx_press: the PSX host takes PRESS, the script both hosts read;
+// - psx_dark, ps2_dark: each host, run to DARK_FRAMES with the display off
+//   and RAM still, samples a black stretch and a RAM one of exactly
+//   core.COMPAT_STRETCH vblanks, both on at the end;
+// - stretches (in process): a stretch one sample short of
+//   core.COMPAT_STRETCH is not listed and one of exactly it is, for each
+//   kind; frozen needs a lit picture, a black one is not frozen; only
+//   sample vblanks count.
 package main
 
 import "core:encoding/json"
@@ -33,6 +40,10 @@ import psx_host "ps:psx/host"
 
 @(private = "file")
 FRAMES :: 5
+
+// The first sample, and the last of a stretch of exactly COMPAT_STRETCH.
+@(private = "file")
+DARK_FRAMES :: core.COMPAT_SAMPLE + core.COMPAT_STRETCH
 
 @(private = "file")
 failed: int
@@ -79,9 +90,6 @@ main :: proc() {
 		check("psx_fatal", l.result == "fatal" && strings.contains(l.fatal, "reserved instruction"), "result")
 	}
 	run("psx_off", false, 1)
-	os.set_env(core.env_name("PRESS"), "Start@2+3")
-	run("psx_press", true, 0)
-	os.unset_env(core.env_name("PRESS"))
 	if l, ok := run("ps2", true, 0); ok {
 		check("ps2", l.system == "ps2" && l.result == "frames" && l.frames == FRAMES && l.cycles_per_insn == 1, "result")
 		// No picture, and nothing in RAM moved after the call.
@@ -94,6 +102,16 @@ main :: proc() {
 		check("ps2", len(l.interp_entries) == 1 && l.interp_entries[0] == {"00100000", 2}, "entries")
 		check("ps2", l.interp_insns == 4 && l.interp_entries_other == 0, "interpreter work")
 	}
+	os.set_env(core.env_name("PRESS"), "Start@2+3")
+	run("psx_press", true, 0)
+	os.unset_env(core.env_name("PRESS"))
+	for name in ([]string{"psx_dark", "ps2_dark"}) {
+		if l, ok := run(name, true, 0, DARK_FRAMES); ok {
+			want := []core.Compat_Stretch{{"black", core.COMPAT_SAMPLE, DARK_FRAMES}, {"ram_still", core.COMPAT_SAMPLE, DARK_FRAMES}}
+			check(name, l.result == "frames" && l.frames == DARK_FRAMES && slice.equal(l.stretches, want) && l.stretches_other == 0, fmt.tprint("stretches:", l.stretches))
+		}
+	}
+	test_stretches()
 	if failed > 0 {
 		os.exit(1)
 	}
@@ -103,9 +121,9 @@ main :: proc() {
 // Run a case's child and check its status and its line: one, which parses,
 // under COMPAT; none without.
 @(private = "file")
-run :: proc(name: string, compat: bool, status: int) -> (l: core.Compat_Line, ok: bool) {
+run :: proc(name: string, compat: bool, status: int, frames: u64 = FRAMES) -> (l: core.Compat_Line, ok: bool) {
 	os.set_env(core.env_name("HEADLESS"), "1")
-	os.set_env(core.env_name("FRAMES"), fmt.tprint(FRAMES))
+	os.set_env(core.env_name("FRAMES"), fmt.tprint(frames))
 	os.set_env(core.env_name("SW"), "1") // no Vulkan device needed
 	os.set_env(core.env_name("GPU"), "sw")
 	os.set_env(core.env_name("COMPAT"), compat ? "1" : "")
@@ -146,15 +164,21 @@ run :: proc(name: string, compat: bool, status: int) -> (l: core.Compat_Line, ok
 child :: proc(name: string) -> ! {
 	vblank: proc()
 	switch name {
-	case "psx_press":
+	case "psx_dark", "psx_press":
 		if !psx_cpu.trace_init() || !psx_host.platform_init("compat") {os.exit(2)}
-		if !slice.equal(core.input.script[:], []core.Scripted_Press{{at = 2, hold = 3, buttons = {.Start}}}) {
+		if name == "psx_press" && !slice.equal(core.input.script[:], []core.Scripted_Press{{at = 2, hold = 3, buttons = {.Start}}}) {
 			fmt.eprintln("PRESS not loaded:", core.input.script)
 			os.exit(3)
 		}
 		vblank = psx_host.platform_frame
 		psx_cpu.register_funcs(nil)
 		psx_cpu.next_event = max(u64)
+	case "ps2_dark":
+		if !ps2_host.platform_init("compat") {os.exit(2)}
+		vblank = kernel.vblank_hook
+		mem.mem_init()
+		kernel.kernel_init()
+		iop.sif_init()
 	case "psx", "psx_fatal", "psx_off":
 		if !psx_cpu.trace_init() || !psx_host.platform_init("compat") {os.exit(2)}
 		vblank = psx_host.platform_frame
@@ -212,8 +236,53 @@ child :: proc(name: string) -> ! {
 	case:
 		os.exit(2)
 	}
-	for _ in 1 ..= FRAMES + 3 {
+	for _ in 1 ..= core.frames + 3 {
 		vblank()
 	}
 	os.exit(1)
+}
+
+// Samples of 4x2 pictures in process: black (display off, or every pixel
+// black), A or B (lit, different), with main RAM moved (fresh) or not.
+@(private = "file")
+test_stretches :: proc() {
+	name := "stretches"
+	S :: core.COMPAT_SAMPLE
+	ram: [16]u8
+	core.compat.on = true
+	core.compat.ram = ram[:]
+	dark := [8]u32{0xff000000, 0, 0, 0, 0, 0, 0, 0} // only the unused bits
+	a := [8]u32{0, 0, 0, 0, 0, 0x00102030, 0, 0}
+	b := [8]u32{0x00ffffff, 0, 0, 0, 0, 0, 0, 0}
+	n: u64
+	sample :: proc(n: ^u64, ram: []u8, px: []u32, fresh: bool) {
+		n^ += core.COMPAT_SAMPLE
+		if fresh {ram[0] += 1}
+		core.compat_sample(n^ - 1, px, 4, 4, 2) // not a sample: nothing
+		core.compat_sample(n^, px, 4, 4, len(px) > 0 ? 2 : 0)
+	}
+	// Sample k is vblank k*S. Black short: display off 1..6 (5*S), then A.
+	for _ in 0 ..< 6 {sample(&n, ram[:], nil, true)}
+	sample(&n, ram[:], a[:], true)
+	// Black exactly: dark pixels 8..14 (6*S), then B at 15.
+	for _ in 0 ..< 7 {sample(&n, ram[:], dark[:], true)}
+	sample(&n, ram[:], b[:], true)
+	// Frozen exactly: B again 16..21, so 15..21; then A at 22 and again
+	// 23..27, frozen short (22..27).
+	for _ in 0 ..< 6 {sample(&n, ram[:], b[:], true)}
+	sample(&n, ram[:], a[:], true)
+	for _ in 0 ..< 5 {sample(&n, ram[:], a[:], true)}
+	// RAM still short: B at 28, RAM held 29..33 (28..33), the pictures
+	// taking turns; RAM moves at 34, then held 35..40 (34..40), on at the
+	// end.
+	sample(&n, ram[:], b[:], true)
+	for _ in 0 ..< 5 {sample(&n, ram[:], b[:] if n % (2 * S) == 0 else a[:], false)}
+	sample(&n, ram[:], a[:], true)
+	for _ in 0 ..< 6 {sample(&n, ram[:], b[:] if n % (2 * S) == 0 else a[:], false)}
+	want := []core.Compat_Stretch{{"black", 8 * S, 14 * S}, {"frozen", 15 * S, 21 * S}, {"ram_still", 34 * S, 40 * S}}
+	l := core.compat_line()
+	check(name, slice.equal(l.stretches, want) && l.stretches_other == 0, fmt.tprint("stretches:", l.stretches, "frames", n))
+	check(name, core.compat_sample_near(S - 10, 10) && !core.compat_sample_near(S - 11, 10) && core.compat_sample_near(S, 10) && !core.compat_sample_due(0), "sample timing")
+	core.compat.on = false
+	check(name, !core.compat_sample_due(S) && !core.compat_sample_near(S, 10), "sampling outside COMPAT")
 }

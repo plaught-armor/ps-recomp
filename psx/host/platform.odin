@@ -492,6 +492,21 @@ thumb_save :: proc() {
 	core.thumb_save(frame_pixels(), int(fw), int(fw), int(fh), .Xrgb)
 }
 
+// Under COMPAT, the picture this vblank shows as a sample
+// (core.compat_sample): none with the display off or no frame converted.
+@(private)
+compat_sample :: proc() {
+	px: []u32
+	w, h: int
+	if gpu.display.enabled && gpu.display.w > 0 && gpu.display.h > 0 {
+		fw, fh := frame_size()
+		if f := frame_pixels(); len(f) >= int(fw) * int(fh) {
+			px, w, h = f, int(fw), int(fh)
+		}
+	}
+	core.compat_sample(cpu.presents, px, w, w, h)
+}
+
 // XRGB8888 pixels as tightly packed RGB888 bytes, in temp memory.
 frame_rgb :: proc(px: []u32) -> []u8 {
 	out := make([]u8, len(px) * 3, context.temp_allocator)
@@ -939,6 +954,9 @@ platform_frame :: proc() {
 	}
 	pause_wait()
 	core.compat_vblank(cpu.presents, gpu.display.enabled && gpu.display.w > 0 && gpu.display.h > 0, cpu.ram[:])
+	if core.compat_sample_due(cpu.presents) {
+		compat_sample()
+	}
 	if host.quit || core.frames_done(cpu.presents) {
 		thumb_save()
 		platform_shutdown()

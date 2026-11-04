@@ -252,6 +252,12 @@ vblank_frame :: proc() {
 		quit(0)
 	}
 	if core.compat.on && u64(vblank) == core.frames {core.compat.lit = i64(lit_pixels(w, h))}
+	if core.compat_sample_due(u64(vblank)) {
+		px: []u32
+		stride, pw, ph: int
+		if w > 0 && h > 0 {px, stride, pw, ph = screen_picture(w, h)}
+		core.compat_sample(u64(vblank), px, stride, pw, ph)
+	}
 	if core.frames_done(u64(vblank)) {quit(0)}
 	if pace == 0 || rerun {return}
 	// Netplay time sync stretches the frame while this host is ahead.
@@ -356,21 +362,22 @@ rbtest_frame :: proc() {
 }
 
 // Whether this vblank's picture is read: a shot is due, or under COMPAT the
-// FRAMES vblank, which lit_pixels counts. A headless run reads no other
-// picture.
+// FRAMES vblank, which lit_pixels counts, or a sample (core.compat_sample).
+// A headless run reads no other picture.
 @(private)
 readout_due :: proc() -> bool {
 	if next_shot < len(shots) && shots[next_shot] == vblank {return true}
-	return core.compat.on && core.frames > 0 && u64(vblank) == core.frames
+	return (core.compat.on && core.frames > 0 && u64(vblank) == core.frames) || core.compat_sample_due(u64(vblank))
 }
 
 // Whether a picture is read within SHOT_WARMUP vblanks (a shot, or under
-// COMPAT the FRAMES vblank): the GS then draws everything, so a game that
-// fills its buffers over several frames has them full when read.
+// COMPAT the FRAMES vblank or a sample): the GS then draws everything, so a
+// game that fills its buffers over several frames has them full when read.
 @(private)
 draw_due :: proc() -> bool {
 	if next_shot < len(shots) && shots[next_shot] - vblank <= SHOT_WARMUP {return true}
-	return core.compat.on && core.frames > 0 && u64(vblank) + SHOT_WARMUP >= core.frames
+	return (core.compat.on && core.frames > 0 && u64(vblank) + SHOT_WARMUP >= core.frames) ||
+		core.compat_sample_near(u64(vblank), SHOT_WARMUP)
 }
 
 // The picture on screen, w x h when drawn in software: its pixels (XBGR),
