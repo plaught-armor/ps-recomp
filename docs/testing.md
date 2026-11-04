@@ -9,6 +9,7 @@ odin run tests/ee_native -collection:ps=.
 odin run tests/ee_spin -collection:ps=.
 odin run tests/fpu -collection:ps=.
 odin run tests/lower -collection:ps=.
+odin run tests/discover -collection:ps=.
 odin run tests/vu -collection:ps=.
 odin run tests/gs -collection:ps=.
 odin run tests/gs_tex -collection:ps=.
@@ -56,6 +57,7 @@ here.
 | `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store and an INTC_STAT poll are skipped; a counter, a GIF_STAT poll and a timer poll are not |
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |
+| `discover` | Functions with no prologue that tables of methods in a writable code section point at: thunks, leaves and jumps on through a register, stubs in a row included, are entries; code after a `b` or a `j` inside a function, code that calls or uses `$sp`, data after a `jr` with stray fields or a jump in a delay slot, a jump table's cases (tables of functions next to each other in one run included) and a pair of words are not |
 | `vu` | VU0 microprograms from the EE, macro flags |
 | `vu_macro` | The EE recompiler's VU0 macro code against the interpreter |
 | `ee_emit` | The EE recompiler's inline MMI, multiply-add and FPU code against the interpreter |

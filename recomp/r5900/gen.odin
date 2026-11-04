@@ -209,6 +209,7 @@ generate :: proc(o: mips.Options) {
 	lo, hi := ranges[0][0], ranges[len(ranges) - 1][1]
 	// Code addresses in data and built by lui pairs in code.
 	refs, ptrs, mixed: mips.Set
+	runs: [dynamic]mips.Run
 	pairs: [dynamic][2]u32
 	calls: mips.Set
 	for t in ranges {
@@ -223,7 +224,7 @@ generate :: proc(o: mips.Options) {
 			mips.data_pointers(data_image(img, from, img.base + u32(len(img.data))), t[0], t[1], &ptrs, &pairs)
 		} else {
 			mips.data_pointers(img, t[0], t[1], &ptrs, &pairs)
-			mips.mixed_words(img, t[0], t[1], &mixed)
+			mips.mixed_words(img, t[0], t[1], &mixed, &runs)
 		}
 		for c in ranges {
 			mips.address_constants(RULES, img, c[0], c[1], t[0], t[1], &refs)
@@ -261,7 +262,13 @@ generate :: proc(o: mips.Options) {
 		// No guessed entries: dropping data after a return is gated on
 		// r3000 games only so far.
 		entries, _, _ := mips.module_entries(RULES, img, t[0], t[1], nil, refs, known)
-		mips.table_labels(RULES, img, t[0], t[1], ptrs, pairs[:], entries, &labels)
+		tables: mips.Set
+		mips.table_labels(RULES, img, t[0], t[1], ptrs, pairs[:], entries, &tables)
+		for a in tables {
+			labels[a] = {}
+		}
+		// After table_labels, so a jump table's labels stay labels.
+		mips.vtable_entries(RULES, img, t[0], t[1], runs[:], tables, &entries)
 		append(&funcs, ..mips.build_module(RULES, img, t[0], t[1], entries, labels, calls, {}, {}))
 	}
 	n_imports := drop_imports(&funcs, mips.option_or(o, "quiet", "") == "true")

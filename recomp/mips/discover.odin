@@ -59,6 +59,15 @@ func_make :: proc(entry, end: u32, start: Maybe(u32) = nil) -> ^Func {
 	return f
 }
 
+func_free :: proc(f: ^Func) {
+	delete(f.insns)
+	delete(f.labels)
+	delete(f.delay)
+	delete(f.exits)
+	delete(f.warnings)
+	free(f)
+}
+
 inside :: #force_inline proc(f: ^Func, a: u32) -> bool {
 	return f.start <= a && a < f.end
 }
@@ -232,18 +241,174 @@ data_pointers :: proc(img: Image, lo, hi: u32, out: ^Set, pairs: ^[dynamic][2]u3
 // Aligned words in the writable executable sections of img, which hold
 // code and data together, that point into [lo, hi). data_pointers skips
 // these sections: code words can look like addresses too, so the caller
-// keeps only those that pass a stricter test.
-mixed_words :: proc(img: Image, lo, hi: u32, out: ^Set) {
+// keeps only those that pass a stricter test. With runs, each three or more
+// such words in a row (a table of methods, or a jump table) also go there,
+// for vtable_entries.
+mixed_words :: proc(img: Image, lo, hi: u32, out: ^Set, runs: ^[dynamic]Run = nil) {
 	for s in img.sections {
 		if s.data == nil || s.addr >= 0x01000000 || s.flags & SHF_EXEC == 0 || s.flags & SHF_WRITE == 0 {
 			continue
 		}
-		for o := 0; o + 4 <= len(s.data); o += 4 {
-			if v := u32le(s.data, o); lo <= v && v < hi && v & 3 == 0 {
+		run: [dynamic]u32
+		defer delete(run)
+		for o := 0; o <= len(s.data); o += 4 {
+			v: u32 = 1 // past the end: not a pointer, so the last run ends
+			if o + 4 <= len(s.data) {v = u32le(s.data, o)}
+			if lo <= v && v < hi && v & 3 == 0 {
 				out[v] = {}
+				append(&run, v)
+				continue
 			}
+			if runs != nil && len(run) >= 3 {
+				append(runs, Run{s.addr + u32(o - 4 * len(run)), slice.clone(run[:])})
+			}
+			clear(&run)
 		}
 	}
+}
+
+// Words in a row in a writable executable section from at (mixed_words).
+Run :: struct {
+	at:    u32,
+	words: []u32,
+}
+
+// The words of runs (mixed_words) that begin a function without a
+// prologue, such as a thunk (a `j` on to the method), a short leaf or a jump
+// on through a register, added to entries: a table of methods points at
+// them. Each follows, past nop padding, a `jr` or a `j` out of the function
+// it lies in (by entries), never a `b` or a `j` within that function, which
+// end blocks inside one; and its code up to the next entry makes no call,
+// does not use $sp, and leaves only for outside that function. Two or more
+// words in a row of a run that lie in one function that jumps through a
+// register and builds the address of one of those words (`lui` + `addiu`)
+// are that function's jump table. The tables of functions next to each
+// other can make one run, and methods in a row can lie in one such function
+// by entries too: stubs that each jump on through a register, whose table
+// is built elsewhere. The words in skip (table_labels) are jump table labels
+// already: those stay labels too.
+vtable_entries :: proc(r: Rules, img: Image, lo, hi: u32, runs: []Run, skip: Set, entries: ^Set) {
+	starts := sorted_keys(entries^)
+	defer delete(starts)
+	// By index in starts: whether that function jumps through a register.
+	computed: map[int]bool
+	defer delete(computed)
+	add: [dynamic]u32
+	defer delete(add)
+	for rw in runs {
+		run := rw.words
+		for s := 0; s < len(run); {
+			// The words in a row from s that lie in one function.
+			k := bisect_right(starts, run[s])
+			e := s + 1
+			for e < len(run) && bisect_right(starts, run[e]) == k {e += 1}
+			from := k > 0 ? starts[k - 1] : lo
+			to := k < len(starts) ? starts[k] : hi
+			table := false
+			if e - s >= 2 && k > 0 {
+				if k not_in computed {
+					f := func_make(from, to)
+					discover(r, img, f, nil)
+					computed[k] = f.computed
+					func_free(f)
+				}
+				if computed[k] {
+					built: Set
+					address_constants(r, img, from, to, rw.at + 4 * u32(s), rw.at + 4 * u32(e), &built)
+					table = len(built) > 0
+					delete(built)
+				}
+			}
+			for v in run[s:e] {
+				if table || !(lo <= v && v < hi) || v in entries^ || v in skip {continue}
+				if exit_before(r, img, v, from, to, lo, hi) && thunk_body(r, img, v, from, to) {append(&add, v)}
+			}
+			s = e
+		}
+	}
+	for v in add {entries[v] = {}}
+}
+
+// e follows, past nop padding, a `jr` (plain_jr) or a `j` out of [from, to)
+// into [lo, hi), with its delay slot, which is no jump.
+@(private = "file")
+exit_before :: proc(r: Rules, img: Image, e, from, to, lo, hi: u32) -> bool {
+	p := e - 4
+	for _ in 0 ..< 16 {
+		if w, ok := word(img, p); !ok || w != 0 {
+			break
+		}
+		p -= 4
+	}
+	for q in ([2]u32{p - 4, p}) {
+		if q > e - 8 {
+			continue // e would be this instruction's delay slot
+		}
+		w, ok := word(img, q)
+		if !ok {
+			return false
+		}
+		i := r.decode(q, w)
+		if has_delay(i) {
+			if d, d_ok := word(img, q + 4); d_ok && has_delay(r.decode(q + 4, d)) {
+				return false // a jump in a delay slot: data
+			}
+			return plain_jr(i) || i.kind == .Jump && !(from <= i.target && i.target < to) && lo <= i.target && i.target < hi
+		}
+	}
+	return false
+}
+
+// i is `jr` as a compiler writes it: through a register other than $zero,
+// every other field zero. A data word decodes as `jr` with any of them set.
+@(private = "file")
+plain_jr :: proc(i: Insn) -> bool {
+	return i.kind == .Jr && i.w & 0xfc1fffff == 8 && i.rs != 0
+}
+
+// The code at e, walked up to the next entry `to`, makes no call, does not
+// use $sp, has no jump in a delay slot, and leaves only for outside [from, to): a return or a jump on
+// through a register (plain_jr), or a jump or branch out.
+@(private = "file")
+thunk_body :: proc(r: Rules, img: Image, e, from, to: u32) -> bool {
+	// Its reachable code only: discover would walk every word up to `to`
+	// after a jump through a register.
+	f := func_make(e, to)
+	defer func_free(f)
+	work: [dynamic]u32
+	defer delete(work)
+	append(&work, e)
+	seen: Set
+	defer delete(seen)
+	walk(r, img, f, &work, &seen)
+	for t in f.exits {
+		if from <= t && t <= to {
+			return false // into its own function, or on into the next
+		}
+	}
+	for d in f.delay {
+		if i, ok := f.insns[d]; ok && has_delay(i) {
+			return false // a jump in a delay slot: data
+		}
+	}
+	for _, i in f.insns {
+		if i.kind == .Bad || i.kind == .Call || i.kind == .Jalr || i.kind == .Jr && !plain_jr(i) || uses_sp(i) {
+			return false
+		}
+	}
+	return len(f.insns) > 0
+}
+
+// i names $sp in a register field: rs or rt, or rd in a SPECIAL or MMI
+// instruction. The r5900 decoder does not set Insn.sp; a field that is not a
+// register (a COP1 format) can only make this say yes.
+@(private = "file")
+uses_sp :: proc(i: Insn) -> bool {
+	if i.kind == .Jump || i.kind == .Call {
+		return false
+	}
+	op := i.w >> 26
+	return i.w >> 21 & 31 == 29 || i.w >> 16 & 31 == 29 || (op == 0 || op == 0x1c) && i.w >> 11 & 31 == 29
 }
 
 // e follows a `jr $ra`, a `j` or a `b` back to a loop (with its delay slot
