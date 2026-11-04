@@ -232,7 +232,10 @@ sd_proc_batch_ex :: proc(batch, returns, count, mask: u32) -> u32 {
 					n += 1
 				}
 			}
-			n -= 1 // retail's: the last slot is written again below
+			// Retail's: the last slot is written again below. With no
+			// voice of a set in the mask and n 0, n wraps and the write
+			// lands at returns - 4; retail has no guard and does the same.
+			n -= 1
 		} else {
 			ok: bool
 			v, ok = sd_batch_one(func, entry, value, returns)
