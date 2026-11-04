@@ -40,8 +40,8 @@ COMPAT_TOP :: 10
 
 // The kinds of call the HLE may not implement. Id and sub per kind:
 // Bios_A/B/C the function number; Syscall the syscall number (as an i32);
-// Sif_Bind the server id; Sif_Rpc the server id and function number, or of
-// a call to no descriptor a bind handed out, its server word and function
+// Sif_Bind the server id; Sif_Rpc the server id and function number (of
+// padman, its command word), or of a call to no descriptor a bind handed out, its server word and function
 // number;
 // Sif_Cmd the command id; Iop_Call an IOP library's name (compat_name) and
 // function number; Iop_Import a library's name no module registered, or

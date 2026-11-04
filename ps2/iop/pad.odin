@@ -3,6 +3,12 @@
 // pad_data frames, of which libpad reads the one with the higher frame
 // counter. pad_update rewrites both every vblank.
 //
+// Command numbers, arguments and result words follow the padman the discs
+// load (module version 0x0422): its RPC handler switches on the command word.
+// A socket's button mask is the wire 0x4f mask its pad would get, so it sets
+// the mode the same way as the wire pad's (ds2_mask_mode): pressures only
+// once a game asks for them, as on a DualShock 2.
+//
 // Player 1 is port 0 slot 0. With more than one player a multitap sits in
 // port 0 and players 2..4 are its slots 1..3, which the game sees once it
 // has opened the tap (mtap port 2).
@@ -34,6 +40,11 @@ pads: [MAX_PLAYERS]Pad
 @(private = "file")
 pad_area: [2][4]u32 // per port and slot; 0 = closed
 
+// Per port and slot: the 0x4f mask of poll bytes (SetButtonMask), reset to
+// the analog set on Open.
+@(private = "file")
+btn_mask: [2][4]u32
+
 // Actuator align per player (SetActAlign): which actuator each byte of a
 // SetActDirect drives, 0xff for none.
 @(private = "file")
@@ -46,7 +57,6 @@ mtap: struct {
 }
 
 PAD_STATE_STABLE :: 6
-PAD_MODE_DUALSHOCK :: 0x73 // id 7, 3 halfwords of data
 
 // pad_data field offsets, as read by libpad (its frame pick, GetState and
 // InfoMode).
@@ -79,6 +89,7 @@ pad_init :: proc() {
 	for &p in pads {p.axes = {0x80, 0x80, 0x80, 0x80}}
 	pads[0].connected = true
 	for &a in act_align {a = 0xff}
+	for &m in btn_mask {m = DS2_RESPONSE_ANALOG}
 	ds2_reset()
 }
 
@@ -98,6 +109,13 @@ pad_player :: proc(port, slot: u32) -> int {
 	return int(slot)
 }
 
+// Player on an open port and slot, or -1.
+@(private = "file")
+pad_open :: proc(port, slot: u32) -> int {
+	if port >= 2 || slot >= 4 || pad_area[port][slot] == 0 {return -1}
+	return pad_player(port, slot)
+}
+
 // Writes the current host input into every open pad area, and the
 // multitap connection table.
 pad_update :: proc() {
@@ -108,7 +126,7 @@ pad_update :: proc() {
 			if addr == 0 {continue}
 			player := pad_player(port, slot)
 			for half in u32(0) ..< 2 {
-				pad_fill(mem.ram_slice(addr + half * 128, 128), pad_frame * 2 + half, player)
+				pad_fill(mem.ram_slice(addr + half * 128, 128), pad_frame * 2 + half, player, btn_mask[port][slot])
 			}
 		}
 	}
@@ -121,9 +139,12 @@ pad_update :: proc() {
 }
 
 // An empty socket keeps its frame counter running with state 0
-// (disconnected), so a pad pulled out mid-game reads as gone.
+// (disconnected), so a pad pulled out mid-game reads as gone. The mode the
+// mask sets decides the data: the buttons, then the sticks unless digital,
+// then the pressures only in DualShock 2 mode; the length is the mode's
+// halfwords and the 2 bytes before them.
 @(private = "file")
-pad_fill :: proc(p: []u8, frame: u32, player: int) {
+pad_fill :: proc(p: []u8, frame: u32, player: int, mask: u32) {
 	w32 :: proc(p: []u8, o: int, v: u32) {(^u32)(&p[o])^ = v}
 	w16 :: proc(p: []u8, o: int, v: u16) {(^u16)(&p[o])^ = v}
 	if player < 0 {
@@ -132,24 +153,26 @@ pad_fill :: proc(p: []u8, frame: u32, player: int) {
 		return
 	}
 	pad := &pads[player]
+	mode := ds2_mask_mode(mask)
+	analog := mode != DS2_DIGITAL
 	d := p[PD_DATA:][:32]
 	d[0] = 0
-	d[1] = PAD_MODE_DUALSHOCK
+	d[1] = mode
 	w16(d, 2, ~transmute(u16)pad.buttons)
-	copy(d[4:8], pad.axes[:])
-	for b, i in PRESSURE {d[8 + i] = 0xff if b in pad.buttons else 0}
+	copy(d[4:8], pad.axes[:] if analog else []u8{0, 0, 0, 0})
+	for b, i in PRESSURE {d[8 + i] = 0xff if mode == DS2_DUALSHOCK2 && b in pad.buttons else 0}
 	// DualShock 2 motors: small (on/off) and large (8-bit speed).
 	copy(p[PD_ACT_DATA:][:8], []u8{1, 0, 0, 1, 1, 1, 1, 10})
 	w16(p, PD_MODE_TABLE + 0, 4)
 	w16(p, PD_MODE_TABLE + 2, 7)
 	w32(p, PD_FRAME, frame)
-	w32(p, PD_LENGTH, 20)
+	w32(p, PD_LENGTH, 2 + 2 * u32(mode & 0xf))
 	p[PD_MODE_CONFIG] = 2 // 1 = no mode info yet, 2+ = modes and actuators known
-	p[PD_MODE_CUR_ID] = PAD_MODE_DUALSHOCK
+	p[PD_MODE_CUR_ID] = mode
 	p[PD_MODEL] = 3 // DualShock 2
 	p[PD_READY] = 1
 	p[PD_NR_MODES] = 2
-	p[PD_MODE_CUR_OFFS] = 1
+	p[PD_MODE_CUR_OFFS] = 1 if analog else 0 // in the mode table
 	p[PD_NR_ACTS] = 2
 	p[PD_NR_ACT_COMB] = 0
 	p[PD_STATE] = PAD_STATE_STABLE
@@ -157,8 +180,10 @@ pad_fill :: proc(p: []u8, frame: u32, player: int) {
 	p[PD_OK] = 1
 }
 
-// padman: the command is the first word of the request, the result goes in
-// the fourth word of the reply.
+// padman: the command is the first word of the request; the result word
+// depends on the command, the fourth for most.
+PADMAN_SID :: 0x80000100
+
 @(private)
 padman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
@@ -168,6 +193,7 @@ padman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		if cpu.debug >= 1 {fmt.eprintfln("pad: open port %d slot %d data %08x", w[1], w[2], w[4])}
 		if w[1] < 2 && w[2] < 4 {
 			pad_area[w[1]][w[2]] = w[4]
+			btn_mask[w[1]][w[2]] = DS2_RESPONSE_ANALOG
 			pad_update()
 		}
 		w[3] = 1
@@ -197,9 +223,23 @@ padman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 			case 1: pad.large = b[i]
 			}
 		}
+	// GetButtonMask {cmd, port, slot}: what the pad answered wire 0x41 at
+	// open, which a DualShock 2 in analog mode answers with every byte.
+	case 0x09: w[3] = DS2_RESPONSE_DUALSHOCK2 if pad_open(w[1], w[2]) >= 0 else 0
+	case 0x0a: // SetButtonMask {cmd, port, slot, mask}: a mask of the 12 pressures, sent as 0x4f's after the 6 bytes before them
+		ok := pad_open(w[1], w[2]) >= 0
+		if ok {btn_mask[w[1]][w[2]] = w[3] << 6 | DS2_RESPONSE_ANALOG}
+		w[4] = 1 if ok else 0
+	// SetVref {cmd, port, slot, u8[12]}: the pressure levels, which change
+	// nothing here, where a pressure is 0 or 0xff.
+	case 0x0b: w[7] = 1 if pad_open(w[1], w[2]) >= 0 else 0
+	case 0x0c: w[3] = 2 // GetPortMax
+	case 0x0d: // GetSlotMax {cmd, port}: the multitap's 4 once libmtap opened it
+		w[3] = 4 if w[1] == 0 && tap_present() && mtap.open[2] else 1
 	case 0x12: w[3] = 0x400 // GetModuleVersion
 	case:
-		fmt.eprintfln("pad: unhandled command %08x", cmd)
+		// The command word is padman's function: the row's function number.
+		if !core.compat_unknown(.Sif_Rpc, PADMAN_SID, sub = cmd) {fmt.eprintfln("pad: unhandled command %08x", cmd)}
 		w[3] = 0
 	}
 	return true
@@ -228,6 +268,7 @@ mtap_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 // Emulated state, saved and restored by snapshots (snap.odin).
 pad_snap :: proc() {
 	core.snap_add(&pad_area)
+	core.snap_add(&btn_mask)
 	core.snap_add(&act_align)
 	core.snap_add(&mtap)
 	core.snap_add(&pad_frame)

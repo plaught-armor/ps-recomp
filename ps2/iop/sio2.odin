@@ -128,9 +128,10 @@ DS2_ANALOG :: 0x73
 DS2_DUALSHOCK2 :: 0x79
 DS2_CONFIG :: 0xf3
 // 0x4f's mask of the poll bytes the pad sends (PadTypes.h ResponseBytes):
-// the analog set, the DualShock 2 set with pressures; any other is digital.
-@(private = "file") DS2_RESPONSE_ANALOG :: 0x3f
-@(private = "file") DS2_RESPONSE_DUALSHOCK2 :: 0x3ffff
+// the analog set, the DualShock 2 set with pressures; any other is digital
+// (ds2_mask_mode).
+DS2_RESPONSE_ANALOG :: 0x3f
+DS2_RESPONSE_DUALSHOCK2 :: 0x3ffff
 // Motor map entries (0x4d): which motor a poll argument byte drives.
 @(private = "file") DS2_MOTOR_SMALL :: 0x00
 @(private = "file") DS2_MOTOR_LARGE :: 0x01
@@ -146,6 +147,17 @@ ds2: struct {
 	cmd_config:    bool, // whether it came in config mode
 	response:      u32, // 0x4f's mask
 	motor_map:     [6]u8,
+}
+
+// The mode a 0x4f mask of poll bytes sets, after PCSX2. The HLE padman's
+// SetButtonMask (pad.odin) sends its mask through here as well, so the two
+// pads agree.
+ds2_mask_mode :: proc(mask: u32) -> u8 {
+	switch mask {
+	case DS2_RESPONSE_ANALOG: return DS2_ANALOG
+	case DS2_RESPONSE_DUALSHOCK2: return DS2_DUALSHOCK2
+	}
+	return DS2_DIGITAL
 }
 
 ds2_reset :: proc() {
@@ -225,11 +237,8 @@ ds2_byte :: proc(i: int, tx: u8) -> u8 {
 			d.response = d.response &~ (0xff << (8 * u32(i - 3))) | u32(tx) << (8 * u32(i - 3))
 		case 5:
 			d.response = d.response & 0xffff | u32(tx) << 16
-			switch d.response {
-			case DS2_RESPONSE_ANALOG: d.mode, d.analog_light = DS2_ANALOG, 1
-			case DS2_RESPONSE_DUALSHOCK2: d.mode, d.analog_light = DS2_DUALSHOCK2, 1
-			case: d.mode, d.analog_light = DS2_DIGITAL, 0
-			}
+			d.mode = ds2_mask_mode(d.response)
+			d.analog_light = 0 if d.mode == DS2_DIGITAL else 1
 		case 8:
 			return 0x5a
 		}

@@ -103,7 +103,7 @@ sif_init :: proc() {
 	sif.servers[0x8000059c] = cdvd_ready_server
 	sif.servers[0x80000003] = iop_heap_server
 	sif.servers[0x80000400] = mcserv_server
-	sif.servers[0x80000100] = padman_server
+	sif.servers[PADMAN_SID] = padman_server
 	sif.servers[0x80000101] = padman_server
 	sif.servers[0x80000900] = mtap_server
 	sif.servers[SDR_SID] = sdr_server

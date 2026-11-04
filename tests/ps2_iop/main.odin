@@ -86,6 +86,13 @@
 // reads its path at 0x20 and gets a 0x20 record; 0x128 searches the first
 // layer; any nonzero layer word searches the second; a miss writes nothing.
 //
+// padman: GetButtonMask, SetButtonMask, SetVref, GetPortMax and GetSlotMax
+// answer in the result word each uses, 0 for a socket not open; a button
+// mask sets the pad data's mode as the wire pad's 0x4f does: pressures and
+// length 20 for the full mask, analog without them, digital for a partial
+// one, back to analog on Open. GetSlotMax is 4 once the multitap is open.
+// An unknown command is a row answered 0.
+//
 // sdrdrv: a user command handler's slot, range and previous handler; an
 // EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
 //
@@ -197,6 +204,7 @@ game :: proc(_: rawptr) {
 	test_sio2_lock_undo_held()
 	test_sio2_stat()
 	test_ds2()
+	test_padman()
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
@@ -1758,6 +1766,86 @@ pad_frame :: proc(cmd: u8, args: []u8 = nil, n := 21) -> []u8 {
 all_ff :: proc(b: []u8) -> bool {
 	for x in b {if x != 0xff {return false}}
 	return true
+}
+
+// padman's commands 0x09..0x0d on a pad area in EE RAM, and the mode a mask
+// sets against the wire pad's 0x4f.
+test_padman :: proc() {
+	fresh()
+	iop.pad_init()
+	defer iop.pad_init()
+	AREA :: 0x00100000
+	SID :: iop.PADMAN_SID
+	buf: [128]u8
+	w := ([^]u32)(&buf)
+	cmd :: proc(buf: []u8, words: ..u32) {
+		for &b in buf {b = 0}
+		w := ([^]u32)(raw_data(buf))
+		for x, i in words {w[i] = x}
+		iop.sif.servers[iop.PADMAN_SID](1, buf, 128)
+	}
+	cmd(buf[:], 0x09, 0, 0)
+	check(w[3] == 0, "padman 0x09: a socket not open, mask 0")
+	cmd(buf[:], 0x0a, 0, 0, 0xfff)
+	check(w[4] == 0, "padman 0x0a: a socket not open, 0")
+	cmd(buf[:], 0x0b, 0, 0)
+	check(w[7] == 0, "padman 0x0b: a socket not open, 0")
+
+	iop.pads[0].buttons = {.Cross}
+	cmd(buf[:], 0x01, 0, 0, 0, AREA)
+	d := mem.ram_slice(AREA, 256)
+	length :: proc(d: []u8) -> u32 {return endian.unchecked_get_u32le(d[0x60:])}
+	check(d[1] == iop.DS2_ANALOG && length(d) == 8 && d[8 + 6] == 0 && d[0x65] == iop.DS2_ANALOG && d[0x69] == 1, "padman: open, analog, length 8, no pressures")
+	cmd(buf[:], 0x09, 0, 0)
+	check(w[3] == iop.DS2_RESPONSE_DUALSHOCK2, "padman 0x09: an open DualShock 2, 0x3ffff")
+	cmd(buf[:], 0x0a, 0, 0, 0xfff)
+	iop.pad_update()
+	check(w[4] == 1 && d[1] == iop.DS2_DUALSHOCK2 && length(d) == 20 && d[8 + 6] == 0xff && d[8 + 7] == 0 && d[0x65] == iop.DS2_DUALSHOCK2, "padman 0x0a: 0xfff, DualShock 2, length 20, cross's pressure")
+	check(d[128 + 1] == iop.DS2_DUALSHOCK2 && length(d[128:]) == 20, "padman 0x0a: both frames")
+	cmd(buf[:], 0x0a, 0, 0, 0)
+	iop.pad_update()
+	check(w[4] == 1 && d[1] == iop.DS2_ANALOG && length(d) == 8 && d[8 + 6] == 0, "padman 0x0a: 0, analog without pressures")
+	cmd(buf[:], 0x0a, 0, 0, 1)
+	iop.pad_update()
+	check(w[4] == 1 && d[1] == iop.DS2_DIGITAL && length(d) == 4 && d[4] == 0 && d[0x69] == 0, "padman 0x0a: a partial mask, digital, no sticks")
+	cmd(buf[:], 0x01, 0, 0, 0, AREA)
+	check(d[1] == iop.DS2_ANALOG && length(d) == 8, "padman: open sets the analog mask again")
+	cmd(buf[:], 0x0b, 0, 0, 0x02020202, 0x02020202, 0x02020202)
+	check(w[7] == 1, "padman 0x0b: SetVref, 1")
+	cmd(buf[:], 0x0c)
+	check(w[3] == 2, "padman 0x0c: 2 ports")
+	cmd(buf[:], 0x0d, 0)
+	check(w[3] == 1, "padman 0x0d: 1 slot without a tap")
+	iop.pads[1].connected = true
+	cmd(buf[:], 0x0d, 0)
+	check(w[3] == 1, "padman 0x0d: 1 slot while libmtap has not opened the tap")
+	mw := ([^]u32)(&buf)
+	for &b in buf {b = 0}
+	mw[0] = 2
+	iop.sif.servers[0x80000900](1, buf[:], 128)
+	cmd(buf[:], 0x0d, 0)
+	check(w[3] == 4, "padman 0x0d: 4 slots once the tap is open")
+	cmd(buf[:], 0x0d, 1)
+	check(w[3] == 1, "padman 0x0d: port 1, 1 slot")
+	iop.pads[1].connected = false
+	for &b in buf {b = 0}
+	mw[0] = 2
+	iop.sif.servers[0x80000900](2, buf[:], 128)
+
+	// The HLE pad and the wire pad: one mode for each mask.
+	for m in ([3]u32{iop.DS2_RESPONSE_ANALOG, iop.DS2_RESPONSE_DUALSHOCK2, 0x7f}) {
+		iop.ds2_reset()
+		_, _ = xfer({0}, pad_frame(0x4f, {u8(m), u8(m >> 8), u8(m >> 16)}, n = 9))
+		cmd(buf[:], 0x0a, 0, 0, m >> 6)
+		iop.pad_update()
+		check(iop.ds2.mode == iop.ds2_mask_mode(m) && d[1] == iop.ds2.mode, fmt.tprintf("padman: mask %x, the wire pad's mode", m))
+	}
+
+	key := core.Compat_Key{.Sif_Rpc, SID, 0x30}
+	clear(&core.compat.calls)
+	cmd(buf[:], 0x30)
+	check(w[3] == 0 && core.compat.calls[key].n == 1, "padman: an unknown command is a row, 0")
+	cmd(buf[:], 0x0e, 0, 0)
 }
 
 // stat6c as PCSX2 builds it: the ports a pad frame opened, the MISSING bits
