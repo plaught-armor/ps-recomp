@@ -154,6 +154,28 @@ the IOP on PS2; psx/cpu/cpu.odin report_once), with `PS_DUMP_HASH=1` too.
 A run that interprets many functions writes many: about 545 MB in a
 3600-frame PS2 run.
 
+## The wasm C maths functions
+
+The `wasi_wasm32` build has no C library, so `core/libm_wasi.odin` supplies
+the maths functions the tree calls (`sinf`, `cosf`, `expf`, `sin`, `pow`,
+`exp2`, `fmax`, `fmin`), ported from glibc so results match a glibc host bit
+for bit. `tests/libm_wasi` checks them: build it for the host and for
+`wasi_wasm32`, and `tests/libm_wasi/run.mjs` runs both, the wasm under Node
+on `web/wasi.js`, and compares. Run it after any change to
+`core/libm_wasi.odin`, on a glibc host; it needs Node 24 or newer.
+
+```sh
+odin build tests/libm_wasi -collection:ps=. -o:speed -out:libm_host
+odin build tests/libm_wasi -collection:ps=. -o:speed -target:wasi_wasm32 -out:libm_wasi.wasm
+node tests/libm_wasi/run.mjs libm_host libm_wasi.wasm
+```
+
+It covers every `f32` input of `sinf`, `cosf` and `expf` (3 x 2^32
+calls, 2 to 3 minutes on 8 cores), `sin` and `pow(2, y)` on the inputs the
+tree passes them, and `pow` and `exp2` on 1310720 random inputs. It prints
+each input whose result differs (the first 10000) and their count, and
+exits 1 if any does; `--only s|c|e|domain` runs one part.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
