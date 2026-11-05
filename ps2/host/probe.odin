@@ -95,6 +95,7 @@ probe_input :: proc() {
 @(private)
 probe_frame :: proc(w, h: int) {
 	if w > 0 && h > 0 {frame += 1}
+	core.compat_probe_beat()
 	if vblank - probe.at < core.COMPAT_PROBE_RUN {return}
 	if probe.branch == 0 {
 		if probe.none == nil {probe.none = make([]u8, len(mem.ram), core.host_allocator)}

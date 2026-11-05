@@ -383,7 +383,9 @@ compat_disc :: proc(image: string, frames, wait: u64, keep: bool) -> (row: Row, 
 
 // Wait for the child p to end, reading its vblank count from progress each
 // COMPAT_POLL. hang: the count stayed at 0 (no vblank yet) for boot, or at
-// any later value for stall, so p was killed (and waited for).
+// any later value for stall, so p was killed (and waited for). Any new
+// value is progress, a compat probe's heartbeat included
+// (core.compat_probe_beat).
 @(private = "file")
 compat_wait :: proc(p: os.Process, progress: ^os.File, boot, stall: time.Duration) -> (state: os.Process_State, err: os.Error, hang: bool) {
 	last: u64

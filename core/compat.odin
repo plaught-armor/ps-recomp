@@ -302,8 +302,9 @@ compat: struct {
 	// entry pcs and IRX loads since the last sample, whether that sample was
 	// quiet, the vblank the next probe is due, whether one runs now (the
 	// host's branches count nothing), the interpreter count and host file
-	// writes it set aside, and the last deaf probe's
-	// vblank (0: the last probe was not deaf).
+	// writes it set aside, the last deaf probe's vblank (0: the last probe
+	// was not deaf), and the vblanks of every branch so far
+	// (compat_probe_beat).
 	probe_every:    u64,
 	quiet_new:      u64,
 	quiet_loads:    u64,
@@ -313,6 +314,7 @@ compat: struct {
 	probe_insns:    u64,
 	probe_writes:   bool,
 	deaf_at:        u64,
+	probe_beats:    u64,
 	reported:      bool,
 	// COMPAT_PROGRESS, open under COMPAT; nil without it.
 	progress:      ^os.File,
@@ -630,6 +632,21 @@ compat_probe_begin :: proc() {
 	compat.probe_writes = host_writes_off
 	host_writes_off = true
 	learn_hold()
+}
+
+// A vblank of a probe's branch, which compat_vblank does not count: every
+// COMPAT_PROGRESS_EVERY of them a heartbeat goes to COMPAT_PROGRESS, the
+// top bit set over the branch vblanks so far, a value never written
+// before. The parent takes any new value as progress (play/compat.odin
+// compat_wait), so a probe, which runs no vblank of its own for up to
+// len(COMPAT_PROBE_BUTTONS) * COMPAT_PROBE_RUN, is not a hang.
+compat_probe_beat :: proc() {
+	compat.probe_beats += 1
+	if compat.progress != nil && compat.probe_beats % COMPAT_PROGRESS_EVERY == 0 {
+		b: [8]u8
+		endian.unchecked_put_u64le(b[:], 1 << 63 | compat.probe_beats)
+		_, _ = os.write_at(compat.progress, b[:], 0)
+	}
 }
 
 // The probe at sample vblank n ended, the state it saved loaded again:

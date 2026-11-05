@@ -25,7 +25,8 @@
 //   changes is frozen only. Then probes (in process): a sample with a new
 //   interpreter entry pc or an IRX load is not quiet; PS_COMPAT_PROBE
 //   vblanks into quiet a probe is due, and every PS_COMPAT_PROBE after;
-//   a probe counts nothing and holds learn and card writes; two deaf probes
+//   a probe counts nothing and holds learn and card writes, and its
+//   branches write a heartbeat to COMPAT_PROGRESS; two deaf probes
 //   in a row are a stuck stretch, one is not, and a probe a button moved
 //   more than core.COMPAT_DEAF_BYTES for ends it.
 package main
@@ -347,6 +348,30 @@ test_probe :: proc(n: ^u64, ram: []u8) {
 	core.learn.cpus = {.Ee}
 	core.compat_probe_begin()
 	check(name, core.compat.probing && core.learn.cpus == {} && core.host_writes_off && !core.compat_sample_due(S), "held while probing")
+	// A branch's vblanks: a heartbeat to COMPAT_PROGRESS every
+	// COMPAT_PROGRESS_EVERY, each a value not written before.
+	{
+		dir, derr := os.make_directory_temp("", "ps_compat_beat_*", context.temp_allocator)
+		check(name, derr == nil, "beat: temp directory")
+		path := fmt.tprintf("%s/progress", dir)
+		f, ferr := os.open(path, {.Read, .Write, .Create, .Trunc}, os.Permissions_Default_File)
+		check(name, ferr == nil, "beat: progress file")
+		core.compat.progress = f
+		seen: [dynamic]u64
+		defer delete(seen)
+		for i in 1 ..= 3 * core.COMPAT_PROGRESS_EVERY {
+			core.compat_probe_beat()
+			if i % core.COMPAT_PROGRESS_EVERY != 0 {continue}
+			b: [8]u8
+			_, _ = os.read_at(f, b[:], 0)
+			v := u64(b[0]) | u64(b[1]) << 8 | u64(b[2]) << 16 | u64(b[3]) << 24 | u64(b[4]) << 32 | u64(b[5]) << 40 | u64(b[6]) << 48 | u64(b[7]) << 56
+			check(name, v >> 63 == 1 && !slice.contains(seen[:], v), fmt.tprintf("beat %d: %x", i, v))
+			append(&seen, v)
+		}
+		core.compat.progress = nil
+		os.close(f)
+		os.remove_all(dir)
+	}
 	core.compat_probe_end(due[0], deaf)
 	check(name, !core.compat.probing && core.learn.cpus == {.Ee} && !core.host_writes_off, "set back after")
 	core.learn.cpus = {}
