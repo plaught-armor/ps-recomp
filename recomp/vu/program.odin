@@ -20,6 +20,7 @@
 package vu
 
 import "core:fmt"
+import "core:hash/xxhash"
 import "core:os"
 import "core:slice"
 import "core:strings"
@@ -562,12 +563,83 @@ ranges :: proc(ext: []bool) -> [dynamic][2]int {
 	return rs
 }
 
+// A capture file's records (ps2/vu/capture.odin), deduped: the images by
+// hash, each the offset of its micro memory in the file's data, and the
+// entries by {hash, pc}, kept only for an image the file holds. The file
+// is appended to and never rewritten, so a run stopped mid-write leaves its
+// last record cut short: the file ends there. False, after a message, for a
+// record of no kind the format has.
+@(private)
+Capture :: struct {
+	images:  map[u64]int,
+	entries: map[u64][dynamic]u32, // each image's pcs, in file order
+	seen:    map[[2]u64]bool,
+}
+
+@(private)
+capture_read :: proc(data: []u8, path: string, unit: Unit) -> (c: Capture, ok: bool) {
+	mask := MASK[unit]
+	image := int(mask) + 8
+	pending: [dynamic][2]u64
+	pending.allocator = context.temp_allocator
+	loop: for pos := 0; pos < len(data); {
+		size := 9
+		switch data[pos] {
+		case 'I': size += image
+		case 'E': size += 4
+		case:
+			fmt.eprintfln("vu: %s: bad record %02x at %d", path, data[pos], pos)
+			return {}, false
+		}
+		if pos + size > len(data) {
+			fmt.eprintfln("vu: %s: last record at %d cut short; the file ends there", path, pos)
+			break loop
+		}
+		hash := u64(endian_u64(data[pos + 1:]))
+		if data[pos] == 'I' {
+			if hash not_in c.images {c.images[hash] = pos + 9}
+		} else {
+			append(&pending, [2]u64{hash, u64(endian_u32(data[pos + 9:]) & mask)})
+		}
+		pos += size
+	}
+	for key in pending {
+		if key[0] not_in c.images || key in c.seen {continue}
+		c.seen[key] = true
+		if key[0] not_in c.entries {c.entries[key[0]] = {}}
+		append(&c.entries[key[0]], u32(key[1]))
+	}
+	return c, true
+}
+
+// What a unit's VU0_CAPTURE or VU1_CAPTURE file gives the recompiler: the
+// XXH3-64 of its entries ({hash, pc}, the image's hash naming its micro
+// memory), sorted. Records repeated by later runs leave it as it was; a new
+// entry, into a new image or an old one, changes it. False for a file that
+// adds no programs: missing, with no entry, or one load_capture rejects
+// (after a message).
+capture_fingerprint :: proc(path: string, unit: Unit) -> (fp: u64, ok: bool) {
+	context.allocator = context.temp_allocator
+	data, err := os.read_entire_file(path, context.allocator)
+	if err == os.General_Error.Not_Exist {return 0, false}
+	if err != nil {
+		fmt.eprintln("vu: cannot read", path, err)
+		return 0, false
+	}
+	c := capture_read(data, path, unit) or_return
+	if len(c.seen) == 0 {return 0, false}
+	keys := make([dynamic][2]u64, 0, len(c.seen))
+	for key in c.seen {append(&keys, key)}
+	slice.sort_by(keys[:], proc(a, b: [2]u64) -> bool {return a[0] < b[0] || a[0] == b[0] && a[1] < b[1]})
+	return u64(xxhash.XXH3_64_default(slice.to_bytes(keys[:]))), true
+}
+
 // Programs from a unit's VU0_CAPTURE or VU1_CAPTURE file
-// (ps2/vu/capture.odin): for each entry into each captured image, the pairs
-// reachable from it. A JR or JALR ends an extent; its targets were captured
-// as entries of their own. Extents with the same pairs at the same addresses
-// compile once. A missing file (ENOENT) adds no programs, so that microcode
-// runs in the interpreter.
+// (ps2/vu/capture.odin, as capture_read reads it): for each entry into
+// each captured image, the pairs reachable from it. A JR or JALR ends an
+// extent; its targets were captured as entries of their own. Extents with
+// the same pairs at the same addresses compile once. A missing file
+// (ENOENT) adds no programs, so that microcode runs in the interpreter.
 @(private)
 load_capture :: proc(progs: ^[dynamic]Prog, path: string, unit: Unit) -> bool {
 	data, err := os.read_entire_file(path, context.allocator)
@@ -581,46 +653,14 @@ load_capture :: proc(progs: ^[dynamic]Prog, path: string, unit: Unit) -> bool {
 	}
 	mask := MASK[unit]
 	image := int(mask) + 8
+	c := capture_read(data, path, unit) or_return
 	images: map[u64][]u32
-	entries: map[u64][dynamic]u32
-	seen: map[[2]u64]bool
-	for pos := 0; pos < len(data); {
-		if pos + 9 > len(data) {
-			fmt.eprintfln("vu: %s: record at %d cut short", path, pos)
-			return false
-		}
-		kind := data[pos]
-		hash := u64(endian_u64(data[pos + 1:]))
-		switch kind {
-		case 'I':
-			if pos + 9 + image > len(data) {
-				fmt.eprintfln("vu: %s: image at %d cut short", path, pos)
-				return false
-			}
-			if hash not_in images {
-				w := make([]u32, image / 4)
-				for &x, k in w {x = endian_u32(data[pos + 9 + k * 4:])}
-				images[hash] = w
-			}
-			pos += 9 + image
-		case 'E':
-			if pos + 13 > len(data) {
-				fmt.eprintfln("vu: %s: entry at %d cut short", path, pos)
-				return false
-			}
-			pc := endian_u32(data[pos + 9:]) & mask
-			key := [2]u64{hash, u64(pc)}
-			if key not_in seen {
-				seen[key] = true
-				if hash not_in entries {entries[hash] = {}}
-				append(&entries[hash], pc)
-			}
-			pos += 13
-		case:
-			fmt.eprintfln("vu: %s: bad record %02x at %d", path, kind, pos)
-			return false
-		}
+	for h, at in c.images {
+		w := make([]u32, image / 4)
+		for &x, k in w {x = endian_u32(data[at + k * 4:])}
+		images[h] = w
 	}
+	entries, seen := c.entries, c.seen
 	hashes := make([dynamic]u64, context.temp_allocator)
 	for h in images {append(&hashes, h)}
 	slice.sort(hashes[:])

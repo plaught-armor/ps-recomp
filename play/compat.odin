@@ -306,7 +306,7 @@ compat_disc :: proc(image: string, frames, wait: u64, keep: bool) -> (row: Row, 
 	// Each compile gets the child's window before its first vblank: a
 	// hung one is stopped, and the child runs without what it makes.
 	stall := time.Duration(wait) * time.Second
-	native := core.env("NATIVE") != "0" && (core.blob_cached(dir) || convert_store(image, dir, COMPAT_BOOT_FACTOR * stall))
+	native := core.env("NATIVE") != "0" && (native_cached(dir) || convert_store(image, dir, COMPAT_BOOT_FACTOR * stall))
 	// The child finds the blob stored and compiles nothing (compat_child).
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
 	learned, learned_ee: string
@@ -367,7 +367,7 @@ compat_disc :: proc(image: string, frames, wait: u64, keep: bool) -> (row: Row, 
 	}
 	// A stored blob the child could not load is removed, and the run
 	// was interpreted.
-	row[.Native] = "yes" if native && core.blob_cached(dir) else "no"
+	row[.Native] = "yes" if native && native_cached(dir) else "no"
 	// The same for the learned blob, whose key the child removes.
 	had := learned != "" && os.exists(core.disc_path(dir, learned_files(learn_cpu).key))
 	had ||= learned_ee != "" && os.exists(core.disc_path(dir, learned_files(.Ee).key))

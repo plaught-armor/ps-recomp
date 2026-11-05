@@ -10,14 +10,22 @@ import "ps:recomp/mips"
 import "ps:recomp/native"
 import "ps:recomp/r3000"
 import "ps:recomp/r5900"
+import "ps:recomp/vu"
 
-// The converter child (`play --convert <disc image> <out>`): the executable
-// SYSTEM.CNF names, compiled to a native blob for this host at out. A
-// failure exits with status 1 after a message (mips.fail), which is why it
-// runs in a child.
-convert :: proc(image, out: string) -> int {
+// The converter child (`play --convert <disc image> <out> <vu0> <vu1>`):
+// the executable SYSTEM.CNF names, compiled to a native blob for this host
+// at out. vu0 and vu1 are a PS2 disc's VU capture files (native_captures),
+// "" for none; with either, the blob holds the VU microprograms too, the
+// captured ones and those of .vutext. A failure exits with status 1 after
+// a message (mips.fail), which is why it runs in a child.
+convert :: proc(image, out, vu0, vu1: string) -> int {
 	o := mips.disc_options(image, "")
 	o.values["native_out"] = out
+	if vu0 != "" || vu1 != "" {
+		o.values["native_vu"] = "true"
+		if vu0 != "" {o.values["vu0_capture"] = vu0}
+		if vu1 != "" {o.values["vu1_capture"] = vu1}
+	}
 	fmt.eprintln("converting", image)
 	switch b := mips.option(o, "backend"); b {
 	case "r3000": r3000.generate(o)
@@ -61,15 +69,44 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 }
 
 // Convert the disc image in a child of this executable and store the blob
-// in the disc directory dir. The child's output goes to stderr as it comes,
+// in the disc directory dir, its key naming the VU captures it was compiled
+// with (native_captures). The child's output goes to stderr as it comes,
 // on a terminal as one line rewritten in place. False, after a message
 // naming the child's last line, when there is no blob. A child still
 // running after deadline (0: none) is stopped (child_blob).
 convert_store :: proc(image, dir: string, deadline: time.Duration) -> bool {
+	set, caps := native_captures(dir)
 	tmp := strings.concatenate({core.disc_path(dir, .Native, context.temp_allocator), ".convert"}, context.temp_allocator)
-	blob := child_blob({"--convert", image, tmp}, tmp, "native code", "conversion", deadline) or_return
+	blob := child_blob({"--convert", image, tmp, caps[0], caps[1]}, tmp, "native code", "conversion", deadline) or_return
 	defer delete(blob)
-	return core.blob_store(dir, blob)
+	return core.blob_store(dir, blob, core.COMMIT, .Native, set)
+}
+
+// Whether the disc directory dir holds a native blob this build can run,
+// compiled with the VU captures dir holds now (native_captures).
+native_cached :: proc(dir: string) -> bool {
+	set, _ := native_captures(dir)
+	return core.blob_cached(dir, core.COMMIT, .Native, set)
+}
+
+// The VU capture files of the disc directory dir (VU_CAPTURE) that add
+// programs, each unit's path or "", and the set the native blob's key names
+// them by: "vu0 <fingerprint> vu1 <fingerprint>", "-" for a unit without
+// one, and "" when neither has one, so a blob compiled without captures
+// keeps its key. A capture that grows by new entries changes its
+// fingerprint, and the blob is compiled again; one that only repeats
+// records does not (vu.capture_fingerprint). Temp allocated.
+native_captures :: proc(dir: string) -> (set: string, caps: [2]string) {
+	fps: [2]string = {"-", "-"}
+	for f, unit in ([2]core.Disc_File{.Vu0_Capture, .Vu1_Capture}) {
+		path := core.disc_path(dir, f, context.temp_allocator)
+		if fp, ok := vu.capture_fingerprint(path, vu.Unit(unit)); ok {
+			caps[unit] = path
+			fps[unit] = fmt.tprintf("%016x", fp)
+		}
+	}
+	if caps[0] == "" && caps[1] == "" {return "", caps}
+	return fmt.tprintf("vu0 %s vu1 %s", fps[0], fps[1]), caps
 }
 
 // Compile the LEARN file at records in a child of this executable (as

@@ -79,6 +79,13 @@
 // - launcher: the launcher's steps, settings, picture, dropped files and
 //   runs (test_launcher), a value cut to its width on a rune boundary
 //   (test_launcher_fit), and play.log's plain lines (test_log_strip).
+// - vu_captures: a PS2 disc's VU capture files name the native blob's key
+//   (play.native_captures): none, or one with no entry, keeps the key of a
+//   blob without captures; a capture with an entry needs a new blob, which
+//   records repeated, or a last record cut short, keep, and a new entry or a
+//   bad record in the middle (that file counts as none) do not. A run with a
+//   VU1 capture converts with it, runs its microprogram natively, and the
+//   next run uses the stored blob (test_vu_captures).
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -220,6 +227,7 @@ main :: proc() {
 	test_line_row()
 	test_library()
 	test_export()
+	test_vu_captures()
 	test_press()
 	test_log_strip()
 	test_launcher_fit()
@@ -765,6 +773,98 @@ run :: proc(name, path: string, status := 0) -> (errs: string, ok: bool) {
 		return errs, false
 	}
 	return errs, true
+}
+
+// A VU1 capture (ps2/vu/capture.odin): an image whose pair at 0 ends the
+// program (E bit, then a NOP delay pair), with an entry at 0 and one at
+// pc, each record whole.
+@(private = "file")
+vu1_capture :: proc(pc: u32 = 0) -> []u8 {
+	micro := make([]u8, 16 * 1024, context.temp_allocator)
+	endian.put_u32(micro[0:], .Little, 0x8000033c) // NOP lower
+	endian.put_u32(micro[4:], .Little, 0x400002ff) // NOP upper, E bit
+	endian.put_u32(micro[8:], .Little, 0x8000033c)
+	endian.put_u32(micro[12:], .Little, 0x000002ff)
+	hash := xxhash.XXH3_64_default(micro)
+	b := make([dynamic]u8, context.temp_allocator)
+	head: [9]u8
+	head[0] = 'I'
+	endian.put_u64(head[1:], .Little, u64(hash))
+	append(&b, ..head[:])
+	append(&b, ..micro)
+	for at in ([2]u32{0, pc}) {
+		e: [13]u8
+		e[0] = 'E'
+		endian.put_u64(e[1:], .Little, u64(hash))
+		endian.put_u32(e[9:], .Little, at)
+		append(&b, ..e[:])
+	}
+	return b[:]
+}
+
+@(private = "file")
+test_vu_captures :: proc() {
+	name :: "vu_captures"
+	path := write(name, ps2_disc())
+	dir := disc_dir(name, path)
+	if dir == "" {
+		return
+	}
+	cap := core.disc_path(dir, .Vu1_Capture, context.temp_allocator)
+	b: [core.NATIVE_HEADER]u8
+	endian.put_u32(b[0:], .Little, core.NATIVE_MAGIC)
+	endian.put_u32(b[4:], .Little, core.NATIVE_VERSION)
+	endian.put_u32(b[8:], .Little, core.NATIVE_ARCH)
+	store :: proc(dir: string, b: []u8) -> bool {
+		set, _ := play.native_captures(dir)
+		return core.blob_store(dir, b, core.COMMIT, .Native, set)
+	}
+	// cached: with the capture file holding data, whether the blob is still
+	// the one to run, and the set naming it.
+	cached :: proc(cap: string, dir: string, data: []u8) -> (bool, string) {
+		_ = os.write_entire_file(cap, data)
+		set, _ := play.native_captures(dir)
+		return play.native_cached(dir), set
+	}
+	if !store(dir, b[:]) || !play.native_cached(dir) {
+		check(name, false, "cannot store the blob")
+		return
+	}
+	set, caps := play.native_captures(dir)
+	check(name, set == "" && caps == [2]string{}, fmt.tprintf("captures with no files: %q %v", set, caps))
+	ok, _ := cached(cap, dir, nil)
+	check(name, ok, "an empty capture changed the key")
+	ok, _ = cached(cap, dir, vu1_capture()[:16 * 1024 + 9])
+	check(name, ok, "a capture with no entry changed the key")
+	one := vu1_capture()
+	ok, set = cached(cap, dir, one)
+	check(name, !ok, "a capture with an entry kept a blob without it")
+	_, caps = play.native_captures(dir)
+	check(name, strings.has_prefix(set, "vu0 - vu1 ") && len(set) == 26 && caps == [2]string{"", cap}, fmt.tprintf("captures: %q %v", set, caps))
+	store(dir, b[:])
+	twice := slice.concatenate([][]u8{one, one}, context.temp_allocator)
+	ok, _ = cached(cap, dir, twice)
+	check(name, ok, "repeated records changed the key")
+	// An image cut in its head and in its micro memory, and an entry.
+	for cut, k in ([3][]u8{one[:5], one[:9 + 100], one[len(one) - 13:][:7]}) {
+		ok, _ = cached(cap, dir, slice.concatenate([][]u8{one, cut}, context.temp_allocator))
+		check(name, ok, fmt.tprintf("last record %d cut short changed the key", k))
+	}
+	ok, _ = cached(cap, dir, slice.concatenate([][]u8{one, vu1_capture(8)}, context.temp_allocator))
+	check(name, !ok, "a new entry kept the key")
+	bad := slice.concatenate([][]u8{one, {'X'}, one}, context.temp_allocator)
+	ok, set = cached(cap, dir, bad)
+	check(name, !ok && set == "", fmt.tprintf("a bad record in the middle: cached %v, set %q", ok, set))
+	// A run converts with the capture and runs its program natively.
+	_ = os.write_entire_file(cap, one)
+	_ = os.remove(core.disc_path(dir, .Native_Key, context.temp_allocator))
+	errs := run(name, path) or_else ""
+	check(name, strings.contains(errs, "converting") && strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("first run:\n%s", errs))
+	key, _ := os.read_entire_file(core.disc_path(dir, .Native_Key, context.temp_allocator), context.temp_allocator)
+	set, _ = play.native_captures(dir)
+	check(name, strings.has_suffix(string(key), fmt.tprintf(" %s\n", set)), fmt.tprintf("key %q for set %q", key, set))
+	errs = run(name, path) or_else ""
+	check(name, !strings.contains(errs, "converting") && strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("second run:\n%s", errs))
 }
 
 // img with label as its volume identifier, space padded.

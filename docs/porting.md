@@ -219,7 +219,15 @@ game to cover. It records both VUs' microcode in the disc's directory
 (`vu0-capture.bin`, `vu1-capture.bin`; ps2/vu/capture.odin). Capturing is
 off by default and is never a saved setting: a captured VU runs only in
 the interpreter, so the run is slower. Each run appends what it saw, so
-the files grow with every run and cover every part played.
+the files grow with every run and cover every part played. A run stopped
+mid-write leaves its last record cut short; readers stop there and keep
+the rest.
+
+The player uses the captures too. Its next run converts the disc again
+with them, so the VU programs (the captured ones and those of
+`.vutext`) run as native code in the player as well. It converts again
+only when a capture gains a program entry it did not have; runs that
+repeat what is already recorded keep the stored code.
 
 Then export the disc again (`play --export`): `local.tsv` names the
 capture files that exist, and `setup.sh` adds each one still there to

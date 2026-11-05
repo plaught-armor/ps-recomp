@@ -180,7 +180,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 | `PS_IRX` | PS2 only. By default, a game's own sound and input/output modules run on an emulated copy of the console's I/O processor. `0` turns that off: each module is answered as loaded, without running it. |
 | `PS_NATIVE` | `0` runs the game through the interpreter instead of as native code. Slower; for checking a bug. |
 | `PS_LEARN` | By default, a PS2 game's I/O processor code (its own modules, loaded from the disc) is recorded in the disc's folder as it runs, and later runs use native code compiled from it. `1` records the code every processor interprets. `0` records nothing and uses no learned code. |
-| `PS_VU_CAPTURE` | PS2 only. `1` records the game's vector unit microcode in the disc's folder as it runs, for a [port](docs/porting.md#vu-microcode) to compile. Off by default: the vector units then run through the interpreter, so the game is slower. Each run adds to the record. |
+| `PS_VU_CAPTURE` | PS2 only. `1` records the game's vector unit microcode in the disc's folder as it runs, for a [port](docs/porting.md#vu-microcode) to compile. Off by default: the vector units then run through the interpreter, so the game is slower. Each run adds to the record. Later runs without it run the recorded microcode as native code. |
 
 `PS_GPU`, `PS_SW`, `PS_SCALE`, `PS_IRX` and `PS_NATIVE` can also be set
 in the [launcher](#the-launcher). It keeps them in `settings.tsv` files:

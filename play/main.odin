@@ -8,9 +8,11 @@
 // The disc image (a .cue sheet, or a single-track .bin or .iso) is all it
 // needs. The first run of a disc compiles the executable SYSTEM.CNF names to
 // a native blob for this host, in a child process (`play --convert <disc
-// image> <out>`), and keeps it in the disc's directory under the user data
-// directory (DATA) with the memory cards; later runs of the same build
-// use it. A dev build (no COMMIT) converts every time. When the conversion
+// image> <out> <vu0> <vu1>`), and keeps it in the disc's directory under
+// the user data directory (DATA) with the memory cards; later runs of the
+// same build use it. A PS2 disc's VU capture files (VU_CAPTURE), once they
+// hold microcode, go into the blob too, which is compiled again when they
+// gain some. A dev build (no COMMIT) converts every time. When the conversion
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
 //
@@ -56,8 +58,8 @@ run :: proc(args: []string) -> int {
 	switch {
 	case len(args) == 1:
 		return launcher(args[0])
-	case len(args) == 4 && args[1] == "--convert":
-		return convert(args[2], args[3])
+	case len(args) == 6 && args[1] == "--convert":
+		return convert(args[2], args[3], args[4], args[5])
 	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
 		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
@@ -253,7 +255,7 @@ play :: proc(image: string) -> int {
 	}
 	// NATIVE=0 runs the game interpreted.
 	native := core.disc_path(dir, .Native)
-	if core.env("NATIVE") == "0" || (!core.blob_cached(dir) && !convert_store(image, dir, 0)) {
+	if core.env("NATIVE") == "0" || (!native_cached(dir) && !convert_store(image, dir, 0)) {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
