@@ -779,8 +779,9 @@ Compat_Name :: struct {
 	client: string `json:"client,omitempty"`,
 }
 
-// The compat line's fields. result: "frames" (FRAMES reached), "fatal" or
-// "exit" (any other exit); frames: the last vblank the host counted;
+// The compat line's fields. result: "frames" (FRAMES reached), "fatal",
+// "watch" (a PRESS condition timed out, the message in fatal) or "exit"
+// (any other exit); frames: the last vblank the host counted;
 // idle_cycles: the cycles skipped with every guest thread waiting (0 where
 // the kernel skips none), so idle_cycles / cycles is the share of the run the
 // game sat idle; cycles_per_insn: what the interpreter charges an
@@ -835,6 +836,7 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 	}
 	switch {
 	case fatal != "": l.result = "fatal"
+	case input.watch_fail != "": l.result, l.fatal = "watch", input.watch_fail
 	case frames != 0 && vblank >= frames: l.result = "frames"
 	case: l.result = "exit"
 	}

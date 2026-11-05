@@ -85,14 +85,16 @@ FATAL_MAX :: 200
 // with no progress: the display never on, nothing drawn on the last frame, or
 // main RAM unchanged from FRAMES/2), fallback (FRAMES reached with progress,
 // but an IOP module's load failed and the HLE stood in for it), exit (the
-// game ended), fatal, crash (no compat line), hang (stopped with no new
-// vblank in a window, COMPAT_WAIT), spawn (no child); status: the child's
+// game ended), fatal, watch (a PRESS condition timed out,
+// core.input_script_frame; the child exits 1), crash (no compat line),
+// hang (stopped with no new vblank in a window, COMPAT_WAIT), spawn (no child); status: the child's
 // exit status (the signal of a crash on POSIX), 1 for stalled as for
 // fatal though the child exits 0, "" for hang and spawn; native: whether the
 // run had the disc's native code; interp_share: interp_insns *
 // cycles_per_insn / cycles, at most 1; entries: the hottest interpreter
 // entries, pc:count, comma separated; unimplemented: name=count, semicolon
-// separated; fatal: the fatal message, else why a run stalled, else a crash's
+// separated; fatal: the fatal message or a watch's timeout message, else
+// why a run stalled, else a crash's
 // last output line ("" for a hang); when: UTC; shown: the vblanks with the
 // display on, whether anything was drawn or not; idle_share: idle_cycles /
 // cycles, the share of the run with every guest thread waiting (0 for a

@@ -4,6 +4,7 @@
 //        play <disc image>
 //        play --compat <disc image | directory> [frames]
 //        play --export <disc image> <directory>
+//        play --ramdiff <dump directory> <frame> <[=]frame>...
 //
 // The disc image (a .cue sheet, or a single-track .bin or .iso) is all it
 // needs. The first run of a disc compiles the executable SYSTEM.CNF names to
@@ -35,6 +36,9 @@
 //
 // --export writes a new repository for the disc, to study and hand-tune the
 // game in, into a directory that is missing or empty (export.odin).
+//
+// --ramdiff prints the main RAM bytes that changed between RAM dumps, to
+// find what a PRESS condition should watch (ramdiff.odin).
 package play
 
 import "core:fmt"
@@ -66,6 +70,8 @@ run :: proc(args: []string) -> int {
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 4 && args[1] == "--export":
 		return export(args[2], args[3])
+	case len(args) >= 5 && args[1] == "--ramdiff":
+		return ramdiff(args[2], args[3:])
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
 		if compat_child() {
 			parent_watch()
@@ -76,6 +82,7 @@ run :: proc(args: []string) -> int {
 	fmt.eprintln("       play <disc image>")
 	fmt.eprintln("       play --compat <disc image | directory> [frames]")
 	fmt.eprintln("       play --export <disc image> <directory>")
+	fmt.eprintln("       play --ramdiff <dump directory> <frame> <[=]frame>...")
 	return 2
 }
 

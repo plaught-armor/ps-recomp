@@ -288,9 +288,10 @@ platform_init :: proc(title: cstring) -> bool {
 	// PRESS=Start@600,Cross@900: the press script both consoles take
 	// (core.input_script_load, buttons and stick directions), each held
 	// SCRIPT_HOLD presents unless "+n" says otherwise; frames are
-	// presents. A bad entry stops
-	// platform_init.
-	core.input_script_load(SCRIPT_HOLD) or_return
+	// presents, and a script's RAM conditions are checked as each is
+	// counted (present). A bad entry stops platform_init, a condition that
+	// times out the run (status 1).
+	core.input_script_load(SCRIPT_HOLD, cpu.RAM_SIZE) or_return
 	if spec := core.env("STICK"); spec != "" {
 		parse_stick_script(spec)
 	}
@@ -738,6 +739,7 @@ render_scale_apply :: proc() -> bool {
 present :: proc() {
 	replay_panel()
 	cpu.presents += 1
+	core.input_script_frame(cpu.presents, cpu.ram[:])
 	core.trace_window()
 	run_poke_script()
 	run_drag_script()
@@ -958,14 +960,15 @@ platform_frame :: proc() {
 	if core.compat_sample_due(cpu.presents) {
 		compat_sample()
 	}
-	if host.quit || core.frames_done(cpu.presents) {
-		thumb_save()
+	if host.quit || core.frames_done(cpu.presents) || core.input_watch_failed() != "" {
+		failed := core.input_watch_failed() != ""
+		if !failed {thumb_save()}
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
 		when core.FLAT {cpu.flat_print()}
 		core.learn_report()
 		core.compat_report()
-		os.exit(0)
+		os.exit(failed ? 1 : 0)
 	}
 	if vblank_hook != nil {
 		vblank_hook()

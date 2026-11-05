@@ -245,6 +245,7 @@ one of these:
 | `fallback` | Reached the count and made progress, but a module on the emulated I/O processor failed to load, and the built-in stand-in took over. |
 | `exit` | The game ended. |
 | `fatal` | The program stopped on a fatal error. |
+| `watch` | A condition in the press script was not met in time; the `fatal` column says which. |
 | `crash` | The run crashed. It ended without writing its result. |
 | `hang` | Stopped because no new vblank came for `PS_COMPAT_WAIT` seconds (default 120), or for 5 times that before the first vblank. A slow game that keeps going is never stopped. |
 | `spawn` | The game's process could not be started. |
@@ -290,6 +291,10 @@ example `Start@600,Cross@900+10,LUp&LRight@1200+300:2`:
 - `+<n>` after the frame holds the entry for `n` frames instead of a short
   tap.
 - `:<n>` at the end presses on player `n` instead of player 1.
+- `?<condition>~<n>` after the frame makes the entry wait for a value in
+  the game's memory, for at most `n` frames, as in
+  `Cross@900?u8[801f2a40]==3~600`. docs/testing.md has the details and
+  `play --ramdiff`, which helps find the address.
 
 ## Report a problem
 

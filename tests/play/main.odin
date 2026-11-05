@@ -229,6 +229,8 @@ main :: proc() {
 	test_export()
 	test_vu_captures()
 	test_press()
+	test_press_watch()
+	test_ramdiff()
 	test_log_strip()
 	test_launcher_fit()
 	test_launcher()
@@ -1245,6 +1247,11 @@ test_line_row :: proc() {
 	l.lit, l.fallback = 1, false
 	play.line_row(&row, l)
 	check(name, row[.Result] == "ok", fmt.tprintf("ok: %v", row))
+	// A PRESS timeout: the child exits 1, which the row's status takes.
+	row = {}
+	msg := "PRESS: Cross@5?u8[80000010]==1~5 timed out at frame 10 (u8[00000010]=0)"
+	play.line_row(&row, core.Compat_Line{result = "watch", fatal = msg, frames = 10, shown = 1, lit = 1})
+	check(name, row[.Result] == "watch" && row[.Fatal] == msg, fmt.tprintf("watch: %v", row))
 }
 
 // play --compat with COMPAT_CARDS unset, keep, and a bad value.
@@ -2355,9 +2362,8 @@ test_press :: proc() {
 	name := "press"
 	defer os.unset_env(core.env_name("PRESS"))
 	load :: proc(spec: string) -> bool {
-		clear(&core.input.script)
 		os.set_env(core.env_name("PRESS"), spec)
-		return core.input_script_load(6)
+		return core.input_script_load(6, 1 << 20)
 	}
 	check(name, load("Cross@10+3,Start@11"), "buttons-only script did not load")
 	for f in u64(0) ..< 20 {
@@ -2384,7 +2390,181 @@ test_press :: proc() {
 	ps := core.input_poll(8)
 	check(name, ps[0].left == {0, -1} && ps[0].right == {0, 1} && ps[1].right == {0, 1} && ps[1].left == {}, fmt.tprintf("overlapping LUp, RDown gives %v", ps))
 	check(name, !load("LRight@5,Sideways@6"), "an unknown name loaded")
-	clear(&core.input.script)
+	core.input_script_clear()
+}
+
+// What the press script gives player 1 at one frame.
+@(private = "file")
+Press_Frame :: struct {
+	buttons: core.Buttons,
+	left:    [2]f32,
+	started: u64,
+}
+
+// PRESS conditions through input_script_load, input_script_frame and
+// input_poll, on a RAM slice the test writes: a wait, a repeat, a wait with
+// no names, the shift of the entries after them in the text, timeouts, and
+// bad entries.
+@(private = "file")
+test_press_watch :: proc() {
+	name := "press_watch"
+	defer os.unset_env(core.env_name("PRESS"))
+	defer core.input_script_clear()
+	RAM :: 0x100
+	// The script run frames 0 ..< n, `polls` input_polls a frame, with
+	// ram[at] = v from frame `from` on (before it 0 for "pokes" given).
+	Poke :: struct {
+		from: u64,
+		at:   int,
+		v:    u8,
+	}
+	run :: proc(spec: string, n: u64, pokes: []Poke, polls := 1) -> (fs: [dynamic]Press_Frame, ok: bool) {
+		os.set_env(core.env_name("PRESS"), spec)
+		core.input_script_load(2, RAM) or_return
+		ram: [RAM]u8
+		fs = make([dynamic]Press_Frame, context.temp_allocator)
+		for f in u64(0) ..< n {
+			for p in pokes {
+				if f == p.from {
+					ram[p.at] = p.v
+				}
+			}
+			core.input_script_frame(f, ram[:])
+			p: core.Player_Input
+			for _ in 0 ..< polls {
+				p = core.input_poll(f)[0]
+			}
+			append(&fs, Press_Frame{p.buttons, p.left, core.input.script_started})
+		}
+		return fs, true
+	}
+	// The frames at which fs has buttons b (or the left stick at left).
+	at :: proc(fs: []Press_Frame, b: core.Buttons, left := [2]f32{}) -> []u64 {
+		out := make([dynamic]u64, context.temp_allocator)
+		for f, i in fs {
+			if b != {} && b <= f.buttons || left != {} && f.left == left {
+				append(&out, u64(i))
+			}
+		}
+		return out[:]
+	}
+	same :: proc(a: []u64, b: ..u64) -> bool {
+		return slice.equal(a, b)
+	}
+
+	// A wait from 10, met at 14: Cross pressed at 14. Circle and Square,
+	// after it in the text, move 4 later (Square to 8, already past, so it
+	// never presses); Start, before it, does not move.
+	fs, ok := run("Start@3,Cross@10?u8[80000010]==3~20,Circle@15,Square@4", 24, {{14, 0x10, 3}})
+	check(name, ok, "wait script did not load")
+	check(name, same(at(fs[:], {.Start}), 3, 4), fmt.tprint("wait: Start at", at(fs[:], {.Start})))
+	check(name, same(at(fs[:], {.Cross}), 14, 15), fmt.tprint("wait: Cross at", at(fs[:], {.Cross})))
+	check(name, same(at(fs[:], {.Circle}), 19, 20), fmt.tprint("wait: Circle at", at(fs[:], {.Circle})))
+	check(name, len(at(fs[:], {.Square})) == 0, fmt.tprint("wait: Square at", at(fs[:], {.Square})))
+	check(name, fs[13].started == 1 && fs[14].started == 3, fmt.tprint("wait: started", fs[13].started, fs[14].started))
+	check(name, core.input_watch_failed() == "", core.input_watch_failed())
+
+	// A repeat from 5 every 4: LUp at 5 and 9 while the byte is 2, none at
+	// 13 where it is 0; Cross moves 8 later, to 14.
+	spec := "LUp@5*4?u8[80000010]==0~40,Cross@6"
+	pokes := []Poke{{0, 0x10, 2}, {13, 0x10, 0}}
+	fs, ok = run(spec, 20, pokes)
+	check(name, ok, "repeat script did not load")
+	check(name, same(at(fs[:], {}, {0, -1}), 5, 6, 9, 10), fmt.tprint("repeat: LUp at", at(fs[:], {}, {0, -1})))
+	check(name, same(at(fs[:], {.Cross}), 14, 15), fmt.tprint("repeat: Cross at", at(fs[:], {.Cross})))
+	check(name, fs[12].started == 2 && fs[14].started == 3, fmt.tprint("repeat: started", fs[12].started, fs[14].started))
+	// The same with three input_polls a frame.
+	fs3, _ := run(spec, 20, pokes, 3)
+	check(name, slice.equal(fs[:], fs3[:]), "three polls a frame press differently from one")
+
+	// A wait with no names, met at 7: Cross moves from 4 to 8, and the wait
+	// is not a started press.
+	fs, ok = run("@3?u16[80000012]!=0~10,Cross@4", 12, {{7, 0x13, 1}})
+	check(name, ok, "a wait with no names did not load")
+	check(name, same(at(fs[:], {.Cross}), 8, 9), fmt.tprint("gate: Cross at", at(fs[:], {.Cross})))
+	check(name, fs[7].started == 0 && fs[8].started == 1, fmt.tprint("gate: started", fs[7].started, fs[8].started))
+
+	// Timeouts: a wait at 5 + 6, the message naming the entry and the value
+	// read; a repeat at its last check, 10, after two presses. Nothing after
+	// a timeout presses.
+	fs, ok = run("Cross@5?u32[80000014]==0x01020304~6,Start@6", 16, {{0, 0x14, 9}})
+	check(name, ok, "timeout script did not load")
+	want := "PRESS: Cross@5?u32[80000014]==0x01020304~6 timed out at frame 11 (u32[00000014]=9)"
+	check(name, core.input_watch_failed() == want, fmt.tprintf("timeout: %q", core.input_watch_failed()))
+	check(name, len(at(fs[:], {.Cross})) == 0 && len(at(fs[:], {.Start})) == 0, "timeout: a press after it")
+	fs, ok = run("LUp@0*5?u8[80000010]==1~10", 16, {})
+	fail := core.input_watch_failed()
+	check(name, ok && strings.contains(fail, "LUp@0*5?u8[80000010]==1~10 timed out at frame 10 "), fmt.tprintf("repeat timeout: %q", fail))
+	check(name, same(at(fs[:], {}, {0, -1}), 0, 1, 5, 6), fmt.tprint("repeat timeout: LUp at", at(fs[:], {}, {0, -1})))
+	// A repeat whose timeout, 30, is not one of its steps (0, 20, 40):
+	// RAM is read at 30 too, the byte is 0 from 25, so it ends at 30 and
+	// Cross moves from 1 to 31.
+	fs, ok = run("LUp@0*20?u8[80000010]==0~30,Cross@1", 34, {{0, 0x10, 2}, {25, 0x10, 0}})
+	check(name, ok && core.input_watch_failed() == "", fmt.tprintf("timeout off a step: %q", core.input_watch_failed()))
+	check(name, same(at(fs[:], {}, {0, -1}), 0, 1, 20, 21), fmt.tprint("timeout off a step: LUp at", at(fs[:], {}, {0, -1})))
+	check(name, same(at(fs[:], {.Cross}), 31, 32), fmt.tprint("timeout off a step: Cross at", at(fs[:], {.Cross})))
+	// A load after a timeout starts clean.
+	_, ok = run("Cross@2", 4, {})
+	check(name, ok && core.input_watch_failed() == "", "a load kept the last timeout")
+
+	bad := [?]string {
+		"Cross@5?u9[80000010]==1~5", // unknown width
+		"Cross@5?u8[80000100]==1~5", // outside RAM
+		"Cross@5?u16[80000011]==1~5", // unaligned
+		"Cross@5?u8[80000010]==1", // no timeout
+		"Cross@5?u8[80000010]==256~5", // value wider than u8
+		"Cross@5?u8[80000010]=1~5", // no == or !=
+		"Cross@5?u8[80000010==1~5", // no ]
+		"Cross@5+4*4?u8[80000010]==1~5", // every not more than hold
+		"Cross@5*10", // every with no condition
+		"@5", // no names with no condition
+		"@5*10?u8[80000010]==1~5", // no names with every
+		"Cross@1_0", // "_" in a number
+		"Cross@5?u8[80000010]==1~1_0", // "_" in a timeout
+	}
+	for b in bad {
+		os.set_env(core.env_name("PRESS"), b)
+		check(name, !core.input_script_load(2, RAM), fmt.tprintf("%q loaded", b))
+	}
+}
+
+// play --ramdiff on three small dumps: the bytes that change, then change
+// again, then stay; its exit status for a missing dump, a dump not main
+// RAM's size and a bad frame.
+@(private = "file")
+test_ramdiff :: proc() {
+	name := "ramdiff"
+	dir, _ := filepath.join({tmp, name}, context.temp_allocator)
+	if os.make_directory(dir) != nil {
+		check(name, false, fmt.tprintf("cannot make %s", dir))
+		return
+	}
+	rams := [][]u8{{0, 1, 2, 3, 4}, {0, 2, 2, 4, 5}, {0, 3, 2, 4, 6}, {0, 3, 2, 4, 6}}
+	// The dumps: PS1 main RAM (2 MB), rams[i] at its start.
+	ram := make([]u8, 2 << 20, context.temp_allocator)
+	for r, i in rams {
+		copy(ram, r)
+		path, _ := filepath.join({dir, fmt.tprintf("ram_%d.bin", i * 10)}, context.temp_allocator)
+		if os.write_entire_file(path, ram) != nil {
+			check(name, false, fmt.tprintf("cannot write %s", path))
+		}
+	}
+	small, _ := filepath.join({dir, "ram_40.bin"}, context.temp_allocator)
+	if os.write_entire_file(small, rams[0]) != nil {
+		check(name, false, fmt.tprintf("cannot write %s", small))
+	}
+	// Bytes 1 and 4 change at both; byte 3 changes, then stays.
+	got := play.ramdiff_offsets(rams[:3], {false, false, false}, context.temp_allocator)
+	check(name, slice.equal(got, []int{1, 4}), fmt.tprint("changed twice:", got))
+	got = play.ramdiff_offsets(rams[:3], {false, false, true}, context.temp_allocator)
+	check(name, slice.equal(got, []int{3}), fmt.tprint("changed then stayed:", got))
+	check(name, play.ramdiff(dir, {"0", "10", "=20"}) == 0, "a good ramdiff failed")
+	check(name, play.ramdiff(dir, {"0", "15"}) == 1, "a missing dump did not fail with 1")
+	check(name, play.ramdiff(dir, {"=0", "10"}) == 2, "a first frame with = did not fail with 2")
+	check(name, play.ramdiff(dir, {"0", "x"}) == 2, "a bad frame did not fail with 2")
+	check(name, play.ramdiff(dir, {"0", "1_0"}) == 2, "a frame with _ did not fail with 2")
+	check(name, play.ramdiff(dir, {"00", "010"}) == 0, "frames with leading zeros did not read ram_0, ram_10")
+	check(name, play.ramdiff(dir, {"0", "40"}) == 1, "a dump not 2 or 32 MB did not fail with 1")
 }
 
 // play.log's text: a carriage return a line break, CSI sequences and

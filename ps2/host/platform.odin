@@ -60,7 +60,8 @@ shown: [2]int
 // holds for n frames, and stick directions (LRight@900+60) or several names
 // joined by "&" (LUp&LRight@900) push the sticks
 // (core.input_script_load). Frames are presented frames
-// (frame). A bad entry stops platform_init.
+// (frame); a script's RAM conditions are checked as each is counted. A bad
+// entry stops platform_init, a condition that times out the run (status 1).
 @(private)
 PRESS_FRAMES :: 6
 
@@ -168,7 +169,7 @@ platform_init :: proc(title: cstring) -> bool {
 		}
 		slice.sort(shots[:])
 	}
-	if !core.input_script_load(PRESS_FRAMES) {return false}
+	if !core.input_script_load(PRESS_FRAMES, mem.RAM_SIZE) {return false}
 	return true
 }
 
@@ -232,6 +233,7 @@ vblank_frame :: proc() {
 			sdl.RenderPresent(ren)
 		}
 		frame += 1
+		core.input_script_frame(u64(frame), mem.ram)
 		snaptest_frame()
 		if rbtest[1] > 0 {rbtest_frame()}
 		if stats && frame % STATS_FRAMES == 0 {print_stats()}
@@ -280,6 +282,7 @@ vblank_frame :: proc() {
 		probe_maybe()
 	}
 	if core.frames_done(u64(vblank)) {quit(0)}
+	if core.input_watch_failed() != "" {quit(1)}
 	if pace == 0 || rerun {return}
 	// Netplay time sync stretches the frame while this host is ahead.
 	// NTSC's vblank: pace * 1000 / 1001 Hz, as the guest's clock runs.

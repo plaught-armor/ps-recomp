@@ -92,13 +92,31 @@ Trigger :: enum {
 }
 
 // A scripted press: `buttons` held and `sticks` pushed on `player` for
-// frames at ..< at + hold.
+// frames at ..< at + hold. An entry with a watch is conditional
+// (input_script_frame): `at` is when its watch starts, then when it
+// pressed, or max(u64) once it ended without a press.
 Scripted_Press :: struct {
 	at:      u64,
 	hold:    u64,
 	buttons: Buttons,
 	sticks:  Stick_Dirs,
 	player:  int,
+	watch:   Press_Watch,
+}
+
+// A press script entry's main RAM condition: `width` bytes (little-endian)
+// at RAM offset `addr` equal to `value` (not equal without `equal`).
+// every == 0 waits for the condition and then presses; every > 0 presses
+// every `every` frames while it is false and ends, pressing nothing, once
+// it is true. Either fails `timeout` frames after it starts. width 0: no
+// condition.
+Press_Watch :: struct {
+	width:   u8,
+	equal:   bool,
+	addr:    u32,
+	value:   u32,
+	every:   u64,
+	timeout: u64,
 }
 
 // Community controller mappings (SDL_GameControllerDB format).
@@ -144,6 +162,16 @@ input: struct {
 	script:    [dynamic]Scripted_Press,
 	// The script's presses that have started as of the last input_poll.
 	script_started: u64,
+	// The script's conditional state (input_script_frame), in snapshots
+	// (with the script's entries) when the script has a condition.
+	watch: Script_Watch,
+	// Each script entry's text when the script has a condition, for
+	// watch_fail; outside snapshots, as a snapshot may be loaded by another
+	// run.
+	script_text: [dynamic]string,
+	// The timeout message once a script condition timed out, else "". The
+	// run ends at once, so no snapshot is loaded after it.
+	watch_fail: string,
 	// The kind of device last used, for button prompts.
 	device:    Input_Device,
 	// The family of the controller last used or connected; PlayStation
@@ -153,6 +181,17 @@ input: struct {
 	device_fixed: bool,
 } = {
 	rumble_strength = 1,
+}
+
+// gate: the first conditional entry of the script not yet ended,
+// len(script) when none is left; input_poll reads only the entries before
+// it. A repeating gate (every > 0) presses from frame `pressed` while
+// `pressing`; `repeats` counts its presses.
+Script_Watch :: struct {
+	gate:     int,
+	pressing: bool,
+	pressed:  u64,
+	repeats:  u64,
 }
 
 // Console button names as used in config files and press scripts.
@@ -521,11 +560,19 @@ input_poll :: proc(now: u64) -> (ps: [MAX_PLAYERS]Player_Input) {
 	}
 	sticks: [MAX_PLAYERS]Stick_Dirs
 	input.script_started = 0
-	for s in input.script {
+	w := &input.watch
+	for s in input.script[:w.gate] {
 		if now >= s.at {
 			input.script_started += 1
 		}
 		if now >= s.at && now < s.at + s.hold {
+			ps[s.player].buttons += s.buttons
+			sticks[s.player] += s.sticks
+		}
+	}
+	input.script_started += w.repeats
+	if w.pressing {
+		if s := input.script[w.gate]; now >= w.pressed && now < w.pressed + s.hold {
 			ps[s.player].buttons += s.buttons
 			sticks[s.player] += s.sticks
 		}
@@ -655,35 +702,252 @@ rumble_send :: proc(k: int, lo, hi: u16, ms: u32) {
 // Button names are PAD_NAMES and stick directions STICK_NAMES (LRight@900
 // pushes the left stick fully right), any case. "&" joins several names in
 // one entry (LUp&LRight@900 for a diagonal, Cross&LUp@900); entries that
-// overlap in time also combine. Returns false on a bad entry.
-input_script_load :: proc(hold: u64) -> bool {
+// overlap in time also combine.
+//
+// "?<cond>~<n>" after the timing makes an entry conditional, on main RAM
+// (ram_size bytes; an address is taken & 0x1fffffff): <cond> is
+// u8|u16|u32 "[" <hex address> "]" ==|!= <value> (decimal or 0x hex).
+// Cross@900?u8[801f2a40]==3~600 presses at the first frame from 900 at
+// which the condition holds; LUp@900*20?u8[801f2a40]==0~400 presses every
+// 20 frames from 900 while it does not, and ends without a press once it
+// does; "@900?<cond>~<n>", with no names (and no "*"), only waits. When a conditional
+// entry ends at frame t, every entry after it in the text moves t - 900
+// frames later. The condition is read up to and including frame 900 + n
+// (a repeat reads it there too, step or not); not met by then, it fails
+// the run (input_watch_failed). Returns false on a bad entry, or on a condition
+// under netplay (net_active, started before the script loads).
+input_script_load :: proc(hold: u64, ram_size: u32) -> bool {
+	input_script_clear()
 	spec := env("PRESS")
 	if spec == "" {
 		return true
 	}
 	ok := true
 	for item in strings.split(spec, ",", context.temp_allocator) {
-		names, _, rest := strings.partition(item, "@")
-		timing, colon, who := strings.partition(rest, ":")
-		at_s, plus, dur := strings.partition(timing, "+")
-		buttons, sticks, bok := press_names(names)
-		at, aok := strconv.parse_u64(at_s)
-		player, pok := 1, true
-		if colon != "" {
-			player, pok = strconv.parse_int(who)
-		}
-		n, hok := hold, true
-		if plus != "" {
-			n, hok = strconv.parse_u64(dur)
-		}
-		if !bok || !aok || !pok || !hok || n < 1 || player < 1 || player > MAX_PLAYERS {
+		p, pok := press_entry(item, hold, ram_size)
+		if !pok {
 			fmt.eprintfln(ENV_PREFIX + "PRESS: bad entry \"%s\"", item)
 			ok = false
 			continue
 		}
-		append(&input.script, Scripted_Press{at = at, hold = n, buttons = buttons, sticks = sticks, player = player - 1})
+		append(&input.script, p)
+		append(&input.script_text, item)
+	}
+	w := &input.watch
+	for w.gate < len(input.script) && input.script[w.gate].watch.width == 0 {
+		w.gate += 1
+	}
+	// A timeout ends the run, and a rolled-back frame cannot undo that:
+	// conditions are a test tool, not for netplay.
+	if w.gate < len(input.script) && net_active() {
+		fmt.eprintln(ENV_PREFIX + "PRESS: conditions do not run under netplay")
+		clear(&input.script_text) // not cloned yet
+		input_script_clear()
+		return false
+	}
+	if w.gate < len(input.script) {
+		for &s in input.script_text {
+			s = strings.clone(s)
+		}
+		script_snap()
+	} else {
+		clear(&input.script_text)
 	}
 	return ok
+}
+
+// Empty the press script and its conditional state.
+input_script_clear :: proc() {
+	clear(&input.script)
+	for s in input.script_text {
+		delete(s)
+	}
+	clear(&input.script_text)
+	delete(input.watch_fail)
+	input.watch, input.watch_fail = {}, ""
+	script_snap()
+}
+
+// The index in snap_regions + 1 of the press script's entries, 0 before
+// they are first registered.
+@(private = "file")
+script_region: int
+
+// Keep the script's entries and conditional state in snapshots once the
+// script has a condition: input_script_frame changes them. The region is
+// registered once and then follows the entries (only a test loads twice).
+@(private = "file")
+script_snap :: proc() {
+	if script_region == 0 && input.watch.gate == len(input.script) {
+		return
+	}
+	b := mem.slice_to_bytes(input.script[:])
+	if script_region == 0 {
+		snap_add(&input.watch)
+		append(&snap_regions, b)
+		script_region = len(snap_regions)
+	} else {
+		snap_regions[script_region - 1] = b
+	}
+}
+
+// One press script entry, from its text.
+@(private = "file")
+press_entry :: proc(item: string, hold: u64, ram_size: u32) -> (p: Scripted_Press, ok: bool) {
+	names, at_sign, rest := strings.partition(item, "@")
+	if at_sign == "" {
+		return
+	}
+	p.player = 1
+	if i := strings.last_index_byte(rest, ':'); i >= 0 {
+		p.player = int(press_number(rest[i + 1:]) or_return)
+		rest = rest[:i]
+	}
+	timing, query, watch := strings.partition(rest, "?")
+	start, _, every := strings.partition(timing, "*")
+	at_s, plus, dur := strings.partition(start, "+")
+	p.at = press_number(at_s) or_return
+	p.hold = hold
+	if plus != "" {
+		p.hold = press_number(dur) or_return
+	}
+	if names != "" || query == "" {
+		p.buttons, p.sticks = press_names(names) or_return
+	}
+	if query != "" {
+		p.watch = press_watch(watch, ram_size) or_return
+		if every != "" {
+			p.watch.every = press_number(every) or_return
+			if p.watch.every <= p.hold || names == "" {
+				return
+			}
+		}
+	} else if every != "" {
+		return
+	}
+	if p.hold < 1 || p.player < 1 || p.player > MAX_PLAYERS {
+		return
+	}
+	p.player -= 1
+	return p, true
+}
+
+// A number in a press script entry: decimal or 0x hex (base 0), or in
+// `base`; no "_", which strconv takes as a digit separator.
+@(private = "file")
+press_number :: proc(s: string, base := 0) -> (n: u64, ok: bool) {
+	if strings.contains_rune(s, '_') {
+		return
+	}
+	if base == 0 {
+		return strconv.parse_u64(s)
+	}
+	return strconv.parse_u64(s, base)
+}
+
+// A press script entry's "<cond>~<timeout>".
+@(private = "file")
+press_watch :: proc(s: string, ram_size: u32) -> (w: Press_Watch, ok: bool) {
+	cond, tilde, timeout := strings.partition(s, "~")
+	if tilde == "" {
+		return
+	}
+	w.timeout = press_number(timeout) or_return
+	width, bracket, rest := strings.partition(cond, "[")
+	switch width {
+	case "u8": w.width = 1
+	case "u16": w.width = 2
+	case "u32": w.width = 4
+	case: return
+	}
+	addr_s, close, test := strings.partition(rest, "]")
+	if bracket == "" || close == "" || len(test) < 3 {
+		return
+	}
+	addr := press_number(addr_s, 16) or_return
+	switch test[:2] {
+	case "==": w.equal = true
+	case "!=": w.equal = false
+	case: return
+	}
+	value := press_number(test[2:]) or_return
+	if addr > 0xffffffff || value >> (u64(w.width) * 8) != 0 {
+		return
+	}
+	w.addr = u32(addr) & 0x1fffffff
+	w.value = u32(value)
+	if w.addr % u32(w.width) != 0 || u64(w.addr) + u64(w.width) > u64(ram_size) {
+		return
+	}
+	return w, true
+}
+
+// Run the press script's conditions at frame `now`, with main RAM as it
+// stands: once a frame, at the same point each frame, before the frame's
+// input_poll calls. Frames come one by one (a snapshot load restores the
+// state with the frame count). A script with no condition returns at once.
+input_script_frame :: proc(now: u64, ram: []u8) {
+	w := &input.watch
+	for w.gate < len(input.script) && input.watch_fail == "" {
+		g := &input.script[w.gate]
+		if now < g.at {
+			return
+		}
+		pw := &g.watch
+		since := now - g.at
+		// A repeat reads RAM at its presses and, whatever the step, at its
+		// timeout frame, so it ends there if the condition holds.
+		edge := pw.every == 0 || since % pw.every == 0
+		met := false
+		if edge || since >= pw.timeout {
+			met = watch_met(pw^, ram)
+			if !met && pw.every > 0 && edge && since < pw.timeout {
+				w.pressing, w.pressed = true, now
+				w.repeats += 1
+			}
+		}
+		if !met {
+			if since >= pw.timeout {
+				input.watch_fail = fmt.aprintf("PRESS: %s timed out at frame %d (%s[%08x]=%d)", input.script_text[w.gate], now, WATCH_WIDTHS[pw.width], pw.addr, watch_read(pw^, ram))
+				w.pressing = false
+				fmt.eprintln(input.watch_fail)
+			}
+			return
+		}
+		// Ended at `now`: a wait presses now (a wait with no names
+		// presses nothing), a repeat ends pressing nothing; the entries
+		// after it move as much later as it waited.
+		w.pressing = false
+		g.at = pw.every == 0 && (g.buttons != {} || g.sticks != {}) ? now : max(u64)
+		for &p in input.script[w.gate + 1:] {
+			p.at += since
+		}
+		w.gate += 1
+		for w.gate < len(input.script) && input.script[w.gate].watch.width == 0 {
+			w.gate += 1
+		}
+	}
+}
+
+// The timeout message when a press script condition timed out, else "".
+input_watch_failed :: proc() -> string {
+	return input.watch_fail
+}
+
+@(private = "file")
+WATCH_WIDTHS := [5]string{1 = "u8", 2 = "u16", 4 = "u32"}
+
+@(private = "file")
+watch_read :: proc(w: Press_Watch, ram: []u8) -> (v: u32) {
+	for i in 0 ..< u32(w.width) {
+		v |= u32(ram[w.addr + i]) << (8 * i)
+	}
+	return
+}
+
+@(private = "file")
+watch_met :: proc(w: Press_Watch, ram: []u8) -> bool {
+	return (watch_read(w, ram) == w.value) == w.equal
 }
 
 // The buttons and stick directions an "&"-joined press script name list

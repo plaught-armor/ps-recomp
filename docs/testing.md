@@ -123,6 +123,58 @@ progress file, and push no sound, so the run after a probe is the run
 without one (`PS_DUMP_HASH` is the same with `PS_COMPAT_PROBE=0`). A
 warm run has no new entry pcs, so it is quiet whenever it loads no IRX.
 
+### Press scripts with conditions
+
+A `PS_PRESS` entry (core/input.odin input_script_load; the README has the
+plain form) can wait on main RAM. `?<cond>~<n>` after the timing makes it
+conditional, where `<cond>` is `u8`, `u16` or `u32`, a hex address in
+brackets, `==` or `!=`, and a value (decimal or `0x` hex). Values are
+little-endian, a `u16` or `u32` address must be aligned, and an address is
+taken `& 0x1fffffff`, so `801f2a40` (PS1) and `00123450` (PS2) both name
+main RAM; one outside it is a bad entry.
+
+- `Cross@900?u8[801f2a40]==3~600`: from frame 900, press Cross at the first
+  frame the byte is 3.
+- `LUp@900*20?u8[801f2a40]==0~400`: at frames 900, 920, 940, ... press LUp
+  while the byte is not 0; at the first of those frames it is 0, end
+  without a press. `*<n>` must be more than the hold.
+- `@900?u8[801e0010]!=0~3000`: no names, only wait.
+
+The condition is checked once a frame, as the frame is counted (PS2:
+presented frames, PS1: presents), with RAM as it stands then, so a run
+replays exactly and snapshots and rollback keep the script's state.
+
+When a conditional entry ends at frame t, every entry after it in the text
+moves t - (its frame) frames later. That is every later entry in text
+order, whatever its frame, not only the ones timed after it: write a
+route in the order it is played. A conditional entry also holds back the
+entries after it in the text until it ends. A script with no condition
+runs as it always did.
+
+The `~<n>` window is inclusive: from frame 900, a wait with `~600` reads
+the condition at frames 900 to 1500, 601 checks. A repeat reads it at each step and also
+at the last frame, step or not, so `LUp@900*20?...~30` ends at 930 if the
+condition holds there. Numbers are decimal or `0x` hex,
+without `_` separators.
+
+Conditions are a test tool: with netplay on, a script with one does not
+load.
+
+A condition not met by the last frame of its window ends the run at once
+with status 1 and prints `PRESS: <entry> timed out at frame <f>
+(<width>[<address>]=<value read>)`. A compat run's row has result `watch`
+and that message in `fatal`.
+
+To find the address, dump RAM around a few presses that move what the
+script must watch: on PS1 `PS_DUMP=<dir> PS_DUMP_RAM=1` (with
+`PS_DUMP_FROM` near the presses, as every present is 2 MB), on PS2
+`PS_DUMP=<dir>` (32 MB a frame). Then `play --ramdiff <dir> <frame>
+<frame> ...` prints each byte that changed between every two frames named
+in a row, with its value at each, as a condition writes the address; a
+frame written `=<frame>` wants the byte unchanged since the one before. A dump must be PS1 (2 MB) or PS2 (32 MB) main RAM.
+For a cursor moved at frames 1000 and 1100:
+`play --ramdiff dump 990 =999 1010 1110`.
+
 ### Pictures and dumps
 
 `PS_SHOT=<vblank>,<vblank>,...` (PS2 only, read in ps2/host/platform.odin)
