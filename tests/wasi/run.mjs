@@ -1,17 +1,19 @@
-// Dev harness: runs recomp built for wasi_wasm32 under Node's WASI
-// (preview1), to check that it converts a disc as the host build does. A
-// development tool only: needs Node 24 or newer, no npm packages.
+// Dev harness: runs recomp built for wasi_wasm32 on the web page's WASI shim
+// (web/wasi.js) under Node, to check that it converts a disc as the host
+// build does. A development tool only: needs Node 24 or newer, no npm
+// packages.
 //
-//   odin build recomp -target:wasi_wasm32 -collection:ps=. -o:speed -out:recomp.wasm
-//   node tests/wasi/run.mjs recomp.wasm <out dir> [--arch <arch>] <disc image>
+//   web/build.sh <page dir>     (or odin build recomp -target:wasi_wasm32 ...)
+//   node tests/wasi/run.mjs <page dir>/recomp.wasm <out dir> [--arch <arch>] <disc image>
 //
-// The disc image's directory is preopened as /disc (a .cue's track files
-// sit beside it) and the out dir as the working directory, so the blob
-// <serial>.<arch>.bin lands there. Exits with recomp's exit code.
-import { readFile } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
-import { argv, exit } from "node:process";
-import { WASI } from "node:wasi";
+// Every file in the disc image's directory is visible as /disc/<name> (a
+// .cue's track files sit beside it). What recomp writes, the blob
+// <serial>.<arch>.bin, lands in the out dir. Prints the shim's call counts
+// and block cache numbers to stderr, and exits with recomp's exit code.
+import { mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { argv, exit, stderr, stdout } from "node:process";
+import { Wasi } from "../../web/wasi.js";
 
 const args = argv.slice(2);
 if (args.length !== 3 && !(args.length === 5 && args[2] === "--arch")) {
@@ -20,20 +22,42 @@ if (args.length !== 3 && !(args.length === 5 && args[2] === "--arch")) {
 }
 const [wasm, out] = args;
 const image = resolve(args[args.length - 1]);
-const wasi = new WASI({
-	version: "preview1",
+
+// A reader per file in the image's directory, opened on first read.
+const disc = new Map();
+for (const e of readdirSync(dirname(image), { withFileTypes: true })) {
+	if (!e.isFile()) continue;
+	const path = join(dirname(image), e.name);
+	let fd;
+	disc.set(e.name, {
+		size: statSync(path).size,
+		read(offset, length) {
+			fd ??= openSync(path, "r");
+			const b = new Uint8Array(length);
+			for (let o = 0; o < length;) {
+				const n = readSync(fd, b, o, length - o, offset + o);
+				if (n === 0) return b.subarray(0, o);
+				o += n;
+			}
+			return b;
+		},
+	});
+}
+
+const wasi = new Wasi({
 	args: ["recomp", ...args.slice(2, -1), "/disc/" + basename(image)],
-	preopens: { "/disc": dirname(image), ".": resolve(out) },
-	returnOnExit: true,
+	disc,
+	log: (fd, text) => (fd === 1 ? stdout : stderr).write(text),
 });
-const module = await WebAssembly.compile(await readFile(wasm));
-// Odin's core:os opens a file for reading with the fd_read right but not
-// fd_seek, which WASI's fd_pread also needs (Node enforces it): add fd_seek
-// (bit 2) to every path_open, as a shim that ignores rights would.
-const imports = wasi.getImportObject();
-const p1 = imports.wasi_snapshot_preview1;
-const path_open = p1.path_open;
-p1.path_open = (fd, dirflags, path, len, oflags, base, inheriting, fdflags, out) =>
-	path_open(fd, dirflags, path, len, oflags, base | 4n, inheriting | 4n, fdflags, out);
-const instance = await WebAssembly.instantiate(module, imports);
-exit(wasi.start(instance));
+const start = performance.now();
+const module = await WebAssembly.compile(readFileSync(wasm));
+const instance = await WebAssembly.instantiate(module, wasi.imports);
+const code = wasi.run(instance);
+const ms = Math.round(performance.now() - start);
+for (const [path, bytes] of wasi.files()) {
+	const to = join(resolve(out), path);
+	mkdirSync(dirname(to), { recursive: true });
+	writeFileSync(to, bytes);
+}
+stderr.write(`wasi: ${ms} ms, ${JSON.stringify(wasi.stats)}\n`);
+exit(code);

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'">
+<title>ps-recomp converter</title>
+<link rel="stylesheet" href="page.css">
+<script type="module" src="page.js"></script>
+</head>
+<body>
+<main>
+<h1>ps-recomp converter</h1>
+<p>Converts a disc image into the native code blob for the player, in this
+tab. The disc is read here and nothing is sent anywhere.</p>
+<label id="drop">
+<input id="disc" type="file" multiple>
+<span>Pick or drop a disc image (.iso, .bin, or a .cue with its track files)</span>
+</label>
+<p id="picked"></p>
+<p>
+<label for="arch">Player machine</label>
+<select id="arch">
+<option value="x64_sysv">x86-64 Linux / macOS (x64_sysv)</option>
+<option value="x64_win">x86-64 Windows (x64_win)</option>
+<option value="arm64">arm64 (arm64)</option>
+</select>
+<button id="convert" type="button" disabled>Convert</button>
+</p>
+<p id="result"></p>
+<pre id="log"></pre>
+<p id="commit">Built from ps-recomp <code id="sha">?</code>. Use the player from the same release.</p>
+</main>
+</body>
+</html>

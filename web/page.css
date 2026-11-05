@@ -1,0 +1,8 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; }
+main { max-width: 48rem; margin: 0 auto; padding: 1rem; }
+#drop { display: block; border: 2px dashed GrayText; border-radius: 0.5rem; padding: 1.5rem; text-align: center; cursor: pointer; }
+#drop.over { border-color: Highlight; }
+#drop input { display: block; margin: 0 auto 0.5rem; }
+#log { min-height: 8rem; max-height: 24rem; overflow: auto; padding: 0.5rem; border: 1px solid GrayText; white-space: pre-wrap; }
+#result a { font-weight: bold; }

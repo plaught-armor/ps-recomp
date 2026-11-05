@@ -173,3 +173,5 @@ and the tests do not. Add `-target:` to check another platform, as CI does
 for `linux_arm64`, `darwin_amd64` and `darwin_arm64`. recomp is also
 checked for `wasi_wasm32`, the target of the web converter: a recomp
 import of a package that needs the host (such as `core`) fails there.
+The web page's scripts have no build step; `node --check` each of
+`web/*.js` and `tests/wasi/run.mjs` after editing them.

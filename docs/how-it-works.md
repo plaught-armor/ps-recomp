@@ -66,13 +66,36 @@ without `.text` has its executable sections compiled whole, data in them
 included.
 
 recomp also builds for `wasi_wasm32`, where it reads only what WASI
-preopens. `tests/wasi/run.mjs` runs that build under Node 24 or newer (a
-development harness, no npm packages); its blob for an arch is the host
-build's byte for byte:
+preopens. That build is the web converter: `web/` is a static page that
+converts a disc in the browser, with nothing sent anywhere. A Worker runs
+`recomp.wasm` on `web/wasi.js`, a WASI shim that provides only the imports
+recomp has. The shim reads the picked disc files in slices
+(`FileReaderSync` on `File.slice`, through a 64 KiB block cache), so the
+image is never read whole, and the blob comes back as a download.
+`web/build.sh <out dir>` builds `recomp.wasm` (then shrinks it with
+`wasm-opt -O3` when binaryen is installed) and copies the page files
+next to it with `commit.txt`. The page shows that commit: use the blob
+with the player built from the same commit. Serve the out dir from
+any static host, with `.wasm` as `application/wasm`.
+
+`tests/wasi/run.mjs` runs the same build on the same shim under Node 24 or
+newer (a development harness, no npm packages); its blob for an arch is
+the host build's byte for byte:
 
 ```sh
-odin build recomp -target:wasi_wasm32 -collection:ps=. -o:speed -out:recomp.wasm
-node tests/wasi/run.mjs recomp.wasm <out dir> --arch arm64 path/to/game.cue
+web/build.sh <out dir>
+node tests/wasi/run.mjs <out dir>/recomp.wasm <blob dir> --arch arm64 path/to/game.cue
+```
+
+`tests/wasi/serve.py` checks the page itself in a browser. It serves the
+out dir and the named disc files, and prints a URL for the page's test
+mode (`index.html?test=<disc url>&arch=<arch>`). Open that URL in any
+browser: the page converts the disc, read by HTTP Range requests rather
+than a picked file, and posts the blob and a report (sha256, size, time,
+user agent, errors). The server writes them out and exits:
+
+```sh
+python3 tests/wasi/serve.py <out dir> result.json path/to/game.iso --arch x64_sysv
 ```
 
 The options file is tab-separated: a `key<TAB>value` header row, then one
