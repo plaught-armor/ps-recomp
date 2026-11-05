@@ -175,9 +175,9 @@ does not link glibc's `libm.so.6`.
 
 Two differences remain by design. `fmax` and `fmin` follow C on a tie of
 `+0` and `-0` (`fmax` gives `+0`, `fmin` gives `-0`), where the host's
-`maxpd` and `minpd` pick by operand order. Whether their one caller,
-`texels_read` in `psx/render/gpu.odin`, can meet that tie is not traced;
-the test leaves the pair out. And a NaN result's sign and payload are
+`maxpd` and `minpd` pick by operand order. Their one caller,
+`texels_read` in `psx/render/gpu.odin`, converts the result to `i32`, so
+the sign of a zero never reaches its output; the test leaves the pair out. And a NaN result's sign and payload are
 not matched: x86 makes `0/0` negative and wasm leaves NaN signs unspecified,
 so the test compares every NaN as one value.
 

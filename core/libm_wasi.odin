@@ -15,8 +15,9 @@
 //     pan), not on every input.
 //   - fmax and fmin have C semantics: a NaN operand gives the other operand.
 //     On a tie of +0 and -0 they give +0 (fmax) or -0 (fmin), where the
-//     host's maxpd and minpd pick by operand order. Whether the one caller,
-//     psx/render/gpu.odin texels_read, can meet that tie is not traced.
+//     host's maxpd and minpd pick by operand order. The one caller,
+//     psx/render/gpu.odin texels_read, converts the result to i32, so the
+//     sign of a zero never reaches its output.
 // A NaN result's sign and payload are not matched: x86 makes 0/0 negative,
 // and wasm leaves NaN signs unspecified.
 // tests/libm_wasi checks sinf, cosf and expf on all 2^32 inputs, sin, pow
