@@ -25,7 +25,7 @@ package ps2_iop
 
 import "core:fmt"
 import "core:hash/xxhash"
-import "core:mem/virtual"
+@(require) import "core:mem/virtual" // unused on wasi
 import "core:slice"
 import "core:strings"
 import "ps:core"
@@ -697,16 +697,29 @@ lib_register :: proc(a: u32) -> u32 {
 // psx_cpu indexes its table of recompiled functions on every call, and the
 // IOP has none: an all-nil table, mapped read-only so that no path can make
 // it emulated state by writing it (a write faults).
+//
+// On wasi it comes from the heap and is writable: wasm memory has no page
+// protection, and core:mem/virtual maps nothing there. Nothing is lost. The
+// only writers are the installs of recompiled code (register_funcs, hook),
+// which a wasi build, always FLAT, refuses; a native FLAT build runs the
+// same paths on the read-only mapping, so a stray write still faults there.
 @(private = "file")
 iop_fixed: []r3000.Func_Proc
 
 iop_dispatch_init :: proc() {
 	if iop_fixed == nil {
 		size := uint(r3000.RAM_SIZE / 4 * size_of(r3000.Func_Proc))
-		data, err := virtual.reserve_and_commit(size)
-		assert(err == nil, "iop: dispatch table not mapped")
-		ok := virtual.protect(raw_data(data), size, {.Read})
-		assert(ok, "iop: dispatch table not made read-only")
+		data: []u8
+		err: virtual.Allocator_Error
+		when ODIN_OS == .WASI {
+			data, err = make([]u8, size)
+			assert(err == nil, "iop: dispatch table not allocated")
+		} else {
+			data, err = virtual.reserve_and_commit(size)
+			assert(err == nil, "iop: dispatch table not mapped")
+			ok := virtual.protect(raw_data(data), size, {.Read})
+			assert(ok, "iop: dispatch table not made read-only")
+		}
 		iop_fixed = slice.reinterpret([]r3000.Func_Proc, data)
 	}
 	assert(r3000.dispatch.fixed == nil || raw_data(r3000.dispatch.fixed) == raw_data(iop_fixed), "iop: PS1 functions registered")
