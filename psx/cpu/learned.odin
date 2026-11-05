@@ -21,6 +21,8 @@ package psx_cpu
 @(require) import "core:fmt"
 import "core:slice"
 
+import "ps:core"
+
 LEARNED_CHECK :: #config(LEARNED_CHECK, false)
 
 Learned_Entry :: struct {
@@ -84,6 +86,7 @@ Learned_Func :: struct {
 // Register a package's recompiled learned functions (register_learned),
 // their words in words.
 register_learned_funcs :: proc(funcs: []Learned_Func, words: []u32) {
+	when core.FLAT {fatal("FLAT runs interpreted only: %s not installed", "recompiled learned functions")}
 	for f in funcs {
 		register_learned(f.entry, f.lo, words[f.at:][:f.n], f.fn)
 	}

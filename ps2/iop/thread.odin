@@ -26,6 +26,17 @@
 // handler, where it may not wait. One that waits, or spins past its
 // budget, is stopped there (th_intr_stop).
 //
+// Under FLAT (core/flat.odin) there are no coroutines: each thread, and the
+// handlers, runs on a flat run of its own (r3000.Flat_Ctx, Iop_Flat), which
+// keeps its call chain as data. The scheduler runs a thread's run until it
+// ends or stops; a wait, a yield or an end stops it (r3000.flat_block) and
+// returns to the HLE call that made it, which returns at once. What that
+// call owed its caller after the wait, its v0 and the yield to a better
+// thread, is then owed to the thread's resume (th_flat_stopped,
+// th_flat_run). A host function that calls guest code and may wait
+// inside it (sceSifRpcLoop, sdrdrv's server) runs as a continuation
+// (iop_flat_step), not a nested call.
+//
 // A thread's context: the R3000's r[0..31], hi and lo, cop0's sr, cause and
 // epc, and frame_ret, saved when it leaves the CPU and restored when it gets
 // it back. Its pc and branch state are the interpreter's locals, on its
@@ -124,6 +135,19 @@ Iop_Thread :: struct {
 	wake_at:                u64, // when its Delay ends, IOP cycles
 	ctx:                    Th_Context,
 	co:                     ^core.Coroutine,
+	flat:                   Iop_Flat,
+}
+
+// A thread's flat run under FLAT, and what its resume owes; empty otherwise.
+when core.FLAT {
+	Iop_Flat :: struct {
+		run:  ^r3000.Flat_Ctx, // emu heap; nil until it first runs
+		wait: bool, // it stopped in th_wait
+		v0:   bool, // its resume puts the wait's wake in v0 (th_flat_stopped)
+		post: bool, // its resume owes an HLE call's yield to a better thread
+	}
+} else {
+	Iop_Flat :: struct {}
 }
 
 Iop_Sema :: struct {
@@ -174,11 +198,15 @@ iop_wake_ee: u64 = max(u64)
 @(private = "file")
 th_loader: ^core.Coroutine
 
+// FLAT: the handlers' flat run (th_intr), emu heap.
+when core.FLAT {
+	@(private = "file")
+	th_intr_run: ^r3000.Flat_Ctx
+}
+
 th_init :: proc() {
 	s := &iop_sched
-	for &t in s.threads {
-		if t.co != nil {core.co_kill(t.co)}
-	}
+	for &t in s.threads {th_drop(&t)}
 	if s.intr_co != nil {core.co_kill(s.intr_co)}
 	clear(&s.threads)
 	clear(&s.semas)
@@ -277,8 +305,12 @@ th_schedule :: proc(until: u64, idle := false) {
 		id := t.id
 		t.status = .Run
 		s.cur = id
-		if t.co == nil {t.co = core.co_create(th_main, rawptr(uintptr(id)))}
-		core.co_switch(t.co)
+		when core.FLAT {
+			th_flat_run(t)
+		} else {
+			if t.co == nil {t.co = core.co_create(th_main, rawptr(uintptr(id)))}
+			core.co_switch(t.co)
+		}
 		s.cur = 0
 		if t = th_find(id); t != nil && t.status == .Dormant {th_stop(t)}
 	}
@@ -369,15 +401,74 @@ th_main :: proc(arg: rawptr) {
 	th_exit()
 }
 
+// FLAT: th_main and th_yield's resume for the running thread t. Its run
+// starts at its entry when it has none; else it goes on, after what its
+// stop owed (th_flat_stopped): v0, and the yield to a better thread its HLE
+// call would make once the wait returned. A run that ends is the thread's
+// ExitThread.
+@(private = "file")
+th_flat_run :: proc(t: ^Iop_Thread) {
+	when core.FLAT {
+		f := &t.flat
+		th_restore(t)
+		if f.run == nil {
+			f.run = new(r3000.Flat_Ctx, core.emu_allocator())
+			r3000.flat_start(f.run, t.entry)
+		} else {
+			if f.v0 {r3000.state.r[2] = t.wake}
+			post := f.post
+			f.wait, f.v0, f.post = false, false, false
+			if post && iop_sched.resched {
+				// th_preempt, before the run goes on: v0 is the call's.
+				iop_sched.resched = false
+				th_ready(t, head = true)
+				th_save(t)
+				return
+			}
+		}
+		if r3000.flat_run(f.run) {th_end(t)}
+	}
+}
+
+// FLAT: the HLE call of the running thread stopped it (a wait, a yield or
+// an end) before returning v. What it would do once the thread runs again
+// is owed to th_flat_run: v0, v or a wait's wake, and its resched check.
+// Nothing on a handler's run, which is dropped.
+th_flat_stopped :: proc(v: u32) {
+	when core.FLAT {
+		t := th_find(iop_sched.cur)
+		if t == nil {return}
+		if t.flat.wait {
+			t.flat.v0 = true
+		} else {
+			t.ctx.r[2] = v
+		}
+		t.flat.post = true
+	}
+}
+
+// Drops a thread's coroutine or flat run.
+@(private = "file")
+th_drop :: proc(t: ^Iop_Thread) {
+	if t.co != nil {
+		core.co_kill(t.co)
+		t.co = nil
+	}
+	when core.FLAT {
+		if t.flat.run != nil {
+			r3000.flat_free(t.flat.run)
+			free(t.flat.run, core.emu_allocator())
+		}
+		t.flat = {}
+	}
+}
+
 // Drops a dormant thread's coroutine, and the thread itself when it asked
 // to be deleted; the RPC queues it served go (rpc_thread_gone).
 @(private = "file")
 th_stop :: proc(t: ^Iop_Thread) {
 	rpc_thread_gone(t.id)
-	if t.co != nil {
-		core.co_kill(t.co)
-		t.co = nil
-	}
+	th_drop(t)
 	if t.exit_delete {th_remove(t.id)}
 }
 
@@ -414,13 +505,18 @@ th_restore :: proc(t: ^Iop_Thread) {
 }
 
 // Takes the running thread, its status already set, off the CPU, and puts
-// its context back once the loader runs it again.
+// its context back once the loader runs it again. Under FLAT it stops the
+// thread's run and returns at once; th_flat_run puts the context back.
 @(private = "file")
 th_yield :: proc() {
 	id := iop_sched.cur
 	th_save(th_find(id))
-	core.co_switch(th_loader)
-	th_restore(th_find(id))
+	when core.FLAT {
+		r3000.flat_block("an IOP thread switch")
+	} else {
+		core.co_switch(th_loader)
+		th_restore(th_find(id))
+	}
 }
 
 // The running thread back to the head of its ready queue.
@@ -434,21 +530,35 @@ th_preempt :: proc() {
 
 // run_events while the IOP runs: the budget is spent. The running thread
 // stays ready, first in its queue, its context saved; a command handler is
-// stopped.
+// stopped. Under FLAT, native code cannot be stopped: the clock stays past
+// the budget, so the next events check once it returned stops the run.
 @(private = "file")
 th_budget :: proc() {
-	if iop_sched.intr {th_intr_stop(.Blocked)}
+	when core.FLAT {
+		if !r3000.flat_can_stop() {
+			r3000.flat_put_off()
+			return
+		}
+	}
+	if iop_sched.intr {
+		th_intr_stop(.Blocked)
+		return
+	}
 	if iop_sched.cur == 0 {return}
 	iop_sched.budget = true
 	th_preempt()
 }
 
 // The running thread waits; what its waker gave, or KE_CAN_NOT_WAIT on the
-// loader. A command handler that waits is stopped.
+// loader. A command handler that waits is stopped. Under FLAT the wait only
+// begins: what it returns is KE_OK, and the wake is the resume's (Iop_Flat).
 @(private = "file")
 th_wait :: proc(status: Th_Status, sema: u32 = 0) -> u32 {
 	s := &iop_sched
-	if s.intr {th_intr_stop(.Blocked)}
+	if s.intr {
+		th_intr_stop(.Blocked)
+		return ke(KE_CAN_NOT_WAIT)
+	}
 	t := th_find(s.cur)
 	if t == nil {return ke(KE_CAN_NOT_WAIT)}
 	t.status = status
@@ -456,6 +566,7 @@ th_wait :: proc(status: Th_Status, sema: u32 = 0) -> u32 {
 	t.seq = s.tail
 	s.tail += 1
 	t.wake = KE_OK
+	when core.FLAT {t.flat.wait = true}
 	th_yield()
 	return th_find(s.cur).wake
 }
@@ -476,7 +587,10 @@ th_sleep :: proc() -> u32 {
 // (vblank.odin). A handler is stopped even then: retail refuses a wait in
 // an interrupt handler before it looks at what it would wait for.
 th_wait_until :: proc(at: u64) -> u32 {
-	if iop_sched.intr {th_intr_stop(.Blocked)}
+	if iop_sched.intr {
+		th_intr_stop(.Blocked)
+		return ke(KE_CAN_NOT_WAIT)
+	}
 	if at <= r3000.state.cycles {return KE_OK}
 	if t := th_find(iop_sched.cur); t != nil {t.wake_at = at}
 	return th_wait(.Delay)
@@ -485,7 +599,12 @@ th_wait_until :: proc(at: u64) -> u32 {
 // The running thread waits for its RPC's RPC_END (sifclient.odin), on what
 // retail's sifcmd keeps an event flag for, so no WakeupThread ends it.
 th_rpc_wait :: proc() -> u32 {
-	return th_wait(.Wait)
+	v := th_wait(.Wait)
+	// Its callers return 0, not the wake: under FLAT the resume keeps it.
+	when core.FLAT {
+		if t := th_find(iop_sched.cur); t != nil {t.flat.wait = false}
+	}
+	return v
 }
 
 // Readies thread id if it waits so; else nothing, the flag retail would set
@@ -509,26 +628,40 @@ th_wakeup :: proc(id: u32) -> u32 {
 }
 
 // Ends the running thread; the loader drops its coroutine. A start's end
-// is its return, v0 its result.
+// is its return, v0 its result. Under FLAT it stops the thread's run and
+// returns.
 th_exit :: proc(delete := false) {
-	s := &iop_sched
-	t := th_find(s.cur)
+	t := th_find(iop_sched.cur)
 	if t == nil {return}
+	th_end(t, delete)
+	when core.FLAT {
+		r3000.flat_block("an IOP thread's end")
+	} else {
+		core.co_switch(th_loader)
+		unreachable()
+	}
+}
+
+// Thread t ends: dormant, and a start's v0 is its result.
+@(private = "file")
+th_end :: proc(t: ^Iop_Thread, delete := false) {
+	s := &iop_sched
 	if t.start {
 		s.start_done = true
 		s.start_result = r3000.state.r[2]
 	}
 	t.status = .Dormant
 	t.exit_delete ||= delete
-	core.co_switch(th_loader)
-	unreachable()
 }
 
 // An HLE call failed in the running thread. In a start the load fails once
 // the start returns, or at once at its IOP_START_GAPS-th; any other thread,
 // or a command handler, is stopped there, dormant.
 th_call_failed :: proc() {
-	if iop_sched.intr {th_intr_stop(.Call)}
+	if iop_sched.intr {
+		th_intr_stop(.Call)
+		return
+	}
 	t := th_find(iop_sched.cur)
 	if t == nil || t.start {
 		l := &iop_loader
@@ -552,18 +685,31 @@ th_intr :: proc(handler, a0, a1: u32) -> Intr_Stop {
 	s := &iop_sched
 	assert(th_loader == nil && s.cur == 0, "iop: a handler run while the IOP runs")
 	saved := Th_Context{r3000.state.r, r3000.state.hi, r3000.state.lo, r3000.cop0, r3000.frame_ret}
-	if s.intr_co == nil {s.intr_co = core.co_create(th_intr_main, nil)}
+	when !core.FLAT {
+		if s.intr_co == nil {s.intr_co = core.co_create(th_intr_main, nil)}
+	}
 	s.intr, s.intr_stop = true, .None
 	s.intr_handler, s.intr_a0, s.intr_a1 = handler, a0, a1
 	th_loader = core.co_current
 	r3000.next_event = r3000.state.cycles + IOP_INTR_BUDGET
 	r3000.run_events = th_budget
-	core.co_switch(s.intr_co)
+	when core.FLAT {
+		// th_intr_main's one handler, on the handlers' run: a stopped one
+		// is dropped as it is, the next starting it over.
+		if th_intr_run == nil {th_intr_run = new(r3000.Flat_Ctx, core.emu_allocator())}
+		r := &r3000.state.r
+		r[4], r[5] = a0, a1
+		r[29] = IOP_INTR_STACK - 16
+		r3000.flat_start(th_intr_run, handler)
+		if r3000.flat_run(th_intr_run) {s.intr_v0 = r[2]}
+	} else {
+		core.co_switch(s.intr_co)
+	}
 	th_loader = nil
 	r3000.next_event = IOP_EVENT_OFF
 	r3000.run_events = proc() {}
 	s.intr = false
-	if s.intr_stop != .None {
+	if s.intr_stop != .None && s.intr_co != nil {
 		core.co_kill(s.intr_co)
 		s.intr_co = nil
 	}
@@ -588,12 +734,16 @@ th_intr_main :: proc(_: rawptr) {
 }
 
 // Stops the running command handler where it is; th_intr kills its
-// coroutine.
+// coroutine. Under FLAT it stops the handler's run and returns.
 @(private = "file")
 th_intr_stop :: proc(why: Intr_Stop) {
 	iop_sched.intr_stop = why
-	core.co_switch(th_loader)
-	unreachable()
+	when core.FLAT {
+		r3000.flat_block("an IOP handler's stop")
+	} else {
+		core.co_switch(th_loader)
+		unreachable()
+	}
 }
 
 // The ids a load's threads, semaphores and event flags start from.
@@ -621,7 +771,7 @@ th_undo :: proc(m: Th_Mark) {
 	for i := len(s.threads) - 1; i >= 0; i -= 1 {
 		t := &s.threads[i]
 		if t.id < thid {continue}
-		if t.co != nil {core.co_kill(t.co)}
+		th_drop(t)
 		ordered_remove(&s.threads, i)
 	}
 	for t in s.threads {assert(t.id < thid, "iop: a failed load's thread left queued")}

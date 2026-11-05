@@ -7,12 +7,13 @@ package ps2
 
 import "core:fmt"
 
+import "ps:core"
 import cpu "cpu"
 import host "host"
 import iop "iop"
 import kernel "kernel"
 import mem "mem"
-import psx_native "ps:psx/native"
+@(require) import psx_native "ps:psx/native" // used only without FLAT
 
 // What boot needs.
 Boot :: struct {
@@ -65,18 +66,33 @@ boot :: proc(b: Boot) -> bool {
 	init()
 	if b.setup != nil {b.setup() or_return}
 	host.platform_init(b.title) or_return
-	if b.native != "" {
-		if !load_native(b.native) {
-			if b.native_failed != nil {b.native_failed()}
-			return false
+	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
+	// native code would leave its host frames running on.
+	when core.FLAT {
+		what := ""
+		switch {
+		case b.native != "": what = "native code (Boot.native)"
+		case b.learned != "": what = "the IOP's learned code (Boot.learned)"
+		case b.learned_ee != "": what = "the EE's learned code (Boot.learned_ee)"
 		}
+		if what != "" {cpu.fatal("FLAT runs interpreted only: %s not installed", what)}
 	}
-	// After init, which makes the R3000 the IOP (iop.iop_cpu_init).
-	if b.learned != "" && !psx_native.load_learned(b.learned) && b.learned_failed != nil {
-		b.learned_failed()
-	}
-	if b.learned_ee != "" && !load_learned(b.learned_ee) && b.learned_ee_failed != nil {
-		b.learned_ee_failed()
+	// Under FLAT the loaders are not compiled in (the check above refuses
+	// what they load), so a FLAT build refers to no map_code.
+	when !core.FLAT {
+		if b.native != "" {
+			if !load_native(b.native) {
+				if b.native_failed != nil {b.native_failed()}
+				return false
+			}
+		}
+		// After init, which makes the R3000 the IOP (iop.iop_cpu_init).
+		if b.learned != "" && !psx_native.load_learned(b.learned) && b.learned_failed != nil {
+			b.learned_failed()
+		}
+		if b.learned_ee != "" && !load_learned(b.learned_ee) && b.learned_ee_failed != nil {
+			b.learned_ee_failed()
+		}
 	}
 	if b.hooks != nil {b.hooks() or_return}
 	// Without a blob, a port's hooks register its recompiled functions

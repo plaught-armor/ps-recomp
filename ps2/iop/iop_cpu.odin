@@ -11,12 +11,34 @@ package ps2_iop
 
 import "core:fmt"
 import "ps:core"
+@(require) import cpu "../cpu" // used only under FLAT
 import r3000 "ps:psx/cpu"
 
 IOP_EVENT_OFF :: max(u64)
 
-// Point psx_cpu's hooks at the IOP. Every hook is set, nil included: a
-// binary that links psx too has had them set to the PS1's at init.
+when core.FLAT {
+	// Point psx_cpu's hooks at the IOP. Every hook is set, nil included: a
+	// binary that links psx too has had them set to the PS1's at init.
+	// FLAT: the step of the continuation h on top of run x (r3000.flat_step).
+	// The guest calls host code makes on the IOP, and how FLAT runs each:
+	//   - a thread's entry (th_main): the thread's own run (th_flat_run);
+	//   - a command or interrupt handler (th_intr_main): the handlers' run;
+	//   - sceSifRpcLoop's server calls (rpc_exec): FLAT_RPC_LOOP;
+	//   - sdrdrv's user command handler (sdr_serve): FLAT_SDR_SERVE.
+	// None is nested (r3000.flat_nested), where a wait would be fatal.
+	@(private = "file")
+	iop_flat_step :: proc(x: ^r3000.Flat_Ctx, h: ^r3000.Flat_Host) {
+		switch h.tag {
+		case FLAT_RPC_LOOP:
+			rpc_loop_step(h)
+		case FLAT_SDR_SERVE:
+			sdr_serve_step(h)
+		case:
+			r3000.fatal("iop: flat continuation %d", h.tag)
+		}
+	}
+}
+
 iop_cpu_init :: proc() {
 	r3000.state = {}
 	r3000.learn_cpu = .Iop
@@ -30,7 +52,13 @@ iop_cpu_init :: proc() {
 	r3000.bios_syscall = proc() {r3000.fatal("iop: syscall %d", r3000.state.r[4])}
 	r3000.bios_entry = iop_hle_entry
 	r3000.irq_check = proc() {}
-	r3000.interp_run = r3000.interp_loop
+	when core.FLAT {
+		r3000.interp_run = r3000.flat_nested
+		r3000.flat_step = iop_flat_step
+		cpu.iop_flat_print = r3000.flat_print
+	} else {
+		r3000.interp_run = r3000.interp_loop
+	}
 	r3000.run_events = proc() {}
 	r3000.gte_cmd = nil
 	r3000.gte_read = nil

@@ -517,8 +517,16 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 		core.compat_unknown(.Iop_Import, core.compat_name(name), u32(s.version), pc = addr, ra = r[31])
 		fmt.eprintfln("iop: call to %s version %x fno %d, a major version the HLE does not serve", name, s.version, s.fno)
 	} else if v, ok := hle_fn(name, s.fno); ok {
-		r[2] = v
-		if iop_sched.resched {th_preempt()}
+		when core.FLAT {
+			// It stopped the thread: its return is owed to the resume. It
+			// went on as a continuation: that returns (hle_return).
+			if r3000.flat_stop {
+				th_flat_stopped(v)
+				return
+			}
+			if r3000.flat_deferred() {return}
+		}
+		hle_return(v)
 		return
 	} else {
 		core.compat_unknown(.Iop_Call, core.compat_name(name), s.fno, pc = addr, ra = r[31])
@@ -526,6 +534,13 @@ hle_call :: proc(addr: u32, s: Hle_Stub) {
 	}
 	r[2] = ke(KE_ERROR)
 	th_call_failed()
+}
+
+// An HLE function returns v to its guest caller, which yields first when
+// it readied a thread of better priority.
+hle_return :: proc(v: u32) {
+	r3000.state.r[2] = v
+	if iop_sched.resched {th_preempt()}
 }
 
 // Maps a call to IOP address `addr` to function fno of the HLE's library

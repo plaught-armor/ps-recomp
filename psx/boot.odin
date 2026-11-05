@@ -10,7 +10,7 @@ import bios "bios"
 import cpu "cpu"
 import host "host"
 import io "io"
-import native "native"
+@(require) import native "native" // used only without FLAT
 import spu "spu"
 
 // What run needs from the port.
@@ -71,22 +71,41 @@ run :: proc(b: Boot) -> bool {
 	if b.setup != nil {b.setup() or_return}
 	host.platform_init(b.title) or_return
 
+	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
+	// native code would leave its host frames running on.
+	when core.FLAT {
+		what := ""
+		switch {
+		case len(b.funcs) > 0: what = "recompiled functions (Boot.funcs)"
+		case b.overlays != nil: what = "recompiled overlays (Boot.overlays)"
+		case b.native != "": what = "native code (Boot.native)"
+		case b.learned_funcs != nil: what = "recompiled learned functions (Boot.learned_funcs)"
+		case b.learned != "": what = "learned code (Boot.learned)"
+		}
+		if what != "" {cpu.fatal("FLAT runs interpreted only: %s not installed", what)}
+	}
 	cpu.register_funcs(b.funcs)
 	if b.overlays != nil {b.overlays()}
 	// On failure load_native prints why and the Odin functions stay; a
 	// standalone blob has none behind it. With neither, every function is
 	// interpreted: a disc nobody has converted still runs, slowly.
+	// Under FLAT the loaders are not compiled in (the check above refuses
+	// what they load), so a FLAT build refers to no map_code.
 	standalone := len(b.funcs) == 0
-	if b.native != "" && !load_native(b.native, standalone) && standalone {
-		if b.native_failed != nil {b.native_failed()}
-		return false
+	when !core.FLAT {
+		if b.native != "" && !load_native(b.native, standalone) && standalone {
+			if b.native_failed != nil {b.native_failed()}
+			return false
+		}
 	}
 	if standalone && b.native == "" {
 		fmt.eprintln("psx: no native code, interpreting everything")
 	}
-	if b.learned_funcs != nil {b.learned_funcs()}
-	if b.learned != "" && !native.load_learned(b.learned) && b.learned_failed != nil {
-		b.learned_failed()
+	when !core.FLAT {
+		if b.learned_funcs != nil {b.learned_funcs()}
+		if b.learned != "" && !native.load_learned(b.learned) && b.learned_failed != nil {
+			b.learned_failed()
+		}
 	}
 	if b.hooks != nil {b.hooks() or_return}
 	cpu.watch_code()

@@ -125,12 +125,51 @@ sdr_serve :: proc(fno, buf, size: u32) -> u32 {
 		if !sdr_server(fno, out, size, client) {core.compat_unknown(.Sif_Rpc, SDR_SID, fno, client = client)}
 		return res
 	}
-	r := &r3000.state.r
-	r[4], r[5] = fno, buf
-	r3000.call(h)
-	for &x in out {x = 0}
-	w32(res, r[2])
-	return res
+	when core.FLAT {
+		c := (^Sdr_Cont)(&r3000.flat_push_cont(FLAT_SDR_SERVE).w)
+		c^ = {h, fno, buf, res, false}
+		return res
+	} else {
+		r := &r3000.state.r
+		r[4], r[5] = fno, buf
+		r3000.call(h)
+		sdr_reply(res)
+		return res
+	}
+}
+
+// The handler returned: its v0 is the reply, the rest of the area cleared.
+@(private = "file")
+sdr_reply :: proc(res: u32) {
+	for &x in iop_ram_at(res, SDR_RET) {x = 0}
+	w32(res, r3000.state.r[2])
+}
+
+// FLAT: sdr_serve's call of the handler as a continuation
+// (r3000.flat_push_cont), on the thread's run, where it may wait.
+FLAT_SDR_SERVE :: 2
+
+Sdr_Cont :: struct {
+	h, fno, buf, res: u32,
+	called:           bool,
+}
+#assert(size_of(Sdr_Cont) <= r3000.FLAT_HOST_WORDS * size_of(u32))
+
+when core.FLAT {
+	sdr_serve_step :: proc(h: ^r3000.Flat_Host) {
+		c := (^Sdr_Cont)(&h.w)
+		if !c.called {
+			c.called = true
+			r := &r3000.state.r
+			r[4], r[5] = c.fno, c.buf
+			r3000.flat_call(c.h)
+			return
+		}
+		res := c.res
+		sdr_reply(res)
+		r3000.flat_pop_cont()
+		hle_return(res)
+	}
 }
 
 // An EE sdrdrv RPC `fno` from EE client `client` whose handler is set and

@@ -11,9 +11,12 @@ import "ps:core"
 flat_returns, flat_mismatch: u64
 // The deepest shadow return stack of any run.
 flat_max_depth: u32
+// The IOP's counts (r3000.flat_print), set once the IOP is (iop_cpu_init).
+iop_flat_print: proc()
 
 flat_print :: proc() {
 	when core.FLAT {
 		fmt.eprintfln("ee flat: %d returns, %d with $ra not the call's return address, %d deep at most", flat_returns, flat_mismatch, flat_max_depth)
+		if iop_flat_print != nil {iop_flat_print()}
 	}
 }

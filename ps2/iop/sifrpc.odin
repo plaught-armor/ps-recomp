@@ -81,7 +81,13 @@ sifrpc_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		rpc_queue_set(a0, a1)
 		return 0, true
 	case 22: // sceSifRpcLoop(qd): returns only on a thread that cannot sleep
-		return rpc_loop(a0), true
+		when core.FLAT {
+			c := (^Rpc_Loop_Cont)(&r3000.flat_push_cont(FLAT_RPC_LOOP).w)
+			c.qd = a0
+			return 0, true
+		} else {
+			return rpc_loop(a0), true
+		}
 	case 24: // sceSifRemoveRpc(sd, qd)
 		return rpc_remove(a0, a1), true
 	case 25: // sceSifRemoveRpcQueue(qd)
@@ -304,25 +310,99 @@ rpc_fits :: proc(buf, size: u32) -> bool {
 // returned.
 @(private = "file")
 rpc_loop :: proc(qd: u32) -> u32 {
-	s := &iop_rpc
 	for {
-		req: Iop_Rpc_Req
-		found := false
-		for v, i in s.reqs[:s.n_reqs] {
-			if v.qd != qd {continue}
-			req, found = v, true
-			rpc_req_remove(i)
-			break
-		}
-		q := rpc_queue(qd)
-		if q == nil || !found {
-			if q != nil {q.busy = false}
+		req, found := rpc_next(qd)
+		if !found {
 			if v := th_sleep(); v != KE_OK {return v}
 			continue
 		}
-		q.busy, q.cur = true, req
 		rpc_exec(req)
-		if q = rpc_queue(qd); q != nil {q.busy = false}
+		if q := rpc_queue(qd); q != nil {q.busy = false}
+	}
+}
+
+// Takes queue qd's first request off the list, its queue then busy with it;
+// none, the queue free, when there is none or the queue is gone.
+@(private = "file")
+rpc_next :: proc(qd: u32) -> (req: Iop_Rpc_Req, found: bool) {
+	s := &iop_rpc
+	for v, i in s.reqs[:s.n_reqs] {
+		if v.qd != qd {continue}
+		req, found = v, true
+		rpc_req_remove(i)
+		break
+	}
+	q := rpc_queue(qd)
+	if q == nil || !found {
+		if q != nil {q.busy = false}
+		return {}, false
+	}
+	q.busy, q.cur = true, req
+	return req, true
+}
+
+// FLAT: rpc_loop as a continuation (r3000.flat_push_cont), whose server
+// calls run on the thread's run, where they may wait.
+FLAT_RPC_LOOP :: 1
+
+Rpc_Loop_Cont :: struct {
+	qd:    u32,
+	phase: enum u32 {
+		Next, // take the next request, or sleep
+		Slept, // the sleep returned: its wake decides
+		Served, // the server function returned
+	},
+	req:   Iop_Rpc_Req,
+	saved: [32]u32, // rpc_exec's registers
+}
+#assert(size_of(Rpc_Loop_Cont) <= r3000.FLAT_HOST_WORDS * size_of(u32))
+
+when core.FLAT {
+	// rpc_loop's steps: each runs on until it calls the server, stops the run
+	// on a sleep, or returns from sceSifRpcLoop.
+	rpc_loop_step :: proc(h: ^r3000.Flat_Host) {
+		c := (^Rpc_Loop_Cont)(&h.w)
+		for {
+			switch c.phase {
+			case .Next:
+				req, found := rpc_next(c.qd)
+				if found {
+					c.req = req
+					c.saved = rpc_exec_begin(req)
+					c.phase = .Served
+					r3000.flat_call(r32(req.sd + 4))
+					return
+				}
+				v := th_sleep()
+				if r3000.flat_stop {
+					c.phase = .Slept
+					return
+				}
+				if v != KE_OK {
+					rpc_loop_return(v)
+					return
+				}
+			case .Slept:
+				c.phase = .Next
+				if v := th_find(iop_sched.cur).wake; v != KE_OK {
+					rpc_loop_return(v)
+					return
+				}
+			case .Served:
+				rpc_exec_end(c.req, c.saved)
+				if q := rpc_queue(c.qd); q != nil {q.busy = false}
+				c.phase = .Next
+			}
+		}
+	}
+}
+
+when core.FLAT {
+	// sceSifRpcLoop returns v.
+	@(private = "file")
+	rpc_loop_return :: proc(v: u32) {
+		r3000.flat_pop_cont()
+		hle_return(v)
 	}
 }
 
@@ -338,12 +418,26 @@ rpc_req_remove :: proc(i: int) {
 // sends no bytes.
 @(private = "file")
 rpc_exec :: proc(req: Iop_Rpc_Req) {
+	saved := rpc_exec_begin(req)
+	r3000.call(r32(req.sd + 4))
+	rpc_exec_end(req, saved)
+}
+
+// rpc_exec up to the call: the registers it puts back after.
+@(private = "file")
+rpc_exec_begin :: proc(req: Iop_Rpc_Req) -> [32]u32 {
 	r := &r3000.state.r
 	saved := r^
 	r[4], r[5], r[6] = req.fno, r32(req.sd + 8), req.size
 	iop_rpc.calls += 1
 	if cpu.debug >= 1 {fmt.eprintfln("iop: rpc %08x fno %d size %d", req.sid, req.fno, req.size)}
-	r3000.call(r32(req.sd + 4))
+	return saved
+}
+
+// rpc_exec once the server function returned.
+@(private = "file")
+rpc_exec_end :: proc(req: Iop_Rpc_Req, saved: [32]u32) {
+	r := &r3000.state.r
 	res := r[2]
 	r^ = saved
 	if res != 0 && req.receive != 0 && req.rsize != 0 {

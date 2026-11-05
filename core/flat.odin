@@ -1,7 +1,9 @@
 // FLAT: every console thread runs on the flat interpreters, which keep the
 // guest pc and a shadow return stack per thread in emulated memory instead
 // of host call frames. A thread switch is then a swap of that state, so no
-// coroutine (host stack) is needed. No recompiled or learned code runs, and
+// coroutine (host stack) is needed. No recompiled or learned code runs: a
+// thread switch inside it would leave its host frames running on, so the
+// boot refuses it (fatal), as does registering recompiled learned functions.
 // LEARN records nothing.
 //
 // On by default on wasi, where host stacks cannot be switched or copied. A
