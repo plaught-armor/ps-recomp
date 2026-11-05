@@ -1,11 +1,11 @@
 // The C maths functions LLVM calls on wasi_wasm32. LLVM turns math.sin,
 // math.cos and math.exp on f32, math.sin and math.pow on f64 and the simd
-// max/min on f64 into calls to the C library's sinf, cosf, expf, sin, pow,
-// fmax and fmin, and math.pow(2, y) into exp2(y); wasi_wasm32 has no C
-// library, so without these the module would import them. They are ports
-// chosen to give the same bits as the Linux x86-64 host build, whose libm is
-// glibc built with FMA (x86-64-v3), so a run in the browser computes what a
-// desktop run computes:
+// reduce_max/reduce_min on f64 into calls to the C library's sinf, cosf,
+// expf, sin, pow, fmax and fmin, and math.pow(2, y) into exp2(y);
+// wasi_wasm32 has no C library, so without these the module would import
+// them. They are ports chosen to give the same bits as the Linux x86-64
+// host build, whose libm is glibc built with FMA (x86-64-v3), so a run in
+// the browser computes what a desktop run computes:
 //   - sinf, cosf, expf, pow and exp2 are glibc's (from Arm's
 //     optimized-routines). Each multiply-add the FMA build fuses is written
 //     as an explicit fma. wasm has no fma instruction, so fma is musl's exact
@@ -14,10 +14,16 @@
 //     sin on the inputs the tree passes (k*pi/60 for k = 0..30, adx_gain's
 //     pan), not on every input.
 //   - fmax and fmin have C semantics: a NaN operand gives the other operand.
-// tests/libm_wasi checks sinf, cosf and expf on all 2^32 inputs, and sin,
-// pow and exp2 on the inputs the tree passes and on random ones, against
-// glibc. The other hosts still use their own C library; this file is wasm
-// only.
+//     On a tie of +0 and -0 they give +0 (fmax) or -0 (fmin), where the
+//     host's maxpd and minpd pick by operand order. Whether the one caller,
+//     psx/render/gpu.odin texels_read, can meet that tie is not traced.
+// A NaN result's sign and payload are not matched: x86 makes 0/0 negative,
+// and wasm leaves NaN signs unspecified.
+// tests/libm_wasi checks sinf, cosf and expf on all 2^32 inputs, sin, pow
+// and exp2 on the inputs the tree passes and on random ones, and fmax and
+// fmin as texels_read calls them on pairs of edge values (the tie left
+// out), against glibc. The other hosts still use their own C library; this
+// file is wasm only.
 //
 // Sources, licences and notices:
 // - glibc 2.44: sysdeps/ieee754/flt-32/s_sinf.c, s_cosf.c, s_sincosf.h,

@@ -9,9 +9,14 @@
 //                            chunk, "<f> <chunk> <hash of the results>"
 //   list <s|c|e> <chunk>     one line per input of one chunk, "<x> <f(x)>"
 //   domain                   sin and pow(2, y) on the inputs the tree passes
-//                            them (ps2/iop/adx.odin, ps2/iop/libsd.odin), one
-//                            line each, then pow and exp2 on random inputs,
-//                            a hash per block of 4096
+//                            them (ps2/iop/adx.odin, ps2/iop/libsd.odin), and
+//                            fmax and fmin as psx/render/gpu.odin calls them
+//                            (simd.reduce_max and simd.reduce_min on f64
+//                            lanes) on pairs
+//                            of NaNs, signed zeros and edge values, one line
+//                            each;
+//                            then pow and exp2 on random inputs, a hash per
+//                            block of 4096
 //   randomblock <block>      the random calls of one block, "<x> <y>
 //                            <result>" as hex bits
 //   pow <x> <y>              one pow call, operands as hex bits
@@ -25,6 +30,7 @@ import "base:intrinsics"
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:simd"
 import "core:strconv"
 import "core:strings"
 
@@ -85,6 +91,33 @@ opaque :: proc(x: i32) -> i32 {
 	return intrinsics.volatile_load(&v)
 }
 
+opaque_f64 :: proc(x: u64) -> f64 {
+	v := x
+	return transmute(f64)intrinsics.volatile_load(&v)
+}
+
+// fmax and fmin operands, as bits: NaNs, signed zeros, infinities, the
+// subnormal and finite extremes, and values around integers (texels_read
+// floors and truncates its results).
+EDGE_INPUTS :: [?]u64 {
+	0x7ff8000000000000, // NaN
+	0xfff8000000000000, // -NaN
+	0x0000000000000000, // +0
+	0x8000000000000000, // -0
+	0x7ff0000000000000, // +inf
+	0xfff0000000000000, // -inf
+	0x0000000000000001, // the least subnormal
+	0x8000000000000001, // its negative
+	0x7fefffffffffffff, // the largest finite
+	0xffefffffffffffff, // its negative
+	0x3ff0000000000000, // 1
+	0xbff0000000000000, // -1
+	0x3ff8000000000000, // 1.5
+	0xbff8000000000000, // -1.5
+	0x3fefffffffffffff, // just below 1
+	0xbfefffffffffffff, // just above -1
+}
+
 domain :: proc() {
 	// The expressions are the tree's, so each host build makes the calls the
 	// tree makes; LLVM turns pow(2, y) into exp2(y).
@@ -96,6 +129,21 @@ domain :: proc() {
 	}
 	for f in i32(0) ..< 128 {
 		emit("pow2 f %d %016x\n", f, f64_bits(math.pow(2, f64(opaque(f)) / 1536)))
+	}
+	// psx/render/gpu.odin texels_read's simd.reduce_max and simd.reduce_min
+	// on f64 lanes, which call fmax and fmin on wasm (simd.max and simd.min
+	// compare and select instead), on every pair of EDGE_INPUTS but +0 with
+	// -0, whose result differs by design (docs/testing.md).
+	F :: #simd[4]f64
+	for x, i in EDGE_INPUTS {
+		for y, j in EDGE_INPUTS {
+			if x != y && x | y == 0x8000000000000000 {
+				continue
+			}
+			a, b := opaque_f64(x), opaque_f64(y)
+			emit("fmax %d %d %016x\n", i, j, f64_bits(simd.reduce_max(F{a, b, b, b})))
+			emit("fmin %d %d %016x\n", i, j, f64_bits(simd.reduce_min(F{a, b, b, b})))
+		}
 	}
 	seed: u64 = 1
 	for b in 0 ..< RANDOM_BLOCKS {

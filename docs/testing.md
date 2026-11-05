@@ -158,11 +158,28 @@ A run that interprets many functions writes many: about 545 MB in a
 
 The `wasi_wasm32` build has no C library, so `core/libm_wasi.odin` supplies
 the maths functions the tree calls (`sinf`, `cosf`, `expf`, `sin`, `pow`,
-`exp2`, `fmax`, `fmin`), ported from glibc so results match a glibc host bit
-for bit. `tests/libm_wasi` checks them: build it for the host and for
-`wasi_wasm32`, and `tests/libm_wasi/run.mjs` runs both, the wasm under Node
-on `web/wasi.js`, and compares. Run it after any change to
-`core/libm_wasi.odin`, on a glibc host; it needs Node 24 or newer.
+`exp2`, `fmax`, `fmin`), so that results match the Linux x86-64 build bit
+for bit. `sinf`, `cosf`, `expf`, `pow` and `exp2` are ported from glibc and
+match it on every input; `sin` is fdlibm's and matches glibc only on the
+inputs the tree passes it. `tests/libm_wasi` checks them: build it for the
+host and for `wasi_wasm32`, and `tests/libm_wasi/run.mjs` runs both, the
+wasm under Node on `web/wasi.js`, and compares. Run it after any change to
+`core/libm_wasi.odin`; it needs Node 24 or newer.
+
+The reference is a glibc compiled for x86-64-v3 or later (FMA), such as
+CachyOS's v3 and v4 packages: the ports fuse the multiply-adds that build
+fuses. A stock x86-64 glibc picks FMA variants at run time for some of
+these functions only, so on it the test can report differences, in `exp2`
+for one, that are not bugs in the ports. `run.mjs` refuses a host build that
+does not link glibc's `libm.so.6`.
+
+Two differences remain by design. `fmax` and `fmin` follow C on a tie of
+`+0` and `-0` (`fmax` gives `+0`, `fmin` gives `-0`), where the host's
+`maxpd` and `minpd` pick by operand order. Whether their one caller,
+`texels_read` in `psx/render/gpu.odin`, can meet that tie is not traced;
+the test leaves the pair out. And a NaN result's sign and payload are
+not matched: x86 makes `0/0` negative and wasm leaves NaN signs unspecified,
+so the test compares every NaN as one value.
 
 ```sh
 odin build tests/libm_wasi -collection:ps=. -o:speed -out:libm_host
@@ -172,7 +189,9 @@ node tests/libm_wasi/run.mjs libm_host libm_wasi.wasm
 
 It covers every `f32` input of `sinf`, `cosf` and `expf` (3 x 2^32
 calls, 2 to 3 minutes on 8 cores), `sin` and `pow(2, y)` on the inputs the
-tree passes them, and `pow` and `exp2` on 1310720 random inputs. It prints
+tree passes them, `fmax` and `fmin` as `texels_read` calls them
+(`simd.reduce_max` and `simd.reduce_min` on `f64` lanes) on every pair of 16 edge values
+(NaNs, signed zeros, infinities, extremes, values around integers), and `pow` and `exp2` on 1310720 random inputs. It prints
 each input whose result differs (the first 10000) and their count, and
 exits 1 if any does; `--only s|c|e|domain` runs one part.
 

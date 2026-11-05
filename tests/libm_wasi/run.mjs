@@ -10,7 +10,7 @@
 //
 // Counts and lists the inputs whose results differ (the first 10000), and
 // exits 1 if any does.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { readFileSync } from "node:fs";
 import { argv, exit, stderr, stdout } from "node:process";
@@ -46,6 +46,14 @@ if (args.length < 2 || !(jobs > 0) || !(only === null || ["s", "c", "e", "domain
 	exit(2);
 }
 const [host, wasm] = args;
+
+// The reference is glibc's libm: a host build linked to anything else (a
+// static musl one, say) could agree or differ by accident.
+const ldd = spawnSync("ldd", [host], { encoding: "utf8" });
+if (ldd.status !== 0 || !/\blibm\.so\.6\b/.test(ldd.stdout)) {
+	console.error(`${host} does not link glibc's libm.so.6 (ldd: ${(ldd.stdout || ldd.stderr || ldd.error?.message || "").trim()})`);
+	exit(2);
+}
 
 // Runs one build with the given arguments; resolves to its output.
 const runRaw = (wasmBuild, a) =>
