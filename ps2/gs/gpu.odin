@@ -60,17 +60,19 @@ Hw_State :: struct {
 	mtb:                                     [6]u32, // levels 1..6: TBP | TBW << 16
 	dec, dec_ls:                             u32, // see hw_dec: offset in hw.dec (0: none), words per layer
 }
-#assert(size_of(Hw_State) == 160)
 
+// SNAP: the texture is read from hw.snap (see hw_snap).
 @(private)
-Hw_Flag :: enum u32 {TME, FGE, ABE, FST, ATE, DATE, DATM, ZTE, ZMSK, PABE, FBA, COLCLAMP, TCC, BILINEAR, AEM}
+Hw_Flag :: enum u32 {TME, FGE, ABE, FST, ATE, DATE, DATM, ZTE, ZMSK, PABE, FBA, COLCLAMP, TCC, BILINEAR, AEM, SNAP}
 
 // Push constants, as declared by each shader.
 @(private)
 Draw_PC :: struct {
-	vram, states, cluts, verts, dec: vk.DeviceAddress,
-	scale:                           u32,
+	vram, states, cluts, verts, dec, snap: vk.DeviceAddress,
+	scale:                                 u32,
 }
+// The layouts shaders/draw.glsl declares: State, and PC after it.
+#assert(size_of(Hw_State) == 160 && offset_of(Draw_PC, scale) == 48)
 @(private)
 Upload_PC :: struct {
 	vram, data:                                vk.DeviceAddress,
@@ -171,6 +173,11 @@ hw: struct {
 	dec_map:             map[Dec_Key]Dec_Entry,
 	dec_top:             u32,
 	dec_seq:             u64, // seq when the current state's texture was looked up
+	// Local memory's layout, holding the pages of the textures hw_snap
+	// copied; created on first use. A page's copy is current while
+	// page_seq < snap_seq (one past seq when it was copied).
+	snap:                core.Vk_Buf,
+	snap_seq:            [PAGES]u64,
 	// The transfer being gathered into one dispatch.
 	up:                  struct {
 		active:                                bool,
@@ -290,7 +297,7 @@ hw_flush_draws :: proc() {
 		vk.CmdBindPipeline(s.cmd, .GRAPHICS, hw.prim)
 		vp := vk.Viewport{0, 0, f32(size), f32(size), 0, 1}
 		vk.CmdSetViewport(s.cmd, 0, 1, &vp)
-		pc := Draw_PC{hw.vram.addr, s.states.addr, s.cluts.addr, s.verts.addr, hw.dec.addr, hw.scale}
+		pc := Draw_PC{hw.vram.addr, s.states.addr, s.cluts.addr, s.verts.addr, hw.dec.addr, hw.snap.addr, hw.scale}
 		vk.CmdPushConstants(s.cmd, hw.draw_layout, {.VERTEX, .FRAGMENT}, 0, size_of(pc), &pc)
 		hw.rendering = true
 	}
@@ -463,11 +470,10 @@ hw_clut :: proc(cpsm, cbp, cbw, cou, cov: u32, csm2: bool, n, base: u32) {
 
 // ----------------------------------------------------------- primitives
 
-// Pages holding rows y0..y1 of a buffer at block `bp`, `bw` 64-pixel units
-// wide; a superset, for hazard tracking.
+// A page's width and height in pixels of format psm.
 @(private)
-page_span :: proc(psm, bp, bw, y0, y1: u32) -> [2]u32 {
-	pw, ph: u32 = 64, 32
+page_dims :: proc(psm: u32) -> (pw, ph: u32) {
+	pw, ph = 64, 32
 	switch psm_bits(psm) {
 	case 16: ph = 64
 	case 8: pw, ph = 128, 64
@@ -475,20 +481,42 @@ page_span :: proc(psm, bp, bw, y0, y1: u32) -> [2]u32 {
 		if psm == PSMT4 {pw, ph = 128, 128}
 	}
 	if psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH {pw, ph = 64, 32}
+	return
+}
+
+// Pages holding rows y0..y1 of a buffer at block `bp`, `bw` 64-pixel units
+// wide; a superset, for hazard tracking.
+@(private)
+page_span :: proc(psm, bp, bw, y0, y1: u32) -> [2]u32 {
+	pw, ph := page_dims(psm)
 	per_row := max(bw * 64 / pw, 1)
 	first := bp / 32 + (y0 / ph) * per_row
 	n := (y1 / ph - y0 / ph + 1) * per_row + 1 // +1: bp need not be page-aligned
 	return {first, min(n, PAGES)}
 }
 
-// Pages of every level the texture can sample, as one span.
+// Pages of every level the texture can sample, as one span. Region wrap
+// samples texels outside w x h, and a texel past the buffer's width lies in
+// the pages of a later row.
 @(private)
 tex_span :: proc(t: ^Tex) -> [2]u32 {
-	span := page_span(t.psm, t.tbp, t.tbw, 0, t.h - 1)
-	if t.mmin < 2 {return span}
-	lo, hi := span[0], span[0] + span[1]
-	for n in 1 ..= t.mxl {
-		l := page_span(t.psm, t.mtbp[n], t.mtbw[n], 0, max(t.h >> n, 1) - 1)
+	// The last texel of level n along an axis (wrap_coord in prim.frag).
+	last :: proc(wm, size, lo, hi, n: u32) -> u32 {
+		l := max(size >> n, 1) - 1
+		switch wm {
+		case 2: return max(l, max(lo, hi) >> n)
+		case 3: return max(l, lo | hi)
+		}
+		return l
+	}
+	pw, ph := page_dims(t.psm)
+	lo, hi := u32(max(u32)), u32(0)
+	for n in 0 ..= (t.mmin < 2 ? 0 : t.mxl) {
+		bp, bw := t.tbp, t.tbw
+		if n > 0 {bp, bw = t.mtbp[n], t.mtbw[n]}
+		x1, y1 := last(t.wms, t.w, t.minu, t.maxu, n), last(t.wmt, t.h, t.minv, t.maxv, n)
+		l := page_span(t.psm, bp, bw, 0, y1)
+		l[1] = max(l[1], y1 / ph * max(bw * 64 / pw, 1) + x1 / pw + 2) // +1: bp need not be page-aligned
 		lo, hi = min(lo, l[0]), max(hi, l[0] + l[1])
 	}
 	return {lo, min(hi - lo, PAGES)}
@@ -557,6 +585,60 @@ pages_hit :: proc(set: ^Page_Set, span: [2]u32) -> bool {
 	return false
 }
 
+@(private)
+spans_meet :: proc(a, b: [2]u32) -> bool {
+	set: Page_Set
+	pages_mark(&set, b)
+	return pages_hit(&set, a)
+}
+
+// Copy the pages of span, in every layer, to the same addresses in hw.snap,
+// after every command before and ahead of every command after. Only pages
+// written since their last copy are copied; none written records nothing.
+@(private)
+hw_snap :: proc(span: [2]u32) {
+	PAGE_BYTES :: VRAM_WORDS * 4 / PAGES
+	layers := hw.scale * hw.scale
+	if hw.snap.buf == 0 {
+		hw.snap = core.vk_buf_create(int(layers) * VRAM_WORDS * 4, {.STORAGE_BUFFER, .TRANSFER_DST}, {.DEVICE_LOCAL})
+	}
+	// Runs of stale pages, first page and count; a run never wraps.
+	runs: [PAGES / 2 + 1][2]u32
+	nr := 0
+	for i in 0 ..< span[1] {
+		p := (span[0] + i) % PAGES
+		if hw.page_seq[p] < hw.snap_seq[p] {continue}
+		hw.snap_seq[p] = hw.seq + 1
+		if nr > 0 && runs[nr - 1][0] + runs[nr - 1][1] == p {
+			runs[nr - 1][1] += 1
+		} else {
+			runs[nr] = {p, 1}
+			nr += 1
+		}
+	}
+	if nr == 0 {return}
+	s := &hw.slots[hw.cur]
+	hw_flush_draws()
+	hw_end_render()
+	hw_barrier(s.cmd)
+	r: [64]vk.BufferCopy
+	n := 0
+	for l in 0 ..< layers {
+		base := vk.DeviceSize(l) * VRAM_WORDS * 4
+		for run in runs[:nr] {
+			at := base + vk.DeviceSize(run[0]) * PAGE_BYTES
+			r[n] = {at, at, vk.DeviceSize(run[1]) * PAGE_BYTES}
+			n += 1
+			if n == len(r) {
+				vk.CmdCopyBuffer(s.cmd, hw.vram.buf, hw.snap.buf, u32(n), &r[0])
+				n = 0
+			}
+		}
+	}
+	if n > 0 {vk.CmdCopyBuffer(s.cmd, hw.vram.buf, hw.snap.buf, u32(n), &r[0])}
+	hw.barrier_due = true
+}
+
 // The decoded copy of a state's texture, decoding it now when there is no
 // valid one: its offset in hw.dec and words per layer, or offset 0 to read
 // local memory. Only direct-colour textures that repeat or clamp, whose
@@ -565,9 +647,9 @@ pages_hit :: proc(set: ^Page_Set, span: [2]u32) -> bool {
 // primitive (each one writes its pages and so outdates the copy): read
 // straight from local memory, a fragment would race the same primitive's
 // writes to the texels it samples, which tiles of the screen win in no
-// fixed order. A texture read straight from local memory (a CLUT format,
-// region wrap, or too big to decode at this scale) still races so; that
-// path wants a copy of the pages taken before the primitive.
+// fixed order. A texture read straight from local memory there (a CLUT
+// format, region wrap, or too big to decode at this scale) is read from a
+// copy of its pages instead (hw_snap in hw_state).
 @(private)
 hw_dec :: proc(t: ^Tex, st: ^Hw_State, tex: [2]u32) -> (off, stride: u32) {
 	switch t.psm {
@@ -702,6 +784,13 @@ hw_state :: proc(c: ^Ctx) -> u32 {
 	if c.tme {
 		st.dec, st.dec_ls = hw_dec(t, &st, tex)
 		hw.dec_seq = hw.seq
+		// Not decoded but sharing a page with the frame or depth buffer: the
+		// pages as they stand before the primitive, as hw_dec takes them.
+		if st.dec == 0 && (spans_meet(tex, fb) || spans_meet(tex, z)) {
+			hw_snap(tex)
+			f += {.SNAP}
+			st.flags = transmute(u32)f
+		}
 		if hw.state_ok && st == hw.state {return hw.state_idx}
 	}
 	hw.state, hw.state_ok = st, true

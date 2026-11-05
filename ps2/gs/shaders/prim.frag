@@ -40,7 +40,8 @@ uint expand16(uint c) { return texel16(c, S.ta, (S.flags & F_AEM) != 0u); }
 // Texel as RGBA8888 (R in the low byte).
 uint fetch(uint x, uint y) {
 	if (DEC != 0u) return pc.dec.w[DEC + y * DW + x];
-	uint raw = read_raw(S.tpsm, TBP, TBW, x, y);
+	Pixel p = pixel(S.tpsm, TBP, TBW, x, y);
+	uint raw = (S.flags & F_SNAP) != 0u ? (pc.snap.w[LB + p.i] >> p.sh) & p.m : load(p);
 	switch (S.tpsm) {
 	case PSMCT32: case PSMCT24: case PSMCT16: case PSMCT16S:
 		return texel_direct(S.tpsm, raw, S.ta, (S.flags & F_AEM) != 0u);

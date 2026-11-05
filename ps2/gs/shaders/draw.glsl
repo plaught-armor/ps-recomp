@@ -45,6 +45,7 @@ struct State {
 #define F_TCC (1u << 12)
 #define F_BILINEAR (1u << 13)
 #define F_AEM (1u << 14)
+#define F_SNAP (1u << 15) // the texture is read from pc.snap
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer Verts {
 	Vert v[];
@@ -53,8 +54,9 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer Verts {
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly restrict buffer States {
 	State s[];
 };
-// Decoded textures: written only by decode.comp, before the barrier ahead of
-// the draws that read them, so they need no coherent loads.
+// Decoded textures and page copies: written only by decode.comp and
+// hw_snap's copy, before the barrier ahead of the draws that read them, so
+// they need no coherent loads.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly restrict buffer Plain {
 	uint w[];
 };
@@ -65,5 +67,6 @@ layout(push_constant) uniform PC {
 	Words cluts;
 	Verts verts;
 	Plain dec;
+	Plain snap; // local memory's layout, the texture's pages before the primitive
 	uint scale;
 } pc;
