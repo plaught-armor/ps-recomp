@@ -6,6 +6,19 @@
 // when it needs input the in FIFO lacks, or the out FIFO is full, it
 // switches back to whoever poked the IPU, and resumes at the next register
 // access, FIFO access or DMA kick.
+//
+// Under FLAT there is no coroutine: a command is restartable. It stops
+// where the coroutine would wait and leaves the guest-visible state as the
+// coroutine shows it there. Out FIFO full: the rest of that output is kept
+// in pend and the command resumes after it. Input dry: the decoder reads
+// zero bits until it unwinds, the visible state at the wait is put back,
+// and once the input the wait needed arrives the command re-runs from its
+// last checkpoint, replaying the quadwords journaled since (ipu_resume).
+// Checkpoints sit at the command start, after each output and before the
+// final TOP peek, so no output, and no visible state a command word
+// written during the wait could clear, lies between a checkpoint and a
+// wait for input. A re-run reads guest registers only through values
+// latched on its first read (ipu_ctrl_in).
 package ps2_ipu
 
 import "base:intrinsics"
@@ -71,6 +84,80 @@ Ipu :: struct {
 @(private)
 ipu: Ipu
 
+// Where a command resumes: Start runs it from its command word; Body is
+// IDEC's macroblock loop (after the setup), or the CSC/PACK loop; Mba is
+// IDEC after a macroblock's output, at the next address increment; Tail is
+// ipu_tail; Top is the TOP peek that ends IDEC, BDEC and VDEC, after all
+// the state they show (DATA, ECD/SCD), so a re-run from it only peeks and a
+// command word written while it waits keeps what it cleared. The coroutine
+// path runs each command once from Start, and the phase never moves
+// (ipu_mark is a no-op there).
+@(private)
+Ipu_Phase :: enum u8 {Start, Body, Mba, Tail, Top}
+
+@(private)
+Ipu_Run :: struct {
+	cmd:   u32, // the running command, latched when it starts
+	phase: Ipu_Phase,
+	left:  u32, // CSC/PACK macroblocks still to do
+}
+
+@(private)
+ipu_run: Ipu_Run
+
+when core.FLAT {
+	@(private)
+	Ipu_Stall :: enum u8 {None, In, Out}
+
+	// What a re-run restores. The rest of the decoder state is set again
+	// before use by the phase it resumes at.
+	@(private)
+	Ipu_Mark :: struct {
+		buf:     [3]u128,
+		bp, fp:  u32,
+		dc_pred: [3]i32,
+		qs:      i32,
+		run:     Ipu_Run,
+	}
+
+	// The state at an input wait, put back once the zero-bit decode has
+	// unwound: the guest-visible part, and the decoder state a reset there
+	// leaves for the next command as the coroutine's kill does.
+	@(private)
+	Ipu_Live :: struct {
+		buf:                     [3]u128,
+		bp, fp, ctrl, cbp, top, data: u32,
+		dc_pred:                 [3]i32,
+		qs:                      i32,
+		block:                   [64]i16,
+	}
+
+	@(private)
+	IPU_JOURNAL :: 256 // quadwords; a macroblock takes about 85 at most
+
+	@(private)
+	Ipu_Flat :: struct {
+		stall:      Ipu_Stall,
+		stall_bits: u32, // the bits the input wait asked ipu_fill for
+		running:    bool, // ipu_resume is on the stack
+		mark:       Ipu_Mark,
+		live:       Ipu_Live,
+		// Quadwords pulled from the in FIFO since the mark; ipu_fill takes
+		// journal[jr] while jr < jn, so a re-run reads what the run it
+		// repeats read.
+		journal:    [IPU_JOURNAL]u128,
+		jr, jn:     u32,
+		// The rest of an ipu_out that met a full out FIFO.
+		pend:       [64]u128,
+		pend_n:     u32,
+		ctrl:       u32, // ipu_ctrl_in's latch, valid when ctrl_set
+		ctrl_set:   bool,
+	}
+
+	@(private)
+	ipu_flat: Ipu_Flat
+}
+
 @(private) IPU_CTRL_ECD :: 1 << 14
 @(private) IPU_CTRL_SCD :: 1 << 15
 @(private) IPU_CTRL_RST :: 1 << 30
@@ -107,9 +194,13 @@ ipu_write :: proc(o: u32, v: u32) {
 
 @(private)
 ipu_reset :: proc() {
-	if ipu.co != nil && ipu.busy {
-		core.co_kill(ipu.co)
-		ipu.co = nil
+	when core.FLAT {
+		ipu_flat.stall, ipu_flat.jr, ipu_flat.jn, ipu_flat.pend_n = .None, 0, 0, 0
+	} else {
+		if ipu.co != nil && ipu.busy {
+			core.co_kill(ipu.co)
+			ipu.co = nil
+		}
 	}
 	ipu.in_r, ipu.in_n, ipu.out_r, ipu.out_n = 0, 0, 0, 0
 	ipu.bp, ipu.fp = 0, 0
@@ -128,6 +219,9 @@ ipu_cmd_write :: proc(v: u32) {
 	ipu.cmd = v
 	switch v >> 28 {
 	case 0: // BCLR
+		// The coroutine resumes on the cleared buffer; a re-run would
+		// restore the bits before it.
+		when core.FLAT {if ipu.busy {cpu.fatal("ipu: BCLR while a command runs")}}
 		ipu.in_r, ipu.in_n = 0, 0
 		ipu.fp = 0
 		ipu.bp = v & 0x7f
@@ -144,6 +238,15 @@ ipu_cmd_write :: proc(v: u32) {
 		ipu.top_busy = true
 		ipu.cmd_busy = true
 	}
+	// A command written while one runs is lost, as the running one
+	// finishes and clears BUSY: keep the running one's word.
+	if !ipu.busy {
+		ipu_run = {cmd = v}
+		when core.FLAT {
+			ipu_flat.jr, ipu_flat.jn, ipu_flat.ctrl_set = 0, 0, false
+			ipu_mark(.Start)
+		}
+	}
 	ipu.busy = true
 	ipu.ctrl |= IPU_CTRL_BUSY
 	ipu_pump()
@@ -153,44 +256,130 @@ ipu_cmd_write :: proc(v: u32) {
 ipu_pump :: proc() {
 	ipu_ch3_drain()
 	ipu_in_refill()
-	if ipu.busy && core.co_current != ipu.co {
-		if ipu.co == nil {ipu.co = core.co_create(ipu_entry, nil)}
-		ipu.caller = core.co_current
-		t := cpu.prof_start()
-		core.co_switch(ipu.co)
-		cpu.prof_end(.IPU, t)
+	when core.FLAT {
+		if ipu.busy && !ipu_flat.running {
+			t := cpu.prof_start()
+			ipu_resume()
+			cpu.prof_end(.IPU, t)
+		}
+	} else {
+		if ipu.busy && core.co_current != ipu.co {
+			if ipu.co == nil {ipu.co = core.co_create(ipu_entry, nil)}
+			ipu.caller = core.co_current
+			t := cpu.prof_start()
+			core.co_switch(ipu.co)
+			cpu.prof_end(.IPU, t)
+		}
 	}
 }
 
-// Block the running command until the IPU is pumped again.
-@(private)
-ipu_wait :: proc() {
-	core.co_switch(ipu.caller)
-}
-
-@(private)
-ipu_entry :: proc(_: rawptr) {
-	for {
-		ipu_exec()
-		ipu.busy, ipu.cmd_busy, ipu.top_busy = false, false, false
-		ipu.ctrl &~= IPU_CTRL_BUSY
-		mem.intc_raise(mem.INTC_IPU)
+when !core.FLAT {
+	// Block the running command until the IPU is pumped again.
+	@(private)
+	ipu_wait :: proc() {
 		core.co_switch(ipu.caller)
 	}
+
+	@(private)
+	ipu_entry :: proc(_: rawptr) {
+		for {
+			ipu_exec()
+			ipu_done()
+			core.co_switch(ipu.caller)
+		}
+	}
+}
+
+when core.FLAT {
+	// Go on with the running command from where it stopped; see the top of
+	// the file. Each case starts as the coroutine's wait loop does on its
+	// next pump.
+	@(private)
+	ipu_resume :: proc() {
+		f := &ipu_flat
+		f.running = true
+		defer f.running = false
+		switch f.stall {
+		case .None:
+		case .Out:
+			n := f.pend_n
+			f.stall, f.pend_n = .None, 0
+			ipu_out(&f.pend, int(n), true)
+			if f.stall != .None {return}
+		case .In:
+			// The pull the coroutine's `for !ipu_fill(bits)` makes, so IFC
+			// and FP move as there even when the input is still short.
+			if !ipu_fill(f.stall_bits) {return}
+			f.stall = .None
+			m := &f.mark
+			ipu.buf, ipu.bp, ipu.fp = m.buf, m.bp, m.fp
+			ipu.dc_pred, ipu.qs = m.dc_pred, m.qs
+			ipu_run = m.run
+			ipu.block = {} // a block cut short by the wait
+			f.jr = 0
+			cpu.ipu_reruns += 1
+		}
+		ipu_exec()
+		if f.stall == .In {
+			l := &f.live
+			ipu.buf, ipu.bp, ipu.fp = l.buf, l.bp, l.fp
+			ipu.ctrl, ipu.cbp, ipu.top, ipu.data = l.ctrl, l.cbp, l.top, l.data
+			ipu.dc_pred, ipu.qs, ipu.block = l.dc_pred, l.qs, l.block
+			return
+		}
+		// Quadwords pulled while the command waited (ipu_read peeks) sit
+		// in the coroutine's bit buffer from then on; a re-run reads them
+		// from the journal when it needs them. Put them back at each stop.
+		for f.jr < f.jn && ipu.fp < len(ipu.buf) {
+			ipu.buf[ipu.fp] = f.journal[f.jr]
+			f.jr += 1
+			ipu.fp += 1
+		}
+		if f.stall == .None {
+			if f.jr < f.jn {cpu.fatal("ipu: %d journaled quadwords left over at the end of a command", f.jn - f.jr)}
+			f.jr, f.jn = 0, 0
+			ipu_done()
+		}
+	}
+}
+
+// Checkpoint the running command at phase ph; false when it must stop
+// there (FLAT: it is waiting). An input wait keeps the last checkpoint:
+// the state past it is the zero-bit decode's.
+@(private)
+ipu_mark :: #force_inline proc(ph: Ipu_Phase) -> bool {
+	when core.FLAT {
+		f := &ipu_flat
+		if f.stall == .In {return false}
+		ipu_run.phase = ph
+		f.mark = {ipu.buf, ipu.bp, ipu.fp, ipu.dc_pred, ipu.qs, ipu_run}
+		if f.jr > 0 {
+			copy(f.journal[:f.jn - f.jr], f.journal[f.jr:f.jn])
+			f.jn -= f.jr
+			f.jr = 0
+		}
+		return f.stall == .None
+	} else {
+		return true
+	}
+}
+
+@(private)
+ipu_done :: proc() {
+	ipu.busy, ipu.cmd_busy, ipu.top_busy = false, false, false
+	ipu.ctrl &~= IPU_CTRL_BUSY
+	mem.intc_raise(mem.INTC_IPU)
 }
 
 @(private)
 ipu_exec :: proc() {
-	v := ipu.cmd
+	v := ipu_run.cmd
 	switch v >> 28 {
 	case 1: // IDEC
-		ipu_advance(v & 0x3f)
 		ipu_idec(v)
 	case 2: // BDEC
-		ipu_advance(v & 0x3f)
 		ipu_bdec(v)
 	case 3: // VDEC
-		ipu_advance(v & 0x3f)
 		ipu_vdec(v)
 	case 4: // FDEC
 		ipu_advance(v & 0x3f)
@@ -204,7 +393,8 @@ ipu_exec :: proc() {
 		ipu_get_bytes(([^]u8)(&ipu.vqclut)[:32])
 	case 7: // CSC
 		ofm, dte := (v >> 27) & 1 != 0, (v >> 26) & 1 != 0
-		for _ in 0 ..< v & 0x7ff {
+		if ipu_run.phase == .Start {ipu_run.left = v & 0x7ff}
+		for ipu_run.left > 0 {
 			ipu_get_bytes(([^]u8)(&ipu.mb8)[:size_of(ipu.mb8)])
 			ipu_csc(false)
 			if ofm {
@@ -213,10 +403,13 @@ ipu_exec :: proc() {
 			} else {
 				ipu_out(&ipu.rgb32, 64)
 			}
+			ipu_run.left -= 1
+			if !ipu_mark(.Body) {return}
 		}
 	case 8: // PACK
 		ofm, dte := (v >> 27) & 1 != 0, (v >> 26) & 1 != 0
-		for _ in 0 ..< v & 0x7ff {
+		if ipu_run.phase == .Start {ipu_run.left = v & 0x7ff}
+		for ipu_run.left > 0 {
 			ipu_get_bytes(([^]u8)(&ipu.rgb32)[:size_of(ipu.rgb32)])
 			ipu_dither(dte)
 			if ofm {
@@ -225,6 +418,8 @@ ipu_exec :: proc() {
 				ipu_vq()
 				ipu_out(&ipu.indx4, 8)
 			}
+			ipu_run.left -= 1
+			if !ipu_mark(.Body) {return}
 		}
 	case:
 		fmt.eprintfln("ipu: unknown command %08x", v)
@@ -420,20 +615,35 @@ ipu_ch3_direct :: proc(src: [^]u8, n: int) -> int {
 	return k
 }
 
-// Queue qwc quadwords from p for the fromIPU channel.
+// Queue qwc quadwords from p for the fromIPU channel. resume: go on from a
+// wait on a full out FIFO, whose loop does not store directly.
 @(private)
-ipu_out :: proc(p: rawptr, qwc: int) {
+ipu_out :: proc(p: rawptr, qwc: int, resume := false) {
+	when core.FLAT {if ipu_flat.stall != .None {return}} // zero-bit decode
 	b := ([^]u8)(p)
+	resume := resume
 	for i := 0; i < qwc; i += 1 {
-		if ipu.out_n == 0 {
+		if ipu.out_n == 0 && !resume {
 			if n := ipu_ch3_direct(b[i * 16:], qwc - i); n > 0 {
 				i += n - 1
 				continue
 			}
 		}
+		resume = false
 		for ipu.out_n == 8 {
 			ipu_ch3_drain()
-			if ipu.out_n == 8 {ipu_wait()}
+			if ipu.out_n == 8 {
+				when core.FLAT {
+					// Stop here; ipu_resume goes on with the rest.
+					n := qwc - i
+					intrinsics.mem_copy(&ipu_flat.pend, &b[i * 16], n * 16) // may overlap: b can be pend
+					ipu_flat.pend_n = u32(n)
+					ipu_flat.stall = .Out
+					return
+				} else {
+					ipu_wait()
+				}
+			}
 		}
 		ipu.out_fifo[(ipu.out_r + ipu.out_n) & 7] = intrinsics.unaligned_load((^u128)(&b[i * 16]))
 		ipu.out_n += 1
@@ -449,10 +659,31 @@ ipu_out :: proc(p: rawptr, qwc: int) {
 @(private)
 ipu_fill :: proc(bits: u32) -> bool {
 	for ipu.fp * 128 < ipu.bp + bits {
+		when core.FLAT {
+			// A re-run reads what the run it repeats pulled.
+			f := &ipu_flat
+			if f.jr < f.jn {
+				if ipu.fp >= len(ipu.buf) {panic("ipu: bit buffer overrun")}
+				#no_bounds_check ipu.buf[ipu.fp] = f.journal[f.jr % IPU_JOURNAL] // jr < jn <= IPU_JOURNAL
+				f.jr += 1
+				ipu.fp += 1
+				cpu.ipu_replayed += 1
+				continue
+			}
+		}
 		if ipu.in_n == 0 {ipu_in_refill()}
 		if ipu.in_n == 0 {return false}
 		v: u128
 		#no_bounds_check v = ipu.in_fifo[ipu.in_r & 7] // masked slot
+		when core.FLAT {
+			if ipu.busy {
+				if f.jn == IPU_JOURNAL {cpu.fatal("ipu: %d quadwords since the last checkpoint", f.jn + 1)}
+				f.journal[f.jn] = v
+				f.jn += 1
+				f.jr = f.jn
+				cpu.ipu_journal_max = max(cpu.ipu_journal_max, f.jn)
+			}
+		}
 		if ipu.fp >= len(ipu.buf) {panic("ipu: bit buffer overrun")} // snapshots restore fp
 		#no_bounds_check ipu.buf[ipu.fp] = v
 		ipu.in_r = (ipu.in_r + 1) & 7
@@ -470,7 +701,19 @@ ipu_need :: #force_inline proc(bits: u32) {
 
 @(private)
 ipu_need_slow :: proc(bits: u32) {
-	for !ipu_fill(bits) {ipu_wait()}
+	when core.FLAT {
+		f := &ipu_flat
+		if f.stall == .None {
+			if ipu_fill(bits) {return}
+			f.stall, f.stall_bits = .In, bits
+			f.live = {ipu.buf, ipu.bp, ipu.fp, ipu.ctrl, ipu.cbp, ipu.top, ipu.data, ipu.dc_pred, ipu.qs, ipu.block}
+		}
+		// Zero bits until the command unwinds: every decode loop ends on
+		// them, and ipu_mark stops it at its next checkpoint.
+		ipu.buf, ipu.bp, ipu.fp = {}, 0, len(ipu.buf)
+	} else {
+		for !ipu_fill(bits) {ipu_wait()}
+	}
 }
 
 // The 64 stream bits at BP, left-aligned.
@@ -532,18 +775,27 @@ ipu_align :: proc() {
 	ipu_wrap()
 }
 
+// FLAT: the zero-bit decode is running; it stores nothing into tables, so
+// a reset while it waits leaves SETIQ/SETVQ's with the bytes that came in,
+// as the coroutine's kill does.
+@(private)
+ipu_zero_run :: #force_inline proc() -> bool {
+	when core.FLAT {return ipu_flat.stall == .In} else {return false}
+}
+
 @(private)
 ipu_get_bytes :: proc(dst: []u8) {
 	i := 0
 	for i < len(dst) {
 		if ipu.bp & 7 != 0 {
-			dst[i] = u8(ipu_getbits(8))
+			b := u8(ipu_getbits(8))
+			if !ipu_zero_run() {dst[i] = b}
 			i += 1
 			continue
 		}
 		ipu_need(8)
 		n := min(int(ipu.fp * 16 - ipu.bp / 8), len(dst) - i)
-		copy(dst[i:][:n], ([^]u8)(&ipu.buf)[ipu.bp / 8:][:n])
+		if !ipu_zero_run() {copy(dst[i:][:n], ([^]u8)(&ipu.buf)[ipu.bp / 8:][:n])}
 		i += n
 		ipu.bp += u32(n) * 8
 		for ipu.bp >= 128 && ipu.fp > 0 {ipu_wrap()}
@@ -552,9 +804,29 @@ ipu_get_bytes :: proc(dst: []u8) {
 
 // ------------------------------------------------------------ VLC decoding
 
+// IPU_CTRL as the running command first read it. A re-run reads guest
+// registers only through latches like this one, so a CTRL write while it
+// waits does not change what it decodes again; the coroutine reads each
+// once. The other inputs read past a checkpoint need none: TH0/TH1 (SETTH)
+// feed only ipu_csc, which runs once a macroblock's input is all in, so no
+// input wait falls between it and the next checkpoint; IQ, NIQ and VQCLUT
+// change only by command, and a command written while one runs is lost;
+// the out side (ipu_out) never re-runs.
+@(private)
+ipu_ctrl_in :: proc() -> u32 {
+	when core.FLAT {
+		f := &ipu_flat
+		if f.stall == .In {return ipu.ctrl} // the zero-bit decode, thrown away
+		if !f.ctrl_set {f.ctrl, f.ctrl_set = ipu.ctrl, true}
+		return f.ctrl
+	} else {
+		return ipu.ctrl
+	}
+}
+
 @(private)
 ipu_setup :: proc() {
-	c := ipu.ctrl
+	c := ipu_ctrl_in()
 	ipu.coding = 1
 	ipu.mpeg1 = (c >> 23) & 1 != 0
 	ipu.qst = (c >> 22) & 1 != 0
@@ -876,53 +1148,75 @@ ipu_dct_layout :: proc() -> (offset, stride: int) {
 // After a macroblock run: stop at a start code, then latch TOP.
 @(private)
 ipu_tail :: proc() {
-	if ipu_peek(8) == 0 {
-		ipu_align()
-		for {
-			sc := ipu_peek(24)
-			if sc != 0 {
-				ipu.ctrl |= sc == 1 ? IPU_CTRL_SCD : IPU_CTRL_ECD
-				break
+	if ipu_run.phase != .Top {
+		if ipu_peek(8) == 0 {
+			ipu_align()
+			for {
+				sc := ipu_peek(24)
+				if sc != 0 {
+					ipu.ctrl |= sc == 1 ? IPU_CTRL_SCD : IPU_CTRL_ECD
+					break
+				}
+				ipu_advance(8)
+				if !ipu_mark(.Tail) {return}
 			}
-			ipu_advance(8)
 		}
+		if !ipu_mark(.Top) {return}
 	}
 	ipu.top = ipu_peek(32)
 }
 
 @(private)
 ipu_idec :: proc(v: u32) {
-	ipu_setup()
-	ipu.qs = i32((v >> 16) & 0x1f)
-	ipu.fpfd = (v >> 24) & 1 == 0
 	sgn, dte, ofm := (v >> 25) & 1 != 0, (v >> 26) & 1 != 0, (v >> 27) & 1 != 0
-	ipu_dc_reset()
-	ipu.top = 0
-	ipu.ctrl &~= IPU_CTRL_ECD
-	ipu_need(32)
+	// The phase a FLAT re-run or resume starts at; Start on the coroutine.
+	at := ipu_run.phase
+	switch at {
+	case .Start:
+		ipu_advance(v & 0x3f)
+		ipu_setup()
+		ipu.qs = i32((v >> 16) & 0x1f)
+		ipu.fpfd = (v >> 24) & 1 == 0
+		ipu_dc_reset()
+		ipu.top = 0
+		ipu.ctrl &~= IPU_CTRL_ECD
+		if !ipu_mark(.Body) {return}
+		fallthrough
+	case .Body:
+		ipu_need(32)
+		at = .Body
+	case .Mba:
+	case .Tail, .Top:
+		ipu_tail()
+		return
+	}
 	slice: for {
-		ipu.modes = ipu_mb_modes()
-		if ipu.modes & MB_QUANT != 0 {
-			code := ipu_getbits(5)
-			ipu.qs = ipu.qst ? NON_LINEAR_QSCALE[code] : i32(code) << 1
+		if at != .Mba {
+			ipu.modes = ipu_mb_modes()
+			if ipu.modes & MB_QUANT != 0 {
+				code := ipu_getbits(5)
+				ipu.qs = ipu.qst ? NON_LINEAR_QSCALE[code] : i32(code) << 1
+			}
+			ipu.cbp = 0x3f
+			ipu.mb8 = {}
+			off, stride := ipu_dct_layout()
+			y := ([^]u8)(&ipu.mb8.y)
+			ipu_intra_dct(0, y, stride)
+			ipu_intra_dct(0, y[8:], stride)
+			ipu_intra_dct(0, y[off:], stride)
+			ipu_intra_dct(0, y[off + 8:], stride)
+			ipu_intra_dct(1, ([^]u8)(&ipu.mb8.cb), 8)
+			ipu_intra_dct(2, ([^]u8)(&ipu.mb8.cr), 8)
+			ipu_csc(sgn)
+			if ofm {
+				ipu_dither(dte)
+				ipu_out(&ipu.rgb16, 32)
+			} else {
+				ipu_out(&ipu.rgb32, 64)
+			}
+			if !ipu_mark(.Mba) {return}
 		}
-		ipu.cbp = 0x3f
-		ipu.mb8 = {}
-		off, stride := ipu_dct_layout()
-		y := ([^]u8)(&ipu.mb8.y)
-		ipu_intra_dct(0, y, stride)
-		ipu_intra_dct(0, y[8:], stride)
-		ipu_intra_dct(0, y[off:], stride)
-		ipu_intra_dct(0, y[off + 8:], stride)
-		ipu_intra_dct(1, ([^]u8)(&ipu.mb8.cb), 8)
-		ipu_intra_dct(2, ([^]u8)(&ipu.mb8.cr), 8)
-		ipu_csc(sgn)
-		if ofm {
-			ipu_dither(dte)
-			ipu_out(&ipu.rgb16, 32)
-		} else {
-			ipu_out(&ipu.rgb32, 64)
-		}
+		at = .Body
 
 		// Macroblock address increment of the next macroblock.
 		mba: i32
@@ -952,11 +1246,17 @@ ipu_idec :: proc(v: u32) {
 		ipu_need(16)
 	}
 	ipu.ctrl &~= IPU_CTRL_SCD
+	if !ipu_mark(.Tail) {return}
 	ipu_tail()
 }
 
 @(private)
 ipu_bdec :: proc(v: u32) {
+	if ipu_run.phase == .Tail || ipu_run.phase == .Top { // a FLAT resume past the macroblock
+		ipu_tail()
+		return
+	}
+	ipu_advance(v & 0x3f)
 	ipu_setup()
 	qsc := (v >> 16) & 0x1f
 	ipu.qs = ipu.qst ? NON_LINEAR_QSCALE[qsc] : i32(qsc) << 1
@@ -996,19 +1296,25 @@ ipu_bdec :: proc(v: u32) {
 	}
 	ipu.ctrl &~= IPU_CTRL_SCD
 	ipu_out(&ipu.mb16, 48)
+	if !ipu_mark(.Tail) {return}
 	ipu_tail()
 }
 
 @(private)
 ipu_vdec :: proc(v: u32) {
+	if ipu_run.phase == .Top { // a FLAT re-run of the TOP peek
+		ipu.top = ipu_peek(32)
+		return
+	}
+	ipu_advance(v & 0x3f)
 	ipu_need(32)
 	switch (v >> 26) & 3 {
 	case 0: // macroblock address increment
-		ipu.mpeg1 = (ipu.ctrl >> 23) & 1 != 0
+		ipu.mpeg1 = (ipu_ctrl_in() >> 23) & 1 != 0
 		ipu.data = ipu_mba_increment()
 	case 1: // macroblock type
 		ipu.fpfd = true
-		pct := (ipu.ctrl >> 24) & 7
+		pct := (ipu_ctrl_in() >> 24) & 7
 		ipu.coding = pct > 0 ? pct : 1
 		ipu.data = ipu_mb_modes()
 	case 2: // motion code
@@ -1030,6 +1336,7 @@ ipu_vdec :: proc(v: u32) {
 		ipu.data = u32(i32(t.val) | i32(t.len) << 16)
 	}
 	if ipu.data == 0 {ipu.ctrl |= IPU_CTRL_ECD} else {ipu.ctrl &~= IPU_CTRL_ECD}
+	if !ipu_mark(.Top) {return}
 	ipu.top = ipu_peek(32)
 }
 
@@ -1115,4 +1422,12 @@ ipu_vq :: proc() {
 // Emulated state, saved and restored by snapshots (snap.odin).
 ipu_snap :: proc() {
 	core.snap_add(&ipu)
+	// Not on the default build: a command's progress there is its
+	// coroutine's stack, which snapshots never held, and ipu_run is set
+	// afresh at each start; adding it would change that build's layout.
+	when core.FLAT {
+		// A command stopped mid-way; the coroutine's stack never could be.
+		core.snap_add(&ipu_run)
+		core.snap_add(&ipu_flat)
+	}
 }

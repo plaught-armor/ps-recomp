@@ -13,10 +13,16 @@ flat_returns, flat_mismatch: u64
 flat_max_depth: u32
 // The IOP's counts (r3000.flat_print), set once the IOP is (iop_cpu_init).
 iop_flat_print: proc()
+// IPU commands re-run from a checkpoint after input ran dry, the quadwords
+// they replayed, and the most quadwords pulled since any one checkpoint
+// (ps2/ipu, the restartable command).
+ipu_reruns, ipu_replayed: u64
+ipu_journal_max: u32
 
 flat_print :: proc() {
 	when core.FLAT {
 		fmt.eprintfln("ee flat: %d returns, %d with $ra not the call's return address, %d deep at most", flat_returns, flat_mismatch, flat_max_depth)
+		fmt.eprintfln("ipu flat: %d re-runs, %d quadwords replayed, %d quadwords since a checkpoint at most", ipu_reruns, ipu_replayed, ipu_journal_max)
 		if iop_flat_print != nil {iop_flat_print()}
 	}
 }
