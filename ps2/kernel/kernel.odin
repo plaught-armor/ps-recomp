@@ -184,9 +184,17 @@ ROM_ONLY_SYSCALLS := [0x83]string {
 }
 
 syscall :: proc(pc: u32) {
-	cpu.spin_dirty |= cpu.SPIN_SIDE
 	c := &cpu.state
 	n := i32(i16(c.r[3].d[0]))
+	// A RotateThreadReadyQueue outside a handler does nothing but the
+	// scheduler's work, which the spin probe compares itself (spin.odin);
+	// what any other syscall does is a side effect to it. A program's own
+	// handler for it (SetSyscall) sets SPIN_SIDE in cpu.call.
+	if n == 0x2b && !cpu.in_interrupt {
+		spin_rotate()
+	} else {
+		cpu.spin_dirty |= cpu.SPIN_SIDE
+	}
 	a0 := u32(c.r[4].d[0])
 	a1 := u32(c.r[5].d[0])
 	a2 := u32(c.r[6].d[0])

@@ -65,11 +65,17 @@ in_interrupt: bool
 // What ran since the spin skip (ps2/spin.odin) armed its probe that a loop
 // at a fixed point must not do: SPIN_SIDE for an effect the snapshot of EE
 // state and RAM cannot show (a register read, a syscall, the interpreter, a
-// read of COP0 Count), SPIN_EVENT for run_events and all its handlers did.
-// Nonzero, the probe does not skip.
+// read of COP0 Count), SPIN_EVENT for run_events and all its handlers did,
+// SPIN_ROTATE for a RotateThreadReadyQueue, whose effects on the threads the
+// probe compares itself (kernel/spin.odin). Nonzero but for SPIN_ROTATE, the
+// probe does not skip.
 spin_dirty: u32
 SPIN_SIDE :: 1
 SPIN_EVENT :: 2
+SPIN_ROTATE :: 4
+// The bytes of a Cpu the spin probe compares: all but cycles (and the
+// padding before it).
+STATE_BYTES :: int(offset_of(Cpu, cop0)) + size_of(Cpu{}.cop0)
 // The cycles the spin skip added, for STATS.
 spin_cycles: u64
 

@@ -19,12 +19,24 @@
 // below next_event: none of them would have run run_events, and the run is
 // the same as without the skip, cycle for cycle.
 //
+// A pass may also go round other threads at the loop's priority: a loop
+// that yields with RotateThreadReadyQueue to one that yields back (a thread
+// idling while another polls). The probe then passes the other loops'
+// branches on its way back round, and waits for its own (SPIN_FOREIGN_MAX).
+// The rotate marks cpu.SPIN_ROTATE in place of SPIN_SIDE, and the probe
+// compares the threads as well (kernel/spin.odin): with the same thread
+// current, each thread as it was (the registers it saved, its status and
+// wait), and the ready order kept, the pass repeats like any other, the
+// threads switching back and forth at the same points; the skip then moves
+// the ready order on by n passes as well.
+//
 // SPIN=0 turns it off. STATS counts the cycles it skipped (cpu.spin_cycles);
 // they are not idle cycles.
 package ps2
 
 import "base:runtime"
 import cpu "cpu"
+import kernel "kernel"
 import mem "mem"
 import vu "vu"
 
@@ -42,10 +54,18 @@ SPIN_BACK_MIN :: 64
 @(private = "file")
 SPIN_BACK_MAX :: 4096
 
-// The EE state the probe compares: cpu.state up to cycles, and VU0's
-// registers up to the memory slices.
+// The other loops' branches an armed probe passes before it gives up on
+// coming back to its own. A pass that rotates round the threads at one
+// priority passes one for each other thread spinning there, and these are
+// few (an idle thread and a poller); 16 leaves room for more, and for a
+// loop nested in the one armed, while a probe that never comes back costs
+// only 16 branches of stores checked on the slow path before it backs off
+// as at a failed compare.
 @(private = "file")
-CPU_BYTES :: int(offset_of(cpu.Cpu, cop0)) + size_of(cpu.Cpu{}.cop0)
+SPIN_FOREIGN_MAX :: 16
+
+// The EE state the probe compares: cpu.state up to cycles
+// (cpu.STATE_BYTES), and VU0's registers up to the memory slices.
 @(private = "file")
 VU_BYTES :: int(offset_of(vu.Vu, cmsar)) + size_of(u32)
 
@@ -54,6 +74,7 @@ spin: struct {
 	site:   u32, // the backward branch armed at
 	cycles: u64, // cycles when armed
 	back:   i32,
+	passed: i32, // other branches passed since armed
 	cpu:    cpu.Cpu,
 	vu0:    vu.Vu,
 }
@@ -65,20 +86,29 @@ spin_probe :: proc(site: u32) {
 	}
 	if spin.back == 0 {spin.back = SPIN_BACK_MIN}
 	if mem.spin_armed {
+		if site != spin.site && spin.passed < SPIN_FOREIGN_MAX {
+			spin.passed += 1
+			spin_tick = 1
+			return
+		}
 		spin_disarm()
 		dirty := cpu.spin_dirty
 		same :=
 			site == spin.site &&
-			runtime.memory_equal(&cpu.state, &spin.cpu, CPU_BYTES) &&
+			runtime.memory_equal(&cpu.state, &spin.cpu, cpu.STATE_BYTES) &&
 			runtime.memory_equal(&vu.vu0, &spin.vu0, VU_BYTES)
 		now, next := cpu.state.cycles, cpu.next_event
 		d := now - spin.cycles
-		if same && dirty == 0 && d > 0 && now < next && !cpu.in_interrupt && next != max(u64) {
+		rotated := dirty & cpu.SPIN_ROTATE != 0
+		skip := same && dirty &~ cpu.SPIN_ROTATE == 0 && d > 0 && now < next && !cpu.in_interrupt && next != max(u64)
+		if skip && rotated {skip = kernel.spin_threads_same()}
+		if skip {
 			// Every pass skipped ends at or before now + n*d <= next - 1,
 			// below next_event; see the top of the file.
 			n := (next - 1 - now) / d
 			cpu.state.cycles = now + n * d
 			cpu.spin_cycles += n * d
+			if rotated {kernel.spin_threads_skip(n, d)}
 			spin.back = SPIN_BACK_MIN
 			spin_tick = 1 // arm again for the pass after the event
 			return
@@ -97,7 +127,7 @@ spin_probe :: proc(site: u32) {
 		spin_tick = spin.back
 		return
 	}
-	spin.site, spin.cycles = site, cpu.state.cycles
+	spin.site, spin.cycles, spin.passed = site, cpu.state.cycles, 0
 	spin.cpu, spin.vu0 = cpu.state, vu.vu0
 	cpu.spin_dirty = 0
 	mem.spin_armed = true

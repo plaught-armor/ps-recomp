@@ -9,6 +9,12 @@
 // that changes memory (a counter) or reads a register is never skipped,
 // but for INTC_STAT, which only an event or a store changes: a loop that
 // polls it is skipped, one that polls GIF_STAT or a timer is not.
+//
+// Last, two threads at one priority hand the EE back and forth with
+// RotateThreadReadyQueue: the main thread polls the flag between rotates,
+// the other only rotates. Each pass goes round both threads, and must be
+// skipped, with the same end as above and both threads' saved registers
+// and ready order (seq) the same.
 package main
 
 import "base:runtime"
@@ -30,6 +36,9 @@ CODE :: u32(0x00200000)
 HANDLER :: u32(0x00300000) // the alarms' handler, an Odin proc
 // Alarm times, in lines; the vblanks between them are events too.
 ALARMS :: [?]u32{300, 700, 1200, 2000}
+PARAM :: FLAG + 0x40 // the rotating thread's CreateThread parameters
+PRIO :: 0x14 // both rotating threads'
+SYSCALL :: 0x0000000c
 
 // t0 = 8, t1 = 9, t2 = 10, t3 = 11, t4 = 12.
 lui :: proc(rt, imm: u32) -> u32 {return 0x0f << 26 | rt << 16 | imm}
@@ -38,6 +47,8 @@ lw :: proc(rt, off, base: u32) -> u32 {return 0x23 << 26 | base << 21 | rt << 16
 sw :: proc(rt, off, base: u32) -> u32 {return 0x2b << 26 | base << 21 | rt << 16 | off & 0xffff}
 // beq t0, $0 back to the loop's first word, n words before it.
 beqz_back :: proc(n: u32) -> u32 {return 0x04 << 26 | 8 << 21 | (-(n + 1)) & 0xffff}
+// beq $0, $0 back, n words before it.
+b_back :: proc(n: u32) -> u32 {return 0x04 << 26 | (-(n + 1)) & 0xffff}
 JR_RA :: 0x03e00008
 
 Loop :: struct {
@@ -57,6 +68,18 @@ Result :: struct {
 	count:   u32,
 	frame:   u64,
 	intc:    u32,
+	calls:   [len(ALARMS)]Call,
+	n_calls: int,
+	skipped: u64,
+}
+
+// What the rotating threads' run ends with.
+Rotate_Result :: struct {
+	state:   cpu.Cpu,
+	other:   cpu.Cpu, // the other thread's saved registers
+	seq:     [3]u64, // k.seq, the main thread's and the other's
+	current: i64,
+	frame:   u64,
 	calls:   [len(ALARMS)]Call,
 	n_calls: int,
 	skipped: u64,
@@ -85,7 +108,7 @@ program :: proc(l: Loop) -> []u32 {
 main :: proc() {
 	ps2.init()
 	kernel.k.threads[1].co = &core.co_main_thread
-	cpu.text_range(HANDLER, HANDLER + 4)
+	cpu.text_range(CODE, HANDLER + 4)
 	cpu.register(HANDLER, handler)
 
 	loops := [?]Loop {
@@ -101,12 +124,17 @@ main :: proc() {
 
 	arch := native.Arch(core.NATIVE_ARCH)
 	a := native.make_asm(arch, r5900.native_ram())
-	funcs: [len(loops)]native.Blob_Func
+	// The rotating threads' loops, after the others: the main thread's
+	// rotates, then polls the flag; the other's only rotates.
+	programs: [len(loops) + 2][]u32
+	for l, k in loops {programs[k] = program(l)}
+	programs[len(loops)] = {lui(10, FLAG >> 16), addiu(3, 0, 0x2b), addiu(4, 0, PRIO), SYSCALL, lw(8, 0, 10), beqz_back(4), 0, JR_RA, 0}
+	programs[len(loops) + 1] = {addiu(3, 0, 0x2b), addiu(4, 0, PRIO), SYSCALL, b_back(3), 0, JR_RA, 0}
+	funcs: [len(programs)]native.Blob_Func
 	slow: map[string]int
 	defer delete(slow)
-	for l, k in loops {
+	for words, k in programs {
 		at := CODE + 0x100 * u32(k)
-		words := program(l)
 		data := make([]u8, 4 * len(words))
 		for w, n in words {
 			data[4 * n], data[4 * n + 1], data[4 * n + 2], data[4 * n + 3] = u8(w), u8(w >> 8), u8(w >> 16), u8(w >> 24)
@@ -177,6 +205,71 @@ main :: proc() {
 		}
 		fmt.printfln("%-17s cycles %d, skipped %d (%.1f%%)", l.name, on.state.cycles, on_skipped, 100 * f64(on_skipped) / f64(on.state.cycles))
 	}
+
+	// The rotating threads, from the same machine state with the main
+	// thread at PRIO, and the other created and started afresh each run.
+	other_at := CODE + 0x100 * u32(len(loops) + 1)
+	cpu.register(other_at, cast(cpu.Func_Proc)rawptr(code.base + uintptr(code.funcs[len(loops) + 1].off)))
+	main_thread := kernel.k.threads[1]
+	main_prio, main_seq, seq := main_thread.prio, main_thread.seq, kernel.k.seq
+	main_thread.prio = PRIO
+	mem.wr32(PARAM + 4, other_at)
+	mem.wr32(PARAM + 8, 0x00180000)
+	mem.wr32(PARAM + 12, 0x1000)
+	mem.wr32(PARAM + 16, 0)
+	mem.wr32(PARAM + 20, PRIO)
+	mem.wr32(PARAM + 28, 0)
+	mem.wr32(PARAM + 32, 0)
+	rotated: [2]Rotate_Result
+	for on, n in ([2]bool{true, false}) {
+		cpu.state = start
+		kernel.k.vblank_start, kernel.k.vblank_end, kernel.k.frame, kernel.k.next_alarm = vblank_start, vblank_end, frame, next_alarm
+		mem.intc_stat, mem.intc_pending, mem.gs_csr = intc_stat, 0, gs_csr
+		kernel.k.seq, main_thread.seq = seq, main_seq
+		mem.wr32(FLAG, 0)
+		n_calls = 0
+		for t in ALARMS {kernel.set_alarm(t, HANDLER, 0)}
+		id := i32(kernel.create_thread(PARAM))
+		if id < 0 || kernel.start_thread(id, 0) != i64(id) {
+			fmt.eprintln("FAIL rotate: cannot start the other thread")
+			os.exit(1)
+		}
+		ps2.spin_on, ps2.spin_tick = on, 1
+		skipped := cpu.spin_cycles
+		run := cast(proc())rawptr(code.base + uintptr(code.funcs[len(loops)].off))
+		run()
+		other := kernel.k.threads[id]
+		rotated[n] = {
+			state   = cpu.state,
+			other   = other.regs,
+			seq     = {kernel.k.seq, main_thread.seq, other.seq},
+			current = i64(kernel.k.current.id),
+			frame   = kernel.k.frame,
+			calls   = calls,
+			n_calls = n_calls,
+			skipped = cpu.spin_cycles - skipped,
+		}
+		kernel.terminate_thread(id)
+		kernel.delete_thread(id)
+	}
+	main_thread.prio = main_prio
+	on, off := rotated[0], rotated[1]
+	on_skipped := on.skipped
+	on.skipped = 0
+	if on.n_calls != len(ALARMS) || len(kernel.k.alarms) != 0 {
+		failed += 1
+		fmt.eprintfln("FAIL rotate: %d alarm calls, %d alarms left", on.n_calls, len(kernel.k.alarms))
+	}
+	if !runtime.memory_equal(&on, &off, size_of(Rotate_Result)) {
+		failed += 1
+		fmt.eprintln("FAIL rotate: skip on and off differ")
+		fmt.eprintfln("  cycles %d %d, other cycles %d %d, seq %v %v, current %d %d, frame %d %d, calls %v %v", on.state.cycles, off.state.cycles, on.other.cycles, off.other.cycles, on.seq, off.seq, on.current, off.current, on.frame, off.frame, on.calls, off.calls)
+	}
+	if off.skipped != 0 || on_skipped == 0 {
+		failed += 1
+		fmt.eprintfln("FAIL rotate: skipped %d cycles on, %d off; want skipped", on_skipped, off.skipped)
+	}
+	fmt.printfln("%-17s cycles %d, skipped %d (%.1f%%)", "rotate", on.state.cycles, on_skipped, 100 * f64(on_skipped) / f64(on.state.cycles))
 	if failed != 0 {os.exit(1)}
 	fmt.println("ok")
 }

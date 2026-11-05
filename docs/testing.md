@@ -55,7 +55,7 @@ here.
 | `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading |
 | `native` | The machine-code emitter |
 | `ee_native` | EE instructions through the native backend against the interpreter |
-| `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store and an INTC_STAT poll are skipped; a counter, a GIF_STAT poll and a timer poll are not |
+| `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store, an INTC_STAT poll and two threads at one priority handing the EE back and forth with RotateThreadReadyQueue are skipped; a counter, a GIF_STAT poll and a timer poll are not |
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |
 | `discover` | Functions with no prologue that tables of methods in a writable code section point at: thunks, leaves and jumps on through a register, stubs in a row included, are entries; code after a `b` or a `j` inside a function, code that calls or uses `$sp`, data after a `jr` with stray fields or a jump in a delay slot, a jump table's cases (tables of functions next to each other in one run included) and a pair of words are not |
