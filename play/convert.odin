@@ -153,12 +153,19 @@ child_blob :: proc(args: []string, tmp, what, step: string, deadline: time.Durat
 		fmt.eprintfln("play: cannot start the %s: %v", step, err)
 		return nil, false
 	}
-	cw := Child_Wait{p = p, deadline = deadline if deadline > 0 else os.TIMEOUT_INFINITE}
-	t := thread.create_and_start_with_poly_data(&cw, child_watch)
-	if t == nil {
-		// Unwatched, it could hang the run: stopped, it fails below.
-		fmt.eprintfln("play: cannot watch the %s", step)
-		_ = os.process_kill(p)
+	// Without threads (core.THREADS) nothing watches the child while its
+	// output is relayed, and relay blocks for as long as a hung child keeps
+	// its pipe open, so there is no deadline at all: the child is waited for
+	// once its output ends, for as long as it takes.
+	cw := Child_Wait{p = p, deadline = deadline if deadline > 0 && core.THREADS else os.TIMEOUT_INFINITE}
+	t: ^thread.Thread
+	if core.THREADS {
+		t = thread.create_and_start_with_poly_data(&cw, child_watch)
+		if t == nil {
+			// Unwatched, it could hang the run: stopped, it fails below.
+			fmt.eprintfln("play: cannot watch the %s", step)
+			_ = os.process_kill(p)
+		}
 	}
 	last := relay(r)
 	if t != nil {

@@ -12,3 +12,10 @@
 package core
 
 FLAT :: #config(PS_FLAT, ODIN_OS == .WASI)
+
+// THREADS: whether the emulator starts host threads of its own (the SPU
+// mixer, the raster and stream pools, play's watchers). Off on wasi, which
+// has no core:thread; there each job runs on the calling thread, as in a
+// forked child. A native build with -define:PS_THREADS=false is the test
+// build: its runs must match a default build's.
+THREADS :: #config(PS_THREADS, ODIN_OS != .WASI)

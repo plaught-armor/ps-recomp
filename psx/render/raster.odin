@@ -233,9 +233,14 @@ raster_parallel :: proc(job: proc(band, bands: i32, data: rawptr), data: rawptr)
 raster_pool :: proc() -> i32 {
 	if !raster.started {
 		raster.started = true
-		raster.bands = i32(clamp(os.get_processor_core_count() / 2, 1, MAX_BANDS))
-		for _ in 0 ..< raster.bands {
-			thread.start(thread.create(raster_worker))
+		// Without threads (core.THREADS) one band, as on wasm, where the
+		// core count is 1: more would only run one after another.
+		raster.bands = 1
+		if core.THREADS {
+			raster.bands = i32(clamp(os.get_processor_core_count() / 2, 1, MAX_BANDS))
+			for _ in 0 ..< raster.bands {
+				thread.start(thread.create(raster_worker))
+			}
 		}
 	}
 	return raster.bands
@@ -244,8 +249,9 @@ raster_pool :: proc() -> i32 {
 // Run job(i, bands, data) for i in 0 ..< n (at most bands + 1) at once.
 @(private)
 raster_launch :: proc(job: proc(band, bands: i32, data: rawptr), data: rawptr, n: i32) {
-	if io.preload_child {
-		// A forked child has no pool threads: run the jobs in turn.
+	if !core.THREADS || io.preload_child {
+		// No pool threads (none started, or a forked child): run the jobs in
+		// turn.
 		for i in 0 ..< n {
 			job(i, raster.bands, data)
 		}
@@ -370,10 +376,11 @@ stream_drain :: proc(count := true) {
 }
 
 // Whether VRAM's draws run on the stream: with the hi-res target on the
-// GPU, but in a forked child, which has no stream threads.
+// GPU, but not without threads or in a forked child, which has no stream
+// threads.
 @(private)
 stream_on :: #force_inline proc() -> bool {
-	return targets[1].vk && !io.preload_child
+	return core.THREADS && targets[1].vk && !io.preload_child
 }
 
 // Whether VRAM's draws run on the stream and some are not synced yet.

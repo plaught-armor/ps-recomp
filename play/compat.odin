@@ -434,6 +434,11 @@ parent_watch :: proc() {
 		fmt.eprintfln("compat: parent %d gone, stopping", pid)
 		parent_exit(1)
 	}
+	if !core.THREADS {
+		// No thread to watch it with (core.THREADS): this run outlives
+		// the parent.
+		return
+	}
 	if thread.create_and_start_with_poly_data(pid, watch, self_cleanup = true) == nil {
 		fmt.eprintln("compat: cannot watch the parent; this run outlives it")
 	}

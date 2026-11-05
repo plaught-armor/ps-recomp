@@ -446,8 +446,9 @@ spu_batch :: proc() {
 // sees the state it would have seen mixed at its event. Batches go to the
 // thread SPU_HANDOFF at a time, so a wake comes once per few batches; the
 // game touches the SPU in under a tenth of batch gaps. With the sound RAM
-// IRQ on, and in a forked child (fork copies no threads), batches mix at
-// their event as before: the IRQ must be raised on the machine's thread.
+// IRQ on, in a forked child (fork copies no threads) and without threads
+// (core.THREADS), batches mix at their event as before: the IRQ must be
+// raised on the machine's thread.
 @(private)
 spu_mixer: struct {
 	// Batches due (written by the machine) and mixed.
@@ -469,7 +470,7 @@ spu_event :: proc() {
 	// host queue ran dry every few seconds.
 	io.schedule_period(.Spu, SAMPLE_CYCLES * SPU_BATCH)
 	m := &spu_mixer
-	if io.preload_child || reg(SPU_CNT) & SPUCNT_IRQ_ENABLE != 0 {
+	if !core.THREADS || io.preload_child || reg(SPU_CNT) & SPUCNT_IRQ_ENABLE != 0 {
 		spu_sync()
 		spu_batch()
 		return

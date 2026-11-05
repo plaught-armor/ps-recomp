@@ -2,14 +2,17 @@
 package core
 
 import "base:intrinsics"
-import "core:thread"
+@(require) import "core:thread" // used only when THREADS
 
 // Back off for the spin'th time while waiting on another thread: a pause
-// for the first rounds, then yield the core.
+// for the first rounds, then yield the core. Without threads (THREADS) it
+// never yields.
 spin_pause :: #force_inline proc(spin: int) {
-	if spin < 256 {
-		intrinsics.cpu_relax()
-	} else {
-		thread.yield()
+	when THREADS {
+		if spin >= 256 {
+			thread.yield()
+			return
+		}
 	}
+	intrinsics.cpu_relax()
 }

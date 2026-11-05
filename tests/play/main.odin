@@ -223,7 +223,8 @@ main :: proc() {
 	test_compat_learned()
 	test_compat_cards()
 	test_quit()
-	test_orphan()
+	// Without threads (core.THREADS) a compat child cannot watch its parent.
+	if core.THREADS {test_orphan()}
 	test_line_row()
 	test_library()
 	test_export()
