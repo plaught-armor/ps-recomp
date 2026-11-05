@@ -15,14 +15,16 @@
 // coroutine_windows_amd64.odin) supplies CO_CODE, CO_TRAMPOLINE and co_frame
 // (a new stack laid out as a suspended one); each OS's (coroutine_<os>.odin,
 // with Windows in its ABI file) supplies co_map_stack, and code_<os>.odin
-// map_code.
+// map_code. On wasm, which has no switch yet, coroutine_wasi.odin and
+// code_wasi.odin stand in and panic.
 package core
 
 import "base:runtime"
 import "core:mem"
 
 when !(ODIN_ARCH == .amd64 && (ODIN_OS == .Linux || ODIN_OS == .Windows || ODIN_OS == .Darwin)) &&
-     !(ODIN_ARCH == .arm64 && (ODIN_OS == .Linux || ODIN_OS == .Darwin)) {
+     !(ODIN_ARCH == .arm64 && (ODIN_OS == .Linux || ODIN_OS == .Darwin)) &&
+     ODIN_OS != .WASI {
 	#panic("core: no coroutine switch for this target yet")
 }
 

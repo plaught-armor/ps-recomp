@@ -1,3 +1,4 @@
+#+build !wasi
 // The launcher's window: `play` with no disc image. Keyboard, controller and
 // mouse each become an Action (launcher.odin), and a file or directory
 // dropped on the window joins the library in place; a disc launched runs as a

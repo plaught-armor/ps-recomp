@@ -1,3 +1,4 @@
+#+build !wasi
 // play --export: an opt-in repository for one disc, to study and hand-tune
 // the game in. The player keeps what it needs in the disc's directory under
 // DATA either way (core/data.odin). An export records the disc there as the

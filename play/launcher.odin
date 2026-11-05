@@ -1,3 +1,4 @@
+#+build !wasi
 // The launcher's state and picture, apart from the window (launcher_window.odin)
 // so tests drive it with no display. Every input source maps to an Action;
 // launcher_step applies one and says what the window must do next.

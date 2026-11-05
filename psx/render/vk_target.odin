@@ -1,3 +1,4 @@
+#+build !wasi
 // The hi-res target on Vulkan (GPU=vk), headless: no surface, the picture
 // reaches the window through present as the software target's does. Its
 // draws are queued (prim_queue.odin) and drawn here by the same

@@ -1,3 +1,4 @@
+#+build !wasi
 // Vulkan device shared by the GPU renderers: instance, device and queue,
 // buffers with device addresses, and pipelines. Headless runs have no
 // surface and render the same way. VK_LOADER is per OS (vulkan_<os>.odin).

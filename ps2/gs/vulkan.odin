@@ -1,3 +1,4 @@
+#+build !wasi
 // GS-only Vulkan pieces on top of core's device layer (core/vulkan.odin):
 // the optional swapchain.
 package ps2_gs

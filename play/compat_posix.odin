@@ -1,4 +1,4 @@
-#+build !windows
+#+build linux, darwin
 package play
 
 import "core:os"

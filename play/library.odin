@@ -1,3 +1,4 @@
+#+build !wasi
 // The launcher's library: the disc images the player added, each referenced
 // where it is, never copied. <data>/library.tsv holds one `path<TAB>id` row
 // per image in the order added, the path absolute with symlinks resolved
