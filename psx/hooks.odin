@@ -2,6 +2,7 @@
 // variables; this sets them all before anything runs.
 package psx
 
+import "ps:core"
 import "ps:core/disc"
 import bios "bios"
 import cpu "cpu"
@@ -20,7 +21,7 @@ hooks_init :: proc "contextless" () {
 	cpu.bios_syscall = bios.bios_syscall
 	cpu.bios_entry = bios.bios_entry
 	cpu.irq_check = io.irq_check
-	cpu.interp_run = cpu.interp_loop
+	when core.FLAT {cpu.interp_run = cpu.flat_nested} else {cpu.interp_run = cpu.interp_loop}
 	cpu.run_events = io.run_events
 	cpu.gte_cmd = gte.gte_cmd
 	cpu.gte_read = gte.gte_read

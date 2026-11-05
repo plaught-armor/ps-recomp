@@ -1164,12 +1164,18 @@ threads_init :: proc() {
 	}
 	cpu.w32(PCB, KSEG1 | tcb(0))
 	cur_thread = 0
+	when core.FLAT {flat = {live = {0 = true}}}
 }
 
 // Let go of slot i's coroutine. The running one finishes as the zombie; the
 // host main thread's own stack cannot be freed, and is only left.
 @(private)
 drop_thread :: proc(i: int) {
+	when core.FLAT {
+		flat.live[i] = false
+		if i == cur_thread {flat.orphan = true}
+		return
+	}
 	co := threads[i].co
 	threads[i].co = nil
 	switch {
@@ -1213,6 +1219,18 @@ open_thread :: proc(pc, sp, gp: u32) -> u32 {
 	return 0xffffffff
 }
 
+// Whether thread i has a continuation: its coroutine, or under FLAT its run.
+@(private)
+thread_started :: #force_inline proc(i: int) -> bool {
+	when core.FLAT {return flat.live[i]} else {return threads[i].co != nil}
+}
+
+// Whether the running thread still has its slot.
+@(private)
+slot_owned :: #force_inline proc() -> bool {
+	when core.FLAT {return !flat.orphan} else {return threads[cur_thread].co == core.co_current}
+}
+
 @(private)
 thread_entry :: proc(arg: rawptr) {
 	i := int(uintptr(arg))
@@ -1248,9 +1266,10 @@ change_thread :: proc(h: u32) {
 	if i == cur_thread {
 		return
 	}
+	when core.FLAT {cpu.flat_block("ChangeTh")}
 	// A thread that lost its slot has no TCB to save into; OpenTh may have
 	// handed it to another thread.
-	if threads[cur_thread].co == core.co_current {
+	if slot_owned() {
 		t := tcb(cur_thread)
 		for v, n in cpu.state.r {
 			cpu.w32(t + TCB_REGS + 4 * u32(n), v)
@@ -1274,14 +1293,26 @@ change_thread :: proc(h: u32) {
 	cpu.rfe()
 	cur_thread = i
 	to := &threads[i]
-	if epc := cpu.r32(t + TCB_EPC); to.co == nil || epc != TCB_PARKED {
-		if to.co != nil && !bios.epc_warn {
+	if epc := cpu.r32(t + TCB_EPC); !thread_started(i) || epc != TCB_PARKED {
+		if thread_started(i) && !bios.epc_warn {
 			fmt.eprintfln("bios: thread %d's TCB epc set to %#08x; starting it over there", i, epc)
 			bios.epc_warn = true
 		}
-		drop_thread(i)
-		to.entry = epc
-		to.co = core.co_create(thread_entry, rawptr(uintptr(i)))
+		when core.FLAT {
+			to.entry = epc
+			flat.live[i] = true
+			flat.fresh[i] = true
+		} else {
+			drop_thread(i)
+			to.entry = epc
+			to.co = core.co_create(thread_entry, rawptr(uintptr(i)))
+		}
+	}
+	// Under FLAT the run stops (flat_block) and flat_main goes on with
+	// thread i's.
+	when core.FLAT {
+		flat.orphan = false
+		return
 	}
 	core.co_switch(to.co)
 	// Resumed: whoever switched back already loaded our registers.

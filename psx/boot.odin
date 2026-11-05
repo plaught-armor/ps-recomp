@@ -4,6 +4,7 @@ package psx
 
 import "core:fmt"
 
+import "ps:core"
 import "ps:core/disc"
 import bios "bios"
 import cpu "cpu"
@@ -104,7 +105,7 @@ run :: proc(b: Boot) -> bool {
 	cpu.state.r[29] = sp
 	cpu.state.r[30] = sp
 	cpu.cop0.sr = 0x40000401
-	cpu.call(pc)
+	when core.FLAT {bios.flat_main(pc)} else {cpu.call(pc)}
 	return true
 }
 
