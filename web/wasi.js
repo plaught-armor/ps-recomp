@@ -1,17 +1,29 @@
-// WASI preview1 for recomp.wasm: just the imports the module has, shared by
-// the web page's Worker and tests/wasi/run.mjs. No dependencies.
+// WASI preview1 for recomp.wasm and play.wasm: just the imports the modules
+// have, shared by the web pages' Workers and tests/wasi/run.mjs. No
+// dependencies.
 //
-// Two preopens: "/disc" (fd 3), a read-only directory of named readers
-// {size, read(offset, length) -> Uint8Array}, and "." (fd 4), an in-memory
-// directory that collects what recomp writes. Rights are not checked: Odin's
+// One preopen, "." (fd 3): an in-memory directory that collects what recomp
+// writes, with two directories mounted in it: "disc", read-only, of named
+// readers {size, read(offset, length) -> Uint8Array}; and "data", for play's
+// settings and saves, lost when the page goes. Odin's core:os strips the
+// leading "/" from paths and preopen names alike, so "/disc/x" is "disc/x"
+// in the preopen. One preopen, not one per directory: core:os indexes past
+// the end of a path that equals a preopen's name (match_preopen), and
+// make_directory_all("/data/x") reaches "/data" itself. Clocks are performance.now() and Date.now(); poll_oneoff takes clock
+// subscriptions only and blocks the thread until the deadline, which a Worker
+// or Node may do. Rights are not checked: Odin's
 // core:os opens read-only files without the fd_seek right that fd_pread
 // needs. A 64 KiB block cache sits in front of each reader, so sector-sized
 // reads do not each reach the reader. One instance per run: proc_exit throws.
 
 const ERR = {
-	SUCCESS: 0, ACCES: 2, BADF: 8, EXIST: 20, INVAL: 28, ISDIR: 31, NOENT: 44,
-	NOSYS: 52, NOTDIR: 54, ROFS: 69, SPIPE: 70, NOTCAPABLE: 76,
+	SUCCESS: 0, ACCES: 2, BADF: 8, BUSY: 10, EXIST: 20, INVAL: 28, ISDIR: 31, NOENT: 44,
+	NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55, NOTSUP: 58, ROFS: 69, SPIPE: 70,
+	NOTCAPABLE: 76,
 };
+const CLOCK = { REALTIME: 0, MONOTONIC: 1, PROCESS_CPUTIME: 2, THREAD_CPUTIME: 3 };
+const EVENTTYPE_CLOCK = 0;
+const SUBCLOCK_ABSTIME = 1;
 const FILETYPE = { CHARACTER_DEVICE: 2, DIRECTORY: 3, REGULAR_FILE: 4 };
 const OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };
 const FDFLAG_APPEND = 1;
@@ -103,9 +115,11 @@ const dir = (writable) => ({ entries: new Map(), writable });
 const isDir = (node) => node.entries !== undefined;
 
 export class Wasi {
-	// args: argv strings. disc: Map of name -> reader. log(fd, text): fd 1 and 2.
-	constructor({ args, disc, log }) {
+	// args: argv strings. env: an object of environment variables. disc: Map
+	// of name -> reader. log(fd, text): fd 1 and 2.
+	constructor({ args, env = {}, disc, log }) {
 		this.args = args.map((a) => new TextEncoder().encode(a + "\0"));
+		this.env = Object.entries(env).map(([k, v]) => new TextEncoder().encode(`${k}=${v}\0`));
 		this.log = log;
 		this.decoders = [null, new TextDecoder(), new TextDecoder()];
 		this.stats = {
@@ -116,11 +130,14 @@ export class Wasi {
 		const discDir = dir(false);
 		for (const [name, reader] of disc) discDir.entries.set(name, new Cached(reader, this.stats.cache));
 		this.out = dir(true);
-		this.fds = new Map([
-			[3, { node: discDir, pos: 0, preopen: "/disc" }],
-			[4, { node: this.out, pos: 0, preopen: "." }],
-		]);
-		this.next = 5;
+		this.data = dir(true);
+		this.out.entries.set("disc", discDir);
+		this.out.entries.set("data", this.data);
+		// Neither removed nor renamed, and not among recomp's files.
+		this.mounts = new Set([discDir, this.data]);
+		this.fds = new Map([[3, { node: this.out, pos: 0, preopen: "." }]]);
+		this.next = 4;
+		this.sleeper = null; // an Int32Array on a SharedArrayBuffer, for Atomics.wait
 		this.memory = null;
 		this.view = null;
 
@@ -166,17 +183,32 @@ export class Wasi {
 		}
 	}
 
-	// The files recomp wrote: path -> bytes (views of the file buffers).
-	files() {
+	// The files recomp wrote (or, with root this.data, play's): path -> bytes
+	// (views of the file buffers). The mounts are not walked.
+	files(root = this.out) {
 		const out = new Map();
 		const walk = (node, prefix) => {
 			for (const [name, n] of node.entries) {
+				if (this.mounts.has(n)) continue;
 				if (isDir(n)) walk(n, prefix + name + "/");
 				else out.set(prefix + name, n.buf.subarray(0, n.size));
 			}
 		};
-		walk(this.out, "");
+		walk(root, "");
 		return out;
+	}
+
+	// Blocks the thread for `ms` milliseconds.
+	sleep(ms) {
+		if (!(ms > 0)) return;
+		if (this.sleeper === null && typeof SharedArrayBuffer === "function") {
+			this.sleeper = new Int32Array(new SharedArrayBuffer(4));
+		}
+		if (this.sleeper !== null) {
+			Atomics.wait(this.sleeper, 0, 0, ms);
+			return;
+		}
+		for (const end = performance.now() + ms; performance.now() < end;);
 	}
 
 	dv() {
@@ -212,6 +244,40 @@ export class Wasi {
 		}
 		const name = parts[parts.length - 1];
 		return { parent, name, node: parent.entries.get(name) };
+	}
+
+	// Nanoseconds on clock `id`, or null for an unknown clock. The CPU-time
+	// clocks read the monotonic one.
+	now(id) {
+		switch (id) {
+			case CLOCK.REALTIME:
+				return BigInt(Date.now()) * 1000000n;
+			case CLOCK.MONOTONIC:
+			case CLOCK.PROCESS_CPUTIME:
+			case CLOCK.THREAD_CPUTIME:
+				return BigInt(Math.round(performance.now() * 1e6));
+		}
+		return null;
+	}
+
+	// The directory holding directory `d`, or null for a preopen's root.
+	parentOf(d) {
+		const find = (node) => {
+			for (const n of node.entries.values()) {
+				if (!isDir(n)) continue;
+				if (n === d) return node;
+				const p = find(n);
+				if (p) return p;
+			}
+			return null;
+		};
+		for (const f of this.fds.values()) {
+			if (f.preopen === undefined) continue;
+			if (f.node === d) return null;
+			const p = find(f.node);
+			if (p) return p;
+		}
+		return null;
 	}
 
 	filestat(ptr, node, size) {
@@ -280,6 +346,54 @@ export class Wasi {
 				}
 				return ERR.SUCCESS;
 			},
+			environ_sizes_get: (count, size) => {
+				out32(count, this.env.length);
+				out32(size, this.env.reduce((s, e) => s + e.length, 0));
+				return ERR.SUCCESS;
+			},
+			environ_get: (environ, buf) => {
+				for (const [i, e] of this.env.entries()) {
+					out32(environ + i * 4, buf);
+					this.bytes(buf, e.length).set(e);
+					buf += e.length;
+				}
+				return ERR.SUCCESS;
+			},
+			clock_time_get: (id, _precision, out) => {
+				const ns = this.now(id);
+				if (ns === null) return ERR.INVAL;
+				this.dv().setBigUint64(out, ns, true);
+				return ERR.SUCCESS;
+			},
+			// Clock subscriptions only: sleeps until the earliest deadline and
+			// reports every subscription due by then.
+			poll_oneoff: (subs, events, n, out) => {
+				if (n === 0) return ERR.INVAL;
+				const dv = this.dv(), due = [];
+				let wake = null;
+				for (let i = 0; i < n; i++) {
+					const s = subs + i * 48;
+					if (dv.getUint8(s + 8) !== EVENTTYPE_CLOCK) return ERR.NOTSUP;
+					const id = dv.getUint32(s + 16, true), now = this.now(id);
+					if (now === null) return ERR.INVAL;
+					const timeout = dv.getBigUint64(s + 24, true);
+					const at = dv.getUint16(s + 40, true) & SUBCLOCK_ABSTIME ? timeout : now + timeout;
+					const ms = Number(at - now) / 1e6;
+					due.push({ userdata: dv.getBigUint64(s, true), ms });
+					wake = wake === null ? ms : Math.min(wake, ms);
+				}
+				this.sleep(wake);
+				let k = 0;
+				for (const d of due) {
+					if (d.ms > wake) continue;
+					const e = events + k++ * 32;
+					this.bytes(e, 32).fill(0);
+					dv.setBigUint64(e, d.userdata, true);
+					dv.setUint8(e + 10, EVENTTYPE_CLOCK);
+				}
+				out32(out, k);
+				return ERR.SUCCESS;
+			},
 			fd_prestat_get: (fd, ptr) => {
 				const f = this.fds.get(fd);
 				if (!f?.preopen) return ERR.BADF;
@@ -330,6 +444,49 @@ export class Wasi {
 				if (r.node) return ERR.EXIST;
 				if (!r.parent.writable) return ERR.ROFS;
 				r.parent.entries.set(r.name, dir(true));
+				return ERR.SUCCESS;
+			},
+			path_unlink_file: (fd, path, len) => {
+				const r = this.resolve(fd, this.str(path, len));
+				if (typeof r === "number") return r;
+				if (!r.node) return ERR.NOENT;
+				if (isDir(r.node)) return ERR.ISDIR;
+				if (!r.parent.writable) return ERR.ROFS;
+				r.parent.entries.delete(r.name);
+				return ERR.SUCCESS;
+			},
+			path_remove_directory: (fd, path, len) => {
+				const r = this.resolve(fd, this.str(path, len));
+				if (typeof r === "number") return r;
+				if (!r.node) return ERR.NOENT;
+				if (!isDir(r.node)) return ERR.NOTDIR;
+				if (this.mounts.has(r.node)) return ERR.BUSY;
+				if (r.name === "." || !r.parent.writable) return ERR.ROFS;
+				if (r.node.entries.size > 0) return ERR.NOTEMPTY;
+				r.parent.entries.delete(r.name);
+				return ERR.SUCCESS;
+			},
+			// As POSIX rename: replaces a file, or an empty directory with a
+			// directory.
+			path_rename: (fd, path, len, newFd, newPath, newLen) => {
+				const a = this.resolve(fd, this.str(path, len));
+				if (typeof a === "number") return a;
+				const b = this.resolve(newFd, this.str(newPath, newLen));
+				if (typeof b === "number") return b;
+				if (!a.node) return ERR.NOENT;
+				if (a.name === "." || b.name === ".") return ERR.INVAL;
+				if (this.mounts.has(a.node) || this.mounts.has(b.node)) return ERR.BUSY;
+				if (!a.parent.writable || !b.parent.writable) return ERR.ROFS;
+				if (a.node === b.node) return ERR.SUCCESS;
+				if (isDir(a.node)) {
+					for (let d = b.parent; d; d = this.parentOf(d)) if (d === a.node) return ERR.INVAL;
+				}
+				if (b.node) {
+					if (isDir(a.node) !== isDir(b.node)) return isDir(b.node) ? ERR.ISDIR : ERR.NOTDIR;
+					if (isDir(b.node) && b.node.entries.size > 0) return ERR.NOTEMPTY;
+				}
+				a.parent.entries.delete(a.name);
+				b.parent.entries.set(b.name, a.node);
 				return ERR.SUCCESS;
 			},
 			path_filestat_get: (fd, _flags, path, len, ptr) => {

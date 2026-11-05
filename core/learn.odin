@@ -157,8 +157,18 @@ learn_held: struct {
 learn_hold :: proc() {
 	h := &learn_held
 	assert(!h.on)
-	h.on, h.cpus, h.space, h.handoff = true, learn.cpus, learn.space, learn_handoff
-	h.pool, h.used, h.free, h.n_free, h.pooled = learn.pool, learn.used, learn.free, learn.n_free, learn.pooled
+	// One copy per statement: a tuple assignment loads the right side whole
+	// first, and the pool's aggregate load unrolls into hundreds of KB of
+	// code on wasm32 (which wasm-opt then cannot optimize in 8 GB).
+	h.on = true
+	h.cpus = learn.cpus
+	h.space = learn.space
+	h.handoff = learn_handoff
+	h.pool = learn.pool
+	h.used = learn.used
+	h.free = learn.free
+	h.n_free = learn.n_free
+	h.pooled = learn.pooled
 	learn.cpus = {}
 	for &s, cpu in learn.space {
 		if s.ram_bytes == 0 {
@@ -184,8 +194,15 @@ learn_release :: proc() {
 	h := &learn_held
 	assert(h.on)
 	h.on = false
-	learn.cpus, learn.space, learn_handoff = h.cpus, h.space, h.handoff
-	learn.pool, learn.used, learn.free, learn.n_free, learn.pooled = h.pool, h.used, h.free, h.n_free, h.pooled
+	// One copy per statement, as in learn_hold.
+	learn.cpus = h.cpus
+	learn.space = h.space
+	learn_handoff = h.handoff
+	learn.pool = h.pool
+	learn.used = h.used
+	learn.free = h.free
+	learn.n_free = h.n_free
+	learn.pooled = h.pooled
 }
 
 @(rodata)

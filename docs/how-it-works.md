@@ -111,6 +111,24 @@ python3 tests/wasi/serve.py <out dir> result.json path/to/game.iso --arch x64_sy
 python3 tests/wasi/serve.py <out dir> result.json --pick --arch x64_sysv
 ```
 
+play builds for `wasi_wasm32` too, and `play.html` on the same out dir runs
+a disc in the tab. A Worker runs `play.wasm` on `web/wasi.js` and
+`web/sdl.js`, which provides the SDL 2 calls play makes (the
+`system:SDL2` imports). The Worker never yields while the game runs, so it
+shares three `SharedArrayBuffer`s with the page (`web/layout.js`): control
+(the page writes the gamepads, read from the Gamepad API, and pushes key
+events), audio (a ring of s16 frames that an AudioWorklet, `web/audio.js`,
+plays) and present (three slots; the Worker writes each frame's draw
+commands and textures into a free slot, and the page replays the newest
+one with WebGL2 on each animation frame, `web/present.js`).
+`SharedArrayBuffer` needs a cross-origin isolated page: a host that sends
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` gives that directly, and on
+one that cannot (GitHub Pages) the page registers `web/sw.js`, a service
+worker that adds the headers, and reloads once. WebKitGTK isolates a page
+through the service worker; whether Safari does is not verified. Settings and saves live in
+memory (`GetPrefPath` is `/data/`) and are lost when the page reloads.
+
 The options file is tab-separated: a `key<TAB>value` header row, then one
 option per row; lines starting with `#` are comments. `backend` (`r3000` or
 `r5900`) picks the console; the backend's header comment lists the rest of

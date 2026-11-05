@@ -1,8 +1,10 @@
-"""Dev harness: serves the converter page (web/build.sh's out dir) and disc
-files for the page's test mode, then waits for the browser's result.
+"""Dev harness: serves the converter page or the play page (web/build.sh's
+out dir) and disc files for the page's test mode, then waits for the
+browser's result.
 
     python3 tests/wasi/serve.py <page dir> <result.json> <disc file>... [--host H] [--port P] [--arch A]
     python3 tests/wasi/serve.py <page dir> <result.json> --pick [--host H] [--port P] [--arch A]
+    python3 tests/wasi/serve.py <page dir> <result.json> --play <module.wasm> [<disc file>] [--seconds N] [--no-isolate]
 
 Open the printed URL in any browser. The page converts the first disc file,
 read by HTTP Range requests, posts the blob and its report, and the server
@@ -15,6 +17,15 @@ page as a user would (read through File.slice), press Convert, and the page
 posts the same report. Every response carries the page's Content Security
 Policy as a header, which also covers the Worker (the page's meta tag does
 not).
+
+With --play the URL opens play.html's test mode on <module.wasm> (a file in
+the page dir: play.wasm, or the gate program tests/wasi/host built there),
+on the first disc file if one is given. The page runs it until it exits or
+for --seconds, then posts its state ({isolated, frames, capture, audio,
+sabUpload, done, log, errors, ...}), which the server writes to
+<result.json>. Every response carries COOP, COEP and CORP, so the page is
+cross-origin isolated by the headers; --no-isolate leaves them out, so the
+page has to isolate itself through web/sw.js as on a static host.
 """
 
 import argparse
@@ -34,9 +45,12 @@ parser.add_argument("--pick", action="store_true")
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8765)
 parser.add_argument("--arch")
+parser.add_argument("--play", metavar="MODULE")
+parser.add_argument("--seconds", type=int)
+parser.add_argument("--no-isolate", action="store_true")
 args = parser.parse_args()
-if not args.discs and not args.pick:
-    parser.error("give a disc file, or --pick")
+if not args.discs and not args.pick and not args.play:
+    parser.error("give a disc file, --pick, or --play")
 discs = {os.path.basename(d): os.path.abspath(d) for d in args.discs}
 blob = bytearray()
 CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
@@ -49,6 +63,10 @@ class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", CSP)
+        if not args.no_isolate:
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         super().end_headers()
 
     def disc(self, body):
@@ -118,15 +136,24 @@ class Handler(SimpleHTTPRequestHandler):
         threading.Thread(target=self.server.shutdown).start()
 
 
-if not os.path.isfile(os.path.join(args.page, "recomp.wasm")):
-    sys.exit(f"{args.page}: no recomp.wasm (run web/build.sh)")
+module = args.play or "recomp.wasm"
+if not os.path.isfile(os.path.join(args.page, module)):
+    sys.exit(f"{args.page}: no {module} (run web/build.sh)")
 server = ThreadingHTTPServer((args.host, args.port), Handler)
-if args.pick:
+page = "index.html"
+if args.play:
+    page = "play.html"
+    query = "test=1&wasm=" + quote(args.play)
+    if args.discs:
+        query += "&disc=" + quote("disc/" + os.path.basename(args.discs[0]))
+    if args.seconds:
+        query += f"&seconds={args.seconds}"
+elif args.pick:
     query = "pick=1"
 else:
     query = "test=" + quote("disc/" + os.path.basename(args.discs[0]))
 if args.arch:
     query += "&arch=" + args.arch
 host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
-print(f"http://{host}:{args.port}/index.html?{query}", flush=True)
+print(f"http://{host}:{args.port}/{page}?{query}", flush=True)
 server.serve_forever()

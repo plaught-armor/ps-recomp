@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'">
+<title>ps-recomp player</title>
+<link rel="stylesheet" href="page.css">
+<script type="module" src="play.js"></script>
+</head>
+<body>
+<main>
+<h1>ps-recomp player</h1>
+<p id="isolation" hidden></p>
+<p>Plays a disc image in this tab. The disc is read here and nothing is
+sent anywhere.</p>
+<p>Settings and saves are lost when the page reloads, until browser storage comes.</p>
+<label id="drop">
+<input id="disc" type="file" multiple>
+<span>Pick or drop a disc image (.iso, .bin, or a .cue with its track files)</span>
+</label>
+<p id="picked"></p>
+<p><button id="start" type="button" disabled>Start</button></p>
+<canvas id="screen" tabindex="0"></canvas>
+<pre id="log"></pre>
+<p id="commit">Built from ps-recomp <code id="sha">?</code>.</p>
+</main>
+</body>
+</html>

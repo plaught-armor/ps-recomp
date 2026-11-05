@@ -195,6 +195,49 @@ tree passes them, `fmax` and `fmin` as `texels_read` calls them
 each input whose result differs (the first 10000) and their count, and
 exits 1 if any does; `--only s|c|e|domain` runs one part.
 
+## The browser player
+
+`tests/wasi/host` is the play page's gate program: built for
+`wasi_wasm32` into the page's out dir, it runs in `play.html` in place of
+`play.wasm` with the same SDL imports, so it needs no disc. It draws a
+fixed pattern every frame (exact in 8-bit arithmetic, so the captured
+frame is the same bytes in every browser), queues a 440 Hz square wave,
+prints each controller and key event, and exits after 6 seconds.
+`tests/wasi/serve.py --play` serves the page in its test mode, which
+presses A on a fake gamepad and the Z key once the first frame is drawn,
+and writes the page's report to the result file:
+
+```sh
+web/build.sh <out dir>
+odin build tests/wasi/host -target:wasi_wasm32 -o:speed -out:<out dir>/host.wasm
+python3 tests/wasi/serve.py <out dir> result.json --play host.wasm
+python3 tests/wasi/serve.py <out dir> result.json --play host.wasm --no-isolate --port 8766
+python3 tests/wasi/serve.py <out dir> result.json --play play.wasm path/to/game.iso --seconds 30
+```
+
+The test URL's `disc` parameter may name a disc on another origin only if
+that server sends CORS headers and answers the preflight for the page's
+`Range` requests: an isolated page (COEP `require-corp`, from the server
+or `web/sw.js`) loads nothing cross-origin without them. Open each printed
+URL in the browser under test. A headless browser needs
+autoplay allowed for the audio to run (Chromium:
+`--autoplay-policy=no-user-gesture-required`). WebKitGTK withholds
+`SharedArrayBuffer` even from an isolated page unless it runs with
+`JSC_useSharedArrayBuffer=1` in the environment; without it the report has
+`isolated` true and nothing else, and the page says why. For host.wasm the report
+should have `isolated` true, `done.code` 0, `capture` 320x240 with the same
+`sha256` in every browser, `audio.frames` over zero with `audio.rms` near
+0.25, the log lines `host: pad added`, `host: button 0 down` and `up`,
+`host: key Z down` and `up`, and no `errors`. The `--no-isolate` run checks
+the service worker path: `controlled` true and `isolated` true after the
+page's one reload. `sabUpload` says whether `texSubImage2D` took a view of
+the `SharedArrayBuffer` itself (false: the page copies each texture
+first). play.wasm cannot run a game yet: guest code has no way to run on
+wasm (`core/code_wasi.odin`), so console start-up stops at a runtime
+assertion. Its run checks that the page loads the module and reads the
+disc, and that the assertion reaches the report's `errors` with
+`done.code` -1.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
