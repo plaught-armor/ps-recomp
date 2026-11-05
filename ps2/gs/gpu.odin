@@ -88,9 +88,9 @@ Clut_PC :: struct {
 }
 @(private)
 Decode_PC :: struct {
-	vram, outp:                             vk.DeviceAddress,
-	psm, ta, aem, tw, th, nlev, stride: u32,
-	tb:                                     [7]u32,
+	vram, outp, pages:                         vk.DeviceAddress, // pages: see hw_dec
+	psm, ta, aem, tw, th, nlev, stride, part: u32,
+	tb:                                        [7]u32,
 }
 @(private)
 Scan_PC :: struct {
@@ -586,6 +586,21 @@ hw_dec :: proc(t: ^Tex, st: ^Hw_State, tex: [2]u32) -> (off, stride: u32) {
 	if size * layers > DEC_WORDS / 4 {return}
 	e, ok := hw.dec_map[k]
 	if ok && pages_seq(tex) <= e.seq {return e.off, e.stride}
+	// A copy that stands but for pages written since gets only their texels
+	// decoded again: the pages written after it, a bit each, in the slot's
+	// upload ring. With no room there it is decoded whole.
+	s := &hw.slots[hw.cur]
+	part := ok && s.nup + PAGES / 32 <= UP_CAP
+	pages := s.up.addr + vk.DeviceAddress(s.nup * 4)
+	if part {
+		set: [PAGES / 32]u32 // built here: s.up is write-combined
+		for i in 0 ..< tex[1] {
+			p := (tex[0] + i) % PAGES
+			if hw.page_seq[p] > e.seq {set[p / 32] |= 1 << (p % 32)}
+		}
+		mem.copy(&([^]u32)(s.up.ptr)[s.nup], &set, size_of(set))
+		s.nup += PAGES / 32
+	}
 	if !ok {
 		if hw.dec_top + size * layers > DEC_WORDS {
 			clear(&hw.dec_map)
@@ -599,6 +614,8 @@ hw_dec :: proc(t: ^Tex, st: ^Hw_State, tex: [2]u32) -> (off, stride: u32) {
 	pc := Decode_PC {
 		vram   = hw.vram.addr,
 		outp   = hw.dec.addr + vk.DeviceAddress(e.off * 4),
+		pages  = pages,
+		part   = u32(part),
 		psm    = k.psm,
 		ta     = k.ta,
 		aem    = k.aem,

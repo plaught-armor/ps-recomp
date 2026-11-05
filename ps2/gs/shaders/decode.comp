@@ -1,14 +1,16 @@
 #version 460
 // Texture decode (../gpu.odin `hw_dec`): every level of a direct-colour
 // texture as RGBA8888 rows, level after level, one copy per layer, for
-// prim.frag to read in place of local memory.
+// prim.frag to read in place of local memory. With part set only the
+// texels on the pages set in pc.pages are written, the rest of the copy
+// standing.
 #include "common.glsl"
 
 layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PC {
-	Words vram, outp;
-	uint psm, ta, aem, tw, th, nlev, stride; // stride: words per layer
+	Words vram, outp, pages; // pages: a bit per page of local memory
+	uint psm, ta, aem, tw, th, nlev, stride, part; // stride: words per layer
 	uint tb[7]; // level n: TBP | TBW << 16
 } pc;
 
@@ -26,6 +28,9 @@ void main() {
 		n++;
 	}
 	uint w = max(pc.tw >> n, 1u);
-	uint raw = read_raw(pc.psm, pc.tb[n] & 0xffffu, pc.tb[n] >> 16, off % w, off / w);
+	Pixel p = pixel(pc.psm, pc.tb[n] & 0xffffu, pc.tb[n] >> 16, off % w, off / w);
+	uint page = p.i >> 11; // 2048 words a page
+	if (pc.part != 0u && (pc.pages.w[page >> 5u] & (1u << (page & 31u))) == 0u) return;
+	uint raw = load(p);
 	pc.outp.w[layer * pc.stride + i] = texel_direct(pc.psm, raw, pc.ta, pc.aem != 0u);
 }
