@@ -21,8 +21,9 @@ Boot :: struct {
 	disc:           string,
 	// The window's title.
 	title:          cstring,
-	// A native blob holding all the game's code ("" none: every function is
-	// interpreted). The boot stops if it cannot be loaded.
+	// A native blob holding all the game's code ("" none: the functions
+	// hooks registers run, every other one is interpreted). The boot stops
+	// if it cannot be loaded.
 	native:         string,
 	// Called when the blob cannot be loaded, before boot returns false; nil
 	// none.
@@ -69,8 +70,6 @@ boot :: proc(b: Boot) -> bool {
 			if b.native_failed != nil {b.native_failed()}
 			return false
 		}
-	} else {
-		fmt.eprintln("ps2: no native code, interpreting everything")
 	}
 	// After init, which makes the R3000 the IOP (iop.iop_cpu_init).
 	if b.learned != "" && !psx_native.load_learned(b.learned) && b.learned_failed != nil {
@@ -80,6 +79,15 @@ boot :: proc(b: Boot) -> bool {
 		b.learned_ee_failed()
 	}
 	if b.hooks != nil {b.hooks() or_return}
+	// Without a blob, a port's hooks register its recompiled functions
+	// (text_range sizes their table); with neither, nothing is.
+	if b.native == "" {
+		if cpu.text_hi == 0 {
+			fmt.eprintln("ps2: no native code, interpreting everything")
+		} else {
+			fmt.eprintln("ps2: no native blob, running the registered functions")
+		}
+	}
 	entry, ok := mem.load_elf(elf)
 	delete(elf)
 	if !ok {
