@@ -4,7 +4,14 @@
 // Test mode, for tests/wasi/serve.py: index.html?test=<disc url>[&arch=<arch>]
 // converts the disc read from that URL, then posts the blob to `blob` and
 // {sha256, size, ms, arch, userAgent, errors} to `result` on the same origin.
+// Pick mode, index.html?pick=1[&arch=<arch>]: the page works as usual and
+// also posts each conversion of the picked files that way.
 const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+// Content Security Policy violations in the page or the Worker, for the report.
+const violations = [];
+const violation = (e) => violations.push(`csp: ${e.effectiveDirective} blocked ${e.blockedURI || "inline"}`);
+document.addEventListener("securitypolicyviolation", violation);
 let files = [];
 let worker = null;
 let link = null;
@@ -52,6 +59,7 @@ function run(msg) {
 	return new Promise((resolve, reject) => {
 		worker.onmessage = ({ data }) => {
 			if (data.log !== undefined) return log(data.log);
+			if (data.csp !== undefined) return violations.push(data.csp);
 			if (data.error !== undefined) {
 				// A trap leaves the instance unusable: start a fresh Worker next time.
 				worker.terminate();
@@ -71,7 +79,9 @@ async function convert() {
 	if (link) URL.revokeObjectURL(link);
 	link = null;
 	try {
-		const { code, ms, out } = await run({ files, image: image(files).name, arch: $("arch").value });
+		const task = run({ files, image: image(files).name, arch: $("arch").value });
+		if (params.has("pick")) send($("arch").value, task);
+		const { code, ms, out } = await task;
 		const blob = out.find((o) => o.name.endsWith(".bin"));
 		if (code !== 0 || !blob) {
 			$("result").textContent = `Failed (exit ${code}).`;
@@ -91,14 +101,12 @@ async function convert() {
 	}
 }
 
-async function selfTest(url, arch) {
+// Posts a conversion's blob to `blob` and its report to `result` (test and
+// pick modes); task is the promise from run().
+async function send(arch, task) {
 	const report = { userAgent: navigator.userAgent, arch, errors: [] };
 	try {
-		const head = await fetch(url, { method: "HEAD" });
-		const size = Number(head.headers.get("Content-Length"));
-		const name = decodeURIComponent(new URL(url, location.href).pathname.split("/").pop());
-		$("picked").textContent = `Test: ${name}, ${size} bytes, ${arch}`;
-		const done = await run({ urls: [{ name, url, size }], image: name, arch });
+		const done = await task;
 		Object.assign(report, { code: done.code, ms: done.ms, stats: done.stats });
 		const blob = done.out.find((o) => o.name.endsWith(".bin"));
 		if (done.code !== 0 || !blob) throw new Error(`exit ${done.code}, no blob`);
@@ -115,9 +123,22 @@ async function selfTest(url, arch) {
 	} catch (e) {
 		report.errors.push(String(e?.message ?? e));
 	}
+	report.errors.push(...violations);
 	report.log = $("log").textContent;
-	$("result").textContent = report.errors.length ? "Test failed." : "Test done.";
 	await fetch("result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report) });
+	return report;
+}
+
+async function selfTest(url, arch) {
+	const task = (async () => {
+		const head = await fetch(url, { method: "HEAD" });
+		const size = Number(head.headers.get("Content-Length"));
+		const name = decodeURIComponent(new URL(url, location.href).pathname.split("/").pop());
+		$("picked").textContent = `Test: ${name}, ${size} bytes, ${arch}`;
+		return run({ urls: [{ name, url, size }], image: name, arch });
+	})();
+	const report = await send(arch, task);
+	$("result").textContent = report.errors.length ? "Test failed." : "Test done.";
 }
 
 $("disc").addEventListener("change", (e) => pick(e.target.files));
@@ -133,7 +154,6 @@ $("drop").addEventListener("drop", (e) => {
 });
 $("convert").addEventListener("click", convert);
 fetch("commit.txt").then((r) => (r.ok ? r.text() : "?")).then((t) => ($("sha").textContent = t.trim()));
-const params = new URLSearchParams(location.search);
 guessArch().then((a) => {
 	$("arch").value = params.get("arch") ?? a;
 	if (params.has("test")) selfTest(params.get("test"), $("arch").value);

@@ -2,12 +2,19 @@
 files for the page's test mode, then waits for the browser's result.
 
     python3 tests/wasi/serve.py <page dir> <result.json> <disc file>... [--host H] [--port P] [--arch A]
+    python3 tests/wasi/serve.py <page dir> <result.json> --pick [--host H] [--port P] [--arch A]
 
 Open the printed URL in any browser. The page converts the first disc file,
 read by HTTP Range requests, posts the blob and its report, and the server
 writes the report (plus its own sha256 of the blob) to <result.json>, the
 blob beside it as <result>.bin, and exits. Only the named disc files are
 served, under /disc/<name>.
+
+With --pick the URL opens the page's pick mode instead: pick the disc in the
+page as a user would (read through File.slice), press Convert, and the page
+posts the same report. Every response carries the page's Content Security
+Policy as a header, which also covers the Worker (the page's meta tag does
+not).
 """
 
 import argparse
@@ -22,13 +29,17 @@ from urllib.parse import quote, unquote, urlsplit
 parser = argparse.ArgumentParser()
 parser.add_argument("page")
 parser.add_argument("result")
-parser.add_argument("discs", nargs="+")
+parser.add_argument("discs", nargs="*")
+parser.add_argument("--pick", action="store_true")
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8765)
 parser.add_argument("--arch")
 args = parser.parse_args()
+if not args.discs and not args.pick:
+    parser.error("give a disc file, or --pick")
 discs = {os.path.basename(d): os.path.abspath(d) for d in args.discs}
 blob = bytearray()
+CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -37,6 +48,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
         super().end_headers()
 
     def disc(self, body):
@@ -109,7 +121,10 @@ class Handler(SimpleHTTPRequestHandler):
 if not os.path.isfile(os.path.join(args.page, "recomp.wasm")):
     sys.exit(f"{args.page}: no recomp.wasm (run web/build.sh)")
 server = ThreadingHTTPServer((args.host, args.port), Handler)
-query = "test=" + quote("disc/" + os.path.basename(args.discs[0]))
+if args.pick:
+    query = "pick=1"
+else:
+    query = "test=" + quote("disc/" + os.path.basename(args.discs[0]))
 if args.arch:
     query += "&arch=" + args.arch
 host = "127.0.0.1" if args.host == "0.0.0.0" else args.host

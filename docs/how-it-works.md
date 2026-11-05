@@ -76,7 +76,10 @@ image is never read whole, and the blob comes back as a download.
 `wasm-opt -O3` when binaryen is installed) and copies the page files
 next to it with `commit.txt`. The page shows that commit: use the blob
 with the player built from the same commit. Serve the out dir from
-any static host, with `.wasm` as `application/wasm`.
+any static host, with `.wasm` as `application/wasm`. The host should also
+send the page's Content Security Policy (the one in `index.html`'s meta
+tag) as a `Content-Security-Policy` header: a Worker takes its policy from
+its own response's headers only, so the meta tag does not cover it.
 
 `tests/wasi/run.mjs` runs the same build on the same shim under Node 24 or
 newer (a development harness, no npm packages); its blob for an arch is
@@ -92,10 +95,15 @@ out dir and the named disc files, and prints a URL for the page's test
 mode (`index.html?test=<disc url>&arch=<arch>`). Open that URL in any
 browser: the page converts the disc, read by HTTP Range requests rather
 than a picked file, and posts the blob and a report (sha256, size, time,
-user agent, errors). The server writes them out and exits:
+user agent, errors, any CSP violation). The server writes them out and
+exits. With `--pick` and no disc, the URL opens pick mode
+(`index.html?pick=1`) instead: pick the disc in the page as a user does,
+read through `File.slice`, press Convert, and the page posts the same
+report. serve.py sends the CSP header on every response:
 
 ```sh
 python3 tests/wasi/serve.py <out dir> result.json path/to/game.iso --arch x64_sysv
+python3 tests/wasi/serve.py <out dir> result.json --pick --arch x64_sysv
 ```
 
 The options file is tab-separated: a `key<TAB>value` header row, then one

@@ -5,6 +5,9 @@ import { Wasi } from "./wasi.js";
 
 let module;
 
+addEventListener("securitypolicyviolation", (e) =>
+	postMessage({ csp: `csp (worker): ${e.effectiveDirective} blocked ${e.blockedURI || "inline"}` }));
+
 const fileReader = (f) => {
 	const fr = new FileReaderSync();
 	return { size: f.size, read: (offset, length) => new Uint8Array(fr.readAsArrayBuffer(f.slice(offset, offset + length))) };
