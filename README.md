@@ -246,6 +246,9 @@ one of these:
 Each game's output goes to `compat.log`, in its `discs/<disc id>/` folder.
 If a `press.txt` file is in that folder, it is used as the game's scripted
 button presses (`PS_PRESS`).
+`PS_SHOT=<vblank>,...` saves the picture at those vblanks on a PS2 disc;
+on a PS1 disc, `PS_DUMP=<dir>` saves frames. docs/testing.md has the
+details.
 
 Each game starts on blank memory cards, so a save left by an earlier run
 does not change what the game does. They are kept in `compat-cards` in the

@@ -119,6 +119,31 @@ progress file, and push no sound, so the run after a probe is the run
 without one (`PS_DUMP_HASH` is the same with `PS_COMPAT_PROBE=0`). A
 warm run has no new entry pcs, so it is quiet whenever it loads no IRX.
 
+### Pictures and dumps
+
+`PS_SHOT=<vblank>,<vblank>,...` (PS2 only, read in ps2/host/platform.odin)
+writes `shot_<vblank>.ppm` into the working directory at each listed
+vblank, in ascending order. Shots count vblanks, as `PS_FRAMES` does, so a
+shot at the last frame is the picture the compat `lit` column counts. With
+the display off at that vblank no file is written and the run prints
+`shot: vblank <n>, display off, none written`. A headless run without
+`PS_FRAMES` exits after its last shot; with `PS_FRAMES` it runs on to that
+count. The PS1 host does not read `PS_SHOT`.
+
+Both consoles also save the disc's thumbnail, `thumb.ppm` in the disc's
+folder, from the picture on screen when the run ends without an error,
+unless the display is off then.
+
+On PS1, pictures come from `PS_DUMP=<dir>` (core/dump.odin): from present
+`PS_DUMP_FROM` (default 1), every `PS_DUMP_EVERY` presents (default 1), the
+displayed area is written as `frame_<n>.ppm` and main RAM as
+`ram_<n>.bin`, plus all of VRAM as `vram_<n>.ppm` on every 150th present.
+On PS2, `PS_DUMP` writes the guest clock, EE RAM and IOP memory per
+presented frame (`cyc`, `ram`, `iop`, `iophle`), no pictures.
+`PS_DUMP_HASH=1` turns every dump into a line `<kind>\t<frame>\t<XXH3>`
+in `<dir>/hashes.tsv` instead of a file, so two runs can be diffed for the
+first frame they diverge; a PS1 run with it writes no pictures.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
