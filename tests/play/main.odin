@@ -790,12 +790,14 @@ id_of :: proc(path: string) -> string {
 // play --export under a DATA of its own. A PS1 disc whose directory has
 // settings.tsv, press.txt, thumb.ppm, a compat.tsv row (a fatal message with
 // a '|' in it) and a native blob, learn records and a memory card exports to
-// exactly README.md (ps-recomp pinned to the player's commit), .gitignore
+// exactly README.md (ps-recomp pinned to the player's commit and committed,
+// settings.tsv named, the LEARN step), .gitignore
 // (port/src/rec left out), local.tsv, settings.tsv and press.txt (the same
 // bytes), docs/notes.md (the row, the '|' escaped), shots/thumb.png (the
 // picture's size) and the port: setup.sh (whose rec mode stops before
 // port/build.sh), tools/recomp.tsv (r3000, no
-// disc), port/build.sh, port/src/local.odin, port/src/main.odin (psx.run)
+// disc), port/build.sh, port/src/local.odin, port/src/main.odin (psx.run,
+// the learned functions registered)
 // and tests/run.sh; a PS2 disc with none of them to the same but
 // settings.tsv, press.txt and the thumb, docs/notes.md saying no run yet,
 // recomp.tsv r5900 and main.odin ps2.boot (with the IOP and EE learned
@@ -805,6 +807,7 @@ id_of :: proc(path: string) -> string {
 // again, or into one holding another file, is refused and changes nothing;
 // one into an empty directory is written there, its local.tsv naming the
 // VU1 capture the PS2 disc's directory holds by then (and no VU0 one).
+// Off Windows, setup.sh writes build/recomp.tsv (below).
 @(private = "file")
 test_export :: proc() {
 	name := "export"
@@ -918,13 +921,19 @@ test_export :: proc() {
 	check(name, strings.contains(local, fmt.tprintf("\nid\t%s\n", id)) && strings.contains(local, "\ncommit\ttest\n") && strings.contains(local, "\nsystem\tps1\n"), fmt.tprintf("local.tsv:\n%s", local))
 	recomp := read(out1, "tools/recomp.tsv")
 	check(name, strings.contains(recomp, "\nbackend\tr3000\n") && strings.contains(recomp, "\nout\tport/src/rec\n") && !strings.contains(recomp, "\ndisc\t"), fmt.tprintf("PS1 recomp.tsv:\n%s", recomp))
-	check(name, strings.contains(read(out1, "port/src/main.odin"), "psx.run(b)"), "PS1 main.odin does not run psx")
+	ps1_main := read(out1, "port/src/main.odin")
+	check(name, strings.contains(ps1_main, "psx.run(b)"), "PS1 main.odin does not run psx")
+	check(name, strings.contains(ps1_main, "\t\tlearned_funcs = rec.register_learned,\n"), "PS1 main.odin does not register the learned functions")
 	setup := read(out1, "setup.sh")
 	check(name, strings.contains(setup, "if [ \"$1\" = rec ]; then\n\tdu -sh port/src/rec\n\texit 0\nfi\nsh port/build.sh\n"), fmt.tprintf("setup.sh has no rec mode before the build:\n%s", setup))
-	check(name, strings.contains(setup, "\t\tif [ -n \"$cap\" ] && [ -f \"$cap\" ]; then\n\t\t\tprintf '%s_capture\t%s\n' \"$vu\" \"$cap\"\n\t\tfi\n\tdone\n} >build/recomp.tsv\n"), fmt.tprintf("setup.sh does not add the VU captures:\n%s", setup))
+	check(name, strings.contains(setup, "\t\tif [ -n \"$cap\" ] && [ -f \"$cap\" ]; then\n\t\t\tprintf '%s_capture\t%s\n' \"$vu\" \"$cap\"\n\t\tfi\n\tdone\n"), fmt.tprintf("setup.sh does not add the VU captures:\n%s", setup))
 	check(name, !strings.contains(local, "_capture\t"), fmt.tprintf("PS1 local.tsv names a VU capture:\n%s", local))
 	check(name, strings.contains(read(out1, ".gitignore"), "\n/port/src/rec/\n"), ".gitignore tracks port/src/rec")
-	check(name, strings.contains(read(out1, "README.md"), "git -C ps-recomp checkout test\n"), "README does not pin ps-recomp to the player's commit")
+	ps1_readme := read(out1, "README.md")
+	check(name, strings.contains(ps1_readme, "git -C ps-recomp checkout test\ngit add .\ngit commit -m "), "README does not pin ps-recomp to the player's commit and commit")
+	check(name, strings.contains(ps1_readme, "it needs the network"), "README does not say the submodule add needs the network")
+	check(name, strings.contains(ps1_readme, "as the player does: with `settings.tsv`, the player's"), "PS1 README does not name its settings.tsv")
+	check(name, strings.contains(ps1_readme, "PS_LEARN=1 play <your disc image>\nsh setup.sh\n"), "PS1 README has no LEARN step")
 	clean(name, out1, files, forbidden)
 
 	out2, _ := filepath.join({tmp, "export_ps2_repo"}, context.temp_allocator)
@@ -939,6 +948,7 @@ test_export :: proc() {
 	check(name, strings.contains(read(out2, "docs/notes.md"), "No compatibility run yet"), "PS2 notes name a run")
 	readme := read(out2, "README.md")
 	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "- `settings.tsv`"), fmt.tprintf("PS2 README:\n%s", readme))
+	check(name, strings.contains(readme, "as the player does: with the player's") && !strings.contains(readme, "PS_LEARN=1"), fmt.tprintf("PS2 README names a settings.tsv or the LEARN step:\n%s", readme))
 	clean(name, out2, files, forbidden)
 
 	// Refused: the directory again, and one holding another file.
@@ -964,6 +974,38 @@ test_export :: proc() {
 	check(name, strings.contains(ps2_local, fmt.tprintf("\nvu1_capture\t%s\n", vu1)) && !strings.contains(ps2_local, "vu0_capture"), fmt.tprintf("PS2 local.tsv with a VU1 capture:\n%s", ps2_local))
 	clean(name, empty, got, forbidden)
 	_ = os.remove(tsv)
+
+	// setup.sh's build/recomp.tsv, with odin failing so it stops there:
+	// tools/recomp.tsv and the disc image, then for the PS1 disc the learned
+	// row while its player directory has learn/psx.bin, and the same as
+	// without the row once the file is gone; never for the PS2 disc, even
+	// with the file.
+	when ODIN_OS != .Windows {
+		setup_tsv :: proc(name, out: string) -> string {
+			state, _, e, err := os.process_exec({command = {"sh", "-c", "PS_RECOMP=.; odin() { return 1; }; . ./setup.sh"}, working_dir = out}, context.temp_allocator)
+			check(name, err == nil && state.exit_code != 0, fmt.tprintf("setup.sh in %s did not stop at the odin build: %v %s", out, err, e))
+			return read(out, "build/recomp.tsv")
+		}
+		local_value :: proc(out, key: string) -> string {
+			rest := read(out, "local.tsv")
+			for line in strings.split_lines_iterator(&rest) {
+				k, _, v := strings.partition(line, "\t")
+				if k == key {return v}
+			}
+			return ""
+		}
+		base := fmt.tprintf("%sdisc\t%s\n", read(out1, "tools/recomp.tsv"), local_value(out1, "image"))
+		learn, _ := filepath.join({local_value(out1, "data"), "learn", "psx.bin"}, context.temp_allocator)
+		check(name, os.is_file(learn), fmt.tprintf("local.tsv data does not hold %s", learn))
+		with := setup_tsv(name, out1)
+		check(name, with == fmt.tprintf("%slearned\t%s\n", base, learn), fmt.tprintf("PS1 build/recomp.tsv with learn/psx.bin:\n%s", with))
+		_ = os.remove(learn)
+		without := setup_tsv(name, out1)
+		check(name, without == base, fmt.tprintf("PS1 build/recomp.tsv without learn/psx.bin:\n%s", without))
+		put(name, ps2_dir, "learn/psx.bin", transmute([]u8)string("not a PS1 disc's"))
+		ps2_tsv := setup_tsv(name, out2)
+		check(name, ps2_tsv == fmt.tprintf("%sdisc\t%s\n", read(out2, "tools/recomp.tsv"), local_value(out2, "image")), fmt.tprintf("PS2 build/recomp.tsv:\n%s", ps2_tsv))
+	}
 }
 
 // The library under a DATA of its own: a directory of a PS1 disc, a PS2 one

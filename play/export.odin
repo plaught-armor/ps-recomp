@@ -108,8 +108,10 @@ PORT_SETUP :: `#!/bin/sh
 #                      docs/porting.md)
 #
 # build/recomp.tsv is tools/recomp.tsv with the disc image local.tsv names,
-# and the VU capture files it names that are still there; recomp writes
-# the game's code to port/src/rec from it, then port/build.sh builds
+# the VU capture files it names that are still there and, for a PS1 disc,
+# the code the player learned (learn/psx.bin in the player's directory for
+# the disc, recorded with PS_LEARN=1) when there is any; recomp writes the
+# game's code to port/src/rec from it, then port/build.sh builds
 # port/game. Both stay out of git. PS_RECOMP overrides the ps-recomp
 # checkout (default: the ps-recomp submodule).
 set -e
@@ -140,6 +142,12 @@ mkdir -p build
 ' "$vu" "$cap"
 		fi
 	done
+	data=$(awk -F '	' '$1 == "data" { print $2 }' local.tsv)
+	system=$(awk -F '	' '$1 == "system" { print $2 }' local.tsv)
+	if [ "$system" = ps1 ] && [ -f "$data/learn/psx.bin" ]; then
+		printf 'learned	%s
+' "$data/learn/psx.bin"
+	fi
 } >build/recomp.tsv
 odin build "$PS_RECOMP/recomp" -collection:ps="$PS_RECOMP" -o:speed -out:build/recomp
 build/recomp build/recomp.tsv
@@ -275,11 +283,12 @@ main :: proc() {
 	l := local_read()
 	settings(l)
 	b := psx.Boot {
-		disc    = l.image,
-		exe     = psx_exe(l.image),
-		title   = TITLE,
-		funcs   = rec.EXE_FUNCS[:],
-		learned = learned(l, .Learned, .Learned, .Learned_Key),
+		disc          = l.image,
+		exe           = psx_exe(l.image),
+		title         = TITLE,
+		funcs         = rec.EXE_FUNCS[:],
+		learned       = learned(l, .Learned, .Learned, .Learned_Key),
+		learned_funcs = rec.register_learned,
 	}
 	dir := cards(l)
 	for &c, i in b.cards {
@@ -583,7 +592,8 @@ export_readme :: proc(id: string, info: [Info]string, files: bit_set[Export_File
 		"  one\n\n" +
 		"`.gitignore` lists the files that are tracked; add a line there to track\n" +
 		"another.\n\n## Build the port\n\n" +
-		"With git and Odin, in this directory:\n\n```sh\ngit init\n" +
+		"With git and Odin, in this directory (the submodule add downloads\n" +
+		"ps-recomp: it needs the network):\n\n```sh\ngit init\n" +
 		"git submodule add https://github.com/plaught-armor/ps-recomp ps-recomp\n",
 	)
 	if core.COMMIT == "dev" {
@@ -593,17 +603,40 @@ export_readme :: proc(id: string, info: [Info]string, files: bit_set[Export_File
 	}
 	strings.write_string(
 		&b,
-		"sh setup.sh\n```\n\n" +
+		"git add .\ngit commit -m \"The export, ps-recomp pinned\"\nsh setup.sh\n```\n\n" +
+		"The commit records the exported files and the ps-recomp commit, so\n" +
+		"`git status` shows only what changes after it.\n\n" +
 		"`setup.sh` recompiles the game on your disc into `port/src/rec` and builds\n" +
-		"`port/game`, which runs it as the player does: with `settings.tsv`, the\n" +
-		"player's memory cards for the disc and, at the player's ps-recomp commit,\n" +
-		"the code the player learned. `sh tests/run.sh [frames]` makes a\n" +
+		"`port/game`, which runs it as the player does: with ",
+	)
+	if .Settings in files {
+		strings.write_string(&b, "`settings.tsv`, ")
+	}
+	strings.write_string(
+		&b,
+		"the player's memory cards for the disc and, at the player's ps-recomp\n" +
+		"commit, the code the player learned. `sh tests/run.sh [frames]` makes a\n" +
 		"compatibility run of it. `port/src/main.odin` is where the port changes\n" +
 		"the game: see ps-recomp's `docs/porting.md`. `sh setup.sh rec` only\n" +
 		"recompiles, and prints the size of `port/src/rec`: the build needs\n" +
 		"memory in step with it. Only tried on Linux: the\n" +
 		"scripts need a POSIX shell.\n",
 	)
+	if system == "PS1" {
+		strings.write_string(
+			&b,
+			"\n## Recompile the code the game loads\n\n" +
+			"The recompiler sees the disc's executable; code the game loads from\n" +
+			"other files as it runs stays interpreted. Play that code with the player\n" +
+			"recording what it interprets, then recompile:\n\n```sh\n" +
+			"PS_LEARN=1 play <your disc image>\nsh setup.sh\n```\n\n" +
+			"`PS_LEARN=1` records each run of code the player interprets in its\n" +
+			"directory for the disc, as `learn/psx.bin`; `setup.sh` gives that file to\n" +
+			"the recompiler, which adds it to `port/src/rec`. Only what was played is\n" +
+			"recorded: play through the parts of the game to cover. The file holds\n" +
+			"the game's code and stays out of git.\n",
+		)
+	}
 	return b.buf[:]
 }
 
