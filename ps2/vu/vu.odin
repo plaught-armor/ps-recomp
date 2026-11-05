@@ -21,7 +21,6 @@
 // flags: CFC2 waits for the pipeline to drain.
 package ps2_vu
 
-import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:simd"
@@ -702,7 +701,7 @@ vu_register_native :: proc(unit: int, ranges: []Vu_Range, native: Vu_Native) {
 // Candidates are longest first; of the same size, native code before Odin.
 @(private)
 micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run, native: Vu_Native = nil) {
-	context.allocator = runtime.heap_allocator()
+	context.allocator = core.long_allocator()
 	p := new(Vu_Program)
 	p.ranges = slice.clone(ranges)
 	p.run = run

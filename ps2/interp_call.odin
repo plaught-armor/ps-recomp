@@ -7,7 +7,6 @@
 // whose words RAM holds runs instead (learned.odin).
 package ps2
 
-import "base:runtime"
 import "core:fmt"
 
 import "ps:core"
@@ -88,13 +87,13 @@ interp_call :: proc(entry: u32) {
 interp_enter :: proc(entry: u32) {
 	when cpu.FALLBACK_COUNT {
 		if cpu.fallback_ee_calls == nil {
-			cpu.fallback_ee_calls = make(map[u32]u64, runtime.heap_allocator())
+			cpu.fallback_ee_calls = make(map[u32]u64, core.long_allocator())
 		}
 		cpu.fallback_ee_calls[entry] += 1
 	}
 	when core.COMPAT_COUNT {core.compat_entry(entry)}
 	if entry not_in interp_seen {
-		if interp_seen == nil {interp_seen = make(map[u32]bool, runtime.heap_allocator())}
+		if interp_seen == nil {interp_seen = make(map[u32]bool, core.long_allocator())}
 		interp_seen[entry] = true
 		fmt.eprintfln("ee: interpreting %08x (ra %08x): no function registered", entry, u32(cpu.state.r[31].d[0]))
 	}

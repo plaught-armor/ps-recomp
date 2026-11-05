@@ -31,7 +31,6 @@
 // the interpreters only test a nil frame pointer; nothing else changes.
 package core
 
-import "base:runtime"
 import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
@@ -176,12 +175,12 @@ learn_hold :: proc() {
 		}
 		x := &h.scratch[cpu]
 		if x.fetched == nil {
-			x.fetched = make([]u32, s.ram_bytes / 4, runtime.heap_allocator())
-			x.fetched_at = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
+			x.fetched = make([]u32, s.ram_bytes / 4, long_allocator())
+			x.fetched_at = make([]u64, s.ram_bytes / 4, long_allocator())
 			if s.stamped {
-				x.stamps = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
+				x.stamps = make([]u64, s.ram_bytes / 4, long_allocator())
 			} else {
-				x.log = make([]u32, LEARN_STORES_MAX, runtime.heap_allocator())
+				x.log = make([]u32, LEARN_STORES_MAX, long_allocator())
 			}
 		}
 		s.fetched, s.fetched_at, s.stamps, s.log = x.fetched, x.fetched_at, x.stamps, x.log
@@ -233,7 +232,7 @@ learn_open :: proc() -> bool {
 // Open path as the LEARN file, noting the runs of the processors in cpus
 // alone (default: all); false after a message when it cannot be opened.
 learn_open_path :: proc(path: string, cpus := ~Learn_Cpus{}) -> bool {
-	context.allocator = runtime.heap_allocator()
+	context.allocator = long_allocator()
 	f, err := os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
 	if err != nil {
 		fmt.eprintfln("learn: cannot open %s: %v", path, err)
@@ -324,8 +323,8 @@ learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) {
 // only those of the RAM code is fetched from.
 @(private = "file")
 learn_fetched_make :: proc(s: ^Learn_Space) {
-	s.fetched = make([]u32, s.ram_bytes / 4, runtime.heap_allocator())
-	s.fetched_at = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
+	s.fetched = make([]u32, s.ram_bytes / 4, long_allocator())
+	s.fetched_at = make([]u64, s.ram_bytes / 4, long_allocator())
 }
 
 // f's run stores at addr.
@@ -337,14 +336,14 @@ learn_store :: proc(f: ^Learn_Frame, addr: u32) {
 			return
 		}
 		if s.stamps == nil {
-			s.stamps = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
+			s.stamps = make([]u64, s.ram_bytes / 4, long_allocator())
 		}
 		s.seq += 1
 		s.stamps[w] = s.seq
 		return
 	}
 	if s.log == nil {
-		s.log = make([]u32, LEARN_STORES_MAX, runtime.heap_allocator())
+		s.log = make([]u32, LEARN_STORES_MAX, long_allocator())
 	} else if s.seq > s.begin_seq && s.log[(s.seq - 1) % LEARN_STORES_MAX] == addr {
 		// The same address as the last store, which every run in progress
 		// sees already: it began after the latest run did.
@@ -427,7 +426,7 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 		flags += {.Large}
 		n = 0
 	}
-	context.allocator = runtime.heap_allocator()
+	context.allocator = long_allocator()
 	resize(&learn.buf, LEARN_HEADER + int(n) * 4)
 	words := ([^]u32le)(raw_data(learn.buf[LEARN_HEADER:]))[:n]
 	for &w, i in words {

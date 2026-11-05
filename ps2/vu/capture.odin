@@ -20,7 +20,6 @@ package ps2_vu
 import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
-import "base:runtime"
 import "ps:core"
 
 @(private)
@@ -45,7 +44,7 @@ capture_open :: proc(c: ^Capture, env: string, unit: int) -> bool {
 	path := core.env(env)
 	if path == "" {return false}
 	// Off the emulator heap: snapshots must not roll capture state back.
-	context.allocator = runtime.heap_allocator()
+	context.allocator = core.long_allocator()
 	c.seen = make(map[[2]u64]bool)
 	f, err := os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
 	if err != nil {

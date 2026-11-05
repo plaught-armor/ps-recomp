@@ -9,7 +9,6 @@
 // caller's calls) is recorded .Smc (core/learn.odin) and never compiled.
 package ps2
 
-import "base:runtime"
 import "core:fmt"
 import "core:os"
 
@@ -80,11 +79,11 @@ load_learned :: proc(path: string) -> bool {
 		if code.base != 0 {core.native_free(&code)}
 		return false
 	}
-	if learned_fns == nil {learned_fns = make(map[u32][dynamic]Learned_Fn, runtime.heap_allocator())}
+	if learned_fns == nil {learned_fns = make(map[u32][dynamic]Learned_Fn, core.long_allocator())}
 	for s in code.spans {
 		r := code.ranges[s.range_first]
 		fns := learned_fns[s.entry]
-		if fns == nil {fns = make([dynamic]Learned_Fn, runtime.heap_allocator())}
+		if fns == nil {fns = make([dynamic]Learned_Fn, core.long_allocator())}
 		append(&fns, Learned_Fn{r.pc, code.pool[r.at:][:r.n_words], cast(cpu.Func_Proc)rawptr(code.base + uintptr(s.off))})
 		learned_fns[s.entry] = fns
 	}

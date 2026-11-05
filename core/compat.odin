@@ -30,7 +30,6 @@
 // can tell a slow run from a hung one.
 package core
 
-import "base:runtime"
 import "core:encoding/endian"
 import "core:encoding/json"
 import "core:fmt"
@@ -243,9 +242,9 @@ compat_name :: proc(s: string) -> u32 {
 		}
 	}
 	if compat_names.allocator.procedure == nil {
-		compat_names.allocator = runtime.heap_allocator()
+		compat_names.allocator = long_allocator()
 	}
-	append(&compat_names, strings.clone(s, runtime.heap_allocator()))
+	append(&compat_names, strings.clone(s, long_allocator()))
 	return u32(len(compat_names) - 1)
 }
 

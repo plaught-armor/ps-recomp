@@ -5,7 +5,6 @@
 // through a table indexed by word offset into .text.
 package ps2_cpu
 
-import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "ps:core"
@@ -105,7 +104,7 @@ reported: map[u32]bool
 // Host state, outside the emulated heap: snapshots never need it.
 text_range :: proc(lo, hi: u32) {
 	text_lo, text_hi = lo, hi
-	fn_table = make([]Func_Proc, (hi - lo) / 4, runtime.heap_allocator())
+	fn_table = make([]Func_Proc, (hi - lo) / 4, core.long_allocator())
 }
 
 register :: proc(addr: u32, fn: Func_Proc) {

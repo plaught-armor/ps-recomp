@@ -246,10 +246,10 @@ when core.FLAT {
 
 	// The shadow stacks' allocator. The IOP means snapshotted: its runs are
 	// emulated state, on the emulated heap (core.snap_init) a snapshot holds.
-	// The PS1 has none: no emulated heap, so the host's.
+	// The PS1 has none: no emulated heap, so long-lived host memory.
 	@(private = "file")
 	flat_allocator :: proc() -> runtime.Allocator {
-		return learn_cpu == .Iop ? core.emu_allocator() : runtime.default_allocator()
+		return learn_cpu == .Iop ? core.emu_allocator() : core.long_allocator()
 	}
 
 	@(private = "file")
