@@ -1,9 +1,10 @@
 // Probes of input under COMPAT (core/compat.odin, PS_COMPAT_PROBE): at a
 // quiet sample the probe saves state, then runs a branch per
-// core.COMPAT_PROBE_BUTTONS entry from it, each core.COMPAT_PROBE_RUN
-// vblanks long with player 1 pressing its button for the first
-// core.COMPAT_PROBE_HOLD, loading the state back after each; the last load
-// puts the run back where it was, and it goes on as if no branch ran.
+// core.COMPAT_PROBE_BRANCHES entry from it, each core.COMPAT_PROBE_RUN
+// vblanks long with player 1 pressing its buttons or pushing its stick for
+// the first core.COMPAT_PROBE_HOLD, loading the state back after each; the
+// last load puts the run back where it was, and it goes on as if no branch
+// ran.
 //
 // A branch is emulated as usual but leaves no trace outside the state it
 // loads back: it presents, dumps, shoots, samples and paces nothing, and
@@ -24,7 +25,7 @@ import mem "../mem"
 PROBE_SNAP_ID :: 2
 
 @(private = "file")
-BUTTONS :: core.COMPAT_PROBE_BUTTONS
+BRANCHES :: core.COMPAT_PROBE_BRANCHES
 
 @(private = "file")
 probe: struct {
@@ -35,7 +36,7 @@ probe: struct {
 	branch:  int,
 	at:      int,
 	none:    []u8,
-	changed: [len(BUTTONS) - 1]int,
+	changed: [len(BRANCHES) - 1]int,
 	display: gs.Display_Track,
 	ending:  bool, // the last load puts the run back
 }
@@ -80,14 +81,17 @@ probe_loaded :: proc(id: int) {
 }
 
 // Every pad: nothing pressed, sticks centred; player 1 holds the branch's
-// button for its first COMPAT_PROBE_HOLD vblanks.
+// buttons and stick for its first COMPAT_PROBE_HOLD vblanks.
 @(private)
 probe_input :: proc() {
 	for &pad in iop.pads {
-		pad.buttons, pad.axes = {}, {128, 128, 128, 128}
+		pad.buttons, pad.axes = {}, pad_axes({}, {})
 	}
-	buttons := BUTTONS
-	if vblank - probe.at <= core.COMPAT_PROBE_HOLD {iop.pads[0].buttons = buttons[probe.branch]}
+	if vblank - probe.at > core.COMPAT_PROBE_HOLD {return}
+	branches := BRANCHES
+	b := branches[probe.branch]
+	iop.pads[0].buttons = b.buttons
+	iop.pads[0].axes = pad_axes(core.script_sticks(b.stick))
 }
 
 // A branch's vblank, its picture w x h: at its last, compare main RAM and
@@ -104,7 +108,7 @@ probe_frame :: proc(w, h: int) {
 		probe.changed[probe.branch - 1] = core.compat_bytes_differ(probe.none, mem.ram)
 	}
 	probe.branch += 1
-	if probe.branch == len(BUTTONS) {
+	if probe.branch == len(BRANCHES) {
 		probe.branch, probe.ending = -1, true
 	}
 	core.snap_op, core.snap_target = .Load, &probe.snap

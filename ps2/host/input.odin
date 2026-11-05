@@ -24,9 +24,7 @@ input_poll :: proc() {
 	for &in_, i in inputs {
 		p := ps[i]
 		in_.buttons = p.buttons
-		for f, j in ([4]f32{p.right.x, p.right.y, p.left.x, p.left.y}) {
-			in_.axes[j] = u8((i32(math.round(f * 32767)) + 32768) >> 8)
-		}
+		in_.axes = pad_axes(p.left, p.right)
 		pad_hook(&in_)
 	}
 	// Netplay: this host's player 1 plays the session slot NET_PLAYER;
@@ -47,4 +45,14 @@ input_poll :: proc() {
 		pad.axes = inputs[i].axes
 		core.input_rumble(i, pad.small != 0, pad.large)
 	}
+}
+
+// Sticks, x right and y down in -1..1, as the pad's axis bytes (rx, ry, lx,
+// ly; 0x80 centred).
+@(private)
+pad_axes :: proc(left, right: [2]f32) -> (axes: [4]u8) {
+	for f, j in ([4]f32{right.x, right.y, left.x, left.y}) {
+		axes[j] = u8((i32(math.round(f * 32767)) + 32768) >> 8)
+	}
+	return
 }

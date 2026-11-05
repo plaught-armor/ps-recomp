@@ -72,16 +72,36 @@ COMPAT_STILL_DIFF :: 2.0
 
 // The default vblanks of quiet between probes of input (PS_COMPAT_PROBE),
 // 60 s at 60 Hz. A probe saves state at a quiet sample, runs one branch per
-// COMPAT_PROBE_BUTTONS entry (the first presses nothing) for
-// COMPAT_PROBE_RUN vblanks, each pressing its button on player 1 for the
-// first COMPAT_PROBE_HOLD, loads the state back after each and compares
-// each button branch's main RAM with the first's. A probe where every
-// button changed at most COMPAT_DEAF_BYTES bytes is deaf.
+// COMPAT_PROBE_BRANCHES entry (the first presses nothing) for
+// COMPAT_PROBE_RUN vblanks, each pressing its buttons or pushing its stick
+// on player 1 for the first COMPAT_PROBE_HOLD, loads the state back after
+// each and compares each other branch's main RAM with the first's. A probe
+// where every other branch changed at most COMPAT_DEAF_BYTES bytes is deaf.
+// The left stick has a branch: mid-fight a game can ignore every button
+// while the character attacks or is hit, and still move it with the stick.
+// The hold is long because a short push of the stick only moves the
+// character's position, a few bytes; a held one also turns the walk
+// animation and the camera.
 COMPAT_PROBE :: 3600
 COMPAT_PROBE_RUN :: 90
-COMPAT_PROBE_HOLD :: 10
+COMPAT_PROBE_HOLD :: 60
 COMPAT_DEAF_BYTES :: 64
-COMPAT_PROBE_BUTTONS :: [?]Buttons{{}, {.Start}, {.Cross}, {.Circle}, {.Up}, {.Down}}
+COMPAT_PROBE_BRANCHES :: [?]Compat_Probe_Branch {
+	{},
+	{buttons = {.Start}},
+	{buttons = {.Cross}},
+	{buttons = {.Circle}},
+	{buttons = {.Up}},
+	{buttons = {.Down}},
+	{stick = {.LUp}},
+}
+
+// One branch of a probe: the buttons player 1 holds and the stick
+// directions it pushes fully (script_sticks).
+Compat_Probe_Branch :: struct {
+	buttons: Buttons,
+	stick:   Stick_Dirs,
+}
 
 // What a stretch is: the display off or every pixel black (Black), the
 // same picture as the sample before, not black (Frozen), main RAM the same
@@ -91,9 +111,9 @@ COMPAT_PROBE_BUTTONS :: [?]Buttons{{}, {.Start}, {.Cross}, {.Circle}, {.Up}, {.D
 // for input on purpose; Deaf when one did, so the presses changed nothing
 // to see: a soft lock, or a script pressing the wrong thing). A stretch
 // that is frozen throughout is listed as frozen only. Stuck: probes of
-// input (compat_probe_end) found every button changed at most
-// COMPAT_DEAF_BYTES of main RAM, from the first such probe to the last of
-// two or more in a row. Still and Deaf only
+// input (compat_probe_end) found every button and the left stick changed at
+// most COMPAT_DEAF_BYTES of main RAM, from the first such probe to the last
+// of two or more in a row. Still and Deaf only
 // flag a picture that is static as a whole: a stuck prompt drawn over a
 // moving 3D scene (a camera orbiting behind a save prompt changes the
 // thumbnail by 8 to 17) is not flagged.
@@ -639,7 +659,7 @@ compat_probe_begin :: proc() {
 // top bit set over the branch vblanks so far, a value never written
 // before. The parent takes any new value as progress (play/compat.odin
 // compat_wait), so a probe, which runs no vblank of its own for up to
-// len(COMPAT_PROBE_BUTTONS) * COMPAT_PROBE_RUN, is not a hang.
+// len(COMPAT_PROBE_BRANCHES) * COMPAT_PROBE_RUN, is not a hang.
 compat_probe_beat :: proc() {
 	compat.probe_beats += 1
 	if compat.progress != nil && compat.probe_beats % COMPAT_PROGRESS_EVERY == 0 {
@@ -650,9 +670,9 @@ compat_probe_beat :: proc() {
 }
 
 // The probe at sample vblank n ended, the state it saved loaded again:
-// changed[i] the bytes of main RAM button branch i left different from the
-// branch that pressed nothing. Deaf when every one is at most
-// COMPAT_DEAF_BYTES; deaf probes in a row, with no sample that was not
+// changed[i] the bytes of main RAM COMPAT_PROBE_BRANCHES entry i + 1 left
+// different from the branch that pressed nothing. Deaf when every one is at
+// most COMPAT_DEAF_BYTES; deaf probes in a row, with no sample that was not
 // quiet between them, are a stuck stretch from the first to the last.
 compat_probe_end :: proc(n: u64, changed: []int) {
 	compat.probing = false

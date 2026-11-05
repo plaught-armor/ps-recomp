@@ -331,8 +331,12 @@ test_probe :: proc(n: ^u64, ram: []u8) {
 		core.compat_probe_end(n, changed)
 		check("probe", core.compat.interp_insns == insns && core.compat.quiet_new == 0 && core.compat.quiet_loads == 0, "nothing counted")
 	}
-	deaf := []int{0, 64, 3, 0, 0}
-	heard := []int{0, 65, 0, 0, 0}
+	// changed per COMPAT_PROBE_BRANCHES entry after the first: Start, Cross,
+	// Circle, Up, Down, the left stick.
+	#assert(len(core.COMPAT_PROBE_BRANCHES) == 7)
+	deaf := []int{0, 64, 3, 0, 0, 0}
+	heard := []int{0, 65, 0, 0, 0, 0}
+	stick := []int{0, 0, 3, 0, 0, 65}
 	check(name, !sample(n, ram, &pc, true, false), "new pc")
 	quiet_from := n^
 	// Quiet from the next sample: a probe EVERY vblanks after this one.
@@ -393,6 +397,9 @@ test_probe :: proc(n: ^u64, ram: []u8) {
 	sample(n, ram, &pc, false, true)
 	probe(due[2] + 2 * EVERY, deaf)
 	check(name, slice.equal(stuck()[:], want) && core.compat.deaf_at == due[2] + 2 * EVERY, fmt.tprint("after a load:", stuck()))
+	// Only the stick moved RAM: heard, so the deaf probe before stays alone.
+	probe(due[2] + 3 * EVERY, stick)
+	check(name, slice.equal(stuck()[:], want) && core.compat.deaf_at == 0, fmt.tprint("stick:", stuck()))
 	core.compat.probe_every = 0
 }
 
