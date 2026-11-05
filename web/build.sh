@@ -4,11 +4,15 @@
 # the out dir from any static host; .wasm must be served as application/wasm.
 # With binaryen's wasm-opt on PATH, recomp.wasm is also run through
 # wasm-opt -O3 (about 14% smaller, same output); without it the step is skipped.
+# -source-code-locations:filename keeps only the file name in panic and
+# assert locations (`emit.odin(4:2) runtime assertion: ...`), so the build
+# does not depend on the checkout path: two checkouts give the same bytes.
 set -eu
 out=${1:?usage: web/build.sh <out dir>}
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$out"
-odin build "$root/recomp" -target:wasi_wasm32 -collection:ps="$root" -o:speed -out:"$out/recomp.wasm"
+odin build "$root/recomp" -target:wasi_wasm32 -collection:ps="$root" -o:speed \
+	-source-code-locations:filename -out:"$out/recomp.wasm"
 if command -v wasm-opt >/dev/null; then
 	wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
 		--enable-mutable-globals "$out/recomp.wasm" -o "$out/recomp.wasm"
