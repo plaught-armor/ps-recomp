@@ -253,9 +253,12 @@ play :: proc(image: string) -> int {
 			}
 		}
 	}
-	// NATIVE=0 runs the game interpreted.
+	// NATIVE=0 runs the game interpreted, as a FLAT build always does
+	// (core/flat.odin): it has neither recompiled nor learned code, and
+	// LEARN records nothing.
+	native_off := core.FLAT || core.env("NATIVE") == "0"
 	native := core.disc_path(dir, .Native)
-	if core.env("NATIVE") == "0" || (!native_cached(dir) && !convert_store(image, dir, 0)) {
+	if native_off || (!native_cached(dir) && !convert_store(image, dir, 0)) {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
@@ -264,9 +267,9 @@ play :: proc(image: string) -> int {
 	// which compacting rewrites. A compat child's parent compiled it already
 	// (compat_disc): one that failed there is not tried again here.
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
-	learn_env := core.env("LEARN")
+	learn_env := "0" if core.FLAT else core.env("LEARN")
 	learned, learned_ee: string
-	if core.env("NATIVE") != "0" && learn_env != "0" {
+	if !native_off && learn_env != "0" {
 		learned = learned_blob(dir, learn_cpu, !compat_child(), 0)
 		if cnf.ps2 {learned_ee = learned_blob(dir, .Ee, !compat_child(), 0)}
 	}

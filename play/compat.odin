@@ -306,7 +306,7 @@ compat_disc :: proc(image: string, frames, wait: u64, keep: bool) -> (row: Row, 
 	// Each compile gets the child's window before its first vblank: a
 	// hung one is stopped, and the child runs without what it makes.
 	stall := time.Duration(wait) * time.Second
-	native := core.env("NATIVE") != "0" && (native_cached(dir) || convert_store(image, dir, COMPAT_BOOT_FACTOR * stall))
+	native := !core.FLAT && core.env("NATIVE") != "0" && (native_cached(dir) || convert_store(image, dir, COMPAT_BOOT_FACTOR * stall))
 	// The child finds the blob stored and compiles nothing (compat_child).
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
 	learned, learned_ee: string
