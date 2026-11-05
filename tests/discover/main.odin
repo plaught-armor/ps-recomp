@@ -49,8 +49,10 @@
 //           jal 0x1060; nop; jr $ra; nop
 //   0x1040  addiu $sp, -16; jr $ra; addiu $sp, 16   a callback: stays
 //   0x1050  li $v0, 1; jr $ra; nop                  a leaf no code reaches
-//                                                    and no prologue: goes
+//                                                    and no prologue, which
+//                                                    runs to its return: stays
 //   0x1060  li; li; li (0x1068); jr $ra; nop        0x1068 reached: stays
+//   0x1074  addu with sa set; jr $ra; nop           data: goes
 //   0x1080  "abcdefgh" (a guessed entry)            data: goes
 //   0x1088  a jump table label                      stays
 //
@@ -183,6 +185,7 @@ main :: proc() {
 	put(mixed, 0x1040, 0x27bdfff0, JR_RA, 0x27bd0010)
 	put(mixed, 0x1050, 0x24020001, JR_RA, NOP)
 	put(mixed, 0x1060, 0x24020002, 0x24020003, 0x24020004, JR_RA, NOP)
+	put(mixed, 0x1074, 0x00a41061, JR_RA, NOP) // addu $v0, $a1, $a0 with sa 1
 	put(mixed, 0x1080, 0x64636261, 0x68676665)
 	for flags in ([2]u32{mips.SHF_ALLOC | mips.SHF_WRITE | mips.SHF_EXEC, mips.SHF_ALLOC | mips.SHF_EXEC}) {
 		code := mips.Image {
@@ -190,13 +193,13 @@ main :: proc() {
 			data     = mixed,
 			sections = {{name = ".text", addr = 0x1000, size = u32(len(mixed)), data = mixed, flags = flags}},
 		}
-		labels := set(0x1040, 0x1050, 0x1068, 0x1080, 0x1088)
+		labels := set(0x1040, 0x1050, 0x1068, 0x1074, 0x1080, 0x1088)
 		mips.drop_data_labels(r5900.RULES, code, 0x1000, 0x1090, set(0x1000, 0x1060, 0x1080), set(0x1080), set(0x1088), &labels)
 		if flags & mips.SHF_WRITE != 0 {
-			check(0x1040 in labels && 0x1068 in labels && 0x1088 in labels, "mixed: a label on code dropped")
-			check(0x1050 not_in labels && 0x1080 not_in labels, "mixed: a label on data or an unreached leaf kept")
+			check(0x1040 in labels && 0x1050 in labels && 0x1068 in labels && 0x1088 in labels, "mixed: a label on code dropped")
+			check(0x1074 not_in labels && 0x1080 not_in labels, "mixed: a label on data kept")
 		} else {
-			check(len(labels) == 5, fmt.tprintf("code only: %d labels, want 5", len(labels)))
+			check(len(labels) == 6, fmt.tprintf("code only: %d labels, want 6", len(labels)))
 		}
 		delete(labels)
 	}

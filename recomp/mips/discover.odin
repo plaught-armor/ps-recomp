@@ -369,8 +369,8 @@ reached_code :: proc(r: Rules, img: Image, lo, hi: u32, seeds: Set) -> Set {
 // but the guessed ones: data after a return looks the same) and from the
 // jump table labels in tables, which stay. An address that starts a
 // function (starts_function) stays a label too: a callback only a pointer
-// reaches. One without a prologue that only a lui pair builds, such as a
-// short leaf, loses its label and runs in the interpreter.
+// reaches. So does one that runs straight to a return (walks_to_return): a
+// short leaf without a prologue that only a lui pair builds.
 drop_data_labels :: proc(r: Rules, img: Image, lo, hi: u32, entries, guessed, tables: Set, labels: ^Set) {
 	seeds: Set
 	defer delete(seeds)
@@ -387,13 +387,67 @@ drop_data_labels :: proc(r: Rules, img: Image, lo, hi: u32, entries, guessed, ta
 	drop: [dynamic]u32
 	defer delete(drop)
 	for a in labels {
-		if lo <= a && a < hi && a not_in reached && a not_in tables && in_mixed_section(img, a) && !starts_function(img, a) {
+		if lo <= a && a < hi && a not_in reached && a not_in tables && in_mixed_section(img, a) && !starts_function(img, a) && !walks_to_return(r, img, a, lo, hi) {
 			append(&drop, a)
 		}
 	}
 	for a in drop {
 		delete_key(labels, a)
 	}
+}
+
+// The words a leaf may take to its return (walks_to_return). The longest of
+// the leaves without a prologue found in the interpreter takes 45, the
+// longest rescued on the mixed discs measured 56.
+@(private = "file")
+LEAF_WORDS :: 64
+
+// The code at a runs to a return within LEAF_WORDS words. Every word
+// decodes and has its zero fields clear (zero_fields); a branch stays inside
+// those words and is not a coprocessor's; nothing calls, traps or jumps
+// through a register other than $ra; and the walk ends at `jr $ra`, or at a
+// `j` into [lo, hi) (a tail call), whose delay slot is neither a jump nor a
+// trap. It reads only the image.
+@(private = "file")
+walks_to_return :: proc(r: Rules, img: Image, a, lo, hi: u32) -> bool {
+	for k in u32(0) ..< LEAF_WORDS {
+		pc := a + 4 * k
+		i, ok := strict_insn(r, img, pc)
+		if !ok || i.kind == .Sys || i.kind == .Call || i.kind == .Jalr {
+			return false
+		}
+		if !has_delay(i) {
+			continue
+		}
+		d, d_ok := strict_insn(r, img, pc + 4)
+		if !d_ok || has_delay(d) || d.kind == .Sys {
+			return false
+		}
+		#partial switch i.kind {
+		case .Jr:
+			return i.rs == 31
+		case .Jump:
+			return lo <= i.target && i.target < hi
+		case .Branch:
+			op := i.w >> 26
+			if 16 <= op && op <= 18 || i.target < a || i.target - a >= 4 * LEAF_WORDS {
+				return false
+			}
+		}
+	}
+	return false
+}
+
+// The instruction at pc, and whether it is one: in the image, decoded, and
+// with its zero fields clear.
+@(private = "file")
+strict_insn :: proc(r: Rules, img: Image, pc: u32) -> (Insn, bool) {
+	w, ok := word(img, pc)
+	if !ok {
+		return {}, false
+	}
+	i := r.decode(pc, w)
+	return i, i.kind != .Bad && zero_fields(w)
 }
 
 // Words in a row in a writable executable section from at (mixed_words).
