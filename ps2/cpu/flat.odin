@@ -9,9 +9,11 @@ import "ps:core"
 // address the call pushed: the run went on at the pushed one, as the
 // coroutine model's interpreter does (ps2/kernel/flat.odin).
 flat_returns, flat_mismatch: u64
+// The deepest shadow return stack of any run.
+flat_max_depth: u32
 
 flat_print :: proc() {
 	when core.FLAT {
-		fmt.eprintfln("ee flat: %d returns, %d with $ra not the call's return address", flat_returns, flat_mismatch)
+		fmt.eprintfln("ee flat: %d returns, %d with $ra not the call's return address, %d deep at most", flat_returns, flat_mismatch, flat_max_depth)
 	}
 }

@@ -146,11 +146,7 @@ flat_reload :: proc() -> (^kernel.Flat_Ctx, u32) {
 @(private = "file")
 flat_enter :: #force_inline proc(x: ^kernel.Flat_Ctx, ret, t: u32) {
 	cpu.spin_dirty |= cpu.SPIN_SIDE
-	if x.depth == kernel.FLAT_DEPTH {cpu.fatal("guest calls nested %d deep at %08x", kernel.FLAT_DEPTH, t)}
-	x.ret[x.depth] = ret
-	x.depth += 1
-	x.pc = t
-	x.enter = true
+	kernel.flat_push(x, ret, t)
 }
 
 // interp_body's goto_pc with nothing registered: a backward jump from pc to

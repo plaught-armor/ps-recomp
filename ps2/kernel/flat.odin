@@ -14,8 +14,10 @@ import "ps:core"
 
 import cpu "../cpu"
 
-// Shadow return stack entries per run: deeper guest recursion is fatal.
-FLAT_DEPTH :: 1024
+// Shadow return stack entries a run starts with. It grows by doubling, on
+// the emulated heap, up to FLAT_DEPTH_MAX: deeper guest recursion is fatal.
+FLAT_DEPTH_MIN :: 64
+FLAT_DEPTH_MAX :: 32768
 // Guest runs the host starts inside one (a user syscall handler, an
 // interrupt handler).
 FLAT_NEST :: 8
@@ -43,7 +45,9 @@ Flat_Ctx :: struct {
 	// register other than $ra: the second (a backward jump's) comes first.
 	back:  bool,
 	end:   Flat_End,
-	ret:   [FLAT_DEPTH]u32,
+	// The return addresses; len is the capacity. On the emulated heap, so a
+	// snapshot holds them with the rest of the machine.
+	ret:   []u32,
 }
 
 // Emulated state: a snapshot holds it with the rest of the machine.
@@ -95,6 +99,28 @@ flat_nest_push :: proc(entry: u32) -> ^Flat_Ctx {
 
 flat_nest_pop :: proc() {
 	flat.nest_depth -= 1
+}
+
+// Push a call from x to t that returns to ret, with the checks a call makes
+// on entry owed (the flat interpreter's flat_reload).
+flat_push :: proc(x: ^Flat_Ctx, ret, t: u32) {
+	if int(x.depth) == len(x.ret) {flat_grow(x, t)}
+	x.ret[x.depth] = ret
+	x.depth += 1
+	cpu.flat_max_depth = max(cpu.flat_max_depth, x.depth)
+	x.pc = t
+	x.enter = true
+}
+
+@(private = "file")
+flat_grow :: proc(x: ^Flat_Ctx, t: u32) {
+	n := max(2 * len(x.ret), FLAT_DEPTH_MIN)
+	if n > FLAT_DEPTH_MAX {cpu.fatal("guest calls nested %d deep at %08x", FLAT_DEPTH_MAX, t)}
+	ret, err := make([]u32, n, core.emu_allocator())
+	if err != nil {cpu.fatal("flat: a shadow stack of %d not allocated", n)}
+	copy(ret, x.ret)
+	delete(x.ret, core.emu_allocator())
+	x.ret = ret
 }
 
 // Record the switch to next (switch_to under FLAT).
