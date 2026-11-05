@@ -145,6 +145,12 @@ presented frame (`cyc`, `ram`, `iop`, `iophle`), no pictures.
 in `<dir>/hashes.tsv` instead of a file, so two runs can be diffed for the
 first frame they diverge; a PS1 run with it writes no pictures.
 
+`PS_DUMP` also writes `ram_interp_<addr>.bin`, the processor's whole 2 MB
+RAM, for every address the R3000 interpreter first enters (the PS1 CPU, or
+the IOP on PS2; psx/cpu/cpu.odin report_once), with `PS_DUMP_HASH=1` too.
+A run that interprets many functions writes many: about 545 MB in a
+3600-frame PS2 run.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on

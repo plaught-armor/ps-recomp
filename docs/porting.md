@@ -166,8 +166,47 @@ do not change it. Measured peaks:
 | Generated source | Build peak |
 |---|---|
 | 29 MB | 6.7 GB |
+| 30.7 MB | 6.82 GB |
 | 53 MB | over 9.0 GB (stopped there, not a full peak) |
 | 145 MB | over 10.2 GB (stopped there, not a full peak) |
 
 Run the build with no other large jobs on the machine. On a system with
 less memory than the peak, it is stopped by the out-of-memory killer.
+
+`setup.sh` recompiles and builds in one step. To see the size before the
+build, run its recompile step on its own. It reads `build/recomp.tsv`, which
+`setup.sh` writes before anything else, so it works once `setup.sh` has run
+(even if its build was stopped), and again after a change to
+`tools/recomp.tsv` or the submodule:
+
+```sh
+odin build ps-recomp/recomp -collection:ps=ps-recomp -o:speed -out:build/recomp
+build/recomp build/recomp.tsv && du -sh port/src/rec
+```
+
+Then build with `sh port/build.sh`. A change to `tools/recomp.tsv` reaches
+`build/recomp.tsv` only through `setup.sh`, so edit both or run `setup.sh`.
+
+### VU microcode
+
+The recompiler compiles the VU programs in the ELF's `.vutext` section.
+Microcode the game builds in data and uploads at run time (VIF MPG
+packets) is not in the ELF; it is found only by running the game with a
+capture, and without one it runs in the interpreter. An export's
+`tools/recomp.tsv` names no capture.
+
+To capture, run the player with `PS_VU1_CAPTURE=<file>` (and
+`PS_VU0_CAPTURE=<file>` for VU0) through the parts of the game to cover
+(ps2/vu/capture.odin). Each run appends what it saw, so several runs can
+share a file. A captured VU runs only in the interpreter, so the run is
+slower. Then name the files in `tools/recomp.tsv`:
+
+```
+vu1_capture	build/vu1.cap
+vu0_capture	build/vu0.cap
+```
+
+and run `setup.sh` again. The files hold the game's code, so keep them out
+of git: `build/` is not tracked. A capture file that is missing is a
+warning, and that microcode runs in the interpreter, so a fresh clone
+still builds. The options are listed at the top of recomp/r5900/gen.odin.
