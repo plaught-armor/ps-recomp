@@ -24,17 +24,7 @@
 // LEARN_STORES_MAX store addresses is looked back over; a run whose stores
 // outran it is marked .Smc_Unknown, never clean.
 //
-// The file is a run of records, appended and never rewritten, so several
-// runs can share one file and a run that never reaches its end keeps what it
-// wrote:
-//	'E', cpu: u8, flags: u8, 0: u8, entry: u32, lo: u32, n: u32, hash: u64,
-//	words: [n]u32
-// lo is the first word's address; hash is the XXH3-64 of the words' bytes,
-// so a reader drops a record whose words do not match it. Integers are
-// little-endian. Records repeat across runs; readers dedupe. The tag is the
-// stream's version: earlier files are not read, as 'C' (no .Open, ring-only
-// checks) and 'D' (fetched words not checked) records may hold code that
-// changed mid-run.
+// The file's format is core/learnfile's.
 //
 // Learning is host state, off the emulator heap: snapshots and rollback
 // never roll it back, so a replayed frame is counted again. Without LEARN
@@ -45,24 +35,20 @@ import "base:runtime"
 import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
-import "core:slice"
+import "ps:core/learnfile"
 
-Learn_Cpu :: enum u8 {
-	Psx,
-	Ee,
-	Iop,
-}
+// The LEARN file format lives in core/learnfile; these are its names here.
+Learn_Cpu :: learnfile.Learn_Cpu
+Learn_Flag :: learnfile.Learn_Flag
+Learn_Flags :: learnfile.Learn_Flags
+Learn_Record :: learnfile.Learn_Record
+LEARN_SPAN_MAX :: learnfile.LEARN_SPAN_MAX
+LEARN_HEADER :: learnfile.LEARN_HEADER
+LEARN_TAG :: learnfile.LEARN_TAG
+learn_read :: learnfile.learn_read
+learn_compact :: learnfile.learn_compact
+learn_compilable :: learnfile.learn_compilable
 
-Learn_Flag :: enum u8 {
-	Smc,         // the run stored into its own range
-	Smc_Unknown, // its stores could not all be checked
-	Large,       // the range is over LEARN_SPAN_MAX; no words kept
-	Open,        // the run had not returned when the process reported
-}
-Learn_Flags :: bit_set[Learn_Flag;u8]
-
-// The widest range kept, in bytes.
-LEARN_SPAN_MAX :: 64 * 1024
 // The most records one process writes, and the most bytes.
 LEARN_RECORDS_MAX :: 4096
 LEARN_BYTES_MAX :: 16 * 1024 * 1024
@@ -72,9 +58,6 @@ LEARN_STORES_MAX :: 1 << 16
 // The most runs in progress at once, over every processor. A run begun past
 // it is not noted (learn_begin returns nil) and is counted as dropped.
 LEARN_LIVE_MAX :: 1024
-
-LEARN_HEADER :: 24
-LEARN_TAG :: 'E'
 
 // One interpreted run in progress. Frames live in learn.pool, not on the
 // interpreter's stack: guest threads switch coroutines mid-run, so runs need
@@ -88,24 +71,6 @@ Learn_Frame :: struct {
 	log_at:   u64, // Learn_Space.seq when the run began
 	fetch_at: u64, // Learn_Space.insns when the run began
 	changed:  bool, // a fetch saw another word than an earlier one there
-}
-
-Learn_Record :: struct {
-	cpu:   Learn_Cpu,
-	flags: Learn_Flags,
-	entry: u32,
-	lo:    u32,
-	hash:  u64,
-	words: []u32,
-}
-
-@(private = "file")
-Learn_Key :: struct {
-	cpu:   Learn_Cpu,
-	flags: Learn_Flags,
-	entry: u32,
-	lo, n: u32,
-	hash:  u64,
 }
 
 @(private = "file")
@@ -147,7 +112,7 @@ learn: struct {
 	file:    ^os.File,
 	written: int, // bytes this process wrote
 	capped:  bool,
-	keys:    map[Learn_Key]bool,
+	keys:    map[learnfile.Learn_Key]bool,
 	space:   [Learn_Cpu]Learn_Space,
 	buf:     [dynamic]u8,
 	// The frames of runs in progress: pool[k] is in use while used[k];
@@ -455,7 +420,7 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 		flags += {.Smc}
 	}
 	hash := u64(xxhash.XXH3_64_default(learn.buf[LEARN_HEADER:]))
-	key := Learn_Key{f.cpu, flags, f.entry, f.lo, n, hash}
+	key := learnfile.Learn_Key{f.cpu, flags, f.entry, f.lo, n, hash}
 	if key in learn.keys {
 		return
 	}
@@ -465,7 +430,7 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 		return
 	}
 	learn.keys[key] = true
-	learn_header(learn.buf[:LEARN_HEADER], f.cpu, flags, f.entry, f.lo, n, hash)
+	learnfile.learn_header(learn.buf[:LEARN_HEADER], f.cpu, flags, f.entry, f.lo, n, hash)
 	if _, err := os.write(learn.file, learn.buf[:]); err != nil {
 		fmt.eprintfln("learn: write failed: %v; no more are kept", err)
 		learn.capped = true
@@ -499,127 +464,6 @@ learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> boo
 		}
 	}
 	return false
-}
-
-@(private = "file")
-learn_header :: proc(h: []u8, cpu: Learn_Cpu, flags: Learn_Flags, entry, lo, n: u32, hash: u64) {
-	h[0] = LEARN_TAG
-	h[1] = u8(cpu)
-	h[2] = transmute(u8)flags
-	h[3] = 0
-	(^u32le)(&h[4])^ = u32le(entry)
-	(^u32le)(&h[8])^ = u32le(lo)
-	(^u32le)(&h[12])^ = u32le(n)
-	(^u64le)(&h[16])^ = u64le(hash)
-}
-
-// The records in data, in order. A record whose words do not hash to its
-// hash is dropped (bad); a short or unknown tail ends the read (bad, once).
-// The words point into data.
-learn_read :: proc(data: []u8, allocator := context.allocator) -> (recs: [dynamic]Learn_Record, bad: int) {
-	recs = make([dynamic]Learn_Record, allocator)
-	for at := 0; at < len(data); {
-		h := data[at:]
-		if len(h) < LEARN_HEADER || h[0] != LEARN_TAG || h[1] > u8(max(Learn_Cpu)) {
-			return recs, bad + 1
-		}
-		n := int((^u32le)(&h[12])^)
-		size := LEARN_HEADER + n * 4
-		if n > LEARN_SPAN_MAX / 4 || len(h) < size {
-			return recs, bad + 1
-		}
-		at += size
-		hash := u64((^u64le)(&h[16])^)
-		if u64(xxhash.XXH3_64_default(h[LEARN_HEADER:size])) != hash {
-			bad += 1
-			continue
-		}
-		append(&recs, Learn_Record {
-			cpu = Learn_Cpu(h[1]),
-			flags = transmute(Learn_Flags)h[2],
-			entry = u32((^u32le)(&h[4])^),
-			lo = u32((^u32le)(&h[8])^),
-			hash = hash,
-			words = ([^]u32)(raw_data(h[LEARN_HEADER:]))[:n],
-		})
-	}
-	return recs, bad
-}
-
-// The records in data each once, without bad ones, sorted by cpu, entry,
-// lo, words, hash and flags: a LEARN file's bytes compacted, which a
-// rewrite of the file bounds growth across runs with. In context.allocator;
-// n is the records it holds.
-learn_compact :: proc(data: []u8) -> (out: []u8, n: int) {
-	recs, _ := learn_read(data, context.temp_allocator)
-	seen := make(map[Learn_Key]bool, context.temp_allocator)
-	keep := make([dynamic]Learn_Record, context.temp_allocator)
-	size := 0
-	for r in recs {
-		key := Learn_Key{r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash}
-		if key in seen {continue}
-		seen[key] = true
-		append(&keep, r)
-		size += LEARN_HEADER + 4 * len(r.words)
-	}
-	slice.sort_by(keep[:], learn_less)
-	buf := make([]u8, size)
-	at := 0
-	for r in keep {
-		learn_header(buf[at:][:LEARN_HEADER], r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash)
-		at += LEARN_HEADER
-		copy(buf[at:], ([^]u8)(raw_data(r.words))[:4 * len(r.words)])
-		at += 4 * len(r.words)
-	}
-	return buf, len(keep)
-}
-
-@(private = "file")
-learn_less :: proc(a, b: Learn_Record) -> bool {
-	if a.cpu != b.cpu {return a.cpu < b.cpu}
-	if a.entry != b.entry {return a.entry < b.entry}
-	if a.lo != b.lo {return a.lo < b.lo}
-	if len(a.words) != len(b.words) {return len(a.words) > len(b.words)}
-	if a.hash != b.hash {return a.hash < b.hash}
-	return transmute(u8)a.flags < transmute(u8)b.flags
-}
-
-// The records of cpu in recs that native code can stand for, each entry
-// and words once: those of runs that kept their words (not .Large) and
-// never stored into them. An entry and words that any run stored into
-// (.Smc), or may have (.Smc_Unknown), is left out, as a copy of its words
-// would not see the stores. .Open runs are kept. Also how many records
-// are left out as .Large and as stored into. In allocator; the words are
-// recs'.
-learn_compilable :: proc(recs: []Learn_Record, cpu: Learn_Cpu, allocator := context.allocator) -> (out: [dynamic]Learn_Record, large, smc: int) {
-	Code :: struct {
-		entry, lo, n: u32,
-		hash:         u64,
-	}
-	stored := make(map[Code]bool, context.temp_allocator)
-	for r in recs {
-		if r.cpu == cpu && r.flags & {.Smc, .Smc_Unknown} != {} {
-			stored[{r.entry, r.lo, u32(len(r.words)), r.hash}] = true
-		}
-	}
-	taken := make(map[Code]bool, context.temp_allocator)
-	out = make([dynamic]Learn_Record, allocator)
-	for r in recs {
-		if r.cpu != cpu {continue}
-		if .Large in r.flags {
-			large += 1
-			continue
-		}
-		c := Code{r.entry, r.lo, u32(len(r.words)), r.hash}
-		if stored[c] {
-			smc += 1
-			continue
-		}
-		if len(r.words) == 0 || taken[c] {continue}
-		taken[c] = true
-		append(&out, r)
-	}
-	return
 }
 
 // Under LEARN, write each run still in progress as an .Open record, then

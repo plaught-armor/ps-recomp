@@ -53,17 +53,27 @@ each column.
 ```sh
 odin build recomp -collection:ps=. -out:recomp-bin
 ./recomp-bin path/to/recomp.tsv
-./recomp-bin path/to/game.cue [source dir]
+./recomp-bin [--arch <x64_sysv|x64_win|arm64>] path/to/game.cue [source dir]
 ```
 
 Given a disc image (a `.cue` sheet, or a single-track `.bin` or `.iso`) in
 place of an options file, recomp needs no options: it compiles the
 executable `SYSTEM.CNF` names (`PSX.EXE` on a PS1 disc without one) to
-machine code for the host, into `<serial>.<arch>.bin` in the working
-directory, and to Odin source too when given a source directory. Code the
+machine code for the host (or for the `--arch` given), into
+`<serial>.<arch>.bin` in the working directory, and to Odin source too when given a source directory. Code the
 executable loads from other files (PS1 overlays) is not found; an ELF
 without `.text` has its executable sections compiled whole, data in them
 included.
+
+recomp also builds for `wasi_wasm32`, where it reads only what WASI
+preopens. `tests/wasi/run.mjs` runs that build under Node 24 or newer (a
+development harness, no npm packages); its blob for an arch is the host
+build's byte for byte:
+
+```sh
+odin build recomp -target:wasi_wasm32 -collection:ps=. -o:speed -out:recomp.wasm
+node tests/wasi/run.mjs recomp.wasm <out dir> --arch arm64 path/to/game.cue
+```
 
 The options file is tab-separated: a `key<TAB>value` header row, then one
 option per row; lines starting with `#` are comments. `backend` (`r3000` or

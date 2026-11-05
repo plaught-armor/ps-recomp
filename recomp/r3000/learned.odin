@@ -1,7 +1,7 @@
 package r3000
 
 import "core:fmt"
-import "ps:core"
+import "ps:core/learnfile"
 import "../mips"
 import "../native"
 
@@ -40,13 +40,13 @@ learned_blob :: proc(runs: []Learned, arch: native.Arch) -> []u8 {
 }
 
 // The PS1 runs of the LEARN file at path that code can stand for
-// (core.learn_compilable), each code once, after the file's records are
-// compacted as play does (core.learn_compact). Fails when the file cannot
+// (learnfile.learn_compilable), each code once, after the file's records are
+// compacted as play does (learnfile.learn_compact). Fails when the file cannot
 // be read. The words live as long as the program.
 learned_read :: proc(path: string) -> []Learned {
-	compact, _ := core.learn_compact(mips.read_file(path))
-	recs, _ := core.learn_read(compact)
-	ok, large, smc := core.learn_compilable(recs[:], .Psx)
+	compact, _ := learnfile.learn_compact(mips.read_file(path))
+	recs, _ := learnfile.learn_read(compact)
+	ok, large, smc := learnfile.learn_compilable(recs[:], .Psx)
 	runs := make([]Learned, len(ok))
 	for r, k in ok {
 		runs[k] = {r.entry, r.lo, r.words}

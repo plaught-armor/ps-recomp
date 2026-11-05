@@ -2,7 +2,7 @@
 // to Odin source.
 //
 // Usage: recomp <options.tsv>
-//        recomp <disc image> [<source dir>]
+//        recomp [--arch <x64_sysv|x64_win|arm64>] <disc image> [<source dir>]
 //
 // The options file is a `key value` table; `backend` (r3000 or r5900)
 // picks the console and the rest are that backend's options. Relative paths
@@ -10,9 +10,9 @@
 //
 // A disc image (a .cue sheet, or a single-track .bin or .iso) alone needs no
 // options: the executable SYSTEM.CNF names (PSX.EXE on a PS1 disc without
-// one) is compiled to machine code for this host, and with a source
-// directory to Odin source too. Code the executable loads from other files
-// (PS1 overlays) is not found.
+// one) is compiled to machine code for this host, or for the --arch given,
+// and with a source directory to Odin source too. Code the executable loads
+// from other files (PS1 overlays) is not found.
 package recomp
 
 import "core:fmt"
@@ -20,23 +20,36 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "mips"
+import "native"
 import "r3000"
 import "r5900"
 
+USAGE :: "usage: recomp <options.tsv> | recomp [--arch <x64_sysv|x64_win|arm64>] <disc image> [<source dir>]"
+
 main :: proc() {
-	if len(os.args) < 2 || len(os.args) > 3 {
-		fmt.eprintln("usage: recomp <options.tsv> | recomp <disc image> [<source dir>]")
+	args := os.args[1:]
+	arch := mips.HOST_ARCH
+	if len(args) >= 2 && args[0] == "--arch" {
+		if _, ok := native.parse_arch(args[1]); !ok {
+			fmt.eprintfln("recomp: unknown arch %s", args[1])
+			os.exit(2)
+		}
+		arch = args[1]
+		args = args[2:]
+	}
+	if len(args) < 1 || len(args) > 2 {
+		fmt.eprintln(USAGE)
 		os.exit(2)
 	}
 	o: mips.Options
-	if strings.equal_fold(filepath.ext(os.args[1]), ".tsv") {
-		if len(os.args) != 2 {
+	if strings.equal_fold(filepath.ext(args[0]), ".tsv") {
+		if len(args) != 1 || len(os.args) != 2 {
 			fmt.eprintln("usage: recomp <options.tsv>")
 			os.exit(2)
 		}
-		o = mips.load_options(os.args[1])
+		o = mips.load_options(args[0])
 	} else {
-		o = mips.disc_options(os.args[1], len(os.args) == 3 ? os.args[2] : "")
+		o = mips.disc_options(args[0], len(args) == 2 ? args[1] : "", arch)
 	}
 	switch b := mips.option(o, "backend"); b {
 	case "r3000":

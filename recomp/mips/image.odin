@@ -39,10 +39,11 @@ word :: proc(img: Image, addr: u32) -> (u32, bool) {
 }
 
 // The options for a disc image alone: the backend SYSTEM.CNF's executable
-// needs (with no SYSTEM.CNF, PSX.EXE, as the PS1 BIOS boots it), machine code for this host into <serial>.<arch>.bin (the executable's
-// name when it has no serial) and, given source, Odin source there; the
-// backends default the rest.
-disc_options :: proc(image, source: string) -> Options {
+// needs (with no SYSTEM.CNF, PSX.EXE, as the PS1 BIOS boots it), machine
+// code for arch (a native_arch, this host's by default) into
+// <serial>.<arch>.bin (the executable's name when it has no serial) and,
+// given source, Odin source there; the backends default the rest.
+disc_options :: proc(image, source: string, arch := HOST_ARCH) -> Options {
 	d, ok := disc.open(image)
 	if !ok {
 		fail("%s: not a disc image", image)
@@ -65,12 +66,12 @@ disc_options :: proc(image, source: string) -> Options {
 	o.values["backend"] = cnf.ps2 ? "r5900" : "r3000"
 	o.values["disc"] = image
 	o.values["quiet"] = "true"
-	o.values["native_arch"] = HOST_ARCH
+	o.values["native_arch"] = arch
 	name := cnf.serial
 	if name == "" {
 		name = cnf.boot[strings.last_index_byte(cnf.boot, '/') + 1:]
 	}
-	o.values["native_out"] = fmt.aprintf("%s.%s.bin", name, HOST_ARCH)
+	o.values["native_out"] = fmt.aprintf("%s.%s.bin", name, arch)
 	if source != "" {
 		o.values["out"] = source
 	}

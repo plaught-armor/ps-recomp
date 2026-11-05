@@ -163,10 +163,13 @@ strict style:
 ```sh
 odin check psx -no-entry-point -collection:ps=. -vet -strict-style
 odin check recomp -collection:ps=. -vet -strict-style
+odin check recomp -collection:ps=. -target:wasi_wasm32 -vet -strict-style
 odin check tests/core -collection:ps=. -vet -strict-style
 ```
 
-The runtime packages (`core`, `core/disc`, `psx`, `ps2`, `ps2/host`) and
-`tests/discimg` take `-no-entry-point`; `recomp`, `play` and the tests do
-not. Add `-target:` to check another platform, as CI does for
-`linux_arm64`, `darwin_amd64` and `darwin_arm64`.
+The runtime packages (`core`, `core/disc`, `core/learnfile`, `psx`, `ps2`,
+`ps2/host`) and `tests/discimg` take `-no-entry-point`; `recomp`, `play`
+and the tests do not. Add `-target:` to check another platform, as CI does
+for `linux_arm64`, `darwin_amd64` and `darwin_arm64`. recomp is also
+checked for `wasi_wasm32`, the target of the web converter: a recomp
+import of a package that needs the host (such as `core`) fails there.
