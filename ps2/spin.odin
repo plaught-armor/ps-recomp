@@ -60,7 +60,10 @@ SPIN_BACK_MAX :: 4096
 // few (an idle thread and a poller); 16 leaves room for more, and for a
 // loop nested in the one armed, while a probe that never comes back costs
 // only 16 branches of stores checked on the slow path before it backs off
-// as at a failed compare.
+// as at a failed compare. A probe at the armed site in another thread is
+// one of these too. A loop passing more than 16 branches of others' (a
+// poll loop of its own in another thread) runs out of them, and is not
+// skipped.
 @(private = "file")
 SPIN_FOREIGN_MAX :: 16
 
@@ -75,6 +78,7 @@ spin: struct {
 	cycles: u64, // cycles when armed
 	back:   i32,
 	passed: i32, // other branches passed since armed
+	thread: i32, // the thread armed in (kernel.current_id)
 	cpu:    cpu.Cpu,
 	vu0:    vu.Vu,
 }
@@ -86,7 +90,8 @@ spin_probe :: proc(site: u32) {
 	}
 	if spin.back == 0 {spin.back = SPIN_BACK_MIN}
 	if mem.spin_armed {
-		if site != spin.site && spin.passed < SPIN_FOREIGN_MAX {
+		own := site == spin.site && kernel.current_id() == spin.thread
+		if !own && spin.passed < SPIN_FOREIGN_MAX {
 			spin.passed += 1
 			spin_tick = 1
 			return
@@ -94,7 +99,7 @@ spin_probe :: proc(site: u32) {
 		spin_disarm()
 		dirty := cpu.spin_dirty
 		same :=
-			site == spin.site &&
+			own &&
 			runtime.memory_equal(&cpu.state, &spin.cpu, cpu.STATE_BYTES) &&
 			runtime.memory_equal(&vu.vu0, &spin.vu0, VU_BYTES)
 		now, next := cpu.state.cycles, cpu.next_event
@@ -127,7 +132,7 @@ spin_probe :: proc(site: u32) {
 		spin_tick = spin.back
 		return
 	}
-	spin.site, spin.cycles, spin.passed = site, cpu.state.cycles, 0
+	spin.site, spin.cycles, spin.passed, spin.thread = site, cpu.state.cycles, 0, kernel.current_id()
 	spin.cpu, spin.vu0 = cpu.state, vu.vu0
 	cpu.spin_dirty = 0
 	mem.spin_armed = true

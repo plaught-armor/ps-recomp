@@ -50,6 +50,9 @@ Thread :: struct {
 	wait_result: i32,
 	wakeups:    i32,
 	seq:        u64, // order of becoming ready, for FIFO within a priority
+	// The pc of the thread's last syscall: where a thread switched out
+	// resumes, as every switch but an event's is in one (spin.odin).
+	syscall_pc: u32,
 	regs:       cpu.Cpu,
 	co:         ^core.Coroutine,
 }
@@ -195,6 +198,7 @@ syscall :: proc(pc: u32) {
 	} else {
 		cpu.spin_dirty |= cpu.SPIN_SIDE
 	}
+	k.current.syscall_pc = pc
 	a0 := u32(c.r[4].d[0])
 	a1 := u32(c.r[5].d[0])
 	a2 := u32(c.r[6].d[0])

@@ -4,7 +4,9 @@
 // them is in their saved registers, their statuses and the ready order
 // (seq). The first rotate after the probe arms saves the threads; none has
 // switched since the arm, so they are as they were then. The probe then
-// asks spin_threads_same whether the pass left them so, and on a skip
+// asks spin_threads_same whether the pass left them so, each thread parked
+// at the same syscall (syscall_pc: a thread's registers do not say where it
+// resumes, its coroutine does), and on a skip
 // spin_threads_skip moves seq and the saved cycles on as the passes
 // skipped would have.
 //
@@ -33,6 +35,12 @@ saved: struct {
 	t:          [len(k.threads)]Thread,
 }
 
+// The current thread's id, which the spin probe keys its arm on; -1 before
+// the kernel has one.
+current_id :: proc() -> i32 {
+	return k.current == nil ? -1 : k.current.id
+}
+
 // The syscall entry's mark for RotateThreadReadyQueue (syscall).
 @(private)
 spin_rotate :: proc() {
@@ -56,7 +64,7 @@ spin_threads_same :: proc() -> bool {
 		if t != saved.ptr[i] {return false}
 		if t == nil {continue}
 		was := &saved.t[i]
-		if t.status != was.status || t.prio != was.prio || t.wait != was.wait || t.wait_id != was.wait_id || t.wait_result != was.wait_result || t.wakeups != was.wakeups {return false}
+		if t.status != was.status || t.prio != was.prio || t.wait != was.wait || t.wait_id != was.wait_id || t.wait_result != was.wait_result || t.wakeups != was.wakeups || t.syscall_pc != was.syscall_pc {return false}
 		if !runtime.memory_equal(&t.regs, &was.regs, cpu.STATE_BYTES) {return false}
 		if t.seq != was.seq && t.seq - was.seq != d {return false}
 	}
