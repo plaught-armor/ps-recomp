@@ -102,13 +102,23 @@ EXPORT_IGNORE :: `# Only the files listed here are tracked. local.tsv (the paths
 PORT_SETUP :: `#!/bin/sh
 # Recompile the game on your disc and build the port.
 #
-#   sh setup.sh
+#   sh setup.sh        recompile, then build port/game
+#   sh setup.sh rec    recompile only, and print the size of port/src/rec
+#                      (the build's memory peak grows with it: ps-recomp's
+#                      docs/porting.md)
 #
 # build/recomp.tsv is tools/recomp.tsv with the disc image local.tsv names;
 # recomp writes the game's code to port/src/rec from it, then port/build.sh
 # builds port/game. Both stay out of git. PS_RECOMP overrides the ps-recomp
 # checkout (default: the ps-recomp submodule).
 set -e
+case "$1" in
+"" | rec) ;;
+*)
+	echo "usage: sh setup.sh [rec]" >&2
+	exit 2
+	;;
+esac
 cd "$(dirname "$0")"
 PS_RECOMP=$(cd "${PS_RECOMP:-ps-recomp}" && pwd)
 export PS_RECOMP
@@ -125,6 +135,10 @@ mkdir -p build
 } >build/recomp.tsv
 odin build "$PS_RECOMP/recomp" -collection:ps="$PS_RECOMP" -o:speed -out:build/recomp
 build/recomp build/recomp.tsv
+if [ "$1" = rec ]; then
+	du -sh port/src/rec
+	exit 0
+fi
 sh port/build.sh
 `
 
@@ -572,7 +586,9 @@ export_readme :: proc(id: string, info: [Info]string, files: bit_set[Export_File
 		"player's memory cards for the disc and, at the player's ps-recomp commit,\n" +
 		"the code the player learned. `sh tests/run.sh [frames]` makes a\n" +
 		"compatibility run of it. `port/src/main.odin` is where the port changes\n" +
-		"the game: see ps-recomp's `docs/porting.md`. Only tried on Linux: the\n" +
+		"the game: see ps-recomp's `docs/porting.md`. `sh setup.sh rec` only\n" +
+		"recompiles, and prints the size of `port/src/rec`: the build needs\n" +
+		"memory in step with it. Only tried on Linux: the\n" +
 		"scripts need a POSIX shell.\n",
 	)
 	return b.buf[:]

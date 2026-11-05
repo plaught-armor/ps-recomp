@@ -140,7 +140,7 @@ notes, settings and picture it holds a port that builds as it is:
 | File | What it is |
 |---|---|
 | `tools/recomp.tsv` | The recompiler's options, `out` set to `port/src/rec`; `setup.sh` adds the disc row. |
-| `setup.sh` | Builds `recomp` from the `ps-recomp` submodule, recompiles the disc `local.tsv` names, then runs `port/build.sh`. |
+| `setup.sh` | Builds `recomp` from the `ps-recomp` submodule, recompiles the disc `local.tsv` names, then runs `port/build.sh`; `sh setup.sh rec` stops after the recompile and prints the size of `port/src/rec`. |
 | `port/build.sh` | Builds `port/game` with `COMMIT` set to the submodule's commit. |
 | `port/src/main.odin` | Boots the disc with the generated code, as the player does. Change the game here. |
 | `port/src/local.odin` | Reads `local.tsv`: the disc image, the player's data for the disc, its settings, memory cards and learned code. |
@@ -173,19 +173,9 @@ do not change it. Measured peaks:
 Run the build with no other large jobs on the machine. On a system with
 less memory than the peak, it is stopped by the out-of-memory killer.
 
-`setup.sh` recompiles and builds in one step. To see the size before the
-build, run its recompile step on its own. It reads `build/recomp.tsv`, which
-`setup.sh` writes before anything else, so it works once `setup.sh` has run
-(even if its build was stopped), and again after a change to
-`tools/recomp.tsv` or the submodule:
-
-```sh
-odin build ps-recomp/recomp -collection:ps=ps-recomp -o:speed -out:build/recomp
-build/recomp build/recomp.tsv && du -sh port/src/rec
-```
-
-Then build with `sh port/build.sh`. A change to `tools/recomp.tsv` reaches
-`build/recomp.tsv` only through `setup.sh`, so edit both or run `setup.sh`.
+`sh setup.sh rec` recompiles without building: it writes
+`port/src/rec` and prints its size, so the peak can be judged before
+`sh setup.sh` (or `sh port/build.sh`) builds.
 
 ### VU microcode
 

@@ -793,7 +793,8 @@ id_of :: proc(path: string) -> string {
 // exactly README.md (ps-recomp pinned to the player's commit), .gitignore
 // (port/src/rec left out), local.tsv, settings.tsv and press.txt (the same
 // bytes), docs/notes.md (the row, the '|' escaped), shots/thumb.png (the
-// picture's size) and the port: setup.sh, tools/recomp.tsv (r3000, no
+// picture's size) and the port: setup.sh (whose rec mode stops before
+// port/build.sh), tools/recomp.tsv (r3000, no
 // disc), port/build.sh, port/src/local.odin, port/src/main.odin (psx.run)
 // and tests/run.sh; a PS2 disc with none of them to the same but
 // settings.tsv, press.txt and the thumb, docs/notes.md saying no run yet,
@@ -916,6 +917,8 @@ test_export :: proc() {
 	recomp := read(out1, "tools/recomp.tsv")
 	check(name, strings.contains(recomp, "\nbackend\tr3000\n") && strings.contains(recomp, "\nout\tport/src/rec\n") && !strings.contains(recomp, "\ndisc\t"), fmt.tprintf("PS1 recomp.tsv:\n%s", recomp))
 	check(name, strings.contains(read(out1, "port/src/main.odin"), "psx.run(b)"), "PS1 main.odin does not run psx")
+	setup := read(out1, "setup.sh")
+	check(name, strings.contains(setup, "if [ \"$1\" = rec ]; then\n\tdu -sh port/src/rec\n\texit 0\nfi\nsh port/build.sh\n"), fmt.tprintf("setup.sh has no rec mode before the build:\n%s", setup))
 	check(name, strings.contains(read(out1, ".gitignore"), "\n/port/src/rec/\n"), ".gitignore tracks port/src/rec")
 	check(name, strings.contains(read(out1, "README.md"), "git -C ps-recomp checkout test\n"), "README does not pin ps-recomp to the player's commit")
 	clean(name, out1, files, forbidden)
