@@ -55,6 +55,24 @@
 //   0x1088  a jump table label                      stays
 //
 // In a section that holds code only, every label stays.
+//
+// Then mips.discover on secondary functions, which share their container's
+// range, on a third image (code only), extra labels 0x100c, 0x1028, 0x104c:
+//
+//   0x1000  li $v0, 1; jr $ra; nop          C, the container
+//   0x100c  li $v0, 2; jr $ra; nop          L, an extra label T never reaches
+//   0x1018  li $v0, 3                       T, a secondary of C
+//   0x101c  bne $a0, $0, 0x1000; nop        back into C
+//   0x1024  j 0x1100                        out
+//   0x1028  li $v0, 4                       D, its delay slot, an extra label
+//   0x102c  li $v0, 5; jr $ra; nop          reached only by walking on from D
+//   0x1040  lw $v0, 0($a0); jr $v0; nop     K, a jump through a register
+//   0x104c  li $v0, 1; jr $ra; nop          Q, K's case, an extra label
+//   0x1058  li $v0, 2; b 0x1040; nop        S, a secondary of K
+//
+// T keeps D (the probe reached it) and drops L; D is walked as code before
+// the `j` claims it as a delay slot, so 0x102c is decoded and labelled. S's
+// probe meets `jr $v0`, so S keeps Q.
 package main
 
 import "core:fmt"
@@ -182,6 +200,35 @@ main :: proc() {
 		}
 		delete(labels)
 	}
+
+	sec := make([]u8, 0x80)
+	put(sec, 0x1000, 0x24020001, JR_RA, NOP, 0x24020002, JR_RA, NOP)
+	put(sec, 0x1018, 0x24020003, 0x1480fff8, NOP, j(0x1100), 0x24020004, 0x24020005, JR_RA, NOP) // bne $a0, $0, 0x1000
+	put(sec, 0x1040, 0x8c820000, 0x00400008, NOP, 0x24020001, JR_RA, NOP, 0x24020002, 0x1000fff8, NOP) // b 0x1040
+	secondaries := mips.Image {
+		base     = 0x1000,
+		data     = sec,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(sec)), data = sec, flags = mips.SHF_ALLOC | mips.SHF_EXEC}},
+	}
+	extras := []u32{0x100c, 0x1028, 0x104c}
+	c := mips.func_make(0x1000, 0x1040)
+	mips.discover(r5900.RULES, secondaries, c, extras)
+	check(0x100c in c.labels && 0x100c in c.insns, "container: lost its extra label 0x100c")
+	mips.func_free(c)
+	t := mips.func_make(0x1018, 0x1040, 0x1000)
+	mips.discover(r5900.RULES, secondaries, t, extras)
+	check(0x100c not_in t.labels && 0x100c not_in t.insns && 0x1010 not_in t.insns, "secondary: walked the unreached label 0x100c")
+	check(0x1000 in t.labels && 0x1000 in t.insns && 0x1004 in t.insns, "secondary: lost the branch back to 0x1000")
+	check(0x1028 in t.labels && 0x1028 in t.delay, "secondary: lost the delay-slot label 0x1028")
+	check(0x102c in t.insns && 0x102c in t.labels && 0x1030 in t.insns, "secondary: 0x102c after the delay-slot label not walked")
+	check(len(t.labels) == 4, fmt.tprintf("secondary: %d labels, want 4", len(t.labels)))
+	mips.func_free(t)
+	s := mips.func_make(0x1058, 0x1080, 0x1040)
+	mips.discover(r5900.RULES, secondaries, s, extras)
+	check(s.computed, "computed secondary: `jr $v0` not seen")
+	check(0x104c in s.labels && 0x104c in s.insns && 0x1050 in s.insns, "computed secondary: lost the case 0x104c")
+	mips.func_free(s)
+	delete(sec)
 
 	if failed != 0 {
 		os.exit(1)

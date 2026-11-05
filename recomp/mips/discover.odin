@@ -112,8 +112,40 @@ sorted_range :: proc(s: []u32, lo, hi: u32) -> []u32 {
 // with no code pointers into the function can land on any instruction, as
 // in a Duff's device, so then every word in the range is walked and
 // labelled. extra_labels is sorted.
+//
+// A secondary function (start before entry: a tail-call target or a
+// dropped entry inside another function) shares its container's range.
+// Seeded with every extra label of that range, it would walk the whole
+// container and become a copy of it. So a probe walk from the entry alone
+// runs first, and only the extra labels it reached are kept; when the probe
+// meets a computed `jr`, every extra label stays, so jump-table cases are
+// still walked. The kept labels then go through the same seed-and-walk as
+// before: the work list pops last-in first, so an extra label that is also
+// a delay slot is walked as code, on to the word after it, before the
+// branch that owns the slot reaches it.
 discover :: proc(r: Rules, img: Image, f: ^Func, extra_labels: []u32) {
-	extra := sorted_range(extra_labels, f.start, f.end)
+	all := sorted_range(extra_labels, f.start, f.end)
+	extra := all
+	kept: [dynamic]u32
+	defer delete(kept)
+	if f.start != f.entry && len(all) > 0 {
+		probe := func_make(f.entry, f.end, f.start)
+		probe_work: [dynamic]u32
+		append(&probe_work, f.entry)
+		probe_seen: Set
+		walk(r, img, probe, &probe_work, &probe_seen)
+		if !probe.computed {
+			for a in all {
+				if a in probe_seen {
+					append(&kept, a)
+				}
+			}
+			extra = kept[:]
+		}
+		func_free(probe)
+		delete(probe_work)
+		delete(probe_seen)
+	}
 	work: [dynamic]u32
 	append(&work, f.entry)
 	append(&work, ..extra)
@@ -123,7 +155,7 @@ discover :: proc(r: Rules, img: Image, f: ^Func, extra_labels: []u32) {
 	seen: Set
 	defer delete(seen)
 	walk(r, img, f, &work, &seen)
-	if f.computed && len(extra) == 0 {
+	if f.computed && len(all) == 0 {
 		clear(&work)
 		for a := f.start; a < f.end; a += 4 {
 			if a not_in seen {
