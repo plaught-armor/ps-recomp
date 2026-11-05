@@ -489,7 +489,7 @@ delete_thread :: proc(id: i32) -> i64 {
 	t := thread(id)
 	if t == nil || t == k.current || t.status != .Dormant {return KE_ERROR}
 	k.threads[id] = nil
-	if t.co != nil {core.co_kill(t.co)}
+	when !core.FLAT {if t.co != nil {core.co_kill(t.co)}}
 	free(t)
 	return i64(id)
 }
@@ -561,14 +561,16 @@ exit_delete_thread :: proc() {
 // Free the thread exit_delete_thread left behind, once off its coroutine.
 @(private)
 reap :: proc() {
-	if co := k.exec.dead_co; co != nil && co != k.current.co {
-		k.exec.dead_co = nil
-		core.co_kill(co)
+	when !core.FLAT {
+		if co := k.exec.dead_co; co != nil && co != k.current.co {
+			k.exec.dead_co = nil
+			core.co_kill(co)
+		}
 	}
 	t := k.dead
 	if t == nil || t == k.current {return}
 	k.dead = nil
-	core.co_kill(t.co)
+	when !core.FLAT {core.co_kill(t.co)}
 	free(t)
 }
 
@@ -579,7 +581,7 @@ terminate_thread :: proc(id: i32) -> i64 {
 	t.status = .Dormant
 	// The coroutine is parked inside a syscall; drop it so a restart begins
 	// anew.
-	if t.co != nil {core.co_kill(t.co); t.co = nil}
+	when !core.FLAT {if t.co != nil {core.co_kill(t.co); t.co = nil}}
 	return i64(id)
 }
 
@@ -762,18 +764,18 @@ reschedule :: proc() {
 switch_to :: proc(next: ^Thread) {
 	when core.FLAT {
 		flat_switch(next)
-		return
+	} else {
+		cur := k.current
+		cur.regs = cpu.state
+		if cur.status == .Run {cur.status = .Ready}
+		k.current = next
+		next.status = .Run
+		cycles := cpu.state.cycles
+		cpu.state = next.regs
+		cpu.state.cycles = cycles
+		core.co_switch(next.co)
+		reap()
 	}
-	cur := k.current
-	cur.regs = cpu.state
-	if cur.status == .Run {cur.status = .Ready}
-	k.current = next
-	next.status = .Run
-	cycles := cpu.state.cycles
-	cpu.state = next.regs
-	cpu.state.cycles = cycles
-	core.co_switch(next.co)
-	reap()
 }
 
 // Guest cycles skipped while every thread waits, for STATS and the compat

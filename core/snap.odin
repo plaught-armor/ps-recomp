@@ -74,9 +74,11 @@ snap_areas: [dynamic][]u8
 // boundary would change the frame it lands on.
 snap_check: proc()
 
-// The coroutine to resume after a snapshot operation; part of the state.
-@(private)
-snap_resume: ^Coroutine
+when !FLAT {
+	// The coroutine to resume after a snapshot operation; part of the state.
+	@(private)
+	snap_resume: ^Coroutine
+}
 
 @(private)
 emu_heap: mem.Buddy_Allocator
@@ -109,22 +111,26 @@ snap_init :: proc(heap: int) {
 	host_allocator = context.allocator
 	emu_heap_mem = snap_map(heap)
 	mem.buddy_allocator_init(&emu_heap, emu_heap_mem, 64) // maps want cache-line alignment
-	snap_add(&snap_resume)
-	snap_add(&co_stack_owner)
+	when !FLAT {
+		snap_add(&snap_resume)
+		snap_add(&co_stack_owner)
+	}
 }
 
 emu_allocator :: proc() -> runtime.Allocator {
 	return mem.buddy_allocator(&emu_heap)
 }
 
-// Host main thread: run the console from coroutine `co` (made with
-// emu_allocator), serving snapshot requests. Never returns.
-snap_run :: proc(co: ^Coroutine) -> ! {
-	snap_resume = co
-	context.allocator = host_allocator // for snapshot buffers
-	for {
-		co_switch(snap_resume)
-		snap_serve()
+when !FLAT {
+	// Host main thread: run the console from coroutine `co` (made with
+	// emu_allocator), serving snapshot requests. Never returns.
+	snap_run :: proc(co: ^Coroutine) -> ! {
+		snap_resume = co
+		context.allocator = host_allocator // for snapshot buffers
+		for {
+			co_switch(snap_resume)
+			snap_serve()
+		}
 	}
 }
 
@@ -182,7 +188,7 @@ snap_save :: proc(s: ^Snapshot) {
 		n := b.is_free ? size_of(mem.Buddy_Block) : int(b.size)
 		append(&s.data, ..([^]u8)(b)[:n])
 	}
-	co_stacks_put(&s.data)
+	when !FLAT {co_stacks_put(&s.data)}
 	for h in snap_hooks {h.save(s.id)}
 }
 
@@ -201,7 +207,7 @@ snap_load :: proc(s: ^Snapshot) {
 		copy(([^]u8)(b)[:len(hdr)], hdr)
 		if !b.is_free {copy(([^]u8)(b)[len(hdr):b.size], take(s.data[:], &pos, int(b.size) - len(hdr)))}
 	}
-	co_stacks_take(s.data[:], &pos)
+	when !FLAT {co_stacks_take(s.data[:], &pos)}
 	assert(pos == len(s.data), "snapshot: size mismatch")
 	// The frames rollback holds belong to the run before the load. Netplay
 	// never loads a state; if it ever does, net.odin behind() must bound its

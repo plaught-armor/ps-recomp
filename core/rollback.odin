@@ -104,7 +104,7 @@ rb_commit :: proc() {
 	}
 	clear(&rec.small)
 	put_regions(&rec.small)
-	co_stacks_put(&rec.small)
+	when !FLAT {co_stacks_put(&rec.small)}
 	rb.count = min(rb.count + 1, RB_FRAMES)
 	for h in snap_hooks {h.save(RB_HOOK_ID + rb.head)}
 	d := time.tick_since(t)
@@ -140,7 +140,7 @@ rb_rewind :: proc(back: int) {
 	rec := &rb.records[rb.head]
 	pos := 0
 	take_regions(rec.small[:], &pos)
-	co_stacks_take(rec.small[:], &pos)
+	when !FLAT {co_stacks_take(rec.small[:], &pos)}
 	assert(pos == len(rec.small), "rollback: size mismatch")
 	for h in snap_hooks {h.load(RB_HOOK_ID + rb.head)}
 }

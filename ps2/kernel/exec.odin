@@ -147,7 +147,7 @@ exec_reset :: proc(what: string) {
 	cur.prio = 0
 	for &t in k.threads[:k.thread_end] {
 		if t == nil || t == cur {continue}
-		if t.co != nil {core.co_kill(t.co)}
+		when !core.FLAT {if t.co != nil {core.co_kill(t.co)}}
 		free(t)
 		t = nil
 	}
@@ -178,17 +178,17 @@ exec_switch :: proc(entry: u32) {
 	when core.FLAT {
 		if flat.nest_depth > 0 {cpu.fatal("program switch to %08x in a nested guest call", entry)}
 		flat_start(t, entry, .Exec)
-		return
+	} else {
+		k.exec.dead_co = t.co
+		t.co = core.co_create(proc(arg: rawptr) {
+			th := (^Thread)(arg)
+			reap()
+			cpu.call(th.entry)
+			cpu.fatal("program %08x started by ExecPS2 returned", th.entry)
+		}, t)
+		core.co_switch(t.co)
+		cpu.fatal("program replaced by ExecPS2 resumed")
 	}
-	k.exec.dead_co = t.co
-	t.co = core.co_create(proc(arg: rawptr) {
-		th := (^Thread)(arg)
-		reap()
-		cpu.call(th.entry)
-		cpu.fatal("program %08x started by ExecPS2 returned", th.entry)
-	}, t)
-	core.co_switch(t.co)
-	cpu.fatal("program replaced by ExecPS2 resumed")
 }
 
 // _ExecPS2(entry, gp, argc, argv): the program already in memory. gp is the

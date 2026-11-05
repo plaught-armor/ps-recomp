@@ -55,7 +55,7 @@ init :: proc() {
 		}
 	}
 	context.allocator = core.emu_allocator()
-	core.co_allocator = core.emu_allocator()
+	when !core.FLAT {core.co_allocator = core.emu_allocator()}
 	mem.hw_read = hw_read
 	mem.hw_write = hw_write
 	mem.hw_read128 = hw_read128
@@ -82,10 +82,11 @@ run :: proc(entry: u32) -> ! {
 		context.allocator = core.emu_allocator()
 		kernel.flat_start(t, entry, .Main)
 		flat_run()
+	} else {
+		t.co = core.co_create(proc(arg: rawptr) {
+			cpu.call(u32(uintptr(arg)))
+			cpu.fatal("entry returned")
+		}, rawptr(uintptr(entry)), core.emu_allocator())
+		core.snap_run(t.co)
 	}
-	t.co = core.co_create(proc(arg: rawptr) {
-		cpu.call(u32(uintptr(arg)))
-		cpu.fatal("entry returned")
-	}, rawptr(uintptr(entry)), core.emu_allocator())
-	core.snap_run(t.co)
 }

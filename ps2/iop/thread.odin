@@ -194,9 +194,15 @@ Intr_Stop :: enum u8 {
 // unless PS_IRX=1. Emulated state: snapshotted (sif_snap).
 iop_wake_ee: u64 = max(u64)
 
-// The coroutine a load schedules from. Only set while a load runs.
-@(private = "file")
-th_loader: ^core.Coroutine
+// The coroutine a load schedules from. Only set while a load runs. Under
+// FLAT there is none; th_entered marks the same span.
+when core.FLAT {
+	@(private = "file")
+	th_entered: bool
+} else {
+	@(private = "file")
+	th_loader: ^core.Coroutine
+}
 
 // FLAT: the handlers' flat run (th_intr), emu heap.
 when core.FLAT {
@@ -220,7 +226,7 @@ th_flat_busy :: proc() -> bool {
 th_init :: proc() {
 	s := &iop_sched
 	for &t in s.threads {th_drop(&t)}
-	if s.intr_co != nil {core.co_kill(s.intr_co)}
+	when !core.FLAT {if s.intr_co != nil {core.co_kill(s.intr_co)}}
 	clear(&s.threads)
 	clear(&s.semas)
 	clear(&s.evfs)
@@ -299,8 +305,13 @@ th_wake :: proc(t: ^Iop_Thread, v: u32) {
 // before `until`, and they run on from there.
 th_schedule :: proc(until: u64, idle := false) {
 	s := &iop_sched
-	assert(th_loader == nil && s.cur == 0, "iop: the scheduler entered while the IOP runs")
-	th_loader = core.co_current
+	when core.FLAT {
+		assert(!th_entered && s.cur == 0, "iop: the scheduler entered while the IOP runs")
+		th_entered = true
+	} else {
+		assert(th_loader == nil && s.cur == 0, "iop: the scheduler entered while the IOP runs")
+		th_loader = core.co_current
+	}
 	frame := r3000.frame_ret
 	s.budget = false
 	s.resched = false
@@ -331,7 +342,7 @@ th_schedule :: proc(until: u64, idle := false) {
 	r3000.next_event = IOP_EVENT_OFF
 	r3000.run_events = proc() {}
 	r3000.frame_ret = frame // a suspended thread's call has not restored it
-	th_loader = nil
+	when core.FLAT {th_entered = false} else {th_loader = nil}
 }
 
 // Readies the delayed threads whose wake the clock reached, in the order
@@ -463,9 +474,11 @@ th_flat_stopped :: proc(v: u32) {
 // Drops a thread's coroutine or flat run.
 @(private = "file")
 th_drop :: proc(t: ^Iop_Thread) {
-	if t.co != nil {
-		core.co_kill(t.co)
-		t.co = nil
+	when !core.FLAT {
+		if t.co != nil {
+			core.co_kill(t.co)
+			t.co = nil
+		}
 	}
 	when core.FLAT {
 		if t.flat.run != nil {
@@ -696,14 +709,18 @@ th_call_failed :: proc() {
 // thread's is lost.
 th_intr :: proc(handler, a0, a1: u32) -> Intr_Stop {
 	s := &iop_sched
-	assert(th_loader == nil && s.cur == 0, "iop: a handler run while the IOP runs")
+	when core.FLAT {
+		assert(!th_entered && s.cur == 0, "iop: a handler run while the IOP runs")
+	} else {
+		assert(th_loader == nil && s.cur == 0, "iop: a handler run while the IOP runs")
+	}
 	saved := Th_Context{r3000.state.r, r3000.state.hi, r3000.state.lo, r3000.cop0, r3000.frame_ret}
 	when !core.FLAT {
 		if s.intr_co == nil {s.intr_co = core.co_create(th_intr_main, nil)}
 	}
 	s.intr, s.intr_stop = true, .None
 	s.intr_handler, s.intr_a0, s.intr_a1 = handler, a0, a1
-	th_loader = core.co_current
+	when core.FLAT {th_entered = true} else {th_loader = core.co_current}
 	r3000.next_event = r3000.state.cycles + IOP_INTR_BUDGET
 	r3000.run_events = th_budget
 	when core.FLAT {
@@ -718,31 +735,36 @@ th_intr :: proc(handler, a0, a1: u32) -> Intr_Stop {
 	} else {
 		core.co_switch(s.intr_co)
 	}
-	th_loader = nil
+	when core.FLAT {th_entered = false} else {th_loader = nil}
 	r3000.next_event = IOP_EVENT_OFF
 	r3000.run_events = proc() {}
 	s.intr = false
-	if s.intr_stop != .None && s.intr_co != nil {
-		core.co_kill(s.intr_co)
-		s.intr_co = nil
+	when !core.FLAT {
+		if s.intr_stop != .None && s.intr_co != nil {
+			core.co_kill(s.intr_co)
+			s.intr_co = nil
+		}
 	}
 	r3000.state.r, r3000.state.hi, r3000.state.lo = saved.r, saved.hi, saved.lo
 	r3000.cop0, r3000.frame_ret = saved.cop0, saved.frame_ret
 	return s.intr_stop
 }
 
-// The handler coroutine: each handler, then back to th_intr. It never
-// returns, so one coroutine serves every handler until one is stopped on it.
-@(private = "file")
-th_intr_main :: proc(_: rawptr) {
-	s := &iop_sched
-	for {
-		r := &r3000.state.r
-		r[4], r[5] = s.intr_a0, s.intr_a1
-		r[29] = IOP_INTR_STACK - 16
-		r3000.call(s.intr_handler)
-		s.intr_v0 = r[2]
-		core.co_switch(th_loader)
+when !core.FLAT {
+	// The handler coroutine: each handler, then back to th_intr. It never
+	// returns, so one coroutine serves every handler until one is stopped on
+	// it.
+	@(private = "file")
+	th_intr_main :: proc(_: rawptr) {
+		s := &iop_sched
+		for {
+			r := &r3000.state.r
+			r[4], r[5] = s.intr_a0, s.intr_a1
+			r[29] = IOP_INTR_STACK - 16
+			r3000.call(s.intr_handler)
+			s.intr_v0 = r[2]
+			core.co_switch(th_loader)
+		}
 	}
 }
 

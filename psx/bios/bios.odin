@@ -1143,9 +1143,11 @@ zombie: ^core.Coroutine
 
 @(private)
 reap_zombie :: proc() {
-	if zombie != nil {
-		core.co_kill(zombie)
-		zombie = nil
+	when !core.FLAT {
+		if zombie != nil {
+			core.co_kill(zombie)
+			zombie = nil
+		}
 	}
 }
 
@@ -1156,9 +1158,8 @@ tcb :: #force_inline proc(i: int) -> u32 {
 
 @(private)
 threads_init :: proc() {
-	threads[0] = {
-		co = &core.co_main_thread,
-	}
+	threads[0] = {}
+	when !core.FLAT {threads[0].co = &core.co_main_thread}
 	for i in 0 ..< MAX_THREADS {
 		cpu.w32(tcb(i) + TCB_STATUS, i == 0 ? TCB_USED : TCB_FREE)
 	}
@@ -1174,17 +1175,17 @@ drop_thread :: proc(i: int) {
 	when core.FLAT {
 		flat.live[i] = false
 		if i == cur_thread {flat.orphan = true}
-		return
-	}
-	co := threads[i].co
-	threads[i].co = nil
-	switch {
-	case co == nil, co == &core.co_main_thread:
-	case co == core.co_current:
-		assert(zombie == nil)
-		zombie = co
-	case:
-		core.co_kill(co)
+	} else {
+		co := threads[i].co
+		threads[i].co = nil
+		switch {
+		case co == nil, co == &core.co_main_thread:
+		case co == core.co_current:
+			assert(zombie == nil)
+			zombie = co
+		case:
+			core.co_kill(co)
+		}
 	}
 }
 
@@ -1312,9 +1313,9 @@ change_thread :: proc(h: u32) {
 	// thread i's.
 	when core.FLAT {
 		flat.orphan = false
-		return
+	} else {
+		core.co_switch(to.co)
+		// Resumed: whoever switched back already loaded our registers.
+		reap_zombie()
 	}
-	core.co_switch(to.co)
-	// Resumed: whoever switched back already loaded our registers.
-	reap_zombie()
 }
