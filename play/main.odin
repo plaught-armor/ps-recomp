@@ -237,6 +237,20 @@ play :: proc(image: string) -> int {
 	if core.env("COMPAT") != "1" && !core.settings_apply(dir) {
 		return 1
 	}
+	// VU_CAPTURE=1 records a PS2 game's VU microcode in its directory, where
+	// an export's port is compiled from (docs/porting.md). Only from the
+	// environment: settings.tsv goes into the export. VU0_CAPTURE or
+	// VU1_CAPTURE set already names that VU's file.
+	if cnf.ps2 && core.env("VU_CAPTURE") == "1" {
+		for f, unit in ([2]core.Disc_File{.Vu0_Capture, .Vu1_Capture}) {
+			name := fmt.tprintf("VU%d_CAPTURE", unit)
+			if _, set := core.env_lookup(name); set {continue}
+			if err := os.set_env(core.env_name(name), core.disc_path(dir, f, context.temp_allocator)); err != nil {
+				fmt.eprintln("play: cannot set", core.env_name(name), err)
+				return 1
+			}
+		}
+	}
 	// NATIVE=0 runs the game interpreted.
 	native := core.disc_path(dir, .Native)
 	if core.env("NATIVE") == "0" || (!core.blob_cached(dir) && !convert_store(image, dir, 0)) {

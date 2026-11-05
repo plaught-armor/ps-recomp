@@ -52,6 +52,8 @@ Disc_File :: enum {
 	Press,
 	Thumb,
 	Play_Log,
+	Vu0_Capture,
+	Vu1_Capture,
 }
 
 DISC_FILES :: [Disc_File]string {
@@ -74,6 +76,8 @@ DISC_FILES :: [Disc_File]string {
 	.Press           = "press.txt",
 	.Thumb           = "thumb.ppm",
 	.Play_Log        = "play.log",
+	.Vu0_Capture     = "vu0-capture.bin",
+	.Vu1_Capture     = "vu1-capture.bin",
 }
 
 // The data directory, created if missing. False, after a message, when it

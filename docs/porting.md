@@ -182,21 +182,30 @@ less memory than the peak, it is stopped by the out-of-memory killer.
 The recompiler compiles the VU programs in the ELF's `.vutext` section.
 Microcode the game builds in data and uploads at run time (VIF MPG
 packets) is not in the ELF; it is found only by running the game with a
-capture, and without one it runs in the interpreter. An export's
-`tools/recomp.tsv` names no capture.
+capture, and without one it runs in the interpreter.
 
-To capture, run the player with `PS_VU1_CAPTURE=<file>` (and
-`PS_VU0_CAPTURE=<file>` for VU0) through the parts of the game to cover
-(ps2/vu/capture.odin). Each run appends what it saw, so several runs can
-share a file. A captured VU runs only in the interpreter, so the run is
-slower. Then name the files in `tools/recomp.tsv`:
+To capture, run the player with `PS_VU_CAPTURE=1` through the parts of the
+game to cover. It records both VUs' microcode in the disc's directory
+(`vu0-capture.bin`, `vu1-capture.bin`; ps2/vu/capture.odin). Capturing is
+off by default and is never a saved setting: a captured VU runs only in
+the interpreter, so the run is slower. Each run appends what it saw, so
+the files grow with every run and cover every part played.
+
+Then export the disc again (`play --export`): `local.tsv` names the
+capture files that exist, and `setup.sh` adds each one still there to
+`build/recomp.tsv`, so the recompiler compiles that microcode too. The
+files hold the game's code, so they stay in the player's data, out of the
+repository. Without them, a fresh clone builds the same as before, and
+that microcode runs in the interpreter.
+
+`PS_VU0_CAPTURE=<file>` and `PS_VU1_CAPTURE=<file>` capture one VU into a
+file of your own (each wins over `PS_VU_CAPTURE` for its VU); name such a
+file in `tools/recomp.tsv` by hand:
 
 ```
 vu1_capture	build/vu1.cap
 vu0_capture	build/vu0.cap
 ```
 
-and run `setup.sh` again. The files hold the game's code, so keep them out
-of git: `build/` is not tracked. A capture file that is missing is a
-warning, and that microcode runs in the interpreter, so a fresh clone
-still builds. The options are listed at the top of recomp/r5900/gen.odin.
+A capture file that is missing is a warning. The options are listed at
+the top of recomp/r5900/gen.odin.

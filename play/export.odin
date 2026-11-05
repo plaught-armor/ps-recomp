@@ -107,9 +107,10 @@ PORT_SETUP :: `#!/bin/sh
 #                      (the build's memory peak grows with it: ps-recomp's
 #                      docs/porting.md)
 #
-# build/recomp.tsv is tools/recomp.tsv with the disc image local.tsv names;
-# recomp writes the game's code to port/src/rec from it, then port/build.sh
-# builds port/game. Both stay out of git. PS_RECOMP overrides the ps-recomp
+# build/recomp.tsv is tools/recomp.tsv with the disc image local.tsv names,
+# and the VU capture files it names that are still there; recomp writes
+# the game's code to port/src/rec from it, then port/build.sh builds
+# port/game. Both stay out of git. PS_RECOMP overrides the ps-recomp
 # checkout (default: the ps-recomp submodule).
 set -e
 case "$1" in
@@ -132,6 +133,13 @@ mkdir -p build
 	cat tools/recomp.tsv
 	printf 'disc	%s
 ' "$image"
+	for vu in vu0 vu1; do
+		cap=$(awk -F '	' -v k="${vu}_capture" '$1 == k { print $2 }' local.tsv)
+		if [ -n "$cap" ] && [ -f "$cap" ]; then
+			printf '%s_capture	%s
+' "$vu" "$cap"
+		fi
+	done
 } >build/recomp.tsv
 odin build "$PS_RECOMP/recomp" -collection:ps="$PS_RECOMP" -o:speed -out:build/recomp
 build/recomp build/recomp.tsv
@@ -471,12 +479,17 @@ export_write :: proc(root, src, id: string, info: [Info]string, psx_exe: bool) -
 	return export_put(root, .Readme, export_readme(id, info, files))
 }
 
-// local.tsv: the image's path, the disc's directory, id and system, and the
-// ps-recomp commit this player is (the one to build a port with).
+// local.tsv: the image's path, the disc's directory, id and system, the
+// ps-recomp commit this player is (the one to build a port with), and the
+// VU capture files the player has written for the disc (VU_CAPTURE=1).
 @(private = "file")
 export_local :: proc(src, id: string, info: [Info]string) -> []u8 {
 	b := strings.builder_make(context.temp_allocator)
 	fmt.sbprintf(&b, "key\tvalue\nimage\t%s\ndata\t%s\nid\t%s\nsystem\t%s\ncommit\t%s\n", info[.Path], src, id, info[.System], core.COMMIT)
+	for f, unit in ([2]core.Disc_File{.Vu0_Capture, .Vu1_Capture}) {
+		path := core.disc_path(src, f, context.temp_allocator)
+		if os.is_file(path) {fmt.sbprintf(&b, "vu%d_capture\t%s\n", unit, path)}
+	}
 	return b.buf[:]
 }
 

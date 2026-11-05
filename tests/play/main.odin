@@ -803,7 +803,8 @@ id_of :: proc(path: string) -> string {
 // 16-byte run of the executable, nor of the blob, records or card. The
 // .gitignore lists every file but local.tsv. An export into the directory
 // again, or into one holding another file, is refused and changes nothing;
-// one into an empty directory is written there.
+// one into an empty directory is written there, its local.tsv naming the
+// VU1 capture the PS2 disc's directory holds by then (and no VU0 one).
 @(private = "file")
 test_export :: proc() {
 	name := "export"
@@ -878,7 +879,8 @@ test_export :: proc() {
 	ps1 := write("export_ps1", cnf_disc())
 	ps1_dir := disc_dir(name, ps1)
 	ps2 := write("export_ps2", ps2_disc())
-	if ps1_dir == "" || disc_dir(name, ps2) == "" {
+	ps2_dir := disc_dir(name, ps2)
+	if ps1_dir == "" || ps2_dir == "" {
 		return
 	}
 	id := id_of(ps1)
@@ -919,6 +921,8 @@ test_export :: proc() {
 	check(name, strings.contains(read(out1, "port/src/main.odin"), "psx.run(b)"), "PS1 main.odin does not run psx")
 	setup := read(out1, "setup.sh")
 	check(name, strings.contains(setup, "if [ \"$1\" = rec ]; then\n\tdu -sh port/src/rec\n\texit 0\nfi\nsh port/build.sh\n"), fmt.tprintf("setup.sh has no rec mode before the build:\n%s", setup))
+	check(name, strings.contains(setup, "\t\tif [ -n \"$cap\" ] && [ -f \"$cap\" ]; then\n\t\t\tprintf '%s_capture\t%s\n' \"$vu\" \"$cap\"\n\t\tfi\n\tdone\n} >build/recomp.tsv\n"), fmt.tprintf("setup.sh does not add the VU captures:\n%s", setup))
+	check(name, !strings.contains(local, "_capture\t"), fmt.tprintf("PS1 local.tsv names a VU capture:\n%s", local))
 	check(name, strings.contains(read(out1, ".gitignore"), "\n/port/src/rec/\n"), ".gitignore tracks port/src/rec")
 	check(name, strings.contains(read(out1, "README.md"), "git -C ps-recomp checkout test\n"), "README does not pin ps-recomp to the player's commit")
 	clean(name, out1, files, forbidden)
@@ -928,6 +932,7 @@ test_export :: proc() {
 	files = listed(out2)
 	check(name, slice.equal(files, ps2_want), fmt.tprint("PS2 files:", files))
 	check(name, strings.contains(read(out2, "tools/recomp.tsv"), "\nbackend\tr5900\n"), "PS2 recomp.tsv not r5900")
+	check(name, !strings.contains(read(out2, "local.tsv"), "_capture\t"), "PS2 local.tsv names a VU capture the player has not written")
 	ps2_main := read(out2, "port/src/main.odin")
 	check(name, strings.contains(ps2_main, "ps2.boot("), "PS2 main.odin does not boot ps2")
 	check(name, strings.contains(ps2_main, ".Learned_Iop_Key)") && strings.contains(ps2_main, ".Learned_Ee_Key)"), "PS2 main.odin does not pass both learned blobs")
@@ -945,12 +950,19 @@ test_export :: proc() {
 	check(name, export(self, ps1, other) == 1, "an export into a directory with a file")
 	check(name, slice.equal(listed(other), []string{"mine.txt"}) && read(other, "mine.txt") == "mine", "a refused export changed the other directory")
 	check(name, !os.exists(strings.concatenate({other, ".ps-recomp-export"}, context.temp_allocator)), "a refused export left its directory")
-	// An empty directory is exported into.
+	// An empty directory is exported into; the VU1 capture the PS2 disc's
+	// directory holds now is named in local.tsv, never copied.
+	vu1 := core.disc_path(ps2_dir, .Vu1_Capture, context.temp_allocator)
+	put(name, ps2_dir, core.DISC_FILES[.Vu1_Capture], transmute([]u8)string("vu1 capture not exported"))
+	forbid(&forbidden, transmute([]u8)string("vu1 capture not exported"))
 	empty, _ := filepath.join({tmp, "export_empty"}, context.temp_allocator)
 	_ = os.make_directory_all(empty)
 	check(name, export(self, ps2, empty) == 0, "an export into an empty directory failed")
 	got := listed(empty)
 	check(name, slice.equal(got, ps2_want), fmt.tprint("files in the empty directory:", got))
+	ps2_local := read(empty, "local.tsv")
+	check(name, strings.contains(ps2_local, fmt.tprintf("\nvu1_capture\t%s\n", vu1)) && !strings.contains(ps2_local, "vu0_capture"), fmt.tprintf("PS2 local.tsv with a VU1 capture:\n%s", ps2_local))
+	clean(name, empty, got, forbidden)
 	_ = os.remove(tsv)
 }
 
