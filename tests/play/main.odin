@@ -61,6 +61,10 @@
 //   event a closed window sends: play exits with status 0 and the thumb.ppm
 //   it writes is the last picture shrunk, the one last shown (test_quit;
 //   not on Windows, which has no SIGTERM).
+// - orphan: play --compat whose parent is stopped (SIGTERM, then SIGKILL;
+//   on Windows terminated) while its child, a fake one that watches its
+//   parent as a compat child does, runs: the child ends within
+//   ORPHAN_WITHIN (test_orphan).
 // - library: play.library_add, library_load and library_remove
 //   (test_library).
 // - export: play --export of a PS1 disc with saved settings, a PRESS script,
@@ -121,7 +125,9 @@ PLAY_TEST_CHILD :: "PS_PLAY_TEST_CHILD"
 // 60 s; "boot": nothing for 60 s; "slow": vblanks 1 to 12, 0.4 s apart,
 // after 2 s; "learned": none, its last line whether the disc's learned blob
 // and key were stored before it started; "hang": as "learned", and a learned
-// compile (play --learned) is fake_compile.
+// compile (play --learned) is fake_compile; "orphan": watches its parent as
+// a compat child does (play.parent_watch), writes its pid to ORPHAN_PID in
+// the disc directory and vblank 1, then sleeps 60 s.
 @(private = "file")
 fake_child :: proc(mode: string) -> ! {
 	f, err := os.open(core.env("COMPAT_PROGRESS"), {.Write})
@@ -147,6 +153,12 @@ fake_child :: proc(mode: string) -> ! {
 			time.sleep(400 * time.Millisecond)
 		}
 		fmt.eprintln("fake child: done")
+	case "orphan":
+		play.parent_watch()
+		pid_path, _ := filepath.join({filepath.dir(core.env("COMPAT_PROGRESS")), ORPHAN_PID}, context.temp_allocator)
+		_ = os.write_entire_file(pid_path, fmt.tprint(os.get_pid()))
+		put(f, 1)
+		time.sleep(60 * time.Second)
 	case "learned", "hang":
 		dir := filepath.dir(core.env("COMPAT_PROGRESS"))
 		blob, _ := os.read_entire_file(core.disc_path(dir, .Learned, context.temp_allocator), context.temp_allocator)
@@ -204,6 +216,7 @@ main :: proc() {
 	test_compat_learned()
 	test_compat_cards()
 	test_quit()
+	test_orphan()
 	test_line_row()
 	test_library()
 	test_export()
@@ -1408,6 +1421,68 @@ test_compat :: proc() {
 		check(name, c.result == "hang" ? row[.Fatal] == "" : row[.Fatal] == "fake child: done", what)
 	}
 	os.unset_env(core.env_name("COMPAT_WAIT"))
+}
+
+// fake_child's "orphan" pid file, in the disc directory.
+@(private = "file")
+ORPHAN_PID :: "orphan.pid"
+
+// How soon an orphaned compat child must end.
+@(private = "file")
+ORPHAN_WITHIN :: 2 * time.Second
+
+test_orphan :: proc() {
+	name := "orphan"
+	self, serr := os.get_executable_path(context.temp_allocator)
+	if serr != nil {
+		check(name, false, fmt.tprintf("cannot run play: %v", serr))
+		return
+	}
+	// A disc id of its own: no other test's row or files change.
+	path := write(name, labeled(cnf_disc(), "ORPHAN"))
+	ddir, has := core.disc_dir(disc_id(name, path), context.temp_allocator)
+	if !has {
+		check(name, false, "no disc directory")
+		return
+	}
+	pid_path, _ := filepath.join({ddir, ORPHAN_PID}, context.temp_allocator)
+	os.set_env(PLAY_TEST_CHILD, "orphan")
+	defer os.unset_env(PLAY_TEST_CHILD)
+	for how in STOPS {
+		what := fmt.tprintf("%v", how)
+		_ = os.remove(pid_path)
+		parent, err := os.process_start({command = {self, "--compat", path}})
+		if err != nil {
+			check(name, false, fmt.tprintf("%s: cannot run play: %v", what, err))
+			return
+		}
+		// The child's pid, once it has started watching.
+		child := 0
+		for _ in 0 ..< 300 {
+			if text, rerr := os.read_entire_file(pid_path, context.temp_allocator); rerr == nil {
+				if pid, ok := strconv.parse_int(string(text), 10); ok {
+					child = pid
+					break
+				}
+			}
+			time.sleep(100 * time.Millisecond)
+		}
+		check(name, child != 0, fmt.tprintf("%s: the child wrote no pid", what))
+		check(name, stop(parent, how), fmt.tprintf("%s: cannot stop the parent", what))
+		_, _ = os.process_wait(parent)
+		if child == 0 {
+			continue
+		}
+		start := time.tick_now()
+		for alive(child) && time.tick_since(start) < ORPHAN_WITHIN {
+			time.sleep(50 * time.Millisecond)
+		}
+		gone := !alive(child)
+		check(name, gone, fmt.tprintf("%s: the child still runs %v after its parent ended", what, ORPHAN_WITHIN))
+		if !gone {
+			kill_fake_compile(pid_path)
+		}
+	}
 }
 
 // Presents test_quit writes a picture of, from 1: it sends SIGTERM once

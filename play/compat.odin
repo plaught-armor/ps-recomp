@@ -27,6 +27,10 @@
 //
 // The disc's press.txt, when there is one and PRESS is unset, is the
 // child's PRESS script.
+//
+// A child ends when its parent does, however the parent ended (a signal
+// such as SIGTERM, SIGINT or SIGKILL included): it watches the parent's pid
+// (COMPAT_PARENT, parent_watch) on a thread of its own.
 package play
 
 import "base:runtime"
@@ -40,6 +44,7 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "core:thread"
 import "core:time"
 import "core:unicode/utf8"
 import "ps:core"
@@ -411,6 +416,31 @@ compat_wait :: proc(p: os.Process, progress: ^os.File, boot, stall: time.Duratio
 	}
 }
 
+// Watch, on a thread of its own, for the end of the compat parent whose pid
+// is COMPAT_PARENT (child_env), and once it has ended stop this process at
+// once (parent_exit), with status 1: no one is left to read its row. Only
+// a compat child calls it (run). The thread reads the pid alone, no state
+// the run shares; it checks every PARENT_POLL where it polls
+// (parent_gone_wait).
+parent_watch :: proc() {
+	pid, ok := strconv.parse_int(core.env("COMPAT_PARENT"), 10)
+	if !ok || pid <= 0 {
+		return
+	}
+	watch :: proc(pid: int) {
+		parent_gone_wait(pid)
+		fmt.eprintfln("compat: parent %d gone, stopping", pid)
+		parent_exit(1)
+	}
+	if thread.create_and_start_with_poly_data(pid, watch, self_cleanup = true) == nil {
+		fmt.eprintln("compat: cannot watch the parent; this run outlives it")
+	}
+}
+
+// How often parent_gone_wait checks the parent where it polls.
+@(private)
+PARENT_POLL :: 250 * time.Millisecond
+
 // Whether this run is a compat child: COMPAT_PROGRESS is set only by the
 // compat parent (child_env).
 @(private)
@@ -419,7 +449,8 @@ compat_child :: proc() -> bool {
 }
 
 // The child's environment: this one with HEADLESS, COMPAT and FRAMES set,
-// COMPAT_PROGRESS the file for its vblank count, NATIVE=0 without native
+// COMPAT_PROGRESS the file for its vblank count, COMPAT_PARENT this
+// process's pid (parent_watch), NATIVE=0 without native
 // code (so the child does not convert again), and PRESS from the disc's
 // press.txt when PRESS is unset.
 @(private = "file")
@@ -429,6 +460,7 @@ child_env :: proc(dir: string, frames: u64, native: bool, progress: string) -> [
 	append(&set, fmt.tprintf("%s=1", core.env_name("COMPAT")))
 	append(&set, fmt.tprintf("%s=%d", core.env_name("FRAMES"), frames))
 	append(&set, fmt.tprintf("%s=%s", core.env_name("COMPAT_PROGRESS"), progress))
+	append(&set, fmt.tprintf("%s=%d", core.env_name("COMPAT_PARENT"), os.get_pid()))
 	if !native {
 		append(&set, fmt.tprintf("%s=0", core.env_name("NATIVE")))
 	}

@@ -65,6 +65,9 @@ run :: proc(args: []string) -> int {
 	case len(args) == 4 && args[1] == "--export":
 		return export(args[2], args[3])
 	case len(args) == 2 && !strings.has_prefix(args[1], "--"):
+		if compat_child() {
+			parent_watch()
+		}
 		return play(args[1])
 	}
 	fmt.eprintln("usage: play")
