@@ -561,16 +561,20 @@ pages_hit :: proc(set: ^Page_Set, span: [2]u32) -> bool {
 // valid one: its offset in hw.dec and words per layer, or offset 0 to read
 // local memory. Only direct-colour textures that repeat or clamp, whose
 // sampled texels all lie inside each level's w x h. A texture sharing a page
-// with the state's frame or depth buffer may read the state's own writes
-// and is never decoded.
+// with the state's frame or depth buffer is decoded too, before each
+// primitive (each one writes its pages and so outdates the copy): read
+// straight from local memory, a fragment would race the same primitive's
+// writes to the texels it samples, which tiles of the screen win in no
+// fixed order. A texture read straight from local memory (a CLUT format,
+// region wrap, or too big to decode at this scale) still races so; that
+// path wants a copy of the pages taken before the primitive.
 @(private)
-hw_dec :: proc(t: ^Tex, st: ^Hw_State, fb, z, tex: [2]u32) -> (off, stride: u32) {
+hw_dec :: proc(t: ^Tex, st: ^Hw_State, tex: [2]u32) -> (off, stride: u32) {
 	switch t.psm {
 	case PSMCT32, PSMCT24, PSMCT16, PSMCT16S: // the formats fetch converts directly
 	case: return
 	}
 	if t.wms >= 2 || t.wmt >= 2 {return}
-	if spans_meet(tex, fb) || spans_meet(tex, z) {return}
 	k := Dec_Key{psm = t.psm, ta = st.ta, aem = u32(t.aem), tw = t.w, th = t.h, nlev = 1}
 	if t.mmin >= 2 && t.mmin <= 5 {k.nlev = t.mxl + 1}
 	if k.nlev > 7 {return}
@@ -606,13 +610,6 @@ hw_dec :: proc(t: ^Tex, st: ^Hw_State, fb, z, tex: [2]u32) -> (off, stride: u32)
 	}
 	hw_dispatch(hw.decode, &pc, (size + 63) / 64, layers)
 	return e.off, e.stride
-}
-
-@(private)
-spans_meet :: proc(a, b: [2]u32) -> bool {
-	set: Page_Set
-	pages_mark(&set, b)
-	return pages_hit(&set, a)
 }
 
 // The primitive's state index, appending the state if it changed.
@@ -686,7 +683,7 @@ hw_state :: proc(c: ^Ctx) -> u32 {
 	z := c.zte && !c.zmsk ? page_span(c.zpsm, c.zbp, c.fbw, st.sy0, st.sy1) : {}
 	tex := c.tme ? tex_span(t) : {}
 	if c.tme {
-		st.dec, st.dec_ls = hw_dec(t, &st, fb, z, tex)
+		st.dec, st.dec_ls = hw_dec(t, &st, tex)
 		hw.dec_seq = hw.seq
 		if hw.state_ok && st == hw.state {return hw.state_idx}
 	}
