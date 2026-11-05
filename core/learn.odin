@@ -162,6 +162,67 @@ learn: struct {
 // The frame handed from a run's start to its interpreter loop (learn_take).
 learn_handoff: [Learn_Cpu]^Learn_Frame
 
+// What learn_hold set aside, put back by learn_release, and the scratch
+// arrays each processor fetches and stores into meanwhile.
+@(private = "file")
+learn_held: struct {
+	on:      bool,
+	cpus:    Learn_Cpus,
+	space:   [Learn_Cpu]Learn_Space,
+	pool:    [LEARN_LIVE_MAX]Learn_Frame,
+	used:    [LEARN_LIVE_MAX]bool,
+	free:    [LEARN_LIVE_MAX]u16,
+	n_free:  int,
+	pooled:  bool,
+	handoff: [Learn_Cpu]^Learn_Frame,
+	scratch: [Learn_Cpu]struct {
+		fetched:            []u32,
+		fetched_at, stamps: []u64,
+		log:                []u32,
+	},
+}
+
+// A compat probe's branches begin from a saved state (compat_probe_begin):
+// until learn_release no run begins a frame (no processor is learned) and
+// a run that ends notes nothing. The runs in progress at the save, which
+// the branches carry on, fetch and store into scratch arrays; learn_release
+// puts their frames, the counts and the arrays back as they were, so the
+// branches leave no trace in what is learned. No check on the per-word
+// paths: learn_fetch and learn_store cost the same.
+learn_hold :: proc() {
+	h := &learn_held
+	assert(!h.on)
+	h.on, h.cpus, h.space, h.handoff = true, learn.cpus, learn.space, learn_handoff
+	h.pool, h.used, h.free, h.n_free, h.pooled = learn.pool, learn.used, learn.free, learn.n_free, learn.pooled
+	learn.cpus = {}
+	for &s, cpu in learn.space {
+		if s.ram_bytes == 0 {
+			continue // not set up: it runs no frames
+		}
+		x := &h.scratch[cpu]
+		if x.fetched == nil {
+			x.fetched = make([]u32, s.ram_bytes / 4, runtime.heap_allocator())
+			x.fetched_at = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
+			if s.stamped {
+				x.stamps = make([]u64, s.ram_bytes / 4, runtime.heap_allocator())
+			} else {
+				x.log = make([]u32, LEARN_STORES_MAX, runtime.heap_allocator())
+			}
+		}
+		s.fetched, s.fetched_at, s.stamps, s.log = x.fetched, x.fetched_at, x.stamps, x.log
+	}
+}
+
+// The probe's branches ended, its saved state loaded again: learning goes
+// on from where learn_hold left it.
+learn_release :: proc() {
+	h := &learn_held
+	assert(h.on)
+	h.on = false
+	learn.cpus, learn.space, learn_handoff = h.cpus, h.space, h.handoff
+	learn.pool, learn.used, learn.free, learn.n_free, learn.pooled = h.pool, h.used, h.free, h.n_free, h.pooled
+}
+
 @(rodata)
 LEARN_CPU_NAMES := [Learn_Cpu]string {
 	.Psx = "psx",
@@ -320,6 +381,9 @@ learn_take :: #force_inline proc(cpu: Learn_Cpu) -> ^Learn_Frame {
 
 // f's run returned. f is not used after.
 learn_end :: proc(f: ^Learn_Frame) {
+	if learn_held.on {
+		return // in a probe's branch: learn_release puts f back
+	}
 	s := &learn.space[f.cpu]
 	s.runs += 1
 	learn_write(s, f, learn_smc(s, f))

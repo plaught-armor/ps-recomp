@@ -243,6 +243,7 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		fmt.eprintfln("iop: \"%s\" is no IRX", path)
 		return KE_ERROR, 0
 	}
+	core.compat_code_load()
 	l := &iop_loader
 	key := failed_key(path, data)
 	if f, again := l.failed_paths[key]; again && (!f.retry || f.fails >= IOP_LOAD_FAILS) {

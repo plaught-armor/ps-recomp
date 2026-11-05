@@ -72,6 +72,31 @@ display_reset :: proc() {
 	ctx_gen += 1
 }
 
+// The display tracking above, which is host state: a compat probe
+// (ps2/host/probe.odin) keeps it across its branches, so the run goes on as
+// if they never ran.
+Display_Track :: struct {
+	shown:       [SHOWN_MAX]Shown,
+	n_shown:     int,
+	last_fbp:    [2]u32,
+	since_flip:  u32,
+	feedback:    bool,
+	skip_on:     bool,
+	skip_logged: [2]bool,
+	disp_logged: u64,
+}
+
+display_track_get :: proc() -> Display_Track {
+	return {shown, n_shown, last_fbp, since_flip, feedback, skip_on, skip_logged, disp_logged}
+}
+
+// Set the tracking back; the cached drawing context may have seen another.
+display_track_set :: proc(t: Display_Track) {
+	shown, n_shown, last_fbp, since_flip = t.shown, t.n_shown, t.last_fbp, t.since_flip
+	feedback, skip_on, skip_logged, disp_logged = t.feedback, t.skip_on, t.skip_logged, t.disp_logged
+	ctx_gen += 1
+}
+
 // Once per vblank, before the read circuit: note each enabled circuit's
 // DISPFB in the shown set, see whether the game flips, and decide skip_on.
 // The set resets when a buffer's width, format or height changes, or a

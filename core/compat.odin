@@ -13,7 +13,11 @@
 //   hands over and main RAM, so the line can list the stretches of at least
 //   COMPAT_STRETCH vblanks the picture was black, the picture did not
 //   change, the picture barely changed (with or without scripted presses
-//   meanwhile), or RAM did not change.
+//   meanwhile), or RAM did not change;
+// - and under COMPAT, at a sample with no IRX loaded and no interpreter
+//   entry pc first seen since the sample before (quiet), every
+//   PS_COMPAT_PROBE vblanks of quiet the host probes input (compat_probe_due),
+//   so the line can list a stretch the game ignored every button (stuck).
 // Built with -define:COMPAT_COUNT=false the counters compile away.
 //
 // COMPAT=1 makes a run a compatibility run: a call the HLE does not
@@ -33,6 +37,7 @@ import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 
 COMPAT_COUNT :: #config(COMPAT_COUNT, true)
@@ -65,6 +70,19 @@ COMPAT_THUMB :: 4096
 // under it; a camera move or a walking character goes far past it.
 COMPAT_STILL_DIFF :: 2.0
 
+// The default vblanks of quiet between probes of input (PS_COMPAT_PROBE),
+// 60 s at 60 Hz. A probe saves state at a quiet sample, runs one branch per
+// COMPAT_PROBE_BUTTONS entry (the first presses nothing) for
+// COMPAT_PROBE_RUN vblanks, each pressing its button on player 1 for the
+// first COMPAT_PROBE_HOLD, loads the state back after each and compares
+// each button branch's main RAM with the first's. A probe where every
+// button changed at most COMPAT_DEAF_BYTES bytes is deaf.
+COMPAT_PROBE :: 3600
+COMPAT_PROBE_RUN :: 90
+COMPAT_PROBE_HOLD :: 10
+COMPAT_DEAF_BYTES :: 64
+COMPAT_PROBE_BUTTONS :: [?]Buttons{{}, {.Start}, {.Cross}, {.Circle}, {.Up}, {.Down}}
+
 // What a stretch is: the display off or every pixel black (Black), the
 // same picture as the sample before, not black (Frozen), main RAM the same
 // as at the sample before (Ram_Still), or a lit picture that changed but
@@ -72,7 +90,10 @@ COMPAT_STILL_DIFF :: 2.0
 // no press of the loaded PRESS script started in it, so the game may wait
 // for input on purpose; Deaf when one did, so the presses changed nothing
 // to see: a soft lock, or a script pressing the wrong thing). A stretch
-// that is frozen throughout is listed as frozen only. Still and Deaf only
+// that is frozen throughout is listed as frozen only. Stuck: probes of
+// input (compat_probe_end) found every button changed at most
+// COMPAT_DEAF_BYTES of main RAM, from the first such probe to the last of
+// two or more in a row. Still and Deaf only
 // flag a picture that is static as a whole: a stuck prompt drawn over a
 // moving 3D scene (a camera orbiting behind a save prompt changes the
 // thumbnail by 8 to 17) is not flagged.
@@ -82,6 +103,7 @@ Compat_Stretch_Kind :: enum u8 {
 	Ram_Still,
 	Still, // followed for Deaf too; which it is is decided when listed
 	Deaf,
+	Stuck,
 }
 
 COMPAT_STRETCH_NAMES :: [Compat_Stretch_Kind]string {
@@ -90,6 +112,7 @@ COMPAT_STRETCH_NAMES :: [Compat_Stretch_Kind]string {
 	.Ram_Still = "ram_still",
 	.Still     = "still",
 	.Deaf      = "deaf",
+	.Stuck     = "stuck",
 }
 
 // A stretch in the line: from its first sample's vblank to its last's.
@@ -275,6 +298,21 @@ compat: struct {
 	stretches:      [COMPAT_STRETCHES]struct {kind: Compat_Stretch_Kind, from, to: u64},
 	stretches_n:    int,
 	stretches_other: u64,
+	// Probes of input: the vblanks of quiet between them (0: none), the new
+	// entry pcs and IRX loads since the last sample, whether that sample was
+	// quiet, the vblank the next probe is due, whether one runs now (the
+	// host's branches count nothing), the interpreter count and host file
+	// writes it set aside, and the last deaf probe's
+	// vblank (0: the last probe was not deaf).
+	probe_every:    u64,
+	quiet_new:      u64,
+	quiet_loads:    u64,
+	quiet_on:       bool,
+	probe_next:     u64,
+	probing:        bool,
+	probe_insns:    u64,
+	probe_writes:   bool,
+	deaf_at:        u64,
 	reported:      bool,
 	// COMPAT_PROGRESS, open under COMPAT; nil without it.
 	progress:      ^os.File,
@@ -299,13 +337,35 @@ compat_init :: proc(system: string, cycles: ^u64, cycles_per_insn: u64, idle: ^u
 	}
 }
 
-// Count an interpreter entry at pc.
+// PS_COMPAT_PROBE: the vblanks of quiet between probes of input, 0 for
+// none (default COMPAT_PROBE); false, after a message, when it is not a
+// count. A host that probes sets probe_every from it; without, none run.
+compat_probe_setting :: proc() -> (every: u64, ok: bool) {
+	v := env("COMPAT_PROBE")
+	if v == "" {
+		return COMPAT_PROBE, true
+	}
+	if every, ok = strconv.parse_u64(v, 10); !ok {
+		fmt.eprintln("compat:", env_name("COMPAT_PROBE"), "is not a vblank count:", v)
+		return 0, false
+	}
+	return
+}
+
+// Count an interpreter entry at pc. One at a pc not seen before breaks the
+// quiet (one past the table's room does not).
 compat_entry :: proc(pc: u32) {
 	when COMPAT_COUNT {
+		if compat.probing {
+			return
+		}
 		h := (pc >> 2) * 0x9e3779b1 >> 22
 		for i in u32(0) ..< ENTRY_PROBES {
 			s := &compat.entries[(h + i) % ENTRY_SLOTS]
 			if s.pc1 == pc + 1 || s.pc1 == 0 {
+				if s.pc1 == 0 {
+					compat.quiet_new += 1
+				}
 				s.pc1 = pc + 1
 				s.n += 1
 				return
@@ -321,6 +381,9 @@ compat_entry :: proc(pc: u32) {
 // says so on stderr.
 compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0, pc: u32 = 0, ra: u32 = 0, client: u32 = 0) -> (stub: bool) {
 	when COMPAT_COUNT {
+		if compat.probing {
+			return compat.on
+		}
 		key := Compat_Key{kind, id, sub}
 		h := compat.calls[key]
 		if h.n == 0 {
@@ -336,10 +399,23 @@ compat_unknown :: proc(kind: Compat_Call, id: u32, sub: u32 = 0, pc: u32 = 0, ra
 	return compat.on
 }
 
+// Count a load of guest code (an IRX), which breaks the quiet.
+compat_code_load :: proc() {
+	when COMPAT_COUNT {
+		if !compat.probing {
+			compat.quiet_loads += 1
+		}
+	}
+}
+
 // Count vblank n, with the display on or not, with main RAM as it
 // stands. Under COMPAT, vblank FRAMES/2 hashes RAM, and vblank 1 and every
 // COMPAT_PROGRESS_EVERY go to COMPAT_PROGRESS. Call once a vblank.
 compat_vblank :: proc(n: u64, shown: bool, ram: []u8) {
+	// A probe's branches neither count nor show the parent their vblanks.
+	if compat.probing {
+		return
+	}
 	// Outside COMPAT_COUNT: the parent's hang check needs it either way.
 	if compat.progress != nil && (n == 1 || n % COMPAT_PROGRESS_EVERY == 0) {
 		b: [8]u8
@@ -362,7 +438,7 @@ compat_vblank :: proc(n: u64, shown: bool, ram: []u8) {
 // host draws and reads what it did without it.
 compat_sample_due :: proc(n: u64) -> bool {
 	when COMPAT_COUNT {
-		return compat.on && n > 0 && n % COMPAT_SAMPLE == 0
+		return compat.on && !compat.probing && n > 0 && n % COMPAT_SAMPLE == 0
 	} else {
 		return false
 	}
@@ -407,6 +483,7 @@ compat_sample :: proc(n: u64, px: []u32, stride, w, h: int) {
 		stretch_step(.Frozen, frozen, prev, n)
 		stretch_step(.Ram_Still, prev != 0 && ram == compat.sample_ram, prev, n)
 		still_step(n, px, stride, w, h, lit, frozen)
+		quiet_step(prev, n)
 		compat.sample_at, compat.sample_pic, compat.sample_pic_ok, compat.sample_ram = n, pic, lit, ram
 	}
 }
@@ -504,6 +581,102 @@ stretch_keep :: proc(k: Compat_Stretch_Kind, r: Stretch_Run) {
 	}
 	compat.stretches[compat.stretches_n] = {k, r.from, r.last}
 	compat.stretches_n += 1
+}
+
+// One sample's quiet at vblank n (the sample before at prev): no IRX
+// loaded and no interpreter entry pc first seen between them. A sample that
+// is not quiet ends the stuck stretch; the first quiet one puts the next
+// probe probe_every vblanks after prev. A warm run (learned code covering
+// what it once interpreted) sees no new entry pcs, so it is quiet whenever
+// it loads nothing.
+@(private = "file")
+quiet_step :: proc(prev, n: u64) {
+	quiet := prev != 0 && compat.quiet_new == 0 && compat.quiet_loads == 0
+	compat.quiet_new, compat.quiet_loads = 0, 0
+	switch {
+	case quiet && !compat.quiet_on:
+		compat.quiet_on = true
+		compat.probe_next = prev + compat.probe_every
+	case !quiet:
+		compat.quiet_on = false
+		compat.deaf_at = 0
+		stretch_step(.Stuck, false, 0, n)
+	}
+}
+
+// Whether the host probes input at sample vblank n, after compat_sample:
+// under COMPAT with probes on, probe_every vblanks into quiet and every
+// probe_every after while it lasts. True starts the count to the next.
+compat_probe_due :: proc(n: u64) -> bool {
+	when COMPAT_COUNT {
+		c := &compat
+		if !c.on || c.probe_every == 0 || !c.quiet_on || c.probing || n != c.sample_at || n < c.probe_next {
+			return false
+		}
+		c.probe_next = n + c.probe_every
+		return true
+	} else {
+		return false
+	}
+}
+
+// A probe's branches begin, from the state it saved: until
+// compat_probe_end nothing counts, learn notes nothing (learn_hold) and
+// nothing goes to host files, so the branches leave nothing the run would
+// not have.
+compat_probe_begin :: proc() {
+	compat.probing = true
+	compat.probe_insns = compat.interp_insns
+	compat.probe_writes = host_writes_off
+	host_writes_off = true
+	learn_hold()
+}
+
+// The probe at sample vblank n ended, the state it saved loaded again:
+// changed[i] the bytes of main RAM button branch i left different from the
+// branch that pressed nothing. Deaf when every one is at most
+// COMPAT_DEAF_BYTES; deaf probes in a row, with no sample that was not
+// quiet between them, are a stuck stretch from the first to the last.
+compat_probe_end :: proc(n: u64, changed: []int) {
+	compat.probing = false
+	compat.interp_insns = compat.probe_insns
+	host_writes_off = compat.probe_writes
+	learn_release()
+	deaf := true
+	for c in changed {
+		deaf &&= c <= COMPAT_DEAF_BYTES
+	}
+	if compat.on {
+		fmt.eprintfln("compat probe: vblank %d, bytes changed %v%s", n, changed, deaf ? ", deaf" : "")
+	}
+	if !deaf {
+		compat.deaf_at = 0
+		stretch_step(.Stuck, false, 0, n)
+		return
+	}
+	if compat.deaf_at != 0 {
+		stretch_step(.Stuck, true, compat.deaf_at, n)
+	}
+	compat.deaf_at = n
+}
+
+// The bytes of a and b (the same length) that differ.
+compat_bytes_differ :: proc(a, b: []u8) -> int {
+	CHUNK :: 4096
+	n := 0
+	for i := 0; i < len(a); i += CHUNK {
+		k := min(CHUNK, len(a) - i)
+		x, y := a[i:][:k], b[i:][:k]
+		if string(x) == string(y) {
+			continue
+		}
+		for v, j in x {
+			if v != y[j] {
+				n += 1
+			}
+		}
+	}
+	return n
 }
 
 // The name a call has in the line, temp allocated.

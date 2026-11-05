@@ -9,7 +9,8 @@
 // mid-run with no store noted (a callee patching its caller) marks the run
 // .Smc, whether RAM no longer holds a word it fetched or a word it fetched
 // twice changed between, and a word an earlier run fetched as another does
-// not; a range over
+// not; a run carried on through a compat probe's branches (learn_hold)
+// notes nothing of them; a range over
 // LEARN_SPAN_MAX is .Large with no words; a run begun with every frame in
 // use is not noted; a run still in progress at the report is written
 // .Open; and a reader drops a truncated record, one whose words do not
@@ -171,6 +172,25 @@ main :: proc() {
 		check(core.learn_begin(.Ee, 0x6100) == nil, "pool: full")
 		for f in live {core.learn_end(f)}
 	}
+	// A compat probe's branches (learn_hold to learn_release): a run in
+	// progress at the hold carries on in them, fetching another word,
+	// storing into its range and returning, and nothing is noted; released,
+	// it carries on as if they never ran, clean, and writes one record.
+	{
+		f := core.learn_begin(.Ee, 0xb000)
+		core.learn_fetch(f, 0xb000, word(0xb000))
+		core.learn_fetch(f, 0xb004, word(0xb004))
+		core.learn_hold()
+		check(!core.learn_on(.Ee) && !core.learn_on(.Psx), "hold: nothing learned")
+		core.learn_fetch(f, 0xb004, word(0xb004) ~ 0xffff)
+		core.learn_fetch(f, 0xb00c, word(0xb00c))
+		core.learn_store(f, 0xb000)
+		core.learn_end(f)
+		core.learn_release()
+		check(core.learn_on(.Ee) && core.learn_on(.Psx), "release: learned again")
+		core.learn_fetch(f, 0xb004, word(0xb004))
+		core.learn_end(f)
+	}
 	// A run that never returns is written at the report.
 	{
 		f := core.learn_begin(.Psx, 0x7000)
@@ -209,6 +229,7 @@ main :: proc() {
 		{.Psx, {.Smc}, 0xa000, 0xa000, 2},
 		{.Ee, {}, 0x8004, 0x8004, 3},
 		{.Ee, {}, 0x6000, 0x6000, 1},
+		{.Ee, {}, 0xb000, 0xb000, 2},
 		{.Psx, {.Open}, 0x7000, 0x7000, 2},
 	}
 	data, rerr := os.read_entire_file(path, context.allocator)

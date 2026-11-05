@@ -22,7 +22,12 @@
 //   sample vblanks count. Then 32x16 pictures that change by one pixel
 //   are a still stretch, deaf once a scripted press starts in it; a big
 //   change, and a picture of another size, end it; a picture that never
-//   changes is frozen only.
+//   changes is frozen only. Then probes (in process): a sample with a new
+//   interpreter entry pc or an IRX load is not quiet; PS_COMPAT_PROBE
+//   vblanks into quiet a probe is due, and every PS_COMPAT_PROBE after;
+//   a probe counts nothing and holds learn and card writes; two deaf probes
+//   in a row are a stuck stretch, one is not, and a probe a button moved
+//   more than core.COMPAT_DEAF_BYTES for ends it.
 package main
 
 import "core:encoding/json"
@@ -283,6 +288,89 @@ test_still :: proc(n: ^u64, ram: []u8) {
 	core.input.script_started = 0
 }
 
+// Probes (see the header), after test_still's samples, from vblank n.
+@(private = "file")
+test_probe :: proc(n: ^u64, ram: []u8) {
+	name := "probe"
+	S :: core.COMPAT_SAMPLE
+	EVERY :: core.COMPAT_STRETCH
+	key := core.env_name("COMPAT_PROBE")
+	for c in ([]struct {v: string, every: u64, ok: bool}{{"", core.COMPAT_PROBE, true}, {"0", 0, true}, {"600", 600, true}, {"x", 0, false}}) {
+		os.set_env(key, c.v)
+		every, ok := core.compat_probe_setting()
+		check(name, every == c.every && ok == c.ok, fmt.tprint("PS_COMPAT_PROBE", c.v))
+	}
+	os.unset_env(key)
+	a, b: [10000]u8
+	b[0], b[4095], b[9999] = 1, 2, 3
+	check(name, core.compat_bytes_differ(a[:], b[:]) == 3, "bytes differ")
+	core.compat.stretches_n, core.compat.stretches_other, core.compat.runs = 0, 0, {}
+	core.compat.probe_every = EVERY
+	pc: u32 = 0x00300000
+	// A sample: a new entry pc (new), an IRX load (load), or quiet; true
+	// when a probe is due at it.
+	sample :: proc(n: ^u64, ram: []u8, pc: ^u32, new, load: bool) -> bool {
+		n^ += S
+		ram[0] += 1
+		core.compat_entry(0x00200000) // seen before: still quiet
+		if new {
+			core.compat_entry(pc^)
+			pc^ += 4
+		}
+		if load {core.compat_code_load()}
+		core.compat_sample(n^, nil, 0, 0, 0)
+		return core.compat_probe_due(n^)
+	}
+	probe :: proc(n: u64, changed: []int) {
+		core.compat_probe_begin()
+		insns := core.compat.interp_insns
+		core.compat.interp_insns += 100
+		core.compat_entry(0x00400000) // not counted
+		core.compat_code_load()
+		core.compat_probe_end(n, changed)
+		check("probe", core.compat.interp_insns == insns && core.compat.quiet_new == 0 && core.compat.quiet_loads == 0, "nothing counted")
+	}
+	deaf := []int{0, 64, 3, 0, 0}
+	heard := []int{0, 65, 0, 0, 0}
+	check(name, !sample(n, ram, &pc, true, false), "new pc")
+	quiet_from := n^
+	// Quiet from the next sample: a probe EVERY vblanks after this one.
+	due: [dynamic]u64
+	defer delete(due)
+	for _ in 0 ..< 3 * EVERY / S {
+		if sample(n, ram, &pc, false, false) {append(&due, n^)}
+	}
+	check(name, len(due) == 3 && due[0] == quiet_from + EVERY && due[1] == due[0] + EVERY && due[2] == due[1] + EVERY, fmt.tprint("due", due[:], "quiet from", quiet_from))
+	if len(due) != 3 {return}
+	// Probes at those vblanks, replayed in order: deaf, deaf, heard.
+	core.compat.runs[.Stuck], core.compat.deaf_at = {}, 0
+	core.learn.cpus = {.Ee}
+	core.compat_probe_begin()
+	check(name, core.compat.probing && core.learn.cpus == {} && core.host_writes_off && !core.compat_sample_due(S), "held while probing")
+	core.compat_probe_end(due[0], deaf)
+	check(name, !core.compat.probing && core.learn.cpus == {.Ee} && !core.host_writes_off, "set back after")
+	core.learn.cpus = {}
+	stuck :: proc() -> [dynamic]core.Compat_Stretch {
+		out := make([dynamic]core.Compat_Stretch, context.temp_allocator)
+		for s in core.compat_line().stretches {
+			if s.kind == "stuck" {append(&out, s)}
+		}
+		return out
+	}
+	check(name, len(stuck()) == 0, "one deaf probe")
+	probe(due[1], deaf)
+	want := []core.Compat_Stretch{{"stuck", due[0], due[1]}}
+	check(name, slice.equal(stuck()[:], want), fmt.tprint("two deaf probes:", stuck()))
+	probe(due[2], heard)
+	check(name, slice.equal(stuck()[:], want), fmt.tprint("heard:", stuck()))
+	// One deaf probe, then an IRX load: no stretch.
+	probe(due[2] + EVERY, deaf)
+	sample(n, ram, &pc, false, true)
+	probe(due[2] + 2 * EVERY, deaf)
+	check(name, slice.equal(stuck()[:], want) && core.compat.deaf_at == due[2] + 2 * EVERY, fmt.tprint("after a load:", stuck()))
+	core.compat.probe_every = 0
+}
+
 // Samples of 4x2 pictures in process: black (display off, or every pixel
 // black), A or B (lit, different), with main RAM moved (fresh) or not.
 @(private = "file")
@@ -324,6 +412,7 @@ test_stretches :: proc() {
 	l := core.compat_line()
 	check(name, slice.equal(l.stretches, want) && l.stretches_other == 0, fmt.tprint("stretches:", l.stretches, "frames", n))
 	test_still(&n, ram[:])
+	test_probe(&n, ram[:])
 	check(name, core.compat_sample_near(S - 10, 10) && !core.compat_sample_near(S - 11, 10) && core.compat_sample_near(S, 10) && !core.compat_sample_due(0), "sample timing")
 	core.compat.on = false
 	check(name, !core.compat_sample_due(S) && !core.compat_sample_near(S, 10), "sampling outside COMPAT")

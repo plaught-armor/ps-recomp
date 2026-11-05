@@ -75,6 +75,12 @@ platform_init :: proc(title: cstring) -> bool {
 	// exit at vblank n. COMPAT=1: a compatibility run (core/compat).
 	if !core.headless_init() {return false}
 	core.compat_init("ps2", &cpu.state.cycles, cpu.CYCLES_PER_INSN, &kernel.idle_cycles)
+	// PS_COMPAT_PROBE=<vblanks>: probes of input under COMPAT (probe.odin).
+	if every, ok := core.compat_probe_setting(); ok {
+		core.compat.probe_every = every
+	} else {
+		return false
+	}
 	// LEARN=<file>: record the code the interpreters run (core/learn.odin);
 	// the IOP names its counter in iop_cpu_init.
 	core.learn_open()
@@ -153,6 +159,7 @@ platform_init :: proc(title: cstring) -> bool {
 	gs.state.write = gs.write
 	gs.state.transfer = gs.transfer
 	kernel.vblank_hook = vblank_frame
+	probe_init()
 	audio_init(core.headless)
 	last = time.tick_now()
 	if v, ok := core.env_lookup("SHOT"); ok {
@@ -191,6 +198,15 @@ vblank_frame :: proc() {
 		if ev.type == .QUIT {quit(0)}
 		// Hotplug; also fires at startup for pads already plugged in.
 		core.input_event(ev)
+	}
+	// A compat probe's branch: emulated, and nothing else (probe.odin).
+	if probe_running() {
+		probe_input()
+		audio_frame(vblank, false)
+		gs.skip_present, gs.skip_readout = true, true
+		gs.skip_wanted = core.headless && !draw_due()
+		probe_frame(gs.scanout())
+		return
 	}
 	input_poll()
 	// A rerun after a rollback: emulated as usual, but neither shown nor
@@ -260,6 +276,7 @@ vblank_frame :: proc() {
 		stride, pw, ph: int
 		if w > 0 && h > 0 {px, stride, pw, ph = screen_picture(w, h)}
 		core.compat_sample(u64(vblank), px, stride, pw, ph)
+		probe_maybe()
 	}
 	if core.frames_done(u64(vblank)) {quit(0)}
 	if pace == 0 || rerun {return}

@@ -256,6 +256,18 @@ The `cards` column says which: `fresh`, `kept`, or `kept-empty` (kept, but
 the disc's cards held no files). Run one compatibility run of a disc at a
 time: two at once in the same data folder share its `compat-cards`.
 
+A PS2 run also checks whether the game still answers its controller.
+Once it has been quiet for a minute (no new module loaded, and no code
+run through the interpreter for the first time), it saves its state and
+tries a few buttons from it, one at a time: Start, Cross, Circle, Up and
+Down, each against pressing nothing. It then loads the state back and
+goes on as if nothing happened. If no button changed more than 64 bytes
+of main memory, the game ignored it. Two such checks in a row are listed
+as a `stuck` stretch in the game's compat line. `PS_COMPAT_PROBE` sets
+the vblanks of quiet before each check (default 3600, a minute); `0`
+turns the check off. A run of a game that already has learned code for everything
+it runs is quiet whenever it loads nothing.
+
 A press script is a comma-separated list of `<name>@<frame>` entries, for
 example `Start@600,Cross@900+10,LUp&LRight@1200+300:2`:
 

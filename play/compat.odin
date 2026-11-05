@@ -223,6 +223,9 @@ compat_settings :: proc(frames_arg: string) -> (frames, wait: u64, keep, ok: boo
 			return 0, 0, false, false
 		}
 	}
+	if _, ok = core.compat_probe_setting(); !ok {
+		return 0, 0, false, false
+	}
 	switch v = core.env("COMPAT_CARDS"); v {
 	case "", "fresh":
 	case "keep":

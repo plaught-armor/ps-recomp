@@ -106,6 +106,19 @@ save and reload check; the `cards` column says `fresh`, `kept` or
 `kept-empty`. One run of a disc at a time is assumed: a parent runs its
 discs in turn, but two parents in one `PS_DATA` share `compat-cards`.
 
+A PS2 child probes input while quiet (core/compat.odin,
+ps2/host/probe.odin): every `PS_COMPAT_PROBE` vblanks of samples with no
+IRX load and no interpreter entry pc first seen (default 3600; `0` is
+off), it saves state, runs 90 vblanks with nothing pressed and then with
+each of Start, Cross, Circle, Up and Down held for 10, loads the state
+back after each, and counts the bytes of EE RAM each button left
+different. Every button at 64 or fewer is a deaf probe; two in a row
+are a `stuck` stretch in the compat line, from the first to the last.
+The branches count nothing, note no learn records, write no card or
+progress file, and push no sound, so the run after a probe is the run
+without one (`PS_DUMP_HASH` is the same with `PS_COMPAT_PROBE=0`). A
+warm run has no new entry pcs, so it is quiet whenever it loads no IRX.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
