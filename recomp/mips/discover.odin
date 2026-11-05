@@ -267,6 +267,103 @@ mixed_words :: proc(img: Image, lo, hi: u32, out: ^Set, runs: ^[dynamic]Run = ni
 	}
 }
 
+// Whether a lies in a writable executable section of img, which holds code
+// and data together (mixed_words).
+in_mixed_section :: proc(img: Image, a: u32) -> bool {
+	for s in img.sections {
+		if s.data != nil && s.flags & SHF_EXEC != 0 && s.flags & SHF_WRITE != 0 && s.addr <= a && a - s.addr < u32(len(s.data)) {
+			return true
+		}
+	}
+	return false
+}
+
+// The instructions in [lo, hi) that control reaches from the addresses in
+// seeds, by falling through, branches, jumps and calls; a `jr` ends a path.
+@(private = "file")
+reached_code :: proc(r: Rules, img: Image, lo, hi: u32, seeds: Set) -> Set {
+	seen, delay: Set
+	defer delete(delay)
+	work: [dynamic]u32
+	defer delete(work)
+	for a in seeds {
+		append(&work, a)
+	}
+	for len(work) > 0 {
+		pc := pop(&work)
+		step: for lo <= pc && pc < hi && (pc not_in seen) {
+			w, ok := word(img, pc)
+			if !ok {
+				break
+			}
+			seen[pc] = {}
+			i := r.decode(pc, w)
+			if i.kind == .Bad {
+				break
+			}
+			if has_delay(i) {
+				delay[pc + 4] = {}
+				#partial switch i.kind {
+				case .Branch, .Jump, .Call:
+					append(&work, i.target)
+					if i.kind == .Jump {
+						break step
+					}
+				case .Jr:
+					break step
+				}
+				pc += 8
+				continue
+			}
+			if i.halt {
+				break
+			}
+			pc += 4
+		}
+	}
+	// Delay slots run too. They stay out of seen during the walk, so a
+	// branch to one still walks on from there.
+	for a in delay {
+		seen[a] = {}
+	}
+	return seen
+}
+
+// Removes from labels the addresses in [lo, hi) that lie in a section
+// holding code and data together (in_mixed_section) and that no code
+// reaches. There a lui pair as often builds the address of a table or a
+// string as of code, and a label on data makes every function around it
+// walk that data as code. Code is what control reaches from entries (all
+// but the guessed ones: data after a return looks the same) and from the
+// jump table labels in tables, which stay. An address that starts a
+// function (starts_function) stays a label too: a callback only a pointer
+// reaches. One without a prologue that only a lui pair builds, such as a
+// short leaf, loses its label and runs in the interpreter.
+drop_data_labels :: proc(r: Rules, img: Image, lo, hi: u32, entries, guessed, tables: Set, labels: ^Set) {
+	seeds: Set
+	defer delete(seeds)
+	for a in entries {
+		if a not_in guessed {
+			seeds[a] = {}
+		}
+	}
+	for a in tables {
+		seeds[a] = {}
+	}
+	reached := reached_code(r, img, lo, hi, seeds)
+	defer delete(reached)
+	drop: [dynamic]u32
+	defer delete(drop)
+	for a in labels {
+		if lo <= a && a < hi && a not_in reached && a not_in tables && in_mixed_section(img, a) && !starts_function(img, a) {
+			append(&drop, a)
+		}
+	}
+	for a in drop {
+		delete_key(labels, a)
+	}
+}
+
 // Words in a row in a writable executable section from at (mixed_words).
 Run :: struct {
 	at:    u32,
@@ -595,6 +692,17 @@ function_start :: proc(img: Image, p, lo: u32) -> u32 {
 		}
 	}
 	return p
+}
+
+// Whether a function starts at a: a prologue there, or after the global
+// loads that may come before one.
+starts_function :: proc(img: Image, a: u32) -> bool {
+	for k in u32(0) ..= MAX_PRE_PROLOGUE {
+		if is_prologue(img, a + 4 * k) {
+			return k == 0 || function_start(img, a + 4 * k, a) == a
+		}
+	}
+	return false
 }
 
 // Referenced code addresses that begin a function: a prologue, or a lead

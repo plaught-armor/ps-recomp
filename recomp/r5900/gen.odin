@@ -141,18 +141,6 @@ data_image :: proc(img: mips.Image, a, b: u32) -> mips.Image {
 	return {base = a, data = img.data[a - img.base:b - img.base]}
 }
 
-// Whether a function starts at a: a prologue there, or after the global
-// loads that may come before one.
-@(private = "file")
-starts_function :: proc(img: mips.Image, a: u32) -> bool {
-	for k in u32(0) ..= mips.MAX_PRE_PROLOGUE {
-		if mips.is_prologue(img, a + 4 * k) {
-			return k == 0 || mips.function_start(img, a + 4 * k, a) == a
-		}
-	}
-	return false
-}
-
 // Whether f holds a placeholder a module loader fills when it loads the
 // module that exports the symbol: `jal 0` for a function import, or, when
 // data is true, `lui r,0` (r not $zero) for the high half of a data import,
@@ -239,8 +227,9 @@ generate :: proc(o: mips.Options) {
 	for e in calls {
 		known[e] = {}
 	}
-	// Labels: every lui-built address, and the data pointers table_labels
-	// keeps; every reference can start a function.
+	// Labels: every lui-built address (in a section that holds code and
+	// data together, only those on code: drop_data_labels), and the data
+	// pointers table_labels keeps; every reference can start a function.
 	labels: mips.Set
 	for a in refs {
 		labels[a] = {}
@@ -253,15 +242,15 @@ generate :: proc(o: mips.Options) {
 	// one) count, as entries and never as labels. A code word that passes
 	// this points at a function anyway.
 	for a in mixed {
-		if starts_function(img, a) {
+		if mips.starts_function(img, a) {
 			refs[a] = {}
 		}
 	}
 	funcs: [dynamic]^Func
 	for t in ranges {
-		// No guessed entries: dropping data after a return is gated on
-		// r3000 games only so far.
-		entries, _, _ := mips.module_entries(RULES, img, t[0], t[1], nil, refs, known)
+		// Guessed entries stay entries, but build_module gets none of them:
+		// dropping data after a return is gated on r3000 games only so far.
+		entries, _, guessed := mips.module_entries(RULES, img, t[0], t[1], nil, refs, known)
 		tables: mips.Set
 		mips.table_labels(RULES, img, t[0], t[1], ptrs, pairs[:], entries, &tables)
 		for a in tables {
@@ -269,6 +258,12 @@ generate :: proc(o: mips.Options) {
 		}
 		// After table_labels, so a jump table's labels stay labels.
 		mips.vtable_entries(RULES, img, t[0], t[1], runs[:], tables, &entries)
+		// Explicit ranges hold no data. Without them, a section that holds
+		// code and data together keeps only the labels on code.
+		if !explicit {
+			mips.drop_data_labels(RULES, img, t[0], t[1], entries, guessed, tables, &labels)
+		}
+		delete(guessed)
 		append(&funcs, ..mips.build_module(RULES, img, t[0], t[1], entries, labels, calls, {}, {}))
 	}
 	n_imports := drop_imports(&funcs, mips.option_or(o, "quiet", "") == "true")
