@@ -14,6 +14,7 @@ odin run tests/vu -collection:ps=.
 odin run tests/gs -collection:ps=.
 odin run tests/gs_tex -collection:ps=.
 odin run tests/gs_pixel -collection:ps=.
+odin run tests/gs_hw -collection:ps=.
 odin run tests/vu_macro -collection:ps=.
 odin run tests/vu_micro -collection:ps=.
 odin run tests/vu_native -collection:ps=.
@@ -61,6 +62,7 @@ here.
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |
 | `discover` | Functions with no prologue that tables of methods in a writable code section point at: thunks, leaves and jumps on through a register, stubs in a row included, are entries; code after a `b` or a `j` inside a function, code that calls or uses `$sp`, data after a `jr` with stray fields or a jump in a delay slot, a jump table's cases (tables of functions next to each other in one run included) and a pair of words are not |
+| `gs_hw` | The Vulkan GS against the software GS, bit for bit, at scales 1 to 3, run twice each: sprites that sample the frame they draw. Without a Vulkan device it prints `gs_hw: skip, no Vulkan device` and exits 0, which is a skip, not a pass. Scale 3 is a known failure, printed and not counted |
 | `vu` | VU0 microprograms from the EE, macro flags |
 | `vu_macro` | The EE recompiler's VU0 macro code against the interpreter |
 | `ee_emit` | The EE recompiler's inline MMI, multiply-add and FPU code against the interpreter |
@@ -185,6 +187,11 @@ the display off at that vblank no file is written and the run prints
 `shot: vblank <n>, display off, none written`. A headless run without
 `PS_FRAMES` exits after its last shot; with `PS_FRAMES` it runs on to that
 count. The PS1 host does not read `PS_SHOT`.
+
+A change to the Vulkan GS gets a run of a game's `PS_SHOT` set twice on
+Vulkan, each in a directory of its own, then `cmp` of each pair: the GPU
+is meant to give the same picture every run, so a pair that differs is a
+race (the software GS differs from it by rounding, so it is no reference here).
 
 Both consoles also save the disc's thumbnail, `thumb.ppm` in the disc's
 folder, from the picture on screen when the run ends without an error,
