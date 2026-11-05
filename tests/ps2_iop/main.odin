@@ -4619,7 +4619,8 @@ ori :: proc(a: ^Asm, rt, imm: u32) {put(a, 0x34000000 | rt << 16 | imm)} // ori 
 // sdrdrv's SetUserCommandFunction: the slot is bits 4-7 of a command in
 // 0x9000..0x90f0, the previous handler returned, -1 out of range; an EE
 // RPC to a set slot is a row and answers 0, and none without PS_IRX; the
-// slots survive a snapshot, the loader's reset clears them, and a failed
+// EE's callback init and quit answer 0 with no row, a transfer interrupt
+// handler stays unknown; the slots survive a snapshot, the loader's reset clears them, and a failed
 // load puts back the ones it replaced.
 test_sdrdrv :: proc() {
 	fresh()
@@ -4654,6 +4655,14 @@ test_sdrdrv :: proc() {
 	iop.sif.servers[0x80000701](0x90f0, buf[:], 64)
 	check(core.compat.calls[key].n == 1, "sdrdrv: none without PS_IRX")
 	iop.iop_irx = true
+
+	// The EE's callback init and quit answer 0, no row; arming a transfer
+	// interrupt handler is still one.
+	clear(&core.compat.calls)
+	w[0] = 0x55
+	check(iop.sif.servers[0x80000701](0xe620, buf[:], 64) && w[0] == 0 && iop.sif.servers[0x80000701](0xe630, buf[:], 64) && len(core.compat.calls) == 0, "sdrdrv: callback init and quit answer 0, no row")
+	w[1], w[2] = 0, 0x1234
+	check(!iop.sif.servers[0x80000701](0x8160, buf[:], 64), "sdrdrv: a transfer interrupt handler is unknown")
 
 	core.snap_op, core.snap_target = .Save, &snap6
 	core.snap_yield()
