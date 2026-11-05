@@ -6,7 +6,7 @@
 // save states and rollback desync.
 package ps2
 
-import "base:runtime"
+@(require) import "base:runtime" // used only under FLAT
 
 import "ps:core"
 import cpu "cpu"

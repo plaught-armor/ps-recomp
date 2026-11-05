@@ -1,7 +1,7 @@
 // Counts for a FLAT run (core/flat.odin), printed as the game ends.
 package ps2_cpu
 
-import "core:fmt"
+@(require) import "core:fmt" // used only under FLAT
 
 import "ps:core"
 
