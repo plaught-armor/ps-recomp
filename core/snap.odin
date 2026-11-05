@@ -128,8 +128,11 @@ snap_run :: proc(co: ^Coroutine) -> ! {
 }
 
 // From the console, at a frame boundary with snap_op set: hand the machine
-// to snap_run for the operation.
+// to snap_run for the operation. Not under FLAT yet: there the console
+// runs on the host's main thread, so switching to it would do nothing, and
+// the operation would be silently dropped.
 snap_yield :: proc() {
+	when FLAT {panic("snapshots not yet supported under FLAT")}
 	snap_resume = co_current
 	co_switch(&co_main_thread)
 }
