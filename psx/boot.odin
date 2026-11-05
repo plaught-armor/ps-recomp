@@ -33,6 +33,11 @@ Boot :: struct {
 	// Called when a standalone blob cannot be loaded, before run returns
 	// false; nil none.
 	native_failed: proc(),
+	// The port's recompiled learned functions, rec.register_learned (the
+	// recompiler's learned option; nil none). Registered before the blob
+	// below, they win over its functions for the same code
+	// (cpu.register_learned).
+	learned_funcs:  proc(),
 	// A blob of learned functions ("" none; native.load_learned), and what to call
 	// when it cannot be loaded (nil none); the game then runs without it.
 	learned:        string,
@@ -78,6 +83,7 @@ run :: proc(b: Boot) -> bool {
 	if standalone && b.native == "" {
 		fmt.eprintln("psx: no native code, interpreting everything")
 	}
+	if b.learned_funcs != nil {b.learned_funcs()}
 	if b.learned != "" && !native.load_learned(b.learned) && b.learned_failed != nil {
 		b.learned_failed()
 	}

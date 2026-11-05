@@ -16,11 +16,20 @@
 //   - A CPU store into a learned function's code interprets it, and the
 //     word stored back runs it native again; so does RAM put back behind
 //     the guard with learned_epoch bumped, as checkpoint_restore does.
+//   - Two functions registered for the same entry, start and words: the
+//     first runs (a port's recompiled learned functions over the player's
+//     blob), and the second is dropped.
+//   - The recompiler's learned option (r3000.learned_read, write_learned):
+//     a LEARN file's compilable PS1 runs become rows of lrn_NN/funcs.odin
+//     that learned.odin registers; with none, learned.odin registers none
+//     and no package is left behind.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:hash/xxhash"
 import "core:path/filepath"
+import "core:strings"
 import "ps:core"
 import cpu "ps:psx/cpu"
 import psx_native "ps:psx/native"
@@ -211,13 +220,16 @@ main :: proc() {
 	got, native_ran = run(LOOP, 3, 5)
 	check(same(got, want_loop) && native_ran, "loop put back whole not run native")
 
+	test_first_wins()
+	test_recomp(tmp)
+
 	if os.remove_all(tmp) != nil {
 		check(false, fmt.tprintf("cannot remove %s", tmp))
 	}
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does")
+	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; the first function for the same code wins; the recompiler writes the compilable runs as learned functions")
 }
 
 // words at LOOP as one recompiled function.
@@ -226,4 +238,72 @@ r3000_func :: proc(words: []u32) -> ^mips.Func {
 	f := mips.func_make(LOOP, LOOP + 4 * u32(len(words)))
 	mips.discover(r3000.RULES, {base = LOOP, data = ([^]u8)(raw_data(words))[:4 * len(words)]}, f, nil)
 	return f
+}
+
+@(private = "file")
+first_ran, second_ran: int
+
+// The first of two functions registered for the same code runs.
+@(private = "file")
+test_first_wins :: proc() {
+	FIRST :: 0x80015000
+	code := CODE_LOOP
+	put(FIRST, code[:])
+	cpu.register_learned(FIRST, FIRST, code[:], proc() {first_ran += 1})
+	cpu.register_learned(FIRST, FIRST, code[:], proc() {second_ran += 1})
+	check(len(cpu.learned[FIRST]) == 1, fmt.tprintf("%d functions for the same code, want 1", len(cpu.learned[FIRST])))
+	_, ran := run(FIRST, 3, 5)
+	check(ran && first_ran == 1 && second_ran == 0, fmt.tprintf("first ran %d, second %d; want 1, 0", first_ran, second_ran))
+}
+
+// A LEARN record of words at entry.
+@(private = "file")
+learn_bytes :: proc(b: ^[dynamic]u8, flags: core.Learn_Flags, entry: u32, words: []u32) {
+	bytes := ([^]u8)(raw_data(words))[:4 * len(words)]
+	h: [core.LEARN_HEADER]u8
+	h[0], h[1], h[2] = core.LEARN_TAG, u8(core.Learn_Cpu.Psx), transmute(u8)flags
+	(^u32le)(&h[4])^ = u32le(entry)
+	(^u32le)(&h[8])^ = u32le(entry)
+	(^u32le)(&h[12])^ = u32le(len(words))
+	(^u64le)(&h[16])^ = u64le(xxhash.XXH3_64_default(bytes))
+	append(b, ..h[:])
+	append(b, ..bytes)
+}
+
+@(private = "file")
+read_text :: proc(path: string) -> string {
+	data, err := os.read_entire_file(path, context.allocator)
+	check(err == nil, fmt.tprintf("read %s", path))
+	return string(data)
+}
+
+@(private = "file")
+test_recomp :: proc(tmp: string) {
+	loop, body := CODE_LOOP, CODE_BODY
+	file: [dynamic]u8
+	learn_bytes(&file, {}, LOOP, loop[:])
+	learn_bytes(&file, {}, LOOP, loop[:]) // the same run again
+	learn_bytes(&file, {.Open}, BODY, body[:])
+	learn_bytes(&file, {.Smc}, 0x80012000, body[:])
+	runs := r3000.learned_read(write(tmp, "psx.bin", file[:]))
+	check(len(runs) == 2 && runs[0].entry == LOOP && runs[1].entry == BODY, fmt.tprintf("runs %v, want the loop and the body", runs))
+
+	out, _ := filepath.join({tmp, "rec"}, context.allocator)
+	check(os.make_directory(out) == nil, "make rec")
+	r3000.write_learned(out, "ps:psx", runs, 50000)
+	reg, _ := filepath.join({out, "learned.odin"}, context.allocator)
+	funcs, _ := filepath.join({out, "lrn_00", "funcs.odin"}, context.allocator)
+	text := read_text(reg)
+	check(strings.contains(text, "\tcpu.register_learned_funcs(lrn_00.FUNCS[:], lrn_00.WORDS[:])\n"), "learned.odin does not register lrn_00")
+	text = read_text(funcs)
+	check(strings.contains(text, "\t{0x80010000, 0x80010000, 0, 7, l_80010000_0},\n"), "no row for the loop")
+	check(strings.contains(text, "\t{0x80011000, 0x80011000, 7, 6, l_80011000_1},\n"), "no row for the body")
+	check(strings.contains(text, "cpu.jump_unknown(0x80010000, pc)"), "the loop does not jump out through jump_unknown")
+	check(!strings.contains(text, "0x80012000"), "the stored-into run was written")
+
+	// No runs: learned.odin registers none, and lrn_00 is removed.
+	r3000.write_learned(out, "ps:psx", nil, 50000)
+	text = read_text(reg)
+	check(strings.contains(text, "register_learned :: proc() {\n}\n") && !strings.contains(text, "import"), "learned.odin with no runs")
+	check(!os.exists(funcs), "lrn_00/funcs.odin left behind")
 }

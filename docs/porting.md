@@ -49,7 +49,8 @@ window, functions, native code, events, SPU and XA, timers, DMA, BIOS,
 memory cards), points `gp`, `sp` and `fp` at the EXE's values and calls
 its entry; it returns false when a step fails, with the reason printed,
 and true when the entry returns. `overlays` (`rec.register_overlays`,
-generated only with `overlays`), `native` (a blob for `psx.load_native`,
+generated only with `overlays`), `learned_funcs` (`rec.register_learned`,
+always generated; see [PS1 overlays](#ps1-overlays)), `native` (a blob for `psx.load_native`,
 which on failure prints why and keeps the Odin functions), `cards`,
 `setup` and `hooks` are optional. `setup` runs before the window opens;
 `hooks` runs once the functions are registered, and is where the port
@@ -165,6 +166,7 @@ do not change it. Measured peaks:
 
 | Generated source | Build peak |
 |---|---|
+| 2.6 MB (a PS1 executable, no overlays) | 1.14 GB (12.6 s) |
 | 29 MB | 6.7 GB |
 | 30.7 MB | 6.82 GB |
 | 53 MB | over 9.0 GB (stopped there, not a full peak) |
@@ -176,6 +178,34 @@ less memory than the peak, it is stopped by the out-of-memory killer.
 `sh setup.sh rec` recompiles without building: it writes
 `port/src/rec` and prints its size, so the peak can be judged before
 `sh setup.sh` (or `sh port/build.sh`) builds.
+
+### PS1 overlays
+
+The recompiler compiles the PS-X EXE. Code the game loads from other files
+at run time (overlays) is interpreted unless the options give it, in one of
+two ways.
+
+`overlays` names a directory holding the overlay files and a
+`manifest.tsv` with a `file<TAB>slot` header row: each file's name in that
+directory, and the hex address it loads at. The files are read from the
+directory, never from the disc, so the port has to extract them itself
+(how a game packs its overlays is its own). Each overlay is recompiled into
+`ovl_NN` packages that `rec.register_overlays` registers; a function runs
+while its overlay's first word (its id) is at its slot and its first words
+match. In `funcs`, an overlay's space is its file name less `.bin`.
+
+`learned` names a LEARN file: the code the player interpreted, recorded
+with `PS_LEARN=1` in the disc's directory as `learn/psx.bin`
+(core/learn.odin). Each run in it that never stored into its own code is
+recompiled into `lrn_NN` packages that `rec.register_learned` registers.
+A learned function runs only while RAM holds the words it was recompiled
+from, so it needs no knowledge of how the game loads its code, and code
+the player never ran stays interpreted. Recording covers what the run
+played: run the player with `PS_LEARN=1` through the parts of the game to
+cover, then recompile. The file holds the game's code, so keep it out of
+git. `learned.odin` is written with or without the option, registering
+nothing without it. When the player's learned blob is also loaded (psx.Boot
+`learned`), a function for the same code that the port recompiled wins.
 
 ### VU microcode
 

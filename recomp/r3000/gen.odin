@@ -7,7 +7,8 @@
 //                    single-track .bin or .iso) to read exe from; overlays
 //                    stay files
 //   out              optional: output directory (exe.odin, ovl_NN/funcs.odin,
-//                    overlays.odin); without it no Odin source is written
+//                    overlays.odin, lrn_NN/funcs.odin, learned.odin);
+//                    without it no Odin source is written
 //   runtime          import path of the psx runtime package, relative to
 //                    out; by default ps:psx
 //   code_lo, code_hi optional: the executable's code range (hex), the rest
@@ -17,6 +18,10 @@
 //   package_insns    optional: instructions per generated overlay package;
 //                    by default PACKAGE_INSNS
 //   overlays         optional: directory with manifest.tsv (file, slot)
+//   learned          optional: a LEARN file (core/learn.odin, play LEARN=1);
+//                    its PS1 runs native code can stand for, each into an
+//                    Odin learned function (lrn_NN/funcs.odin), valid while
+//                    RAM holds its words. learned.odin is written either way
 //   funcs            optional: listed entries (space, entry); space is `ram`
 //                    for the executable, else an overlay's file name less .bin
 //   patches          optional: patch points (at, cond, target)
@@ -152,10 +157,16 @@ generate :: proc(o: mips.Options) {
 	for ov in p.overlays {
 		program_refs(&p.refs, ov.img, lo, hi)
 	}
+	package_insns := mips.parse_int(mips.option_or(o, "package_insns", fmt.tprint(PACKAGE_INSNS)))
 	recomp_exe(&p, code_lo, code_hi)
 	if p.overlays != nil {
-		recomp_overlays(&p, mips.parse_int(mips.option_or(o, "package_insns", fmt.tprint(PACKAGE_INSNS))))
+		recomp_overlays(&p, package_insns)
 	}
+	runs: []Learned
+	if path := mips.option_or(o, "learned", ""); path != "" {
+		runs = learned_read(path)
+	}
+	write_learned(p.out, p.runtime, runs, package_insns)
 	if p.code != nil {
 		path := mips.option(o, "native_out")
 		if !native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:]) {
@@ -337,4 +348,131 @@ recomp_overlays :: proc(p: ^Program, package_insns: int) {
 	}
 	line(&b, "}")
 	mips.write_file(mips.join(p.out, "overlays.odin"), b.buf[:])
+}
+
+// The learned runs into <out>/lrn_NN/funcs.odin, packages of about
+// package_insns instructions each, and <out>/learned.odin, whose
+// register_learned registers them (cpu.register_learned_funcs); with no
+// runs, learned.odin alone, registering none, so a port can call it
+// either way. Each run's code is found from its entry within its words, as
+// for the learned blob (learned_blob), and costs what the interpreter
+// charges, CYCLES_PER_INSN an instruction; a branch or jump out of its
+// words goes through cpu.jump_unknown. Identical functions are emitted
+// once; every run keeps its own words. Without out, only counts.
+write_learned :: proc(out, runtime: string, runs: []Learned, package_insns: int) {
+	Row :: struct {
+		run:  Learned,
+		at:   int, // its words' index in the package's WORDS
+		name: string,
+	}
+	Lrn_Package :: struct {
+		name:  string,
+		body:  strings.Builder,
+		rows:  [dynamic]Row,
+		words: int,
+		deps:  map[string]struct{},
+	}
+	Emitted :: struct {
+		pkg, name: string,
+	}
+	packages: [dynamic]^Lrn_Package
+	emitted: map[string]Emitted
+	cur: ^Lrn_Package
+	size := package_insns
+	total := 0
+	for r in runs {
+		img := mips.Image {
+			base  = r.lo,
+			data  = ([^]u8)(raw_data(r.words))[:4 * len(r.words)],
+			entry = r.entry,
+		}
+		f := mips.func_make(r.entry, r.lo + 4 * u32(len(r.words)), r.lo)
+		mips.discover(RULES, img, f, nil)
+		if size >= package_insns {
+			cur = new(Lrn_Package)
+			cur.name = fmt.aprintf("lrn_%02d", len(packages))
+			append(&packages, cur)
+			size = 0
+		}
+		key := mips.func_key(f)
+		if key not_in emitted {
+			name := fmt.aprintf("l_%08x_%d", r.entry, len(emitted))
+			emit_func(f, &cur.body, name, nil, CYCLES_PER_INSN)
+			emitted[key] = {cur.name, name}
+			size += len(f.insns)
+			total += len(f.insns)
+		}
+		e := emitted[key]
+		ref := e.name
+		if e.pkg != cur.name {
+			ref = fmt.aprintf("%s.%s", e.pkg, e.name)
+			cur.deps[e.pkg] = {}
+		}
+		append(&cur.rows, Row{r, cur.words, ref})
+		cur.words += len(r.words)
+	}
+	fmt.printfln("learned: %d runs, %d packages, %d unique functions, %d instructions", len(runs), len(packages), len(emitted), total)
+	if out == "" {
+		return
+	}
+	for pkg in packages {
+		dir := mips.join(out, pkg.name)
+		mips.make_dirs(dir)
+		b := strings.builder_make()
+		line(&b, "%s\npackage %s\n", REC_HEADER, pkg.name)
+		runtime_imports(&b, runtime, 1)
+		deps := make([]string, len(pkg.deps))
+		n := 0
+		for d in pkg.deps {
+			deps[n] = d
+			n += 1
+		}
+		slice.sort(deps)
+		for d in deps {
+			line(&b, "import \"../%s\"", d)
+		}
+		if len(deps) > 0 {
+			line(&b, "")
+		}
+		line(&b, "")
+		strings.write_string(&b, strings.to_string(pkg.body))
+		line(&b, "FUNCS := [?]cpu.Learned_Func{")
+		for r in pkg.rows {
+			line(&b, "\t{{%s, %s, %d, %d, %s}},", hexu(r.run.entry), hexu(r.run.lo), r.at, len(r.run.words), r.name)
+		}
+		line(&b, "}")
+		line(&b, "\n@(rodata)\nWORDS := [?]u32{")
+		for r in pkg.rows {
+			for w, k in r.run.words {
+				if k % 8 == 0 {
+					if k != 0 {strings.write_byte(&b, '\n')}
+					strings.write_byte(&b, '\t')
+				} else {
+					strings.write_byte(&b, ' ')
+				}
+				fmt.sbprintf(&b, "%s,", hexu(w))
+			}
+			strings.write_byte(&b, '\n')
+		}
+		line(&b, "}")
+		mips.write_file(mips.join(dir, "funcs.odin"), b.buf[:])
+	}
+	mips.remove_stale_packages(out, "lrn_", "funcs.odin", REC_HEADER, len(packages))
+	b := strings.builder_make()
+	line(&b, "%s\npackage rec\n", REC_HEADER)
+	if len(packages) > 0 {
+		line(&b, "import cpu \"%s/cpu\"", mips.import_path(runtime, 0))
+		for pkg in packages {
+			line(&b, "import \"%s\"", pkg.name)
+		}
+		line(&b, "")
+	}
+	line(&b, "// The functions learned from the LEARN file the recompiler was given, if")
+	line(&b, "// any (psx.Boot.learned_funcs).")
+	line(&b, "register_learned :: proc() {")
+	for pkg in packages {
+		line(&b, "\tcpu.register_learned_funcs(%s.FUNCS[:], %s.WORDS[:])", pkg.name, pkg.name)
+	}
+	line(&b, "}")
+	mips.write_file(mips.join(out, "learned.odin"), b.buf[:])
 }

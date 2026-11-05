@@ -19,6 +19,7 @@
 package psx_cpu
 
 @(require) import "core:fmt"
+import "core:slice"
 
 LEARNED_CHECK :: #config(LEARNED_CHECK, false)
 
@@ -54,13 +55,38 @@ learned_span_ok :: proc(lo: u32, n: int) -> bool {
 }
 
 // Register a learned function entered at entry, compiled from words at lo
-// (learned_span_ok); words must outlive it.
+// (learned_span_ok); words must outlive it. The first function registered
+// for an entry, lo and words wins: a later one for the same code (the
+// player's learned blob after a port's recompiled learned functions,
+// psx.Boot) is dropped.
 register_learned :: proc(entry, lo: u32, words: []u32, fn: Func_Proc) {
 	assert(learned_span_ok(lo, len(words)))
 	list := learned[entry]
+	for e in list {
+		if e.lo == lo && slice.equal(e.words, words) {
+			return
+		}
+	}
 	append(&list, Learned_Entry{lo = lo, words = words, fn = fn})
 	learned[entry] = list
 	learned_loaded = true
+}
+
+// A recompiled learned function (recomp/r3000 learned option): entered at
+// entry, compiled from the n words at index at of its package's WORDS,
+// whose first is at lo.
+Learned_Func :: struct {
+	entry, lo: u32,
+	at, n:     u32,
+	fn:        Func_Proc,
+}
+
+// Register a package's recompiled learned functions (register_learned),
+// their words in words.
+register_learned_funcs :: proc(funcs: []Learned_Func, words: []u32) {
+	for f in funcs {
+		register_learned(f.entry, f.lo, words[f.at:][:f.n], f.fn)
+	}
 }
 
 // The learned function for a call to addr whose words RAM holds; nil none.
