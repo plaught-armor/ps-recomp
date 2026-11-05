@@ -145,9 +145,12 @@ interp_hook: proc(addr: u32)
 
 call :: proc(addr: u32) {
 	spin_dirty |= SPIN_SIDE
-	if fn := lookup(addr); fn != nil {
-		fn()
-		return
+	// FLAT runs no recompiled code: every call goes to the interpreter.
+	when !core.FLAT {
+		if fn := lookup(addr); fn != nil {
+			fn()
+			return
+		}
 	}
 	if interp_hook != nil {
 		interp_hook(addr)
@@ -202,6 +205,7 @@ fatal :: proc(format: string, args: ..any) -> ! {
 	dump_regs()
 	unmapped_print()
 	learned_print()
+	flat_print()
 	core.learn_report()
 	core.compat_report(msg)
 	os.exit(1)

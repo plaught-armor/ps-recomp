@@ -167,13 +167,19 @@ exec_reset :: proc(what: string) {
 }
 
 // The current thread runs entry on a new coroutine; the one it ran on, with
-// the old program's host frames, is freed once off it (reap).
+// the old program's host frames, is freed once off it (reap). Under FLAT,
+// the thread's run starts over at entry, and this returns.
 @(private = "file")
-exec_switch :: proc(entry: u32) -> ! {
+exec_switch :: proc(entry: u32) {
 	t := k.current
 	text_check(entry)
 	t.entry = entry
 	cpu.state.r[2].d[0] = cpu.sx32(entry)
+	when core.FLAT {
+		if flat.nest_depth > 0 {cpu.fatal("program switch to %08x in a nested guest call", entry)}
+		flat_start(t, entry, .Exec)
+		return
+	}
 	k.exec.dead_co = t.co
 	t.co = core.co_create(proc(arg: rawptr) {
 		th := (^Thread)(arg)
@@ -187,7 +193,7 @@ exec_switch :: proc(entry: u32) -> ! {
 
 // _ExecPS2(entry, gp, argc, argv): the program already in memory. gp is the
 // new program's to set (crt0 does).
-exec_ps2 :: proc(entry, argc, argv: u32) -> ! {
+exec_ps2 :: proc(entry, argc, argv: u32) {
 	args_clear()
 	args_guest(argc, argv, "ExecPS2")
 	exec_reset("ExecPS2")
@@ -198,7 +204,7 @@ exec_ps2 :: proc(entry, argc, argv: u32) -> ! {
 // argv[0] the filename and the arguments after it. Retail tears the program
 // down before its loader looks for the file, and boots the console's browser
 // when it is missing or no ELF: the game is over either way.
-load_exec :: proc(filename, argc, argv: u32) -> ! {
+load_exec :: proc(filename, argc, argv: u32) {
 	args_clear()
 	name_in, ok := guest_string(filename, ARGV_BYTES)
 	if !ok {cpu.fatal("LoadExecPS2: the filename is not in RAM")}

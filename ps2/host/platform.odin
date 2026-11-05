@@ -182,6 +182,7 @@ quit :: proc(code: int) -> ! {
 	vu.vu_stats_print()
 	cpu.unmapped_print()
 	cpu.learned_print()
+	cpu.flat_print()
 	core.learn_report()
 	core.compat_report()
 	os.exit(code)

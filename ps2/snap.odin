@@ -6,6 +6,8 @@
 // save states and rollback desync.
 package ps2
 
+import "base:runtime"
+
 import "ps:core"
 import cpu "cpu"
 import dma "dma"
@@ -49,7 +51,7 @@ init :: proc() {
 	mem.hw_write128 = hw_write128
 	mem.vu_mem_addr = vu.vu_mem_addr
 	mem.trace_store = kernel.trace_store
-	cpu.interp_hook = interp_call
+	cpu.interp_hook = flat_call when core.FLAT else interp_call
 	mem.mem_init()
 	vu.vu_init()
 	iop.sif_init()
@@ -62,6 +64,14 @@ init :: proc() {
 run :: proc(entry: u32) -> ! {
 	kernel.exec_boot()
 	t := kernel.k.threads[1]
+	// FLAT: on the host main thread, with the context a coroutine starts
+	// with.
+	when core.FLAT {
+		context = runtime.default_context()
+		context.allocator = core.emu_allocator()
+		kernel.flat_start(t, entry, .Main)
+		flat_run()
+	}
 	t.co = core.co_create(proc(arg: rawptr) {
 		cpu.call(u32(uintptr(arg)))
 		cpu.fatal("entry returned")

@@ -22,7 +22,7 @@ import r5900 "r5900"
 @(private = "file")
 interp_seen: map[u32]bool
 
-@(private = "file")
+@(private)
 branch_taken :: proc(i: r5900.Insn) -> bool {
 	c := &cpu.state
 	s := i.rs == 0 ? 0 : i64(c.r[i.rs].d[0])
@@ -42,7 +42,7 @@ branch_taken :: proc(i: r5900.Insn) -> bool {
 
 // The delay slot at pc. A jump there is undefined on the R5900; exec_insn
 // stops on it.
-@(private = "file")
+@(private)
 delay_slot :: proc(pc: u32, lf: ^core.Learn_Frame) {
 	cpu.state.cycles += cpu.CYCLES_PER_INSN
 	i := r5900.decode(pc, mem.rd32(pc))
@@ -71,7 +71,21 @@ interp_call :: proc(entry: u32) {
 		fn()
 		return
 	}
-	c := &cpu.state
+	interp_enter(entry)
+	if cpu.state.cycles >= cpu.next_event {kernel.run_events()}
+	if !core.learn_on(.Ee) {
+		interp_body(entry, nil)
+		return
+	}
+	f := core.learn_begin(.Ee, entry)
+	interp_body(entry, f)
+	if f != nil {core.learn_end(f)}
+}
+
+// What an interpreted call does first, before its events check: count it
+// and say it is interpreted.
+@(private)
+interp_enter :: proc(entry: u32) {
 	when cpu.FALLBACK_COUNT {
 		if cpu.fallback_ee_calls == nil {
 			cpu.fallback_ee_calls = make(map[u32]u64, runtime.heap_allocator())
@@ -82,22 +96,14 @@ interp_call :: proc(entry: u32) {
 	if entry not_in interp_seen {
 		if interp_seen == nil {interp_seen = make(map[u32]bool, runtime.heap_allocator())}
 		interp_seen[entry] = true
-		fmt.eprintfln("ee: interpreting %08x (ra %08x): no function registered", entry, u32(c.r[31].d[0]))
+		fmt.eprintfln("ee: interpreting %08x (ra %08x): no function registered", entry, u32(cpu.state.r[31].d[0]))
 	}
 	if kernel.trace_on {kernel.trace_call(entry)}
-	if c.cycles >= cpu.next_event {kernel.run_events()}
-	if !core.learn_on(.Ee) {
-		interp_body(entry, nil)
-		return
-	}
-	f := core.learn_begin(.Ee, entry)
-	interp_body(entry, f)
-	if f != nil {core.learn_end(f)}
 }
 
 // Note for LEARN (core/learn.odin) that the run fetched i, and where i
 // stores if it is a store.
-@(private = "file")
+@(private)
 learn_note :: proc(f: ^core.Learn_Frame, i: r5900.Insn) {
 	core.learn_fetch(f, i.pc, i.w)
 	#partial switch i.op {

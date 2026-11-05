@@ -224,8 +224,9 @@ syscall :: proc(pc: u32) {
 	switch abs(n) {
 	case 0x02: // SetGsCrt(interlace, mode, field)
 		fmt.eprintfln("kernel: SetGsCrt(%d, %d, %d)", a0, a1, a2)
-	case 0x06: load_exec(a0, a1, a2)
-	case 0x07: exec_ps2(a0, a2, a3)
+	// They return only under FLAT, with v0 set for the new program.
+	case 0x06: load_exec(a0, a1, a2); return
+	case 0x07: exec_ps2(a0, a2, a3); return
 	case 0x04: // Exit
 		cpu.fatal("program exited with %d", i32(a0))
 	case 0x10: ret = add_handler(&k.intc, a0, a1, a3)
@@ -518,7 +519,11 @@ start_thread :: proc(id: i32, arg: u32) -> i64 {
 	t.regs.cop0[12] = STATUS_USER
 	t.prio = t.init_prio
 	t.wakeups = 0
-	if t.co == nil {t.co = core.co_create(thread_main, t)}
+	when core.FLAT {
+		flat_start(t, t.entry, .Thread)
+	} else {
+		if t.co == nil {t.co = core.co_create(thread_main, t)}
+	}
 	make_ready(t)
 	reschedule()
 	return i64(id)
@@ -529,6 +534,9 @@ exit_thread :: proc() {
 	t.status = .Dormant
 	if t.id == 1 {cpu.fatal("main thread exited")}
 	reschedule()
+	// FLAT: the switch commits after the syscall, and a restart begins at
+	// the entry (start_thread).
+	when core.FLAT {return}
 	// Restarted: run the entry again on a fresh frame of thread_main.
 	cpu.fatal("exited thread %d resumed", t.id)
 }
@@ -545,6 +553,8 @@ exit_delete_thread :: proc() {
 	k.threads[t.id] = nil
 	k.dead = t
 	reschedule()
+	// FLAT: the switch commits after the syscall, and frees the thread.
+	when core.FLAT {return}
 	cpu.fatal("deleted thread %d resumed", t.id)
 }
 
@@ -680,6 +690,11 @@ block :: proc(t: ^Thread, kind: Wait_Kind, id: i32) {
 	t.wait = kind
 	t.wait_id = id
 	reschedule()
+	// FLAT: switched away, with the syscall's result to come as the switch
+	// back commits (flat_commit).
+	when core.FLAT {
+		if k.current != t {flat.wait[t.id] = true}
+	}
 }
 
 wake :: proc(t: ^Thread, result: i32) {
@@ -731,6 +746,10 @@ reschedule :: proc() {
 
 @(private)
 switch_to :: proc(next: ^Thread) {
+	when core.FLAT {
+		flat_switch(next)
+		return
+	}
 	cur := k.current
 	cur.regs = cpu.state
 	if cur.status == .Run {cur.status = .Ready}
@@ -1057,6 +1076,7 @@ dump_threads :: proc() {
 kernel_snap :: proc() {
 	core.snap_add(&k)
 	core.snap_add(&idle_cycles)
+	flat_snap()
 	// The table follows the state an exec left (exec.odin).
 	append(&core.snap_hooks, core.Snap_Hook{save = proc(_: int) {}, load = proc(_: int) {cpu.dispatch_set(!k.exec.text_off)}})
 }
