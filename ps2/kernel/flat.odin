@@ -65,6 +65,18 @@ Flat :: struct {
 	// after which it commits a switch. A switch anywhere else would leave
 	// the switched-from thread running on: fatal.
 	sync: bool,
+	// run_events' spin flags across a snapshot operation at vblank, which
+	// may load a state.
+	dirty: u32,
+	// Where flat_idle is, and the status it puts back as it ends.
+	idle:        Flat_Idle,
+	idle_status: u32,
+}
+
+Flat_Idle :: enum u8 {
+	None,
+	Owed, // reschedule found no thread to run, in a syscall
+	On,   // flat_idle has begun: idle_status is saved
 }
 flat: Flat
 
@@ -163,25 +175,54 @@ flat_sync :: #force_inline proc() {
 // one's, with the cycle count carried as switch_to does.
 flat_commit :: proc() {
 	if flat.nest_depth > 0 {return}
+	if flat.idle != .None {flat_idle()}
 	flat.sync = false
 	from := flat.from
-	if from == nil {return}
 	flat.from = nil
 	next := k.current
-	if from == next {return}
-	cycles := cpu.state.cycles
-	if from == k.dead {
-		k.dead = nil
-		free(from)
-	} else {
-		from.regs = cpu.state
+	if from != nil && from != next {
+		cycles := cpu.state.cycles
+		if from == k.dead {
+			k.dead = nil
+			free(from)
+		} else {
+			from.regs = cpu.state
+		}
+		cpu.state = next.regs
+		cpu.state.cycles = cycles
 	}
-	cpu.state = next.regs
-	cpu.state.cycles = cycles
+	// Set only for a thread switched away, or one blocked as an idle was
+	// owed, which may run on with no switch.
 	if flat.wait[next.id] {
 		flat.wait[next.id] = false
 		cpu.state.r[2].d[0] = u64(i64(next.wait_result))
 	}
+}
+
+// reschedule's idle, done after the syscall that owed it: skip to the next
+// event and run it, until a thread is ready. The state it keeps across
+// run_events is in flat, not in host locals, so a snapshot saved here
+// loads at any other events check (and one saved there loads here) and
+// goes on alike: the first commit after it finishes the idle.
+@(private = "file")
+flat_idle :: proc() {
+	if flat.idle == .Owed {
+		flat.idle = .On
+		flat.idle_status = cpu.state.cop0[12]
+	}
+	for flat.idle != .None {
+		if next := pick_thread(); next != nil {
+			if next != k.current {flat_switch(next)}
+			break
+		}
+		idle_skip()
+		// As idle does: interrupts enabled, whatever the thread's status.
+		cpu.state.cop0[12] = STATUS_USER
+		run_events()
+	}
+	if flat.idle == .None {return}
+	cpu.state.cop0[12] = flat.idle_status
+	flat.idle = .None
 }
 
 flat_snap :: proc() {

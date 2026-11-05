@@ -1080,5 +1080,6 @@ sif_snap :: proc() {
 	core.snap_add(&iop_rpc)
 	core.snap_add(&iop_wake_ee)
 	iop_cpu_snap()
+	th_snap()
 	adx_snap()
 }

@@ -332,6 +332,9 @@ net_frame :: proc(frame: int, local: Net_Input) -> (inputs: [MAX_PLAYERS]Net_Inp
 			assert(back <= rb_frames(), "net: rollback past the held frames")
 			n.status.rollbacks += 1
 			n.status.resimulated += frame - n.rewind
+			// Under FLAT snap_yield would return here, into a frame the
+			// rewind has left: the console would go on from the wrong place.
+			when FLAT {fatal("net: rollback not supported under FLAT")}
 			snap_op, rb_back = .Rewind, back
 			snap_yield()
 			unreachable()

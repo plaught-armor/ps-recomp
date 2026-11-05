@@ -692,8 +692,13 @@ block :: proc(t: ^Thread, kind: Wait_Kind, id: i32) {
 	reschedule()
 	// FLAT: switched away, with the syscall's result to come as the switch
 	// back commits (flat_commit).
+	// An idle still owed (flat_idle) may switch away, or wake t and run it
+	// on: either way the result is written as the commit ends. In an
+	// interrupt handler nothing switches (reschedule returns at once, as on
+	// the coroutine), and an idle owed by the interrupted syscall belongs
+	// to a thread that may not be waiting at all: the call returns as is.
 	when core.FLAT {
-		if k.current != t {flat.wait[t.id] = true}
+		if !cpu.in_interrupt && (k.current != t || flat.idle != .None) {flat.wait[t.id] = true}
 	}
 }
 
@@ -740,6 +745,15 @@ reschedule :: proc() {
 			if next != k.current {switch_to(next)}
 			return
 		}
+		// FLAT: idling runs events, where a snapshot may be loaded, and
+		// the host frames of the syscall this is in would outlive it. The
+		// syscall finishes first; flat_commit idles after it (flat_idle).
+		when core.FLAT {
+			if flat.nest_depth == 0 {
+				if flat.idle == .None {flat.idle = .Owed}
+				return
+			}
+		}
 		idle()
 	}
 }
@@ -768,17 +782,23 @@ idle_cycles: u64
 
 @(private)
 idle :: proc() {
-	if cpu.next_event == max(u64) {cpu.fatal("deadlock: every thread waits and no event is pending")}
-	if cpu.state.cycles < cpu.next_event {
-		idle_cycles += cpu.next_event - cpu.state.cycles
-		cpu.state.cycles = cpu.next_event
-	}
+	idle_skip()
 	// The kernel idles with interrupts enabled, whatever the status of the
 	// thread that blocked last.
 	status := cpu.state.cop0[12]
 	cpu.state.cop0[12] = STATUS_USER
 	run_events()
 	cpu.state.cop0[12] = status
+}
+
+// Skip to the next event.
+@(private)
+idle_skip :: proc() {
+	if cpu.next_event == max(u64) {cpu.fatal("deadlock: every thread waits and no event is pending")}
+	if cpu.state.cycles < cpu.next_event {
+		idle_cycles += cpu.next_event - cpu.state.cycles
+		cpu.state.cycles = cpu.next_event
+	}
 }
 
 // ----------------------------------------------------------- semaphores
@@ -943,6 +963,13 @@ update_next_event :: proc() {
 	cpu.next_event = n
 }
 
+// The host's vblank hook, on host memory.
+@(private)
+vblank_hook_host :: proc() {
+	context.allocator = core.host_allocator
+	vblank_hook()
+}
+
 // Process due events and deliver pending interrupts. Called by recompiled
 // code whenever `state.cycles` reaches `next_event`.
 run_events :: proc() {
@@ -964,11 +991,15 @@ run_events :: proc() {
 		// Snapshots hold the state as of here, before the host's input for
 		// the frame, so a loaded one replays with whatever input the host
 		// gives it next.
-		if core.snap_op != .None {core.snap_yield()}
-		{
-			context.allocator = core.host_allocator
-			vblank_hook()
+		if core.snap_op != .None {
+			// FLAT: the operation is done here, and a load returns with the
+			// state it put back: the locals this proc keeps are taken from
+			// it again, as a coroutine's stack would be.
+			when core.FLAT {flat.dirty = dirty}
+			core.snap_yield()
+			when core.FLAT {now, dirty = cpu.state.cycles, flat.dirty}
 		}
+		vblank_hook_host()
 		iop.pad_update()
 		iop.fmod_vblank()
 		if cpu.debug != 0 && k.frame % 120 == 0 {dump_threads()}

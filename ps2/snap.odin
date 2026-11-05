@@ -43,6 +43,17 @@ init :: proc() {
 	iop.pad_snap()
 	iop.spu_snap()
 	core.snap_add(&cpu.unmapped_seen)
+	core.fatal_hook = proc(msg: string) {cpu.fatal("%s", msg)}
+	// FLAT: run_events reaches a snapshot only at the top of the EE's run
+	// (a nested run's events check returns at once, cpu.in_interrupt), with
+	// the IOP between runs. Anything else would lose host frames.
+	when core.FLAT {
+		core.snap_check = proc() {
+			if kernel.flat.nest_depth > 0 || iop.th_flat_busy() {
+				cpu.fatal("snap: op at nest %d / iop busy %v", kernel.flat.nest_depth, iop.th_flat_busy())
+			}
+		}
+	}
 	context.allocator = core.emu_allocator()
 	core.co_allocator = core.emu_allocator()
 	mem.hw_read = hw_read

@@ -204,6 +204,19 @@ when core.FLAT {
 	th_intr_run: ^r3000.Flat_Ctx
 }
 
+// Emulated state (sif_snap): the handlers' run under FLAT. Each thread's
+// run is its Iop_Flat, in iop_sched; the runs themselves are on the emu
+// heap.
+th_snap :: proc() {
+	when core.FLAT {core.snap_add(&th_intr_run)}
+}
+
+// FLAT: an IOP run is live. Never at an EE frame boundary, where the IOP
+// has returned to the EE: a snapshot there would miss the run's host frames.
+th_flat_busy :: proc() -> bool {
+	when core.FLAT {return r3000.flat_cur != nil} else {return false}
+}
+
 th_init :: proc() {
 	s := &iop_sched
 	for &t in s.threads {th_drop(&t)}

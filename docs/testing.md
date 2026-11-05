@@ -297,6 +297,10 @@ assertion. Its run checks that the page loads the module and reads the
 disc, and that the assertion reaches the report's `errors` with
 `done.code` -1.
 
+Save states made by the wasm build (FLAT) do not load on a desktop build,
+nor the other way round: a snapshot records which model saved it, and a
+mismatched load is fatal.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on

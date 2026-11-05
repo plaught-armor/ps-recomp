@@ -23,7 +23,9 @@
 // Snapshots are taken off the game's stacks: at a frame boundary with an
 // operation requested, the running coroutine calls snap_yield, and the host
 // main thread (snap_run) does the copy and resumes whichever coroutine the
-// state it now holds was running.
+// state it now holds was running. Under FLAT there are no game stacks: the
+// console runs on the host's main thread, its call chains are data on the
+// emulated heap, and snap_yield does the operation where it is called.
 package core
 
 import "base:runtime"
@@ -65,6 +67,12 @@ snap_regions: [dynamic][]u8
 // Memory from snap_area.
 @(private)
 snap_areas: [dynamic][]u8
+
+// FLAT: the console's check, set at init, that no host frame above
+// snap_yield keeps state a snapshot would miss (a guest call the host made).
+// It is fatal if one does: putting the operation off to a later frame
+// boundary would change the frame it lands on.
+snap_check: proc()
 
 // The coroutine to resume after a snapshot operation; part of the state.
 @(private)
@@ -116,25 +124,37 @@ snap_run :: proc(co: ^Coroutine) -> ! {
 	context.allocator = host_allocator // for snapshot buffers
 	for {
 		co_switch(snap_resume)
-		switch snap_op {
-		case .None:
-		case .Save: snap_save(snap_target)
-		case .Load: snap_load(snap_target)
-		case .Commit: rb_commit()
-		case .Rewind: rb_rewind(rb_back)
-		}
-		snap_op = .None
+		snap_serve()
 	}
 }
 
 // From the console, at a frame boundary with snap_op set: hand the machine
-// to snap_run for the operation. Not under FLAT yet: there the console
-// runs on the host's main thread, so switching to it would do nothing, and
-// the operation would be silently dropped.
+// to snap_run for the operation. Under FLAT the console is on the host's
+// main thread already: the operation is done here, and a Load or Rewind
+// returns with the state it put back. The caller must keep nothing in host
+// locals across this that the state holds (snap_check).
 snap_yield :: proc() {
-	when FLAT {panic("snapshots not yet supported under FLAT")}
-	snap_resume = co_current
-	co_switch(&co_main_thread)
+	when FLAT {
+		if snap_check != nil {snap_check()}
+		context.allocator = host_allocator // for snapshot buffers
+		snap_serve()
+	} else {
+		snap_resume = co_current
+		co_switch(&co_main_thread)
+	}
+}
+
+// The requested operation. The caller has set the host's allocator.
+@(private = "file")
+snap_serve :: proc() {
+	switch snap_op {
+	case .None:
+	case .Save: snap_save(snap_target)
+	case .Load: snap_load(snap_target)
+	case .Commit: rb_commit()
+	case .Rewind: rb_rewind(rb_back)
+	}
+	snap_op = .None
 }
 
 @(private)
@@ -144,9 +164,16 @@ take :: proc(d: []u8, pos: ^int, n: int) -> []u8 {
 	return b
 }
 
+// A snapshot's first byte: whether a FLAT build saved it. The two models
+// keep different state at a snapshot point (under FLAT an idle can be owed,
+// with the syscall's result still to come), so neither loads the other's.
+@(private = "file")
+SNAP_FLAT :: u8(1) when FLAT else u8(0)
+
 @(private = "file")
 snap_save :: proc(s: ^Snapshot) {
 	clear(&s.data)
+	append(&s.data, SNAP_FLAT)
 	put_regions(&s.data)
 	for a in snap_areas {append(&s.data, ..a)}
 	// Heap blocks in address order: whole used blocks, free ones' headers.
@@ -161,7 +188,11 @@ snap_save :: proc(s: ^Snapshot) {
 
 @(private = "file")
 snap_load :: proc(s: ^Snapshot) {
-	pos := 0
+	if len(s.data) == 0 || s.data[0] != SNAP_FLAT {
+		model :: proc(flat: bool) -> string {return flat ? "a FLAT (wasm)" : "a native (coroutine)"}
+		fatal("snapshot: saved by %s build, loaded by %s one; save states do not cross between them", model(!FLAT), model(FLAT))
+	}
+	pos := 1
 	take_regions(s.data[:], &pos)
 	for a in snap_areas {copy(a, take(s.data[:], &pos, len(a)))}
 	h := &emu_heap

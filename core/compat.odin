@@ -910,6 +910,20 @@ compat_stretches :: proc() -> (list: []Compat_Stretch, other: u64) {
 	return out[:], other
 }
 
+// The console's fatal error path, set at its init (the PS2's cpu.fatal):
+// it says so with the console's state and prints the compat line.
+fatal_hook: proc(msg: string)
+
+// Stop the run on an error it cannot get past, through the console's fatal
+// path when it has one.
+fatal :: proc(format: string, args: ..any) -> ! {
+	msg := fmt.tprintf(format, ..args)
+	if fatal_hook != nil {fatal_hook(msg)}
+	fmt.eprintln(msg)
+	compat_report(msg)
+	os.exit(1)
+}
+
 // Under COMPAT, print the compat line once; fatal is the fatal error's
 // message, "" for an exit. Call where the run ends.
 compat_report :: proc(fatal := "") {
