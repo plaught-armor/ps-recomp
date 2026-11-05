@@ -169,8 +169,9 @@ flat_goto :: #force_inline proc(x: ^kernel.Flat_Ctx, pc, t: u32) -> bool {
 flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 	if x.depth > 0 {
 		x.depth -= 1
-		x.pc = x.ret[x.depth]
-		if jr {
+		ret := x.ret[x.depth]
+		x.pc = ret &~ kernel.FLAT_HOST_TAIL
+		if jr && ret & kernel.FLAT_HOST_TAIL == 0 {
 			cpu.flat_returns += 1
 			if ra != x.pc {cpu.flat_mismatch += 1}
 		}

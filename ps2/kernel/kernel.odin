@@ -218,7 +218,7 @@ syscall :: proc(pc: u32) {
 	// Syscalls the program installed itself (SetSyscall, or a direct write
 	// to the table) run its own code.
 	if fn := mem.rd32(SYSCALL_TABLE + u32(abs(n) & 0xff) * 4); fn < 0x80000000 {
-		cpu.call(fn)
+		when core.FLAT {flat_syscall(pc, fn)} else {cpu.call(fn)}
 		return
 	}
 	switch abs(n) {

@@ -101,6 +101,11 @@ flat_nest_pop :: proc() {
 	flat.nest_depth -= 1
 }
 
+// Bit 0 of a return address on the shadow stack: the call was made by host
+// code that has nothing left to do after it (FLAT_HOST_TAIL). Its return is
+// not counted against $ra, which the host did not set.
+FLAT_HOST_TAIL :: u32(1)
+
 // Push a call from x to t that returns to ret, with the checks a call makes
 // on entry owed (the flat interpreter's flat_reload).
 flat_push :: proc(x: ^Flat_Ctx, ret, t: u32) {
@@ -121,6 +126,17 @@ flat_grow :: proc(x: ^Flat_Ctx, t: u32) {
 	copy(ret, x.ret)
 	delete(x.ret, core.emu_allocator())
 	x.ret = ret
+}
+
+// A syscall the program installed (SetSyscall) at pc runs its handler fn,
+// as cpu.call. Under FLAT that call is not run nested: syscall has nothing
+// left to do after it, so it is pushed on the running run, a host-tail
+// record returning to the instruction after the syscall, and the handler
+// runs at that run's depth. A thread switch or a wait inside it then parks
+// the thread as anywhere else, and its `jr $ra` pops the record.
+@(private)
+flat_syscall :: proc(pc, fn: u32) {
+	flat_push(flat_ctx(), (pc + 4) | FLAT_HOST_TAIL, fn)
 }
 
 // Record the switch to next (switch_to under FLAT).

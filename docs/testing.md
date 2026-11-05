@@ -34,6 +34,8 @@ odin run tests/ps2_kernel -collection:ps=.
 odin run tests/ps2_iop -collection:ps=.
 odin run tests/ps2_interp -collection:ps=.
 odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true
+odin run tests/ee_syscall_handler -collection:ps=.
+odin run tests/ee_syscall_handler -collection:ps=. -define:PS_FLAT=true
 odin run tests/psx_bios -collection:ps=.
 odin run tests/psx_bios_libc -collection:ps=.
 odin run tests/disc -collection:ps=.
@@ -68,6 +70,7 @@ here.
 | `ps2_kernel` | EE kernel threads, ExecPS2 |
 | `ps2_iop` | The IOP CPU and the IOP modules run on it |
 | `ps2_interp` | Whole EE functions in the interpreter |
+| `ee_syscall_handler` | A SetSyscall handler switched away from (an alarm wakes a thread of higher priority) and sleeping, in the coroutine model and under FLAT: the same log and cycles |
 | `psx_cover` | Which R3000 encodings each PS1 backend does inline |
 | `psx_fallback` | The PS1 ways out of recompiled code and their counts |
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |
