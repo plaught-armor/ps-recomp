@@ -154,3 +154,20 @@ submodule is at that commit; at another, the port interprets what it
 did not recompile. The generated `port/src/rec` is ignored by git, so a
 fresh clone runs `setup.sh` again. The scripts need a POSIX shell and have
 only been run on Linux; Windows and macOS are untested.
+
+### Memory for the build
+
+`port/build.sh` needs much more memory than the generated source is large.
+The Odin front end parses and checks every package of `port/src/rec` and
+holds all of their syntax trees at once, so the peak grows with the size of
+the generated source. The number of packages, `-thread-count` and `-o:none`
+do not change it. Measured peaks:
+
+| Generated source | Build peak |
+|---|---|
+| 29 MB | 6.7 GB |
+| 53 MB | over 9.0 GB (stopped there, not a full peak) |
+| 145 MB | over 10.2 GB (stopped there, not a full peak) |
+
+Run the build with no other large jobs on the machine. On a system with
+less memory than the peak, it is stopped by the out-of-memory killer.
