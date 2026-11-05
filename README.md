@@ -20,6 +20,11 @@ emulation, or HLE. All you need is a disc image made from a disc you own.
 There are no prebuilt downloads. You build the program yourself with the
 Odin compiler. The steps are below.
 
+<https://plaught-armor.github.io/ps-recomp/> is a disc converter that
+runs in your browser, with nothing uploaded. Use what it makes with a
+player built from the commit the page shows (see
+[how it works](docs/how-it-works.md)).
+
 ## Project status
 
 ps-recomp is a work in progress. Not every game runs. A game that starts

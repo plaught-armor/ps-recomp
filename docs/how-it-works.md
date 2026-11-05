@@ -81,6 +81,11 @@ send the page's Content Security Policy (the one in `index.html`'s meta
 tag) as a `Content-Security-Policy` header: a Worker takes its policy from
 its own response's headers only, so the meta tag does not cover it.
 
+`web/deploy.sh` rebuilds the page from a clean checkout and commits it to
+the local `gh-pages` branch (the out dir plus `.nojekyll`), which GitHub
+Pages serves. It never pushes. Pages cannot send headers, so there the
+meta tag is the only policy.
+
 `tests/wasi/run.mjs` runs the same build on the same shim under Node 24 or
 newer (a development harness, no npm packages); its blob for an arch is
 the host build's byte for byte:
