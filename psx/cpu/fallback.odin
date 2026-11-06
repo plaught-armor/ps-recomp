@@ -34,6 +34,8 @@ Jump_Key :: struct {
 // counts them).
 fallback_interp: map[u32]u64
 fallback_interp_insns: u64
+// Of those, the instructions in the mod region (mod_ram.odin).
+fallback_mod_insns: u64
 // jump_unknown calls by function, target and outcome. Only .Interp is a
 // fallback; .Return and .Call are dispatch.
 fallback_jump: map[Jump_Key]u64
@@ -73,7 +75,8 @@ Row :: struct {
 // "dispatch:" the ways out of a function that reach recompiled code (or a
 // BIOS vector) without the interpreter, "demote:" the executable code moved
 // out of the fixed table and the calls that reached it, "helper:" the helper
-// calls. With a
+// calls; with mods loaded, a "mod:" line too, the instructions interpreted
+// in the mod region and the calls its native code ran. With a
 // DUMP directory, every counter as rows too (fallback_tsv, helper_tsv).
 fallback_dump :: proc() {
 	jumps: [Jump_Outcome]u64
@@ -101,6 +104,9 @@ fallback_dump :: proc() {
 		demoted,
 		promoted_pages,
 	)
+	if mod_ram != nil {
+		fmt.eprintfln("mod: %d instructions interpreted in the region, %d native calls", fallback_mod_insns, mod_native_hits)
+	}
 	helpers: [Helper]u64
 	for counts, h in helper_calls {
 		for n in counts {helpers[h] += n}
@@ -144,7 +150,11 @@ fallback_tsv :: proc() -> (fallback, dispatch: string) {
 	for pc, n in dispatch_demoted {
 		append(&dp, Row{"demoted", pc, 0, n})
 	}
-	return tsv(fb[:], fmt.tprintf("interp_insns\t-\t-\t%d\n", fallback_interp_insns)), tsv(dp[:], "")
+	first := fmt.tprintf("interp_insns\t-\t-\t%d\n", fallback_interp_insns)
+	if mod_ram != nil {
+		first = fmt.tprintf("%smod_interp_insns\t-\t-\t%d\nmod_native_calls\t-\t-\t%d\n", first, fallback_mod_insns, mod_native_hits)
+	}
+	return tsv(fb[:], first), tsv(dp[:], "")
 }
 
 @(private = "file")

@@ -42,6 +42,8 @@ Disc_File :: enum {
 	Learned_Iop_Key,
 	Learned_Ee,
 	Learned_Ee_Key,
+	Mods_Native,
+	Mods_Native_Key,
 	Cards,
 	Compat_Cards,
 	Saves,
@@ -67,6 +69,8 @@ DISC_FILES :: [Disc_File]string {
 	.Learned_Iop_Key = "learned-iop." + NATIVE_ARCH_NAME + ".key",
 	.Learned_Ee      = "learned-ee." + NATIVE_ARCH_NAME + ".bin",
 	.Learned_Ee_Key  = "learned-ee." + NATIVE_ARCH_NAME + ".key",
+	.Mods_Native     = "mods." + NATIVE_ARCH_NAME + ".bin",
+	.Mods_Native_Key = "mods." + NATIVE_ARCH_NAME + ".key",
 	.Cards           = "cards",
 	.Compat_Cards    = "compat-cards",
 	.Saves           = "saves",
@@ -131,12 +135,14 @@ disc_path :: proc(dir: string, f: Disc_File, allocator := context.allocator) -> 
 
 // A disc directory's blobs: the executable's native code, and the learned
 // functions (play's LEARN) of a PS1 game or of a PS2 game's IOP or EE,
-// whose key also names the records they are from.
+// whose key also names the records they are from, and the functions of
+// the game's mods, whose key names the mod set (mod_set_hash).
 Blob_Kind :: enum {
 	Native,
 	Learned,
 	Learned_Iop,
 	Learned_Ee,
+	Mods,
 }
 
 @(private = "file")
@@ -145,10 +151,12 @@ BLOB_FILES :: [Blob_Kind][2]Disc_File {
 	.Learned     = {.Learned, .Learned_Key},
 	.Learned_Iop = {.Learned_Iop, .Learned_Iop_Key},
 	.Learned_Ee  = {.Learned_Ee, .Learned_Ee_Key},
+	.Mods        = {.Mods_Native, .Mods_Native_Key},
 }
 
 // Whether the disc directory holds a blob this build can run: its key names
-// this blob format and commit (and for a learned blob the records, set),
+// this blob format and commit (and set: for a learned blob the records,
+// for the mods blob the mod set),
 // and its header this format and host arch. Never for a dev build.
 blob_cached :: proc(dir: string, commit := COMMIT, kind := Blob_Kind.Native, set := "") -> bool {
 	if commit == "dev" {

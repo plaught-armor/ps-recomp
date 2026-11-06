@@ -58,5 +58,5 @@ load_learned :: proc(path: string) -> bool {
 	return true
 }
 
-@(private = "file")
+@(private)
 run_events :: proc() {cpu.run_events()}

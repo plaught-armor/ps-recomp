@@ -172,10 +172,28 @@ address, four code words) and the mod function's address, which must lie
 in the ELF's segments. The region holds the mods' images where they are
 linked, a guard word, then the 16 KiB mods' stack; two mods whose images
 overlap are a load error naming both. With no mods there is no region and
-the bus is as before. Mod code runs interpreted, and LEARN skips it. A
-checkpoint pass saves and puts back the whole region; RAM dumps leave it
-out. A hook that writes the guard (overflows the stack) is fatal when it
-returns.
+the bus is as before. LEARN skips mod code. A checkpoint pass saves and
+puts back the whole region; RAM dumps leave it out. A hook that writes the
+guard (overflows the stack) is fatal when it returns.
+
+The mods' functions run as native code. Each `STT_FUNC` symbol of the
+ELF's `.symtab` with a size, inside an executable segment, is a function;
+`play` compiles them all in a child (`play --mods <mods directory>
+<out>`, recomp/r3000's `learned_blob`) to `mods.<arch>.bin` in the disc's
+data directory, keyed by `core.mod_set_hash`: the mod API, then each mod
+in load order, its id, `mod.tsv` and `mod.elf`. An edited, added or
+removed mod, another order or another build compiles it again. At load
+`native.load_mods` checks every function's words against the region; a
+blob that does not match is refused with a message, its key removed, and
+the mods are interpreted. A call to a mod function's first word runs its
+native code (`cpu.mod_funcs`); a branch out of it is interpreted, as in
+learned code. A mod ELF with no `.symtab` runs interpreted, with a
+message. `NATIVE=0`, `MOD_NATIVE=0`, `FLAT` builds and ports (which do not
+compile) interpret mod code.
+
+Mod code must not change: a store into a mod function's code is fatal,
+naming the mod and the address, interpreted or native. Self-modifying mod
+code is unsupported. Data segments stay writable.
 
 Limits:
 

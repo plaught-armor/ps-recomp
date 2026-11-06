@@ -3,32 +3,54 @@
 // .mod_hooks section lists.
 //
 // The ELF is 32-bit little-endian MIPS, an executable linked inside the mod
-// region. A .mod_hooks record is nine words: the kind (0 before, 1 after,
+// region, its loadable segments not overlapping. A .mod_hooks record is nine words: the kind (0 before, 1 after,
 // 2 replace), the hooked function's key (slot, id, addr, sig[4]) and the
 // mod function's address, which must be in one of the ELF's segments.
+//
+// The ELF's .symtab names the mod's functions: each STT_FUNC symbol with a
+// size, word aligned, in an executable segment's file bytes. They are what
+// play compiles to native code (psx/native/mods.odin); an ELF without a
+// .symtab has none, and its code is interpreted.
 package core
 
 import "core:fmt"
+import "core:slice"
 
-// One loadable segment: bytes at addr, then zeros up to size.
+// One loadable segment: bytes at addr, then zeros up to size. exec: the
+// segment is executable (PF_X).
 Mod_Segment :: struct {
 	addr, size: u32,
 	bytes:      []u8,
+	exec:       bool,
+}
+
+// One function from .symtab: its code at addr (as linked, not masked to
+// physical), bytes slicing the ELF.
+Mod_Func :: struct {
+	addr:  u32,
+	bytes: []u8,
 }
 
 // A mod's code. lo and hi bound its segments, physical addresses (the low
 // 29 bits); segments and hooks are in the read's allocator, and bytes slice
-// the ELF.
+// the ELF, as do the funcs, sorted by address, one per address.
 Mod_Image :: struct {
 	lo, hi:   u32,
 	segments: []Mod_Segment,
 	hooks:    []Mod_Hook,
+	funcs:    []Mod_Func,
 }
 
 MOD_HOOK_WORDS :: 9
 
 @(private = "file")
 ELF_LOAD :: 1
+@(private = "file")
+ELF_PF_X :: 1
+@(private = "file")
+ELF_SYMTAB :: 2
+@(private = "file")
+ELF_STT_FUNC :: 2
 
 // The image in elf, which must lie in [lo, hi) (physical). Each hook's mod
 // is `mod`. err is in the temp allocator.
@@ -58,6 +80,7 @@ mod_elf_read :: proc(elf: []u8, lo, hi: u32, mod: int, allocator := context.allo
 		ph := phoff + k * phsize
 		if u32_at(elf, ph) != ELF_LOAD {continue}
 		off, addr, file, mem := u32_at(elf, ph + 4), u32_at(elf, ph + 8), u32_at(elf, ph + 16), u32_at(elf, ph + 20)
+		flags := u32_at(elf, ph + 24)
 		p := addr & 0x1fff_ffff
 		if file > mem || u64(off) + u64(file) > u64(n) {
 			delete(segs)
@@ -68,7 +91,13 @@ mod_elf_read :: proc(elf: []u8, lo, hi: u32, mod: int, allocator := context.allo
 			delete(segs)
 			return {}, fmt.tprintf("segment %08x-%08x is outside the mod region %08x-%08x", p, u64(p) + u64(mem), lo, hi)
 		}
-		append(&segs, Mod_Segment{p, mem, elf[off:][:file]})
+		for o in segs {
+			if p < o.addr + o.size && o.addr < p + mem {
+				delete(segs)
+				return {}, fmt.tprintf("segments %08x-%08x and %08x-%08x overlap", o.addr, o.addr + o.size, p, p + mem)
+			}
+		}
+		append(&segs, Mod_Segment{p, mem, elf[off:][:file], flags & ELF_PF_X != 0})
 		img.lo, img.hi = min(img.lo, p), max(img.hi, p + mem)
 	}
 	if len(segs) == 0 {
@@ -77,8 +106,8 @@ mod_elf_read :: proc(elf: []u8, lo, hi: u32, mod: int, allocator := context.allo
 	}
 	img.segments = segs[:]
 
-	// .mod_hooks, found by name.
-	hooks: []u8
+	// .mod_hooks, found by name, and the symbol table.
+	hooks, syms: []u8
 	if shnum != 0 {
 		names_at := shoff + shstr * shsize
 		names_off, names_size := u32_at(elf, names_at + 16), u32_at(elf, names_at + 20)
@@ -89,6 +118,15 @@ mod_elf_read :: proc(elf: []u8, lo, hi: u32, mod: int, allocator := context.allo
 		names := elf[names_off:][:names_size]
 		for k in 0 ..< shnum {
 			sh := shoff + k * shsize
+			if u32_at(elf, sh + 4) == ELF_SYMTAB && syms == nil {
+				off, size, ent := u32_at(elf, sh + 16), u32_at(elf, sh + 20), u32_at(elf, sh + 36)
+				if u64(off) + u64(size) > u64(n) || ent != 16 || size % 16 != 0 {
+					mod_image_delete(img, allocator)
+					return {}, "bad .symtab section"
+				}
+				syms = elf[off:][:size]
+				continue
+			}
 			name := u32_at(elf, sh)
 			if u64(name) + len(".mod_hooks") >= u64(names_size) || string(names[name:][:len(".mod_hooks") + 1]) != ".mod_hooks\x00" {
 				continue
@@ -99,9 +137,9 @@ mod_elf_read :: proc(elf: []u8, lo, hi: u32, mod: int, allocator := context.allo
 				return {}, "bad .mod_hooks section"
 			}
 			hooks = elf[off:][:size]
-			break
 		}
 	}
+	img.funcs = mod_elf_funcs(img.segments, syms, allocator)
 	out := make([]Mod_Hook, len(hooks) / (MOD_HOOK_WORDS * 4), allocator)
 	img.hooks = out
 	for &h, k in out {
@@ -139,4 +177,38 @@ mod_image_has :: proc(img: Mod_Image, addr: u32) -> bool {
 mod_image_delete :: proc(img: Mod_Image, allocator := context.allocator) {
 	delete(img.segments, allocator)
 	delete(img.hooks, allocator)
+	delete(img.funcs, allocator)
+}
+
+// The functions syms (.symtab's entries) names in segs: STT_FUNC, sized,
+// word aligned and inside an executable segment's file bytes. Others are
+// skipped, and their code is interpreted. Sorted by address; of symbols at
+// one address (aliases) the longest is kept.
+@(private = "file")
+mod_elf_funcs :: proc(segs: []Mod_Segment, syms: []u8, allocator := context.allocator) -> []Mod_Func {
+	u32_at :: proc(b: []u8, at: u32) -> u32 {
+		return u32(b[at]) | u32(b[at + 1]) << 8 | u32(b[at + 2]) << 16 | u32(b[at + 3]) << 24
+	}
+	funcs := make([dynamic]Mod_Func, allocator)
+	for at := u32(0); at < u32(len(syms)); at += 16 {
+		value, size, info := u32_at(syms, at + 4), u32_at(syms, at + 8), syms[at + 12]
+		if info & 0xf != ELF_STT_FUNC || size == 0 || value % 4 != 0 || size % 4 != 0 {continue}
+		p := value & 0x1fff_ffff
+		for s in segs {
+			if !s.exec || p < s.addr || u64(p - s.addr) + u64(size) > u64(len(s.bytes)) {continue}
+			append(&funcs, Mod_Func{value, s.bytes[p - s.addr:][:size]})
+			break
+		}
+	}
+	slice.sort_by(funcs[:], proc(a, b: Mod_Func) -> bool {
+		return a.addr < b.addr || a.addr == b.addr && len(a.bytes) > len(b.bytes)
+	})
+	keep := 0
+	for f, k in funcs {
+		if k > 0 && f.addr == funcs[keep - 1].addr {continue}
+		funcs[keep] = f
+		keep += 1
+	}
+	resize(&funcs, keep)
+	return funcs[:]
 }

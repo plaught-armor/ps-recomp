@@ -102,6 +102,17 @@ mod_manifest_parse :: proc(text: string, allocator := context.allocator) -> (m: 
 	return m, ""
 }
 
+// Free what mod_manifest_parse put in allocator.
+mod_manifest_delete :: proc(m: Mod_Manifest, allocator := context.allocator) {
+	for s in ([]string{m.id, m.name, m.game, m.disc, m.files}) {delete(s, allocator)}
+	for d in m.deps {delete(d.id, allocator)}
+	delete(m.deps, allocator)
+	for id in m.before {delete(id, allocator)}
+	delete(m.before, allocator)
+	for id in m.after {delete(id, allocator)}
+	delete(m.after, allocator)
+}
+
 @(private = "file")
 mod_manifest_set :: proc(m: ^Mod_Manifest, key, value: string, allocator := context.allocator) -> (err: string) {
 	ok := true

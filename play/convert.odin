@@ -6,6 +6,7 @@ import "core:strings"
 import "core:thread"
 import "core:time"
 import "ps:core"
+import "ps:psx"
 import "ps:recomp/mips"
 import "ps:recomp/native"
 import "ps:recomp/r3000"
@@ -74,6 +75,41 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	return 0
 }
 
+// The mods child (`play --mods <mods directory> <out>`): the functions of
+// the mods in dir (their mod.elf's .symtab, core.mod_elf_read), compiled to
+// a blob of mod functions for this host at out (psx/native/mods.odin). A
+// failure exits with status 1 after a message.
+compile_mods :: proc(dir, out: string) -> int {
+	set, err := psx.mods_read(dir, "")
+	if err != "" {
+		fmt.eprintln(err)
+		return 1
+	}
+	defer core.mod_set_delete(set)
+	arch, ok := native.arch_of("mods", mips.HOST_ARCH)
+	if !ok {
+		return 1
+	}
+	funcs := make([dynamic]r3000.Learned)
+	for img in set.images {
+		for f in img.funcs {
+			words := make([]u32, len(f.bytes) / 4)
+			for &w, i in words {
+				b := f.bytes[i * 4:]
+				w = u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
+			}
+			append(&funcs, r3000.Learned{f.addr, f.addr, words})
+		}
+	}
+	blob := r3000.learned_blob(funcs[:], arch)
+	if werr := os.write_entire_file(out, blob); werr != nil {
+		fmt.eprintln("mods: cannot write", out, werr)
+		return 1
+	}
+	fmt.eprintfln("mods: %d functions from %d mods", len(funcs), len(set.mods))
+	return 0
+}
+
 // Convert the disc image in a child of this executable and store the blob
 // in the disc directory dir, its key naming the VU captures it was compiled
 // with (native_captures). The child's output goes to stderr as it comes,
@@ -125,6 +161,17 @@ learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: 
 	blob := child_blob({"--learned", l.name, records, tmp}, tmp, "learned code", "compile", deadline) or_return
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, l.kind, set)
+}
+
+// Compile the functions of the mods in the mods directory mods in a child
+// of this executable (as convert_store) and store the blob in the disc
+// directory dir, its key naming the mod set by set. False, after a
+// message, when there is no blob.
+mods_store :: proc(mods, dir, set: string, deadline: time.Duration) -> bool {
+	tmp := strings.concatenate({core.disc_path(dir, .Mods_Native, context.temp_allocator), ".compile"}, context.temp_allocator)
+	blob := child_blob({"--mods", mods, tmp}, tmp, "native code for the mods", "mods compile", deadline) or_return
+	defer delete(blob)
+	return core.blob_store(dir, blob, core.COMMIT, .Mods, set)
 }
 
 // Run this executable with args, which write a blob to tmp, relaying its

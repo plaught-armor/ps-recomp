@@ -28,6 +28,12 @@
 // format (always, for a dev build), and loaded beside the native blob.
 // Code that is not in RAM as it was recorded is interpreted, and learned.
 //
+// A PS1 game's mods (the disc directory's mods directory, psx/mods.odin)
+// run their functions as native code too, unless NATIVE=0 or MOD_NATIVE=0:
+// compiled in a child (`play --mods <mods directory> <out>`) when the
+// stored mods blob is not for this mod set (core.mod_set_hash), this build
+// and blob format (always, for a dev build).
+//
 // With no disc image it opens the launcher (launcher_window.odin), a window
 // listing the library's discs to run.
 //
@@ -66,6 +72,8 @@ run :: proc(args: []string) -> int {
 		return convert(args[2], args[3], args[4], args[5])
 	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
 		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4])
+	case len(args) == 4 && args[1] == "--mods":
+		return compile_mods(args[2], args[3])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 4 && args[1] == "--export":
@@ -116,6 +124,16 @@ learned_ee_key: string
 learned_ee_failed :: proc() {
 	os.remove(learned_ee_key)
 	fmt.eprintln("play: the stored learned EE code would not load; it is compiled again next run")
+}
+
+// The same for the mods blob.
+@(private = "file")
+mods_native_key: string
+
+@(private = "file")
+mods_native_failed :: proc() {
+	os.remove(mods_native_key)
+	fmt.eprintln("play: the stored native code of the mods would not load; it is compiled again next run")
 }
 
 // Where the learned code of cpu is kept: its blob, the blob's file and key,
@@ -195,6 +213,44 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile: bool, deadline: 
 		}
 	}
 	return core.disc_path(dir, l.blob)
+}
+
+// The native code of the mods in the disc directory dir's mods directory,
+// for a PS1 game: compiled when the stored blob is not for this mod set
+// (core.mod_set_hash). A mod whose mod.elf has no .symtab functions is
+// interpreted, with a message. Without compile a blob not stored is not
+// compiled either; a compile still running after deadline (0: none) is
+// stopped. "" when there are no mod functions, or no blob. A mods directory
+// that does not read is left to the boot, which reports why.
+@(private)
+mods_blob :: proc(dir: string, compile: bool, deadline: time.Duration) -> string {
+	mods := core.disc_path(dir, .Mods, context.temp_allocator)
+	set, err := psx.mods_read(mods, "")
+	defer core.mod_set_delete(set)
+	if err != "" || len(set.mods) == 0 {
+		return ""
+	}
+	funcs := 0
+	for img, k in set.images {
+		if len(img.funcs) == 0 && compile {
+			fmt.eprintfln("mod %s: its mod.elf has no .symtab functions; it runs interpreted", set.mods[k].id)
+		}
+		funcs += len(img.funcs)
+	}
+	if funcs == 0 {
+		return ""
+	}
+	key := fmt.tprintf("%016x", core.mod_set_hash(set))
+	if !core.blob_cached(dir, core.COMMIT, .Mods, key) {
+		if !compile {
+			fmt.eprintln("play: no native code for the mods (not compiled in the compat run)")
+			return ""
+		}
+		if !mods_store(mods, dir, key, deadline) {
+			return ""
+		}
+	}
+	return core.disc_path(dir, .Mods_Native)
 }
 
 // The path of the file name in the disc directory dir's learn directory,
@@ -307,6 +363,13 @@ play :: proc(image: string) -> int {
 	}
 	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
 	learned_ee_key = core.disc_path(dir, learned_files(.Ee).key)
+	// A PS1 game's mods run native unless NATIVE=0 or MOD_NATIVE=0, which
+	// interprets them; a compat child's parent compiled them (compat_disc).
+	mods_native: string
+	if !native_off && !cnf.ps2 && core.env("MOD_NATIVE") != "0" {
+		mods_native = mods_blob(dir, !compat_child(), 0)
+	}
+	mods_native_key = core.disc_path(dir, .Mods_Native_Key)
 	// LEARN=1 records every processor's runs; unset, a PS2 game's IOP,
 	// whose modules no recompiled code covers, and its EE, whose code the
 	// recompiler never saw (loaded at run time, or missed). A default that
@@ -360,8 +423,10 @@ play :: proc(image: string) -> int {
 		native_failed  = native_failed,
 		learned        = learned,
 		learned_failed = learned_failed,
-		mods           = core.disc_path(dir, .Mods),
-		disc_id        = id,
+		mods               = core.disc_path(dir, .Mods),
+		disc_id            = id,
+		mods_native        = mods_native,
+		mods_native_failed = mods_native_failed,
 	}
 	for &c, i in b.cards {
 		c, _ = filepath.join({cards, fmt.tprintf("slot%d.mcd", i + 1)})

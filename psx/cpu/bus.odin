@@ -384,6 +384,7 @@ store_slow :: proc(a, v: u32, size: u32) {
 			for j in 0 ..< size {store_slow(a + j, v >> (8 * j) & 0xff, 1)}
 			return
 		}
+		mod_code_check(o, size, a)
 		switch size {
 		case 4:
 			(^u32le)(&mod_ram[o])^ = u32le(v)

@@ -49,6 +49,11 @@ Boot :: struct {
 	// which a mod's manifest may name.
 	mods:          string,
 	disc_id:       string,
+	// A blob of the mods' functions ("" none; native.load_mods), and what to
+	// call when it cannot be loaded (nil none); the mods then run
+	// interpreted.
+	mods_native:        string,
+	mods_native_failed: proc(),
 	// The port's own steps, each stopping the boot on false: `setup` before
 	// the window opens, `hooks` once the game's functions (native ones
 	// included) are registered, where the port installs its replacements
@@ -85,6 +90,7 @@ run :: proc(b: Boot) -> bool {
 		case b.native != "": what = "native code (Boot.native)"
 		case b.learned_funcs != nil: what = "recompiled learned functions (Boot.learned_funcs)"
 		case b.learned != "": what = "learned code (Boot.learned)"
+		case b.mods_native != "": what = "the mods' native code (Boot.mods_native)"
 		}
 		if what != "" {cpu.fatal("FLAT runs interpreted only: %s not installed", what)}
 	}
@@ -114,7 +120,7 @@ run :: proc(b: Boot) -> bool {
 	if b.hooks != nil {b.hooks() or_return}
 	cpu.watch_code()
 	// After every other hook, so a mod wraps the port's.
-	mods_load(b.mods, b.disc_id) or_return
+	mods_load(b.mods, b.disc_id, b.mods_native, b.mods_native_failed) or_return
 
 	io.events_init()
 	spu.spu_init()
