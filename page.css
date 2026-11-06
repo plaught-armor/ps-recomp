@@ -6,3 +6,6 @@ main { max-width: 48rem; margin: 0 auto; padding: 1rem; }
 #drop input { display: block; margin: 0 auto 0.5rem; }
 #log { min-height: 8rem; max-height: 24rem; overflow: auto; padding: 0.5rem; border: 1px solid GrayText; white-space: pre-wrap; }
 #result a { font-weight: bold; }
+#screen { display: block; width: 100%; aspect-ratio: 4 / 3; margin: 1rem 0; background: #000; }
+#screen:fullscreen { aspect-ratio: auto; height: 100%; }
+#isolation { border: 2px solid Mark; padding: 0.5rem; }
