@@ -54,6 +54,15 @@ typedef unsigned long long u64;
 // with no replacement running, is fatal.
 unsigned mod_call_original();
 
+// (int)f compiles to trunc.w.s, which the R5900 does not have (the build
+// fails on it). mod_f2i converts with its cvt.w.s instead, which truncates
+// toward zero and gives the largest int of f's sign for an f out of range.
+static inline int mod_f2i(float f) {
+	int i;
+	__asm__("cvt.w.s %1, %1\n\tmfc1 %0, %1" : "=r"(i), "+f"(f));
+	return i;
+}
+
 unsigned ram_00100000();
 #define MOD_KEY_ram_00100000 0x00000000, 0x61701f86, 0x00100000, {0x0c040008, 0x00000000, 0x0c040010, 0x00000000}
 

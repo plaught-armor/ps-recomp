@@ -10,13 +10,28 @@
 //     words the port's RAM has.
 //   - The region constants are the console's (ps2/mem), and an image ending
 //     at MOD_IMAGE_END loads while one 16 bytes past it does not.
+//   - With clang, ld.lld, llvm-nm, llvm-objdump and sh: build.sh builds
+//     ee/hook.c as an n32 EE mod (its MOD_ARCH), and mod_elf_read gives its
+//     three hooks with the fixture's keys; its calls out of the image are
+//     plain jal, to the game function and to MOD_ORIGINAL, with no jalr.
+//     ee/mul64.c (a 64-bit multiply) and ee/f2i.c ((int)f: trunc.w.s)
+//     fail the build, naming the function and the instruction, and
+//     ee/double.c, naming the file and the compiler routine; none leaves a
+//     mod.elf.
+//   - With llvm-mc too: build.sh's fpu list is the decoder's FPU
+//     instructions as llvm names them, every COP1, LWC1 and SWC1 encoding
+//     the decoder (ps2/r5900) takes, and no name an encoding it rejects
+//     has.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
+import "core:strings"
 import "ps:core"
 import kernel "ps:ps2/kernel"
 import "ps:ps2/mem"
+import isa "ps:ps2/r5900"
 import "ps:recomp/mips"
 import "ps:recomp/r5900"
 
@@ -102,10 +117,116 @@ ee :: proc(tmp: string, update: bool) {
 	h2, ld2, _, _ := r5900.mod_api(ps, prows)
 	check(h2 == header && ld2 == script, "ee: a words patch changes no key")
 
+	ee_build(tmp, "ee_api", header, script, spaces[0].id)
+	ee_fpu_list(tmp)
+
 	check(r5900.MOD_API == core.MOD_API && r5900.MOD_BASE == mem.MOD_BASE && r5900.MOD_REGION == mem.MOD_REGION && r5900.MOD_STACK == mem.MOD_STACK, "ee region constants")
 	check(r5900.MOD_ORIGINAL == mem.MOD_ORIGINAL, "ee MOD_ORIGINAL")
 	check(mem.mod_ram_load({{lo = mem.MOD_BASE, hi = r5900.MOD_IMAGE_END}}, {"end"}) == "", "ee: an image to MOD_IMAGE_END loads")
 	mem.mod_ram_free()
 	check(mem.mod_ram_load({{lo = mem.MOD_BASE, hi = r5900.MOD_IMAGE_END + 16}}, {"past"}) != "", "ee: an image past MOD_IMAGE_END does not")
 	mem.mod_ram_free()
+}
+
+// Build the EE fixture mods against the API in <tmp>/<api>.
+@(private = "file")
+ee_build :: proc(tmp, api, header, script: string, prog: u32) {
+	if !have_tools({"clang", "ld.lld", "llvm-nm", "llvm-objdump", "sh"}) {return}
+	write(join({tmp, api}), "mod_api.h", transmute([]u8)header)
+	write(join({tmp, api}), "mod.ld", transmute([]u8)script)
+	code, errs, dir := build_run(tmp, "hook", "", EE_DIR, api)
+	check(code == 0, fmt.tprintf("ee build hook: exit %d: %s", code, errs))
+	if code != 0 {return}
+	elf, _ := os.read_entire_file(join({dir, "mod.elf"}), context.allocator)
+	img, ierr := core.mod_elf_read(elf, mem.MOD_BASE, mem.MOD_BASE + mem.MOD_REGION, 0, context.allocator)
+	check(ierr == "", fmt.tprint("ee read hook:", ierr))
+	check(img.lo == mem.MOD_BASE, fmt.tprintf("ee hook linked at %08x", img.lo))
+	want := [core.Mod_Hook_Kind]core.Mod_Key {
+		.Before  = {0, prog, EE_TEXT, {EE_CODE[0], EE_CODE[1], EE_CODE[2], EE_CODE[3]}},
+		.After   = {0, prog, EE_TEXT + 0x20, {EE_CODE[8], EE_CODE[9], EE_CODE[10], EE_CODE[11]}},
+		.Replace = {0, prog, EE_TEXT + 0x40, {EE_CODE[16], EE_CODE[17], EE_CODE[18], EE_CODE[19]}},
+	}
+	check(len(img.hooks) == 3, fmt.tprint("ee hooks:", len(img.hooks)))
+	for h in img.hooks {check(h.key == want[h.kind], fmt.tprint("ee", h.kind, "key", h.key))}
+	// Calls out of the image: jal targets, and jalr.
+	out: [dynamic]u32
+	jalr: int
+	for sg in img.segments {
+		if !sg.exec {continue}
+		for k := 0; k + 4 <= len(sg.bytes); k += 4 {
+			w := u32((^u32le)(&sg.bytes[k])^)
+			pc := sg.addr + u32(k)
+			if w >> 26 == 3 {
+				to := ((pc + 4) & 0xf000_0000) | (w & 0x3ff_ffff) << 2
+				if (to < img.lo || to >= img.hi) && !slice.contains(out[:], to) {append(&out, to)}
+			}
+			if w >> 26 == 0 && w & 0x3f == 9 {jalr += 1}
+		}
+	}
+	slice.sort(out[:])
+	check(fmt.tprint(out[:]) == fmt.tprint([]u32{EE_TEXT + 0x20, mem.MOD_ORIGINAL}) && jalr == 0, fmt.tprintf("ee hook: jal out %x, %d jalr", out[:], jalr))
+
+	Bad :: struct {
+		name, says: string,
+	}
+	for b in ([]Bad {
+			{"mul64", "before has dmult, which the R5900 does not have"},
+			{"f2i", "before has trunc.w.s, which the R5900 does not have"},
+			{"double", "double.c calls __"},
+		}) {
+		c, e, d := build_run(tmp, b.name, "", EE_DIR, api)
+		_, left := os.stat(join({d, "mod.elf"}), context.temp_allocator)
+		check(c == 1 && strings.contains(e, b.says) && left != nil, fmt.tprintf("ee build %s: exit %d: %s", b.name, c, e))
+	}
+}
+
+// build.sh's fpu list against the decoder: llvm-mc's name for each COP1
+// (rs MF to BC, and fmt S, D, W, L with every function), LWC1, LDC1, SWC1
+// and SDC1 encoding, the list being the names of the ones the decoder
+// takes; a name of one it rejects must not be in it.
+@(private = "file")
+ee_fpu_list :: proc(tmp: string) {
+	if !have_tools({"llvm-mc"}) {return}
+	words: [dynamic]u32
+	for rs in u32(0) ..< 8 {append(&words, 0x4400_0000 | rs << 21 | 2 << 16 | 3 << 11)}
+	for rt in u32(0) ..< 4 {append(&words, 0x4500_0004 | rt << 16)}
+	for f in ([]u32{16, 17, 20, 21}) {
+		for fn in u32(0) ..< 64 {append(&words, 0x4400_0000 | f << 21 | fn)}
+	}
+	for op in ([]u32{49, 53, 57, 61}) {append(&words, op << 26 | 4 << 21 | 2 << 16 | 8)}
+	// Each word after a marker (addiu $zero, $zero, 77), so the names
+	// llvm-mc prints line up with the words it knows.
+	MARK :: 0x2400_004d
+	input: strings.Builder
+	for w in words {
+		for x in ([]u32{MARK, w}) {fmt.sbprintf(&input, "0x%02x 0x%02x 0x%02x 0x%02x\n", x & 0xff, x >> 8 & 0xff, x >> 16 & 0xff, x >> 24)}
+	}
+	write(join({tmp, "ee"}), "fpu.txt", transmute([]u8)strings.to_string(input))
+	cmd := []string{"llvm-mc", "--disassemble", "-triple=mips64el", "-mcpu=mips3", join({tmp, "ee", "fpu.txt"})}
+	state, out, _, err := os.process_exec({command = cmd}, context.temp_allocator)
+	check(err == nil && state.exited, fmt.tprint("ee: llvm-mc", err))
+	if err != nil {return}
+	has, lacks: map[string]bool
+	k := -1
+	for line in strings.split_lines(string(out), context.temp_allocator) {
+		f := strings.fields(line, context.temp_allocator)
+		if len(f) == 0 {continue}
+		if f[0] == "addiu" && strings.has_suffix(line, "77") {
+			k += 1
+			continue
+		}
+		if k < 0 || k >= len(words) {continue}
+		if isa.decode(0, words[k]).op != .INVALID {has[f[0]] = true} else {lacks[f[0]] = true}
+	}
+	sh, _ := os.read_entire_file("mods/build.sh", context.temp_allocator)
+	list: []string
+	for line in strings.split_lines(string(sh), context.temp_allocator) {
+		if strings.has_prefix(line, "fpu='") {list = strings.fields(strings.trim(line[4:], "'"), context.temp_allocator)}
+	}
+	names := make([dynamic]string, context.temp_allocator)
+	for n in has {append(&names, n)}
+	slice.sort(names[:])
+	check(fmt.tprint(list) == fmt.tprint(names[:]), fmt.tprintf("ee: build.sh fpu is %v, the decoder's %v", list, names[:]))
+	for n in has {check(!lacks[n], fmt.tprint("ee:", n, "names an encoding the decoder takes and one it rejects"))}
+	check(len(lacks) > 0 && lacks["trunc.w.s"] && lacks["c.ule.s"] && lacks["ldc1"], fmt.tprint("ee: rejected names", lacks))
 }

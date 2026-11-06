@@ -242,7 +242,11 @@ as loaded, before a `words` patch. The mod region shares the game's
 integer arguments in a0-a7 and then on the stack, as the game passes them,
 but floats by position where the game's EABI counts them apart, so a mod
 must not hook or call a game function that takes or returns a float
-(`mod_api.h` says so, and how to wrap one).
+(`mod_api.h` says so, and how to wrap one). `mods/build.sh` builds for
+the console `mod_api.h` names (`MOD_ARCH`): an EE mod is MIPS III n32
+code, and needs llvm-objdump too. The R5900 has no 64-bit multiply or
+divide, no LL/SC and no double floats, so the build fails, naming the
+function and the instruction, when the linked mod has one.
 
 Limits:
 

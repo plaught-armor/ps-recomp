@@ -142,13 +142,7 @@ main :: proc() {
 // Build the fixture mods with mods/build.sh and read them back.
 @(private = "file")
 build :: proc(tmp, header, script: string) {
-	for tool in ([]string{"clang", "ld.lld", "llvm-nm", "sh"}) {
-		state, _, _, err := os.process_exec({command = {tool, "--version"}}, context.temp_allocator)
-		if err != nil || !state.exited || state.exit_code != 0 {
-			fmt.printfln("mod_api: skip build: no %s", tool)
-			return
-		}
-	}
+	if !have_tools({"clang", "ld.lld", "llvm-nm", "sh"}) {return}
 	api := join({tmp, "api"})
 	write(api, "mod_api.h", transmute([]u8)header)
 	write(api, "mod.ld", transmute([]u8)script)
@@ -222,14 +216,27 @@ build :: proc(tmp, header, script: string) {
 	}
 }
 
-// Run build.sh on DIR/<name>.c at origin ("" the default): its exit code
-// (-1 when it did not run) and stderr. The mod is <dir>/mod.elf.
-@(private = "file")
-build_run :: proc(tmp, name, origin: string) -> (code: int, errs: string, dir: string) {
-	dir = join({tmp, fmt.tprintf("%s_%s", name, origin)})
-	src, _ := os.read_entire_file(fmt.tprintf("%s/%s.c", DIR, name), context.temp_allocator)
+// Whether every tool runs (`--version`); else a skip naming the first that
+// does not.
+have_tools :: proc(tools: []string) -> bool {
+	for tool in tools {
+		state, _, _, err := os.process_exec({command = {tool, "--version"}}, context.temp_allocator)
+		if err != nil || !state.exited || state.exit_code != 0 {
+			fmt.printfln("mod_api: skip build: no %s", tool)
+			return false
+		}
+	}
+	return true
+}
+
+// Run build.sh on <from>/<name>.c at origin ("" the default) against the
+// API in <tmp>/<api>: its exit code (-1 when it did not run) and stderr.
+// The mod is <dir>/mod.elf.
+build_run :: proc(tmp, name, origin: string, from := DIR, api := "api") -> (code: int, errs: string, dir: string) {
+	dir = join({tmp, fmt.tprintf("%s_%s_%s", api, name, origin)})
+	src, _ := os.read_entire_file(fmt.tprintf("%s/%s.c", from, name), context.temp_allocator)
 	write(dir, fmt.tprintf("%s.c", name), src)
-	cmd := []string{"sh", "mods/build.sh", join({tmp, "api"}), dir, "--origin", origin}
+	cmd := []string{"sh", "mods/build.sh", join({tmp, api}), dir, "--origin", origin}
 	state, _, e, err := os.process_exec({command = cmd[:origin == "" ? 4 : 6]}, context.temp_allocator)
 	if err != nil || !state.exited {return -1, fmt.tprint(err), dir}
 	return state.exit_code, string(e), dir
@@ -251,7 +258,6 @@ build_one :: proc(tmp, name, origin: string) -> (core.Mod_Image, []u8) {
 
 // The calls in the image's code: jal or j out of it, jal into it, jalr, and
 // jr through a register other than $ra (a tail call).
-@(private = "file")
 calls :: proc(img: core.Mod_Image) -> (out, jal_in, jalr, jr: int) {
 	for s in img.segments {
 		if !s.exec {continue}
