@@ -59,6 +59,7 @@ odin build tests/ps2_mod -collection:ps=. -target:wasi_wasm32 -extra-linker-flag
 node tests/ps2_mod/run.mjs ps2_mod.wasm
 odin run tests/ps2_mod_elf -collection:ps=.
 odin run tests/ps2_mod_elf -collection:ps=. -- interp
+odin run tests/ps2_mod_elf -collection:ps=. -- native
 odin run tests/ps2_mod_elf -collection:ps=. -define:PS_FLAT=true
 odin run tests/mod_api -collection:ps=.
 odin run tests/read_dir -collection:ps=.

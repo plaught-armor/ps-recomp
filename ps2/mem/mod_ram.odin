@@ -10,11 +10,14 @@
 // are linked, then a guard word, then MOD_STACK bytes of stack; mod_sp is
 // the region's top. mod_ram_check after every hook makes an overflow of the
 // stack fatal. The mods' functions (core.Mod_Image funcs) are never written:
-// a store into one is fatal. DMA never reaches the region: an address in it
-// is fatal (dma_addr).
+// a store into one is fatal, so the native code play compiled for them
+// (mod_funcs, ps2/mods_native.odin) always stands for what the region
+// holds. DMA never reaches the region: an address in it is fatal
+// (dma_addr).
 package ps2_mem
 
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "ps:core"
 import cpu "../cpu"
@@ -43,6 +46,23 @@ mod_guard: u32
 // mods: the one test a store past RAM makes.
 @(private = "file")
 mod_code: []bool
+
+// Each mod function's first word (offset in mod_ram) and length in words,
+// sorted by offset: what native code may stand for (mod_func_words).
+@(private = "file")
+Mod_Span :: struct {
+	at, words: u32,
+}
+@(private = "file")
+mod_spans: []Mod_Span
+
+// Per word of mod_ram: the native code for the mod function that starts
+// there (nil none); nil with no native code. mod_native_calls counts the
+// calls that ran one, mod_interp_calls the calls into the region that were
+// interpreted (ps2/mod.odin mod_interp_hook): counted per call, not per
+// instruction, so the interpreter's loop is the same with no mods.
+mod_funcs: []cpu.Func_Proc
+mod_native_calls, mod_interp_calls: u64
 
 // Each mod's image and id, for the message of a store into its code.
 @(private = "file")
@@ -80,14 +100,19 @@ mod_ram_load :: proc(images: []core.Mod_Image, who: []string) -> (err: string) {
 	mod_ram = make([]u8, size)
 	mod_code = make([]bool, size / 4)
 	mod_owners = make([]Mod_Owner, len(images))
+	spans := make([dynamic]Mod_Span)
 	for img, i in images {
 		for s in img.segments {copy(mod_ram[s.addr - MOD_BASE:][:s.size], s.bytes)}
 		for f in img.funcs {
 			at := (f.addr & 0x1fff_ffff) - MOD_BASE
 			for &c in mod_code[at / 4:][:len(f.bytes) / 4] {c = true}
+			append(&spans, Mod_Span{at, u32(len(f.bytes) / 4)})
 		}
 		mod_owners[i] = {img.lo, img.hi, strings.clone(who[i])}
 	}
+	// Images do not overlap, and each image's funcs are one per address.
+	slice.sort_by(spans[:], proc(a, b: Mod_Span) -> bool {return a.at < b.at})
+	mod_spans = spans[:]
 	mod_guard = guard
 	(^u32le)(&mod_ram[guard])^ = MOD_GUARD
 	mod_sp = MOD_BASE + size
@@ -101,6 +126,57 @@ mod_ram_has :: #force_inline proc(addr: u32) -> bool {
 		return (addr & 0x0fff_ffff) - MOD_BASE < u32(len(mod_ram))
 	}
 	return false
+}
+
+// The offset in mod_ram of addr (any RAM mirror); false outside the region.
+@(private = "file")
+mod_off :: #force_inline proc(addr: u32) -> (off: u32, ok: bool) {
+	switch addr >> 28 {
+	case 0x0, 0x2, 0x3, 0x8, 0xa:
+		off = (addr & 0x0fff_ffff) - MOD_BASE
+		return off, off < u32(len(mod_ram))
+	}
+	return 0, false
+}
+
+// The length in words of the mod function whose first word is at addr; 0
+// when none starts there.
+mod_func_words :: proc(addr: u32) -> u32 {
+	off, ok := mod_off(addr)
+	if !ok || addr & 3 != 0 {return 0}
+	k, found := slice.binary_search_by(mod_spans, off, proc(s: Mod_Span, off: u32) -> slice.Ordering {return slice.cmp(s.at, off)})
+	return found ? mod_spans[k].words : 0
+}
+
+// Make the native code fn stand for the mod function at entry, which must
+// be in the region (ps2/mods_native.odin).
+mod_native_set :: proc(entry: u32, fn: cpu.Func_Proc) {
+	off, ok := mod_off(entry)
+	assert(ok && entry & 3 == 0)
+	if mod_funcs == nil {mod_funcs = make([]cpu.Func_Proc, len(mod_ram) / 4)}
+	mod_funcs[off >> 2] = fn
+}
+
+// The native code for the mod function at addr; nil when there is none
+// (no mod function starts there, or no native code was loaded).
+mod_func_at :: #force_inline proc(addr: u32) -> cpu.Func_Proc {
+	if mod_funcs == nil || addr & 3 != 0 {return nil}
+	off, ok := mod_off(addr)
+	if !ok {return nil}
+	return mod_funcs[off >> 2]
+}
+
+// mod_func_at, counted as a call when there is code.
+mod_native :: #force_inline proc(addr: u32) -> cpu.Func_Proc {
+	fn := mod_func_at(addr)
+	if fn != nil {mod_native_calls += 1}
+	return fn
+}
+
+// One line on stderr, with mods.
+mod_print :: proc() {
+	if mod_ram == nil {return}
+	fmt.eprintfln("mod: %d interpreted calls into the region, %d native calls", mod_interp_calls, mod_native_calls)
 }
 
 // For the message of a host view of guest memory (a kernel string, a SIF
@@ -153,8 +229,11 @@ mod_ram_check :: #force_inline proc(fn: u32) {
 mod_ram_free :: proc() {
 	delete(mod_ram)
 	delete(mod_code)
+	delete(mod_spans)
+	delete(mod_funcs)
 	for o in mod_owners {delete(o.id)}
 	delete(mod_owners)
 	mod_ram, mod_guard, mod_sp = nil, 0, 0
-	mod_code, mod_owners = nil, nil
+	mod_code, mod_spans, mod_funcs, mod_owners = nil, nil, nil, nil
+	mod_native_calls, mod_interp_calls = 0, 0
 }

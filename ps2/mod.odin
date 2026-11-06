@@ -82,11 +82,16 @@ import mem "mem"
 MOD_SITES :: 512
 
 // A hooked function: its chain, and what runs it with no hooks: the
-// procedure its call table slot had (nil: the interpreter).
+// procedure its call table slot had (nil: the interpreter). before, after
+// and replace: the native code of the chain's hooks, each at its index
+// (nil: none, interpreted; mod_native_resolve), so a hook call is one
+// indirect call.
 @(private = "file")
 Mod_Site :: struct {
-	chain:    core.Mod_Chain,
-	original: cpu.Func_Proc,
+	chain:         core.Mod_Chain,
+	original:      cpu.Func_Proc,
+	before, after: []cpu.Func_Proc,
+	replace:       cpu.Func_Proc,
 }
 
 @(private = "file")
@@ -122,12 +127,18 @@ mod_thunks_fill :: proc($LO, $HI: int) {
 	}
 }
 
+// The mods in dir (core.mods_read), read for the EE's mod region: what
+// play compiles their native code from (ps2/mods_native.odin).
+mods_read_set :: proc(dir, disc: string) -> (set: core.Mod_Set, err: string) {
+	return core.mods_read(dir, disc, mem.MOD_BASE, mem.MOD_BASE + mem.MOD_REGION)
+}
+
 // The mods in dir (core.mods_read), read for the EE's mod region and noted
 // as this run's set (core.mods_note), and the hash of the set they hook
 // (core.mod_hooks_hash). ps2.boot calls it before host.platform_init opens
 // the input record, which carries the set.
 mods_read :: proc(dir, disc: string) -> (set: core.Mod_Set, hash: u64, err: string) {
-	set, err = core.mods_read(dir, disc, mem.MOD_BASE, mem.MOD_BASE + mem.MOD_REGION)
+	set, err = mods_read_set(dir, disc)
 	if err != "" {return}
 	core.mods_note(set, "ps2")
 	return set, core.mod_hooks_hash(set.hooks), ""
@@ -213,6 +224,19 @@ mod_install :: proc(mods: []core.Mod_Manifest, chains: []core.Mod_Chain, prog: u
 	return ""
 }
 
+// Each site's hooks' native code (mem.mod_func_at), once load_mods has
+// loaded it. Mod code cannot change after (mem.mod_ram_check), so it stays.
+mod_native_resolve :: proc() {
+	for &s in mod_sites {
+		c := &s.chain
+		s.before = make([]cpu.Func_Proc, len(c.before), core.long_allocator())
+		s.after = make([]cpu.Func_Proc, len(c.after), core.long_allocator())
+		for f, k in c.before {s.before[k] = mem.mod_func_at(f.fn)}
+		for f, k in c.after {s.after[k] = mem.mod_func_at(f.fn)}
+		if r, ok := c.replace.?; ok {s.replace = mem.mod_func_at(r.fn)}
+	}
+}
+
 // Why mod `who` cannot hook the function k names in the boot program with
 // id prog, or "": its code must be in RAM now, as the mod was built for it.
 @(private = "file")
@@ -263,11 +287,16 @@ mod_live :: proc(site: int) -> bool {
 	return kernel.k.exec.prog == mod_prog && mod_resident(mod_sites[site].chain.key)
 }
 
-// cpu.interp_hook with mods, recursive model: a call to MOD_ORIGINAL or to
-// a hooked function no table slot holds (outside the recompiled range, or
+// cpu.interp_hook with mods, recursive model: a mod function with native
+// code (ps2/mods_native.odin) runs it; a call to MOD_ORIGINAL or to a
+// hooked function no table slot holds (outside the recompiled range, or
 // while dispatch is off) runs the chain.
 @(private = "file")
 mod_interp_hook :: proc(addr: u32) {
+	if fn := mem.mod_native(addr); fn != nil {
+		fn()
+		return
+	}
 	if addr == mem.MOD_ORIGINAL {
 		mod_call_original()
 		return
@@ -276,6 +305,7 @@ mod_interp_hook :: proc(addr: u32) {
 		mod_enter(site)
 		return
 	}
+	if mem.mod_ram_has(addr) {mem.mod_interp_calls += 1}
 	interp_call(addr)
 }
 
@@ -294,18 +324,29 @@ mod_enter :: proc(site: int) {
 	}
 	c := &s.chain
 	entry := mod_args()
-	mod_before(c)
+	mod_before(s)
 	if r, ok := c.replace.?; ok {
 		inner := cpu.Mod_Inner{site, cpu.mod_depth, cpu.mod_inner}
 		cpu.mod_inner = &inner
 		kept := mod_kept()
-		cpu.call(r.fn)
+		mod_run(r.fn, s.replace)
 		mod_kept_set(kept)
 		cpu.mod_inner = inner.prev
 	} else {
 		mod_original(site)
 	}
-	mod_after(c, entry)
+	mod_after(s, entry)
+}
+
+// Run the mod function at fn: its native code p, else through cpu.call.
+@(private = "file")
+mod_run :: #force_inline proc(fn: u32, p: cpu.Func_Proc) {
+	if p != nil {
+		mem.mod_native_calls += 1
+		p()
+	} else {
+		cpu.call(fn)
+	}
 }
 
 // Run site's function past its thunk, recursive model, under a marker:
@@ -323,8 +364,9 @@ mod_original :: proc(site: int) {
 }
 
 // A call to MOD_ORIGINAL, recursive model: the original of the innermost
-// running replacement.
-@(private = "file")
+// running replacement. A mod's native code calls it direct
+// (ps2.mod_call_original in native_imports).
+@(private)
 mod_call_original :: proc() {
 	i := cpu.mod_inner
 	if i == nil || i.site < 0 || i.depth != cpu.mod_depth {mod_original_fatal()}
@@ -390,40 +432,51 @@ mod_kept_set :: proc(m: Mod_Kept) {
 }
 
 @(private = "file")
-mod_before :: proc(c: ^core.Mod_Chain) {
-	for f in c.before {mod_call(f.fn)}
+mod_before :: proc(s: ^Mod_Site) {
+	for f, k in s.chain.before {mod_call(f.fn, s.before[k] if s.before != nil else nil)}
 }
 
 // The after hooks, each with the arguments the function had (entry) and its
 // results; then a0-a7 as the function left them.
 @(private = "file")
-mod_after :: proc(c: ^core.Mod_Chain, entry: Mod_Args) {
-	if len(c.after) == 0 {return}
+mod_after :: proc(s: ^Mod_Site, entry: Mod_Args) {
+	if len(s.chain.after) == 0 {return}
 	done := mod_args()
-	for f in c.after {
+	for f, k in s.chain.after {
 		mod_args_set(entry)
-		mod_call(f.fn)
+		mod_call(f.fn, s.after[k] if s.after != nil else nil)
 	}
 	mod_args_set(done)
 }
 
-// Call the before or after hook at fn on the mod stack, in frozen time,
-// and put every register back after. Under FLAT, cpu.call runs it nested.
+// The bytes of a Cpu a hook's return puts back: every register but cop0
+// (cycles, after it, apart). A hook's own C code cannot write cop0; game
+// code the hook calls can (EI, DI, Status), and that is real execution,
+// so it stays. One copy costs about 30% less than the whole Cpu.
 @(private = "file")
-mod_call :: proc(fn: u32) {
-	saved, next, held := cpu.state, cpu.next_event, cpu.mod_held
+MOD_REGS :: int(offset_of(cpu.Cpu, cop0))
+#assert(offset_of(cpu.Cpu, fcr31) < offset_of(cpu.Cpu, cop0) && offset_of(cpu.Cpu, cop0) < offset_of(cpu.Cpu, cycles))
+
+// Call the before or after hook at fn (native code p, nil none) on the
+// mod stack, in frozen time, and put every register but cop0 back after.
+// Under FLAT, cpu.call runs it nested.
+@(private = "file")
+mod_call :: proc(fn: u32, p: cpu.Func_Proc) {
+	regs := (^[MOD_REGS]u8)(&cpu.state)^
+	cycles, next, held := cpu.state.cycles, cpu.next_event, cpu.mod_held
 	if cpu.mod_depth == 0 {cpu.state.r[29].q = u128(mem.mod_sp)}
 	cpu.next_event, cpu.mod_held = max(u64), false
 	cpu.mod_depth += 1
-	cpu.call(fn)
+	mod_run(fn, p)
 	cpu.mod_depth -= 1
 	mem.mod_ram_check(fn)
 	// An event the hook scheduled or an interrupt it raised lowered
 	// next_event, or came due and was held: run_events then runs as the game
 	// goes on, and handles what is due.
 	due := cpu.next_event != max(u64) || cpu.mod_held
-	cpu.state, cpu.mod_held = saved, held
-	cpu.next_event = due ? min(next, saved.cycles) : next
+	(^[MOD_REGS]u8)(&cpu.state)^ = regs
+	cpu.state.cycles, cpu.mod_held = cycles, held
+	cpu.next_event = due ? min(next, cycles) : next
 }
 
 // ---------------------------------------------------------------- FLAT
@@ -497,7 +550,7 @@ mod_flat_enter :: proc(x: ^kernel.Flat_Ctx) {
 	}
 	mark := x.ret[x.depth - 1]
 	c := &mod_sites[site].chain
-	mod_before(c)
+	mod_before(&mod_sites[site])
 	if r, rok := c.replace.?; rok {
 		mod_conts[mark >> 2].replaced = true
 		mod_conts[mark >> 2].kept = mod_kept()
@@ -545,7 +598,7 @@ mod_flat_return :: proc(mark: u32) -> (ret: u32, again: bool) {
 	m := mod_conts[n]
 	append(&mod_conts_free, n)
 	if m.replaced {mod_kept_set(m.kept)}
-	if !m.orig {mod_after(&mod_sites[m.site].chain, m.entry)}
+	if !m.orig {mod_after(&mod_sites[m.site], m.entry)}
 	return m.ret, m.again
 }
 

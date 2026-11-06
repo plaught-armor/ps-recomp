@@ -95,12 +95,19 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	return 0
 }
 
-// The mods child (`play --mods <mods directory> <out>`): the functions of
-// the mods in dir (their mod.elf's .symtab, core.mod_elf_read), compiled to
-// a blob of mod functions for this host at out (psx/native/mods.odin). A
-// failure exits with status 1 after a message.
-compile_mods :: proc(dir, out: string) -> int {
-	set, err := psx.mods_read(dir, "")
+// The mods in dir, read for a PS2 game's EE when ee, else for a PS1 game.
+mods_read :: proc(ee: bool, dir: string) -> (core.Mod_Set, string) {
+	if ee {return ps2.mods_read_set(dir, "")}
+	return psx.mods_read(dir, "")
+}
+
+// The mods child (`play --mods <psx | ee> <mods directory> <out>`): the
+// functions of the mods in dir (their mod.elf's .symtab, core.mod_elf_read)
+// for a PS1 game, or a PS2 game's EE when ee, compiled to a blob of mod
+// functions for this host at out (psx/native/mods.odin,
+// ps2/mods_native.odin). A failure exits with status 1 after a message.
+compile_mods :: proc(ee: bool, dir, out: string) -> int {
+	set, err := mods_read(ee, dir)
 	if err != "" {
 		fmt.eprintln(err)
 		return 1
@@ -121,12 +128,24 @@ compile_mods :: proc(dir, out: string) -> int {
 			append(&funcs, r3000.Learned{f.addr, f.addr, words})
 		}
 	}
-	blob := r3000.learned_blob(funcs[:], arch)
+	blob: []u8
+	skipped := 0 // functions the EE's compiler left to the interpreter
+	if ee {
+		// The same runs: a mod function is one, entered at its first word;
+		// a call between two is direct.
+		blob, skipped = r5900.mods_blob(transmute([]r5900.Learned)funcs[:], arch)
+	} else {
+		blob = r3000.learned_blob(funcs[:], arch)
+	}
 	if werr := os.write_entire_file(out, blob); werr != nil {
 		fmt.eprintln("mods: cannot write", out, werr)
 		return 1
 	}
-	fmt.eprintfln("mods: %d functions from %d mods", len(funcs), len(set.mods))
+	if ee {
+		fmt.eprintfln("mods: %d functions from %d mods (%d not lowered, interpreted)", len(funcs) - skipped, len(set.mods), skipped)
+	} else {
+		fmt.eprintfln("mods: %d functions from %d mods", len(funcs), len(set.mods))
+	}
 	return 0
 }
 
@@ -293,9 +312,9 @@ learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: 
 // of this executable (as convert_store) and store the blob in the disc
 // directory dir, its key naming the mod set by set. False, after a
 // message, when there is no blob.
-mods_store :: proc(mods, dir, set: string, deadline: time.Duration) -> bool {
+mods_store :: proc(ee: bool, mods, dir, set: string, deadline: time.Duration) -> bool {
 	tmp := strings.concatenate({core.disc_path(dir, .Mods_Native, context.temp_allocator), ".compile"}, context.temp_allocator)
-	blob := child_blob({"--mods", mods, tmp}, tmp, "native code for the mods", "mods compile", deadline) or_return
+	blob := child_blob({"--mods", "ee" if ee else "psx", mods, tmp}, tmp, "native code for the mods", "mods compile", deadline) or_return
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, .Mods, set)
 }

@@ -251,6 +251,7 @@ native_imports :: proc(types: ^map[string]typeid = nil) -> map[string]u64 {
 	m["cpu.next_event"] = p(&cpu.next_event)
 	m["cpu.native_exit"] = p(&cpu.native_exit)
 	f(&m, types, "cpu.call", cpu.call)
+	f(&m, types, "ps2.mod_call_original", mod_call_original)
 	f(&m, types, "cpu.jump_unknown", cpu.jump_unknown)
 	f(&m, types, "cpu.bad_insn", cpu.bad_insn)
 	f(&m, types, "cpu.brk", cpu.brk)

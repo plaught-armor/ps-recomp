@@ -32,9 +32,11 @@
 // format (always, for a dev build), and loaded beside the native blob.
 // Code that is not in RAM as it was recorded is interpreted, and learned.
 //
-// A PS1 game's mods (the disc directory's mods directory, psx/mods.odin)
-// run their functions as native code too, unless NATIVE=0 or MOD_NATIVE=0:
-// compiled in a child (`play --mods <mods directory> <out>`) when the
+// A game's mods (the disc directory's mods directory: psx/mods.odin for a
+// PS1 game, ps2/mod.odin for a PS2 game's EE) run their functions as native
+// code too, unless NATIVE=0 or MOD_NATIVE=0 (or a FLAT build, which runs
+// them interpreted): compiled in a child
+// (`play --mods <psx | ee> <mods directory> <out>`) when the
 // stored mods blob is not for this mod set (core.mod_set_hash), this build
 // and blob format (always, for a dev build).
 //
@@ -81,8 +83,8 @@ run :: proc(args: []string) -> int {
 		return convert(args[2], args[3], args[4], args[5], vu_only = true)
 	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
 		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4])
-	case len(args) == 4 && args[1] == "--mods":
-		return compile_mods(args[2], args[3])
+	case len(args) == 5 && args[1] == "--mods" && (args[2] == "psx" || args[2] == "ee"):
+		return compile_mods(args[2] == "ee", args[3], args[4])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
 		return compat_mode(args[2], args[3] if len(args) == 4 else "")
 	case len(args) == 4 && args[1] == "--export":
@@ -148,6 +150,14 @@ mods_native_key: string
 mods_native_failed :: proc() {
 	os.remove(mods_native_key)
 	fmt.eprintln("play: the stored native code of the mods would not load; it is compiled again next run")
+}
+
+// The same for a PS2 game's, with why it would not (ps2.load_mods): the key
+// goes first, then one line.
+@(private = "file")
+mods_native_refused :: proc(why: string) {
+	os.remove(mods_native_key)
+	fmt.eprintfln("play: %s; the mods are interpreted, and compiled again next run", why)
 }
 
 // Where the learned code of cpu is kept: its blob, the blob's file and key,
@@ -230,16 +240,17 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile: bool, deadline: 
 }
 
 // The native code of the mods in the disc directory dir's mods directory,
-// for a PS1 game: compiled when the stored blob is not for this mod set
+// for a PS1 game, or a PS2 game's EE when ee: compiled when the stored blob
+// is not for this mod set
 // (core.mod_set_hash). A mod whose mod.elf has no .symtab functions is
 // interpreted, with a message. Without compile a blob not stored is not
 // compiled either; a compile still running after deadline (0: none) is
 // stopped. "" when there are no mod functions, or no blob. A mods directory
 // that does not read is left to the boot, which reports why.
 @(private)
-mods_blob :: proc(dir: string, compile: bool, deadline: time.Duration) -> string {
+mods_blob :: proc(dir: string, ee, compile: bool, deadline: time.Duration) -> string {
 	mods := core.disc_path(dir, .Mods, context.temp_allocator)
-	set, err := psx.mods_read(mods, "")
+	set, err := mods_read(ee, mods)
 	defer core.mod_set_delete(set)
 	if err != "" || len(set.mods) == 0 {
 		return ""
@@ -260,7 +271,7 @@ mods_blob :: proc(dir: string, compile: bool, deadline: time.Duration) -> string
 			fmt.eprintln("play: no native code for the mods (not compiled in the compat run)")
 			return ""
 		}
-		if !mods_store(mods, dir, key, deadline) {
+		if !mods_store(ee, mods, dir, key, deadline) {
 			return ""
 		}
 	}
@@ -383,11 +394,11 @@ play :: proc(image: string) -> int {
 	}
 	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
 	learned_ee_key = core.disc_path(dir, learned_files(.Ee).key)
-	// A PS1 game's mods run native unless NATIVE=0 or MOD_NATIVE=0, which
+	// A game's mods run native unless NATIVE=0 or MOD_NATIVE=0, which
 	// interprets them; a compat child's parent compiled them (compat_disc).
 	mods_native: string
-	if !native_off && !cnf.ps2 && core.env("MOD_NATIVE") != "0" {
-		mods_native = mods_blob(dir, !compat_child(), 0)
+	if !native_off && core.env("MOD_NATIVE") != "0" {
+		mods_native = mods_blob(dir, cnf.ps2, !compat_child(), 0)
 	}
 	mods_native_key = core.disc_path(dir, .Mods_Native_Key)
 	// LEARN=1 records every processor's runs; unset, a PS2 game's IOP,
@@ -431,6 +442,8 @@ play :: proc(image: string) -> int {
 			cards             = cards,
 			mods              = core.disc_path(dir, .Mods),
 			disc_id           = id,
+			mods_native        = mods_native,
+			mods_native_failed = mods_native_refused,
 		}
 		if midload_init(image, native, capture) {
 			b.vblank = midload_vblank

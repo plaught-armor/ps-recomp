@@ -1,7 +1,16 @@
 // An EE mod built from C (mods/build.sh) on a hand-assembled game, loaded
 // as a port loads one: ps2.mods_read of tests/ps2_mod_elf/mods, then
 // ps2.mods_load. Plain (with the game's 8-argument function registered as
-// recompiled code; `interp`: none), and -define:PS_FLAT=true.
+// recompiled code; `interp`: none), `native` (as plain, and the mod's own
+// functions compiled for this host by r5900.mods_blob and loaded by
+// ps2.load_mods, as play's --mods child and boot do), and
+// -define:PS_FLAT=true.
+//
+//   - native: a blob of the mod's functions with one word changed (a stale
+//     blob, as after an edit) and the arm64 blob on an x64 host are
+//     refused, and the mod then runs from the host's blob: every call into
+//     the mod region reaches native code, none the interpreter. The arm64
+//     blob is built and its header and spans read, never run.
 //
 //   - api/mod_api.h and api/mod.ld are recomp --mod-api's for the game's
 //     ELF (`odin run tests/ps2_mod_elf -collection:ps=. -- update` writes
@@ -24,6 +33,7 @@ package main
 import "core:bytes"
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "ps:core"
 import "ps:ps2"
@@ -31,6 +41,7 @@ import cpu "ps:ps2/cpu"
 import kernel "ps:ps2/kernel"
 import "ps:ps2/mem"
 import "ps:recomp/mips"
+import rnative "ps:recomp/native"
 import "ps:recomp/r5900"
 
 @(private = "file")
@@ -272,6 +283,8 @@ fn_add8 :: proc() {
 }
 
 native: bool
+// The mod's own functions run as native code (`native`).
+mods_native: bool
 
 vblank :: proc() {
 	if mem.rd32(DONE) == 0 {
@@ -296,9 +309,40 @@ vblank :: proc() {
 	check(mem.rd32(DATA + 32) == F21 && mem.rd32(DATA + 36) == F31, fmt.tprintf("$f21 $f31 after G_KEEP %08x %08x", mem.rd32(DATA + 32), mem.rd32(DATA + 36)))
 	check(mem.rd32(LOG + 16) == 1, fmt.tprintf("G_KEEP's before hook ran %d times", mem.rd32(LOG + 16)))
 	check(mem.rd32(LOG + 24) == transmute(u32)i32(-2), fmt.tprintf("mod_f2i(-2.75) gave %d", i32(mem.rd32(LOG + 24))))
+	if mods_native {
+		check(mem.mod_native_calls > 0, "no call reached the mod's native code")
+		check(mem.mod_interp_calls == 0, fmt.tprintf("%d calls into the mod region were interpreted", mem.mod_interp_calls))
+	} else if !core.FLAT {
+		check(mem.mod_native_calls == 0, "native mod calls with no mods blob")
+		check(mem.mod_interp_calls > 0, "no interpreted call into the mod region")
+	}
+	when !core.FLAT {hooks_keep_cop0()}
 	if failed > 0 {os.exit(1)}
 	fmt.println("ps2_mod_elf: ok")
 	os.exit(0)
+}
+
+// The hooks, for hooks_keep_cop0.
+hooks: []core.Mod_Hook
+
+// Each before and after hook's own code, run on its own, leaves cop0 as it
+// was: mod_call puts every register back but cop0, which only game code
+// a hook calls may change.
+hooks_keep_cop0 :: proc() {
+	ran := 0
+	for h in hooks {
+		if h.kind == .Replace {continue}
+		cop0, sp, next := cpu.state.cop0, cpu.state.r[29], cpu.next_event
+		cpu.state.r[29].q = u128(mem.mod_sp)
+		cpu.next_event = max(u64)
+		cpu.mod_depth += 1
+		cpu.call(h.fn)
+		cpu.mod_depth -= 1
+		check(cpu.state.cop0 == cop0, fmt.tprintf("the hook at %08x changed cop0", h.fn))
+		cpu.state.r[29], cpu.next_event = sp, next
+		ran += 1
+	}
+	check(ran == 3, fmt.tprintf("%d before and after hooks run on their own", ran))
 }
 
 main :: proc() {
@@ -306,6 +350,7 @@ main :: proc() {
 	ps2.init()
 	cpu.text_range(ENTRY, ENTRY + 0x1000)
 	native = !core.FLAT && !(len(os.args) == 2 && os.args[1] == "interp")
+	mods_native = !core.FLAT && len(os.args) == 2 && os.args[1] == "native"
 	if native {cpu.register(G_ADD8, fn_add8)}
 	kernel.vblank_hook = vblank
 	program()
@@ -314,9 +359,113 @@ main :: proc() {
 	kernel.exec_boot_program(elf)
 	set, _, err := ps2.mods_read(DIR + "/mods", "")
 	check(err == "" && len(set.mods) == 1 && len(set.hooks) == 6, fmt.tprint("mods_read:", err, len(set.mods), len(set.hooks)))
+	// set.hooks is in the temp allocator, which mods_blob frees.
+	hooks = slice.clone(set.hooks)
+	funcs := mod_funcs(set)
 	if err = ps2.mods_load(set); err != "" {
 		fmt.eprintln("FAIL ps2_mod_elf:", err)
 		os.exit(1)
 	}
+	when !core.FLAT {if mods_native {load_native(funcs)}}
 	ps2.run(ENTRY)
+}
+
+// The mods' functions as play's --mods child reads them: one run each,
+// entered at its first word.
+mod_funcs :: proc(set: core.Mod_Set) -> []r5900.Learned {
+	funcs := make([dynamic]r5900.Learned)
+	for img in set.images {
+		for f in img.funcs {
+			words := make([]u32, len(f.bytes) / 4)
+			for &w, i in words {
+				b := f.bytes[i * 4:]
+				w = u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
+			}
+			append(&funcs, r5900.Learned{f.addr, f.addr, words})
+		}
+	}
+	return funcs[:]
+}
+
+// The refused blobs, then the host's.
+load_native :: proc(funcs: []r5900.Learned) {
+	check(len(funcs) > 0, "the mod has no functions")
+	tmp, terr := os.make_directory_temp("", "ps_ps2_mod_native_*", context.allocator)
+	if terr != nil {
+		fmt.eprintln("FAIL ps2_mod_elf: temp dir:", terr)
+		os.exit(1)
+	}
+	defer os.remove_all(tmp)
+	arch, ok := rnative.arch_of("mods", mips.HOST_ARCH)
+	check(ok, "no native arch for this host")
+
+	arm64, arm_skipped := r5900.mods_blob(funcs, .Arm64)
+	arm64_spans(arm64, funcs, arm_skipped)
+	if arch != .Arm64 {
+		write(tmp, "arm64.bin", arm64)
+		why := ps2.load_mods(join({tmp, "arm64.bin"}))
+		check(strings.contains(why, "built for arch"), fmt.tprintf("the arm64 blob on this host: %q", why))
+	}
+
+	// A stale blob: one word of the last function changed, as after an edit.
+	last := &funcs[len(funcs) - 1]
+	was := last.words[0]
+	last.words[0] ~= 0x0000_0001
+	stale, _ := r5900.mods_blob(funcs, arch)
+	last.words[0] = was
+	write(tmp, "stale.bin", stale)
+	why := ps2.load_mods(join({tmp, "stale.bin"}))
+	check(strings.contains(why, "is not the mods' code"), fmt.tprintf("the stale blob: %q", why))
+	check(mem.mod_func_at(last.entry) == nil, "the stale blob left code behind")
+
+	blob, skipped := r5900.mods_blob(funcs, arch)
+	check(skipped == 0, fmt.tprintf("%d of the mod's %d functions not lowered", skipped, len(funcs)))
+	// The jal to mod_call_original in replace_add8 calls it direct, on
+	// both backends, not through cpu.call.
+	for b in ([2][]u8{blob, arm64}) {
+		check(bytes.contains(b, transmute([]u8)string("ps2.mod_call_original")), "the mods blob does not import ps2.mod_call_original")
+	}
+	write(tmp, "mods.bin", blob)
+	why = ps2.load_mods(join({tmp, "mods.bin"}))
+	check(why == "", fmt.tprintf("the host's blob: %q", why))
+	for f in funcs {check(mem.mod_func_at(f.entry) != nil, fmt.tprintf("no native code for %08x", f.entry))}
+}
+
+// The arm64 blob's header and spans: an Ee span per function, one range
+// each, the function's words. Read as bytes: an x64 host cannot map it.
+arm64_spans :: proc(blob: []u8, funcs: []r5900.Learned, skipped: int) {
+	at := 0
+	word :: proc(blob: []u8, at: ^int) -> u32 {
+		if at^ + 4 > len(blob) {return 0}
+		b := blob[at^:]
+		at^ += 4
+		return u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
+	}
+	h: [core.NATIVE_HEADER / 4]u32
+	for &v in h {v = word(blob, &at)}
+	n := u32(len(funcs) - skipped)
+	check(h[0] == core.NATIVE_MAGIC && h[1] == core.NATIVE_VERSION && h[2] == u32(rnative.Arch.Arm64), fmt.tprintf("arm64 header %x", h[:3]))
+	check(skipped == 0, fmt.tprintf("arm64: %d functions not lowered", skipped))
+	check(h[4] == 0 && h[5] == 0 && h[6] == n && h[7] == n && h[9] > 0, fmt.tprintf("arm64 counts %v", h))
+	for _ in 0 ..< h[3] {
+		if at + 2 > len(blob) {break}
+		at += 2 + (int(blob[at]) | int(blob[at + 1]) << 8)
+	}
+	spans := make([][5]u32, h[6], context.temp_allocator)
+	for &sp in spans {for &v in sp {v = word(blob, &at)}}
+	ranges := make([][3]u32, h[7], context.temp_allocator)
+	for &r in ranges {for &v in r {v = word(blob, &at)}}
+	pool := make([]u32, h[8], context.temp_allocator)
+	for &w in pool {w = word(blob, &at)}
+	check(at + int(h[9]) == len(blob), "arm64 blob size")
+	for sp, k in spans {
+		if k >= len(funcs) {break}
+		f := funcs[k]
+		check(sp[0] == u32(core.Native_Kind.Ee) && sp[1] == f.entry && sp[2] < h[10] && sp[4] == 1, fmt.tprintf("arm64 span %d %v", k, sp))
+		if sp[3] >= u32(len(ranges)) {continue}
+		r := ranges[sp[3]]
+		ok := r[0] == f.lo && int(r[1]) == len(f.words) && u64(r[2]) + u64(r[1]) <= u64(len(pool))
+		if ok {for w, i in f.words {ok &&= pool[r[2] + u32(i)] == w}}
+		check(ok, fmt.tprintf("arm64 span %d range %v", k, r))
+	}
 }

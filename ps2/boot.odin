@@ -53,6 +53,12 @@ Boot :: struct {
 	// the mods' (the recomp option mod_hooks) stops the boot.
 	mods:           string,
 	disc_id:        string,
+	// A blob of the mods' native code ("" none; load_mods), loaded once the
+	// mods are in their region, and what to call with why when it cannot be
+	// loaded (nil: why is printed); the mods are then interpreted, and the
+	// boot goes on.
+	mods_native:        string,
+	mods_native_failed: proc(why: string),
 	// Called at each vblank after the host's frame (kernel.vblank_hook), on
 	// the EE thread where no microprogram runs; and when the host quits.
 	// nil none.
@@ -119,6 +125,7 @@ boot :: proc(b: Boot) -> bool {
 		case b.native != "" && core.NATIVE_ARCH != core.NATIVE_ARCH_WASM32: what = "native code (Boot.native)"
 		case b.learned != "": what = "the IOP's learned code (Boot.learned)"
 		case b.learned_ee != "": what = "the EE's learned code (Boot.learned_ee)"
+		case b.mods_native != "": what = "the mods' native code (Boot.mods_native)"
 		}
 		if what != "" {cpu.fatal("FLAT runs interpreted only: %s not installed", what)}
 	}
@@ -173,6 +180,15 @@ boot :: proc(b: Boot) -> bool {
 	if merr != "" {
 		fmt.eprintln(merr)
 		return false
+	}
+	when !core.FLAT {
+		if why := load_mods(b.mods_native) if b.mods_native != "" else ""; why != "" {
+			if b.mods_native_failed != nil {
+				b.mods_native_failed(why)
+			} else {
+				fmt.eprintfln("%s; the mods are interpreted", why)
+			}
+		}
 	}
 	cpu.state.r[29].d[0] = mem.RAM_SIZE - 16
 	kernel.exec_boot_args(argv0)

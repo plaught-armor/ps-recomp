@@ -316,8 +316,8 @@ compat_disc :: proc(image: string, frames, wait: u64, keep: bool) -> (row: Row, 
 		learned = learned_blob(dir, learn_cpu, true, COMPAT_BOOT_FACTOR * stall)
 		if cnf.ps2 {learned_ee = learned_blob(dir, .Ee, true, COMPAT_BOOT_FACTOR * stall)}
 	}
-	if !core.FLAT && core.env("NATIVE") != "0" && !cnf.ps2 && core.env("MOD_NATIVE") != "0" {
-		_ = mods_blob(dir, true, COMPAT_BOOT_FACTOR * stall)
+	if !core.FLAT && core.env("NATIVE") != "0" && core.env("MOD_NATIVE") != "0" {
+		_ = mods_blob(dir, cnf.ps2, true, COMPAT_BOOT_FACTOR * stall)
 	}
 
 	self, serr := os.get_executable_path(context.temp_allocator)

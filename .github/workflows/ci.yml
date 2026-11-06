@@ -130,6 +130,7 @@ jobs:
           odin run tests/ps2_mod -collection:ps=. -define:PS_FLAT=true -out:ps2_mod_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ps2_mod_elf -collection:ps=. -out:ps2_mod_elf_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ps2_mod_elf -collection:ps=. -out:ps2_mod_elf_interp_test${{ runner.os == 'Windows' && '.exe' || '' }} -- interp
+          odin run tests/ps2_mod_elf -collection:ps=. -out:ps2_mod_elf_native_test${{ runner.os == 'Windows' && '.exe' || '' }} -- native
           odin run tests/ps2_mod_elf -collection:ps=. -define:PS_FLAT=true -out:ps2_mod_elf_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/mod_api -collection:ps=. -out:mod_api_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_interp -collection:ps=. -out:psx_interp_test${{ runner.os == 'Windows' && '.exe' || '' }}
