@@ -19,6 +19,9 @@ import "ps:recomp/vu"
 // captured ones and those of .vutext. A failure exits with status 1 after
 // a message (mips.fail), which is why it runs in a child.
 convert :: proc(image, out, vu0, vu1: string) -> int {
+	if _, ok := native.arch_of("convert", mips.HOST_ARCH); !ok {
+		return 1
+	}
 	o := mips.disc_options(image, "")
 	o.values["native_out"] = out
 	if vu0 != "" || vu1 != "" {
@@ -49,7 +52,10 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	}
 	recs, _ := core.learn_read(data)
 	runs, large, smc := core.learn_compilable(recs[:], cpu)
-	arch, _ := native.parse_arch(mips.HOST_ARCH)
+	arch, ok := native.arch_of("learned", mips.HOST_ARCH)
+	if !ok {
+		return 1
+	}
 	blob: []u8
 	if cpu == .Ee {
 		funcs := make([]r5900.Learned, len(runs))

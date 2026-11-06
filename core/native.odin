@@ -59,9 +59,16 @@ NATIVE_VERSION :: 3
 // Bytes of the header: magic, version, arch, then the counts and sizes.
 NATIVE_HEADER :: 44
 
-// The blob arch this build runs (recomp/native Arch), and its name there.
-NATIVE_ARCH :: 3 when ODIN_ARCH == .arm64 else (2 when ODIN_OS == .Windows else 1)
-NATIVE_ARCH_NAME :: "arm64" when ODIN_ARCH == .arm64 else ("x64_win" when ODIN_OS == .Windows else "x64_sysv")
+// The blob arch of a wasm build. Reserved: recomp has no emitter for it
+// (it is not a recomp/native Arch), so a wasm build finds no blob of its
+// arch, interprets, and refuses another host's machine code, which it
+// cannot map.
+NATIVE_ARCH_WASM32 :: 4
+
+// The blob arch this build runs (recomp/native Arch, or NATIVE_ARCH_WASM32),
+// and its name there.
+NATIVE_ARCH :: NATIVE_ARCH_WASM32 when ODIN_ARCH == .wasm32 else (3 when ODIN_ARCH == .arm64 else (2 when ODIN_OS == .Windows else 1))
+NATIVE_ARCH_NAME :: "wasm32" when ODIN_ARCH == .wasm32 else ("arm64" when ODIN_ARCH == .arm64 else ("x64_win" when ODIN_OS == .Windows else "x64_sysv"))
 
 // Executable memory is mapped in 64K units, a page on every host.
 @(private)

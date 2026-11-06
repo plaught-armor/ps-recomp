@@ -78,8 +78,9 @@ disc_options :: proc(image, source: string, arch := HOST_ARCH) -> Options {
 	return o
 }
 
-// The native_arch of the machine recomp runs on.
-HOST_ARCH :: "arm64" when ODIN_ARCH == .arm64 else "x64_win" when ODIN_OS == .Windows else "x64_sysv"
+// The native_arch of the machine recomp runs on. A wasm build's, wasm32,
+// has no emitter yet (native.arch_of refuses it), so there an arch is given.
+HOST_ARCH :: "wasm32" when ODIN_ARCH == .wasm32 else ("arm64" when ODIN_ARCH == .arm64 else ("x64_win" when ODIN_OS == .Windows else "x64_sysv"))
 
 // The executable's bytes and its name: option `exe`, a file; or, with
 // option `disc` (a .cue sheet, or a single-track .bin or .iso), the file at

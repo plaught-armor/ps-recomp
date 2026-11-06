@@ -36,6 +36,16 @@ parse_arch :: proc(s: string) -> (Arch, bool) {
 	return {}, false
 }
 
+// The arch named s, or false after a message naming who asked: an arch
+// with no emitter, such as wasm32 (core.NATIVE_ARCH_WASM32), is refused.
+arch_of :: proc(who, s: string) -> (Arch, bool) {
+	a, ok := parse_arch(s)
+	if !ok {
+		fmt.eprintfln("%s: no native backend for arch %s; give x64_sysv, x64_win or arm64", who, s)
+	}
+	return a, ok
+}
+
 // Virtual registers, 32-bit. A, B and C are scratch: a call loses them.
 // T and LD keep their values across calls.
 Reg :: enum u8 {

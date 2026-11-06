@@ -30,10 +30,6 @@ main :: proc() {
 	args := os.args[1:]
 	arch := mips.HOST_ARCH
 	if len(args) >= 2 && args[0] == "--arch" {
-		if _, ok := native.parse_arch(args[1]); !ok {
-			fmt.eprintfln("recomp: unknown arch %s", args[1])
-			os.exit(2)
-		}
 		arch = args[1]
 		args = args[2:]
 	}
@@ -49,6 +45,10 @@ main :: proc() {
 		}
 		o = mips.load_options(args[0])
 	} else {
+		// An options file names its own native_arch; the backend checks it.
+		if _, ok := native.arch_of("recomp", arch); !ok {
+			os.exit(2)
+		}
 		o = mips.disc_options(args[0], len(args) == 2 ? args[1] : "", arch)
 	}
 	switch b := mips.option(o, "backend"); b {

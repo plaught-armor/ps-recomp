@@ -5,6 +5,7 @@ From the repository root:
 ```sh
 odin run tests/core -collection:ps=.
 odin run tests/native -collection:ps=.
+odin run tests/blob_arch -collection:ps=.
 odin run tests/ee_native -collection:ps=.
 odin run tests/ee_spin -collection:ps=.
 odin run tests/fpu -collection:ps=.
@@ -75,6 +76,7 @@ here.
 | `vu_native` | VU microprograms through the native backend against the interpreter |
 | `spu` | SPU2 voices through the port API, sound RAM in snapshots |
 | `ps2_kernel` | EE kernel threads, ExecPS2 |
+| `blob_arch` | A native code header is valid only with this build's arch: arch 0 and wasm32's (4) are refused on a native build, every machine-code arch on a wasm build, and native_load refuses another arch before it maps anything |
 | `ps2_iop` | The IOP CPU and the IOP modules run on it |
 | `iop_thread_grow` | An IOP start that grows the thread array while it runs is removed once it returns, in the coroutine model and under FLAT: the same thread count |
 | `ps2_interp` | Whole EE functions in the interpreter |
@@ -361,6 +363,18 @@ cmp out-wasm/hashes.tsv out-native/hashes.tsv
 
 Both runs start from an empty data directory. A `PS_*` variable set for
 play.mjs is passed on to the module.
+
+A headless PS2 game never presents, so its present count stays 0. To count
+presents, run it with `PS_HEADLESS=0 node tests/wasi/play.mjs ...`: slower,
+and the hashes are the same.
+
+`tests/blob_arch` is pure, so it also runs as a wasi module, where it checks
+the wasm32 arch:
+
+```sh
+odin build tests/blob_arch -collection:ps=. -target:wasi_wasm32 -out:blob_arch.wasm
+node tests/wasi/run.mjs blob_arch.wasm out-test path/to/any/file
+```
 
 ## CI
 
