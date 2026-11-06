@@ -24,6 +24,10 @@ function concat(chunks) {
 // The transfer list for written files: each one's own buffer.
 const buffers = (files) => (files ?? []).map(([, b]) => b.buffer);
 
+// openStored tries on a held lock: LOCK_TRIES more, LOCK_WAIT_MS apart.
+const LOCK_TRIES = 30;
+const LOCK_WAIT_MS = 100;
+
 // The disc for Wasi, {disc, close()}, and how it is read, which goes to the
 // page as {store: {kind, ...}}. stored: play that stored disc. store with
 // files or urls: copy them into the store under that name first, and read
@@ -31,11 +35,18 @@ const buffers = (files) => (files ?? []).map(([, b]) => b.buffer);
 // read files or urls directly.
 async function discFor({ files, urls, store: name, stored }) {
 	if (stored) {
-		const d = await openStored(stored).catch((e) => {
-			if (e.name !== "NoModificationAllowedError") throw e;
-			throw new Error(`${stored}: this disc is playing in another tab`);
-		});
-		return { ...d, info: { kind: "stored", name: stored } };
+		// A Worker the page just stopped (Skip on the conversion) lets go of
+		// the disc's handles a little after, so a lock is tried for a while
+		// before it is put down to another tab.
+		for (let i = 0; ; i++) {
+			try {
+				return { ...(await openStored(stored)), info: { kind: "stored", name: stored } };
+			} catch (e) {
+				if (e.name !== "NoModificationAllowedError") throw e;
+				if (i === LOCK_TRIES) throw new Error(`${stored}: this disc is playing in another tab`);
+			}
+			await new Promise((resolve) => setTimeout(resolve, LOCK_WAIT_MS));
+		}
 	}
 	if (name) {
 		const t0 = performance.now();
@@ -57,9 +68,12 @@ async function discFor({ files, urls, store: name, stored }) {
 // audio, present: the page's buffers; net, for netplay, the NET one. test: also send back, with done or
 // error, the files the module wrote and, as ring.pcm, every sample it
 // queued (their buffers transferred, not copied), plus the compile and run
-// times.
+// times. failSaves: false stores /data back only when the module exits
+// with 0 (`play --convert-store`, whose failure leaves its temporary file
+// there). Before /data is stored the page gets {saving}: from then on
+// stopping the Worker could cut a write short.
 onmessage = async ({ data }) => {
-	const { wasm, args, env = {}, test = false, control, audio, present, net: netBuffer } = data;
+	const { wasm, args, env = {}, test = false, failSaves = true, control, audio, present, net: netBuffer } = data;
 	let wasi = null;
 	let disc = null;
 	const ring = [];
@@ -68,8 +82,9 @@ onmessage = async ({ data }) => {
 	let stored = null; // what dataLoad gave, null when /data is not stored
 	// /data back into the store, before done or error goes to the page: a
 	// run started after it then finds the store whole.
-	const save = async () => {
-		if (stored === null) return;
+	const save = async (ok) => {
+		if (stored === null || (!ok && !failSaves)) return;
+		postMessage({ saving: true });
 		await dataSave(wasi.files(wasi.data), stored).catch((e) =>
 			postMessage({ log: `play: the data of this run cannot be stored (${e.name}: ${e.message})\n` }));
 	};
@@ -119,12 +134,12 @@ onmessage = async ({ data }) => {
 		t1 = performance.now();
 		const code = wasi.run(instance);
 		times.runMs = Math.round(performance.now() - t1);
-		await save();
+		await save(code === 0);
 		const files = written();
 		postMessage({ done: { code, stats: wasi.stats, ...times }, files }, buffers(files));
 	} catch (e) {
 		if (t1 !== null) times.runMs = Math.round(performance.now() - t1);
-		await save();
+		await save(false);
 		const files = written();
 		postMessage({ error: String(e?.stack ?? e), times, files }, buffers(files));
 	} finally {

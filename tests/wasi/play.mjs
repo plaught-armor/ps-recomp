@@ -141,7 +141,9 @@ native.attach(instance);
 net?.attach(instance);
 const code = wasi.run(instance);
 const ms = Math.round(performance.now() - start);
-for (const [path, bytes] of wasi.files()) {
+const written = [...wasi.files()];
+if (env.PLAY_CONVERT === "1") for (const [path, bytes] of wasi.files(wasi.data)) written.push(["data/" + path, bytes]);
+for (const [path, bytes] of written) {
 	const to = join(resolve(out), path);
 	mkdirSync(dirname(to), { recursive: true });
 	writeFileSync(to, bytes);

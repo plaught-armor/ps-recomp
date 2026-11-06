@@ -245,7 +245,7 @@ async function showStored() {
 		play.type = "button";
 		play.textContent = `Play ${name} (stored)`;
 		play.disabled = worker !== null;
-		play.addEventListener("click", () => start({ wasm: "play.wasm", args: [`/disc/${name}`], stored: name }));
+		play.addEventListener("click", () => playStored(name));
 		const drop = document.createElement("button");
 		drop.type = "button";
 		drop.textContent = "Forget";
@@ -255,6 +255,63 @@ async function showStored() {
 		return li;
 	}));
 	list.hidden = names.length === 0;
+}
+
+// The build's commit (commit.txt), null for a dev build (-dirty) or none:
+// play keys stored native code by it and stores none for a dev build.
+let commit = null;
+
+// Plays a stored disc. First a Worker runs `play --convert-store`, which
+// converts the disc's code to native code and stores it in /data unless
+// this build's is there already; then the game starts and takes it.
+// While it converts the page shows the time so far and Skip, which stops
+// the conversion and plays the disc interpreted now; it is tried again on
+// the next Play. A failed conversion stores nothing (failSaves: false)
+// and the game starts interpreted. Once the Worker says {saving} it is
+// writing /data, so Skip goes away and the page waits for it.
+function playStored(name) {
+	const play = () => start({ wasm: "play.wasm", args: [`/disc/${name}`], stored: name });
+	if (commit === null) return play();
+	$("start").disabled = true;
+	for (const b of $("stored").querySelectorAll("button")) b.disabled = true;
+	const box = $("convert");
+	const skip = $("skip");
+	const t0 = performance.now();
+	let last = "";
+	const show = () => ($("convert-text").textContent =
+		`Converting ${name} to native code (${Math.round((performance.now() - t0) / 1000)} s)${last ? `: ${last}` : ""}`);
+	const timer = setInterval(show, 1000);
+	const conv = new Worker("play-worker.js", { type: "module" });
+	let over = false;
+	const finish = (note) => {
+		if (over) return;
+		over = true;
+		clearInterval(timer);
+		conv.terminate();
+		box.hidden = true;
+		skip.onclick = null;
+		play(); // clears the log, so the note goes after
+		if (note) log(note);
+	};
+	conv.onmessage = ({ data }) => {
+		if (data.log !== undefined) {
+			const line = data.log.trim().split("\n").pop();
+			if (line) last = line;
+			show();
+		} else if (data.saving !== undefined) {
+			skip.hidden = true;
+		} else if (data.done !== undefined) {
+			finish(data.done.code === 0 ? "" : `The native code was not made (${last || `exit ${data.done.code}`}); this run is interpreted.\n`);
+		} else if (data.error !== undefined) {
+			finish(`The native code was not made (${data.error.split("\n")[0]}); this run is interpreted.\n`);
+		}
+	};
+	conv.onerror = (e) => finish(`The native code was not made (${e.message || "worker failed to load"}); this run is interpreted.\n`);
+	skip.hidden = false;
+	skip.onclick = () => finish("Conversion skipped; this run is interpreted.\n");
+	show();
+	box.hidden = false;
+	conv.postMessage({ wasm: "play.wasm", args: ["--convert-store", `/disc/${name}`], stored: name, failSaves: false, ...shared });
 }
 
 // The Worker's word on the disc: stored, or why not.
@@ -533,7 +590,10 @@ async function testState() {
 }
 
 async function main() {
-	fetch("commit.txt").then((r) => (r.ok ? r.text() : "?")).then((t) => ($("sha").textContent = t.trim()));
+	fetch("commit.txt").then((r) => (r.ok ? r.text() : "?")).then((t) => {
+		$("sha").textContent = t.trim();
+		commit = /^[0-9a-f]{40}$/.test(t.trim()) ? t.trim() : null;
+	});
 	if (!(await isolate())) {
 		if (test) await postReport({ isolated: crossOriginIsolated, errors, userAgent: navigator.userAgent });
 		return;
