@@ -15,9 +15,12 @@
 //     mod_elf_read gives its three hooks with the fixture's keys; the mod
 //     calls the game through jalr, with no jal or j out of its image, and
 //     control.c and control_tail.c, a game call and tail call without
-//     long_call, have one. --origin moves the image, and two mods that
-//     overlap are refused by name. The build fails for a mod that defines
-//     a game function's name (clash.c), a section mod.ld does not place
+//     long_call, have one. orig.c's replacement calls mod_call_original,
+//     at MOD_ORIGINAL, through jalr, and orig_tail.c's tail-calls it
+//     through a jr not on $ra. --origin moves the image, and two
+//     mods that overlap are refused by name. The build fails for a mod that
+//     defines a game function's name (clash.c) or mod_call_original
+//     (clash_orig.c), a section mod.ld does not place
 //     (stray.c), an image past the region (big.c), and an origin that is
 //     not hex, below or past the region, or not 16-byte aligned. Without
 //     the tools that part prints a skip.
@@ -121,6 +124,7 @@ main :: proc() {
 	// The constants are the console's.
 	check(r3000.MOD_API == core.MOD_API, "MOD_API")
 	check(r3000.MOD_BASE == cpu.MOD_BASE && r3000.MOD_REGION == cpu.MOD_REGION && r3000.MOD_STACK == cpu.MOD_STACK, "region constants")
+	check(r3000.MOD_ORIGINAL == cpu.MOD_ORIGINAL, "MOD_ORIGINAL")
 	check(cpu.mod_ram_load({{lo = cpu.MOD_BASE, hi = r3000.MOD_IMAGE_END}}, {"end"}) == "", "an image to MOD_IMAGE_END loads")
 	cpu.mod_ram_free()
 	check(cpu.mod_ram_load({{lo = cpu.MOD_BASE, hi = r3000.MOD_IMAGE_END + 16}}, {"past"}) != "", "an image past MOD_IMAGE_END does not")
@@ -168,7 +172,7 @@ build :: proc(tmp, header, script: string) {
 		check(is_fn, fmt.tprintf("%v hook fn %08x is a mod function", h.kind, h.fn))
 	}
 	check(seen == {.Before = true, .After = true, .Replace = true}, "one hook of each kind")
-	out, jal_in, jalr := calls(img)
+	out, jal_in, jalr, _ := calls(img)
 	check(out == 0, fmt.tprint("hook: jal or j out of the image:", out))
 	check(jal_in > 0, "hook: its own call is a jal")
 	check(jalr > 0, "hook: the game call is a jalr")
@@ -176,9 +180,17 @@ build :: proc(tmp, header, script: string) {
 
 	for name in ([]string{"control", "control_tail"}) {
 		c, _ := build_one(tmp, name, "")
-		out, _, _ = calls(c)
+		out, _, _, _ = calls(c)
 		check(out > 0, fmt.tprintf("%s: a game call without long_call is a jal or j out of the image", name))
 	}
+
+	orig, _ := build_one(tmp, "orig", "")
+	out, _, jalr, _ = calls(orig)
+	check(out == 0 && jalr > 0 && loads(orig, cpu.MOD_ORIGINAL), fmt.tprintf("orig: %d calls out, %d jalr, loads %08x: %v", out, jalr, u32(cpu.MOD_ORIGINAL), loads(orig, cpu.MOD_ORIGINAL)))
+	tail, _ := build_one(tmp, "orig_tail", "")
+	jr: int
+	out, _, _, jr = calls(tail)
+	check(out == 0 && jr > 0 && loads(tail, cpu.MOD_ORIGINAL), fmt.tprintf("orig_tail: %d calls out, %d jr not on $ra, loads %08x: %v", out, jr, u32(cpu.MOD_ORIGINAL), loads(tail, cpu.MOD_ORIGINAL)))
 
 	moved, _ := build_one(tmp, "hook", "0x1f500000")
 	check(moved.lo == 0x1f50_0000, fmt.tprintf("--origin: linked at %08x", moved.lo))
@@ -195,7 +207,8 @@ build :: proc(tmp, header, script: string) {
 		code:               int,
 	}
 	bads := []Bad {
-		{"clash", "", "the mod defines start, a game function's name", 1},
+		{"clash", "", "the mod defines start, a name mod_api.h gives a game function", 1},
+		{"clash_orig", "", "the mod defines mod_call_original, a name mod_api.h gives", 1},
 		{"stray", "", ".stray", 1},
 		{"big", "", "mod: the image runs past the mod region", 1},
 		{"hook", "zz", "is not a hex address", 2},
@@ -236,9 +249,10 @@ build_one :: proc(tmp, name, origin: string) -> (core.Mod_Image, []u8) {
 	return img, elf
 }
 
-// The calls in the image's code: jal or j out of it, jal into it, and jalr.
+// The calls in the image's code: jal or j out of it, jal into it, jalr, and
+// jr through a register other than $ra (a tail call).
 @(private = "file")
-calls :: proc(img: core.Mod_Image) -> (out, jal_in, jalr: int) {
+calls :: proc(img: core.Mod_Image) -> (out, jal_in, jalr, jr: int) {
 	for s in img.segments {
 		if !s.exec {continue}
 		for k := 0; k + 4 <= len(s.bytes); k += 4 {
@@ -250,10 +264,35 @@ calls :: proc(img: core.Mod_Image) -> (out, jal_in, jalr: int) {
 				if to & 0x1fff_ffff < img.lo || to & 0x1fff_ffff >= img.hi {out += 1} else if w >> 26 == 3 {jal_in += 1}
 			case w >> 26 == 0 && w & 0x3f == 9:
 				jalr += 1
+			case w >> 26 == 0 && w & 0x3f == 8 && (w >> 21) & 31 != 31:
+				jr += 1
 			}
 		}
 	}
 	return
+}
+
+// Whether the image's code puts addr in a register: a lui of its high half,
+// then an addiu or ori of the low half into that register.
+@(private = "file")
+loads :: proc(img: core.Mod_Image, addr: u32) -> bool {
+	for s in img.segments {
+		if !s.exec {continue}
+		hi: [32]u32 // per register: its last lui's value
+		set: [32]bool
+		for k := 0; k + 4 <= len(s.bytes); k += 4 {
+			w := u32((^u32le)(&s.bytes[k])^)
+			op, rs, rt, imm := w >> 26, (w >> 21) & 31, (w >> 16) & 31, w & 0xffff
+			switch op {
+			case 0x0f:
+				hi[rt], set[rt] = imm << 16, true
+			case 0x09, 0x0d:
+				got := op == 0x09 ? hi[rs] + u32(i32(i16(imm))) : hi[rs] | imm
+				if set[rs] && got == addr {return true}
+			}
+		}
+	}
+	return false
 }
 
 @(private = "file")

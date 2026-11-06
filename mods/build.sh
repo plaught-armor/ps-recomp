@@ -12,8 +12,8 @@
 # aligned, in the region; mod.ld checks it): two mods loaded together must
 # not overlap, so give the second its own origin.
 #
-# A mod must not define a name mod_api.h gives a game function: mod.ld's
-# assignment would win over the mod's own definition without a word from
+# A mod must not define a name mod_api.h gives a game function or the
+# runtime (mod_call_original): mod.ld's assignment would win over the mod's own definition without a word from
 # ld.lld, so build.sh fails instead. Every loaded section must be one mod.ld
 # places (--orphan-handling=error), so its end check covers the whole image.
 #
@@ -72,7 +72,7 @@ llvm-nm --defined-only -g -j "$obj"/*.o | grep -v -e '^$' -e ':$' | sort -u >"$o
 clash=$(comm -12 "$obj/game" "$obj/own")
 [ -z "$clash" ] || {
 	for s in $clash; do
-		echo "mods/build.sh: the mod defines $s, a game function's name in mod_api.h: rename it" >&2
+		echo "mods/build.sh: the mod defines $s, a name mod_api.h gives a game function or the runtime: rename it" >&2
 	done
 	exit 1
 }

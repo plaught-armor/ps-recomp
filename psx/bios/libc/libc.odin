@@ -521,7 +521,7 @@ guest_cmp :: proc(cmp, a, b: u32) -> i32 {
 	saved := cpu.state
 	cpu.state.r[4] = a
 	cpu.state.r[5] = b
-	cpu.call(cmp)
+	cpu.call_callback(cmp)
 	v := i32(cpu.state.r[2])
 	cycles := cpu.state.cycles
 	cpu.state = saved

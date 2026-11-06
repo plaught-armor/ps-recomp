@@ -228,7 +228,8 @@ resolve_overlay :: proc(addr: u32) -> ^Ovl_Entry {
 }
 
 // Whether the cpu runs a call to addr without guest code: the A0, B0 and C0
-// vectors and the table entries' stubs (bios_entry). With run, the call
+// vectors, a mod's call to its original (MOD_ORIGINAL) and the table
+// entries' stubs (bios_entry). With run, the call
 // runs too. call_slow runs these; the interpreter asks without run before
 // following a jump into one, as the vectors' RAM holds no code to step.
 host_call :: proc(addr: u32, run: bool) -> bool {
@@ -241,6 +242,9 @@ host_call :: proc(addr: u32, run: bool) -> bool {
 		return true
 	case 0xc0:
 		if run {bios_c(state.r[9])}
+		return true
+	case MOD_ORIGINAL:
+		if run {mod_call_original()}
 		return true
 	}
 	return bios_entry != nil && bios_entry(addr, run)

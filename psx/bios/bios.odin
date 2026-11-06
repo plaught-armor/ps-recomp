@@ -843,7 +843,7 @@ undeliver_event :: proc(class, spec: u32) {
 @(private)
 hle_call :: proc(addr: u32) {
 	saved := cpu.state
-	cpu.call(addr)
+	cpu.call_callback(addr)
 	cycles := cpu.state.cycles
 	cpu.state = saved
 	cpu.state.cycles = cycles
@@ -881,7 +881,7 @@ deliver_irq :: proc() {
 		}
 		cpu.state.r[28] = cpu.r32(buf + 44)
 		cpu.state.r[2] = 1
-		cpu.call(target)
+		cpu.call_callback(target)
 	}
 	io.irq_regs.in_handler = false
 	bios.rfe = false
@@ -906,10 +906,10 @@ run_int_chains :: proc() {
 			second := cpu.r32(e + 4)
 			next := cpu.r32(e)
 			if first != 0 {
-				cpu.call(first)
+				cpu.call_callback(first)
 				if v := cpu.state.r[2]; v != 0 && second != 0 && !bios.rfe {
 					cpu.state.r[4] = v
-					cpu.call(second)
+					cpu.call_callback(second)
 				}
 				if bios.rfe {
 					return
@@ -1236,6 +1236,8 @@ slot_owned :: #force_inline proc() -> bool {
 thread_entry :: proc(arg: rawptr) {
 	i := int(uintptr(arg))
 	reap_zombie()
+	// No replacement runs in a new thread (mod_call_original).
+	cpu.mod_inner = nil
 	cpu.call(threads[i].entry)
 	cpu.fatal("thread %d returned from its entry %#08x", i, threads[i].entry)
 }
@@ -1317,8 +1319,12 @@ change_thread :: proc(h: u32) {
 	when core.FLAT {
 		flat.orphan = false
 	} else {
+		// A mod's replacement may switch threads, as the function it stands
+		// in for may: the replacements running are this thread's.
+		inner := cpu.mod_inner
 		core.co_switch(to.co)
 		// Resumed: whoever switched back already loaded our registers.
+		cpu.mod_inner = inner
 		reap_zombie()
 	}
 }

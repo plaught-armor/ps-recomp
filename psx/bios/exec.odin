@@ -157,9 +157,18 @@ exec :: proc(hdr, argc, argv: u32) {
 	if exec_state.depth >= MAX_EXEC_DEPTH {
 		cpu.fatal("Exec/LoadExec nested %d deep (pc0 %#08x)", exec_state.depth, cpu.r32(hdr + EXEC_PC0))
 	}
+	// The new program runs inside no replacement (cpu.mod_inner), so its
+	// mod_call_original is fatal unless a replacement of its own makes it;
+	// and never in a hook's frozen time, which it would not leave.
+	if cpu.mod_depth > 0 {
+		cpu.fatal("Exec/LoadExec inside a mod hook: hooks run in frozen time (pc0 %#08x, ra %#08x)", cpu.r32(hdr + EXEC_PC0), r[31])
+	}
+	inner := cpu.mod_inner
+	cpu.mod_inner = nil
 	exec_state.depth += 1
 	cpu.call(cpu.r32(hdr + EXEC_PC0))
 	exec_state.depth -= 1
+	cpu.mod_inner = inner
 	r[29] = cpu.r32(save)
 	r[30] = cpu.r32(save + 4)
 	r[28] = cpu.r32(save + 8)

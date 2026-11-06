@@ -38,6 +38,13 @@ struct mod_hook {
 #define MOD_AFTER(target, fn) MOD_HOOK_(1, target, fn)
 #define MOD_REPLACE(target, fn) MOD_HOOK_(2, target, fn)
 
+// From a replacement: run the function it replaces, without its hooks, on
+// the arguments now in a0-a3, and return its results. Cast it to the
+// function's prototype, as a game function. It is the innermost running
+// replacement's; a call from a before or after hook, or with no
+// replacement running, is fatal.
+unsigned mod_call_original() __attribute__((long_call));
+
 unsigned ov_a_80100004() __attribute__((long_call));
 #define MOD_KEY_ov_a_80100004 0x80100000, 0xa0a0a0a0, 0x80100004, {0x0000a001, 0x0000a002, 0x0000a003, 0x0000a004}
 unsigned a_fn() __attribute__((long_call));

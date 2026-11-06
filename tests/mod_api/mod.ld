@@ -3,11 +3,13 @@
  * The image goes at MOD_ORIGIN (mods/build.sh --origin; the mod region's
  * base by default) and must end before the region's guard word and stack.
  * .mod_hooks is not loaded: the runtime reads it from the ELF. Each game
- * function is a symbol at its address. */
+ * function is a symbol at its address, and mod_call_original is the
+ * runtime's. */
 
 ENTRY(mod_entry_none)
 mod_entry_none = 0;
 
+mod_call_original = 0x1f3ffff0;
 ov_a_80100004 = 0x80100004;
 a_fn = 0x80100004;
 ov_b_80100004 = 0x80100004;

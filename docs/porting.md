@@ -153,7 +153,19 @@ from the hook's own cycle count, so it lands later in game time by the
 hook's length. After hooks see the arguments (a0-a3) and the results
 (v0, v1). The replacement runs on the game's stack and in game time,
 except when it is called from inside a hook: then it runs in that hook's
-frozen time.
+frozen time. A replacement runs the function it replaces through
+`mod_call_original()` (cast to the function's type): the innermost running
+replacement's original, recompiled or interpreted, without its hooks;
+the replacements running are per thread, so an original may switch threads.
+It is fatal, with the same message on every build, when called from a
+hook (or a hook inside a replacement), from code an original runs, from
+guest code the BIOS calls back (an interrupt or event handler, a
+`qsort` compare function), from a program `Exec` or `LoadExec` started,
+or with no replacement running: none of that code is inside the
+replacement, unless it is a replacement itself. A replacement may tail-call
+it (`return mod_call_original(x)`, a `jr`). When the function's code is no
+longer in RAM (another overlay loaded at its slot meanwhile), it is fatal
+too, naming the overlay. `Exec` or `LoadExec` inside a hook is fatal.
 An install error leaves nothing installed.
 
 On PS1, `play` loads the mods in the disc's data directory, `mods/`
@@ -206,14 +218,15 @@ four words in its image are left out, with a count. The header declares
 each function `long_call`: a `jal` from the mod region cannot reach the
 game's code, and ld.lld links a wrong target there without an error. It
 also gives `MOD_BEFORE(target, fn)`, `MOD_AFTER` and `MOD_REPLACE`, which
-emit a `.mod_hooks` record keyed by the function as the game has it. Then
+emit a `.mod_hooks` record keyed by the function as the game has it, and
+`mod_call_original`, at an address `mod.ld` reserves below the region. Then
 `mods/build.sh <api dir> <mod dir> [--origin <hex>]` compiles every `.c`
 in the mod directory with `mods/rt.c` (memcpy, memset, memmove and memcmp,
 so the mod never calls the game for them) into `<mod dir>/mod.elf`. It
 needs clang, ld.lld and llvm-nm. The image is linked at the region's
 base, or at `--origin` (hex, 16-byte aligned, in the region) for a second
 mod that loads with the first. The build fails when the mod defines a name
-`mod_api.h` gives a game function (the script's address would win over the
+`mod_api.h` gives a game function or the runtime (the script's address would win over the
 mod's own definition, silently), when a loaded section is not one `mod.ld`
 places (`--orphan-handling=error`), and when the image runs past the
 region's guard word and stack. An overlay file too short for its id word
@@ -234,6 +247,9 @@ Limits:
   where a thread switch or a wait is fatal. A hooked function recursing
   more than 4 deep runs nested; a stop inside it is fatal. So does every
   hook in an executable that Exec or LoadExec started.
+- The running replacements and hooks (`cpu.mod_inner`, `mod_depth`,
+  `mod_held`) are not in a save state; they become state when PS1
+  snapshots land.
 - IOP hooks are untested.
 
 ## Settings and memory cards

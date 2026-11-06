@@ -21,6 +21,10 @@ MOD_BASE :: 0x1f40_0000
 // The region's largest size: up to the scratchpad at 0x1f800000.
 MOD_REGION :: 0x40_0000
 MOD_STACK :: 16 * 1024
+// The address a replacement calls to run the function it replaces
+// (mod_api.h's mod_call_original, mod.odin): host code, below the region,
+// so no image, guard or stack is at it.
+MOD_ORIGINAL :: MOD_BASE - 16
 
 @(private = "file")
 MOD_GUARD :: 0x4d4f_4447

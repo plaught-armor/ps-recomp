@@ -20,6 +20,17 @@
 // hook: then it runs in the hook's frozen time. A hook must not switch
 // threads (fatal) or wait for an event (none comes).
 //
+// A replacement calls the function it replaces with mod_call_original (a
+// call to MOD_ORIGINAL): the original, past the thunk, so with no hooks,
+// on the arguments in a0-a3 then, returning its results. It is the
+// innermost running replacement's: one a replacement's call reached runs
+// its own until it returns. A call to it from a before or after hook, from
+// inside an original (mod_original), from guest code host code called back
+// (call_callback, the BIOS's handlers), or with no replacement running, is
+// fatal, the same on both builds. So is one whose function's code is no
+// longer in RAM (another overlay at its slot): the message names the
+// overlay.
+//
 // mod_install picks the entry by what runs the function now:
 //
 //   - executable function, recompiled: its fixed slot, through hook
@@ -109,6 +120,47 @@ mod_thunks_fill :: proc($LO, $HI: int) {
 		mod_thunks_fill(LO, (LO + HI) / 2)
 		mod_thunks_fill((LO + HI) / 2, HI)
 	}
+}
+
+// The replacements running in the recursive model (mod_enter's call),
+// innermost first, on the host stack: what mod_call_original calls. depth
+// is mod_depth when it was called, so a hook it reached does not get its
+// original. run -1 is a marker, where code runs that is not inside the
+// replacement below it: an original (mod_original) or a callback of host
+// code (call_callback). flat is the flat run then running (FLAT; nil none):
+// a continuation pushed on another run is inside it. Each thread has its
+// own (psx/bios change_thread); Exec and LoadExec start the new program
+// with none (psx/bios exec).
+//
+// mod_inner, mod_depth and mod_held are not in a save state: when PS1
+// snapshots land they become snap_add state (docs/porting.md, Mods).
+Mod_Inner :: struct {
+	run, depth: int,
+	prev:       ^Mod_Inner,
+	flat:       ^Flat_Ctx,
+}
+mod_inner: ^Mod_Inner
+
+// A Mod_Inner for run on top of mod_inner, for the caller to link in.
+@(private = "file")
+mod_inner_at :: proc(run: int) -> Mod_Inner {
+	when core.FLAT {
+		return {run, mod_depth, mod_inner, flat_cur}
+	} else {
+		return {run, mod_depth, mod_inner, nil}
+	}
+}
+
+// Call the guest code at addr for host code, as call does: an interrupt
+// handler, a callback, a compare function. Under a marker: the code it runs
+// is not inside the replacement that may be running, so a mod_call_original
+// it makes outside a replacement of its own is fatal, as it is under FLAT,
+// where such code runs nested, on a run of its own.
+call_callback :: proc(addr: u32) {
+	mark := mod_inner_at(-1)
+	mod_inner = &mark
+	call(addr)
+	mod_inner = mark.prev
 }
 
 // Hooks now running, nested. While it is above 0, run_events handles
@@ -218,7 +270,7 @@ mod_enter :: proc(site: int) {
 	when core.FLAT {
 		if !flat_host_call && flat_cur != nil && flat_cur.hosts < FLAT_HOST {
 			m := (^Mod_Cont)(&flat_push_cont(FLAT_MOD).w)
-			m^ = {site = i32(site)}
+			m^ = {site = i32(site), depth = i32(mod_depth)}
 			for &a, i in m.entry {a = state.r[4 + i]}
 			return
 		}
@@ -233,13 +285,78 @@ mod_enter :: proc(site: int) {
 	entry := mod_args()
 	mod_before(c)
 	if r, ok := c.replace.?; ok {
+		inner := mod_inner_at(run)
+		mod_inner = &inner
 		call(r.fn)
-	} else if mod_runs[run].original != nil {
-		mod_runs[run].original()
+		mod_inner = inner.prev
 	} else {
-		call_guest(addr)
+		mod_original(run)
 	}
 	mod_after(c, entry)
+}
+
+// Run the function run's chain hooks, past its thunk: the procedure its
+// entry had (counted as native code under FLAT), or the interpreter. Under
+// a marker: guest code inside it is not inside the replacement that called
+// it.
+@(private = "file")
+mod_original :: proc(run: int) {
+	mark := mod_inner_at(-1)
+	mod_inner = &mark
+	defer mod_inner = mark.prev
+	if o := mod_runs[run].original; o == nil {
+		call_guest(mod_runs[run].chain.key.addr)
+	} else {
+		when core.FLAT {flat_call_native(o)} else {o()}
+	}
+}
+
+// A call to MOD_ORIGINAL (host_call): the original of the innermost running
+// replacement. Under FLAT, that is the innermost mod continuation of the
+// running flat run, when it has one pushed since mod_inner (mod_inner's
+// flat is another run: a run's frames do not grow while host code it called
+// runs, and the runs nested since are newer). An interpreted original whose
+// replacement guest code on the run called runs as a continuation, where a
+// stop may come, as it does under mod_flat_step; one from host code (native
+// code's call) runs nested.
+mod_call_original :: proc() {
+	i := mod_inner
+	when core.FLAT {
+		x := flat_cur
+		if x != nil && (i == nil || i.flat != x) {
+			if site, run, depth, ok := mod_flat_replacing(x); ok {
+				if run < 0 || int(depth) != mod_depth {mod_original_fatal()}
+				mod_original_resident(run)
+				if mod_runs[run].original == nil && !flat_host_call && x.hosts < FLAT_HOST {
+					m := (^Mod_Cont)(&flat_push_cont(FLAT_MOD).w)
+					m^ = {site = site, run = i32(run), depth = depth, orig = true}
+				} else {
+					mod_original(run)
+				}
+				return
+			}
+		}
+	}
+	if i == nil || i.run < 0 || i.depth != mod_depth {mod_original_fatal()}
+	mod_original_resident(i.run)
+	mod_original(i.run)
+}
+
+// Fatal unless run's code is in RAM, as when its replacement was called: an
+// overlay loaded over it meanwhile is named.
+@(private = "file")
+mod_original_resident :: proc(run: int) {
+	k := mod_runs[run].chain.key
+	if mod_resident(k) {return}
+	if k.slot != 0 {
+		fatal("mod: mod_call_original for %08x, in overlay %08x at %08x: that code is no longer in RAM (overlay %08x there)", k.addr, k.id, k.slot, r32(k.slot))
+	}
+	fatal("mod: mod_call_original for %08x: that code is no longer in RAM", k.addr)
+}
+
+@(private = "file")
+mod_original_fatal :: proc() -> ! {
+	fatal("mod: a call to mod_call_original (%08x) outside a replacement (ra %08x)", u32(MOD_ORIGINAL), state.r[31])
 }
 
 // The run of site's chain whose hooked code is in RAM now, or -1.
@@ -281,7 +398,9 @@ when core.FLAT {
 	// A mod thunk's continuation, in Flat_Host.w: the thunk's site, the
 	// arguments it was called with, whether the replacement or the original
 	// was called, and from then the chain run (an index into mod_runs, or -1
-	// for none resident: the call as call_slow makes it). The chain is picked
+	// for none resident: the call as call_slow makes it). With orig, it is
+	// mod_call_original's instead: it calls the run's interpreted original,
+	// and no hook. The chain is picked
 	// at that step, not at the push: a run can stop between the two, and
 	// another thread may swap the overlay in the meantime. site and run index
 	// this install's tables, so a save state that holds a Mod_Cont is only
@@ -289,8 +408,10 @@ when core.FLAT {
 	@(private = "file")
 	Mod_Cont :: struct {
 		site, run: i32,
+		depth:     i32, // mod_depth at the push
 		entry:     [4]u32,
 		called:    bool,
+		orig:      bool,
 	}
 	#assert(size_of(Mod_Cont) <= FLAT_HOST_WORDS * 4)
 
@@ -301,11 +422,15 @@ when core.FLAT {
 		if h.tag != FLAT_MOD {fatal("psx: flat continuation %d", h.tag)}
 		m := (^Mod_Cont)(&h.w)
 		if m.called {
-			if m.run >= 0 {mod_after(&mod_runs[m.run].chain, m.entry)}
+			if m.run >= 0 && !m.orig {mod_after(&mod_runs[m.run].chain, m.entry)}
 			flat_pop_cont()
 			return
 		}
 		m.called = true
+		if m.orig {
+			flat_call(mod_sites[m.site].addr, .Guest)
+			return
+		}
 		m.run = i32(mod_pick(int(m.site)))
 		if m.run < 0 {
 			flat_call(mod_sites[m.site].addr, .Slow)
@@ -322,6 +447,23 @@ when core.FLAT {
 		} else {
 			flat_call(mod_sites[m.site].addr, .Guest)
 		}
+	}
+
+	// The site, run and depth of x's innermost mod continuation, when it
+	// called a replacement that is running: the guest code on top of x is
+	// inside it. Run -1 when the code is inside an original, or in a hook or
+	// a chain with no replacement; ok false when x has no mod continuation.
+	@(private = "file")
+	mod_flat_replacing :: proc(x: ^Flat_Ctx) -> (site: i32, run: int, depth: i32, ok: bool) {
+		for k := int(x.depth) - 1; k >= 0; k -= 1 {
+			f := x.frames[k]
+			if f.kind != .Cont || x.host[f.slot].tag != FLAT_MOD {continue}
+			m := (^Mod_Cont)(&x.host[f.slot].w)
+			if !m.called || m.orig || m.run < 0 {return 0, -1, 0, true}
+			if _, r := mod_runs[m.run].chain.replace.?; !r {return 0, -1, 0, true}
+			return m.site, int(m.run), m.depth, true
+		}
+		return 0, -1, 0, false
 	}
 }
 

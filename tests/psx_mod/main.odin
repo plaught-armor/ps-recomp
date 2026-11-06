@@ -17,6 +17,36 @@
 //               after of b. FLAT only
 //   0x80014000  G, executable: b replaces it with interpreted guest code at
 //               0x80190100 that stops the run; after of a. FLAT only
+//   0x80015000  H, executable, recompiled: before of a, after of b, and b
+//               replaces it with a function that calls its original
+//               (mod_call_original) twice, and J between
+//   0x80016000  J, executable, interpreted: a replaces it with a function
+//               that calls its original
+//   0x80017000  K, executable, interpreted guest code that stops the run:
+//               b replaces it with interpreted guest code at 0x80190200
+//               that calls its original; after of a. FLAT only
+//   0x80018000  X, executable, recompiled: a before hook of b calls
+//               mod_call_original (fatal)
+//   0x80019000  T, executable, interpreted guest code that yields: b
+//               replaces it with guest code at 0x80190300 that calls its
+//               original twice; after of a
+//   0x8001a000  U, as T, on a second thread: a replaces it with the same
+//               code; after of b
+//   0x80100400  R, the overlay, interpreted: a replaces it with a function
+//               that loads another overlay at the slot, then calls its
+//               original (fatal, naming the overlay)
+//   0x8001d000  W, executable, recompiled: b replaces it with interpreted
+//               guest code at 0x80190400 that calls its original; after of
+//               a. FLAT only
+//   0x8001e000  P, executable, interpreted guest code: a replaces it with
+//               guest code at 0x80190500 that calls P on a0 - 1 while a0 is
+//               above 0, then its original. FLAT only
+//   0x8001e100  L, executable, interpreted guest code: a replaces it with
+//               guest code at 0x80190600 that tail-calls its original (jr);
+//               after of b
+//   0x8001f000  Q, executable, recompiled: a replaces it with a function
+//               that runs a program with Exec (A(43h)), then calls its
+//               original
 //
 // Mod functions live at 0x80180000 (recompiled) and 0x80190000
 // (interpreted). Checked: the order hooks run in; befores and afters on the
@@ -25,11 +55,31 @@
 // afters see the arguments and the results; the replacement and the
 // original in game time; an event a hook schedules or an interrupt it
 // raises is handled only after it returns, at once, and cop0 is put back.
-// With the
-// overlay's id or D's first word changed, calls run without hooks. Install
-// errors leave nothing installed. Under FLAT (-define:PS_FLAT=true), a guest
+// mod_call_original runs the innermost running replacement's original,
+// recompiled or interpreted, without its hooks; from a hook, a hook inside
+// a replacement or no replacement it is fatal (a child process each). With
+// the overlay's id or D's first word changed, calls run without hooks. Install
+// errors leave nothing installed. Fatal too, the same on both builds (a
+// child each): mod_call_original from inside an original (H's recompiled,
+// J's interpreted), from guest code a replacement's host code calls back
+// (call_callback), from a program Exec started (Q's), and for an overlay
+// function whose overlay another replaced meanwhile (R's); under FLAT, from
+// inside W's original and from a callback inside G's replacement, both on a
+// flat run. Exec starts its program with no replacement and no hook
+// running, and the replacement that made it gets its own original after.
+// L's replacement tail-calls its original, plain from host code and under
+// FLAT on a flat run. Under FLAT W's replacement, on the run, gets its
+// recompiled original; P recursing 4 deep fills the run's continuations,
+// so the call below runs nested, inside it its original, and the original
+// of the one at the fourth too (call_guest); the outer three get theirs on
+// the run. Under FLAT (-define:PS_FLAT=true), a guest
 // call from a flat run to F or G stops inside the original or the
-// replacement and goes on with the after hook when the run resumes; with F's
+// replacement and goes on with the after hook when the run resumes, and so
+// does one inside K's original, which K's replacement called. Through the
+// BIOS's threads (ChangeTh), a replacement's original switches to a thread
+// whose own replacement's original switches back: each mod_call_original
+// runs its own thread's replacement's original, and each after hook runs in
+// its thread, plain and under FLAT. With F's
 // last CODE word changed, F stops and resumes without hooks; a call to A from
 // host code while F's run is on runs A's chain nested, at once.
 package main
@@ -38,6 +88,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "ps:core"
+import bios "ps:psx/bios"
 import cpu "ps:psx/cpu"
 import io "ps:psx/io"
 
@@ -57,6 +108,23 @@ EXE_D :: 0x80011000
 EXE_E :: 0x80012000
 FLAT_F :: 0x80013000
 FLAT_G :: 0x80014000
+EXE_H :: 0x80015000
+EXE_J :: 0x80016000
+FLAT_K :: 0x80017000
+EXE_X :: 0x80018000
+FLAT_W :: 0x8001d000
+FLAT_P :: 0x8001e000
+EXE_L :: 0x8001e100
+EXE_Q :: 0x8001f000
+OVL_R :: 0x80100400
+// Q's program's header (Exec's).
+HDR :: 0x80030000
+THR_T :: 0x80019000
+THR_U :: 0x8001a000
+// The two threads' code: the main thread calls T, the second U.
+THR_MAIN :: 0x8001b000
+THR_B :: 0x8001c000
+THR_B_SP :: 0x801e0000
 CALLER :: 0x80020000
 SLOT :: 0x80100000
 ID :: 0x3c011234
@@ -73,8 +141,21 @@ M_B_AFTER :: 0x80180030
 M_REPLACE :: 0x80180040
 M_NEST :: 0x80180050
 M_E_BEFORE :: 0x80180060
+M_ORIG_H :: 0x80180070
+M_ORIG_J :: 0x80180080
+M_ORIG_HOOK :: 0x80180090
+M_MOVE :: 0x801800a0
+M_EXEC :: 0x801800b0
+M_PC0 :: 0x801800c0
 M_I_BEFORE :: 0x80190000
 M_I_REPLACE :: 0x80190100
+M_I_ORIG :: 0x80190200
+M_I_THR :: 0x80190300
+M_I_W :: 0x80190400
+M_I_P :: 0x80190500
+M_I_L :: 0x80190600
+// Guest code a callback runs: it tail-calls mod_call_original (fatal).
+M_I_CB :: 0x80190700
 
 @(private = "file", rodata)
 CODE := [4]u32{0x27bdffe8, 0xafbf0010, 0xafb00014, 0x00000000}
@@ -150,6 +231,22 @@ key :: proc(addr: u32, slot: u32 = 0, id: u32 = 0) -> core.Mod_Key {
 @(private = "file")
 schedule: bool
 
+// J's replacement calls X too (a child's fatal case).
+@(private = "file")
+nest_x: bool
+
+// Children's fatal cases: H's and J's originals, and W's, call
+// mod_call_original (in_orig); J's replacement calls M_I_CB back (cb); Q's
+// program calls it (exec_orig).
+@(private = "file")
+in_orig, cb, exec_orig: bool
+
+// lui t2 and addiu t2 for MOD_ORIGINAL.
+@(private = "file")
+orig_hi :: proc() -> u32 {return 0x3c0a0000 | (cpu.MOD_ORIGINAL + 0x8000) >> 16}
+@(private = "file")
+orig_lo :: proc() -> u32 {return 0x254a0000 | cpu.MOD_ORIGINAL & 0xffff}
+
 main :: proc() {
 	cpu.interp_run = proc(start: u32) {
 		switch start {
@@ -159,6 +256,11 @@ main :: proc() {
 			game_fn("iB", 3)
 		case OVL_C:
 			game_fn("C", 4)
+		case EXE_J:
+			if in_orig {cpu.call(cpu.MOD_ORIGINAL)}
+			game_fn("J", 3)
+		case M_I_CB:
+			cpu.call(cpu.MOD_ORIGINAL)
 		case M_I_BEFORE:
 			hook_fn("i<")
 		case:
@@ -170,6 +272,31 @@ main :: proc() {
 	put_code(EXE_E)
 	put_code(FLAT_F)
 	put_code(FLAT_G)
+	put_code(EXE_H)
+	put_code(EXE_J)
+	put_code(FLAT_K)
+	put_code(EXE_X)
+	put_code(THR_T)
+	put_code(THR_U)
+	put_code(FLAT_W)
+	put_code(FLAT_P)
+	put_code(EXE_L)
+	put_code(EXE_Q)
+	put_code(OVL_R)
+	// L's body after CODE: v0 = a0 + 1.
+	put(EXE_L + 16, 0x24820001) // addiu v0, a0, 1
+	put(EXE_L + 20, 0x03e00008) // jr ra
+	put(EXE_L + 24, 0x27bd0018) // addiu sp, sp, 24
+	// L's replacement: its original on a0 + 1, a tail call.
+	put(M_I_L, 0x24840001) // addiu a0, a0, 1
+	put(M_I_L + 4, orig_hi())
+	put(M_I_L + 8, orig_lo())
+	put(M_I_L + 12, 0x01400008) // jr t2
+	put(M_I_L + 16, 0)
+	put(M_I_CB, orig_hi())
+	put(M_I_CB + 4, orig_lo())
+	put(M_I_CB + 8, 0x01400008) // jr t2
+	put(M_I_CB + 12, 0)
 	put_code(OVL_B)
 	put_code(OVL_C)
 	put_code(BOTH)
@@ -204,6 +331,57 @@ main :: proc() {
 					r()[4] = 9
 					cpu.call(EXE_D)
 				}},
+			{EXE_H, proc() {
+					if in_orig {cpu.call(cpu.MOD_ORIGINAL)}
+					game_fn("H", 1)
+				}},
+			{FLAT_W, proc() {
+					if in_orig {cpu.call(cpu.MOD_ORIGINAL)}
+					game_fn("W", 2)
+				}},
+			{EXE_Q, proc() {game_fn("Q", 4)}},
+			{M_MOVE, proc() {
+					put(SLOT, ID + 1)
+					cpu.call(cpu.MOD_ORIGINAL)
+				}},
+			// Q's replacement: a program with Exec, then Q's original.
+			{M_EXEC, proc() {
+					append(&log, "RQ")
+					a0 := r()[4]
+					r()[4], r()[5], r()[6] = HDR, 0, 0
+					bios.bios_a(0x43)
+					append(&log, fmt.aprintf("exec v0=%x", r()[2]))
+					r()[4] = a0
+					cpu.call(cpu.MOD_ORIGINAL)
+				}},
+			{M_PC0, proc() {
+					append(&log, fmt.aprintf("pc0 inner=%v depth=%d", cpu.mod_inner == nil, cpu.mod_depth))
+					if exec_orig {cpu.call(cpu.MOD_ORIGINAL)}
+				}},
+			{EXE_X, proc() {game_fn("X", 1)}},
+			// H's replacement: its original on a0 + 1, J (whose replacement
+			// calls J's original), then H's original again, on its first
+			// result.
+			{M_ORIG_H, proc() {
+					append(&log, fmt.aprintf("RH a0=%x", r()[4]))
+					r()[4] += 1
+					cpu.call(cpu.MOD_ORIGINAL)
+					v := r()[2]
+					append(&log, fmt.aprintf("RH v0=%x", v))
+					r()[4] = 10
+					cpu.call(EXE_J)
+					r()[4] = v
+					cpu.call(cpu.MOD_ORIGINAL)
+					r()[2] += 0x100
+				}},
+			{M_ORIG_J, proc() {
+					append(&log, fmt.aprintf("RJ a0=%x", r()[4]))
+					if nest_x {cpu.call(EXE_X)}
+					if cb {cpu.call_callback(M_I_CB)}
+					cpu.call(cpu.MOD_ORIGINAL)
+					append(&log, fmt.aprintf("RJ v0=%x", r()[2]))
+				}},
+			{M_ORIG_HOOK, proc() {cpu.call(cpu.MOD_ORIGINAL)}},
 		},
 	)
 	cpu.register_overlay_funcs({{addr = OVL_B, slot = SLOT, id = ID, sig = CODE, fn = proc() {game_fn("B", 3)}}})
@@ -234,6 +412,24 @@ main :: proc() {
 		{key(FLAT_F), .After, 1, M_B_AFTER},
 		{key(FLAT_G), .Replace, 1, M_I_REPLACE},
 		{key(FLAT_G), .After, 0, M_A_AFTER},
+		{key(EXE_H), .Before, 0, M_A_BEFORE},
+		{key(EXE_H), .Replace, 1, M_ORIG_H},
+		{key(EXE_H), .After, 1, M_B_AFTER},
+		{key(EXE_J), .Replace, 0, M_ORIG_J},
+		{key(FLAT_K), .Replace, 1, M_I_ORIG},
+		{key(FLAT_K), .After, 0, M_A_AFTER},
+		{key(EXE_X), .Before, 1, M_ORIG_HOOK},
+		{key(THR_T), .Replace, 1, M_I_THR},
+		{key(THR_T), .After, 0, M_A_AFTER},
+		{key(THR_U), .Replace, 0, M_I_THR},
+		{key(THR_U), .After, 1, M_B_AFTER},
+		{key(OVL_R, SLOT, ID), .Replace, 0, M_MOVE},
+		{key(FLAT_W), .Replace, 1, M_I_W},
+		{key(FLAT_W), .After, 0, M_A_AFTER},
+		{key(FLAT_P), .Replace, 0, M_I_P},
+		{key(EXE_L), .Replace, 0, M_I_L},
+		{key(EXE_L), .After, 1, M_B_AFTER},
+		{key(EXE_Q), .Replace, 0, M_EXEC},
 	}
 	chains, cerr := core.mod_chains(mods, order, hooks)
 	check(cerr == "", cerr)
@@ -243,6 +439,7 @@ main :: proc() {
 	err := cpu.mod_install(mods, chains)
 	check(err == "", err)
 	check(cpu.mod_install(mods, chains) == "mod: hooks installed twice", "twice")
+	if len(os.args) == 2 {orig_child(os.args[1])}
 
 	// A: befores in load order, the port hook and A, afters in reverse.
 	cpu.state.cycles = 100
@@ -313,6 +510,38 @@ main :: proc() {
 	call(BOTH, 1)
 	expect("a< a0=1 v0=0; interp 80100300")
 
+	// H: its replacement runs its original (recompiled) twice, without
+	// hooks, and J between, whose replacement runs J's (interpreted).
+	v0 = call(EXE_H, 5)
+	expect("a< a0=5 v0=0; RH a0=5; H a0=6; RH v0=7; RJ a0=a; J a0=a; RJ v0=d; H a0=7; b> a0=5 v0=108")
+	check(v0 == 0x108, fmt.tprintf("H's result %x", v0))
+
+	// mod_call_original from a before hook, from one a replacement reached,
+	// and with no replacement running: each fatal.
+	self, _ := os.get_executable_path(context.allocator)
+	Child :: struct {
+		name, said: string,
+	}
+	OUTSIDE :: "fatal: mod: a call to mod_call_original (1f3ffff0) outside a replacement"
+	all := [?]Child {
+		{"hook", OUTSIDE},
+		{"nested", OUTSIDE},
+		{"none", OUTSIDE},
+		{"inorig", OUTSIDE},
+		{"ininterp", OUTSIDE},
+		{"callback", OUTSIDE},
+		{"exec", OUTSIDE},
+		{"moved", "fatal: mod: mod_call_original for 80100400, in overlay 3c011234 at 80100000: that code is no longer in RAM (overlay 3c011235 there)"},
+		{"flatorig", OUTSIDE}, // FLAT only
+		{"flatcb", OUTSIDE},
+	}
+	for c in all[:len(all) - (core.FLAT ? 0 : 2)] {
+		state, _, errs, perr := os.process_exec({command = {self, c.name}}, context.temp_allocator)
+		check(perr == nil && state.exit_code == 1, fmt.tprintf("child %s: %v exit %d", c.name, perr, state.exit_code))
+		check(strings.contains(string(errs), c.said), fmt.tprintf("child %s said %q", c.name, string(errs)))
+	}
+	delete(self)
+
 	// D's code changed: D runs as it is, without hooks.
 	put(EXE_D, 0)
 	v0 = call(EXE_D, 1)
@@ -322,7 +551,13 @@ main :: proc() {
 	call(EXE_D, 1)
 	expect(fmt.tprintf("i< a0=1 v0=0; R a0=1 sp=%x", u32(GAME_SP)))
 
-	when core.FLAT {test_flat()}
+	when core.FLAT {
+		test_flat()
+		test_flat_orig()
+	}
+	test_threads()
+	when !core.FLAT {test_tail()}
+	test_exec()
 
 	core.mod_chains_delete(chains)
 	free_all(context.temp_allocator)
@@ -374,6 +609,191 @@ test_errors :: proc(mods: []core.Mod_Manifest) {
 	expect("P; A a0=5")
 }
 
+// A child process: call mod_call_original where it is fatal, and exit 3 if
+// it was not.
+@(private = "file")
+orig_child :: proc(name: string) {
+	switch name {
+	case "hook":
+		call(EXE_X, 1)
+	case "nested":
+		nest_x = true
+		call(EXE_J, 1)
+	case "none":
+		cpu.call(cpu.MOD_ORIGINAL)
+	case "inorig":
+		in_orig = true
+		call(EXE_H, 1)
+	case "ininterp":
+		in_orig = true
+		call(EXE_J, 1)
+	case "callback":
+		cb = true
+		call(EXE_J, 1)
+	case "exec":
+		bios.bios_init()
+		exec_orig = true
+		test_exec()
+	case "moved":
+		call(OVL_R, 1)
+	case "flatorig":
+		when core.FLAT {
+			in_orig = true
+			flat_orig_setup()
+			flat_caller(FLAT_W)
+		}
+	case "flatcb":
+		when core.FLAT {
+			flat_orig_setup()
+			// G's replacement stops with B(43h), which calls M_I_CB back.
+			stopper(M_I_REPLACE, 0x43, 0x24020099)
+			flat_caller(FLAT_G)
+		}
+	}
+	os.exit(3)
+}
+
+// test_threads' handle of its second thread, and how many times each
+// yield (B(46h) to B(49h)) ran.
+@(private = "file")
+thr: struct {
+	b:      u32,
+	yields: [4]int,
+}
+
+// A yield of test_threads, B(n): log it with the running thread's
+// replacements (mod_inner's, past its markers), and switch threads as the case has it.
+@(private = "file")
+thr_yield :: proc(n: u32) {
+	k := n - 0x46
+	if k >= 4 {
+		check(false, fmt.tprintf("B(%x) in test_threads", n))
+		return
+	}
+	depth := 0
+	for i := cpu.mod_inner; i != nil; i = i.prev {depth += int(i.run >= 0)}
+	append(&log, fmt.aprintf("y%x %d", n, depth))
+	thr.yields[k] += 1
+	// T's original and U's switch the first time only; the threads' own
+	// code, every time.
+	to: u32
+	switch n {
+	case 0x46:
+		if thr.yields[k] == 1 {to = thr.b}
+	case 0x47:
+		if thr.yields[k] == 1 {to = 0xff000000}
+	case 0x48:
+		to = thr.b
+	case 0x49:
+		to = 0xff000000
+	}
+	if to == 0 {return}
+	// ChangeTh takes the handle in a0, the function's argument here: the
+	// thread switched from gets its own a0 back.
+	a0 := r()[4]
+	r()[4] = to
+	when core.FLAT {
+		// The run stops with the other thread's registers loaded; this
+		// thread's are in its TCB (the PCB's word).
+		from := cpu.r32(cpu.r32(0x108))
+		bios.bios_b(0x10)
+		cpu.w32(from + 8 + 4 * 4, a0)
+	} else {
+		inner := cpu.mod_inner
+		bios.bios_b(0x10)
+		// Resumed on this thread.
+		r()[4] = a0
+		check(cpu.mod_inner == inner, fmt.tprintf("y%x: the thread's replacements back after the switch", n))
+	}
+}
+
+// A replacement's original switches threads (T's yields to the second
+// thread), and the second thread's replacement's original switches back
+// (U's): each later mod_call_original runs its own thread's original, and
+// each after hook its own thread's chain. Plain the threads are the BIOS's
+// coroutines; under FLAT, flat runs that flat_main switches between.
+@(private = "file")
+test_threads :: proc() {
+	bios.bios_init()
+	when core.FLAT {
+		cpu.interp_run = cpu.flat_nested
+		cpu.flat_step = cpu.mod_flat_step
+	} else {
+		cpu.interp_run = cpu.interp_loop
+	}
+	cpu.bios_b = thr_yield
+	thr = {}
+	// T and U as K is, their original yielding.
+	stopper(THR_T + 16, 0x46, 0x24820001) // addiu v0, a0, 1
+	put(THR_T + 16 + 9 * 4, 0x27bd0018)
+	stopper(THR_U + 16, 0x47, 0x24820001)
+	put(THR_U + 16 + 9 * 4, 0x27bd0018)
+	hi, lo := u32(0x3c0a0000 | (cpu.MOD_ORIGINAL + 0x8000) >> 16), u32(0x254a0000 | cpu.MOD_ORIGINAL & 0xffff)
+	// The replacement: the original, then the original on 7, the sum.
+	repl := [?]u32 {
+		0x03e09021, // addu s2, ra, zero
+		hi, // lui t2, hi
+		lo, // addiu t2, t2, lo
+		0x0140f809, // jalr t2
+		0x00000000,
+		0x00409821, // addu s3, v0, zero
+		0x24040007, // addiu a0, zero, 7
+		hi,
+		lo,
+		0x0140f809, // jalr t2
+		0x00000000,
+		0x00531021, // addu v0, v0, s3
+		0x02400008, // jr s2
+		0x00000000,
+	}
+	for w, k in repl {put(M_I_THR + u32(k) * 4, w)}
+	// The main thread: T(5), then yield to the second thread, and return
+	// T's result.
+	main_code := [?]u32 {
+		0x03e08821, // addu s1, ra, zero
+		0x24040005, // addiu a0, zero, 5
+		0x0c000000 | (THR_T >> 2) & 0x3ffffff, // jal T
+		0x00000000,
+		0x00408021, // addu s0, v0, zero
+		0x24090048, // addiu t1, zero, 0x48
+		0x240a00b0, // addiu t2, zero, 0xb0
+		0x0140f809, // jalr t2
+		0x00000000,
+		0x02001021, // addu v0, s0, zero
+		0x02200008, // jr s1
+		0x00000000,
+	}
+	for w, k in main_code {put(THR_MAIN + u32(k) * 4, w)}
+	// The second thread: U(9), then yield back to the main thread, forever.
+	b_code := [?]u32 {
+		0x24040009, // addiu a0, zero, 9
+		0x0c000000 | (THR_U >> 2) & 0x3ffffff, // jal U
+		0x00000000,
+		0x24090049, // addiu t1, zero, 0x49
+		0x240a00b0, // addiu t2, zero, 0xb0
+		0x0140f809, // jalr t2
+		0x00000000,
+		0x1000fffb, // b back to the yield
+		0x00000000,
+	}
+	for w, k in b_code {put(THR_B + u32(k) * 4, w)}
+	r()[4], r()[5], r()[6] = THR_B, THR_B_SP, 0
+	bios.bios_b(0x0e)
+	thr.b = r()[2]
+	check(thr.b == 0xff000001, fmt.tprintf("OpenTh %x", thr.b))
+
+	clear(&log)
+	r()[2], r()[29], r()[31] = 0, GAME_SP, 0x80001234
+	when core.FLAT {bios.flat_main(THR_MAIN)} else {cpu.call(THR_MAIN)}
+	// U's original ran on 9 then 7 (10h + 8), T's on 5 then 7 (6 + 8).
+	// Plain, a thread's replacements are its own: one where an original
+	// yields, none in a thread's own code. Under FLAT a replacement is a
+	// continuation of its thread's run, not on the host stack.
+	d := core.FLAT ? 0 : 1
+	expect(fmt.tprintf("y46 %d; y47 %d; y46 %d; a> a0=5 v0=e; y48 0; y47 %d; b> a0=9 v0=12; y49 0", d, d, d, d))
+	check(r()[2] == 0xe && r()[29] == GAME_SP && cpu.mod_inner == nil, fmt.tprintf("threads: v0 %x, sp %x, back on the main thread with no replacement", r()[2], r()[29]))
+}
+
 // Guest code for test_flat: save $ra in t3, make BIOS call B(n) (which
 // stops the run), set v0, v1 (0x77) and a0 (0x55), return through t3.
 @(private = "file")
@@ -412,6 +832,22 @@ when core.FLAT {
 		stopper(FLAT_F + 16, 0x42, 0x24820001) // addiu v0, a0, 1
 		put(FLAT_F + 16 + 9 * 4, 0x27bd0018) // jr t3's slot: addiu sp, sp, 24
 		stopper(M_I_REPLACE, 0x43, 0x24020099) // addiu v0, zero, 0x99
+		// K as F is, stopping with B(45h).
+		stopper(FLAT_K + 16, 0x45, 0x24820001)
+		put(FLAT_K + 16 + 9 * 4, 0x27bd0018)
+		// K's replacement: K's original on a0 + 1, then 0x100 more.
+		orig := [?]u32 {
+			0x03e06021, // addu t4, ra, zero
+			0x24840001, // addiu a0, a0, 1
+			0x3c0a0000 | (cpu.MOD_ORIGINAL + 0x8000) >> 16, // lui t2, hi
+			0x254a0000 | cpu.MOD_ORIGINAL & 0xffff, // addiu t2, t2, lo
+			0x0140f809, // jalr t2
+			0x00000000,
+			0x24420100, // addiu v0, v0, 0x100
+			0x01800008, // jr t4
+			0x00000000,
+		}
+		for w, k in orig {put(M_I_ORIG + u32(k) * 4, w)}
 		Case :: struct {
 			target: u32,
 			first:  string, // logged until the stop
@@ -423,6 +859,8 @@ when core.FLAT {
 			{FLAT_G, "stop 43", "a> a0=5 v0=99", 0x99},
 			{FLAT_F, "stop 42", "", 6}, // F's last CODE word changed: no hooks
 			{FLAT_F, "a< a0=5 v0=0; a< a0=5 v0=0; b< a0=5 v0=0; P; A a0=5; b> a0=5 v0=6; a> a0=5 v0=6; stop 44", "b> a0=5 v0=6", 6},
+			// The stop is inside K's original, which its replacement called.
+			{FLAT_K, "stop 45", "a> a0=5 v0=107", 0x107},
 		}
 		x: cpu.Flat_Ctx
 		for c, i in cases {
@@ -453,5 +891,134 @@ when core.FLAT {
 			check(r()[2] == c.v0 && r()[3] == 0x77 && r()[4] == 0x55 && r()[29] == GAME_SP, fmt.tprintf("%08x: v0 %x, v1 %x, a0 %x, sp %x: as the function left them, past the after hook", c.target, r()[2], r()[3], r()[4], r()[29]))
 		}
 		cpu.flat_free(&x)
+	}
+}
+
+// L's replacement tail-calls its original (jr t2), called from host code
+// and interpreted. Plain only: FLAT interprets only inside a flat run
+// (test_flat_orig).
+@(private = "file")
+test_tail :: proc() {
+	v0 := call(EXE_L, 5)
+	expect("b> a0=5 v0=7")
+	check(v0 == 7, fmt.tprintf("L's result %x", v0))
+}
+
+// Q's replacement runs a program with Exec: it starts inside no replacement
+// and no hook, and the replacement gets Q's original after it returns.
+@(private = "file")
+test_exec :: proc() {
+	for k in u32(0) ..< 15 {cpu.w32(HDR + 4 * k, 0)}
+	cpu.w32(HDR, M_PC0)
+	v0 := call(EXE_Q, 5)
+	expect("RQ; pc0 inner=true depth=0; exec v0=1; Q a0=5")
+	check(v0 == 9, fmt.tprintf("Q's result %x", v0))
+}
+
+when core.FLAT {
+	// The code test_flat_orig runs, and its BIOS calls: B(43h) calls M_I_CB
+	// back (flatcb); B(4bh), in P's original, logs a0 and whether a stop may
+	// come there (not inside a nested run).
+	@(private = "file")
+	flat_orig_setup :: proc() {
+		cpu.interp_run = cpu.flat_nested
+		cpu.flat_step = cpu.mod_flat_step
+		cpu.bios_b = proc(n: u32) {
+			switch n {
+			case 0x43:
+				cpu.call_callback(M_I_CB)
+			case 0x4b:
+				append(&log, fmt.aprintf("4b a0=%x nested=%v", r()[4], !cpu.flat_can_stop()))
+			case:
+				check(false, fmt.tprintf("B(%x) in test_flat_orig", n))
+			}
+		}
+		// W's replacement: W's original on a0 + 1, then 0x100 more.
+		w := [?]u32 {
+			0x03e06021, // addu t4, ra, zero
+			0x24840001, // addiu a0, a0, 1
+			orig_hi(),
+			orig_lo(),
+			0x0140f809, // jalr t2
+			0x00000000,
+			0x24420100, // addiu v0, v0, 0x100
+			0x01800008, // jr t4
+			0x00000000,
+		}
+		for v, k in w {put(M_I_W + u32(k) * 4, v)}
+		// P's replacement: P(a0 - 1) while a0 is above 0, then P's original
+		// on a0.
+		p := [?]u32 {
+			0x27bdfff0, // addiu sp, sp, -16
+			0xafbf0000, // sw ra, 0(sp)
+			0xafa40004, // sw a0, 4(sp)
+			0x10800003, // beq a0, zero, past the call
+			0x00000000,
+			0x0c000000 | (FLAT_P >> 2) & 0x3ffffff, // jal P
+			0x2484ffff, // addiu a0, a0, -1
+			0x8fa40004, // lw a0, 4(sp)
+			orig_hi(),
+			orig_lo(),
+			0x0140f809, // jalr t2
+			0x00000000,
+			0x8fbf0000, // lw ra, 0(sp)
+			0x03e00008, // jr ra
+			0x27bd0010, // addiu sp, sp, 16
+		}
+		for v, k in p {put(M_I_P + u32(k) * 4, v)}
+		// P's body after CODE: B(4bh), then v0 = a0 + 1.
+		body := [?]u32 {
+			0x240a00b0, // addiu t2, zero, 0xb0
+			0x2409004b, // addiu t1, zero, 0x4b
+			0x0140f809, // jalr t2
+			0x00000000,
+			0x8fbf0010, // lw ra, 16(sp)
+			0x24820001, // addiu v0, a0, 1
+			0x03e00008, // jr ra
+			0x27bd0018, // addiu sp, sp, 24
+		}
+		for v, k in body {put(FLAT_P + 16 + u32(k) * 4, v)}
+	}
+
+	// Run CALLER, calling target with a0 as a flat run's base, to its end
+	// (true) or a stop.
+	@(private = "file")
+	flat_caller :: proc(target: u32, a0: u32 = 5) -> (ended: bool) {
+		code := [?]u32 {
+			0x03e08821, // addu s1, ra, zero
+			0x24040000 | a0, // addiu a0, zero, a0
+			0x0c000000 | (target >> 2) & 0x3ffffff, // jal target
+			0x00000000,
+			0x02200008, // jr s1
+			0x00000000,
+		}
+		for w, k in code {put(CALLER + u32(k) * 4, w)}
+		clear(&log)
+		r()[2], r()[3], r()[29], r()[31] = 0, 0, GAME_SP, 0x80001234
+		cpu.next_event = 1 << 40
+		x: cpu.Flat_Ctx
+		cpu.flat_start(&x, CALLER)
+		ended = cpu.flat_run(&x)
+		cpu.flat_free(&x)
+		return
+	}
+
+	// W's replacement on a flat run gets W's recompiled original; P's
+	// recursion fills the run's continuations (FLAT_HOST): P(0) runs nested
+	// and gets its original there, P(1)'s original runs nested
+	// (call_guest), and the outer three get theirs on the run; L's
+	// replacement tail-calls its original on the run.
+	@(private = "file")
+	test_flat_orig :: proc() {
+		flat_orig_setup()
+		check(flat_caller(FLAT_W), "W: the run ends")
+		expect("W a0=6; a> a0=5 v0=108")
+		check(r()[2] == 0x108 && r()[29] == GAME_SP, fmt.tprintf("W: v0 %x, sp %x", r()[2], r()[29]))
+		check(flat_caller(FLAT_P, 4), "P: the run ends")
+		expect("4b a0=0 nested=true; 4b a0=1 nested=true; 4b a0=2 nested=false; 4b a0=3 nested=false; 4b a0=4 nested=false")
+		check(r()[2] == 5 && r()[29] == GAME_SP, fmt.tprintf("P: v0 %x, sp %x", r()[2], r()[29]))
+		check(flat_caller(EXE_L), "L: the run ends")
+		expect("b> a0=5 v0=7")
+		check(r()[2] == 7 && r()[29] == GAME_SP, fmt.tprintf("L: v0 %x, sp %x", r()[2], r()[29]))
 	}
 }
