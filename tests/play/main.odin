@@ -1745,6 +1745,13 @@ test_compat :: proc() {
 		}
 	}
 
+	// When is to the second (play/compat.odin), and the fixtures can all run
+	// within one: wait for the next second, so the rerun's row differs.
+	for {
+		now, _ := time.time_to_rfc3339(time.now(), 0, false, context.temp_allocator)
+		if now != first_when {break}
+		time.sleep(20 * time.Millisecond)
+	}
 	out, errs, ok = run_compat(name, {loop, fmt.tprint(FRAMES)})
 	rows = compat_rows(name)
 	check(name, ok && len(rows) == len(fixtures) + 1, fmt.tprintf("rerun: %d rows, stdout:\n%s\nstderr:\n%s", len(rows), out, errs))
