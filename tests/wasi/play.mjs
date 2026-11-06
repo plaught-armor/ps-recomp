@@ -13,13 +13,16 @@
 // settings writes the same file. Other PS_* variables set here are passed
 // on and win over these. Every file in the disc image's directory is
 // visible as /disc/<name>. The data directory is the shim's /data, empty
-// at the start. Prints the frame of the first present, the presents, the
-// time and the shim's call counts to stderr, and exits with play's exit
-// code.
+// at the start, or with PLAY_DATA=<dir> holding that directory's files (a
+// disc directory with a wasm32 native blob and its key, for one), as the
+// play page's /data holds what earlier runs stored (web/readers.js).
+// Prints the frame of the first present, the presents, the time and the
+// shim's call counts to stderr, and exits with play's exit code.
 import { mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { argv, env, exit, stderr, stdout } from "node:process";
 import { AUDIO, CONTROL, PRESENT } from "../../web/layout.js";
+import { Native } from "../../web/native.js";
 import { Sdl } from "../../web/sdl.js";
 import { Wasi } from "../../web/wasi.js";
 
@@ -80,6 +83,18 @@ const sdl = new Sdl({
 	present: new SharedArrayBuffer(PRESENT.SIZE),
 	post: (m) => m.log !== undefined && stderr.write(m.log),
 });
+if (env.PLAY_DATA) {
+	const files = new Map();
+	const walk = (path, prefix) => {
+		for (const e of readdirSync(path, { withFileTypes: true })) {
+			if (e.isDirectory()) walk(join(path, e.name), prefix + e.name + "/");
+			else if (e.isFile()) files.set(prefix + e.name, readFileSync(join(path, e.name)));
+		}
+	};
+	walk(env.PLAY_DATA, "");
+	wasi.seed(files);
+}
+const native = new Native({ log: (text) => stderr.write(text) });
 const start = performance.now();
 let first = null;
 const present = sdl.present.bind(sdl);
@@ -89,8 +104,13 @@ sdl.present = () => {
 };
 
 const module = await WebAssembly.compile(readFileSync(wasm));
-const instance = await WebAssembly.instantiate(module, { ...wasi.imports, "system:SDL2": sdl.imports });
+const instance = await WebAssembly.instantiate(module, {
+	...wasi.imports,
+	"system:SDL2": sdl.imports,
+	"system:ps_native": native.imports,
+});
 sdl.attach(instance);
+native.attach(instance);
 const code = wasi.run(instance);
 const ms = Math.round(performance.now() - start);
 for (const [path, bytes] of wasi.files()) {

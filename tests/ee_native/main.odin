@@ -1032,7 +1032,7 @@ main :: proc() {
 		(^u32)(&vu.vu0.micro[0x40 + 4 * n])^ = v
 	}
 	arch := native.Arch(core.NATIVE_ARCH)
-	a := native.make_asm(arch, r5900.native_ram())
+	a := r5900.native_asm(arch)
 	funcs: [len(cases)]native.Blob_Func
 	slow: map[string]int
 	for c, k in cases {
@@ -1205,7 +1205,7 @@ check_calls :: proc(arch: native.Arch) -> (failed: int) {
 		{CALL_IN, {jal(IN), addiu(2, 0, 5), addiu(3, 3, 0x10), JR_RA, 0}},
 		{CALL_OUT, {jal(OUT), addiu(2, 0, 6), addiu(3, 3, 0x10), JR_RA, 0}},
 	}
-	a := native.make_asm(arch, r5900.native_ram())
+	a := r5900.native_asm(arch)
 	labels := make(map[u32]native.Label)
 	defer delete(labels)
 	for p in progs {labels[p.at] = native.new_label(&a)}

@@ -5,6 +5,10 @@
 // and `jr $ra` or ERET pops. The host enters it for the console threads
 // (flat_run) and for each guest call it makes itself (flat_call, as
 // cpu.interp_hook).
+//
+// On wasm32, native code (recomp/r5900/native.odin) is a step of this
+// runner: flat_resume enters it at a pc it has an entry for, and does what
+// its exit (cpu.native_exit) leaves to the runner.
 package ps2
 
 import cpu "cpu"
@@ -31,11 +35,12 @@ flat_call :: proc(entry: u32) {
 //
 // The pc is kept in the run (x.pc) before each syscall and events check:
 // one may switch threads, or load a snapshot. After it, flat_reload picks
-// up the run that is current then.
+// up the run that is current then (flat_resume).
 @(private = "file")
 flat_loop :: proc() {
 	c := &cpu.state
-	x, pc := flat_reload()
+	x, pc, ok := flat_resume()
+	if !ok {return}
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
 		c.cycles += cpu.CYCLES_PER_INSN
@@ -49,13 +54,11 @@ flat_loop :: proc() {
 			if i.op == .ERET {
 				exec_insn(i)
 				if !flat_return(x, false, 0) {return}
-				x, pc = flat_reload()
+				if x, pc, ok = flat_resume(); !ok {return}
 				continue
 			}
-			kernel.flat_sync()
-			exec_insn(i)
-			kernel.flat_commit()
-			x, pc = flat_reload()
+			flat_sys(i)
+			if x, pc, ok = flat_resume(); !ok {return}
 		case .Bad:
 			cpu.bad_insn(pc, i.w)
 		case .Branch:
@@ -66,40 +69,48 @@ flat_loop :: proc() {
 				pc = ret
 			} else if i.link {
 				flat_enter(x, ret, i.target)
-				x, pc = flat_reload()
+					if x, pc, ok = flat_resume(); !ok {return}
 			} else if flat_mod_tail(x, i.target) {
-				x, pc = flat_reload()
+					if x, pc, ok = flat_resume(); !ok {return}
 			} else if flat_goto(x, pc, i.target) {
-				x, pc = flat_reload()
+				if x, pc, ok = flat_resume(); !ok {return}
 			} else {
 				pc = i.target
+				if flat_native_at(pc) {
+					x.pc = pc
+					if x, pc, ok = flat_resume(); !ok {return}
+				}
 			}
 		case .Jump:
 			delay_slot(pc + 4, nil)
 			if flat_mod_tail(x, i.target) {
-				x, pc = flat_reload()
+					if x, pc, ok = flat_resume(); !ok {return}
 			} else if flat_goto(x, pc, i.target) {
-				x, pc = flat_reload()
+					if x, pc, ok = flat_resume(); !ok {return}
 			} else {
 				pc = i.target
+				if flat_native_at(pc) {
+					x.pc = pc
+					if x, pc, ok = flat_resume(); !ok {return}
+				}
 			}
 		case .Call:
 			c.r[31].d[0] = u64(ret)
 			delay_slot(pc + 4, nil)
 			flat_enter(x, ret, i.target)
-			x, pc = flat_reload()
+			if x, pc, ok = flat_resume(); !ok {return}
 		case .Jalr:
 			t := u32(c.r[i.rs].d[0])
 			if i.rd != 0 {c.r[i.rd].d[0] = u64(ret)}
 			delay_slot(pc + 4, nil)
 			flat_enter(x, ret, t)
-			x, pc = flat_reload()
+			if x, pc, ok = flat_resume(); !ok {return}
 		case .Jr:
 			t := u32(c.r[i.rs].d[0])
 			delay_slot(pc + 4, nil)
 			if i.rs == 31 {
 				if !flat_return(x, true, t) {return}
-				x, pc = flat_reload()
+				if x, pc, ok = flat_resume(); !ok {return}
 				continue
 			}
 			// interp_body's two checks: the events check of every such
@@ -113,14 +124,90 @@ flat_loop :: proc() {
 				kernel.flat_sync()
 				kernel.run_events()
 				kernel.flat_commit()
-				x, pc = flat_reload()
+					if x, pc, ok = flat_resume(); !ok {return}
 			} else if tail {
-				x, pc = flat_reload()
+					if x, pc, ok = flat_resume(); !ok {return}
 			} else {
 				pc = t
+				if flat_native_at(pc) {
+					x.pc = pc
+					if x, pc, ok = flat_resume(); !ok {return}
+				}
 			}
 		}
 	}
+}
+
+// wasm32: whether native code is loaded (load_native), which flat_resume
+// and the interpreter's taken jumps then look pcs up for. With no blob
+// they test it and nothing more.
+flat_native_on: bool
+
+// What native code is called as: the pc to enter it at, among its
+// function's entries.
+Wasm_Func :: #type proc(pc: u32)
+
+// The run that is current now and its pc (flat_reload), after running the
+// native code there is at it, on wasm32: false when a return in it ended
+// the run (flat_return), which the caller then returns from. Native code
+// runs from block to block of its function until the interpreter has work
+// to do, and leaves the rest to here: due events, a call, a return, a
+// SYSCALL, ERET, or a jump out of its blocks (to other native code, or to
+// interpret).
+@(private = "file")
+flat_resume :: proc() -> (x: ^kernel.Flat_Ctx, pc: u32, ok: bool) {
+	x, pc = flat_reload()
+	when ODIN_ARCH == .wasm32 {
+		for flat_native_on {
+			f := cpu.lookup(pc)
+			if f == nil {break}
+			e := &cpu.native_exit
+			(cast(Wasm_Func)rawptr(f))(pc)
+			switch e.reason {
+			case .None:
+				// An entry its code has no block for: interpret, rather
+				// than enter it again.
+				if e.pc == pc {return x, pc, true}
+				x.pc = e.pc
+			case .Events:
+				x.pc = e.pc
+				x.back = e.back != 0
+				kernel.flat_sync()
+				kernel.run_events()
+				kernel.flat_commit()
+			case .Call:
+				flat_enter(x, e.arg, e.pc)
+			case .Return:
+				flat_return(x, true, e.pc) or_return
+			case .Sys:
+				x.pc = e.pc
+				flat_sys(r5900.decode(e.pc - 4, mem.rd32(e.pc - 4)))
+			case .Eret:
+				flat_return(x, false, 0) or_return
+			}
+			x, pc = flat_reload()
+		}
+	}
+	return x, pc, true
+}
+
+// wasm32: native code at t, which a taken jump that checked nothing goes
+// on in (flat_resume, after x.pc = t).
+@(private = "file")
+flat_native_at :: #force_inline proc(t: u32) -> bool {
+	when ODIN_ARCH == .wasm32 {
+		return flat_native_on && cpu.lookup(t) != nil
+	} else {
+		return false
+	}
+}
+
+// A SYSCALL, with the run's pc past it (x.pc): it may switch threads.
+@(private = "file")
+flat_sys :: proc(i: r5900.Insn) {
+	kernel.flat_sync()
+	exec_insn(i)
+	kernel.flat_commit()
 }
 
 // The run that is current now, and its pc, after the checks it owes: a

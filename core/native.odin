@@ -1,5 +1,6 @@
 // Native code from the recompiler, the file recomp/native/blob.odin writes:
-// its code mapped executable with each import slot filled by name. The
+// its code mapped executable with each import slot filled by name (on
+// wasm32, a module the host instantiates with each slot a global). The
 // console package (psx/native.odin) names the imports and puts the
 // functions in its dispatch tables.
 package core
@@ -45,8 +46,8 @@ Native_Range :: struct {
 }
 
 Native_Code :: struct {
-	base:   uintptr, // a function is at base + off
-	size:   int, // bytes of code at base, for unmap_code
+	base:   uintptr, // a function is at base + off (wasm32: table index)
+	size:   int, // bytes of code at base, for unmap_code (wasm32: functions)
 	funcs:  []Native_Func,
 	ovls:   []Native_Ovl,
 	spans:  []Native_Span,
@@ -59,10 +60,9 @@ NATIVE_VERSION :: 3
 // Bytes of the header: magic, version, arch, then the counts and sizes.
 NATIVE_HEADER :: 44
 
-// The blob arch of a wasm build. Reserved: recomp has no emitter for it
-// (it is not a recomp/native Arch), so a wasm build finds no blob of its
-// arch, interprets, and refuses another host's machine code, which it
-// cannot map.
+// The blob arch of a wasm build (recomp/native Arch .Wasm32): its code is
+// a module whose functions the host puts in the runtime's function table
+// (core/code_wasi.odin), and another host's machine code is refused.
 NATIVE_ARCH_WASM32 :: 4
 
 // The blob arch this build runs (recomp/native Arch, or NATIVE_ARCH_WASM32),
@@ -119,8 +119,17 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_spans) * 20 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
 		return {}, "bad table sizes"
 	}
-	if imports_at % 16 != 0 || int(imports_at) + 8 * int(n_imports) != int(size) {
-		return {}, "bad import slots"
+	// A function's offset is below imports_at; on wasm32 there is no slot
+	// table (imports_at is 0), and offsets are checked once the module says
+	// how many functions it has.
+	limit := imports_at
+	when ODIN_ARCH == .wasm32 {
+		if imports_at != 0 {return {}, "bad import slots"}
+		limit = max(u32)
+	} else {
+		if imports_at % 16 != 0 || int(imports_at) + 8 * int(n_imports) != int(size) {
+			return {}, "bad import slots"
+		}
 	}
 	defer if err != "" {
 		delete(code.funcs)
@@ -134,7 +143,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	for &f in code.funcs {
 		f.addr, _ = word(blob, &at)
 		f.off, _ = word(blob, &at)
-		if f.off >= imports_at {return code, "function outside the code"}
+		if f.off >= limit {return code, "function outside the code"}
 	}
 	code.ovls = make([]Native_Ovl, n_ovls)
 	for &o in code.ovls {
@@ -143,7 +152,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		o.id, _ = word(blob, &at)
 		for &w in o.sig {w, _ = word(blob, &at)}
 		o.off, _ = word(blob, &at)
-		if o.off >= imports_at {return code, "function outside the code"}
+		if o.off >= limit {return code, "function outside the code"}
 	}
 	code.spans = make([]Native_Span, n_spans)
 	for &s in code.spans {
@@ -154,7 +163,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		s.n_ranges, _ = word(blob, &at)
 		if kind > u32(max(Native_Kind)) {return code, "bad span kind"}
 		s.kind = Native_Kind(kind)
-		if s.off >= imports_at {return code, "function outside the code"}
+		if s.off >= limit {return code, "function outside the code"}
 		if u64(s.range_first) + u64(s.n_ranges) > u64(n_ranges) {return code, "bad span ranges"}
 	}
 	code.ranges = make([]Native_Range, n_ranges)
@@ -166,6 +175,30 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	}
 	code.pool = make([]u32, n_pool)
 	for &w in code.pool {w, _ = word(blob, &at)}
+	when ODIN_ARCH == .wasm32 {
+		vals := make([]u32, n_imports, context.temp_allocator)
+		for name, k in slots {
+			v, ok := imports[name]
+			if !ok {return code, fmt.tprintf("the runtime has no %s", name)}
+			if v > u64(max(u32)) {return code, fmt.tprintf("%s does not fit a wasm32 slot", name)}
+			vals[k] = u32(v)
+		}
+		n: u32
+		base := wasm_instantiate(raw_data(blob[at:]), size, raw_data(vals), n_imports, &n)
+		if base == 0 {return code, "the host cannot instantiate wasm32 code"}
+		code.base, code.size = uintptr(base), int(n)
+		outside := false
+		for f in code.funcs {outside ||= f.off >= n}
+		for o in code.ovls {outside ||= o.off >= n}
+		for s in code.spans {outside ||= s.off >= n}
+		if outside {
+			// Released here: the caller's native_free must not again.
+			wasm_release(base)
+			code.base, code.size = 0, 0
+			return code, "function outside the code"
+		}
+		return code, ""
+	}
 	text := make([]u8, size)
 	defer delete(text)
 	copy(text, blob[at:])
@@ -218,7 +251,11 @@ perf_map :: proc(code: Native_Code, end: int) {
 
 // Free what native_load returned: the mapped code and the tables.
 native_free :: proc(code: ^Native_Code) {
-	unmap_code(rawptr(code.base), code.size)
+	when ODIN_ARCH == .wasm32 {
+		wasm_release(u32(code.base))
+	} else {
+		unmap_code(rawptr(code.base), code.size)
+	}
 	delete(code.funcs)
 	delete(code.ovls)
 	delete(code.spans)

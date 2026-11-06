@@ -125,7 +125,7 @@ main :: proc() {
 	}
 
 	arch := native.Arch(core.NATIVE_ARCH)
-	a := native.make_asm(arch, r5900.native_ram())
+	a := r5900.native_asm(arch)
 	// The rotating threads' loops, after the others: the main thread's
 	// rotates, then polls the flag; the other's only rotates, at one site
 	// or at two in turn.

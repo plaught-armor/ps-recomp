@@ -368,7 +368,9 @@ native_hooked_check :: proc(blob: []u8, want: u64) -> string {
 // False, with the reason printed, when it cannot be used; the Odin
 // functions then stay. hooked is the hash of the hooked set of the mods
 // to load (core.mod_hooks_hash, 0 none): the blob must have been built for
-// it (the recomp option mod_hooks; its import slot mod_hooks:<hash>).
+// it (the recomp option mod_hooks; its import slot mod_hooks:<hash>). On
+// wasm32 the functions are steps of the FLAT runner (interp_flat.odin),
+// which flat_native_on lets it take.
 load_native :: proc(path: string, hooked: u64 = 0) -> bool {
 	if core.env("NATIVE") == "0" {
 		if cpu.text_hi == 0 {fmt.eprintln("native: NATIVE=0, and there are no recompiled functions to keep")}
@@ -398,6 +400,15 @@ load_native :: proc(path: string, hooked: u64 = 0) -> bool {
 	}
 	defer delete(code.funcs)
 	defer delete(code.ovls)
+	// wasm32 code is EE functions only: an overlay needs the dispatch
+	// x64 and arm64 code does itself, a span a VU or learned backend.
+	when ODIN_ARCH == .wasm32 {
+		if len(code.ovls) != 0 || len(code.spans) != 0 {
+			fmt.eprintfln("native: %s: %d overlay functions and %d spans, which wasm32 code cannot have", path, len(code.ovls), len(code.spans))
+			core.native_free(&code)
+			return false
+		}
+	}
 	if cpu.text_hi == 0 {
 		// Standalone: the table spans the blob's functions.
 		if len(code.funcs) == 0 {
@@ -415,6 +426,7 @@ load_native :: proc(path: string, hooked: u64 = 0) -> bool {
 		}
 		fmt.eprintfln("native: %d functions from %s, standalone (%08x-%08x)", len(code.funcs), path, lo, hi + 4)
 		register_vus(&code)
+		when ODIN_ARCH == .wasm32 {flat_native_on = true}
 		return true
 	}
 	// A function the build does not have means the blob is from other code:
@@ -433,6 +445,7 @@ load_native :: proc(path: string, hooked: u64 = 0) -> bool {
 	}
 	fmt.eprintfln("native: %d functions from %s", len(code.funcs), path)
 	register_vus(&code)
+	when ODIN_ARCH == .wasm32 {flat_native_on = true}
 	return true
 }
 

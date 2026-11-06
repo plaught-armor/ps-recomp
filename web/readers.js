@@ -101,6 +101,76 @@ export async function store(name, sources) {
 	}
 }
 
+// ---- play's /data stored in OPFS ----
+//
+// play's data directory (Wasi /data: settings, memory cards, native blobs
+// and their keys, core/data.odin) is kept under "data", mirrored file for
+// file: loaded before a run, written back after it. A blob is found again
+// by the key file play wrote next to it, as natively; nothing else names
+// it.
+
+const DATA = "data";
+
+// Every stored file of /data: [path ("a/b"), bytes]. Workers only.
+export async function dataLoad() {
+	const out = [];
+	const walk = async (dir, prefix) => {
+		for await (const [name, h] of dir.entries()) {
+			if (h.kind === "directory") await walk(h, prefix + name + "/");
+			else out.push([prefix + name, new Uint8Array(await (await h.getFile()).arrayBuffer())]);
+		}
+	};
+	await walk(await (await navigator.storage.getDirectory()).getDirectoryHandle(DATA, { create: true }), "");
+	return out;
+}
+
+// Makes the store match files (path -> bytes, /data after a run), given
+// before (what dataLoad gave): files gone from /data are removed, then the
+// new and changed ones written, the *.key files last. A key names a
+// directory's blobs only by version, commit and set, so it can be the same
+// over a changed blob: a directory with a changed file has its keys removed
+// before that file is written and written again after, and a sync cut short
+// leaves no key beside a blob it does not match. Workers only; throws on a
+// full quota.
+export async function dataSave(files, before) {
+	const root = await (await navigator.storage.getDirectory()).getDirectoryHandle(DATA, { create: true });
+	const parent = async (path, create) => {
+		let dir = root;
+		for (const name of path.split("/").slice(0, -1)) dir = await dir.getDirectoryHandle(name, { create });
+		return dir;
+	};
+	const old = new Map(before);
+	for (const path of old.keys()) {
+		if (files.has(path)) continue;
+		const dir = await parent(path, false).catch(notFound);
+		await dir?.removeEntry(path.split("/").at(-1)).catch(notFound);
+	}
+	const same = (a, b) => a !== undefined && a.length === b.length && a.every((v, i) => v === b[i]);
+	const changed = [...files].filter(([path, bytes]) => !same(old.get(path), bytes));
+	const dirOf = (path) => path.slice(0, path.lastIndexOf("/") + 1);
+	const touched = new Set(changed.filter(([path]) => !path.endsWith(".key")).map(([path]) => dirOf(path)));
+	const keys = [...files].filter(([path]) => path.endsWith(".key") && touched.has(dirOf(path)));
+	for (const [path] of keys) {
+		if (!old.has(path)) continue;
+		const dir = await parent(path, false).catch(notFound);
+		await dir?.removeEntry(path.split("/").at(-1)).catch(notFound);
+	}
+	const writing = new Set(changed.map(([path]) => path));
+	changed.push(...keys.filter(([path]) => !writing.has(path)));
+	changed.sort(([a], [b]) => a.endsWith(".key") - b.endsWith(".key"));
+	for (const [path, bytes] of changed) {
+		const dir = await parent(path, true);
+		const h = await (await dir.getFileHandle(path.split("/").at(-1), { create: true })).createSyncAccessHandle();
+		try {
+			if (h.write(bytes, { at: 0 }) !== bytes.length) throw new DOMException(`${path}: short write`, "QuotaExceededError");
+			h.truncate(bytes.length);
+			h.flush();
+		} finally {
+			h.close();
+		}
+	}
+}
+
 // For a catch: null when the entry is not there, else rethrown.
 function notFound(e) {
 	if (e.name === "NotFoundError") return null;

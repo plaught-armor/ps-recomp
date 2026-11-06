@@ -88,7 +88,7 @@ Wasm_Type :: struct {
 	result: u8, // 0: none
 }
 
-// Locals of a generated function: the parameters, then 12 i32, 2 i64 and
+// Locals of a generated function: the parameters, then 12 i32, 3 i64 and
 // 6 v128.
 @(private = "file")
 L_PC :: 0
@@ -109,9 +109,11 @@ L_ACC :: 14 // mac64's sum
 @(private = "file")
 L_W :: 15
 @(private = "file")
-L_V :: 16 // V0 to V4
+L_C64 :: 16 // Asm.cached64
 @(private = "file")
-L_VT :: 21
+L_V :: 17 // V0 to V4
+@(private = "file")
+L_VT :: 22
 
 // Locals of a slow routine: a and b, then 3 i32, 2 i64 and 1 v128.
 @(private = "file")
@@ -548,8 +550,12 @@ wasm_br_cmp_imm :: proc(a: ^Asm, c: Cond, r: Reg, v: u32, l: Label) {
 
 wasm_br_state64_below :: proc(a: ^Asm, off: u32, limit: int, l: Label) {
 	wa_flush(a)
-	wa_state(a)
-	wa_mem(a, I64_LOAD, 3, off)
+	if off == a.cached64 {
+		wa_get(a, L_C64)
+	} else {
+		wa_state(a)
+		wa_mem(a, I64_LOAD, 3, off)
+	}
 	wa_global(a, limit)
 	wa_mem(a, I64_LOAD, 3, 0)
 	emit8(a, I64_LT_U)
@@ -610,6 +616,28 @@ wasm_cache_sync :: proc(a: ^Asm, k: int, off: u32, store: bool) {
 	}
 }
 
+wasm_cache64_sync :: proc(a: ^Asm, store: bool) {
+	wa_state(a)
+	if store {
+		wa_get(a, L_C64)
+		wa_mem(a, I64_STORE, 3, a.cached64)
+	} else {
+		wa_mem(a, I64_LOAD, 3, a.cached64)
+		wa_set(a, L_C64)
+	}
+}
+
+// r = the cached 64-bit field's low half, or its high one.
+wasm_cache64_load :: proc(a: ^Asm, r: Reg, high: bool) {
+	wa_get(a, L_C64)
+	if high {
+		wa_i64(a, 32)
+		emit8(a, I64_SHR_U)
+	}
+	emit8(a, I32_WRAP)
+	wa_set(a, wa_reg(r))
+}
+
 wasm_cache_mov :: proc(a: ^Asm, r: Reg, k: int, to_cache: bool) {
 	if to_cache {
 		wa_get(a, wa_reg(r))
@@ -640,6 +668,13 @@ wasm_state_store :: proc(a: ^Asm, off: u32, src: Reg) {
 }
 
 wasm_state_add64 :: proc(a: ^Asm, off, v: u32) {
+	if off == a.cached64 {
+		wa_get(a, L_C64)
+		wa_i64(a, i64(v))
+		emit8(a, I64_ADD)
+		wa_set(a, L_C64)
+		return
+	}
 	wa_state(a)
 	wa_state(a)
 	wa_mem(a, I64_LOAD, 3, off)
@@ -1667,7 +1702,7 @@ wasm_finalize :: proc(a: ^Asm) {
 	body := &w.out
 	lo := len(body)
 	wa_uleb(body, 3)
-	append(body, 12, I32, 2, I64, 6, V128)
+	append(body, 12, I32, 3, I64, 6, V128)
 	if n_regions > 1 {
 		append(body, OP_LOOP, VOID)
 		for _ in 0 ..< n_regions {append(body, OP_BLOCK, VOID)}

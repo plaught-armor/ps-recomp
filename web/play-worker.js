@@ -1,7 +1,8 @@
 // The play Worker: runs play.wasm (or, for the gate, another module with the
 // same imports) on web/wasi.js and web/sdl.js. It never yields while the
 // module runs; the page reaches it only through the SharedArrayBuffers.
-import { discOf, openStored, store } from "./readers.js";
+import { dataLoad, dataSave, discOf, openStored, store } from "./readers.js";
+import { Native } from "./native.js";
 import { Sdl } from "./sdl.js";
 import { Wasi } from "./wasi.js";
 
@@ -63,6 +64,14 @@ onmessage = async ({ data }) => {
 	const ring = [];
 	const times = { compileMs: null, runMs: null };
 	let t1 = null; // when the module started
+	let stored = null; // what dataLoad gave, null when /data is not stored
+	// /data back into the store, before done or error goes to the page: a
+	// run started after it then finds the store whole.
+	const save = async () => {
+		if (stored === null) return;
+		await dataSave(wasi.files(wasi.data), stored).catch((e) =>
+			postMessage({ log: `play: the data of this run cannot be stored (${e.name}: ${e.message})\n` }));
+	};
 	// The files for the page, copied out of the shim's buffers.
 	const written = () => {
 		if (!test || wasi === null) return undefined;
@@ -78,17 +87,36 @@ onmessage = async ({ data }) => {
 		disc = await discFor(data);
 		postMessage({ store: disc.info });
 		wasi = new Wasi({ args: [wasm.replace(/\.wasm$/, ""), ...args], env, disc: disc.disc, log });
+		// /data from the store (readers.js), but in test mode, whose runs start
+		// from an empty /data so they compare with native ones.
+		if (!test && typeof navigator.storage?.getDirectory === "function") {
+			try {
+				stored = await dataLoad();
+				wasi.seed(stored);
+			} catch (e) {
+				stored = null;
+				postMessage({ log: `play: the stored data cannot be read (${e.name}: ${e.message}); this run starts without it and stores nothing\n` });
+			}
+		}
 		const tee = test ? (samples) => ring.push(samples.slice()) : null;
 		const sdl = new Sdl({ control, audio, present, post: (m) => postMessage(m), tee });
-		const instance = await WebAssembly.instantiate(module, { ...wasi.imports, "system:SDL2": sdl.imports });
+		const native = new Native({ log: (text) => postMessage({ log: text }) });
+		const instance = await WebAssembly.instantiate(module, {
+			...wasi.imports,
+			"system:SDL2": sdl.imports,
+			"system:ps_native": native.imports,
+		});
 		sdl.attach(instance);
+		native.attach(instance);
 		t1 = performance.now();
 		const code = wasi.run(instance);
 		times.runMs = Math.round(performance.now() - t1);
+		await save();
 		const files = written();
 		postMessage({ done: { code, stats: wasi.stats, ...times }, files }, buffers(files));
 	} catch (e) {
 		if (t1 !== null) times.runMs = Math.round(performance.now() - t1);
+		await save();
 		const files = written();
 		postMessage({ error: String(e?.stack ?? e), times, files }, buffers(files));
 	} finally {

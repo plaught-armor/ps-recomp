@@ -20,7 +20,7 @@ Learned :: struct {
 // cannot lower for arch (nil: wasm32's exact lowering) gets no span and
 // stays interpreted; skipped counts them. In context.allocator.
 learned_blob :: proc(runs: []Learned, arch: native.Arch) -> (blob: []u8, skipped: int) {
-	a := native.make_asm(arch, native_ram())
+	a := native_asm(arch)
 	spans := make([dynamic]native.Blob_Span, 0, len(runs))
 	defer delete(spans)
 	slow: map[string]int

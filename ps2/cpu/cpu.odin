@@ -164,9 +164,13 @@ call :: proc(addr: u32) {
 // (the guest stack frame is shared, and its `jr $ra` returns for us).
 jump_unknown :: proc(fn, pc: u32) {
 	spin_dirty |= SPIN_SIDE
-	if f := lookup(pc); f != nil {
-		f()
-		return
+	// Only x64 and arm64 code calls it, which FLAT never runs; a FLAT
+	// build's table holds wasm32 code, which is no Func_Proc.
+	when !core.FLAT {
+		if f := lookup(pc); f != nil {
+			f()
+			return
+		}
 	}
 	if interp_hook != nil {
 		interp_hook(pc)

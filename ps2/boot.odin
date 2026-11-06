@@ -110,25 +110,30 @@ boot :: proc(b: Boot) -> bool {
 	}
 	host.quit_hook = b.quit
 	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
-	// native code would leave its host frames running on.
+	// native code would leave its host frames running on. A wasm32 blob is
+	// the exception: its functions are steps of the FLAT runner, which
+	// leave to it for every call, return and thread switch.
 	when core.FLAT {
 		what := ""
 		switch {
-		case b.native != "": what = "native code (Boot.native)"
+		case b.native != "" && core.NATIVE_ARCH != core.NATIVE_ARCH_WASM32: what = "native code (Boot.native)"
 		case b.learned != "": what = "the IOP's learned code (Boot.learned)"
 		case b.learned_ee != "": what = "the EE's learned code (Boot.learned_ee)"
 		}
 		if what != "" {cpu.fatal("FLAT runs interpreted only: %s not installed", what)}
 	}
 	// Under FLAT the loaders are not compiled in (the check above refuses
-	// what they load), so a FLAT build refers to no map_code.
-	when !core.FLAT {
+	// what they load), so a FLAT build refers to no map_code; but for
+	// load_native on wasm32, which maps none.
+	when !core.FLAT || core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
 		if b.native != "" {
 			if !load_native(b.native, hooked) {
 				if b.native_failed != nil {b.native_failed()}
 				return false
 			}
 		}
+	}
+	when !core.FLAT {
 		// After init, which makes the R3000 the IOP (iop.iop_cpu_init).
 		if b.learned != "" && !psx_native.load_learned(b.learned) && b.learned_failed != nil {
 			b.learned_failed()

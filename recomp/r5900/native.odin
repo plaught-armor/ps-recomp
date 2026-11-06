@@ -135,6 +135,12 @@ native_ram :: proc() -> native.Ram {
 	}
 }
 
+// An Asm for EE native code: native_ram's RAM and, on wasm32, the cycle
+// count kept in a local (native.make_asm's cached64).
+native_asm :: proc(arch: native.Arch) -> native.Asm {
+	return native.make_asm(arch, native_ram(), cached64 = CYCLES)
+}
+
 // dst = the low (or high) word of guest register n.
 @(private = "file")
 get :: proc(a: ^native.Asm, dst: native.Reg, n: u8, high := false) {

@@ -349,11 +349,17 @@ play :: proc(image: string) -> int {
 	}
 	// NATIVE=0 runs the game interpreted, as a FLAT build always does
 	// (core/flat.odin): it has neither recompiled nor learned code, and
-	// LEARN records nothing.
+	// LEARN records nothing. The one exception is a wasm32 build's PS2
+	// blob, whose functions are steps of the FLAT runner; it runs only
+	// stored, as a wasm build cannot start the converter child.
 	native_off := core.FLAT || core.env("NATIVE") == "0"
 	native := core.disc_path(dir, .Native)
-	if native_off || (!native_cached(dir, cnf.ps2) && !convert_store(image, dir, cnf.ps2, 0)) {
-		native = ""
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		if !cnf.ps2 || core.env("NATIVE") == "0" || !native_cached(dir, cnf.ps2) {native = ""}
+	} else {
+		if native_off || (!native_cached(dir, cnf.ps2) && !convert_store(image, dir, cnf.ps2, 0)) {
+			native = ""
+		}
 	}
 	native_key = core.disc_path(dir, .Native_Key)
 	// Learned code runs on a PS1 game, and on a PS2 game's IOP and EE,

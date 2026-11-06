@@ -319,7 +319,7 @@ generate :: proc(o: mips.Options) {
 			mips.fail("%s: unknown native_arch %s", o.path, s)
 		}
 		code = new(native.Asm)
-		code^ = native.make_asm(arch, native_ram())
+		code^ = native_asm(arch)
 		code.sigs = EE_SIGS[:]
 		// The hooked set's hash, as an import slot the runtime has only with
 		// that set's mods loaded: a blob for other mods (or none) is refused.
@@ -343,7 +343,7 @@ generate :: proc(o: mips.Options) {
 		for &a, k in asms[:2] {
 			if a == nil {
 				a = new(native.Asm)
-				a^ = native.make_asm(k == 0 ? .X64_SysV : .Arm64, native_ram())
+				a^ = native_asm(k == 0 ? .X64_SysV : .Arm64)
 			}
 		}
 	}

@@ -13,7 +13,8 @@
 // whole of a function: the state_* operations on one use its register. A
 // function reads them in at its start and writes them back at its end and
 // around every call, since a called procedure may read or change the state
-// and may change the registers.
+// and may change the registers. On wasm32 one 64-bit field (Asm.cached64)
+// is also kept, in an i64 local, the same way.
 package native
 
 import "core:fmt"
@@ -195,6 +196,7 @@ Asm :: struct {
 	cold:      [dynamic]Cold, // of the function being emitted
 	slow:      [dynamic]Slow,
 	cached:    []u32, // state field offsets, at most CACHE_MAX
+	cached64:  u32, // wasm32: a 64-bit state field's offset, 0 none
 	state:     string, // import: the state of the function being emitted
 	// import: one whose address the function being emitted keeps in a
 	// host register, x86-64's RAM register, for vec_load, vec_store,
@@ -313,9 +315,17 @@ unal_shape :: proc(op: Unal) -> (wide, left, from_top, store: bool) {
 
 CACHE_MAX :: 4
 
-make_asm :: proc(arch: Arch, ram := Ram{}, cached: []u32 = nil) -> Asm {
+// cached64 is kept on wasm32 only (it has a local for it; the hosts have
+// no register to spare), so the other archs' code does not depend on it.
+make_asm :: proc(arch: Arch, ram := Ram{}, cached: []u32 = nil, cached64: u32 = 0) -> Asm {
 	assert(len(cached) <= CACHE_MAX, "native: too many cached fields")
-	return {arch = arch, ram = ram, cached = cached}
+	return {arch = arch, ram = ram, cached = cached, cached64 = cached64 if arch == .Wasm32 else 0}
+}
+
+// Whether the 32-bit field at off is a half of the cached 64-bit one.
+@(private)
+in_cached64 :: proc(a: ^Asm, off: u32) -> bool {
+	return a.cached64 != 0 && (off == a.cached64 || off == a.cached64 + 4)
 }
 
 // Index of the cached field at state offset off, or -1.
@@ -340,6 +350,7 @@ cache_sync :: proc(a: ^Asm, store: bool) {
 			wasm_cache_sync(a, k, off, store)
 		}
 	}
+	if a.cached64 != 0 {wasm_cache64_sync(a, store)}
 }
 
 // Index of an import slot, added on first use.
@@ -506,11 +517,16 @@ state_load :: proc(a: ^Asm, dst: Reg, off: u32) {
 	case .Arm64:
 		if k >= 0 {a64_cache_mov(a, dst, k, false)} else {a64_state_load(a, dst, off)}
 	case .Wasm32:
-		if k >= 0 {wasm_cache_mov(a, dst, k, false)} else {wasm_state_load(a, dst, off)}
+		switch {
+		case k >= 0: wasm_cache_mov(a, dst, k, false)
+		case in_cached64(a, off): wasm_cache64_load(a, dst, off == a.cached64 + 4)
+		case: wasm_state_load(a, dst, off)
+		}
 	}
 }
 
 state_store :: proc(a: ^Asm, off: u32, src: Reg) {
+	assert(!in_cached64(a, off), "native: 32-bit store into the cached 64-bit field")
 	k := cache_index(a, off)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
@@ -524,6 +540,7 @@ state_store :: proc(a: ^Asm, off: u32, src: Reg) {
 
 // The 32-bit state field at off = v. May change C.
 state_store_imm :: proc(a: ^Asm, off: u32, v: u32) {
+	assert(!in_cached64(a, off), "native: 32-bit store into the cached 64-bit field")
 	k := cache_index(a, off)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
@@ -545,7 +562,8 @@ state_store_imm :: proc(a: ^Asm, off: u32, v: u32) {
 	}
 }
 
-// The 64-bit field at `off` of the guest state += v; not a cached one.
+// The 64-bit field at `off` of the guest state += v; not a cached 32-bit
+// one (the cached 64-bit one is fine).
 state_add64 :: proc(a: ^Asm, off: u32, v: u32) {
 	assert(cache_index(a, off) < 0 && cache_index(a, off + 4) < 0, "native: add64 of a cached field")
 	switch a.arch {
@@ -683,7 +701,7 @@ vec_store :: proc(a: ^Asm, off: u32, src: Vreg, base := "") {
 vec_check :: proc(a: ^Asm, off: u32) {
 	assert(off % 16 == 0, "native: vector state offset")
 	for k in u32(0) ..< 4 {
-		assert(cache_index(a, off + 4 * k) < 0, "native: vector of a cached field")
+		assert(cache_index(a, off + 4 * k) < 0 && !in_cached64(a, off + 4 * k), "native: vector of a cached field")
 	}
 }
 

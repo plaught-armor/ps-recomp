@@ -183,6 +183,21 @@ export class Wasi {
 		}
 	}
 
+	// Put files in /data before the run: path ("a/b") -> bytes.
+	seed(files) {
+		for (const [path, bytes] of files) {
+			const names = path.split("/");
+			let node = this.data;
+			for (const name of names.slice(0, -1)) {
+				if (!node.entries.has(name)) node.entries.set(name, dir(true));
+				node = node.entries.get(name);
+			}
+			const f = new Mem();
+			f.write(0, bytes);
+			node.entries.set(names.at(-1), f);
+		}
+	}
+
 	// The files recomp wrote (or, with root this.data, play's): path -> bytes
 	// (views of the file buffers). The mounts are not walked.
 	files(root = this.out) {
