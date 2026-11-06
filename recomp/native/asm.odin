@@ -39,13 +39,11 @@ parse_arch :: proc(s: string) -> (Arch, bool) {
 	return {}, false
 }
 
-// The arch named s, or false after a message naming who asked: an arch
-// with no runtime loader yet, wasm32 (core.NATIVE_ARCH_WASM32), is refused.
+// The arch named s, or false after a message naming who asked.
 arch_of :: proc(who, s: string) -> (Arch, bool) {
 	a, ok := parse_arch(s)
-	if ok && a == .Wasm32 {ok = false}
 	if !ok {
-		fmt.eprintfln("%s: no native backend for arch %s; give x64_sysv, x64_win or arm64", who, s)
+		fmt.eprintfln("%s: no native backend for arch %s; give x64_sysv, x64_win, arm64 or wasm32", who, s)
 	}
 	return a, ok
 }
@@ -414,6 +412,13 @@ func_begin :: proc(a: ^Asm, state: string) -> int {
 	}
 	cache_sync(a, false)
 	return at
+}
+
+// dst = the guest pc the function was entered at (wasm32 only, where one
+// function has every entry of a guest function: its pc parameter).
+entry_pc :: proc(a: ^Asm, dst: Reg) {
+	assert(a.arch == .Wasm32, "native: entry_pc off wasm32")
+	wasm_entry_pc(a, dst)
 }
 
 // Bind l to off, a func_begin or func_entry result, for call_func.

@@ -73,10 +73,11 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 		return 1
 	}
 	blob: []u8
+	skipped := 0 // runs the EE's compiler left to the interpreter
 	if cpu == .Ee {
 		funcs := make([]r5900.Learned, len(runs))
 		for r, k in runs {funcs[k] = {r.entry, r.lo, r.words}}
-		blob = r5900.learned_blob(funcs, arch)
+		blob, skipped = r5900.learned_blob(funcs, arch)
 	} else {
 		funcs := make([]r3000.Learned, len(runs))
 		for r, k in runs {funcs[k] = {r.entry, r.lo, r.words}}
@@ -86,7 +87,7 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 		fmt.eprintln("learned: cannot write", out, werr)
 		return 1
 	}
-	fmt.eprintfln("learned: %d functions from %d records (not compiled: %d stored into their code, %d large)", len(runs), len(recs), smc, large)
+	fmt.eprintfln("learned: %d functions from %d records (not compiled: %d stored into their code, %d large, %d not lowered)", len(runs) - skipped, len(recs), smc, large, skipped)
 	return 0
 }
 

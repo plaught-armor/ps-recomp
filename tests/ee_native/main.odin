@@ -1048,7 +1048,7 @@ main :: proc() {
 		}
 		f := mips.func_make(at, at + len(data))
 		mips.discover(r5900.RULES, {base = at, data = data[:]}, f, {})
-		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0]}
+		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0].off}
 		free_all(context.temp_allocator)
 	}
 	if len(slow) != 0 {
@@ -1219,7 +1219,7 @@ check_calls :: proc(arch: native.Arch) -> (failed: int) {
 		}
 		f := mips.func_make(p.at, p.at + len(data))
 		mips.discover(r5900.RULES, {base = p.at, data = data[:]}, f, {})
-		funcs[k] = {p.at, r5900.native_func(&a, f, {}, 1, &slow, labels)[0]}
+		funcs[k] = {p.at, r5900.native_func(&a, f, {}, 1, &slow, labels)[0].off}
 		free_all(context.temp_allocator)
 	}
 	code, err := core.native_load(native.make_blob(&a, funcs[:], {}), ps2.native_imports())

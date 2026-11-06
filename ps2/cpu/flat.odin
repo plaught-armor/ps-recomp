@@ -19,6 +19,28 @@ iop_flat_print: proc()
 ipu_reruns, ipu_replayed: u64
 ipu_journal_max: u32
 
+// Why wasm32 native code (recomp/r5900/native.odin) returned to the FLAT
+// runner, which does the rest: compiled code never runs events, a syscall
+// or a guest call in-line, since only the runner may switch threads.
+Native_Exit_Reason :: enum u32 {
+	None,   // go on at pc
+	Events, // run the due events, then go on at pc; back: a backward jr's second check is owed
+	Call,   // a call of pc returning to arg (the runner's flat_enter)
+	Return, // `jr $ra` to pc (flat_return)
+	Sys,    // the SYSCALL at pc - 4 is to run, then go on at pc
+	Eret,   // ERET ran: return from the exception (flat_return)
+}
+
+// Written by the code just before it returns; each reason sets the fields
+// it names, the rest are stale.
+Native_Exit :: struct {
+	reason: Native_Exit_Reason,
+	pc:     u32,
+	arg:    u32,
+	back:   u32,
+}
+native_exit: Native_Exit
+
 flat_print :: proc() {
 	when core.FLAT {
 		fmt.eprintfln("ee flat: %d returns, %d with $ra not the call's return address, %d deep at most", flat_returns, flat_mismatch, flat_max_depth)

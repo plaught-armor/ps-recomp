@@ -2,7 +2,7 @@
 // to Odin source.
 //
 // Usage: recomp <options.tsv>
-//        recomp [--arch <x64_sysv|x64_win|arm64>] <disc image> [<source dir>]
+//        recomp [--arch <x64_sysv|x64_win|arm64|wasm32>] <disc image> [<source dir>]
 //        recomp --mod-api <options.tsv> <out dir>
 //
 // The options file is a `key value` table; `backend` (r3000 or r5900)
@@ -29,7 +29,7 @@ import "native"
 import "r3000"
 import "r5900"
 
-USAGE :: "usage: recomp <options.tsv> | recomp [--arch <x64_sysv|x64_win|arm64>] <disc image> [<source dir>] | recomp --mod-api <options.tsv> <out dir>"
+USAGE :: "usage: recomp <options.tsv> | recomp [--arch <x64_sysv|x64_win|arm64|wasm32>] <disc image> [<source dir>] | recomp --mod-api <options.tsv> <out dir>"
 
 main :: proc() {
 	args := os.args[1:]

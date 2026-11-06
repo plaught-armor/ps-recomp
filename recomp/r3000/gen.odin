@@ -129,6 +129,9 @@ generate :: proc(o: mips.Options) {
 		if !ok {
 			mips.fail("%s: unknown native_arch %s", o.path, s)
 		}
+		if arch == .Wasm32 {
+			mips.fail("%s: no wasm32 native backend for the R3000 yet", o.path)
+		}
 		p.code = new(native.Asm)
 		p.code^ = native.make_asm(arch, native_ram(), NATIVE_CACHED[:])
 	}
@@ -177,10 +180,11 @@ generate :: proc(o: mips.Options) {
 	write_learned(p.out, p.runtime, runs, package_insns)
 	if p.code != nil {
 		path := mips.option(o, "native_out")
-		if !native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:]) {
+		size, ok := native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:])
+		if !ok {
 			mips.fail("cannot write %s", path)
 		}
-		fmt.printfln("native: %d bytes", len(p.code.code))
+		fmt.printfln("native: %d bytes", size)
 	}
 }
 

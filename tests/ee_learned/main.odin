@@ -11,6 +11,8 @@
 //   - Two versions at one entry: each runs native while RAM holds its words.
 //   - A record stored into (.Smc, .Smc_Unknown) or too large (.Large) is not
 //     compiled (core.learn_compilable).
+//   - A run wasm32 cannot lower (a SYSCALL in a delay slot) gets no span and
+//     is counted.
 package main
 
 import "core:fmt"
@@ -114,10 +116,29 @@ test_compilable :: proc() {
 	check(smc == 2, fmt.tprintf("stored into %d, want 2", smc))
 }
 
+// wasm32 cannot lower a SYSCALL in a delay slot (r5900.lower's exact): that
+// run gets no span and is counted, the loop beside it compiled.
+@(private = "file")
+test_wasm_skip :: proc() {
+	loop := CODE_LOOP
+	slot := [?]u32 {
+		0x03e00008, // jr ra
+		0x0000000c, // syscall
+	}
+	blob, skipped := r5900.learned_blob({{LOOP, LOOP, loop[:]}, {LOOP + 0x100, LOOP + 0x100, slot[:]}}, .Wasm32)
+	defer delete(blob)
+	check(skipped == 1, fmt.tprintf("wasm32 skipped %d runs, want 1", skipped))
+	// The header's n_spans, its seventh field (recomp/native/blob.odin).
+	n_spans := len(blob) < 28 ? -1 : int(u32(blob[24]) | u32(blob[25]) << 8 | u32(blob[26]) << 16 | u32(blob[27]) << 24)
+	check(n_spans == 1, fmt.tprintf("wasm32 blob has %d spans, want 1", n_spans))
+}
+
 @(private = "file")
 write_blob :: proc(dir, name: string, runs: []r5900.Learned) -> string {
 	path, _ := filepath.join({dir, name}, context.allocator)
-	check(os.write_entire_file(path, r5900.learned_blob(runs, native.Arch(core.NATIVE_ARCH))) == nil, fmt.tprintf("write %s", path))
+	blob, skipped := r5900.learned_blob(runs, native.Arch(core.NATIVE_ARCH))
+	check(skipped == 0, fmt.tprintf("%s: %d runs skipped", name, skipped))
+	check(os.write_entire_file(path, blob) == nil, fmt.tprintf("write %s", path))
 	return path
 }
 
@@ -134,6 +155,7 @@ tmp: string
 game :: proc(_: rawptr) {
 	if !loaded {
 		test_compilable()
+		test_wasm_skip()
 		put_loop(CODE_LOOP[0])
 		v0, native_ran := run()
 		check(v0 == 15 && !native_ran, "interpreted loop")

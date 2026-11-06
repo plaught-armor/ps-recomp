@@ -41,6 +41,16 @@ Wasm :: struct {
 	open:    bool, // a function is being emitted and not laid out yet
 	n_funcs: int,
 	st:      int, // import index of the open function's state
+	stats:   Wasm_Stats,
+}
+
+// The generated functions' sizes, for recomp's report. A branch through
+// the dispatch (a label the layout demoted) is a br_table round trip.
+Wasm_Stats :: struct {
+	bodies:              int,
+	max_bytes, max_func: int, // the largest body and its function index
+	max_arms, arms_func: int, // the most dispatch regions and its function index
+	branches, via:       int, // all branches, and those through the dispatch
 }
 
 @(private)
@@ -636,6 +646,11 @@ wasm_state_add64 :: proc(a: ^Asm, off, v: u32) {
 	wa_i64(a, i64(v))
 	emit8(a, I64_ADD)
 	wa_mem(a, I64_STORE, 3, off)
+}
+
+wasm_entry_pc :: proc(a: ^Asm, dst: Reg) {
+	wa_get(a, L_PC)
+	wa_set(a, wa_reg(dst))
 }
 
 wasm_mov_imm :: proc(a: ^Asm, dst: Reg, v: u32) {
@@ -1382,15 +1397,19 @@ wa_unal :: proc(a: ^Asm, s: Slow) {
 	}
 	if s.unal == .LWR {
 		// The word's sign extends only with all four bytes loaded.
+		// An arm sees nothing of the stack outside it: each pushes its own
+		// operands.
 		wa_set(a, S_W)
-		wa_global(a, st)
-		wa_get(a, S_W)
 		wa_get(a, S_T)
 		wa_i32(a, 0x18)
 		emit8(a, I32_AND)
 		emit8(a, OP_IF, VOID)
+		wa_global(a, st)
+		wa_get(a, S_W)
 		wa_mem(a, I64_STORE32, 2, s.off)
 		emit8(a, OP_ELSE)
+		wa_global(a, st)
+		wa_get(a, S_W)
 		emit8(a, I32_WRAP, I64_EXTEND_S)
 		wa_mem(a, I64_STORE, 3, s.off)
 		emit8(a, OP_END)
@@ -1502,7 +1521,7 @@ wasm_emit_slow :: proc(a: ^Asm, s: Slow) {
 	}
 	emit8(a, OP_END) // $call
 	wa_need(a)
-	emit8(a, OP_RETURN, OP_END, OP_UNREACHABLE) // $top
+	emit8(a, OP_RETURN, OP_END, OP_UNREACHABLE, OP_END) // $top, the function
 }
 
 // ---------------------------------------------------------------- layout
@@ -1698,7 +1717,9 @@ wasm_finalize :: proc(a: ^Asm) {
 		case .Bind:
 		case .Br, .Br_If:
 			if it.kind == .Br_If {append(body, ..a.code[it.lo:it.hi])}
+			w.stats.branches += 1
 			if demoted[it.label] {
+				w.stats.via += 1
 				r := region(starts[:], w.at_item[it.label])
 				depth := len(stack) + n_regions - 1 - k
 				if it.kind == .Br_If {
@@ -1732,6 +1753,11 @@ wasm_finalize :: proc(a: ^Asm) {
 	if n_regions > 1 {append(body, OP_END)} // the dispatch loop
 	append(body, OP_END)
 	append(&w.bodies, Wasm_Body{lo, len(body), wa_type(a, {I32, I32}, 0)})
+	st := &w.stats
+	fi := len(w.bodies) - 1
+	st.bodies += 1
+	if len(body) - lo > st.max_bytes {st.max_bytes, st.max_func = len(body) - lo, fi}
+	if n_regions > st.max_arms {st.max_arms, st.arms_func = n_regions, fi}
 
 	clear(&w.items)
 	clear(&w.calls)

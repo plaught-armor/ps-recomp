@@ -6,18 +6,18 @@ package r5900
 import "core:fmt"
 
 Step_Kind :: enum u8 {
-	Case,     // block at `target`; `check`: the previous block falls into it
+	Case,     // block at `target`; `check`: the previous block falls into it; `n`: 1 where the runner goes on (exact: after a call or a SYSCALL)
 	Op,       // instruction `i` (no control transfer)
 	Cycles,   // charge `n` cycles
-	Return,
-	Goto,     // pc = `target` within the function; `check`: run due events first
-	Call,     // call the function at `target`
+	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead
+	Goto,     // pc = `target` within the function (exact: or outside it); `check`: run due events first; `n`: the jump's pc
+	Call,     // call the function at `target`, returning to `n`
 	Branch,   // t := the condition of branch `i`, up to the matching End
 	Link,     // register `n` = `target` (a return address)
 	If_Taken, // when t, the steps up to the matching End
 	Jump_Reg, // t := register `n`, up to the matching End
-	Call_Reg, // call the function at t
-	Goto_Reg, // pc = t within the function, after running due events
+	Call_Reg, // call the function at t, returning to `n`
+	Goto_Reg, // pc = t within the function, after running due events; `n`: the jr's pc
 	End,
 }
 
@@ -36,6 +36,28 @@ Lowering :: struct {
 	steps:     [dynamic]Step,
 	open_case: bool, // current block can fall into the next label
 	pending:   int, // instructions not yet charged
+	// Each instruction charged as the interpreter does it, just before it
+	// runs, and each place the code can be left and gone on at a block
+	// (lower's exact).
+	exact:     bool,
+	resume:    map[u32]bool, // exact: where the runner goes on after a call or a SYSCALL
+}
+
+// A block starts at pc.
+@(private = "file")
+is_label :: proc(l: ^Lowering, pc: u32) -> bool {
+	return pc in l.f.labels || pc in l.resume
+}
+
+// Charge the instruction about to be put; exact puts its cycles now, else
+// they wait for the next flush.
+@(private = "file")
+charge :: proc(l: ^Lowering) {
+	if l.exact {
+		put(l, {kind = .Cycles, n = u32(l.cycles)})
+	} else {
+		l.pending += 1
+	}
 }
 
 @(private = "file")
@@ -54,16 +76,22 @@ flush :: proc(l: ^Lowering) {
 // Transfer control to t from instruction src.
 @(private = "file")
 goto_ :: proc(l: ^Lowering, src, t: u32) {
-	if t >= l.f.start && t < l.f.end && t in l.f.labels {
+	if l.exact || t >= l.f.start && t < l.f.end && is_label(l, t) {
 		put(l, {kind = .Goto, target = t, check = t <= src, n = src})
 		return
 	}
-	put(l, {kind = .Call, target = t})
+	put(l, {kind = .Call, target = t, n = src + 8})
 	put(l, {kind = .Return})
 }
 
-// The steps of f, in context.temp_allocator.
-lower :: proc(f: ^Func, cycles: int, quiet: bool) -> []Step {
+// The steps of f, in context.temp_allocator. With exact (wasm32 native
+// code, which leaves the function wherever the interpreter's FLAT runner
+// takes over): cycles per instruction in the interpreter's order, a block
+// after each call and each SYSCALL (where the runner comes back in), a jump
+// out of the function as a Goto, and the address `jr $ra` jumps to read
+// before its delay slot. nil when exact cannot lower f: a SYSCALL, BREAK or
+// ERET in a delay slot.
+lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 	pcs := make([dynamic]u32, 0, len(f.insns), context.temp_allocator)
 	for a in f.insns {append(&pcs, a)}
 	sort_u32(pcs[:])
@@ -71,26 +99,40 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool) -> []Step {
 		f      = f,
 		cycles = cycles,
 		steps  = make([dynamic]Step, 0, 2 * len(f.insns), context.temp_allocator),
+		exact  = exact,
+	}
+	l.resume.allocator = context.temp_allocator
+	if exact {
+		for pc in pcs {
+			i := decode(pc, f.insns[pc].w)
+			at := u32(0)
+			if i.kind == .Call || i.kind == .Jalr || i.kind == .Branch && i.link {
+				at = pc + 8
+			} else if i.op == .SYSCALL {
+				at = pc + 4
+			}
+			if at != 0 && at in f.insns && at not_in f.delay {l.resume[at] = true}
+		}
 	}
 	skip: map[u32]bool
 	skip.allocator = context.temp_allocator
 	for pc in pcs {
 		i := decode(pc, f.insns[pc].w)
 		if pc in skip {continue}
-		if pc in f.labels {
+		if is_label(&l, pc) {
 			if l.open_case {flush(&l)}
-			put(&l, {kind = .Case, target = pc, check = l.open_case})
+			put(&l, {kind = .Case, target = pc, check = l.open_case, n = 1 if pc in l.resume else 0})
 			l.open_case = true
 		} else if !l.open_case {
 			continue // unreachable except as a delay slot
 		}
-		l.pending += 1
+		charge(&l)
 
 		if !has_delay(i) {
 			put(&l, {kind = .Op, i = i})
 			if i.kind == .Bad || i.op == .ERET {
 				flush(&l)
-				put(&l, {kind = .Return})
+				put(&l, {kind = .Return, check = exact && i.op == .ERET})
 				l.open_case = false
 			}
 			continue
@@ -104,19 +146,23 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool) -> []Step {
 			if has_delay(d) {
 				if !quiet {fmt.eprintfln("warning %s: branch in delay slot at %s", hexu(f.entry), hexu(pc + 4))}
 			} else {
+				if exact && d.kind == .Sys {return nil}
 				slot_op = true
-				l.pending += 1
+				if !exact {l.pending += 1}
 			}
 		}
 		skip[pc + 4] = true
 		ret := pc + 8
 		delay :: proc(l: ^Lowering, d: Insn, slot_op: bool) {
-			if slot_op {put(l, {kind = .Op, i = d})}
+			if slot_op {
+				if l.exact {put(l, {kind = .Cycles, n = u32(l.cycles)})}
+				put(l, {kind = .Op, i = d})
+			}
 			flush(l)
 		}
 		taken :: proc(l: ^Lowering, i: Insn) {
 			if i.link {
-				put(l, {kind = .Call, target = i.target})
+				put(l, {kind = .Call, target = i.target, n = i.pc + 8})
 			} else {
 				goto_(l, i.pc, i.target)
 			}
@@ -129,9 +175,9 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool) -> []Step {
 			if i.likely {
 				// delay slot only when taken; the branch and everything
 				// before it count on both paths
-				if slot_op {l.pending -= 1}
+				if slot_op && !exact {l.pending -= 1}
 				flush(&l)
-				if slot_op {l.pending += 1}
+				if slot_op && !exact {l.pending += 1}
 				put(&l, {kind = .If_Taken})
 				delay(&l, d, slot_op)
 				taken(&l, i)
@@ -150,21 +196,26 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool) -> []Step {
 		case .Call:
 			put(&l, {kind = .Link, n = 31, target = ret})
 			delay(&l, d, slot_op)
-			put(&l, {kind = .Call, target = i.target})
+			put(&l, {kind = .Call, target = i.target, n = ret})
 		case .Jalr:
 			put(&l, {kind = .Jump_Reg, n = u32(i.rs)})
 			if i.rd != 0 {put(&l, {kind = .Link, n = u32(i.rd), target = ret})}
 			delay(&l, d, slot_op)
-			put(&l, {kind = .Call_Reg})
+			put(&l, {kind = .Call_Reg, n = ret})
 			put(&l, {kind = .End})
 		case .Jr:
-			if i.rs == 31 {
+			if i.rs == 31 && exact {
+				put(&l, {kind = .Jump_Reg, n = 31})
+				delay(&l, d, slot_op)
+				put(&l, {kind = .Return})
+				put(&l, {kind = .End})
+			} else if i.rs == 31 {
 				delay(&l, d, slot_op)
 				put(&l, {kind = .Return})
 			} else {
 				put(&l, {kind = .Jump_Reg, n = u32(i.rs)})
 				delay(&l, d, slot_op)
-				put(&l, {kind = .Goto_Reg})
+				put(&l, {kind = .Goto_Reg, n = pc})
 				put(&l, {kind = .End})
 			}
 			l.open_case = false
@@ -184,13 +235,16 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool) -> []Step {
 				l.open_case = false
 			} else {
 				put(&l, {kind = .Case, target = pc + 4})
+				if exact {put(&l, {kind = .Cycles, n = u32(l.cycles)})}
 				put(&l, {kind = .Op, i = d})
-				l.pending += 1
+				if !exact {l.pending += 1}
 				l.open_case = true
 			}
 		}
 	}
-	if l.open_case {
+	if l.open_case && exact {
+		put(&l, {kind = .Goto, target = f.end})
+	} else if l.open_case {
 		flush(&l)
 		put(&l, {kind = .Call, target = f.end})
 		put(&l, {kind = .Return})

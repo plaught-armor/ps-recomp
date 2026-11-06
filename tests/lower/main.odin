@@ -82,7 +82,8 @@ main :: proc() {
 	}
 	likely_cycles()
 	imports()
-	fmt.println("ok lower:", len(r5900_firsts), "r5900 and", len(r3000_firsts), "r3000 branches with a branch in a jump-target delay slot; beql cycles; import placeholders")
+	exact_steps()
+	fmt.println("ok lower:", len(r5900_firsts), "r5900 and", len(r3000_firsts), "r3000 branches with a branch in a jump-target delay slot; beql cycles; import placeholders; exact steps")
 }
 
 // The function of `words` at `base`, discovered with the r5900 rules.
@@ -157,4 +158,102 @@ likely_cycles :: proc() {
 		fmt.eprintfln("FAIL r5900 beql cycles: %d before the branch (want 2), %d in the delay slot (want 1)", before, taken)
 		os.exit(1)
 	}
+}
+
+// One step as exact_steps writes it: an Op by its instruction's pc.
+@(private = "file")
+Want :: struct {
+	kind:      r5900.Step_Kind,
+	check:     bool,
+	n, target: u32,
+	pc:        u32,
+}
+
+// r5900.lower's exact mode (wasm32 native code, a step of the FLAT
+// runner), step by step:
+//
+//   0x1000  jal 0x2000
+//   0x1004  nop
+//   0x1008  syscall                 the runner comes back here after the jal
+//   0x100c  jalr $t0                and here after the syscall
+//   0x1010  nop
+//   0x1014  beql $a0, $0, 0x102c    and here after the jalr
+//   0x1018  addiu $v0, $v0, 1
+//   0x101c  bne $a1, $0, 0x1008     a block (beql's not taken); backward: events first
+//   0x1020  nop
+//   0x1024  jr $t0                  a block (bne's not taken); a Goto_Reg
+//   0x1028  nop
+//   0x102c  jr $ra                  its target read before the delay slot
+//   0x1030  nop
+//
+// Each instruction's cycles just before it (a delay slot's inside the
+// slot, a likely one's only when taken), a block with n = 1 after each
+// call and the SYSCALL, and the branches as Gotos.
+@(private = "file")
+exact_steps :: proc() {
+	f := func_of(0x1000, {0x0c000800, 0, 0x0000000c, 0x0100f809, 0, 0x50800005, 0x24420001, 0x14a0fffa, 0, 0x01000008, 0, 0x03e00008, 0})
+	want := [?]Want {
+		{kind = .Case, target = 0x1000},
+		{kind = .Cycles, n = 1},
+		{kind = .Link, n = 31, target = 0x1008},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1004},
+		{kind = .Call, target = 0x2000, n = 0x1008},
+		{kind = .Case, target = 0x1008, check = true, n = 1},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1008},
+		{kind = .Case, target = 0x100c, check = true, n = 1},
+		{kind = .Cycles, n = 1},
+		{kind = .Jump_Reg, n = 8},
+		{kind = .Link, n = 31, target = 0x1014},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1010},
+		{kind = .Call_Reg, n = 0x1014},
+		{kind = .End},
+		{kind = .Case, target = 0x1014, check = true, n = 1},
+		{kind = .Cycles, n = 1},
+		{kind = .Branch, pc = 0x1014},
+		{kind = .If_Taken},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1018},
+		{kind = .Goto, target = 0x102c, n = 0x1014},
+		{kind = .End},
+		{kind = .End},
+		{kind = .Case, target = 0x101c, check = true},
+		{kind = .Cycles, n = 1},
+		{kind = .Branch, pc = 0x101c},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1020},
+		{kind = .If_Taken},
+		{kind = .Goto, target = 0x1008, check = true, n = 0x101c},
+		{kind = .End},
+		{kind = .End},
+		{kind = .Case, target = 0x1024, check = true},
+		{kind = .Cycles, n = 1},
+		{kind = .Jump_Reg, n = 8},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1028},
+		{kind = .Goto_Reg, n = 0x1024},
+		{kind = .End},
+		{kind = .Case, target = 0x102c},
+		{kind = .Cycles, n = 1},
+		{kind = .Jump_Reg, n = 31},
+		{kind = .Cycles, n = 1},
+		{kind = .Op, pc = 0x1030},
+		{kind = .Return},
+		{kind = .End},
+	}
+	steps := r5900.lower(f, 1, true, exact = true)
+	got := make([]Want, len(steps), context.temp_allocator)
+	for s, k in steps {
+		got[k] = {kind = s.kind, check = s.check, n = s.n, target = s.target}
+		if s.kind == .Op || s.kind == .Branch {got[k].pc = s.i.pc}
+	}
+	for k in 0 ..< max(len(got), len(want)) {
+		if k < len(got) && k < len(want) && got[k] == want[k] {continue}
+		fmt.eprintfln("FAIL r5900 exact lower: step %d of %d (want %d)", k, len(got), len(want))
+		for g, j in got {fmt.eprintfln("  %d %v", j, g)}
+		os.exit(1)
+	}
+	free_all(context.temp_allocator)
 }

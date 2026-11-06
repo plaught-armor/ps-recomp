@@ -33,6 +33,11 @@ import vu "vu"
 #assert(offset_of(cpu.Cpu, fcr31) == 680)
 #assert(offset_of(cpu.Cpu, cop0) == 684)
 #assert(offset_of(cpu.Cpu, cycles) == 816)
+// wasm32 native code's exit record, and its reasons' values.
+#assert(offset_of(cpu.Native_Exit, reason) == 0 && offset_of(cpu.Native_Exit, pc) == 4)
+#assert(offset_of(cpu.Native_Exit, arg) == 8 && offset_of(cpu.Native_Exit, back) == 12)
+#assert(int(cpu.Native_Exit_Reason.None) == 0 && int(cpu.Native_Exit_Reason.Events) == 1 && int(cpu.Native_Exit_Reason.Call) == 2 && int(cpu.Native_Exit_Reason.Return) == 3)
+#assert(int(cpu.Native_Exit_Reason.Sys) == 4 && int(cpu.Native_Exit_Reason.Eret) == 5)
 // And a VU's VI and other registers by these offsets from import vu.vf or
 // vu1.vf; acc at a multiple of 16 for arm64's scaled ldr q.
 #assert(offset_of(vu.Vu, vi) - offset_of(vu.Vu, vf) == 512)
@@ -243,6 +248,7 @@ native_imports :: proc(types: ^map[string]typeid = nil) -> map[string]u64 {
 	f(&m, types, "ps2.wr32", wr32)
 	m["cpu.state"] = p(&cpu.state)
 	m["cpu.next_event"] = p(&cpu.next_event)
+	m["cpu.native_exit"] = p(&cpu.native_exit)
 	f(&m, types, "cpu.call", cpu.call)
 	f(&m, types, "cpu.jump_unknown", cpu.jump_unknown)
 	f(&m, types, "cpu.bad_insn", cpu.bad_insn)

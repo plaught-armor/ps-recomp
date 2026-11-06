@@ -10,7 +10,8 @@
 // <dir>/cases.txt lists each case: its module, its imports in slot order,
 // the state it starts with and the one it ends with. Every branch first
 // takes one from the fuel field, and the function returns when it runs out,
-// so every program ends.
+// so every program ends. mem.odin adds the memory cases, which <dir>/mem.txt
+// lists: one in eight as many as cases.
 package wasm_asm
 
 import "core:fmt"
@@ -205,4 +206,5 @@ main :: proc() {
 		os.exit(1)
 	}
 	fmt.printfln("wasm_asm: %d cases in %s", n_cases, dir)
+	mem_cases(dir, n_cases / 8 + 1)
 }

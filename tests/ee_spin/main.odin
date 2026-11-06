@@ -146,7 +146,7 @@ main :: proc() {
 		}
 		f := mips.func_make(at, at + u32(len(data)))
 		mips.discover(r5900.RULES, {base = at, data = data}, f, {})
-		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0]}
+		funcs[k] = {at, r5900.native_func(&a, f, {}, 1, &slow)[0].off}
 		free_all(context.temp_allocator)
 	}
 	if len(slow) != 0 {

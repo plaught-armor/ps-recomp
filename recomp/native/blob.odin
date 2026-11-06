@@ -57,10 +57,13 @@ Blob_Span :: struct {
 	ranges:     []Blob_Range,
 }
 
-write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil) -> bool {
+// Also returns the code's size: the machine code, or the wasm32 module.
+write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil) -> (code_size: int, ok: bool) {
 	b := make_blob(a, funcs, ovls, spans)
 	defer delete(b)
-	return os.write_entire_file(path, b) == nil
+	// The header's code_size, its tenth field.
+	code_size = int(u32(b[36]) | u32(b[37]) << 8 | u32(b[38]) << 16 | u32(b[39]) << 24)
+	return code_size, os.write_entire_file(path, b) == nil
 }
 
 // The file's bytes, in context.allocator; finishes a.

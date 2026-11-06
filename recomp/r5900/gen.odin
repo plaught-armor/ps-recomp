@@ -308,12 +308,19 @@ generate :: proc(o: mips.Options) {
 	}
 
 	// With coverage, native code for x64 and arm64 both: the one native_out
-	// gets in code, the other into a throwaway Asm, counted only.
+	// gets in code, the other into a throwaway Asm, counted only (and
+	// wasm32's, when that is native_out's).
 	cover := mips.option_or(o, "coverage", "") == "true"
-	asms: [2]^native.Asm // x64, arm64
-	if code != nil {asms[code.arch == .Arm64 ? 1 : 0] = code}
+	asms: [3]^native.Asm // x64, arm64, wasm32
+	if code != nil {
+		switch code.arch {
+		case .X64_SysV, .X64_Win: asms[0] = code
+		case .Arm64: asms[1] = code
+		case .Wasm32: asms[2] = code
+		}
+	}
 	if cover {
-		for &a, k in asms {
+		for &a, k in asms[:2] {
 			if a == nil {
 				a = new(native.Asm)
 				a^ = native.make_asm(k == 0 ? .X64_SysV : .Arm64, native_ram())
@@ -322,7 +329,7 @@ generate :: proc(o: mips.Options) {
 	}
 
 	// Per Asm, a label for each function's entry, for direct calls.
-	entry_labels: [2]map[u32]native.Label
+	entry_labels: [3]map[u32]native.Label
 	for a, x in asms {
 		if a == nil {continue}
 		for f in funcs {entry_labels[x][f.entry] = native.new_label(a)}
@@ -331,7 +338,7 @@ generate :: proc(o: mips.Options) {
 	// Per backend, the sites that call the interpreter.
 	slow_emit: map[string]int
 	slow_vu: [vu.Unit]map[string]int
-	slow_native: [2]map[string]int
+	slow_native: [3]map[string]int
 	if out != "" {
 		mips.make_dirs(out)
 	}
@@ -378,10 +385,9 @@ generate :: proc(o: mips.Options) {
 			for a, x in asms {
 				if a == nil {continue}
 				entries := interior_entries(&e, f)
-				offs := native_func(a, f, entries, cycles, &slow_native[x], entry_labels[x])
-				if a != code {continue}
-				append(&n_funcs, native.Blob_Func{f.entry, offs[0]})
-				for l, k in entries {append(&n_funcs, native.Blob_Func{l, offs[1 + k]})}
+				// nil: wasm32 leaves f to the interpreter.
+				fs := native_func(a, f, entries, cycles, &slow_native[x], entry_labels[x])
+				if a == code {append(&n_funcs, ..fs)}
 			}
 			free_all(context.temp_allocator)
 		}
@@ -406,11 +412,16 @@ generate :: proc(o: mips.Options) {
 		// The VU microprograms too, with native_vu: the runtime runs them
 		// natively once it knows them (ps2/vu).
 		vus: [dynamic]native.Blob_Span
-		if mips.option_or(o, "native_vu", "") == "true" {native_vus(o, img, code, &vus)}
-		if !native.write_blob(path, code, n_funcs[:], nil, vus[:]) {
+		if mips.option_or(o, "native_vu", "") == "true" {
+			if code.arch == .Wasm32 {mips.fail("%s: no wasm32 VU backend yet", img.name)}
+			native_vus(o, img, code, &vus)
+		}
+		code_size, ok := native.write_blob(path, code, n_funcs[:], nil, vus[:])
+		if !ok {
 			mips.fail("cannot write %s", path)
 		}
-		fmt.printfln("native: %d bytes -> %s", len(code.code), path)
+		fmt.printfln("native: %d bytes -> %s", code_size, path)
+		if code.arch == .Wasm32 {wasm_report(code.wa.stats, n_funcs[:])}
 	}
 	// The VU microprograms only as Odin source; without it they run in the
 	// interpreter.
@@ -427,6 +438,7 @@ generate :: proc(o: mips.Options) {
 		coverage("emit", slow_emit)
 		coverage("native x64", slow_native[0])
 		coverage("native arm64", slow_native[1])
+		if asms[2] != nil {coverage("native wasm32", slow_native[2])}
 		if programs[.VU0] > 0 {coverage("vu0", slow_vu[.VU0])}
 		coverage("vu", slow_vu[.VU1])
 	}
@@ -466,14 +478,16 @@ vu_only :: proc(o: mips.Options, img: mips.Image) {
 		mips.fail("%s: unknown native_arch %s", o.path, mips.option(o, "native_arch"))
 	}
 	code := new(native.Asm)
+	if arch == .Wasm32 {mips.fail("%s: no wasm32 VU backend yet", img.name)}
 	code^ = native.make_asm(arch, native_ram())
 	vus: [dynamic]native.Blob_Span
 	native_vus(o, img, code, &vus)
 	path := mips.option(o, "native_out")
-	if !native.write_blob(path, code, nil, nil, vus[:]) {
+	code_size, written := native.write_blob(path, code, nil, nil, vus[:])
+	if !written {
 		mips.fail("cannot write %s", path)
 	}
-	fmt.printfln("native: %d VU microprograms, %d bytes -> %s", len(vus), len(code.code), path)
+	fmt.printfln("native: %d VU microprograms, %d bytes -> %s", len(vus), code_size, path)
 }
 
 // Both VUs' programs (.vutext and the captures) compiled into code, their
@@ -492,6 +506,18 @@ native_vus :: proc(o: mips.Options, img: mips.Image, code: ^native.Asm, vus: ^[d
 @(private = "file")
 vu_capture :: proc(o: mips.Options, unit: vu.Unit) -> string {
 	return mips.option_or(o, unit == .VU0 ? "vu0_capture" : "vu1_capture", "")
+}
+
+// The wasm32 module's largest functions, by the entry of each (its first
+// in funcs), and the share of branches that go through a dispatch.
+@(private = "file")
+wasm_report :: proc(s: native.Wasm_Stats, funcs: []native.Blob_Func) {
+	entry :: proc(funcs: []native.Blob_Func, fi: int) -> u32 {
+		for f in funcs {if int(f.off) == fi {return f.addr}}
+		return 0
+	}
+	via := 0.0 if s.branches == 0 else 100 * f64(s.via) / f64(s.branches)
+	fmt.printfln("wasm32: %d functions; largest %d bytes (%08x); most dispatch arms %d (%08x); %d of %d branches through a dispatch (%.2f%%)", s.bodies, s.max_bytes, entry(funcs, s.max_func), s.max_arms, entry(funcs, s.arms_func), s.via, s.branches, via)
 }
 
 // Print the ops of one backend that call the interpreter, the most sites

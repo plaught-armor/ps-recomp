@@ -1446,11 +1446,61 @@ branch_cond :: proc(a: ^native.Asm, i: Insn) {
 	}
 }
 
+// Why wasm32 code left for the FLAT runner (ps2/interp_flat.odin), in
+// cpu.native_exit: cpu.Native_Exit_Reason, whose values ps2/native.odin
+// checks.
+@(private = "file")
+Exit :: enum u32 {
+	None,   // go on at pc
+	Events, // run the due events, then go on at pc (back: a backward jr's)
+	Call,   // call pc, returning to arg
+	Return, // `jr $ra` to pc
+	Sys,    // the SYSCALL before pc
+	Eret,   // ERET ran
+}
+
+// Field offsets in cpu.Native_Exit; the loader checks them.
+@(private = "file")
+EXIT_PC :: 4
+@(private = "file")
+EXIT_ARG :: 8
+@(private = "file")
+EXIT_BACK :: 12
+
+// wasm32: leave for the FLAT runner with reason, pc in register pc, arg
+// (Call) and back in B (Events). Each reason sets only the fields it uses.
+@(private = "file")
+exit :: proc(a: ^native.Asm, reason: Exit, pc := native.Reg.T, arg: u32 = 0) {
+	native.mov_imm(a, .C, u32(reason))
+	native.imp_store(a, "cpu.native_exit", .C)
+	if reason != .Eret {native.imp_store(a, "cpu.native_exit", pc, EXIT_PC)}
+	if reason == .Call {
+		native.mov_imm(a, .C, arg)
+		native.imp_store(a, "cpu.native_exit", .C, EXIT_ARG)
+	}
+	if reason == .Events {native.imp_store(a, "cpu.native_exit", .B, EXIT_BACK)}
+	native.ret(a)
+}
+
+// wasm32: when events are due, leave to run them with pc t (and back B).
+@(private = "file")
+events_exit :: proc(a: ^native.Asm, t: native.Reg) {
+	skip := native.new_label(a)
+	native.br_state64_below(a, CYCLES, "cpu.next_event", skip)
+	exit(a, .Events, t)
+	native.bind(a, skip)
+}
+
 // pc = t: the block at t, or outside the function's blocks.
 @(private = "file")
 go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 	if l, ok := labels[t]; ok {
 		native.jmp(a, l)
+		return
+	}
+	if a.arch == .Wasm32 {
+		native.mov_imm(a, .T, t)
+		exit(a, .None)
 		return
 	}
 	native.mov_imm(a, .A, f.entry)
@@ -1460,14 +1510,25 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 }
 
 // Machine code for f into a: its entry, then one for each of entries (the
-// interior ones the program takes the address of). Returns their code
-// offsets, in context.temp_allocator. Counts the sites that call the
-// interpreter in slow, per op. funcs holds a label in a for the entry of
-// each function a gets: f's is bound here, and a jal to one is a direct
-// call, where cpu.call would look the same code up in its table and call
-// it (nothing registers over the native functions after load_native).
-native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil) -> []u32 {
-	steps := lower(f, cycles, quiet = true) // emit_func warned
+// interior ones the program takes the address of). Returns each entry's
+// pc and code offset, f's first, in context.temp_allocator. Counts the
+// sites that call the interpreter in slow, per op. funcs holds a label in
+// a for the entry of each function a gets: f's is bound here, and a jal to
+// one is a direct call, where cpu.call would look the same code up in its
+// table and call it (nothing registers over the native functions after
+// load_native).
+//
+// On wasm32 the code is a step of the FLAT runner: one function, entered
+// at the block of its pc parameter, that runs until the interpreter has
+// work to do there (a call, a return, a SYSCALL, ERET, due events, a jump
+// out of its blocks) and leaves with the reason (exit). Its entries are
+// the interior ones and each block the runner goes on at (after a call or
+// a SYSCALL), all at the function's offset (its index). nil when lower
+// cannot lower f for it: f is interpreted.
+native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil) -> []native.Blob_Func {
+	wasm := a.arch == .Wasm32
+	steps := lower(f, cycles, quiet = true, exact = wasm) // emit_func warned
+	if steps == nil {return nil}
 	labels := make(map[u32]native.Label, context.temp_allocator)
 	pcs := make([dynamic]u32, context.temp_allocator)
 	for s in steps {
@@ -1477,12 +1538,41 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		}
 	}
 	slice.sort(pcs[:])
-	offs := make([]u32, 1 + len(entries), context.temp_allocator)
-	offs[0] = u32(native.func_begin(a, "cpu.state"))
-	if l, ok := funcs[f.entry]; ok {native.bind_at(a, l, int(offs[0]))}
-	trace(a, f.entry)
-	events(a)
-	go(a, f, labels, f.entry)
+	fs := make([dynamic]native.Blob_Func, 0, 1 + len(entries), context.temp_allocator)
+	at := u32(native.func_begin(a, "cpu.state"))
+	append(&fs, native.Blob_Func{f.entry, at})
+	lookup := native.Label(-1)
+	if wasm {
+		seen := make(map[u32]bool, context.temp_allocator)
+		seen[f.entry] = true
+		for e in entries {
+			if e in seen {continue}
+			seen[e] = true
+			append(&fs, native.Blob_Func{e, at})
+		}
+		for s in steps {
+			if s.kind != .Case || s.n == 0 || s.target in seen {continue}
+			seen[s.target] = true
+			append(&fs, native.Blob_Func{s.target, at})
+		}
+		// The entry search misses only a pc no block starts at, and the
+		// miss leaves with None at that pc, where the runner would enter
+		// again: every pc entered at is a block.
+		for b in fs {assert(b.addr in labels, "wasm32 entry without a block")}
+		if len(fs) == 1 {
+			go(a, f, labels, f.entry)
+		} else {
+			// t = the pc entered at, found among the blocks.
+			native.entry_pc(a, .T)
+			lookup = native.new_label(a)
+			native.jmp(a, lookup)
+		}
+	} else {
+		if l, ok := funcs[f.entry]; ok {native.bind_at(a, l, int(at))}
+		trace(a, f.entry)
+		events(a)
+		go(a, f, labels, f.entry)
+	}
 	// Open ifs: the label each one ends at, or -1 for a group (Branch,
 	// Jump_Reg) that only scopes t.
 	ifs := make([dynamic]native.Label, context.temp_allocator)
@@ -1490,7 +1580,6 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 	// which runs the case again (pc is still the block's own).
 	leaves := true
 	block := native.Label(-1)
-	lookup := native.Label(-1)
 	again :: proc(a: ^native.Asm, leaves: bool, block: native.Label) {
 		if !leaves && block >= 0 {native.jmp(a, block)}
 	}
@@ -1503,21 +1592,37 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			block = labels[s.target]
 			native.bind(a, block)
 		case .Op:
-			if op(a, s.i) {count_slow(slow, s.i)}
+			if wasm && s.i.op == .SYSCALL {
+				native.mov_imm(a, .T, s.i.pc + 4)
+				exit(a, .Sys)
+				leaves = true
+			} else if op(a, s.i) {count_slow(slow, s.i)}
 		case .Cycles:
 			native.state_add64(a, CYCLES, s.n)
 		case .Return:
-			native.ret(a)
+			if wasm {
+				exit(a, .Eret if s.check else .Return)
+			} else {
+				native.ret(a)
+			}
 			leaves = true
 		case .Goto:
-			if s.check {
+			if s.check && wasm {
+				native.mov_imm(a, .T, s.target)
+				native.mov_imm(a, .B, 0)
+				events_exit(a, .T)
+			} else if s.check {
 				events(a)
 				if s.n - s.target < SPIN_SPAN * 4 {spin(a, s.n)}
 			}
 			go(a, f, labels, s.target)
 			leaves = true
 		case .Call:
-			if l, ok := funcs[s.target]; ok {
+			if wasm {
+				native.mov_imm(a, .T, s.target)
+				exit(a, .Call, .T, s.n)
+				leaves = true
+			} else if l, ok := funcs[s.target]; ok {
 				native.call_func(a, l)
 			} else {
 				call_imm(a, "cpu.call", s.target)
@@ -1536,10 +1641,22 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			get(a, .T, u8(s.n))
 			append(&ifs, -1)
 		case .Call_Reg:
-			native.mov(a, .A, .T)
-			native.call(a, "cpu.call", .A)
+			if wasm {
+				exit(a, .Call, .T, s.n)
+				leaves = true
+			} else {
+				native.mov(a, .A, .T)
+				native.call(a, "cpu.call", .A)
+			}
 		case .Goto_Reg:
-			events(a)
+			if wasm {
+				// back: t <= the jr's pc, as flat_loop's .Jr sets it
+				native.mov(a, .B, .T)
+				native.set_cond_imm(a, .Ltu, .B, s.n + 1)
+				events_exit(a, .T)
+			} else {
+				events(a)
+			}
 			if lookup < 0 {lookup = native.new_label(a)}
 			native.jmp(a, lookup)
 			leaves = true
@@ -1553,23 +1670,29 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 	}
 	again(a, leaves, block)
 	native.func_end(a)
-	// One lookup of t among the case pcs, shared by every Goto_Reg.
+	// One lookup of t among the case pcs, shared by every Goto_Reg (and on
+	// wasm32 the entry).
 	if lookup >= 0 {
 		native.bind(a, lookup)
 		miss := native.new_label(a)
 		native.search(a, pcs[:], labels, miss)
 		native.bind(a, miss)
-		native.mov_imm(a, .A, f.entry)
-		native.mov(a, .B, .T)
-		native.call(a, "cpu.jump_unknown", .A, .B)
-		native.ret(a)
+		if wasm {
+			exit(a, .None)
+		} else {
+			native.mov_imm(a, .A, f.entry)
+			native.mov(a, .B, .T)
+			native.call(a, "cpu.jump_unknown", .A, .B)
+			native.ret(a)
+		}
 	}
 	// Interior entries share the body and its epilogue.
-	for e, k in entries {
-		offs[1 + k] = u32(native.func_entry(a, "cpu.state"))
+	for e in entries {
+		if wasm {break}
+		append(&fs, native.Blob_Func{e, u32(native.func_entry(a, "cpu.state"))})
 		trace(a, e)
 		events(a)
 		native.jmp(a, labels[e])
 	}
-	return offs
+	return fs[:]
 }
