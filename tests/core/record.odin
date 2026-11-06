@@ -151,3 +151,29 @@ test_hello :: proc() {
 	if fails > 0 {os.exit(1)}
 	fmt.println("ok hello")
 }
+
+// core.peer_hash: the peer's hash for a frame is taken once, however many
+// INPUT packets carry it. A repeat leaves the slot as compare_hash left it
+// (final cleared once counted), so the hash is not counted again; the next
+// frame's hash replaces it.
+test_peer_hash :: proc() {
+	fails := 0
+	h := core.Hash{frame = -1}
+	if !core.peer_hash(&h, 60, 0xaa) || h != {60, 0xaa, true} {
+		fmt.eprintln("FAIL peer_hash: the first hash for 60 not taken:", h)
+		fails += 1
+	}
+	h.final = false // counted (compare_hash)
+	for _ in 0 ..< 3 {
+		if core.peer_hash(&h, 60, 0xaa) || h != {60, 0xaa, false} {
+			fmt.eprintln("FAIL peer_hash: a repeat of 60 taken again:", h)
+			fails += 1
+		}
+	}
+	if !core.peer_hash(&h, 120, 0xbb) || h != {120, 0xbb, true} {
+		fmt.eprintln("FAIL peer_hash: the hash for 120 not taken:", h)
+		fails += 1
+	}
+	if fails > 0 {os.exit(1)}
+	fmt.println("ok peer_hash")
+}

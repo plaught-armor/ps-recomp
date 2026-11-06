@@ -153,6 +153,7 @@ main :: proc() {
 	test_thumb()
 	test_record_mods()
 	test_hello()
+	test_peer_hash()
 	test_heap_full()
 	core.snap_init(1 << 20)
 	core.snap_add(&frame)

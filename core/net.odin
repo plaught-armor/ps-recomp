@@ -134,7 +134,6 @@ Log_Frame :: struct {
 	used:  [MAX_PLAYERS]Net_Input, // as simulated
 }
 
-@(private = "file")
 Hash :: struct {
 	frame: int, // -1 for none
 	hash:  u64,
@@ -498,8 +497,7 @@ take_input :: proc(player: int, d: []u8) {
 	   0 {n.status.ping = time.tick_since(n.epoch) - time.Duration(echo) * time.Millisecond}
 	if hf := get_u32(d[28:]); hf != NO_FRAME && n.cfg.hash_every > 0 {
 		h := &n.peer_hashes[(int(hf) / n.cfg.hash_every) % HASHES]
-		h^ = {int(hf), get_u64(d[32:]), true}
-		compare_hash(int(hf))
+		if peer_hash(h, int(hf), get_u64(d[32:])) {compare_hash(int(hf))}
 	}
 	for i in 0 ..< count {
 		f := first + i
@@ -645,6 +643,16 @@ finalize_hashes :: proc() {
 		n.sent_hash = max(n.sent_hash, h.frame)
 		compare_hash(h.frame)
 	}
+}
+
+// Take the peer's hash for frame into its slot h: true when it is new, to
+// be compared. Every INPUT carries the peer's newest final hash, so the same
+// frame arrives once per packet; taking it again would mark a hash
+// compare_hash has counted as uncounted, and it would be counted again.
+peer_hash :: proc(h: ^Hash, frame: int, hash: u64) -> bool {
+	if h.frame == frame {return false}
+	h^ = {frame, hash, true}
+	return true
 }
 
 @(private = "file")
