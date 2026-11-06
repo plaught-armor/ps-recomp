@@ -8,13 +8,17 @@
 // (tests/wasi/serve.py) gives it directly; elsewhere web/sw.js adds them
 // and the page reloads once under it.
 //
-// Test mode, play.html?test=1[&wasm=<url>][&disc=<url>][&seconds=<n>]: runs
-// that module (play.wasm by default) on the disc read from that URL, if
-// any. Only test mode has the fake standard gamepad, driven by
-// window.testPad. Once the first frame is drawn the page presses A on it
-// and the Z key for half a second each, then, when the module exits or
-// after <n> seconds (default 20), posts window.testState() to `result` on
-// the same origin (tests/wasi/serve.py --play).
+// Test mode, play.html?test=1[&wasm=<url>][&disc=<url>...][&env=<K=V>...]
+// [&input=0][&seconds=<n>]: runs that module (play.wasm by default) on the
+// disc files read from those URLs, if any (the module's argument is the
+// .cue among them, else the only one), with those environment variables.
+// Only test mode has the fake standard gamepad, driven by window.testPad.
+// Once the first frame is drawn the page presses A on it and the Z key for
+// half a second each (not with input=0, which leaves emulation untouched),
+// then, when the module exits or after <n> seconds (default 20), posts
+// each file the module wrote, and ring.pcm (every sample it queued), to
+// `file/<name>`, then window.testState() to `result`, both on the same
+// origin (tests/wasi/serve.py --play).
 import { SCANCODE_OF_CODE } from "./keys.js";
 import { AUDIO, CONTROL, EV, PAD, PRESENT } from "./layout.js";
 import { Present } from "./present.js";
@@ -272,6 +276,9 @@ async function startAudio(rate) {
 let worker = null;
 let present = null;
 let done = null;
+let startedAt = 0; // performance.now() at start()
+let firstPresentMs = null; // from start() to the first frame seen
+let written = []; // test mode: [name, bytes] of the module's files
 
 function onMessage({ data }) {
 	if (data.log !== undefined) return log(data.log);
@@ -289,9 +296,11 @@ function onMessage({ data }) {
 	if (data.error !== undefined) {
 		errors.push(data.error);
 		log(`\n${data.error}\n`);
-		done = { code: -1 };
+		done = { code: -1, ...data.times };
+		written = data.files ?? [];
 	} else if (data.done !== undefined) {
 		done = data.done;
+		written = data.files ?? [];
 		log(`\nExited with code ${done.code}.\n`);
 	} else {
 		return;
@@ -301,6 +310,8 @@ function onMessage({ data }) {
 }
 
 function tick() {
+	if (worker && firstPresentMs === null && Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD) > 0)
+		firstPresentMs = Math.round(performance.now() - startedAt);
 	if (present) {
 		try {
 			present.frame();
@@ -313,7 +324,7 @@ function tick() {
 	requestAnimationFrame(tick);
 }
 
-// msg: {wasm, args} plus {files} or {urls}.
+// msg: {wasm, args} plus {files} or {urls}, and in test mode {env, test}.
 function start(msg) {
 	$("start").disabled = true;
 	$("log").textContent = "";
@@ -323,6 +334,7 @@ function start(msg) {
 	worker = new Worker("play-worker.js", { type: "module" });
 	worker.onmessage = onMessage;
 	worker.onerror = (e) => onMessage({ data: { error: e.message || "worker failed to load" } });
+	startedAt = performance.now();
 	worker.postMessage({ ...msg, ...shared });
 }
 
@@ -342,6 +354,8 @@ async function testState() {
 		audio: { ...audioStats, state: audioContext?.state ?? null },
 		sabUpload: present?.sabUpload ?? null,
 		done,
+		firstPresentMs,
+		files: written.map(([name, bytes]) => ({ name, size: bytes.length })),
 		log: $("log").textContent,
 		errors: [...errors],
 		userAgent: navigator.userAgent,
@@ -375,27 +389,34 @@ async function main() {
 	if (!test) return;
 	window.testState = testState;
 	const wasm = params.get("wasm") ?? "play.wasm";
-	const disc = params.get("disc");
 	const urls = [];
-	if (disc) {
+	for (const disc of params.getAll("disc")) {
 		const head = await fetch(disc, { method: "HEAD" });
 		const name = decodeURIComponent(new URL(disc, location.href).pathname.split("/").pop());
 		urls.push({ name, url: disc, size: Number(head.headers.get("Content-Length")) });
 	}
-	$("picked").textContent = `Test: ${wasm}` + (urls.length ? ` on ${urls[0].name}` : "");
-	start({ wasm, args: urls.map((u) => `/disc/${u.name}`), urls });
-	await selfTest(Number(params.get("seconds") ?? 20) * 1000);
+	const img = image(urls);
+	if (urls.length && !img) throw new Error("test: several discs and no .cue among them");
+	const env = {};
+	for (const kv of params.getAll("env")) {
+		const eq = kv.indexOf("=");
+		if (eq <= 0) throw new Error(`test: env=${kv} is not K=V`);
+		env[kv.slice(0, eq)] = kv.slice(eq + 1);
+	}
+	$("picked").textContent = `Test: ${wasm}` + (img ? ` on ${img.name}` : "");
+	start({ wasm, args: img ? [`/disc/${img.name}`] : [], urls, env, test: true });
+	await selfTest(Number(params.get("seconds") ?? 20) * 1000, params.get("input") !== "0");
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Test mode's input and report, after start().
-async function selfTest(limit) {
+// Test mode's input (when `input`) and report, after start().
+async function selfTest(limit, input) {
 	const t0 = performance.now();
 	const frames = new Int32Array(shared.present, 0, 4);
 	const over = () => done !== null || performance.now() - t0 > limit;
 	while (!over() && Atomics.load(frames, PRESENT.FRAMES_WORD) === 0) await sleep(50);
-	if (!over()) {
+	if (input && !over()) {
 		window.testPad ??= { buttons: [], axes: [] };
 		await sleep(500); // the pad's add first
 		window.testPad.buttons[0] = true;
@@ -409,7 +430,12 @@ async function selfTest(limit) {
 	}
 	while (!over()) await sleep(100);
 	await sleep(1000); // the last log lines
-	await postReport(await testState());
+	const report = await testState();
+	for (const [name, bytes] of written) {
+		const r = await fetch(`file/${encodeURIComponent(name)}`, { method: "POST", body: bytes }).catch((e) => e);
+		if (!r.ok) report.errors.push(`file/${name}: ${r.status ?? r.message}`);
+	}
+	await postReport(report);
 }
 
 // Test mode's report, to tests/wasi/serve.py.

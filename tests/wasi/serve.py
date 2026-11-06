@@ -4,7 +4,7 @@ browser's result.
 
     python3 tests/wasi/serve.py <page dir> <result.json> <disc file>... [--host H] [--port P] [--arch A]
     python3 tests/wasi/serve.py <page dir> <result.json> --pick [--host H] [--port P] [--arch A]
-    python3 tests/wasi/serve.py <page dir> <result.json> --play <module.wasm> [<disc file>] [--seconds N] [--no-isolate]
+    python3 tests/wasi/serve.py <page dir> <result.json> --play <module.wasm> [<disc file>...] [--env K=V]... [--no-input] [--seconds N] [--no-isolate]
 
 Open the printed URL in any browser. The page converts the first disc file,
 read by HTTP Range requests, posts the blob and its report, and the server
@@ -20,12 +20,20 @@ not).
 
 With --play the URL opens play.html's test mode on <module.wasm> (a file in
 the page dir: play.wasm, or the gate program tests/wasi/host built there),
-on the first disc file if one is given. The page runs it until it exits or
-for --seconds, then posts its state ({isolated, frames, capture, audio,
-sabUpload, done, log, errors, ...}), which the server writes to
-<result.json>. Every response carries COOP, COEP and CORP, so the page is
+on the disc files given (the module opens the .cue among them, else the
+only one), with each --env variable in its environment. --no-input stops
+the page's fake button and key presses, which change what the module does.
+The page runs it until it exits or for --seconds, then posts each file the
+module wrote, and ring.pcm (every sample it queued for the audio device),
+to /file/<name>, which the server writes beside <result.json>, and then its
+state ({isolated, frames, capture, audio, sabUpload, done, firstPresentMs,
+files, log, errors, ...}), which the server writes to <result.json>.
+Every response carries COOP, COEP and CORP, so the page is
 cross-origin isolated by the headers; --no-isolate leaves them out, so the
 page has to isolate itself through web/sw.js as on a static host.
+
+The server takes a POST only from its own page (Sec-Fetch-Site same-origin,
+or an Origin of this server), of at most 1 GiB.
 """
 
 import argparse
@@ -47,13 +55,19 @@ parser.add_argument("--port", type=int, default=8765)
 parser.add_argument("--arch")
 parser.add_argument("--play", metavar="MODULE")
 parser.add_argument("--seconds", type=int)
+parser.add_argument("--env", action="append", default=[], metavar="K=V")
+parser.add_argument("--no-input", action="store_true")
 parser.add_argument("--no-isolate", action="store_true")
 args = parser.parse_args()
 if not args.discs and not args.pick and not args.play:
     parser.error("give a disc file, --pick, or --play")
+for kv in args.env:
+    if kv.partition("=")[0] == "":
+        parser.error(f"--env {kv}: not K=V")
 discs = {os.path.basename(d): os.path.abspath(d) for d in args.discs}
 blob = bytearray()
 CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+POST_MAX = 1 << 30  # the largest body a POST may carry
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -113,9 +127,33 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.disc(False):
             super().do_HEAD()
 
+    # Whether a POST comes from the page itself: another site open in the
+    # same browser must not write files here.
+    def same_origin(self):
+        if self.headers.get("Sec-Fetch-Site") == "same-origin":
+            return True
+        origins = {f"http://{h}:{args.port}" for h in (args.host, "127.0.0.1", "localhost")}
+        return self.headers.get("Origin") in origins
+
     def do_POST(self):
-        data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if not self.same_origin():
+            self.send_error(403)
+            return
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.send_error(400)
+            return
+        if n > POST_MAX:
+            self.send_error(413)
+            return
+        data = self.rfile.read(n)
         path = urlsplit(self.path).path
+        if path.startswith("/file/"):
+            self.file(unquote(path[len("/file/"):]), data)
+            return
         if path not in ("/blob", "/result"):
             self.send_error(404)
             return
@@ -135,6 +173,26 @@ class Handler(SimpleHTTPRequestHandler):
         print(f"result: {args.result}", flush=True)
         threading.Thread(target=self.server.shutdown).start()
 
+    # A file the play page sends back, written beside the result file under
+    # its name; a name that leaves that directory, or is not a file name, is
+    # refused.
+    def file(self, name, data):
+        rel = os.path.normpath(name)
+        if name == "" or "\0" in name or rel == "." or os.path.isabs(rel) or rel == ".." or rel.startswith(".." + os.sep):
+            self.send_error(400)
+            return
+        to = os.path.join(os.path.dirname(os.path.abspath(args.result)), rel)
+        try:
+            os.makedirs(os.path.dirname(to), exist_ok=True)
+            with open(to, "wb") as f:
+                f.write(data)
+        except (OSError, ValueError):
+            self.send_error(400)
+            return
+        self.send_response(204)
+        self.end_headers()
+        print(f"file: {to} ({len(data)} bytes)", flush=True)
+
 
 module = args.play or "recomp.wasm"
 if not os.path.isfile(os.path.join(args.page, module)):
@@ -144,8 +202,12 @@ page = "index.html"
 if args.play:
     page = "play.html"
     query = "test=1&wasm=" + quote(args.play)
-    if args.discs:
-        query += "&disc=" + quote("disc/" + os.path.basename(args.discs[0]))
+    for d in args.discs:
+        query += "&disc=" + quote("disc/" + os.path.basename(d))
+    for kv in args.env:
+        query += "&env=" + quote(kv, safe="")
+    if args.no_input:
+        query += "&input=0"
     if args.seconds:
         query += f"&seconds={args.seconds}"
 elif args.pick:

@@ -58,7 +58,10 @@ const text = new TextDecoder();
 export class Sdl {
 	// control, audio, present: the page's SharedArrayBuffers. post(message)
 	// sends to the page: {log}, {title}, {audio: rate}, {fullscreen}.
-	constructor({ control, audio, present, post }) {
+	// tee(samples), if given, sees every QueueAudio call's samples (an
+	// Int16Array view of the module's memory, valid only during the call),
+	// before the ring drops what does not fit.
+	constructor({ control, audio, present, post, tee = null }) {
 		this.ctl = new Int32Array(control);
 		this.ctlView = new DataView(control);
 		this.ctlBytes = new Uint8Array(control);
@@ -67,6 +70,7 @@ export class Sdl {
 		this.presentBuf = present;
 		this.presentWords = new Int32Array(present, 0, PRESENT.SLOTS / 4);
 		this.post = post;
+		this.tee = tee;
 		this.memory = null;
 		this.page = 0; // the SDL page: keyboard state, then strings
 		this.top = 0;
@@ -513,6 +517,7 @@ export class Sdl {
 			// keeps the queue at its target, far under the ring).
 			QueueAudio: (_dev, data, len) => {
 				const A = this.audioWords, N = AUDIO.RING_FRAMES;
+				this.tee?.(new Int16Array(this.memory.buffer, data, (len >>> 2) * 2));
 				const w = Atomics.load(A, AUDIO.WRITE_WORD), r = Atomics.load(A, AUDIO.READ_WORD);
 				const n = Math.min(len >>> 2, N - ((w - r) | 0));
 				if (n < len >>> 2) this.warnOnce("the audio ring is full; sound dropped");

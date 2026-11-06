@@ -297,6 +297,26 @@ assertion. Its run checks that the page loads the module and reads the
 disc, and that the assertion reaches the report's `errors` with
 `done.code` -1.
 
+For a gate run, the test mode takes the module's input from the URL and
+sends its output back. Every disc file after the module is served (a
+`.cue` with its track files: the module opens the `.cue`); each `--env K=V` is
+set in the module's environment, so the `PS_*` settings of a native run
+apply; `--no-input` leaves out the fake presses, which would change the
+emulation. When the module exits, the page posts each file it wrote and
+`ring.pcm` (every sample it queued for the audio device, 16-bit stereo,
+before the ring drops what does not fit) to the server, which writes them
+beside the result file. The report adds `done.compileMs` (the module's
+compile), `done.runMs` (from the module's start to its exit),
+`firstPresentMs` (from the Worker's start to the first frame the page
+sees), `frames` and `files` (each file's name and size). With
+`PS_DUMP=. PS_DUMP_HASH=1`, `hashes.tsv` lands beside the result file:
+
+```sh
+python3 tests/wasi/serve.py <out dir> run/result.json --play play.wasm game.cue game.bin \
+	--env PS_SW=1 --env PS_FRAMES=600 --env PS_DUMP=. --env PS_DUMP_HASH=1 --env PS_DUMP_EVERY=60 \
+	--env PS_AUDIO_DUMP=audio.wav --no-input --seconds 600
+```
+
 Save states made by the wasm build (FLAT) do not load on a desktop build,
 nor the other way round: a snapshot records which model saved it, and a
 mismatched load is fatal.
