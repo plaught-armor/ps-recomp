@@ -41,7 +41,7 @@ for p in recomp play; do
 	fi
 done
 for f in index.html page.css page.js worker.js readers.js wasi.js \
-	play.html play.js play-worker.js native.js sdl.js keys.js layout.js present.js audio.js sw.js; do
+	play.html play.js play-worker.js native.js sdl.js net.js keys.js layout.js present.js audio.js sw.js; do
 	cp "$root/web/$f" "$out/$f"
 done
 printf '%s\n' "$commit" > "$out/commit.txt"

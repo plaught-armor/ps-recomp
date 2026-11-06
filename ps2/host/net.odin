@@ -9,7 +9,9 @@ import "ps:core"
 // listening on NET_BIND (default 0.0.0.0:7000) as session player
 // NET_PLAYER (1 or 2), with NET_DELAY frames of input delay (default
 // 2) and a desync check every NET_HASH vblanks (default 60). Testing:
-// NET_DROP=<percent> drops outgoing packets, NET_LAG=<ms> delays them.
+// NET_DROP=<percent> drops outgoing packets, NET_LAG=<ms> delays them,
+// NET_ANY_BUILD=1 takes a peer that runs another build (a native peer for
+// a wasm one).
 // Both hosts must run the same build and mods on the same disc, from the
 // same boot and memory card.
 @(private)
@@ -40,6 +42,7 @@ net_init :: proc() -> bool {
 		lag        = time.Duration(num("NET_LAG", 0)) * time.Millisecond,
 		mods       = core.run_mods,
 		disc       = core.run_disc,
+		any_build  = core.env("NET_ANY_BUILD") == "1",
 	}
 	if cfg.bind == "" {cfg.bind = "0.0.0.0:7000"}
 	if !core.net_start(cfg) {return false}

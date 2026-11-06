@@ -19,11 +19,18 @@
 // play page's /data holds what earlier runs stored (web/readers.js).
 // Prints the frame of the first present, the presents, the time and the
 // shim's call counts to stderr, and exits with play's exit code.
+//
+// With PS_NET_PEER set, netplay runs over UDP from a worker_thread
+// (netlink.mjs), so the peer can be another play.mjs or a native play.
+// The build id is the module's (web/net.js buildId), so against a native
+// peer both need PS_NET_ANY_BUILD=1.
 import { mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { argv, env, exit, stderr, stdout } from "node:process";
-import { AUDIO, CONTROL, PRESENT } from "../../web/layout.js";
+import { Worker } from "node:worker_threads";
+import { AUDIO, CONTROL, NET, PRESENT } from "../../web/layout.js";
 import { Native } from "../../web/native.js";
+import { buildId, NetImports, NO_NET } from "../../web/net.js";
 import { Sdl } from "../../web/sdl.js";
 import { Wasi } from "../../web/wasi.js";
 
@@ -103,14 +110,30 @@ sdl.present = () => {
 	first ??= { frame: sdl.frame, ms: Math.round(performance.now() - start) };
 };
 
-const module = await WebAssembly.compile(readFileSync(wasm));
+const bytes = readFileSync(wasm);
+const module = await WebAssembly.compile(bytes);
+let net = null;
+if (settings.PS_NET_PEER !== undefined) {
+	const buffer = new SharedArrayBuffer(NET.SIZE);
+	const link = new Worker(new URL("netlink.mjs", import.meta.url), { workerData: { buffer } });
+	link.unref();
+	await new Promise((resolve, reject) => {
+		link.once("message", resolve);
+		link.once("error", reject);
+	});
+	// Past the ready, the module would only see the peer time out.
+	link.on("error", (e) => console.error(`net: the link failed: ${e.message}`));
+	net = new NetImports(buffer, await buildId(bytes));
+}
 const instance = await WebAssembly.instantiate(module, {
 	...wasi.imports,
 	"system:SDL2": sdl.imports,
 	"system:ps_native": native.imports,
+	"system:ps_net": net?.imports ?? NO_NET,
 });
 sdl.attach(instance);
 native.attach(instance);
+net?.attach(instance);
 const code = wasi.run(instance);
 const ms = Math.round(performance.now() - start);
 for (const [path, bytes] of wasi.files()) {

@@ -1,3 +1,4 @@
+#+build !wasi
 // The link to the peer for netplay (net.odin has the rest): a UDP socket
 // bound to cfg.bind, taking datagrams only from cfg.peer.
 package core

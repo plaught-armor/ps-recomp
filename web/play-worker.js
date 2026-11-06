@@ -1,6 +1,7 @@
 // The play Worker: runs play.wasm (or, for the gate, another module with the
 // same imports) on web/wasi.js and web/sdl.js. It never yields while the
 // module runs; the page reaches it only through the SharedArrayBuffers.
+import { buildId, NetImports, NO_NET } from "./net.js";
 import { dataLoad, dataSave, discOf, openStored, store } from "./readers.js";
 import { Native } from "./native.js";
 import { Sdl } from "./sdl.js";
@@ -53,12 +54,12 @@ async function discFor({ files, urls, store: name, stored }) {
 
 // wasm: the module's URL. args: argv after the program name. env: the
 // module's environment. files, urls, store, stored: the disc (discFor). control,
-// audio, present: the page's buffers. test: also send back, with done or
+// audio, present: the page's buffers; net, for netplay, the NET one. test: also send back, with done or
 // error, the files the module wrote and, as ring.pcm, every sample it
 // queued (their buffers transferred, not copied), plus the compile and run
 // times.
 onmessage = async ({ data }) => {
-	const { wasm, args, env = {}, test = false, control, audio, present } = data;
+	const { wasm, args, env = {}, test = false, control, audio, present, net: netBuffer } = data;
 	let wasi = null;
 	let disc = null;
 	const ring = [];
@@ -81,7 +82,12 @@ onmessage = async ({ data }) => {
 	};
 	try {
 		const t0 = performance.now();
-		const module = await WebAssembly.compileStreaming(fetch(wasm));
+		// The bytes, not a stream: netplay's build id is their hash.
+		const response = await fetch(wasm);
+		if (!response.ok) throw new Error(`${wasm}: ${response.status}`);
+		const bytes = await response.arrayBuffer();
+		const module = await WebAssembly.compile(bytes);
+		const net = netBuffer ? new NetImports(netBuffer, await buildId(bytes)) : null;
 		times.compileMs = Math.round(performance.now() - t0);
 		const log = (_fd, text) => postMessage({ log: text });
 		disc = await discFor(data);
@@ -105,9 +111,11 @@ onmessage = async ({ data }) => {
 			...wasi.imports,
 			"system:SDL2": sdl.imports,
 			"system:ps_native": native.imports,
+			"system:ps_net": net?.imports ?? NO_NET,
 		});
 		sdl.attach(instance);
 		native.attach(instance);
+		net?.attach(instance);
 		t1 = performance.now();
 		const code = wasi.run(instance);
 		times.runMs = Math.round(performance.now() - t1);

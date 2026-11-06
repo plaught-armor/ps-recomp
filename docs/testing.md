@@ -253,9 +253,11 @@ in either build. Each peer is one process: `PS_NET_BIND` is its own
 address, `PS_NET_PEER` the other's, `PS_NET_PLAYER` its slot (1 or 2).
 `PS_NET_DELAY` is the input delay in frames (default 2, at most 8),
 `PS_NET_HASH` the frames between desync checks (default 60). For tests,
-`PS_NET_LAG` adds one-way latency in ms and `PS_NET_DROP` drops that
-percent of outgoing packets; `PS_PACE=<hz>` paces a headless run, and a
-different rate on each peer stands in for clock drift. Give each peer
+`PS_NET_LAG` adds one-way latency in ms, `PS_NET_DROP` drops that
+percent of outgoing packets and `PS_NET_ANY_BUILD=1` takes a peer that
+runs another build (both peers print `net: build check off (testing)`);
+`PS_PACE=<hz>` paces a headless run, and a different rate on each peer
+stands in for clock drift. Give each peer
 its own press script (`PS_PRESS`, without conditions) so the peers'
 inputs differ and change.
 
@@ -295,6 +297,33 @@ ring, back to `RB_FRAMES - 1` frames before the current one. Delay 8
 with `PS_NET_LAG=250` reaches it. Build `play` with
 `-define:PS_FLAT=true` for the FLAT run; the reference is the same pair
 in the same build.
+
+### Netplay on wasm
+
+play.wasm has no sockets: core/net_wasi.odin hands its datagrams to the
+host's `system:ps_net` imports (`web/net.js`), through SharedArrayBuffer rings
+served by a thread that is not the module's. Its build id is the first 8
+bytes of the module's SHA-256.
+
+Under Node, `tests/wasi/play.mjs` with `PS_NET_PEER` set serves the rings
+with a UDP socket (`tests/wasi/netlink.mjs`), with the same `PS_NET_*`
+settings as a native peer (IPv4 addresses, not names). So a wasm peer
+plays a native FLAT one: run the `net` pair above with one side as
+`node tests/wasi/play.mjs <page dir>/play.wasm $out path/to/game.iso 3600`
+and `PS_NET_ANY_BUILD=1` on both sides. Its hashes must be those of the
+native FLAT pair with the same scripts and settings.
+`node tests/wasi/ring.mjs` checks the rings themselves: full, empty,
+oversized and empty datagrams, order, and the counts' wrap.
+
+In the browser, two play pages are the peers, over a WebRTC data channel
+(host candidates only). `serve.py --play play.wasm <disc> --net <room>`
+prints the two pages' URLs; the pages find each other through its
+`/signal` endpoint, which is for development only, not a server to
+expose. Each page writes `p<N>/hashes.tsv` beside the result and
+`<result>.p<N>.json`. Headless Chrome and Brave hide host addresses
+behind mDNS names, which two pages on one machine may fail to resolve:
+run them with `--disable-features=WebRtcHideLocalIpsWithMdns`
+(Firefox: `media.peerconnection.ice.obfuscate_host_addresses` false).
 
 ## The wasm C maths functions
 
@@ -480,5 +509,4 @@ for `linux_arm64`, `darwin_amd64` and `darwin_arm64`. recomp is also
 checked for `wasi_wasm32`, the target of the web converter: a recomp
 import of a package that needs the host (such as `core`) fails there.
 The web page's scripts have no build step; `node --check` each of
-`web/*.js`, `tests/wasi/run.mjs` and `tests/wasi/play.mjs` after editing
-them.
+`web/*.js` and `tests/wasi/*.mjs` after editing them.

@@ -39,8 +39,8 @@
 //   and u32 echo (ms; for ping), u32 hash frame (max = none), u64 hash,
 //   i16 lead (1/16 frames; the sender's frame minus the receiver's as last
 //   seen, smoothed), count * (u16 buttons, u8 lx ly rx ry)
-// The build id is a hash of the executable: determinism needs the same one,
-// and the same mods on the same disc.
+// The build id is a hash of the executable (of the module on wasm):
+// determinism needs the same one, and the same mods on the same disc.
 //
 // The input log is one record per frame with every player's input, so a
 // replay could later be the same log written out.
@@ -85,6 +85,7 @@ Net_Config :: struct {
 	disc:       u64, // the disc's id hash (run_disc)
 	drop:       int, // testing: percent of outgoing packets dropped
 	lag:        time.Duration, // testing: added one-way latency
+	any_build:  bool, // testing: take a peer that runs another build
 }
 
 Net_Status :: struct {
@@ -106,6 +107,9 @@ MAGIC :: 0x504e5350 // "PSNP"
 LOG :: 64 // frames of input held; the live window is under half
 @(private = "file")
 SEND_MAX :: 32 // inputs per packet
+// The largest datagram taken from the link (web/layout.js NET.DATAGRAM_MAX).
+@(private = "file")
+DATAGRAM_MAX :: 1532
 @(private = "file")
 HASHES :: 32
 @(private = "file")
@@ -209,6 +213,7 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 	for &h in n.hashes {h.frame = -1}
 	for &h in n.peer_hashes {h.frame = -1}
 	n.build = build_id()
+	if cfg.any_build {fmt.eprintln("net: build check off (testing)")}
 	n.epoch = time.tick_now()
 
 	n.open = link_open(cfg)
@@ -237,7 +242,7 @@ handshake :: proc() -> bool {
 			sent = time.tick_now()
 		}
 		flush_delayed()
-		buf: [1500]u8
+		buf: [DATAGRAM_MAX]u8
 		for {
 			size := link_recv(buf[:])
 			if size <= 0 {break}
@@ -441,7 +446,7 @@ behind :: proc() -> bool {
 receive :: proc() {
 	n := &net_state
 	flush_delayed()
-	buf: [1500]u8
+	buf: [DATAGRAM_MAX]u8
 	for n.on {
 		size := link_recv(buf[:])
 		if size <= 0 {return}
@@ -566,7 +571,7 @@ hello_encode :: proc(cfg: Net_Config, build: u64, seen: bool) -> (buf: [HELLO_SI
 hello_mismatch :: proc(d: []u8, cfg: Net_Config, build: u64) -> string {
 	player := int(d[6])
 	switch {
-	case get_u64(d[11:]) != build:
+	case get_u64(d[11:]) != build && !cfg.any_build:
 		return "a different build"
 	case get_u64(d[19:]) != cfg.mods:
 		return "a different mod set"
