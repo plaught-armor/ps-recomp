@@ -61,7 +61,7 @@ runtime_imports :: proc(b: ^strings.Builder, runtime: string, depth: int) {
 	}
 }
 
-@(private = "file")
+@(private)
 Overlay :: struct {
 	name: string,
 	img:  mips.Image,
@@ -97,6 +97,26 @@ Program :: struct {
 	n_ovls:   [dynamic]native.Blob_Ovl,
 }
 
+// The overlays/manifest.tsv files (file, slot), each at its slot and named
+// by its file without `.bin`; none without the option.
+@(private)
+load_overlays :: proc(o: mips.Options) -> []Overlay {
+	dir := mips.option_or(o, "overlays", "")
+	if dir == "" {return nil}
+	t := mips.load_table(mips.join(dir, "manifest.tsv"), "file", "slot")
+	if len(t.rows) == 0 {return nil}
+	ovls := make([]Overlay, len(t.rows))
+	for r, k in t.rows {
+		file := mips.cell(t, r, "file")
+		img := mips.Image {
+			base = mips.parse_hex(mips.cell(t, r, "slot")),
+			data = mips.read_file(mips.join(dir, file)),
+		}
+		ovls[k] = {strings.trim_suffix(file, ".bin"), img}
+	}
+	return ovls
+}
+
 generate :: proc(o: mips.Options) {
 	p: Program
 	p.exe = mips.load_psx_exe(o)
@@ -112,19 +132,7 @@ generate :: proc(o: mips.Options) {
 		p.code = new(native.Asm)
 		p.code^ = native.make_asm(arch, native_ram(), NATIVE_CACHED[:])
 	}
-	if dir := mips.option_or(o, "overlays", ""); dir != "" {
-		t := mips.load_table(mips.join(dir, "manifest.tsv"), "file", "slot")
-		ovls: [dynamic]Overlay
-		for r in t.rows {
-			file := mips.cell(t, r, "file")
-			img := mips.Image {
-				base = mips.parse_hex(mips.cell(t, r, "slot")),
-				data = mips.read_file(mips.join(dir, file)),
-			}
-			append(&ovls, Overlay{strings.trim_suffix(file, ".bin"), img})
-		}
-		p.overlays = ovls[:]
-	}
+	p.overlays = load_overlays(o)
 	if path := mips.option_or(o, "funcs", ""); path != "" {
 		t := mips.load_table(path, "space", "entry")
 		for r in t.rows {

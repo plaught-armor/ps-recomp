@@ -1,0 +1,17 @@
+space	entry	name
+# The executable: 64 words at 80010000.
+ram	80010000	start
+ram	80010000	entry_alias
+ram	80010008	ram_80010000
+ram	80010010	helper
+ram	80010020	helper
+ram	80010030	2bad
+ram	80010040	memcpy
+ram	80010050	
+ram	800100f0	last
+ram	800100f4	short
+ram	80020000	far
+# Two overlays at one slot.
+ov_a	80100004	a_fn
+ov_b	80100004	b_fn
+ov_b	80100010	

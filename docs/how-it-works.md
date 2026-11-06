@@ -54,6 +54,7 @@ each column.
 odin build recomp -collection:ps=. -out:recomp-bin
 ./recomp-bin path/to/recomp.tsv
 ./recomp-bin [--arch <x64_sysv|x64_win|arm64>] path/to/game.cue [source dir]
+./recomp-bin --mod-api path/to/recomp.tsv <out dir>
 ```
 
 Given a disc image (a `.cue` sheet, or a single-track `.bin` or `.iso`) in
@@ -64,6 +65,9 @@ machine code for the host (or for the `--arch` given), into
 executable loads from other files (PS1 overlays) is not found; an ELF
 without `.text` has its executable sections compiled whole, data in them
 included.
+
+`--mod-api` writes a PS1 program's mod API, `mod_api.h` and `mod.ld`, for
+building mods (see [porting](porting.md)).
 
 recomp also builds for `wasi_wasm32`, where it reads only what WASI
 preopens. That build is the web converter: `web/` is a static page that

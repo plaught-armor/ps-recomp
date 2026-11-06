@@ -195,6 +195,30 @@ Mod code must not change: a store into a mod function's code is fatal,
 naming the mod and the address, interpreted or native. Self-modifying mod
 code is unsupported. Data segments stay writable.
 
+A PS1 mod is C, built against the game's mod API.
+`recomp --mod-api <options.tsv> <out dir>` reads the options file's
+`exe`, `overlays` and `funcs` and writes `mod_api.h` and `mod.ld`. Each
+function in `funcs` is named `<space>_<entry>` (`ram_80012345`, or the
+overlay file's name and the entry). The row's `name` is an alias when it
+is a C name used by that one function only, is not a keyword or a
+reserved name, and does not start like a `<space>_` name. Rows whose entry does not have
+four words in its image are left out, with a count. The header declares
+each function `long_call`: a `jal` from the mod region cannot reach the
+game's code, and ld.lld links a wrong target there without an error. It
+also gives `MOD_BEFORE(target, fn)`, `MOD_AFTER` and `MOD_REPLACE`, which
+emit a `.mod_hooks` record keyed by the function as the game has it. Then
+`mods/build.sh <api dir> <mod dir> [--origin <hex>]` compiles every `.c`
+in the mod directory with `mods/rt.c` (memcpy, memset, memmove and memcmp,
+so the mod never calls the game for them) into `<mod dir>/mod.elf`. It
+needs clang, ld.lld and llvm-nm. The image is linked at the region's
+base, or at `--origin` (hex, 16-byte aligned, in the region) for a second
+mod that loads with the first. The build fails when the mod defines a name
+`mod_api.h` gives a game function (the script's address would win over the
+mod's own definition, silently), when a loaded section is not one `mod.ld`
+places (`--orphan-handling=error`), and when the image runs past the
+region's guard word and stack. An overlay file too short for its id word
+is an error.
+
 Limits:
 
 - Only calls are hooked. A jump the interpreter steps into enters the

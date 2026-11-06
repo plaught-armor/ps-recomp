@@ -52,6 +52,7 @@ odin run tests/psx_mod_region -collection:ps=.
 odin run tests/psx_mod_region -collection:ps=. -define:PS_FLAT=true
 odin run tests/psx_mod_native -collection:ps=.
 odin run tests/psx_mod_native -collection:ps=. -define:PS_FLAT=true
+odin run tests/mod_api -collection:ps=.
 odin run tests/psx_interp -collection:ps=.
 odin run tests/compat -collection:ps=.
 odin run tests/learn -collection:ps=.
@@ -104,6 +105,7 @@ here.
 | `psx_mod` | Mod hook chains installed in the PS1 dispatch tables: executable and overlay functions, recompiled and interpreted, nested hooks, frozen time, install errors; under FLAT, a stop inside the original or the replacement resumes into the after hooks |
 | `psx_mod_region` | The PS1 mod region and loader: mod ELF and overlap errors, a mod loaded from `mods/` running its hook from the region on its stack, RAM untouched, the region put back by a checkpoint pass, not learned, and a stack overflow fatal |
 | `psx_mod_native` | PS1 mod functions as native code: `.symtab` functions, the mod set hash, a mod function's calls run native from a blob with the interpreted result, through a checkpoint pass, a stale blob refused and interpreted, a store into mod code fatal; under FLAT, interpreted |
+| `mod_api` | The PS1 mod API (`recomp --mod-api`) against committed `mod_api.h` and `mod.ld`, in any row order: names, aliases and left-out rows, error rows and a short overlay, the region constants; with clang, ld.lld, llvm-nm and sh, `mods/build.sh` builds a mod whose hooks read back with the right keys, with no `jal` or `j` out of the image except in controls built without `long_call`, and refuses overlapping images by name; builds fail for a mod defining a game function's name, an unplaced section, an image past the region, and a bad `--origin` |
 | `compat` | Each host's compat line, and stubbed calls, under COMPAT |
 | `play` | `play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included; the launcher, its picture checked by point and a non-ASCII title cell by cell against the font |
 | `discimg` | The small disc images `disc` and `play` use |
