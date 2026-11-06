@@ -66,7 +66,7 @@ executable loads from other files (PS1 overlays) is not found; an ELF
 without `.text` has its executable sections compiled whole, data in them
 included.
 
-`--mod-api` writes a PS1 program's mod API, `mod_api.h` and `mod.ld`, for
+`--mod-api` writes a PS1 or PS2 program's mod API, `mod_api.h` and `mod.ld`, for
 building mods (see [porting](porting.md)).
 
 recomp also builds for `wasi_wasm32`, where it reads only what WASI

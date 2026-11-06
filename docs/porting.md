@@ -233,6 +233,17 @@ places (`--orphan-handling=error`), and when the image runs past the
 region's guard word and stack. An overlay file too short for its id word
 is an error.
 
+A PS2 mod's API comes the same way from an EE options file (`exe`, and
+`disc`): its functions are the ones recomp finds, in one space, `ram`,
+keyed by slot 0 and the boot program's id (the low word of the XXH3-64 of
+its ELF file, as the kernel names it), with the signature words of the ELF
+as loaded, before a `words` patch. The mod region shares the game's
+256 MiB segment, so game functions are plain calls. Mods use the n32 ABI:
+integer arguments in a0-a7 and then on the stack, as the game passes them,
+but floats by position where the game's EABI counts them apart, so a mod
+must not hook or call a game function that takes or returns a float
+(`mod_api.h` says so, and how to wrap one).
+
 Limits:
 
 - Only calls are hooked. A jump the interpreter steps into enters the

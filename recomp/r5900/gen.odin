@@ -81,7 +81,7 @@ RULES :: mips.Rules {
 }
 
 // Overwrite instruction words in the image from a table (at, word).
-@(private = "file")
+@(private)
 replace_words :: proc(img: ^mips.Image, path: string) {
 	t := mips.load_table(path, "at", "word")
 	for r in t.rows {
@@ -204,23 +204,11 @@ check_hooked :: proc(funcs: []^Func, hooked: mips.Set) {
 	}
 }
 
-generate :: proc(o: mips.Options) {
-	img := mips.load_elf(o)
-	// Before vu_only too: words may touch .vutext, whose programs a mid-run
-	// load must find the same as the startup conversion's.
-	if path := mips.option_or(o, "words", ""); path != "" {
-		replace_words(&img, path)
-	}
-	if mips.option_or(o, "vu_only", "") == "true" {
-		vu_only(o, img)
-		return
-	}
-	out := mips.option_or(o, "out", "")
-	runtime := mips.option_or(o, "runtime", "ps:ps2")
-	cycles := mips.parse_int(mips.option_or(o, "cycles_per_insn", fmt.tprint(CYCLES_PER_INSN)))
-	package_insns := mips.parse_int(mips.option_or(o, "package_insns", fmt.tprint(PACKAGE_INSNS)))
+// The functions of img in the options' code ranges, the labels found on the
+// way (lui-built addresses and kept data pointers) and the ranges' span.
+discover :: proc(o: mips.Options, img: mips.Image) -> (funcs: [dynamic]^Func, labels: mips.Set, lo, hi: u32) {
 	ranges, explicit := code_ranges(o, img)
-	lo, hi := ranges[0][0], ranges[len(ranges) - 1][1]
+	lo, hi = ranges[0][0], ranges[len(ranges) - 1][1]
 	// Code addresses in data and built by lui pairs in code.
 	refs, ptrs, mixed: mips.Set
 	runs: [dynamic]mips.Run
@@ -256,7 +244,6 @@ generate :: proc(o: mips.Options) {
 	// Labels: every lui-built address (in a section that holds code and
 	// data together, only those on code: drop_data_labels), and the data
 	// pointers table_labels keeps; every reference can start a function.
-	labels: mips.Set
 	for a in refs {
 		labels[a] = {}
 	}
@@ -272,7 +259,6 @@ generate :: proc(o: mips.Options) {
 			refs[a] = {}
 		}
 	}
-	funcs: [dynamic]^Func
 	for t in ranges {
 		// Guessed entries stay entries, but build_module gets none of them:
 		// dropping data after a return is gated on r3000 games only so far.
@@ -292,6 +278,25 @@ generate :: proc(o: mips.Options) {
 		delete(guessed)
 		append(&funcs, ..mips.build_module(RULES, img, t[0], t[1], entries, labels, calls, {}, {}))
 	}
+	return
+}
+
+generate :: proc(o: mips.Options) {
+	img := mips.load_elf(o)
+	// Before vu_only too: words may touch .vutext, whose programs a mid-run
+	// load must find the same as the startup conversion's.
+	if path := mips.option_or(o, "words", ""); path != "" {
+		replace_words(&img, path)
+	}
+	if mips.option_or(o, "vu_only", "") == "true" {
+		vu_only(o, img)
+		return
+	}
+	out := mips.option_or(o, "out", "")
+	runtime := mips.option_or(o, "runtime", "ps:ps2")
+	cycles := mips.parse_int(mips.option_or(o, "cycles_per_insn", fmt.tprint(CYCLES_PER_INSN)))
+	package_insns := mips.parse_int(mips.option_or(o, "package_insns", fmt.tprint(PACKAGE_INSNS)))
+	funcs, labels, lo, hi := discover(o, img)
 	n_imports := drop_imports(&funcs, mips.option_or(o, "quiet", "") == "true")
 	hooked, hooks_hash := mips.read_mod_hooks(o)
 	check_hooked(funcs[:], hooked)

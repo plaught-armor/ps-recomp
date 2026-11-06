@@ -1,6 +1,7 @@
 // The PS1 mod API (recomp/r3000/mod_api.odin, mods/build.sh), on a
 // hand-made program written to the OS temp directory: a 64-word PS-X EXE
 // at 80010000 and two overlays at one slot, with tests/mod_api/funcs.tsv.
+// The EE's (recomp/r5900/mod_api.odin) is tests/mod_api/ee.odin's.
 //
 //   - mod_api.h and mod.ld are the committed ones byte for byte
 //     (`odin run tests/mod_api -collection:ps=. -- update` writes them),
@@ -36,10 +37,8 @@ import cpu "ps:psx/cpu"
 import "ps:recomp/mips"
 import "ps:recomp/r3000"
 
-@(private = "file")
 failed: int
 
-@(private = "file")
 check :: proc(ok: bool, what: string, loc := #caller_location) {
 	if !ok {
 		fmt.eprintfln("FAIL mod_api: %s (line %d)", what, loc.line)
@@ -131,6 +130,7 @@ main :: proc() {
 	cpu.mod_ram_free()
 
 	build(tmp, header, script)
+	ee(tmp, update)
 
 	if failed > 0 {
 		fmt.eprintfln("mod_api: %d failed", failed)
@@ -295,13 +295,11 @@ loads :: proc(img: core.Mod_Image, addr: u32) -> bool {
 	return false
 }
 
-@(private = "file")
 join :: proc(parts: []string) -> string {
 	p, _ := filepath.join(parts, context.temp_allocator)
 	return p
 }
 
-@(private = "file")
 write :: proc(dir, name: string, data: []u8) {
 	_ = os.make_directory_all(dir)
 	path := join({dir, name})

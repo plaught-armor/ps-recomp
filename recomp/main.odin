@@ -16,8 +16,7 @@
 // from other files (PS1 overlays) is not found.
 //
 // --mod-api writes the options file's mod API, mod_api.h and mod.ld, into
-// the out directory and compiles nothing (recomp/r3000/mod_api.odin; PS1
-// only).
+// the out directory and compiles nothing (recomp/mips/mod_api.odin).
 package recomp
 
 import "core:fmt"
@@ -43,7 +42,7 @@ main :: proc() {
 		case "r3000":
 			r3000.mod_api_write(o, args[2])
 		case "r5900":
-			mips.fail("%s: --mod-api: backend r5900 is not supported yet", o.path)
+			r5900.mod_api_write(o, args[2])
 		case:
 			mips.fail("%s: unknown backend %s", o.path, b)
 		}

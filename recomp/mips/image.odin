@@ -85,7 +85,6 @@ HOST_ARCH :: "wasm32" when ODIN_ARCH == .wasm32 else ("arm64" when ODIN_ARCH == 
 // The executable's bytes and its name: option `exe`, a file; or, with
 // option `disc` (a .cue sheet, or a single-track .bin or .iso), the file at
 // disc path `exe` on that image, by default the one SYSTEM.CNF names.
-@(private = "file")
 read_exe :: proc(o: Options) -> (raw: []u8, name: string) {
 	image := option_or(o, "disc", "")
 	if image == "" {
