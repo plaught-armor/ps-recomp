@@ -116,7 +116,8 @@ python3 tests/wasi/serve.py <out dir> result.json --pick --arch x64_sysv
 ```
 
 play builds for `wasi_wasm32` too, and `play.html` on the same out dir runs
-a disc in the tab. A Worker runs `play.wasm` on `web/wasi.js` and
+a disc in the tab. `play.wasm` is built with wasm SIMD (`simd128`), so it
+needs Chrome 91+, Firefox 89+ or Safari 16.4+. A Worker runs `play.wasm` on `web/wasi.js` and
 `web/sdl.js`, which provides the SDL 2 calls play makes (the
 `system:SDL2` imports). The Worker never yields while the game runs, so it
 shares three `SharedArrayBuffer`s with the page (`web/layout.js`): control

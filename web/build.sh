@@ -12,6 +12,12 @@
 # does not depend on the checkout path: two checkouts give the same bytes.
 # play exports its function table, growable, for web/native.js to put a
 # wasm32 native blob's functions in.
+# play is built with -target-features:simd128, so its #simd code (the
+# software GS's sampling, blending and attribute math) runs as wasm SIMD
+# instead of being split into scalar lanes: sp and gh with a native blob
+# run 15% and 27% faster per frame, the frame hashes are unchanged, and
+# play.wasm is 2% smaller. It needs Chrome 91+, Firefox 89+ or Safari
+# 16.4+. recomp is left scalar: its speed with simd128 is unmeasured.
 # Both are built with -define:COMMIT=<commit hash>, the commit play keys
 # its stored blobs with (core.blob_cached), as a native build is
 # (README.md); a tree with changes gets "dev", whose blobs are never taken
@@ -27,10 +33,11 @@ if ! git -C "$root" diff --quiet HEAD; then
 	define=dev
 fi
 for p in recomp play; do
-	# play exports its function table for native blobs (web/native.js);
-	# odin refuses an empty -extra-linker-flags, so recomp passes none.
+	# play exports its function table for native blobs (web/native.js)
+	# and is built with SIMD; odin refuses an empty -extra-linker-flags,
+	# so recomp passes none.
 	set --
-	[ "$p" = play ] && set -- -extra-linker-flags:"--export-table --growable-table"
+	[ "$p" = play ] && set -- -extra-linker-flags:"--export-table --growable-table" -target-features:simd128
 	odin build "$root/$p" -target:wasi_wasm32 -collection:ps="$root" -o:speed \
 		-source-code-locations:filename -define:COMMIT="$define" "$@" -out:"$out/$p.wasm"
 	if command -v wasm-opt >/dev/null; then
