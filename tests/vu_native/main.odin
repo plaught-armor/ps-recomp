@@ -26,6 +26,7 @@ import "core:fmt"
 import "core:math/rand"
 import "core:os"
 import "core:slice"
+import "core:sys/linux"
 import "ps:core"
 import "ps:ps2"
 import "ps:ps2/vu"
@@ -325,7 +326,8 @@ main :: proc() {
 // of its own: a start where a registered program holds records nothing;
 // one where its micro memory differs records the image and the start, once;
 // a reopen (the next run) appends nothing and cuts off a last record cut
-// short; and past CAPTURE_IMAGES images a start records no new image. Into
+// short; a run holds the file's lock, and one that finds it held, at
+// opening the file or at making it, records nothing (Linux); and past CAPTURE_IMAGES images a start records no new image. Into
 // a second file: a compiled program that leaves to a pc outside it records
 // that pc, and so does one that leaves at once from a pair it has no label
 // for (a clamp elision leave). The failures.
@@ -401,6 +403,43 @@ test_miss_capture :: proc(progs: []vu_programs.Prog, arch: native.Arch) -> (fail
 	vu.vu_capture_reopen()
 	start(micro, prog, nop, 15, 0)
 	if again, _ := parse(path); again != n {fail(&fails, fmt.tprintf("a second run grew the file from %d to %d bytes", n, again))}
+	when ODIN_OS == .Linux {
+		// The run holds the file's lock; one that finds it held, whether at
+		// opening the file or at making it, does not capture.
+		lock :: proc(path: string, flags: os.File_Flags) -> ^os.File {
+			f, e := os.open(path, flags, os.Permissions_Read_All + {.Write_User})
+			if e != nil {return nil}
+			if linux.flock(linux.Fd(os.fd(f)), {.EX, .NB}) != .NONE {
+				_ = os.close(f)
+				return nil
+			}
+			return f
+		}
+		if f := lock(path, {.Read}); f != nil {
+			fail(&fails, "a capturing run does not hold its file's lock")
+			_ = os.close(f)
+		}
+		// Close the run's file, then lock it from outside.
+		_ = os.set_env(core.env_name("VU1_CAPTURE"), "")
+		vu.vu_capture_reopen()
+		held := lock(path, {.Read})
+		if held == nil {fail(&fails, "cannot lock the capture file")}
+		_ = os.set_env(core.env_name("VU1_CAPTURE"), path)
+		vu.vu_capture_reopen()
+		start(micro, prog, nop, 13, 0)
+		if again, _ := parse(path); again != n {fail(&fails, fmt.tprintf("a run that found the file locked grew it from %d to %d bytes", n, again))}
+		if held != nil {_ = os.close(held)}
+		made := fmt.tprintf("%s/vu1-made.cap", dir)
+		_ = os.set_env(core.env_name("VU1_CAPTURE"), made)
+		vu.vu_capture_reopen()
+		held = lock(made, {.Read, .Write, .Create})
+		if held == nil {fail(&fails, "cannot lock a new capture file")}
+		start(micro, prog, nop, 13, 0)
+		if size, _ := parse(made); size != 0 {fail(&fails, fmt.tprintf("a run that found the file it made locked wrote %d bytes", size))}
+		if held != nil {_ = os.close(held)}
+		_ = os.set_env(core.env_name("VU1_CAPTURE"), path)
+		vu.vu_capture_reopen()
+	}
 	// A last record cut short, then a reopen and a new image: the cut is gone.
 	if f, e := os.open(path, {.Write, .Append}); e == nil {
 		os.write(f, []u8{'E', 1, 2, 3, 4})

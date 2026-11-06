@@ -85,8 +85,9 @@
 //   records repeated, or a last record cut short, keep, and a new entry or a
 //   bad record in the middle (that file counts as none) do not. A run with a
 //   VU1 capture converts with it, runs its microprogram natively, and the
-//   next run uses the stored blob (test_vu_captures). A miss capture
-//   (VU_CAPTURE=miss) of a run that adds nothing appends nothing.
+//   next run uses the stored blob (test_vu_captures). VU_CAPTURE=0, or a
+//   compat child with it unset, opens no capture file; unset, a miss
+//   capture opens it, and a run that adds nothing appends nothing.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -869,14 +870,29 @@ test_vu_captures :: proc() {
 	check(name, strings.has_suffix(string(key), fmt.tprintf(" %s\n", set)), fmt.tprintf("key %q for set %q", key, set))
 	errs = run(name, path) or_else ""
 	check(name, !strings.contains(errs, "converting") && strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("second run:\n%s", errs))
-	// A miss capture (VU_CAPTURE=miss) of a run that adds nothing appends
-	// nothing, creates no file and keeps the blob.
-	_ = os.set_env(core.env_name("VU_CAPTURE"), "miss")
+	// VU_CAPTURE=0 opens no capture file: a last record cut short stays.
+	cut := slice.concatenate([][]u8{one, one[:5]}, context.temp_allocator)
+	_ = os.write_entire_file(cap, cut)
+	_ = os.set_env(core.env_name("VU_CAPTURE"), "0")
 	errs = run(name, path) or_else ""
 	os.unset_env(core.env_name("VU_CAPTURE"))
 	after, _ := os.read_entire_file(cap, context.temp_allocator)
 	vu0 := os.exists(core.disc_path(dir, .Vu0_Capture, context.temp_allocator))
-	check(name, !strings.contains(errs, "converting") && slice.equal(after, one) && !vu0, fmt.tprintf("miss capture: vu0 file %v, vu1 %d bytes of %d:\n%s", vu0, len(after), len(one), errs))
+	check(name, !strings.contains(errs, "converting") && slice.equal(after, cut) && !vu0, fmt.tprintf("VU_CAPTURE=0: vu0 file %v, vu1 %d bytes of %d:\n%s", vu0, len(after), len(cut), errs))
+	// Nor does a compat child (COMPAT_PROGRESS set) with VU_CAPTURE unset.
+	_ = os.set_env(core.env_name("COMPAT_PROGRESS"), strings.concatenate({cap, ".progress"}, context.temp_allocator))
+	errs = run(name, path) or_else ""
+	os.unset_env(core.env_name("COMPAT_PROGRESS"))
+	after, _ = os.read_entire_file(cap, context.temp_allocator)
+	vu0 = os.exists(core.disc_path(dir, .Vu0_Capture, context.temp_allocator))
+	check(name, slice.equal(after, cut) && !vu0, fmt.tprintf("compat child: vu0 file %v, vu1 %d bytes of %d:\n%s", vu0, len(after), len(cut), errs))
+	// Unset, a miss capture: it opens the file, which cuts the cut record
+	// off; a run that adds nothing appends nothing, creates no file and
+	// keeps the blob.
+	errs = run(name, path) or_else ""
+	after, _ = os.read_entire_file(cap, context.temp_allocator)
+	vu0 = os.exists(core.disc_path(dir, .Vu0_Capture, context.temp_allocator))
+	check(name, !strings.contains(errs, "converting") && slice.equal(after, one) && !vu0, fmt.tprintf("default capture: vu0 file %v, vu1 %d bytes of %d:\n%s", vu0, len(after), len(one), errs))
 }
 
 // img with label as its volume identifier, space padded.

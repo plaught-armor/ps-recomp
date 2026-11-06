@@ -283,21 +283,27 @@ Microcode the game builds in data and uploads at run time (VIF MPG
 packets) is not in the ELF; it is found only by running the game with a
 capture, and without one it runs in the interpreter.
 
-To capture, run the player with `PS_VU_CAPTURE=1` through the parts of the
-game to cover. It records both VUs' microcode in the disc's directory
-(`vu0-capture.bin`, `vu1-capture.bin`; ps2/vu/capture.odin). Capturing is
-off by default and is never a saved setting: a captured VU runs only in
-the interpreter, so the run is slower. Each run appends what it saw, so
-the files grow with every run and cover every part played. Only one run at
-a time may capture into a file. A run stopped
+The player captures it as the game runs: it records both VUs' microcode
+that has no native code in the disc's directory (`vu0-capture.bin`,
+`vu1-capture.bin`; ps2/vu/capture.odin). The VUs run the native code they
+have, so capturing does not slow the game, and a run over parts already
+covered appends nothing. Each run appends what it saw, so the files grow
+with every run and cover every part played. `PS_VU_CAPTURE=0` turns
+capturing off; it is never a saved setting. A FLAT build captures only
+when asked, as does a `PS_COMPAT` run's child, so a compat row comes from
+the environment alone.
+
+`PS_VU_CAPTURE=1` captures everything a VU runs, the microcode with native
+code too: the VUs then run only in the interpreter, so the run is slower.
+
+Only one run at a time captures into a file: a run locks each file it
+opens or makes until it ends, and a second run that finds the file locked
+does not capture. The lock is taken on Linux and macOS, not on Windows,
+where a second run is not caught. A run stopped
 mid-write leaves its last record cut short; readers stop there and keep
 the rest, and the next capture cuts it off. Each VU's file holds at most
 2048 micro memory images; past that a run says so once and records no new
 ones, and the programs they hold stay in the interpreter.
-
-`PS_VU_CAPTURE=miss` captures without the slowdown: the VUs run the
-native code they have, and only microcode with none is recorded, so a run
-over parts already covered appends nothing.
 
 The player uses the captures too. Its next run converts the disc again
 with them, so the VU programs (the captured ones and those of
@@ -313,8 +319,9 @@ repository. Without them, a fresh clone builds the same as before, and
 that microcode runs in the interpreter.
 
 `PS_VU0_CAPTURE=<file>` and `PS_VU1_CAPTURE=<file>` capture one VU into a
-file of your own (each wins over `PS_VU_CAPTURE` for its VU); name such a
-file in `tools/recomp.tsv` by hand:
+file of your own (each wins over `PS_VU_CAPTURE` for its VU, and with
+`PS_VU_CAPTURE` unset only that VU is captured, in full); name such a file
+in `tools/recomp.tsv` by hand:
 
 ```
 vu1_capture	build/vu1.cap

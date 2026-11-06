@@ -491,7 +491,7 @@ export_write :: proc(root, src, id: string, info: [Info]string, psx_exe: bool) -
 
 // local.tsv: the image's path, the disc's directory, id and system, the
 // ps-recomp commit this player is (the one to build a port with), and the
-// VU capture files the player has written for the disc (VU_CAPTURE=1).
+// VU capture files the player has written for the disc (VU_CAPTURE).
 @(private = "file")
 export_local :: proc(src, id: string, info: [Info]string) -> []u8 {
 	b := strings.builder_make(context.temp_allocator)

@@ -11,9 +11,9 @@
 // a native blob for this host, in a child process (`play --convert <disc
 // image> <out> <vu0> <vu1>`), and keeps it in the disc's directory under
 // the user data directory (DATA) with the memory cards; later runs of the
-// same build use it. A PS2 disc's VU capture files (VU_CAPTURE), once they
-// hold microcode, go into the blob too, which is compiled again when they
-// gain some. A dev build (no COMMIT) converts every time. When the conversion
+// same build use it. A PS2 disc's VU capture files (VU_CAPTURE, on by
+// default), once they hold microcode, go into the blob too, which is
+// compiled again when they gain some. A dev build (no COMMIT) converts every time. When the conversion
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
 //
@@ -205,6 +205,16 @@ learn_records :: proc(dir, name: string) -> string {
 	return path
 }
 
+// Whether the environment says how to capture the VUs: VU_CAPTURE,
+// VU0_CAPTURE or VU1_CAPTURE set, even empty.
+@(private = "file")
+capture_asked :: proc() -> bool {
+	for name in ([3]string{"VU_CAPTURE", "VU0_CAPTURE", "VU1_CAPTURE"}) {
+		if _, set := core.env_lookup(name); set {return true}
+	}
+	return false
+}
+
 // The disc image's id and SYSTEM.CNF, and its PSX.EXE when it has no
 // SYSTEM.CNF. False, after a message, when it is not a disc image or has no
 // executable to run.
@@ -246,12 +256,26 @@ play :: proc(image: string) -> int {
 	if core.env("COMPAT") != "1" && !core.settings_apply(dir) {
 		return 1
 	}
-	// VU_CAPTURE=1 records a PS2 game's VU microcode in its directory, where
-	// an export's port is compiled from (docs/porting.md); VU_CAPTURE=miss
-	// records only what no compiled program runs (ps2/vu/capture.odin).
-	// Only from the environment: settings.tsv goes into the export.
-	// VU0_CAPTURE or VU1_CAPTURE set already names that VU's file.
-	if capture := core.env("VU_CAPTURE"); cnf.ps2 && (capture == "1" || capture == "miss") {
+	// A PS2 game's VU microcode is recorded in its directory, where the next
+	// conversion and an export's port are compiled from (docs/porting.md):
+	// VU_CAPTURE=miss, the default, records only what no compiled program
+	// runs (ps2/vu/capture.odin); VU_CAPTURE=1 records all of it, in the
+	// interpreter; VU_CAPTURE=0 records nothing. Only from the environment:
+	// settings.tsv goes into the export. VU0_CAPTURE or VU1_CAPTURE set
+	// already names that VU's file, and with VU_CAPTURE unset it captures
+	// that VU alone, in full, as without the player. A FLAT build, with no
+	// compiled programs, records only when asked, as does a compat child,
+	// whose result comes from the environment alone: what it recorded would
+	// change the code its parent's next conversion runs.
+	capture := core.env("VU_CAPTURE")
+	if cnf.ps2 && !core.FLAT && !compat_child() && !capture_asked() {
+		capture = "miss"
+		if err := os.set_env(core.env_name("VU_CAPTURE"), capture); err != nil {
+			fmt.eprintln("play: cannot set", core.env_name("VU_CAPTURE"), err)
+			return 1
+		}
+	}
+	if cnf.ps2 && (capture == "1" || capture == "miss") {
 		for f, unit in ([2]core.Disc_File{.Vu0_Capture, .Vu1_Capture}) {
 			name := fmt.tprintf("VU%d_CAPTURE", unit)
 			if _, set := core.env_lookup(name); set {continue}

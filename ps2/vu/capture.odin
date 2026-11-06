@@ -26,7 +26,10 @@
 // and never rewritten, so a run that never reaches quit() keeps what it
 // wrote. Only one run at a time may capture into a file: opening cuts what
 // looks like a record cut short, which may be another run's record still
-// being written, and that run's later records would then be misaligned:
+// being written, and that run's later records would then be misaligned. So
+// a run locks the file when it opens or creates it and holds the lock
+// until it ends; a run that finds the file locked does not capture
+// (capture_lock):
 //	'I', hash: u64, micro: [size]u8   an image, keyed by the XXH3-64 of micro
 //	'E', hash: u64, pc: u32           an entry into that image
 // size is the VU's micro memory: 4 KiB for VU0, 16 KiB for VU1. Integers
@@ -99,7 +102,7 @@ capture_open :: proc(c: ^Capture, env: string, unit: int, miss: bool) -> bool {
 		fmt.eprintfln("vu%d: cannot open capture file %s: %v", unit, path, err)
 		return false
 	}
-	if !capture_load(c, f, path, unit) {
+	if !capture_take(f, path, unit) || !capture_load(c, f, path, unit) {
 		_ = os.close(f)
 		return false
 	}
@@ -107,8 +110,23 @@ capture_open :: proc(c: ^Capture, env: string, unit: int, miss: bool) -> bool {
 	return true
 }
 
+// Lock f, the capture file at path, for this run; false, after a message,
+// when another run holds it or it cannot be locked. The lock goes when f
+// is closed, so f stays open for the run.
+@(private = "file")
+capture_take :: proc(f: ^os.File, path: string, unit: int) -> bool {
+	held, busy := capture_lock(f)
+	if held {return true}
+	if busy {
+		fmt.eprintfln("vu%d: capture file %s is in use by another run; not capturing", unit, path)
+	} else {
+		fmt.eprintfln("vu%d: cannot lock capture file %s; not capturing", unit, path)
+	}
+	return false
+}
+
 // Append rec to c's file, creating it at the first record; a file that
-// cannot be created ends the capture.
+// cannot be created or locked ends the capture.
 @(private = "file")
 capture_write :: proc(c: ^Capture, rec: []u8) {
 	if !c.on {return}
@@ -116,6 +134,11 @@ capture_write :: proc(c: ^Capture, rec: []u8) {
 		f, err := os.open(c.path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
 		if err != nil {
 			fmt.eprintfln("vu%d: cannot open capture file %s: %v", c.unit, c.path, err)
+			c.on = false
+			return
+		}
+		if !capture_take(f, c.path, c.unit) {
+			_ = os.close(f)
 			c.on = false
 			return
 		}
