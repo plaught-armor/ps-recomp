@@ -8,6 +8,8 @@
 //     id the kernel gives the boot program from the same ELF.
 //   - A words option patching a function changes nothing: keys name the
 //     words the port's RAM has.
+//   - A native blob converted with the recomp option mod_hooks has the
+//     import slot mod_hooks:<hash> of that set, which load_native requires.
 //   - The region constants are the console's (ps2/mem), and an image ending
 //     at MOD_IMAGE_END loads while one 16 bytes past it does not.
 //   - With clang, ld.lld, llvm-nm, llvm-objdump and sh: build.sh builds
@@ -117,6 +119,7 @@ ee :: proc(tmp: string, update: bool) {
 	h2, ld2, _, _ := r5900.mod_api(ps, prows)
 	check(h2 == header && ld2 == script, "ee: a words patch changes no key")
 
+	ee_hooked_blob(dir)
 	ee_build(tmp, "ee_api", header, script, spaces[0].id)
 	ee_fpu_list(tmp)
 
@@ -126,6 +129,31 @@ ee :: proc(tmp: string, update: bool) {
 	mem.mod_ram_free()
 	check(mem.mod_ram_load({{lo = mem.MOD_BASE, hi = r5900.MOD_IMAGE_END + 16}}, {"past"}) != "", "ee: an image past MOD_IMAGE_END does not")
 	mem.mod_ram_free()
+}
+
+// A native blob built with the recomp option mod_hooks names the hooked
+// set by its import slot mod_hooks:<hash>, the one load_native requires;
+// the slot's name outlives the conversion's temp allocations.
+@(private = "file")
+ee_hooked_blob :: proc(dir: string) {
+	write(dir, "hooks.txt", transmute([]u8)fmt.tprintf("%08x\n", EE_TEXT + 0x20))
+	// Options as play's converter gives them: generate frees the temp
+	// allocator per function.
+	out := strings.clone(join({dir, "hooked.bin"}))
+	defer delete(out)
+	hooks := strings.clone(join({dir, "hooks.txt"}))
+	defer delete(hooks)
+	o := mips.load_options(join({dir, "options.tsv"}))
+	o.values["native_arch"] = "x64_sysv"
+	o.values["native_out"] = out
+	o.values["mod_hooks"] = hooks
+	r5900.generate(o)
+	blob, _ := os.read_entire_file(out, context.allocator)
+	defer delete(blob)
+	_, slots, _, err := core.native_slots(blob)
+	addrs := [1]u32{EE_TEXT + 0x20}
+	want := fmt.tprintf("mod_hooks:%016x", mips.mod_hooks_hash(addrs[:]))
+	check(err == "" && slice.contains(slots, want), fmt.tprintf("ee: the hooked blob's slots %q have %s (%s)", slots, want, err))
 }
 
 // Build the EE fixture mods against the API in <tmp>/<api>.

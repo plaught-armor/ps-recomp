@@ -328,8 +328,9 @@ generate :: proc(o: mips.Options) {
 		code.sigs = EE_SIGS[:]
 		// The hooked set's hash, as an import slot the runtime has only with
 		// that set's mods loaded: a blob for other mods (or none) is refused.
-		// None without hooks, so the blob is as before.
-		if hooks_hash != 0 {_ = native.imp(code, fmt.tprintf("mod_hooks:%016x", hooks_hash))}
+		// None without hooks, so the blob is as before. Not temp allocated:
+		// the name lasts until write_blob, past the free_all per function.
+		if hooks_hash != 0 {_ = native.imp(code, fmt.aprintf("mod_hooks:%016x", hooks_hash))}
 	}
 
 	// With coverage, native code for x64 and arm64 both: the one native_out
