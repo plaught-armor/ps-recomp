@@ -354,6 +354,24 @@ the environment alone.
 `PS_VU_CAPTURE=1` captures everything a VU runs, the microcode with native
 code too: the VUs then run only in the interpreter, so the run is slower.
 
+A run need not wait for the next one to run what it captured natively:
+once the captures have stopped growing for 300 frames, the player
+converts their microcode in a child process (`play --convert-vu`) and
+loads the programs it did not have at the next frame after the child
+ends (play/midload.odin). The child's blob is a temporary file, removed
+once loaded; the disc's stored blob is compiled again on the next run, as
+before. A load that would bring a program reading the VU1 status flags
+beside a stored blob compiled without them is skipped (once, said in the
+log) and waits for that run. `PS_MIDLOAD=0` turns it off;
+`PS_MIDLOAD_WAIT=1` waits for the child at the frame that starts it, so
+the load comes at the same frame on every run, and so does a run with
+`PS_DUMP` or `PS_SHOT`, whose output is compared with another run's.
+Netplay and rollback runs (`PS_NET_PEER`, `PS_SNAPTEST`, `PS_RBTEST`)
+never load mid-run. A child converting for over 5 minutes is stopped; on
+Linux it dies with its run, and a run removes the temporary files
+(`ps-vu-<pid>-*.bin` in `TMPDIR`) of runs that were killed before
+removing theirs.
+
 Only one run at a time captures into a file: a run locks each file it
 opens or makes until it ends, and a second run that finds the file locked
 does not capture. The lock is taken on Linux and macOS, not on Windows,

@@ -231,6 +231,9 @@ main :: proc() {
 	test_library()
 	test_export()
 	test_vu_captures()
+	test_midload()
+	test_midload_status()
+	test_midload_child()
 	test_press()
 	test_press_watch()
 	test_ramdiff()
@@ -757,10 +760,12 @@ disc_dir :: proc(name, path: string) -> string {
 	return dir if has_id && has_dir else ""
 }
 
-// Run play on the image and check it ends with status, at FRAMES for 0; its
+// Run play on the image and check it ends with status, at frames for 0; its
 // stderr.
 @(private = "file")
-run :: proc(name, path: string, status := 0) -> (errs: string, ok: bool) {
+run :: proc(name, path: string, status := 0, frames := FRAMES) -> (errs: string, ok: bool) {
+	os.set_env(core.env_name("FRAMES"), fmt.tprint(frames))
+	defer os.set_env(core.env_name("FRAMES"), fmt.tprint(FRAMES))
 	self, err := os.get_executable_path(context.temp_allocator)
 	state: os.Process_State
 	out, e: []u8
@@ -772,8 +777,8 @@ run :: proc(name, path: string, status := 0) -> (errs: string, ok: bool) {
 		return
 	}
 	errs = string(e)
-	frames := strings.contains(errs, fmt.tprintf("frames: %d reached", FRAMES))
-	if !state.exited || state.exit_code != status || frames != (status == 0) {
+	reached := strings.contains(errs, fmt.tprintf("frames: %d reached", frames))
+	if !state.exited || state.exit_code != status || reached != (status == 0) {
 		check(name, false, fmt.tprintf("status %d, stdout:\n%s\nstderr:\n%s", state.exit_code, out, errs))
 		return errs, false
 	}
@@ -893,6 +898,170 @@ test_vu_captures :: proc() {
 	after, _ = os.read_entire_file(cap, context.temp_allocator)
 	vu0 = os.exists(core.disc_path(dir, .Vu0_Capture, context.temp_allocator))
 	check(name, !strings.contains(errs, "converting") && slice.equal(after, one) && !vu0, fmt.tprintf("default capture: vu0 file %v, vu1 %d bytes of %d:\n%s", vu0, len(after), len(one), errs))
+}
+
+// The display on as PS2_DARK turns it on, then the 2 quadwords at text +
+// ELF_DATA stored to the VIF1 FIFO at 0x10005000 (PS2_SHOW's loop), then the
+// count as PS2_DARK's.
+@(private = "file")
+PS2_VIF := [?]u32 {
+	0x3c081200, 0x24090001, 0xfd090000, 0x3c0a1000, 0x354a5000, 0x3c0b0010, 0x356b0080, 0x240c0002,
+	0x796d0000, 0x256b0010, 0x258cffff, 0x7d4d0000, 0x1580fffb, 0,
+	0x3c0a0030, 0x8d4b0000, 0, 0x256b0001, 0xad4b0000, 0x1000fffb, 0,
+}
+
+// A PS2 disc that loads a VU1 microprogram of two pairs at 0, lower0 its
+// first pair's lower word (the second pair's is a NOP), and starts it
+// (VIF1 NOP, MPG, whose data is 64-bit aligned, then MSCAL; PS2_VIF): the
+// first pair's upper word ends it.
+@(private = "file")
+ps2_vif_disc :: proc(lower0: u32) -> []u8 {
+	packet := [8]u32{0, 0x4a020000, lower0, 0x400002ff, 0x8000033c, 0x000002ff, 0x14000000, 0}
+	return discimg.make_iso(PS2_CNF, sub_name = "SLUS_123.45;1", sub = string(elf_at({text = 0x00100000, code = PS2_VIF[:], data = string(slice.to_bytes(packet[:]))})))
+}
+
+// The frames a mid-run load test runs to: past play.MIDLOAD_FRAMES quiet
+// after the microprogram's capture at boot.
+@(private = "file")
+MIDLOAD_RUN :: play.MIDLOAD_FRAMES + 20
+
+// The frames the background load test runs to: room for the child to end
+// after it starts at MIDLOAD_FRAMES.
+@(private = "file")
+MIDLOAD_ASYNC_RUN :: play.MIDLOAD_FRAMES + 20000
+
+// Run play on the image to frames, waiting for the mid-run conversion
+// unless !wait (MIDLOAD_WAIT=1), its child failing with fail
+// (MIDLOAD_FAIL=1), with TMPDIR an empty directory: its stderr, and whether
+// that directory is empty after.
+@(private = "file")
+run_midload :: proc(name, path: string, wait := true, fail := false, frames := MIDLOAD_RUN) -> (errs: string, clean: bool) {
+	tmpdir, _ := filepath.join({tmp, "midload_tmp"}, context.temp_allocator)
+	_ = os.make_directory(tmpdir)
+	old := os.get_env("TMPDIR", context.temp_allocator)
+	os.set_env("TMPDIR", tmpdir)
+	if wait {os.set_env(core.env_name("MIDLOAD_WAIT"), "1")}
+	if fail {os.set_env(core.env_name("MIDLOAD_FAIL"), "1")}
+	errs = run(name, path, frames = frames) or_else ""
+	os.unset_env(core.env_name("MIDLOAD_WAIT"))
+	os.unset_env(core.env_name("MIDLOAD_FAIL"))
+	os.set_env("TMPDIR", old)
+	left, _ := os.read_all_directory_by_path(tmpdir, context.temp_allocator)
+	return errs, len(left) == 0
+}
+
+// The names in the directory at path, sorted.
+@(private = "file")
+names :: proc(path: string) -> []string {
+	fis, _ := os.read_all_directory_by_path(path, context.temp_allocator)
+	out := make([]string, len(fis), context.temp_allocator)
+	for fi, k in fis {out[k] = fi.name}
+	slice.sort(out)
+	return out
+}
+
+// A run with no capture at its start converts the microprogram it captures
+// mid-run and loads it, leaving the disc directory as a run without the
+// load does and no temporary file.
+@(private = "file")
+test_midload :: proc() {
+	name :: "midload"
+	path := write(name, ps2_vif_disc(0x8000033c))
+	dir := disc_dir(name, path)
+	if dir == "" {
+		return
+	}
+	cap := core.disc_path(dir, .Vu1_Capture, context.temp_allocator)
+	key := core.disc_path(dir, .Native_Key, context.temp_allocator)
+	// The blob without captures, then the capture alone taken away.
+	os.set_env(core.env_name("MIDLOAD"), "0")
+	errs := run(name, path) or_else ""
+	os.unset_env(core.env_name("MIDLOAD"))
+	check(name, os.exists(cap) && !strings.contains(errs, "mid-run"), fmt.tprintf("MIDLOAD=0: capture %v:\n%s", os.exists(cap), errs))
+	before := names(dir)
+	_ = os.remove(cap)
+	key_before, _ := os.read_entire_file(key, context.temp_allocator)
+	errs2, clean := run_midload(name, path)
+	key_after, _ := os.read_entire_file(key, context.temp_allocator)
+	check(name, !strings.contains(errs2, fmt.tprintf("converting %s", path)), fmt.tprintf("startup converted again:\n%s", errs2))
+	check(name, strings.contains(errs2, "play: mid-run VU load: 1 microprograms (0 already loaded)"), fmt.tprintf("no load:\n%s", errs2))
+	check(name, strings.contains(errs2, "play: mid-run VU loads: 1 (1 microprograms), 0 skipped for status, 0 failed"), fmt.tprintf("quit line:\n%s", errs2))
+	check(name, clean, "the temporary blob is left")
+	check(name, slice.equal(names(dir), before) && slice.equal(key_after, key_before), fmt.tprintf("disc directory %v, was %v; key %q, was %q", names(dir), before, key_after, key_before))
+}
+
+// Without MIDLOAD_WAIT the child converts in the background and a later
+// vblank loads its programs; a child that fails leaves the run interpreted,
+// counted, and no temporary file.
+@(private = "file")
+test_midload_child :: proc() {
+	Case :: struct {
+		name: string,
+		wait: bool,
+		fail: bool,
+		mode: string,
+		line: string,
+		quit: string,
+	}
+	cases := [?]Case {
+		{"midload_async", false, false, "play: mid-run VU loading on, conversions in the background", "play: mid-run VU load: 1 microprograms (0 already loaded)", "play: mid-run VU loads: 1 (1 microprograms), 0 skipped for status, 0 failed"},
+		{"midload_fail", true, true, "play: mid-run VU loading on, each conversion waited for", "play: mid-run VU conversion failed (exit 1)", "play: mid-run VU loads: 0 (0 microprograms), 0 skipped for status, 1 failed"},
+	}
+	for c in cases {
+		path := write(c.name, ps2_vif_disc(0x8000033c))
+		dir := disc_dir(c.name, path)
+		if dir == "" {
+			continue
+		}
+		// The blob without captures, then the capture taken away.
+		os.set_env(core.env_name("MIDLOAD"), "0")
+		_, _ = run(c.name, path)
+		os.unset_env(core.env_name("MIDLOAD"))
+		_ = os.remove(core.disc_path(dir, .Vu1_Capture, context.temp_allocator))
+		errs, clean := run_midload(c.name, path, c.wait, c.fail, MIDLOAD_ASYNC_RUN if !c.wait else MIDLOAD_RUN)
+		check(c.name, strings.contains(errs, c.mode), fmt.tprintf("mode line:\n%s", errs))
+		check(c.name, strings.contains(errs, c.line), fmt.tprintf("no %q:\n%s", c.line, errs))
+		check(c.name, strings.contains(errs, c.quit), fmt.tprintf("quit line:\n%s", errs))
+		check(c.name, clean, "the temporary blob is left")
+	}
+}
+
+// Beside a startup blob holding vu1_capture's program, which reads no
+// status, a mid-run load brings the new program of the capture and leaves
+// that one; one that brings a program reading status is skipped.
+@(private = "file")
+test_midload_status :: proc() {
+	Case :: struct {
+		name:   string,
+		lower0: u32, // the disc's program's first lower word
+		load:   string, // the load line, "" none
+		quit:   string,
+	}
+	cases := [?]Case {
+		// FSSET (lower 0x15) writes status, reading none.
+		{"midload_known", 0x2a000000, "play: mid-run VU load: 1 microprograms (1 already loaded)", "play: mid-run VU loads: 1 (1 microprograms), 0 skipped for status, 0 failed"},
+		// FSAND (lower 0x16) reads it.
+		{"midload_status", 0x2c000000, "", "play: mid-run VU loads: 0 (0 microprograms), 1 skipped for status, 0 failed"},
+	}
+	for c in cases {
+		path := write(c.name, ps2_vif_disc(c.lower0))
+		dir := disc_dir(c.name, path)
+		if dir == "" {
+			continue
+		}
+		_ = os.make_directory_all(dir)
+		_ = os.write_entire_file(core.disc_path(dir, .Vu1_Capture, context.temp_allocator), vu1_capture())
+		errs, clean := run_midload(c.name, path)
+		check(c.name, strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("startup blob:\n%s", errs))
+		skips := strings.count(errs, "play: mid-run VU load skipped")
+		if c.load != "" {
+			check(c.name, strings.contains(errs, c.load) && skips == 0, fmt.tprintf("no load:\n%s", errs))
+		} else {
+			check(c.name, skips == 1 && !strings.contains(errs, "play: mid-run VU load:"), fmt.tprintf("no skip:\n%s", errs))
+		}
+		check(c.name, strings.contains(errs, c.quit), fmt.tprintf("quit line:\n%s", errs))
+		check(c.name, clean, "the temporary blob is left")
+	}
 }
 
 // img with label as its volume identifier, space padded.
