@@ -291,11 +291,13 @@ should have `isolated` true, `done.code` 0, `capture` 320x240 with the same
 the service worker path: `controlled` true and `isolated` true after the
 page's one reload. `sabUpload` says whether `texSubImage2D` took a view of
 the `SharedArrayBuffer` itself (false: the page copies each texture
-first). play.wasm cannot run a game yet: guest code has no way to run on
-wasm (`core/code_wasi.odin`), so console start-up stops at a runtime
-assertion. Its run checks that the page loads the module and reads the
-disc, and that the assertion reaches the report's `errors` with
-`done.code` -1.
+first). play.wasm runs a game: it is a FLAT build that interprets guest
+code (wasm cannot load generated code) and starts none of the
+emulator's own host threads (`core.THREADS`), so it is slower than a
+desktop build but computes the same frames. Its run should have
+`firstPresentMs` set and no `errors`, and, with `--env PS_FRAMES=<n>`,
+`done.code` 0 once it stops at that vblank; the gate run below checks
+what it computes.
 
 For a gate run, the test mode takes the module's input from the URL and
 sends its output back. Every disc file after the module is served (a
@@ -315,7 +317,11 @@ report says how it was read: `kind` `opfs` with `copyMs` (the copy), or,
 when the copy fails (no OPFS, a full quota), `kind` `url` with the
 `error` and the browser's storage `estimate`. `--store url` skips the
 copy and reads the disc by URL (`kind` `url`). With
-`PS_DUMP=. PS_DUMP_HASH=1`, `hashes.tsv` lands beside the result file:
+`PS_DUMP=. PS_DUMP_HASH=1`, `hashes.tsv` lands beside the result file,
+and with `PS_AUDIO_DUMP=audio.wav` the mixed audio. Both must be
+byte-identical to a native FLAT run with the same settings (its
+command is under "The wasm player under Node" below); `ring.pcm` is not compared, since what the ring keeps
+depends on the browser's audio clock:
 
 ```sh
 python3 tests/wasi/serve.py <out dir> run/result.json --play play.wasm game.cue game.bin \
