@@ -301,6 +301,27 @@ Save states made by the wasm build (FLAT) do not load on a desktop build,
 nor the other way round: a snapshot records which model saved it, and a
 mismatched load is fatal.
 
+## The wasm player under Node
+
+`tests/wasi/play.mjs` runs play.wasm headless under Node 24 or newer, on
+the page's shim and SDL imports (`web/wasi.js`, `web/sdl.js`), with the
+software renderer. It stops at a vblank (600 by default) and writes a
+hash line every 60 frames to `<out dir>/hashes.tsv`. A wasi build is
+always FLAT, so its reference is a native FLAT run with the same settings:
+
+```sh
+web/build.sh <page dir>
+node tests/wasi/play.mjs <page dir>/play.wasm out-wasm path/to/game.iso 600
+odin build play -collection:ps=. -o:speed -define:PS_FLAT=true -out:play-flat
+mkdir -p out-native
+PS_NATIVE=0 PS_SW=1 PS_HEADLESS=1 PS_FRAMES=600 PS_DUMP=out-native \
+	PS_DUMP_HASH=1 PS_DUMP_EVERY=60 PS_DATA=out-native/data ./play-flat path/to/game.iso
+cmp out-wasm/hashes.tsv out-native/hashes.tsv
+```
+
+Both runs start from an empty data directory. A `PS_*` variable set for
+play.mjs is passed on to the module.
+
 ## CI
 
 CI type-checks every package on Linux and macOS (amd64 and arm64) and on
@@ -324,4 +345,5 @@ for `linux_arm64`, `darwin_amd64` and `darwin_arm64`. recomp is also
 checked for `wasi_wasm32`, the target of the web converter: a recomp
 import of a package that needs the host (such as `core`) fails there.
 The web page's scripts have no build step; `node --check` each of
-`web/*.js` and `tests/wasi/run.mjs` after editing them.
+`web/*.js`, `tests/wasi/run.mjs` and `tests/wasi/play.mjs` after editing
+them.
