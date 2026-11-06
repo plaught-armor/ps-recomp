@@ -585,11 +585,12 @@ pages_hit :: proc(set: ^Page_Set, span: [2]u32) -> bool {
 	return false
 }
 
+// Whether two spans share a page, each wrapping past the last page.
 @(private)
 spans_meet :: proc(a, b: [2]u32) -> bool {
-	set: Page_Set
-	pages_mark(&set, b)
-	return pages_hit(&set, a)
+	if a[1] == 0 || b[1] == 0 {return false}
+	a0, b0 := a[0] % PAGES, b[0] % PAGES
+	return (a0 + PAGES - b0) % PAGES < b[1] || (b0 + PAGES - a0) % PAGES < a[1]
 }
 
 // Copy the pages of span, in every layer, to the same addresses in hw.snap,
