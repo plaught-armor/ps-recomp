@@ -226,6 +226,56 @@ the IOP on PS2; psx/cpu/cpu.odin report_once), with `PS_DUMP_HASH=1` too.
 A run that interprets many functions writes many: about 545 MB in a
 3600-frame PS2 run.
 
+## Netplay on one machine
+
+Two headless players on loopback test rollback netplay (core/net.odin)
+in either build. Each peer is one process: `PS_NET_BIND` is its own
+address, `PS_NET_PEER` the other's, `PS_NET_PLAYER` its slot (1 or 2).
+`PS_NET_DELAY` is the input delay in frames (default 2, at most 8),
+`PS_NET_HASH` the frames between desync checks (default 60). For tests,
+`PS_NET_LAG` adds one-way latency in ms and `PS_NET_DROP` drops that
+percent of outgoing packets; `PS_PACE=<hz>` paces a headless run, and a
+different rate on each peer stands in for clock drift. Give each peer
+its own press script (`PS_PRESS`, without conditions) so the peers'
+inputs differ and change.
+
+A run with an input delay longer than the latency never predicts, so it
+never rolls back: it is the reference. A run with the same delay and
+scripts but more latency than the delay (or drops) predicts, rolls back
+and reruns, and must reach the same machine at every frame:
+
+```sh
+net() { # <out dir> <player> <bind port> <peer port> <press> [VAR=value ...]
+	out=$1 p=$2 bind=$3 peer=$4 press=$5; shift 5
+	mkdir -p $out
+	env PS_SW=1 PS_HEADLESS=1 PS_FRAMES=3600 PS_DUMP=$out PS_DUMP_HASH=1 \
+		PS_DUMP_EVERY=60 PS_DATA=$out/data PS_NET_PLAYER=$p \
+		PS_NET_BIND=127.0.0.1:$bind PS_NET_PEER=127.0.0.1:$peer \
+		PS_PRESS=$press "$@" ./play path/to/game.iso 2>$out/log &
+}
+A=Start@300,Cross@400,Cross@430,LUp@900+60,Cross@1000,Cross@1030
+B=Cross@350,Circle@700,LLeft@900+40,Cross@990,Circle@1020
+net ref1 1 7000 7001 "$A" PS_NET_DELAY=8
+net ref2 2 7001 7000 "$B" PS_NET_DELAY=8
+wait
+net rb1 1 7000 7001 "$A" PS_NET_DELAY=8 PS_NET_LAG=200 PS_PACE=60
+net rb2 2 7001 7000 "$B" PS_NET_DELAY=8 PS_NET_LAG=200 PS_PACE=57
+wait
+grep 'net:' ref1/log rb1/log # rollbacks, frames rerun, max back, desync
+last() { awk -F'\t' '{h[$1"\t"$2]=$3} END {for (k in h) print k"\t"h[k]}' $1/hashes.tsv | sort; }
+for p in 1 2; do cmp <(last ref$p) <(last rb$p); done
+```
+
+The reference must report 0 rollbacks, the rollback run some rollbacks
+and frames rerun, both `desync -1` with hashes compared. A rerun frame
+is dumped again, so only the last line per kind and frame is compared.
+`max back` is the deepest rollback in frames rewound, 1 being the
+current frame's start; `RB_FRAMES` (core/rollback.odin) is the whole
+ring, back to `RB_FRAMES - 1` frames before the current one. Delay 8
+with `PS_NET_LAG=250` reaches it. Build `play` with
+`-define:PS_FLAT=true` for the FLAT run; the reference is the same pair
+in the same build.
+
 ## The wasm C maths functions
 
 The `wasi_wasm32` build has no C library, so `core/libm_wasi.odin` supplies

@@ -9,11 +9,14 @@
 // - logs the local input for frame + delay and sends it, with the inputs
 //   not yet acknowledged, to the peer;
 // - takes the peer's packets, and when a frame already simulated used a
-//   prediction the real input contradicts, rewinds to that frame right
-//   there (snap_yield; it does not return): the console resumes at that
-//   frame's vblank and calls net_frame again, which hands back the logged
-//   inputs until the frame the rollback came from (net_resimulating: the
-//   console skips presenting and queueing audio meanwhile);
+//   prediction the real input contradicts, asks for a rewind to that frame
+//   at the next vblank (snap_op = .Rewind) in place of the commit; this
+//   frame still runs on its prediction, and the rewind undoes it too. The
+//   console resumes at that frame's vblank and calls net_frame again, which
+//   hands back the logged inputs until the frame the rollback came from
+//   (net_resimulating: the console skips presenting and queueing audio
+//   meanwhile). The rewind is done where the commits are, the one point
+//   where a FLAT build's host stack holds nothing a snapshot misses;
 // - waits for the peer when it is too far behind to roll back to;
 // - when it runs ahead of the peer, asks the console to stretch its frame
 //   (net_stretch; time sync), so the faster host does not keep running into
@@ -79,6 +82,7 @@ Net_Status :: struct {
 	slowed:      int, // frames slowed down for time sync
 	rollbacks:   int,
 	resimulated: int, // frames run again
+	max_back:    int, // the deepest rollback, in frames rewound (rb_back)
 	stalls:      int, // frames that waited for the peer
 	hashes:      int, // hashes compared with the peer's
 	desync:      int, // first frame whose hashes differ; -1 for none
@@ -144,6 +148,7 @@ net_state: struct {
 	live:        int, // the newest frame run; -1 before the first
 	cur:         int, // the frame being run
 	rewind:      int, // earliest frame whose input proved wrong
+	undone:      bool, // the frame being run is undone at the next vblank
 	peer_frame:  int,
 	lead:        f32, // live - peer_frame, smoothed: offset plus latency
 	stretch:     f32, // share of a frame to add to the live one
@@ -300,6 +305,7 @@ net_frame :: proc(frame: int, local: Net_Input) -> (inputs: [MAX_PLAYERS]Net_Inp
 	if !n.on {return}
 	if n.live < 0 {first_frame(frame)}
 	n.cur = frame
+	n.undone = false
 	if frame > n.live {
 		n.live = frame
 		f := frame + n.cfg.delay
@@ -328,39 +334,54 @@ net_frame :: proc(frame: int, local: Net_Input) -> (inputs: [MAX_PLAYERS]Net_Inp
 		send_input()
 		sync()
 		if n.rewind < frame {
+			// No commit is taken at the next vblank, so 1 is still this
+			// frame's start: the rewind first undoes this frame, then goes
+			// back to n.rewind's.
 			back := frame - n.rewind + 1
 			assert(back <= rb_frames(), "net: rollback past the held frames")
 			n.status.rollbacks += 1
-			n.status.resimulated += frame - n.rewind
-			// Under FLAT snap_yield would return here, into a frame the
-			// rewind has left: the console would go on from the wrong place.
-			when FLAT {fatal("net: rollback not supported under FLAT")}
+			// This frame reruns too.
+			n.status.resimulated += back
+			n.status.max_back = max(n.status.max_back, back)
 			snap_op, rb_back = .Rewind, back
-			snap_yield()
-			unreachable()
+			n.undone = true
+			// Not a commit, nor the hashes: this frame's are rerun.
+			inputs = frame_inputs(frame)
+			return inputs, true
 		}
 		finalize_hashes()
 	}
+	inputs = frame_inputs(frame)
+	snap_op = .Commit
+	return inputs, true
+}
+
+// The inputs `frame` runs with: the logged ones, a player's last known one
+// where none is logged yet (the prediction). Each is noted as used.
+@(private = "file")
+frame_inputs :: proc(frame: int) -> (inputs: [MAX_PLAYERS]Net_Input) {
+	n := &net_state
 	l := slot(frame)
 	for p in 0 ..< n.cfg.players {
 		in_ := frame <= n.upto[p] ? l.input[p] : slot(n.upto[p]).input[p]
 		l.used[p] = in_
 		inputs[p] = in_
 	}
-	snap_op = .Commit
-	return inputs, true
+	return
 }
 
-// The frame being run is a rerun after a rollback: nothing of it is shown.
+// The frame being run is a rerun after a rollback, or one the next vblank
+// rewinds: nothing of it is shown.
 net_resimulating :: proc() -> bool {
-	return net_state.on && net_state.cur < net_state.live
+	n := &net_state
+	return n.on && (n.cur < n.live || n.undone)
 }
 
 // The share of a frame the console should add to this one's time, to let
 // the peer catch up; 0 when unpaced (headless) is fine too.
 net_stretch :: proc() -> f32 {
 	n := &net_state
-	return n.on && n.cur == n.live ? n.stretch : 0
+	return n.on && n.cur == n.live && !n.undone ? n.stretch : 0
 }
 
 // The console should hash its memory for this frame (net_hash).

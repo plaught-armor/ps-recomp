@@ -47,7 +47,7 @@ net_init :: proc() -> bool {
 @(private)
 print_net :: proc() {
 	st := core.net_status()
-	fmt.eprintfln("net: vblank %d, ping %.1f ms, ahead %d, offset %.1f, %d rollbacks (%d frames rerun), %d stalls, %d slowed, %d hashes compared, desync %d",
-		vblank, time.duration_milliseconds(st.ping), st.ahead, st.offset, st.rollbacks, st.resimulated, st.stalls,
+	fmt.eprintfln("net: vblank %d, ping %.1f ms, ahead %d, offset %.1f, %d rollbacks (%d frames rerun, max back %d), %d stalls, %d slowed, %d hashes compared, desync %d",
+		vblank, time.duration_milliseconds(st.ping), st.ahead, st.offset, st.rollbacks, st.resimulated, st.max_back, st.stalls,
 		st.slowed, st.hashes, st.desync)
 }
