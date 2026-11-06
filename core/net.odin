@@ -48,9 +48,7 @@ package core
 
 import "base:runtime"
 import "core:fmt"
-import "core:hash/xxhash"
-import "core:net"
-import "core:os"
+import "core:strings"
 import "core:time"
 
 NET_VERSION :: 3
@@ -148,12 +146,11 @@ Delayed :: struct {
 @(private = "file")
 net_state: struct {
 	on:          bool,
+	joined:      bool, // past the handshake
 	cfg:         Net_Config,
 	alloc:       runtime.Allocator, // for delayed packets
-	open:        bool, // the socket
+	open:        bool, // the link to the peer (link_open)
 	peer_player: int,
-	sock:        net.UDP_Socket,
-	peer:        net.Endpoint,
 	build:       u64,
 	epoch:       time.Tick,
 	log:         [LOG]Log_Frame,
@@ -177,8 +174,11 @@ net_state: struct {
 	status:      Net_Status,
 }
 
-// Bind, find the peer and handshake (blocking, up to TIMEOUT while the peer
-// is not there yet). False after a message.
+// Check cfg and open the link to the peer (blocking until it is up, on
+// wasm). The handshake waits for the first net_frame, after the boot: a
+// peer that boots slower must not leave the other one stalled for its input
+// past TIMEOUT, and before the handshake only HELLOs arrive, which are
+// resent anyway. False after a message.
 net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 	n := &net_state
 	net_stop()
@@ -197,6 +197,10 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 	n^ = {}
 	n.cfg = cfg
 	n.alloc = context.allocator
+	// cfg's strings may be temp memory (core.env), and handshake prints
+	// peer on a later frame.
+	n.cfg.bind = strings.clone(cfg.bind, n.alloc)
+	n.cfg.peer = strings.clone(cfg.peer, n.alloc)
 	n.delayed = make([dynamic]Delayed, n.alloc)
 	n.live, n.cur, n.sent_hash = -1, -1, -1
 	n.status.desync = -1
@@ -207,34 +211,25 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 	n.build = build_id()
 	n.epoch = time.tick_now()
 
-	bind, bok := net.parse_endpoint(cfg.bind)
-	if !bok {
-		fmt.eprintln("net: bad bind address", cfg.bind)
-		return false
-	}
-	peer, err := net.resolve_ip4(cfg.peer)
-	if err != nil {
-		fmt.eprintln("net: cannot resolve", cfg.peer, err)
-		return false
-	}
-	n.peer = peer
-	sock, serr := net.make_bound_udp_socket(bind.address, bind.port)
-	if serr != nil {
-		fmt.eprintln("net: cannot bind", cfg.bind, serr)
-		return false
-	}
-	n.sock, n.open = sock, true
-	if e := net.set_blocking(sock, false); e != nil {
-		fmt.eprintln("net: cannot make the socket non-blocking", e)
-		return false
-	}
+	n.open = link_open(cfg)
+	if !n.open {return false}
 
+	n.on = true
+	return true
+}
+
+// Find the peer and agree on the session, from the first net_frame: up to
+// TIMEOUT * 6 for a peer that is not there yet or still booting. False
+// after a message.
+@(private = "file")
+handshake :: proc() -> bool {
+	n := &net_state
 	got, seen := false, false
 	start := time.tick_now()
 	sent: time.Tick
 	for !(got && seen) {
 		if time.tick_since(start) > TIMEOUT * 6 {
-			fmt.eprintln("net: no answer from", cfg.peer)
+			fmt.eprintln("net: no answer from", n.cfg.peer)
 			return false
 		}
 		if time.tick_since(sent) > 50 * time.Millisecond {
@@ -244,9 +239,8 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 		flush_delayed()
 		buf: [1500]u8
 		for {
-			size, from, rerr := net.recv_udp(sock, buf[:])
-			if rerr != nil || size == 0 {break}
-			if from != n.peer {continue}
+			size := link_recv(buf[:])
+			if size <= 0 {break}
 			d := buf[:size]
 			if msg := version_mismatch(d); msg != "" {
 				fmt.eprintln("net: peer refused:", msg)
@@ -257,7 +251,7 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 			switch kind {
 			case HELLO:
 				if len(d) < HELLO_SIZE {continue}
-				if msg := hello_mismatch(d, cfg, n.build); msg != "" {
+				if msg := hello_mismatch(d, n.cfg, n.build); msg != "" {
 					fmt.eprintln("net: peer refused:", msg)
 					return false
 				}
@@ -271,13 +265,13 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 		time.sleep(time.Millisecond)
 	}
 	send_hello(true)
-	n.on = true
+	n.joined = true
 	fmt.eprintfln(
 		"net: connected to %s as player %d of %d, delay %d",
-		cfg.peer,
-		cfg.player + 1,
-		cfg.players,
-		cfg.delay,
+		n.cfg.peer,
+		n.cfg.player + 1,
+		n.cfg.players,
+		n.cfg.delay,
 	)
 	return true
 }
@@ -290,10 +284,13 @@ net_stop :: proc() {
 @(private = "file")
 release :: proc() {
 	n := &net_state
-	if n.open {net.close(n.sock)}
+	if n.open {link_close()}
 	for d in n.delayed {delete(d.data)}
 	delete(n.delayed)
 	n.delayed = nil
+	delete(n.cfg.bind, n.alloc)
+	delete(n.cfg.peer, n.alloc)
+	n.cfg.bind, n.cfg.peer = "", ""
 	n.open, n.on = false, false
 }
 
@@ -306,6 +303,10 @@ net_active :: proc() -> bool {
 net_frame :: proc(frame: int, local: Net_Input) -> (inputs: [MAX_PLAYERS]Net_Input, ok: bool) {
 	n := &net_state
 	if !n.on {return}
+	if !n.joined && !handshake() {
+		net_stop()
+		return
+	}
 	if n.live < 0 {first_frame(frame)}
 	n.cur = frame
 	n.undone = false
@@ -442,9 +443,8 @@ receive :: proc() {
 	flush_delayed()
 	buf: [1500]u8
 	for n.on {
-		size, from, err := net.recv_udp(n.sock, buf[:])
-		if err != nil || size == 0 {return}
-		if from != n.peer {continue}
+		size := link_recv(buf[:])
+		if size <= 0 {return}
 		d := buf[:size]
 		player, kind, ok := header(d)
 		if !ok {continue}
@@ -609,7 +609,7 @@ send :: proc(d: []u8) {
 		append(&n.delayed, Delayed{time.tick_add(time.tick_now(), n.cfg.lag), data})
 		return
 	}
-	_, _ = net.send_udp(n.sock, d, n.peer)
+	link_send(d)
 }
 
 @(private = "file")
@@ -619,7 +619,7 @@ flush_delayed :: proc() {
 	i := 0
 	for i < len(n.delayed) {
 		if time.tick_diff(n.delayed[i].due, now) < 0 {break}
-		_, _ = net.send_udp(n.sock, n.delayed[i].data[:], n.peer)
+		link_send(n.delayed[i].data[:])
 		delete(n.delayed[i].data)
 		i += 1
 	}
@@ -659,24 +659,6 @@ compare_hash :: proc(frame: int) {
 			b.hash,
 		)
 	}
-}
-
-@(private = "file")
-build_id :: proc() -> u64 {
-	path := "/proc/self/exe" when ODIN_OS == .Linux else os.args[0]
-	f, err := os.open(path)
-	if err != nil {return 0}
-	defer os.close(f)
-	state: xxhash.XXH3_state
-	xxhash.XXH3_init_state(&state)
-	_ = xxhash.XXH3_64_reset(&state)
-	buf: [1 << 16]u8
-	for {
-		size, rerr := os.read(f, buf[:])
-		if size > 0 {_ = xxhash.XXH3_64_update(&state, buf[:size])}
-		if rerr != nil || size == 0 {break}
-	}
-	return xxhash.XXH3_64_digest(&state)
 }
 
 @(private = "file")
