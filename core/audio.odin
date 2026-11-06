@@ -29,6 +29,9 @@ import sdl "vendor:sdl2"
 AUDIO_LATENCY_MIN :: 20
 AUDIO_LATENCY_MAX :: 250
 
+// The latency both hosts open the device with.
+AUDIO_LATENCY_MS :: 50
+
 // Largest playback rate correction that keeps the queue at its target: 0.5%,
 // about 9 cents of pitch.
 AUDIO_RATE_MAX :: 0.005

@@ -10,14 +10,11 @@ import cpu "../cpu"
 import iop "../iop"
 
 @(private)
-LATENCY_MS :: 50
-
-@(private)
 audio_init :: proc(headless: bool) {
 	wav, _ := core.env_lookup("WAV")
 	// Headless runs are unpaced: a device queue would drop the mix.
 	core.audio_init(iop.MIX_RATE, wav, !headless)
-	if !headless {core.audio_apply(LATENCY_MS)}
+	if !headless {core.audio_apply(core.AUDIO_LATENCY_MS)}
 }
 
 // Mix exactly vblank v (from 1): the game polls voice positions, so how far

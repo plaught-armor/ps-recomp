@@ -304,7 +304,12 @@ platform_init :: proc(title: cstring) -> bool {
 	if spec := core.env("POINT"); spec != "" {
 		parse_point_script(spec)
 	}
-	return record_init() && core.audio_init(AUDIO_HZ, core.env("AUDIO_DUMP"), !core.headless)
+	if !record_init() || !core.audio_init(AUDIO_HZ, core.env("AUDIO_DUMP"), !core.headless) {
+		return false
+	}
+	// Headless runs are unpaced: a device queue would drop the mix.
+	if !core.headless {core.audio_apply(core.AUDIO_LATENCY_MS)}
+	return true
 }
 
 // A batch of mixed SPU output.
