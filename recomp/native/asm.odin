@@ -22,6 +22,7 @@ Arch :: enum u32 {
 	X64_SysV = 1,
 	X64_Win  = 2,
 	Arm64    = 3,
+	Wasm32   = 4, // a WebAssembly module, wasm.odin
 }
 
 parse_arch :: proc(s: string) -> (Arch, bool) {
@@ -32,14 +33,17 @@ parse_arch :: proc(s: string) -> (Arch, bool) {
 		return .X64_Win, true
 	case "arm64":
 		return .Arm64, true
+	case "wasm32":
+		return .Wasm32, true
 	}
 	return {}, false
 }
 
 // The arch named s, or false after a message naming who asked: an arch
-// with no emitter, such as wasm32 (core.NATIVE_ARCH_WASM32), is refused.
+// with no runtime loader yet, wasm32 (core.NATIVE_ARCH_WASM32), is refused.
 arch_of :: proc(who, s: string) -> (Arch, bool) {
 	a, ok := parse_arch(s)
+	if ok && a == .Wasm32 {ok = false}
 	if !ok {
 		fmt.eprintfln("%s: no native backend for arch %s; give x64_sysv, x64_win or arm64", who, s)
 	}
@@ -200,6 +204,19 @@ Asm :: struct {
 	// function that makes no RAM access, whose slot nothing changes while
 	// it runs.
 	pin:       string,
+	// The runtime procedures call may name, with their signatures: wasm32
+	// declares each call's type from them (x64 and arm64 do not read them).
+	sigs:      []Sig,
+	sig_index: map[string]int,
+	wa:        Wasm, // wasm32 only
+}
+
+// A runtime procedure's signature: n 32-bit arguments then the context, and
+// a 32-bit result or none.
+Sig :: struct {
+	name:   string,
+	args:   u8,
+	result: bool,
 }
 
 // The out-of-line end of a load that left RAM's fast path at far: a host
@@ -229,6 +246,7 @@ Slow :: struct {
 	zero:   bool,
 	base:   string, // import: the address off counts from, else the state
 	unal:   Unal,
+	state:  string, // wasm32: the state import its B64 and B128 fields are in
 }
 
 // Guest RAM that load and store reach in place, without calling the bus
@@ -320,6 +338,8 @@ cache_sync :: proc(a: ^Asm, store: bool) {
 			x64_cache_sync(a, k, off, store)
 		case .Arm64:
 			a64_cache_sync(a, k, off, store)
+		case .Wasm32:
+			wasm_cache_sync(a, k, off, store)
 		}
 	}
 }
@@ -342,6 +362,10 @@ new_label :: proc(a: ^Asm) -> Label {
 
 bind :: proc(a: ^Asm, l: Label) {
 	assert(a.labels[l] == -1, "native: label bound twice")
+	if a.arch == .Wasm32 {
+		wasm_bind(a, l)
+		return
+	}
 	a.labels[l] = len(a.code)
 }
 
@@ -375,6 +399,7 @@ get32 :: proc(a: ^Asm, at: int) -> u32 {
 // register for the state_* operations. A vec_load or vec_store through
 // import state uses that register too, rather than reading the slot.
 func_begin :: proc(a: ^Asm, state: string) -> int {
+	if a.arch == .Wasm32 {return wasm_func_begin(a, state)}
 	align_code(a)
 	at := len(a.code)
 	a.epilogue = new_label(a)
@@ -384,6 +409,8 @@ func_begin :: proc(a: ^Asm, state: string) -> int {
 		x64_prologue(a, imp(a, state))
 	case .Arm64:
 		a64_prologue(a, imp(a, state))
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 	cache_sync(a, false)
 	return at
@@ -399,6 +426,7 @@ bind_at :: proc(a: ^Asm, l: Label, off: int) {
 // epilogue: its body jumps into the function's code. Returns its offset.
 func_entry :: proc(a: ^Asm, state: string) -> int {
 	assert(state == a.state, "native: an entry with another state")
+	assert(a.arch != .Wasm32, "native: a second entry on wasm32")
 	align_code(a)
 	at := len(a.code)
 	switch a.arch {
@@ -406,6 +434,8 @@ func_entry :: proc(a: ^Asm, state: string) -> int {
 		x64_prologue(a, imp(a, state))
 	case .Arm64:
 		a64_prologue(a, imp(a, state))
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 	cache_sync(a, false)
 	return at
@@ -424,6 +454,10 @@ align_code :: proc(a: ^Asm) {
 }
 
 func_end :: proc(a: ^Asm) {
+	if a.arch == .Wasm32 {
+		wasm_func_end(a)
+		return
+	}
 	bind(a, a.epilogue)
 	cache_sync(a, true)
 	switch a.arch {
@@ -431,6 +465,8 @@ func_end :: proc(a: ^Asm) {
 		x64_epilogue(a)
 	case .Arm64:
 		a64_epilogue(a)
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 	for c in a.cold {
 		bind(a, c.far)
@@ -439,6 +475,8 @@ func_end :: proc(a: ^Asm) {
 			x64_call_label(a, c.slow)
 		case .Arm64:
 			a64_call_label(a, c.slow)
+		case .Wasm32:
+			panic("native: wasm32")
 		}
 		jmp(a, c.done)
 	}
@@ -447,6 +485,10 @@ func_end :: proc(a: ^Asm) {
 
 // Return from the function.
 ret :: proc(a: ^Asm) {
+	if a.arch == .Wasm32 {
+		wasm_ret(a)
+		return
+	}
 	jmp(a, a.epilogue)
 }
 
@@ -458,6 +500,8 @@ state_load :: proc(a: ^Asm, dst: Reg, off: u32) {
 		if k >= 0 {x64_cache_mov(a, dst, k, false)} else {x64_state_load(a, dst, off)}
 	case .Arm64:
 		if k >= 0 {a64_cache_mov(a, dst, k, false)} else {a64_state_load(a, dst, off)}
+	case .Wasm32:
+		if k >= 0 {wasm_cache_mov(a, dst, k, false)} else {wasm_state_load(a, dst, off)}
 	}
 }
 
@@ -468,6 +512,8 @@ state_store :: proc(a: ^Asm, off: u32, src: Reg) {
 		if k >= 0 {x64_cache_mov(a, src, k, true)} else {x64_state_store(a, off, src)}
 	case .Arm64:
 		if k >= 0 {a64_cache_mov(a, src, k, true)} else {a64_state_store(a, off, src)}
+	case .Wasm32:
+		if k >= 0 {wasm_cache_mov(a, src, k, true)} else {wasm_state_store(a, off, src)}
 	}
 }
 
@@ -484,6 +530,13 @@ state_store_imm :: proc(a: ^Asm, off: u32, v: u32) {
 			a64_mov_imm(a, .C, v)
 			a64_state_store(a, off, .C)
 		}
+	case .Wasm32:
+		if k >= 0 {
+			wasm_cache_imm(a, k, v)
+		} else {
+			wasm_mov_imm(a, .C, v)
+			wasm_state_store(a, off, .C)
+		}
 	}
 }
 
@@ -495,6 +548,8 @@ state_add64 :: proc(a: ^Asm, off: u32, v: u32) {
 		x64_state_add64(a, off, v)
 	case .Arm64:
 		a64_state_add64(a, off, v)
+	case .Wasm32:
+		wasm_state_add64(a, off, v)
 	}
 }
 
@@ -504,6 +559,8 @@ mov_imm :: proc(a: ^Asm, dst: Reg, v: u32) {
 		x64_mov_imm(a, dst, v)
 	case .Arm64:
 		a64_mov_imm(a, dst, v)
+	case .Wasm32:
+		wasm_mov_imm(a, dst, v)
 	}
 }
 
@@ -516,6 +573,8 @@ mov :: proc(a: ^Asm, dst, src: Reg) {
 		x64_mov(a, dst, src)
 	case .Arm64:
 		a64_mov(a, dst, src)
+	case .Wasm32:
+		wasm_mov(a, dst, src)
 	}
 }
 
@@ -526,6 +585,8 @@ alu :: proc(a: ^Asm, op: Alu, dst, src: Reg) {
 		x64_alu(a, op, dst, src)
 	case .Arm64:
 		a64_alu(a, op, dst, src)
+	case .Wasm32:
+		wasm_alu(a, op, dst, src)
 	}
 }
 
@@ -536,6 +597,8 @@ alu_imm :: proc(a: ^Asm, op: Alu, dst: Reg, v: u32) {
 		x64_alu_imm(a, op, dst, v)
 	case .Arm64:
 		a64_alu_imm(a, op, dst, v)
+	case .Wasm32:
+		wasm_alu_imm(a, op, dst, v)
 	}
 }
 
@@ -546,6 +609,8 @@ clz :: proc(a: ^Asm, dst: Reg) {
 		x64_clz(a, dst)
 	case .Arm64:
 		a64_clz(a, dst)
+	case .Wasm32:
+		wasm_clz(a, dst)
 	}
 }
 
@@ -556,6 +621,8 @@ not :: proc(a: ^Asm, dst: Reg) {
 		x64_not(a, dst)
 	case .Arm64:
 		a64_not(a, dst)
+	case .Wasm32:
+		wasm_not(a, dst)
 	}
 }
 
@@ -566,6 +633,8 @@ set_cond :: proc(a: ^Asm, c: Cond, dst, src: Reg) {
 		x64_set_cond(a, c, dst, src)
 	case .Arm64:
 		a64_set_cond(a, c, dst, src)
+	case .Wasm32:
+		wasm_set_cond(a, c, dst, src)
 	}
 }
 
@@ -586,6 +655,8 @@ vec_load :: proc(a: ^Asm, dst: Vreg, off: u32, base := "") {
 		x64_vec_ldst(a, dst, off, false, base)
 	case .Arm64:
 		a64_vec_ldst(a, dst, off, false, base)
+	case .Wasm32:
+		wasm_vec_ldst(a, dst, off, false, base)
 	}
 }
 
@@ -598,6 +669,8 @@ vec_store :: proc(a: ^Asm, off: u32, src: Vreg, base := "") {
 		x64_vec_ldst(a, src, off, true, base)
 	case .Arm64:
 		a64_vec_ldst(a, src, off, true, base)
+	case .Wasm32:
+		wasm_vec_ldst(a, src, off, true, base)
 	}
 }
 
@@ -620,6 +693,8 @@ vec_op :: proc(a: ^Asm, op: Vop, dst, src: Vreg) {
 		x64_vec_op(a, op, dst, src)
 	case .Arm64:
 		a64_vec_op(a, op, dst, src)
+	case .Wasm32:
+		wasm_vec_op(a, op, dst, src)
 	}
 }
 
@@ -632,6 +707,8 @@ float_op :: proc(a: ^Asm, op: Vop, dst, src: Reg) {
 		x64_float_op(a, op, dst, src)
 	case .Arm64:
 		a64_float_op(a, op, dst, src)
+	case .Wasm32:
+		wasm_float_op(a, op, dst, src)
 	}
 }
 
@@ -642,6 +719,8 @@ float_sqrt :: proc(a: ^Asm, r: Reg) {
 		x64_float_sqrt(a, r)
 	case .Arm64:
 		a64_float_sqrt(a, r)
+	case .Wasm32:
+		wasm_float_sqrt(a, r)
 	}
 }
 
@@ -652,6 +731,8 @@ int_to_float :: proc(a: ^Asm, r: Reg) {
 		x64_int_to_float(a, r)
 	case .Arm64:
 		a64_int_to_float(a, r)
+	case .Wasm32:
+		wasm_int_to_float(a, r)
 	}
 }
 
@@ -664,6 +745,8 @@ float_to_int :: proc(a: ^Asm, r: Reg) {
 		x64_float_to_int(a, r)
 	case .Arm64:
 		a64_float_to_int(a, r)
+	case .Wasm32:
+		wasm_float_to_int(a, r)
 	}
 }
 
@@ -674,6 +757,8 @@ vec_copy :: proc(a: ^Asm, dst, src: Vreg) {
 		x64_vec_copy(a, dst, src)
 	case .Arm64:
 		a64_vec_copy(a, dst, src)
+	case .Wasm32:
+		wasm_vec_copy(a, dst, src)
 	}
 }
 
@@ -685,6 +770,8 @@ vec_shuf32 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 		x64_vec_shuf32(a, dst, src, lanes)
 	case .Arm64:
 		a64_vec_shuf32(a, dst, src, lanes)
+	case .Wasm32:
+		wasm_vec_shuf32(a, dst, src, lanes)
 	}
 }
 
@@ -697,6 +784,8 @@ vec_shuf16 :: proc(a: ^Asm, dst, src: Vreg, lanes: [4]u8) {
 		x64_vec_shuf16(a, dst, src, lanes)
 	case .Arm64:
 		a64_vec_shuf16(a, dst, src, lanes)
+	case .Wasm32:
+		wasm_vec_shuf16(a, dst, src, lanes)
 	}
 }
 
@@ -708,6 +797,8 @@ vec_splat_load :: proc(a: ^Asm, dst: Vreg, base: string, off: u32) {
 		x64_vec_splat_load(a, dst, base, off)
 	case .Arm64:
 		a64_vec_splat_load(a, dst, base, off)
+	case .Wasm32:
+		wasm_vec_splat_load(a, dst, base, off)
 	}
 }
 
@@ -719,6 +810,8 @@ vec_signs :: proc(a: ^Asm, dst: Reg, v: Vreg) {
 		x64_vec_signs(a, dst, v)
 	case .Arm64:
 		a64_vec_signs(a, dst, v)
+	case .Wasm32:
+		wasm_vec_signs(a, dst, v)
 	}
 }
 
@@ -731,6 +824,8 @@ imp_load :: proc(a: ^Asm, dst: Reg, base: string, off: u32 = 0, w := Width.B32, 
 		x64_imp_ldst(a, dst, base, false, off, w, signed)
 	case .Arm64:
 		a64_imp_ldst(a, dst, base, false, off, w, signed)
+	case .Wasm32:
+		wasm_imp_ldst(a, dst, base, false, off, w, signed)
 	}
 }
 
@@ -742,6 +837,8 @@ imp_store :: proc(a: ^Asm, base: string, src: Reg, off: u32 = 0, w := Width.B32)
 		x64_imp_ldst(a, src, base, true, off, w, false)
 	case .Arm64:
 		a64_imp_ldst(a, src, base, true, off, w, false)
+	case .Wasm32:
+		wasm_imp_ldst(a, src, base, true, off, w, false)
 	}
 }
 
@@ -755,6 +852,8 @@ vec_shift16 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 		x64_vec_shift16(a, op, v, n)
 	case .Arm64:
 		a64_vec_shift16(a, op, v, n)
+	case .Wasm32:
+		wasm_vec_shift16(a, op, v, n)
 	}
 }
 
@@ -768,6 +867,8 @@ vec_shift32 :: proc(a: ^Asm, op: Alu, v: Vreg, n: u32) {
 		x64_vec_shift32(a, op, v, n)
 	case .Arm64:
 		a64_vec_shift32(a, op, v, n)
+	case .Wasm32:
+		wasm_vec_shift32(a, op, v, n)
 	}
 }
 
@@ -784,6 +885,8 @@ vec_funnel8 :: proc(a: ^Asm, dst, lo, hi: u32, buf: string) {
 		x64_vec_funnel8(a, dst, lo, hi, imp(a, buf))
 	case .Arm64:
 		a64_vec_funnel8(a, dst, lo, hi, imp(a, buf))
+	case .Wasm32:
+		wasm_vec_funnel8(a, dst, lo, hi, imp(a, buf))
 	}
 }
 
@@ -795,6 +898,8 @@ vec_ldst_at :: proc(a: ^Asm, v: Vreg, base: string, store: bool) {
 		x64_vec_ldst_at(a, v, base, store)
 	case .Arm64:
 		a64_vec_ldst_at(a, v, imp(a, base), store)
+	case .Wasm32:
+		wasm_vec_ldst_at(a, v, imp(a, base), store)
 	}
 }
 
@@ -807,6 +912,8 @@ mul_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 		x64_mul_wide(a, signed, lo, hi, x, y)
 	case .Arm64:
 		a64_mul_wide(a, signed, lo, hi, x, y)
+	case .Wasm32:
+		wasm_mul_wide(a, signed, lo, hi, x, y)
 	}
 }
 
@@ -820,6 +927,8 @@ mac64 :: proc(a: ^Asm, op: Mac, x, y: Reg) {
 		x64_mac64(a, op, x, y)
 	case .Arm64:
 		a64_mac64(a, op, x, y)
+	case .Wasm32:
+		wasm_mac64(a, op, x, y)
 	}
 }
 
@@ -832,6 +941,8 @@ mac64_split :: proc(a: ^Asm, dst: Reg) {
 		x64_mac64_split(a, dst)
 	case .Arm64:
 		a64_mac64_split(a, dst)
+	case .Wasm32:
+		wasm_mac64_split(a, dst)
 	}
 }
 
@@ -846,6 +957,8 @@ mac64_wrap :: proc(a: ^Asm, n: u32, dst: Reg) {
 		x64_mac64_wrap(a, n, dst)
 	case .Arm64:
 		a64_mac64_wrap(a, n, dst)
+	case .Wasm32:
+		wasm_mac64_wrap(a, n, dst)
 	}
 }
 
@@ -860,6 +973,8 @@ div_wide :: proc(a: ^Asm, signed: bool, lo, hi: u32, x, y: Reg) {
 		x64_div_wide(a, signed, lo, hi, x, y)
 	case .Arm64:
 		a64_div_wide(a, signed, lo, hi, x, y)
+	case .Wasm32:
+		wasm_div_wide(a, signed, lo, hi, x, y)
 	}
 }
 
@@ -906,6 +1021,8 @@ call :: proc(a: ^Asm, name: string, args: ..Reg) {
 		x64_call(a, imp(a, name), args)
 	case .Arm64:
 		a64_call(a, imp(a, name), args)
+	case .Wasm32:
+		wasm_call(a, imp(a, name), args)
 	}
 	cache_sync(a, false)
 }
@@ -920,6 +1037,8 @@ call_func :: proc(a: ^Asm, l: Label) {
 		x64_call_func(a, l)
 	case .Arm64:
 		a64_call_func(a, l)
+	case .Wasm32:
+		wasm_call_func(a, l)
 	}
 	cache_sync(a, false)
 }
@@ -935,12 +1054,18 @@ load :: proc(a: ^Asm, w: Width, signed: bool, slow: string) {
 		return
 	}
 	s := Slow{slow = slow, w = w, signed = signed}
+	if a.arch == .Wasm32 {
+		wasm_load(a, s)
+		return
+	}
 	far, done := new_label(a), new_label(a)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_load(a, s, far)
 	case .Arm64:
 		a64_load(a, s, far)
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 	bind(a, done)
 	append(&a.cold, Cold{far, done, slow_path(a, s)})
@@ -960,12 +1085,18 @@ load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 		return
 	}
 	s := Slow{slow = slow, w = w, off = off, n = n, base = base}
+	if a.arch == .Wasm32 {
+		wasm_load(a, s)
+		return
+	}
 	far, done := new_label(a), new_label(a)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_load(a, s, far)
 	case .Arm64:
 		a64_load(a, s, far)
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 	bind(a, done)
 	append(&a.cold, Cold{far, done, slow_path(a, s)})
@@ -983,7 +1114,12 @@ store :: proc(a: ^Asm, w: Width, slow: string) {
 		return
 	}
 	assert(w <= .B32, "native: store width")
-	call_label(a, slow_path(a, {slow = slow, store = true, w = w}))
+	s := Slow{slow = slow, store = true, w = w}
+	if a.arch == .Wasm32 {
+		wasm_slow_call(a, s)
+		return
+	}
+	call_label(a, slow_path(a, s))
 }
 
 // The value at guest address A, which a B128 caller aligns, = guest
@@ -999,7 +1135,12 @@ store_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, zero := false,
 		call(a, slow, .A, .B)
 		return
 	}
-	call_label(a, slow_path(a, {slow = slow, store = true, w = w, off = off, n = n, zero = zero, base = base}))
+	s := Slow{slow = slow, store = true, w = w, off = off, n = n, zero = zero, base = base}
+	if a.arch == .Wasm32 {
+		wasm_slow_call(a, s)
+		return
+	}
+	call_label(a, slow_path(a, s))
 }
 
 // Guest register n, the 8-byte state field at off, and the word or
@@ -1017,7 +1158,12 @@ unaligned :: proc(a: ^Asm, op: Unal, off, n: u32, slow: string) {
 		call(a, slow, .A, .B)
 		return
 	}
-	call_label(a, slow_path(a, {slow = slow, store = store, w = .B64, off = off, n = n, unal = op}))
+	s := Slow{slow = slow, store = store, w = .B64, off = off, n = n, unal = op}
+	if a.arch == .Wasm32 {
+		wasm_slow_call(a, s)
+		return
+	}
+	call_label(a, slow_path(a, s))
 }
 
 // No RAM access in a function with a pinned import, which holds the RAM
@@ -1048,11 +1194,13 @@ call_label :: proc(a: ^Asm, l: Label) {
 		x64_call_label(a, l)
 	case .Arm64:
 		a64_call_label(a, l)
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 }
 
 // The label of the shared routine s describes, made on first use.
-@(private = "file")
+@(private)
 slow_path :: proc(a: ^Asm, s: Slow) -> Label {
 	for t in a.slow {
 		k := s
@@ -1070,6 +1218,10 @@ slow_path :: proc(a: ^Asm, s: Slow) -> Label {
 // frame of its own around the runtime call.
 @(private = "file")
 emit_slow :: proc(a: ^Asm, s: Slow) {
+	if a.arch == .Wasm32 {
+		wasm_emit_slow(a, s)
+		return
+	}
 	align_code(a)
 	bind(a, s.at)
 	far, guarded := new_label(a), new_label(a)
@@ -1081,6 +1233,8 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 		case .Arm64:
 			a64_unaligned(a, s, far, guarded)
 			a64_return(a)
+		case .Wasm32:
+			panic("native: wasm32")
 		}
 	} else if s.store {
 		switch a.arch {
@@ -1090,6 +1244,8 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 		case .Arm64:
 			a64_store(a, s, far, guarded)
 			a64_return(a)
+		case .Wasm32:
+			panic("native: wasm32")
 		}
 	}
 	bind(a, far)
@@ -1112,6 +1268,8 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 			case .Arm64:
 				a64_load(a, s, next)
 				a64_return(a)
+			case .Wasm32:
+				panic("native: wasm32")
 			}
 		}
 		bind(a, next)
@@ -1129,6 +1287,8 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 		case .Arm64:
 			a64_window(a, s)
 			a64_return(a)
+		case .Wasm32:
+			panic("native: wasm32")
 		}
 	}
 	bind(a, guarded)
@@ -1137,6 +1297,8 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 		x64_slow_frame(a, true)
 	case .Arm64:
 		a64_slow_frame(a, true)
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 	if s.w >= .B64 {
 		mov_imm(a, .B, s.n)
@@ -1153,6 +1315,8 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 	case .Arm64:
 		a64_slow_frame(a, false)
 		a64_return(a)
+	case .Wasm32:
+		panic("native: wasm32")
 	}
 }
 
@@ -1162,6 +1326,8 @@ jmp :: proc(a: ^Asm, l: Label) {
 		x64_jmp(a, l)
 	case .Arm64:
 		a64_jmp(a, l)
+	case .Wasm32:
+		wasm_jmp(a, l)
 	}
 }
 
@@ -1172,6 +1338,8 @@ br_zero :: proc(a: ^Asm, r: Reg, l: Label, nonzero := false) {
 		x64_br_zero(a, r, l, nonzero)
 	case .Arm64:
 		a64_br_zero(a, r, l, nonzero)
+	case .Wasm32:
+		wasm_br_zero(a, r, l, nonzero)
 	}
 }
 
@@ -1182,6 +1350,8 @@ br_cmp_imm :: proc(a: ^Asm, c: Cond, r: Reg, v: u32, l: Label) {
 		x64_br_cmp_imm(a, c, r, v, l)
 	case .Arm64:
 		a64_br_cmp_imm(a, c, r, v, l)
+	case .Wasm32:
+		wasm_br_cmp_imm(a, c, r, v, l)
 	}
 }
 
@@ -1193,6 +1363,8 @@ br_state64_below :: proc(a: ^Asm, off: u32, limit: string, l: Label) {
 		x64_br_state64_below(a, off, imp(a, limit), l)
 	case .Arm64:
 		a64_br_state64_below(a, off, imp(a, limit), l)
+	case .Wasm32:
+		wasm_br_state64_below(a, off, imp(a, limit), l)
 	}
 }
 
@@ -1205,6 +1377,8 @@ br_byte_clear :: proc(a: ^Asm, addr, mask: string, l: Label) {
 		x64_br_byte_clear(a, imp(a, addr), m, l)
 	case .Arm64:
 		a64_br_byte_clear(a, imp(a, addr), m, l)
+	case .Wasm32:
+		wasm_br_byte_clear(a, imp(a, addr), m, l)
 	}
 }
 
@@ -1239,6 +1413,7 @@ search :: proc(a: ^Asm, pcs: []u32, labels: map[u32]Label, miss: Label) {
 // Resolve the jumps, place the import table after the code and return the
 // code; the import slots start at the returned offset.
 finish :: proc(a: ^Asm) -> (code: []u8, imports_at: int) {
+	if a.arch == .Wasm32 {return wasm_finish(a), 0}
 	for s in a.slow {
 		emit_slow(a, s)
 	}

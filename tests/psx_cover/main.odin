@@ -216,6 +216,8 @@ native_calls :: proc(a: ^native.Asm, from, first: int) -> [dynamic]string {
 		case .Arm64:
 			// at is the adrp; blr x16 follows the ldr
 			call = at + 12 <= len(a.code) && (^u32le)(&a.code[at + 8])^ == 0xd63f0200
+		case .Wasm32:
+			panic("psx_cover: no wasm32 code")
 		}
 		if call {append(&calls, a.imports[a.imp_refs[k].target])}
 	}

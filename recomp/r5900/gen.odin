@@ -292,6 +292,7 @@ generate :: proc(o: mips.Options) {
 		}
 		code = new(native.Asm)
 		code^ = native.make_asm(arch, native_ram())
+		code.sigs = EE_SIGS[:]
 	}
 
 	// With coverage, native code for x64 and arm64 both: the one native_out
