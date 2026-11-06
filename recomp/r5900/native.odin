@@ -1528,9 +1528,10 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 // at the block of its pc parameter, that runs until the interpreter has
 // work to do there (a call, a return, a SYSCALL, ERET, due events, a jump
 // out of its blocks) and leaves with the reason (exit). Its entries are
-// the interior ones and each block the runner goes on at (after a call or
-// a SYSCALL), all at the function's offset (its index). nil when lower
-// cannot lower f for it: f is interpreted.
+// the interior ones and every block (lower's exact makes each one a place
+// the runner goes on at), all at the function's offset (its index). A short
+// backward Goto spins (ps2/spin.odin) as on x64. nil when lower cannot
+// lower f for it: f is interpreted.
 native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil) -> []native.Blob_Func {
 	wasm := a.arch == .Wasm32
 	steps := lower(f, cycles, quiet = true, exact = wasm) // emit_func warned
@@ -1613,12 +1614,14 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			}
 			leaves = true
 		case .Goto:
-			if s.check && wasm {
-				native.mov_imm(a, .T, s.target)
-				native.mov_imm(a, .B, 0)
-				events_exit(a, .T)
-			} else if s.check {
-				events(a)
+			if s.check {
+				if wasm {
+					native.mov_imm(a, .T, s.target)
+					native.mov_imm(a, .B, 0)
+					events_exit(a, .T)
+				} else {
+					events(a)
+				}
 				if s.n - s.target < SPIN_SPAN * 4 {spin(a, s.n)}
 			}
 			go(a, f, labels, s.target)

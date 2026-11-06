@@ -6,7 +6,7 @@ package r5900
 import "core:fmt"
 
 Step_Kind :: enum u8 {
-	Case,     // block at `target`; `check`: the previous block falls into it; `n`: 1 where the runner goes on (exact: after a call or a SYSCALL)
+	Case,     // block at `target`; `check`: the previous block falls into it; `n`: 1 where the runner goes on (exact: every block)
 	Op,       // instruction `i` (no control transfer)
 	Cycles,   // charge `n` cycles
 	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead
@@ -40,7 +40,7 @@ Lowering :: struct {
 	// runs, and each place the code can be left and gone on at a block
 	// (lower's exact).
 	exact:     bool,
-	resume:    map[u32]bool, // exact: where the runner goes on after a call or a SYSCALL
+	resume:    map[u32]bool, // exact: a block after each call and SYSCALL, also where no branch targets
 }
 
 // A block starts at pc.
@@ -87,7 +87,10 @@ goto_ :: proc(l: ^Lowering, src, t: u32) {
 // The steps of f, in context.temp_allocator. With exact (wasm32 native
 // code, which leaves the function wherever the interpreter's FLAT runner
 // takes over): cycles per instruction in the interpreter's order, a block
-// after each call and each SYSCALL (where the runner comes back in), a jump
+// after each call and each SYSCALL (where the runner comes back in), every
+// block a place the runner goes on at (n = 1: a label is where a due-events
+// exit leaves and where the interpreter's jumps land, and both go on in
+// native code there only if the block is an entry), a jump
 // out of the function as a Goto, and the address `jr $ra` jumps to read
 // before its delay slot. nil when exact cannot lower f: a SYSCALL, BREAK or
 // ERET in a delay slot.
@@ -121,7 +124,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 		if pc in skip {continue}
 		if is_label(&l, pc) {
 			if l.open_case {flush(&l)}
-			put(&l, {kind = .Case, target = pc, check = l.open_case, n = 1 if pc in l.resume else 0})
+			put(&l, {kind = .Case, target = pc, check = l.open_case, n = 1 if l.exact else 0})
 			l.open_case = true
 		} else if !l.open_case {
 			continue // unreachable except as a delay slot

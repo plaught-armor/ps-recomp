@@ -187,13 +187,15 @@ Want :: struct {
 //   0x1030  nop
 //
 // Each instruction's cycles just before it (a delay slot's inside the
-// slot, a likely one's only when taken), a block with n = 1 after each
-// call and the SYSCALL, and the branches as Gotos.
+// slot, a likely one's only when taken), a block after each call and the
+// SYSCALL, every block with n = 1 (an entry: a due-events exit at the loop
+// head 0x1008 and the interpreter's jumps go on in native code there), and
+// the branches as Gotos.
 @(private = "file")
 exact_steps :: proc() {
 	f := func_of(0x1000, {0x0c000800, 0, 0x0000000c, 0x0100f809, 0, 0x50800005, 0x24420001, 0x14a0fffa, 0, 0x01000008, 0, 0x03e00008, 0})
 	want := [?]Want {
-		{kind = .Case, target = 0x1000},
+		{kind = .Case, target = 0x1000, n = 1},
 		{kind = .Cycles, n = 1},
 		{kind = .Link, n = 31, target = 0x1008},
 		{kind = .Cycles, n = 1},
@@ -219,7 +221,7 @@ exact_steps :: proc() {
 		{kind = .Goto, target = 0x102c, n = 0x1014},
 		{kind = .End},
 		{kind = .End},
-		{kind = .Case, target = 0x101c, check = true},
+		{kind = .Case, target = 0x101c, check = true, n = 1},
 		{kind = .Cycles, n = 1},
 		{kind = .Branch, pc = 0x101c},
 		{kind = .Cycles, n = 1},
@@ -228,14 +230,14 @@ exact_steps :: proc() {
 		{kind = .Goto, target = 0x1008, check = true, n = 0x101c},
 		{kind = .End},
 		{kind = .End},
-		{kind = .Case, target = 0x1024, check = true},
+		{kind = .Case, target = 0x1024, check = true, n = 1},
 		{kind = .Cycles, n = 1},
 		{kind = .Jump_Reg, n = 8},
 		{kind = .Cycles, n = 1},
 		{kind = .Op, pc = 0x1028},
 		{kind = .Goto_Reg, n = 0x1024},
 		{kind = .End},
-		{kind = .Case, target = 0x102c},
+		{kind = .Case, target = 0x102c, n = 1},
 		{kind = .Cycles, n = 1},
 		{kind = .Jump_Reg, n = 31},
 		{kind = .Cycles, n = 1},
