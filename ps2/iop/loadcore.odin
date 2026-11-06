@@ -712,7 +712,9 @@ iop_dispatch_init :: proc() {
 		data: []u8
 		err: virtual.Allocator_Error
 		when ODIN_OS == .WASI {
-			data, err = make([]u8, size)
+			// Host memory, as the mapping is natively: init runs on
+			// the emulated heap.
+			data, err = make([]u8, size, core.long_allocator())
 			assert(err == nil, "iop: dispatch table not allocated")
 		} else {
 			data, err = virtual.reserve_and_commit(size)
