@@ -792,7 +792,8 @@ Compat_Name :: struct {
 // not count); ram_still_since: the vblank from which main RAM was the same at
 // the end, else 0 (also when not checked: no FRAMES, or the run ended before
 // FRAMES/2); fallback: an IOP module's load failed and the HLE stood in for
-// it (an Iop_Fallback row); build: the ps-recomp commit (COMMIT);
+// it (an Iop_Fallback row); build: the ps-recomp commit (COMMIT), with
+// "+mods.<run_mods, 16 hex digits>" after it when the run loaded mods;
 // stretches: the sampled stretches of at least COMPAT_STRETCH vblanks
 // (compat_sample), by first vblank, those still on at the end included,
 // and stretches_other the ones past COMPAT_STRETCHES.
@@ -828,7 +829,7 @@ compat_line :: proc(fatal := "") -> Compat_Line {
 		fatal                = fatal,
 		shown                = compat.shown,
 		lit                  = compat.lit,
-		build                = COMMIT,
+		build                = COMMIT if run_mods == 0 else fmt.tprintf("%s+mods.%016x", COMMIT, run_mods),
 	}
 	if compat.ram_at != 0 && xxhash.XXH3_64_default(compat.ram) == compat.ram_hash {
 		l.ram_still_since = compat.ram_at

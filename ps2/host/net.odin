@@ -10,7 +10,8 @@ import "ps:core"
 // NET_PLAYER (1 or 2), with NET_DELAY frames of input delay (default
 // 2) and a desync check every NET_HASH vblanks (default 60). Testing:
 // NET_DROP=<percent> drops outgoing packets, NET_LAG=<ms> delays them.
-// Both hosts must run the same build from the same boot and memory card.
+// Both hosts must run the same build and mods on the same disc, from the
+// same boot and memory card.
 @(private)
 NET_PLAYERS :: 2
 @(private)
@@ -37,6 +38,8 @@ net_init :: proc() -> bool {
 		hash_every = num("NET_HASH", 60),
 		drop       = num("NET_DROP", 0),
 		lag        = time.Duration(num("NET_LAG", 0)) * time.Millisecond,
+		mods       = core.run_mods,
+		disc       = core.run_disc,
 	}
 	if cfg.bind == "" {cfg.bind = "0.0.0.0:7000"}
 	if !core.net_start(cfg) {return false}

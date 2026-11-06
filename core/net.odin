@@ -32,14 +32,15 @@
 //   u32 magic, u8 version, u8 type, u8 player
 // HELLO (handshake, before the game starts):
 //   u8 players, u8 delay, u8 seen (the peer's HELLO arrived), u8 hash_every,
-//   u64 build
+//   u64 build, u64 mods (run_mods), u64 disc (run_disc)
 // INPUT:
 //   u8 count, u32 frame (sender's), u32 ack (last frame of the receiver's
 //   input the sender holds), u32 first (frame of the first input), u32 time
 //   and u32 echo (ms; for ping), u32 hash frame (max = none), u64 hash,
 //   i16 lead (1/16 frames; the sender's frame minus the receiver's as last
 //   seen, smoothed), count * (u16 buttons, u8 lx ly rx ry)
-// The build id is a hash of the executable: determinism needs the same one.
+// The build id is a hash of the executable: determinism needs the same one,
+// and the same mods on the same disc.
 //
 // The input log is one record per frame with every player's input, so a
 // replay could later be the same log written out.
@@ -52,7 +53,18 @@ import "core:net"
 import "core:os"
 import "core:time"
 
-NET_VERSION :: 2
+NET_VERSION :: 3
+
+// A HELLO's size in bytes (hello_encode).
+HELLO_SIZE :: 35
+
+// The XXH3-64 of the running disc's id (core/disc), 0 when unknown: ps2.boot
+// (from the disc image) and psx.run (from the disc id it is given) set it
+// before the host starts, and netplay peers
+// compare it (Net_Config.disc). The id hashes the volume descriptor,
+// SYSTEM.CNF and the boot executable, not the whole image: two images that
+// differ elsewhere pass, and the peers' memory hashes then tell them apart.
+run_disc: u64
 
 // Two inputs a frame differ in buttons or axes; axes are lx ly rx ry, 0x80
 // centred, as the pad reports them (the game applies its own dead zone).
@@ -71,6 +83,8 @@ Net_Config :: struct {
 	players:    int, // in the session; 2 for now
 	delay:      int, // frames of local input delay, the same on every peer
 	hash_every: int, // frames between desync checks; 0 for none
+	mods:       u64, // the mod set loaded (run_mods), 0 for none
+	disc:       u64, // the disc's id hash (run_disc)
 	drop:       int, // testing: percent of outgoing packets dropped
 	lag:        time.Duration, // testing: added one-way latency
 }
@@ -234,27 +248,16 @@ net_start :: proc(cfg: Net_Config) -> (ok: bool) {
 			if rerr != nil || size == 0 {break}
 			if from != n.peer {continue}
 			d := buf[:size]
+			if msg := version_mismatch(d); msg != "" {
+				fmt.eprintln("net: peer refused:", msg)
+				return false
+			}
 			player, kind, valid := header(d)
 			if !valid {continue}
 			switch kind {
 			case HELLO:
-				if len(d) < 19 {continue}
-				players, delay, every := int(d[7]), int(d[8]), int(d[10])
-				build := get_u64(d[11:])
-				msg := ""
-				switch {
-				case build != n.build:
-					msg = "a different build"
-				case players != cfg.players:
-					msg = "a different player count"
-				case delay != cfg.delay:
-					msg = "a different input delay"
-				case every != cfg.hash_every:
-					msg = "a different hash interval"
-				case player == cfg.player || player >= cfg.players:
-					msg = "the same player slot"
-				}
-				if msg != "" {
+				if len(d) < HELLO_SIZE {continue}
+				if msg := hello_mismatch(d, cfg, n.build); msg != "" {
 					fmt.eprintln("net: peer refused:", msg)
 					return false
 				}
@@ -513,7 +516,7 @@ send_input :: proc() {
 	first := n.peer_ack + 1
 	count := clamp(n.upto[me] - n.peer_ack, 0, SEND_MAX)
 	buf: [INPUT_HEAD + SEND_MAX * 6]u8
-	put_header(buf[:], INPUT)
+	put_header(buf[:], INPUT, me)
 	buf[7] = u8(count)
 	put_u32(buf[8:], u32(n.live))
 	put_u32(buf[12:], u32(n.upto[n.peer_player]))
@@ -540,14 +543,54 @@ send_input :: proc() {
 @(private = "file")
 send_hello :: proc(seen: bool) {
 	n := &net_state
-	buf: [19]u8
-	put_header(buf[:], HELLO)
-	buf[7] = u8(n.cfg.players)
-	buf[8] = u8(n.cfg.delay)
-	buf[9] = u8(seen)
-	buf[10] = u8(n.cfg.hash_every)
-	put_u64(buf[11:], n.build)
+	buf := hello_encode(n.cfg, n.build, seen)
 	send(buf[:])
+}
+
+// The HELLO a peer with cfg and build sends; seen says the other's arrived.
+hello_encode :: proc(cfg: Net_Config, build: u64, seen: bool) -> (buf: [HELLO_SIZE]u8) {
+	put_header(buf[:], HELLO, cfg.player)
+	buf[7] = u8(cfg.players)
+	buf[8] = u8(cfg.delay)
+	buf[9] = u8(seen)
+	buf[10] = u8(cfg.hash_every)
+	put_u64(buf[11:], build)
+	put_u64(buf[19:], cfg.mods)
+	put_u64(buf[27:], cfg.disc)
+	return
+}
+
+// Why a peer's HELLO d (HELLO_SIZE bytes, its header checked) cannot join a
+// session with this host's cfg and build; "" when it can. The one place the
+// two peers are compared.
+hello_mismatch :: proc(d: []u8, cfg: Net_Config, build: u64) -> string {
+	player := int(d[6])
+	switch {
+	case get_u64(d[11:]) != build:
+		return "a different build"
+	case get_u64(d[19:]) != cfg.mods:
+		return "a different mod set"
+	case get_u64(d[27:]) != cfg.disc:
+		return "a different disc"
+	case int(d[7]) != cfg.players:
+		return "a different player count"
+	case int(d[8]) != cfg.delay:
+		return "a different input delay"
+	case int(d[10]) != cfg.hash_every:
+		return "a different hash interval"
+	case player >= cfg.players:
+		return "a player slot past the player count"
+	case player == cfg.player:
+		return "the same player slot"
+	}
+	return ""
+}
+
+// Why the peer's packet d cannot be read by this build: it is of another
+// protocol version; "" when it is of this one or not a packet of ours.
+version_mismatch :: proc(d: []u8) -> string {
+	if len(d) < 5 || get_u32(d) != MAGIC || d[4] == NET_VERSION {return ""}
+	return fmt.tprintf("protocol v%d, this build v%d", d[4], NET_VERSION)
 }
 
 // Send now, or after cfg.lag, unless cfg.drop loses it.
@@ -643,11 +686,11 @@ header :: proc(d: []u8) -> (player, kind: int, ok: bool) {
 }
 
 @(private = "file")
-put_header :: proc(d: []u8, kind: u8) {
+put_header :: proc(d: []u8, kind: u8, player: int) {
 	put_u32(d, MAGIC)
 	d[4] = NET_VERSION
 	d[5] = kind
-	d[6] = u8(net_state.cfg.player)
+	d[6] = u8(player)
 }
 
 @(private = "file")

@@ -29,6 +29,8 @@
 //   branches write a heartbeat to COMPAT_PROGRESS; two deaf probes
 //   in a row are a stuck stretch, one is not, and a probe a button moved
 //   more than core.COMPAT_DEAF_BYTES for ends it.
+// - mods (in process): a run with mods has "+mods.<set>" after the commit in
+//   its build column.
 package main
 
 import "core:encoding/json"
@@ -121,6 +123,10 @@ main :: proc() {
 		}
 	}
 	test_stretches()
+	// A run with mods says so in its build column.
+	core.run_mods = 0x0123456789abcdef
+	check("mods", core.compat_line().build == core.COMMIT + "+mods.0123456789abcdef", "build column")
+	core.run_mods = 0
 	if failed > 0 {
 		os.exit(1)
 	}

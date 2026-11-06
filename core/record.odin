@@ -6,6 +6,9 @@
 // A record has one entry per line, keyed by frame:
 //
 //   V 1                       format version, the first line
+//   X <hash>                  the run's mod set (run_mods, 16 hex digits),
+//                             the second line, only when mods were loaded;
+//                             a replay must load the same set
 //   I <frame> <hex>[ <p>]     buttons held on player p (1-4, default 1) from
 //                             that frame on, as the bits of core.Buttons
 //   S <frame> <lx> <ly> <rx> <ry>[ <p>]
@@ -67,6 +70,9 @@ record_open :: proc(path: string) -> bool {
 	}
 	record.out = f
 	record_write(fmt.tprintf("V %d\n", RECORD_VERSION))
+	if run_mods != 0 {
+		record_write(fmt.tprintf("X %016x\n", run_mods))
+	}
 	return record.out != nil
 }
 
@@ -167,6 +173,23 @@ replay_load :: proc(path: string, extra: Replay_Extra = nil) -> bool {
 			}
 			continue
 		}
+		if n == 2 {
+			recorded: u64
+			x := len(f) == 2 && f[0] == "X"
+			if x {
+				// Exactly the 16 hex digits record_open writes.
+				ok := len(f[1]) == 16 && strings.trim_left(f[1], "0123456789abcdefABCDEF") == ""
+				if ok {recorded, ok = strconv.parse_u64(f[1], 16)}
+				if !ok {
+					fmt.eprintf("replay: %s:%d: bad entry %q\n", path, n, line)
+					return false
+				}
+			}
+			replay_mods_match(path, recorded) or_return
+			if x {
+				continue
+			}
+		}
 		if len(f) == 0 {
 			continue
 		}
@@ -198,8 +221,28 @@ replay_load :: proc(path: string, extra: Replay_Extra = nil) -> bool {
 		fmt.eprintf("replay: %s: empty\n", path)
 		return false
 	}
+	if n == 1 {
+		replay_mods_match(path, 0) or_return
+	}
 	fmt.eprintf("replay: %d button and %d stick changes from %s\n", presses, moves, path)
 	return true
+}
+
+// Whether a record made with mod set recorded (0 for none) replays on this
+// run's (run_mods); says why not.
+@(private = "file")
+replay_mods_match :: proc(path: string, recorded: u64) -> bool {
+	switch {
+	case recorded == run_mods:
+		return true
+	case run_mods == 0:
+		fmt.eprintf("replay: %s: recorded with mod set %016x, this run has no mods\n", path, recorded)
+	case recorded == 0:
+		fmt.eprintf("replay: %s: recorded without mods, this run has mod set %016x\n", path, run_mods)
+	case:
+		fmt.eprintf("replay: %s: recorded with mod set %016x, this run has mod set %016x\n", path, recorded, run_mods)
+	}
+	return false
 }
 
 // The player field of an entry with `want` fields before it: 1-4, default 1.

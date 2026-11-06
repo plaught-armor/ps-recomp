@@ -3,6 +3,7 @@
 package psx
 
 import "core:fmt"
+import "core:hash/xxhash"
 
 import "ps:core"
 import "ps:core/disc"
@@ -78,6 +79,10 @@ run :: proc(b: Boot) -> bool {
 	}
 	cpu.trace_init() or_return
 	if b.setup != nil {b.setup() or_return}
+	// The input record opened here carries the mod set (core/record.odin).
+	// Netplay peers compare it (core/net.odin HELLO).
+	if b.disc_id != "" {core.run_disc = xxhash.XXH3_64_default(transmute([]u8)b.disc_id)}
+	mods := mods_identify(b.mods, b.disc_id) or_return
 	host.platform_init(b.title) or_return
 
 	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
@@ -120,7 +125,7 @@ run :: proc(b: Boot) -> bool {
 	if b.hooks != nil {b.hooks() or_return}
 	cpu.watch_code()
 	// After every other hook, so a mod wraps the port's.
-	mods_load(b.mods, b.disc_id, b.mods_native, b.mods_native_failed) or_return
+	mods_load(mods, b.mods_native, b.mods_native_failed) or_return
 
 	io.events_init()
 	spu.spu_init()

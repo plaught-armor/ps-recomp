@@ -112,11 +112,14 @@ mod_thunks_fill :: proc($LO, $HI: int) {
 	}
 }
 
-// The mods in dir (core.mods_read), read for the EE's mod region, and the
-// hash of the set they hook (core.mod_hooks_hash).
+// The mods in dir (core.mods_read), read for the EE's mod region and noted
+// as this run's set (core.mods_note), and the hash of the set they hook
+// (core.mod_hooks_hash). ps2.boot calls it before host.platform_init opens
+// the input record, which carries the set.
 mods_read :: proc(dir, disc: string) -> (set: core.Mod_Set, hash: u64, err: string) {
 	set, err = core.mods_read(dir, disc, mem.MOD_BASE, mem.MOD_BASE + mem.MOD_REGION)
 	if err != "" {return}
+	core.mods_note(set, "ps2")
 	return set, core.mod_hooks_hash(set.hooks), ""
 }
 

@@ -169,7 +169,8 @@ too, naming the overlay. `Exec` or `LoadExec` inside a hook is fatal.
 An install error leaves nothing installed.
 
 On PS1, `play` loads the mods in the disc's data directory, `mods/`
-(`psx.mods_load`, after the port's `hooks`): every subdirectory with a
+(`psx.mods_identify` reads them once, `psx.mods_load` installs that set
+after the port's `hooks`): every subdirectory with a
 `mod.tsv` is a mod, its code in `mod.elf` beside it. An optional
 `mods/mods.tsv` lists mod ids, one a line, in the order the user wants
 them; dependencies and `before`/`after` still come first. A manifest's
@@ -252,6 +253,20 @@ Limits:
   snapshots land.
 - IOP hooks are untested.
 
+A run's mods are part of what it ran. `psx.mods_identify` and
+`ps2.mods_read` note the set (`core.mods_note`: `core.run_mods`, the
+`mod_set_hash` the mods blob is keyed by) before the input record opens,
+and print `psx: mod set <hash> (<n> mods)` (`ps2:` on the PS2).
+With mods loaded, the compat line's build column is the commit with
+`+mods.<hash>` after it, and an input record's second line is
+`X <hash>`. A replay refuses a record made with another set, with mods
+on a run without, and without mods on a run with them. A netplay HELLO
+(version 3) carries the set and a hash of the disc id (`core.run_disc`,
+which `ps2.boot` and `psx.run` set, ports included); a peer with a
+different one is refused, and so is a peer of another protocol version,
+before any other field is read. Snapshots, `PS_DUMP_HASH` and blob keys do not
+carry the set.
+
 ## Settings and memory cards
 
 Build with `-define:ENV_PREFIX=GAME_` so settings read `GAME_*`. PS1 cards
@@ -280,7 +295,7 @@ commit of the player that wrote the export, then `sh setup.sh`. The
 learned code the player compiled for the disc is used only while the
 submodule is at that commit; at another, the port interprets what it
 did not recompile. The generated `port/src/rec` is ignored by git, so a
-fresh clone runs `setup.sh` again. The scripts need a POSIX shell and have
+fresh clone runs `setup.sh` again. Mods are not exported. The scripts need a POSIX shell and have
 only been run on Linux; Windows and macOS are untested.
 
 ### Memory for the build

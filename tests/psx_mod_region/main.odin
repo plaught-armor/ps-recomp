@@ -6,7 +6,7 @@
 //   - mod_elf_read rejects a file that is not an ELF, a segment outside the
 //     region, a hook of an unknown kind and a hook whose function is not in
 //     the image; two mods' overlapping images are an error naming both.
-//   - psx.mods_load reads mods/<id>/mod.tsv and mod.elf, puts the image in
+//   - psx.mods_identify and psx.mods_load read mods/<id>/mod.tsv and mod.elf, puts the image in
 //     the region and installs its before hook on a game function in RAM.
 //     The hook, interpreted from the region, counts its calls in its own
 //     .bss and sees the region's stack; the game's result is kept and RAM
@@ -147,7 +147,8 @@ load :: proc(tmp: string, code: []u32) -> bool {
 	one, _ := filepath.join({mods, "counter"})
 	write(one, "mod.tsv", transmute([]u8)string("id\tcounter\nversion\t1.0.0\napi\t1\ndisc\tTEST-00001\n"))
 	write(one, "mod.elf", elf_make(mod_segs(code), hook_words(HOOK)))
-	return psx.mods_load(mods, "TEST-00001.0123456789abcdef")
+	set, read := psx.mods_identify(mods, "TEST-00001.0123456789abcdef")
+	return read && psx.mods_load(set)
 }
 
 // The child: a hook overflows the mod stack, which is fatal.
@@ -180,7 +181,10 @@ main :: proc() {
 	// No mods.
 	check(cpu.mod_ram == nil, "mod_ram with no mods")
 	check(cpu.lw(HOOK) == 0, "region read with no mods")
-	check(psx.mods_load("", "") && psx.mods_load("/nonexistent/mods", ""), "no mods dir loads")
+	for dir in ([2]string{"", "/nonexistent/mods"}) {
+		set, read := psx.mods_identify(dir, "")
+		check(read && len(set.mods) == 0 && psx.mods_load(set), "no mods dir loads")
+	}
 	check(cpu.mod_ram == nil, "mod_ram after loading no mods")
 
 	// ELF errors.
@@ -215,6 +219,31 @@ main :: proc() {
 	core.learn_cpu(.Psx, &cpu.state.cycles, cpu.CYCLES_PER_INSN, proc(a: u32) -> u32 {return cpu.lw(a)}, cpu.RAM_SIZE, true)
 
 	check(load(tmp, HOOK_CODE[:]), "mods_load")
+	// The run's mod set, noted before the input record opens, is the
+	// record's second line.
+	{
+		mods, _ := filepath.join({tmp, "mods"}, context.temp_allocator)
+		set, _ := psx.mods_read(mods, "")
+		want := core.mod_set_hash(set)
+		core.mod_set_delete(set)
+		noted, read := psx.mods_identify(mods, "")
+		check(read && core.run_mods == want && want != 0, "mods_identify sets run_mods")
+		check(core.mod_set_hash(noted) == want, "mods_identify returns the set it noted")
+		core.mod_set_delete(noted)
+		rec, _ := filepath.join({tmp, "input.rec"}, context.temp_allocator)
+		check(core.record_open(rec), "record_open")
+		core.record_close()
+		data, _ := os.read_entire_file(rec, context.temp_allocator)
+		check(string(data) == fmt.tprintf("V 1\nX %016x\n", want), fmt.tprintf("record with mods: %q", string(data)))
+		_, none := psx.mods_identify("", "")
+		check(none && core.run_mods == 0, "mods_identify with no mods")
+		// psx.run opens the record (and loads a replay) in platform_init.
+		boot := #load("../../psx/boot.odin", string)
+		at, opened := strings.index(boot, "mods_identify(b.mods"), strings.index(boot, "host.platform_init(")
+		check(at >= 0 && opened > at, "psx.run notes the mod set before platform_init")
+		disc_at := strings.index(boot, "core.run_disc = xxhash.XXH3_64_default(transmute([]u8)b.disc_id)")
+		check(disc_at >= 0 && opened > disc_at, "psx.run notes the disc id hash before platform_init")
+	}
 	if cpu.mod_ram == nil {
 		fmt.eprintln("FAIL psx_mod_region: no region loaded")
 		os.exit(1)

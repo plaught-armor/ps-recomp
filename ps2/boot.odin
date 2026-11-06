@@ -6,8 +6,10 @@
 package ps2
 
 import "core:fmt"
+import "core:hash/xxhash"
 
 import "ps:core"
+import "ps:core/disc"
 import cpu "cpu"
 import host "host"
 import iop "iop"
@@ -75,6 +77,14 @@ vblank_chain :: proc() {
 // returns.
 boot :: proc(b: Boot) -> bool {
 	iop.disc_image_open(b.disc) or_return
+	// Netplay peers compare the disc's id (core.run_disc), which host.platform_init
+	// sends.
+	if d, opened := disc.open(b.disc); opened {
+		if id, ok := disc.id(&d, context.temp_allocator); ok {
+			core.run_disc = xxhash.XXH3_64_default(transmute([]u8)id)
+		}
+		disc.close(&d)
+	}
 	name, argv0, found := iop.disc_boot()
 	if !found {
 		fmt.eprintln("disc: no PS2 executable named in SYSTEM.CNF")

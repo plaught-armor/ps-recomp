@@ -211,7 +211,8 @@ child :: proc(dir, blob, patch: string) {
 	for at in ([2]u32{GAME, GAME2}) {
 		for w, k in GAME_CODE {(^u32le)(&cpu.ram[(at & 0x1fffff) + u32(k) * 4])^ = u32le(w)}
 	}
-	ok := psx.mods_load(dir, "TEST-00001.0123456789abcdef", blob == "-" ? "" : blob, proc() {
+	set, read := psx.mods_identify(dir, "TEST-00001.0123456789abcdef")
+	ok := read && psx.mods_load(set, blob == "-" ? "" : blob, proc() {
 		fmt.eprintln("child: blob failed")
 	})
 	if !ok || cpu.mod_ram == nil {

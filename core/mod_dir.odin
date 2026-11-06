@@ -95,6 +95,21 @@ mods_read :: proc(dir, disc: string, lo, hi: u32) -> (set: Mod_Set, err: string)
 	return set, ""
 }
 
+// The mod_set_hash of the mods this run loads, 0 for none. The console
+// sets it before its input record opens: record_open writes it and
+// replay_load checks it, and the compat line's build column and a netplay
+// HELLO carry it, so runs with different mods are never taken for the same.
+run_mods: u64
+
+// Note set as this run's mods (run_mods, 0 for none) and, when it has any,
+// say which set it is, as who ("psx", "ps2").
+mods_note :: proc(set: Mod_Set, who: string) {
+	run_mods = 0
+	if len(set.mods) == 0 {return}
+	run_mods = mod_set_hash(set)
+	fmt.eprintfln("%s: mod set %016x (%d mods)", who, run_mods, len(set.mods))
+}
+
 // The mod set's hash: XXH3-64 over MOD_API, then for each mod in load
 // order its id, mod.tsv and mod.elf, each length-prefixed. The mods blob's
 // key names it, so any edit, an added or removed mod, or another order

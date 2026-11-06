@@ -310,8 +310,14 @@ test_refusals :: proc() {
 		check(strings.contains(err, b.said), fmt.tprintf("refused %q, want %q", err, b.said))
 		check(!cpu.mod_on && mem.mod_ram == nil, fmt.tprintf("installed after %q", err))
 	}
+	core.run_mods = 1
 	_, h, _ := ps2.mods_read("", "")
 	check(h == 0 && ps2.mods_check(0) == "", "no mods: no check")
+	check(core.run_mods == 0, "no mods: no run set")
+	// The run's set is noted before the input record opens (ps2.boot).
+	boot := #load("../../ps2/boot.odin", string)
+	at, opened := strings.index(boot, "mods_read(b.mods"), strings.index(boot, "host.platform_init(")
+	check(at >= 0 && opened > at, "ps2.boot reads the mods before host.platform_init")
 	check(strings.contains(ps2.mods_check(1), "the recomp option mod_hooks"), "hash mismatch refused")
 }
 
