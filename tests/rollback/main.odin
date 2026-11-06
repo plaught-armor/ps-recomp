@@ -4,7 +4,8 @@
 // at the top of the emulated heap and freed after a commit must come back
 // whole at a rewind to that commit, with the allocator's block headers: a
 // save state taken at a commit and one taken after a rewind to it must be
-// the same bytes. Pure: no files, no SDL.
+// the same bytes. So must a block made in pages no scan has read yet, over
+// the bytes of one made and freed there first. Pure: no files, no SDL.
 package main
 
 import "core:fmt"
@@ -15,6 +16,8 @@ HEAP :: 2 << 20
 // Takes a whole half of the heap. Made first, it is the top half (a split
 // hands out its upper half), and stays the heap's last block.
 BIG :: 600 << 10
+// Below the big block and the small one, in pages no scan has found state in.
+MID :: 200 << 10
 
 frame: int
 ram: []u8
@@ -41,8 +44,8 @@ main :: proc() {
 	core.snap_add(&frame)
 	ram = core.snap_area(4 * 4096)
 	context.allocator = core.emu_allocator()
-	s0, s1, got: core.Snapshot
-	s0.id, s1.id, got.id = 0, 1, 2
+	s0, s1, s2, got: core.Snapshot
+	s0.id, s1.id, s2.id, got.id = 0, 1, 3, 2
 
 	op(.Commit)
 	op(.Save, &s0)
@@ -85,7 +88,37 @@ main :: proc() {
 		}
 	}
 
+	// A block made and written in pages no scan has read, then freed: its
+	// bytes stay there in free space. One made in its place before the
+	// commit is first found by that commit's scan, and its contents must
+	// come back at a rewind to it.
+	frame = 4
+	tmp := make([]u8, MID)
+	for &b in tmp {b = 0x77}
+	delete(tmp)
+	mid := make([]u8, MID)
+	if uintptr(raw_data(mid)) >= uintptr(raw_data(low)) {
+		fmt.eprintln("FAIL the mid block is not below the small one")
+		os.exit(1)
+	}
+	for &b, i in mid {b = u8(i * 7)}
+	op(.Commit)
+	op(.Save, &s2)
+
+	frame = 5
+	for &b in mid {b = 0xee}
+	op(.Commit)
 	op(.Rewind, back = 2)
+	op(.Save, &got)
+	check("rewind to a block made in pages no scan had read", &s2, &got)
+	for b, i in mid {
+		if b != u8(i * 7) {
+			fmt.eprintln("FAIL the mid block's contents at", i)
+			os.exit(1)
+		}
+	}
+
+	op(.Rewind, back = 3)
 	op(.Save, &got)
 	check("rewind to before the allocations", &s0, &got)
 }

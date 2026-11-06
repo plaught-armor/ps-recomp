@@ -6,11 +6,11 @@
 // this way, guest stores, DMA and host code alike.
 //
 // A scan reads the memory and its shadow whole, except the emulated heap,
-// which is read only up to heap_top: above the highest block the heap has
-// held at any scan, there is only free space, whose bytes no state holds (a
-// snapshot keeps only the header of a free block, and the default allocation
-// paths zero what they hand out; a non-zeroed one, alloc_non_zeroed and the
-// like, hands out whatever free space last held).
+// of which it reads only the pages in heap_seen: elsewhere there is only
+// free space, whose bytes no state holds (a snapshot keeps only the header of
+// a free block, and the default allocation paths zero what they hand out; a
+// non-zeroed one, alloc_non_zeroed and the like, hands out whatever free
+// space last held).
 package core
 
 import "core:mem"
@@ -18,15 +18,25 @@ import "core:mem"
 @(private)
 RB_NEED :: "rollback: cannot start"
 
-// Offset in emu_heap_mem below which the heap is scanned. It only grows: a
-// block freed after a commit must still be scanned at the rewind, which
-// puts back its header and contents. Free space above it is not put back
-// at a rewind (page protection does put it back): a block made and freed
-// there between two commits leaves its bytes, which a later non-zeroed
-// allocation would carry into a save state. With the heap's first block
-// taking its top half, heap_top is the whole heap from the first scan.
+// The pages of emu_heap_mem a scan reads, one bit each: every page that
+// has held a block header or part of a block in use at any scan. A bit is
+// never cleared: a block freed after a commit must still be scanned at the
+// rewind, which puts back its header and contents.
+//
+// A page gets its bit at the first scan that finds state in it. Its shadow
+// was last copied at rb_start, so it can differ from the page as of the last
+// commit: a block made and freed there between two commits leaves its bytes.
+// That page held no state at the last commit (no scan had found any), so
+// the stale shadow bytes are only free space bytes, both in the undo log the
+// commit takes and in what a rewind puts back. Free space outside the bits
+// is not put back at a rewind (page protection does put it back), so a later
+// non-zeroed allocation could carry those bytes into a save state.
+//
+// The buddy allocator hands out the upper half at each split, so the heap
+// fills from its top down, with holes, and the scan skips every page no
+// block has reached.
 @(private = "file")
-heap_top: int
+heap_seen: []u64
 
 // Start tracking: copy the large memory to the shadows.
 @(private)
@@ -34,6 +44,7 @@ rb_start :: proc() -> bool {
 	mems := make([dynamic][]u8, context.temp_allocator)
 	append(&mems, ..snap_areas[:])
 	append(&mems, emu_heap_mem)
+	heap_seen = make([]u64, (len(emu_heap_mem) / PAGE + 63) / 64, long_allocator())
 	for m in mems {
 		a := Rb_Area{m, snap_map(len(m))}
 		copy(a.shadow, a.mem)
@@ -48,26 +59,36 @@ rb_start :: proc() -> bool {
 // is listed again at the next scan.
 @(private)
 rb_scan :: proc(a: Rb_Area, f: proc(a: Rb_Area, off: int, data: rawptr), data: rawptr) {
-	end := len(a.mem)
-	if raw_data(a.mem) == raw_data(emu_heap_mem) {
-		heap_top = max(heap_top, heap_end())
-		end = heap_top
+	if raw_data(a.mem) != raw_data(emu_heap_mem) {
+		for off := 0; off < len(a.mem); off += PAGE {
+			if !page_same(a.mem[off:][:PAGE], a.shadow[off:][:PAGE]) {f(a, off, data)}
+		}
+		return
 	}
-	for off := 0; off < end; off += PAGE {
-		if !page_same(a.mem[off:][:PAGE], a.shadow[off:][:PAGE]) {f(a, off, data)}
+	heap_mark()
+	for w, i in heap_seen {
+		if w == 0 {continue}
+		for j in 0 ..< uint(64) {
+			if w & (1 << j) == 0 {continue}
+			off := (i * 64 + int(j)) * PAGE
+			if !page_same(a.mem[off:][:PAGE], a.shadow[off:][:PAGE]) {f(a, off, data)}
+		}
 	}
 }
 
-// The end of the heap's last block if it is in use, or of its header if it
-// is free, rounded up to a page: the heap holds nothing above it.
+// Set the heap_seen bits of the pages holding a block header, or part of a
+// block in use, now.
 @(private = "file")
-heap_end :: proc() -> int {
+heap_mark :: proc() {
 	h := &emu_heap
-	last := h.head
-	for b := h.head; b < h.tail; b = mem.buddy_block_next(b) {last = b}
-	n := int(uintptr(last) - uintptr(raw_data(emu_heap_mem)))
-	n += last.is_free ? size_of(mem.Buddy_Block) : int(last.size)
-	return mem.align_forward_int(n, PAGE)
+	base := uintptr(raw_data(emu_heap_mem))
+	for b := h.head; b < h.tail; b = mem.buddy_block_next(b) {
+		o := int(uintptr(b) - base)
+		n := b.is_free ? size_of(mem.Buddy_Block) : int(b.size)
+		for p := o / PAGE; p < (o + n + PAGE - 1) / PAGE; p += 1 {
+			heap_seen[p / 64] |= 1 << uint(p % 64)
+		}
+	}
 }
 
 @(private = "file")
