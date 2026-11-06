@@ -7,6 +7,7 @@ odin run tests/core -collection:ps=.
 odin run tests/native -collection:ps=.
 odin run tests/blob_arch -collection:ps=.
 odin run tests/ee_native -collection:ps=.
+odin run tests/wasm_sigs -collection:ps=.
 odin run tests/ee_spin -collection:ps=.
 odin run tests/fpu -collection:ps=.
 odin run tests/lower -collection:ps=.
@@ -81,6 +82,7 @@ here.
 | `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading, the mod set in input records and replays, netplay HELLO checks, a full emulated heap ending the process (a child run) |
 | `native` | The machine-code emitter |
 | `ee_native` | EE instructions through the native backend against the interpreter |
+| `wasm_sigs` | Every runtime procedure native code imports (`ps2.native_imports`) has a signature in `r5900.EE_SIGS`, the signatures wasm32 code calls them with, each agrees with its procedure (Odin convention, argument count, a result or none, every argument and result fits one i32), and no signature lacks an import |
 | `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store, an INTC_STAT poll and two threads at one priority handing the EE back and forth with RotateThreadReadyQueue are skipped, and end the same when the other thread rotates at two sites in turn; a counter, a GIF_STAT poll and a timer poll are not |
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |

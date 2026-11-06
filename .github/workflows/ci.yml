@@ -28,7 +28,7 @@ jobs:
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
             echo "== $t play"
             odin check play -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/blob_arch tests/psx_cover tests/ee_native tests/ee_spin tests/fpu tests/lower tests/discover tests/vu tests/gs tests/gs_tex tests/gs_pixel tests/gs_hw tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/iop_learned tests/ee_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_iop tests/iop_thread_grow tests/ps2_interp tests/ee_syscall_handler tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/mod tests/psx_mod tests/psx_mod_region tests/psx_mod_native tests/ps2_mod tests/ps2_mod_elf tests/mod_api tests/read_dir tests/psx_interp tests/compat tests/learn tests/play; do
+            for p in tests/core tests/native tests/blob_arch tests/psx_cover tests/ee_native tests/wasm_sigs tests/ee_spin tests/fpu tests/lower tests/discover tests/vu tests/gs tests/gs_tex tests/gs_pixel tests/gs_hw tests/vu_macro tests/vu_micro tests/vu_native tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/iop_learned tests/ee_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/ps2_kernel tests/ps2_iop tests/iop_thread_grow tests/ps2_interp tests/ee_syscall_handler tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/mod tests/psx_mod tests/psx_mod_region tests/psx_mod_native tests/ps2_mod tests/ps2_mod_elf tests/mod_api tests/read_dir tests/psx_interp tests/compat tests/learn tests/play; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -79,6 +79,7 @@ jobs:
           odin run tests/native -collection:ps=. -out:native_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/blob_arch -collection:ps=. -out:blob_arch_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_native -collection:ps=. -out:ee_native_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/wasm_sigs -collection:ps=. -out:wasm_sigs_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_spin -collection:ps=. -out:ee_spin_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/fpu -collection:ps=. -out:fpu_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/lower -collection:ps=. -out:lower_test${{ runner.os == 'Windows' && '.exe' || '' }}
