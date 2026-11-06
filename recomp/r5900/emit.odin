@@ -26,6 +26,7 @@ Emitter :: struct {
 	sb:     strings.Builder,
 	refs:   ^mips.Set, // code addresses the program takes
 	pkg_of: ^map[u32]int, // function entry -> package index
+	hooked: ^mips.Set, // function entries a mod hooks: called through the table
 	pkg:    int,
 	cycles: int, // EE cycles charged per instruction (the EE runs at 294.912 MHz)
 	quiet:  bool, // no per-function warnings
@@ -655,7 +656,8 @@ emit_func :: proc(e: ^Emitter, f: ^Func) {
 }
 
 call_stmt :: proc(e: ^Emitter, t: u32) -> string {
-	if pkg, ok := e.pkg_of[t]; ok && pkg == e.pkg {
+	hooked := e.hooked != nil && t in e.hooked^
+	if pkg, ok := e.pkg_of[t]; ok && pkg == e.pkg && !hooked {
 		return fmt.tprintf("f_%08x()", t)
 	}
 	return fmt.tprintf("cpu.call(%s)", hexu(t))

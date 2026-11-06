@@ -55,6 +55,8 @@ slow_addr :: proc(a: u32) -> rawptr {
 	case 0x0, 0x2, 0x3, 0x8, 0xa:
 		p := a & 0x0fffffff
 		if p < RAM_SIZE {#no_bounds_check return &ram[p]}
+		// The mod region (mod_ram.odin); empty with no mods.
+		if p - MOD_BASE < u32(len(mod_ram)) {#no_bounds_check return &mod_ram[p - MOD_BASE]}
 	case 0x7:
 		// The test keeps the index in range, so it is not checked again.
 		if a - SPR_BASE < SPR_SIZE {#no_bounds_check return &spr[a - SPR_BASE]}
@@ -90,7 +92,7 @@ store :: #force_inline proc(a: u32, v: $T) #no_bounds_check {
 		intrinsics.unaligned_store((^T)(&ram[a]), v)
 		return
 	}
-	if p := slow_addr(a); p != nil {
+	if p := slow_store_addr(a, size_of(T)); p != nil {
 		intrinsics.unaligned_store((^T)(p), v)
 		return
 	}
@@ -122,7 +124,7 @@ wr128 :: proc(addr: u32, v: u128) #no_bounds_check {
 		(^u128)(&ram[a])^ = v
 		return
 	}
-	if p := slow_addr(a); p != nil {
+	if p := slow_store_addr(a, 16); p != nil {
 		intrinsics.unaligned_store((^u128)(p), v)
 		return
 	}
@@ -153,7 +155,7 @@ ram_slice :: proc(a: u32, n: u32, loc := #caller_location) -> []u8 {
 	if a >> 28 == 7 {
 		return spr[a - SPR_BASE:][:n]
 	}
-	if p + n > RAM_SIZE {cpu.fatal("ram_slice %08x+%x out of range (%v)", a, n, loc)}
+	if p + n > RAM_SIZE {cpu.fatal("ram_slice %08x+%x out of range%s (%v)", a, n, mod_region_note(a), loc)}
 	return ram[p:][:n]
 }
 

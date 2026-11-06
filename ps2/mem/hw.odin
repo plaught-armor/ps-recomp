@@ -56,7 +56,9 @@ dma_reg :: #force_inline proc(ch, off: u32) -> ^u32 #no_bounds_check {
 }
 
 // DMA addresses with bit 31 set refer to scratchpad.
+// One in the mod region is fatal (mod_ram.odin).
 dma_addr :: #force_inline proc(a: u32) -> u32 {
+	if mod_ram != nil && a & 0x80000000 == 0 {mod_dma_check(a)}
 	return a & 0x80000000 != 0 ? SPR_BASE | (a & (SPR_SIZE - 1)) : a & 0x0fffffff
 }
 

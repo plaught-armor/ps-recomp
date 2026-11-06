@@ -118,6 +118,24 @@ mod_set_hash :: proc(set: Mod_Set) -> u64 {
 	return xxhash.XXH3_64_digest(&state)
 }
 
+// The hooked set's hash: XXH3-64 over the sorted unique addresses the hooks
+// name, as u32 little endian; 0 for none. Recompiled EE code built for a
+// hooked set (recomp option mod_hooks) carries the same hash
+// (recomp/mips/mod_hooks.odin: tests/mod pins both), and the runtime
+// refuses code built for another set.
+mod_hooks_hash :: proc(hooks: []Mod_Hook) -> u64 {
+	addrs := make([]u32, len(hooks), context.temp_allocator)
+	for h, k in hooks {addrs[k] = h.key.addr}
+	slice.sort(addrs)
+	n := len(slice.unique(addrs))
+	if n == 0 {return 0}
+	b := make([]u8, 4 * n, context.temp_allocator)
+	for a, k in addrs[:n] {
+		for i in 0 ..< 4 {b[4 * k + i] = u8(a >> (8 * uint(i)))}
+	}
+	return xxhash.XXH3_64_default(b)
+}
+
 // Free what mods_read gave set in the default allocator (its manifests),
 // for a set not loaded.
 mod_set_delete :: proc(set: Mod_Set) {

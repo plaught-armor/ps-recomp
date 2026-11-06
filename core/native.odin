@@ -76,38 +76,46 @@ code_size :: proc(n: int) -> int {
 	return (n + 0xffff) &~ 0xffff
 }
 
+// The blob's header words and import slot names (temp allocated, into
+// blob), and the offset past them; err when it is no blob of this version
+// and arch.
+native_slots :: proc(blob: []u8) -> (h: [NATIVE_HEADER / 4]u32, slots: []string, at: int, err: string) {
+	for &v in h {
+		if at + 4 > len(blob) {return h, nil, 0, "short header"}
+		v = u32(blob[at]) | u32(blob[at + 1]) << 8 | u32(blob[at + 2]) << 16 | u32(blob[at + 3]) << 24
+		at += 4
+	}
+	if h[0] != NATIVE_MAGIC || h[1] != NATIVE_VERSION {
+		return h, nil, 0, "not a native code file of this version"
+	}
+	if h[2] != NATIVE_ARCH {
+		return h, nil, 0, fmt.tprintf("built for arch %d, this host runs %d", h[2], NATIVE_ARCH)
+	}
+	slots = make([]string, h[3], context.temp_allocator)
+	for &name in slots {
+		if at + 2 > len(blob) {return h, nil, 0, "short import table"}
+		n := int(blob[at]) | int(blob[at + 1]) << 8
+		at += 2
+		if at + n > len(blob) {return h, nil, 0, "short import table"}
+		name = string(blob[at:at + n])
+		at += n
+	}
+	return h, slots, at, ""
+}
+
 // Map the blob's code; `imports` gives each slot's value (an address or a
 // constant). The tables are allocated with context.allocator.
 native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, err: string) {
-	at := 0
 	word :: proc(blob: []u8, at: ^int) -> (u32, bool) {
 		if at^ + 4 > len(blob) {return 0, false}
 		b := blob[at^:]
 		at^ += 4
 		return u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24, true
 	}
-	h: [NATIVE_HEADER / 4]u32
-	for &v in h {
-		ok: bool
-		if v, ok = word(blob, &at); !ok {return {}, "short header"}
-	}
-	magic, version, arch, n_imports, n_funcs, n_ovls := h[0], h[1], h[2], h[3], h[4], h[5]
+	h, slots, at, serr := native_slots(blob)
+	if serr != "" {return {}, serr}
+	n_imports, n_funcs, n_ovls := h[3], h[4], h[5]
 	n_spans, n_ranges, n_pool, size, imports_at := h[6], h[7], h[8], h[9], h[10]
-	if magic != NATIVE_MAGIC || version != NATIVE_VERSION {
-		return {}, "not a native code file of this version"
-	}
-	if arch != NATIVE_ARCH {
-		return {}, fmt.tprintf("built for arch %d, this host runs %d", arch, NATIVE_ARCH)
-	}
-	slots := make([]string, n_imports, context.temp_allocator)
-	for &name in slots {
-		if at + 2 > len(blob) {return {}, "short import table"}
-		n := int(blob[at]) | int(blob[at + 1]) << 8
-		at += 2
-		if at + n > len(blob) {return {}, "short import table"}
-		name = string(blob[at:at + n])
-		at += n
-	}
 	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_spans) * 20 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
 		return {}, "bad table sizes"
 	}

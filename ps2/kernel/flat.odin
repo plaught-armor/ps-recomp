@@ -87,9 +87,15 @@ flat_ctx :: #force_inline proc() -> ^Flat_Ctx {
 	return &flat.ee[k.current.id]
 }
 
+// Called with the return addresses a run drops when it starts over (a
+// thread's end and restart, an exec), never returned through: ps2's mods
+// free the continuations their marks name. nil with no mods. Host state.
+flat_drop: proc(ret: []u32)
+
 // Start thread t's run at entry, empty.
 flat_start :: proc(t: ^Thread, entry: u32, end: Flat_End) {
 	x := &flat.ee[t.id]
+	if flat_drop != nil {flat_drop(x.ret[:x.depth])}
 	x.pc = entry
 	x.depth = 0
 	x.enter = true

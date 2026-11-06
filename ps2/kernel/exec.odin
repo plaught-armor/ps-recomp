@@ -39,6 +39,13 @@ Exec_State :: struct {
 	text_ok:   bool,
 	// An exec found other code over the range: the table is off.
 	text_off:  bool,
+	// The program in RAM, as mod keys name it (ps2/mod.odin): the low word
+	// of the XXH3-64 of its ELF file. ExecPS2 starts code already in memory,
+	// with no file to name it: the boot program (boot_prog) when the
+	// recompiled range holds its bytes, else 0, unknown (so with no range,
+	// always 0).
+	prog:      u32,
+	boot_prog: u32,
 	// The coroutine the program ran on before an exec, freed by reap.
 	dead_co:   ^core.Coroutine,
 }
@@ -63,6 +70,17 @@ text_hash :: proc() -> u64 {
 	return xxhash.XXH3_64_default(mem.ram[cpu.text_lo:cpu.text_hi])
 }
 
+// The boot program, whose ELF file is elf, is the one in RAM.
+exec_boot_program :: proc(elf: []u8) {
+	k.exec.boot_prog = elf_id(elf)
+	k.exec.prog = k.exec.boot_prog
+}
+
+@(private = "file")
+elf_id :: proc(elf: []u8) -> u32 {
+	return u32(xxhash.XXH3_64_default(elf))
+}
+
 // The boot program's arguments: argc 1, argv[0] the BOOT2 value as
 // SYSTEM.CNF writes it (System_Cnf.argv: "cdrom0:\SLUS_123.45;1", device,
 // backslash, case and `;1` kept), which the ROM's loader passes on as for
@@ -75,11 +93,11 @@ exec_boot_args :: proc(argv0: string) {
 
 // The table on when the recompiled range holds the boot program's bytes,
 // else off: the second program's code, whatever of the first it keeps, runs
-// interpreted. Said each time it turns.
+// interpreted. Said each time it turns. same: the range holds them.
 @(private = "file")
-text_check :: proc(entry: u32) {
+text_check :: proc(entry: u32) -> (same: bool) {
 	e := &k.exec
-	same := e.text_ok && text_hash() == e.text_hash
+	same = e.text_ok && text_hash() == e.text_hash
 	if same != e.text_off {return}
 	e.text_off = !same
 	cpu.dispatch_set(same)
@@ -88,6 +106,7 @@ text_check :: proc(entry: u32) {
 	} else {
 		fmt.eprintfln("ee: exec %08x: text %08x-%08x differs from the recompiled program; interpreting", entry, cpu.text_lo, cpu.text_hi)
 	}
+	return
 }
 
 // Start the argument list over.
@@ -141,6 +160,9 @@ args_write :: proc(args: u32) {
 @(private = "file")
 exec_reset :: proc(what: string) {
 	if cpu.in_interrupt {cpu.fatal("%s from an interrupt handler", what)}
+	if cpu.mod_depth > 0 {cpu.fatal("mod: %s in a mod's before or after hook", what)}
+	// The new program runs inside no replacement.
+	cpu.mod_inner, cpu.mod_inners = nil, {}
 	reap()
 	cur := k.current
 	cur.wakeups = 0
@@ -168,11 +190,14 @@ exec_reset :: proc(what: string) {
 
 // The current thread runs entry on a new coroutine; the one it ran on, with
 // the old program's host frames, is freed once off it (reap). Under FLAT,
-// the thread's run starts over at entry, and this returns.
+// the thread's run starts over at entry, and this returns. file is the id
+// of the new program's ELF file (elf_id), nil when it has none (ExecPS2).
 @(private = "file")
-exec_switch :: proc(entry: u32) {
+exec_switch :: proc(entry: u32, file: Maybe(u32)) {
 	t := k.current
-	text_check(entry)
+	same := text_check(entry)
+	id, named := file.?
+	k.exec.prog = named ? id : same ? k.exec.boot_prog : 0
 	t.entry = entry
 	cpu.state.r[2].d[0] = cpu.sx32(entry)
 	when core.FLAT {
@@ -197,7 +222,7 @@ exec_ps2 :: proc(entry, argc, argv: u32) {
 	args_clear()
 	args_guest(argc, argv, "ExecPS2")
 	exec_reset("ExecPS2")
-	exec_switch(entry)
+	exec_switch(entry, nil)
 }
 
 // _LoadExecPS2(filename, argc, argv): the ELF from the disc (only), with
@@ -221,8 +246,9 @@ load_exec :: proc(filename, argc, argv: u32) {
 	user := mem.ram[LOAD_EXEC_CLEAR:]
 	intrinsics.mem_zero(raw_data(user), len(user))
 	entry, loaded := mem.load_elf(data)
+	prog := elf_id(data)
 	delete(data, core.host_allocator)
 	if !loaded {cpu.fatal("LoadExecPS2: %s is not a loadable ELF (the console would boot its browser)", name)}
 	fmt.eprintfln("kernel: LoadExecPS2 %s, entry %08x", name, entry)
-	exec_switch(entry)
+	exec_switch(entry, prog)
 }

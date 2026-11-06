@@ -53,9 +53,19 @@ delay_slot :: proc(pc: u32, lf: ^core.Learn_Frame) {
 // Continue at t from the instruction at pc: a registered function there
 // takes over as a tail call (true: the caller returns), else the loop goes
 // on at t, checking events on a backward jump as recompiled code does.
+// With mods, a jump to a hooked function's entry runs its chain as a tail
+// call, unless it is the entry of the run's own function: a loop, no call.
 @(private = "file")
-goto_pc :: proc(pc, t: u32) -> bool {
-	if fn := cpu.lookup(t); fn != nil {
+goto_pc :: proc(entry, pc, t: u32) -> bool {
+	hooked := false
+	if cpu.mod_on {
+		site: int
+		if site, hooked = mod_hooked(t); hooked && t != entry {
+			mod_enter(site)
+			return true
+		}
+	}
+	if fn := hooked ? nil : cpu.lookup(t); fn != nil {
 		fn()
 		return true
 	}
@@ -141,12 +151,12 @@ interp_body :: proc(entry: u32, lf: ^core.Learn_Frame) {
 				cpu.call(i.target)
 				pc = ret
 			} else {
-				if goto_pc(pc, i.target) {return}
+				if goto_pc(entry, pc, i.target) {return}
 				pc = i.target
 			}
 		case .Jump:
 			delay_slot(pc + 4, lf)
-			if goto_pc(pc, i.target) {return}
+			if goto_pc(entry, pc, i.target) {return}
 			pc = i.target
 		case .Call:
 			c.r[31].d[0] = u64(ret)
@@ -164,7 +174,7 @@ interp_body :: proc(entry: u32, lf: ^core.Learn_Frame) {
 			delay_slot(pc + 4, lf)
 			if i.rs == 31 {return}
 			if c.cycles >= cpu.next_event {kernel.run_events()}
-			if goto_pc(pc, t) {return}
+			if goto_pc(entry, pc, t) {return}
 			pc = t
 		}
 	}

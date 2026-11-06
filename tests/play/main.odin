@@ -826,21 +826,21 @@ test_vu_captures :: proc() {
 	endian.put_u32(b[4:], .Little, core.NATIVE_VERSION)
 	endian.put_u32(b[8:], .Little, core.NATIVE_ARCH)
 	store :: proc(dir: string, b: []u8) -> bool {
-		set, _ := play.native_captures(dir)
+		set, _, _ := play.native_captures(dir, true)
 		return core.blob_store(dir, b, core.COMMIT, .Native, set)
 	}
 	// cached: with the capture file holding data, whether the blob is still
 	// the one to run, and the set naming it.
 	cached :: proc(cap: string, dir: string, data: []u8) -> (bool, string) {
 		_ = os.write_entire_file(cap, data)
-		set, _ := play.native_captures(dir)
-		return play.native_cached(dir), set
+		set, _, _ := play.native_captures(dir, true)
+		return play.native_cached(dir, true), set
 	}
-	if !store(dir, b[:]) || !play.native_cached(dir) {
+	if !store(dir, b[:]) || !play.native_cached(dir, true) {
 		check(name, false, "cannot store the blob")
 		return
 	}
-	set, caps := play.native_captures(dir)
+	set, caps, _ := play.native_captures(dir, true)
 	check(name, set == "" && caps == [2]string{}, fmt.tprintf("captures with no files: %q %v", set, caps))
 	ok, _ := cached(cap, dir, nil)
 	check(name, ok, "an empty capture changed the key")
@@ -849,7 +849,7 @@ test_vu_captures :: proc() {
 	one := vu1_capture()
 	ok, set = cached(cap, dir, one)
 	check(name, !ok, "a capture with an entry kept a blob without it")
-	_, caps = play.native_captures(dir)
+	_, caps, _ = play.native_captures(dir, true)
 	check(name, strings.has_prefix(set, "vu0 - vu1 ") && len(set) == 26 && caps == [2]string{"", cap}, fmt.tprintf("captures: %q %v", set, caps))
 	store(dir, b[:])
 	twice := slice.concatenate([][]u8{one, one}, context.temp_allocator)
@@ -871,7 +871,7 @@ test_vu_captures :: proc() {
 	errs := run(name, path) or_else ""
 	check(name, strings.contains(errs, "converting") && strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("first run:\n%s", errs))
 	key, _ := os.read_entire_file(core.disc_path(dir, .Native_Key, context.temp_allocator), context.temp_allocator)
-	set, _ = play.native_captures(dir)
+	set, _, _ = play.native_captures(dir, true)
 	check(name, strings.has_suffix(string(key), fmt.tprintf(" %s\n", set)), fmt.tprintf("key %q for set %q", key, set))
 	errs = run(name, path) or_else ""
 	check(name, !strings.contains(errs, "converting") && strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("second run:\n%s", errs))

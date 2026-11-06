@@ -13,6 +13,7 @@ import "base:intrinsics"
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:strings"
 
 import "ps:core"
 import cpu "cpu"
@@ -338,11 +339,37 @@ native_imports :: proc(types: ^map[string]typeid = nil) -> map[string]u64 {
 	return m
 }
 
+// The import slot naming the hooked set with hash h a blob was built for
+// (recomp/r5900/gen.odin); a blob built for none has no such slot.
+@(private = "file")
+native_hooked_slot :: proc(h: u64) -> string {
+	return fmt.tprintf("mod_hooks:%016x", h)
+}
+
+// Why blob, built for the hooked set its slot names, cannot run with mods
+// hooking the set with hash want, or "". A header native_load would refuse
+// is left to it.
+@(private = "file")
+native_hooked_check :: proc(blob: []u8, want: u64) -> string {
+	_, slots, _, err := core.native_slots(blob)
+	if err != "" {return ""}
+	have := ""
+	for s in slots {
+		if strings.has_prefix(s, "mod_hooks:") {have = s}
+	}
+	if have == (want != 0 ? native_hooked_slot(want) : "") {return ""}
+	built := have != "" ? fmt.tprintf("hooked set %s", have[len("mod_hooks:"):]) : "no hooked set"
+	mods := want != 0 ? fmt.tprintf("hooked set %016x", want) : "none"
+	return fmt.tprintf("built for %s, the mods hook %s: convert or build it again for this mod set (the recomp option mod_hooks)", built, mods)
+}
+
 // Replace the registered functions with the native code in the file at
 // path, or with no call table yet, register the blob's functions alone.
 // False, with the reason printed, when it cannot be used; the Odin
-// functions then stay.
-load_native :: proc(path: string) -> bool {
+// functions then stay. hooked is the hash of the hooked set of the mods
+// to load (core.mod_hooks_hash, 0 none): the blob must have been built for
+// it (the recomp option mod_hooks; its import slot mod_hooks:<hash>).
+load_native :: proc(path: string, hooked: u64 = 0) -> bool {
 	if core.env("NATIVE") == "0" {
 		if cpu.text_hi == 0 {fmt.eprintln("native: NATIVE=0, and there are no recompiled functions to keep")}
 		return false
@@ -358,7 +385,13 @@ load_native :: proc(path: string) -> bool {
 		return false
 	}
 	defer delete(blob)
-	code, msg := core.native_load(blob, native_imports())
+	if e := native_hooked_check(blob, hooked); e != "" {
+		fmt.eprintfln("native: %s: %s", path, e)
+		return false
+	}
+	imports := native_imports()
+	if hooked != 0 {imports[native_hooked_slot(hooked)] = 0}
+	code, msg := core.native_load(blob, imports)
 	if msg != "" {
 		fmt.eprintfln("native: %s: %s", path, msg)
 		return false

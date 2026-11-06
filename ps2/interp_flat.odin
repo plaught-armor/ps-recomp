@@ -67,6 +67,8 @@ flat_loop :: proc() {
 			} else if i.link {
 				flat_enter(x, ret, i.target)
 				x, pc = flat_reload()
+			} else if flat_mod_tail(x, i.target) {
+				x, pc = flat_reload()
 			} else if flat_goto(x, pc, i.target) {
 				x, pc = flat_reload()
 			} else {
@@ -74,7 +76,9 @@ flat_loop :: proc() {
 			}
 		case .Jump:
 			delay_slot(pc + 4, nil)
-			if flat_goto(x, pc, i.target) {
+			if flat_mod_tail(x, i.target) {
+				x, pc = flat_reload()
+			} else if flat_goto(x, pc, i.target) {
 				x, pc = flat_reload()
 			} else {
 				pc = i.target
@@ -100,13 +104,17 @@ flat_loop :: proc() {
 			}
 			// interp_body's two checks: the events check of every such
 			// `jr`, then goto_pc's of a backward one. A switch at the first
-			// leaves the second to the thread's resume (x.back).
+			// leaves the second to the thread's resume (x.back). A tail call
+			// into a hooked function owes its entry instead (x.enter).
 			x.pc = t
+			tail := flat_mod_tail(x, t)
 			if c.cycles >= cpu.next_event {
-				x.back = t <= pc
+				x.back = t <= pc && !tail
 				kernel.flat_sync()
 				kernel.run_events()
 				kernel.flat_commit()
+				x, pc = flat_reload()
+			} else if tail {
 				x, pc = flat_reload()
 			} else {
 				pc = t
@@ -125,6 +133,7 @@ flat_reload :: proc() -> (^kernel.Flat_Ctx, u32) {
 		check := false
 		if x.enter {
 			x.enter = false
+			if cpu.mod_on {mod_flat_enter(x)}
 			interp_enter(x.pc)
 			check = true
 		} else if x.back {
@@ -149,6 +158,17 @@ flat_enter :: #force_inline proc(x: ^kernel.Flat_Ctx, ret, t: u32) {
 	kernel.flat_push(x, ret, t)
 }
 
+// A jump from x to t that goto_pc takes as a tail call into a hooked
+// function's chain (mod_flat_tail): the run goes on at t, whose entry is
+// owed (flat_reload).
+@(private = "file")
+flat_mod_tail :: #force_inline proc(x: ^kernel.Flat_Ctx, t: u32) -> bool {
+	if !cpu.mod_on || !mod_flat_tail(x, t) {return false}
+	cpu.spin_dirty |= cpu.SPIN_SIDE
+	x.pc, x.enter = t, true
+	return true
+}
+
 // interp_body's goto_pc with nothing registered: a backward jump from pc to
 // t checks events. True when it ran them; the run goes on at x.pc.
 @(private = "file")
@@ -164,12 +184,18 @@ flat_goto :: #force_inline proc(x: ^kernel.Flat_Ctx, pc, t: u32) -> bool {
 // `jr $ra` (jr, with ra the address it jumps to) or ERET ends the
 // innermost call: go on at the address its call pushed (x.pc), as
 // interp_body's return to its caller does. At depth 0 it ends the run:
-// false for a nested run, which returns to the host.
+// false for a nested run, which returns to the host. A return address
+// marked by a hooked call (FLAT_MOD_MARK) runs its after hooks first
+// (mod_flat_return), and may end the run.
 @(private = "file")
 flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 	if x.depth > 0 {
 		x.depth -= 1
 		ret := x.ret[x.depth]
+		for ret & FLAT_MOD_MARK != 0 {
+			again: bool
+			if ret, again = mod_flat_return(ret); again {return flat_end(x)}
+		}
 		x.pc = ret &~ kernel.FLAT_HOST_TAIL
 		if jr && ret & kernel.FLAT_HOST_TAIL == 0 {
 			cpu.flat_returns += 1
@@ -177,6 +203,12 @@ flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 		}
 		return true
 	}
+	return flat_end(x)
+}
+
+// The end of run x, at depth 0: false for a nested run.
+@(private = "file")
+flat_end :: proc(x: ^kernel.Flat_Ctx) -> bool {
 	switch x.end {
 	case .Call:
 		return false

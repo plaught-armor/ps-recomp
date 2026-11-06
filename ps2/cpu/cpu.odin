@@ -175,6 +175,37 @@ jump_unknown :: proc(fn, pc: u32) {
 	fatal("function %08x: jump to %08x which is not a label", fn, pc)
 }
 
+// ---------------------------------------------------------------- mods
+
+// EE mod hooks (ps2/mod.odin) keep here what the kernel and recompiled
+// code see. Host state, not in snapshots.
+//
+// mod_on: mods are loaded. mod_depth: before and after hooks now running,
+// nested; while it is above 0, run_events handles nothing and sets
+// mod_held instead, and a thread switch or a program switch is fatal.
+mod_on: bool
+mod_depth: int
+mod_held: bool
+
+// The hooked set (recomp option mod_hooks) the registered recompiled code
+// was built for: its register procedure sets it, 0 for none. Loaded mods
+// must hook exactly that set (ps2 mods_check).
+mod_hooks_hash: u64
+
+// The replacements running in the recursive model, innermost first, on the
+// host stack: what mod_call_original calls. depth is mod_depth when it was
+// called. site -1 is a marker: code inside it is not inside the
+// replacement below (an original, an interrupt handler). Each thread has
+// its own (mod_inners by thread id, swapped by the kernel's thread switch);
+// an exec starts with none. Unused under FLAT, whose runs keep the chain as
+// data (ps2/mod.odin).
+Mod_Inner :: struct {
+	site, depth: int,
+	prev:        ^Mod_Inner,
+}
+mod_inner: ^Mod_Inner
+mod_inners: [256]^Mod_Inner
+
 bad_insn :: proc(pc, w: u32) {
 	fatal("invalid instruction %08x at %08x", w, pc)
 }

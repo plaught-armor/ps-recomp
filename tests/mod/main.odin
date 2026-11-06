@@ -3,13 +3,16 @@
 // before/after hints and otherwise the user's order; a missing or too old
 // dependency, a cycle, two mods with one id and a wrong api are load
 // errors; hook chains run befores in load order, afters in reverse, and two
-// replacements of one function are an error naming both mods.
+// replacements of one function are an error naming both mods. The hooked
+// set's hash is the same in the runtime (core) and the recompiler
+// (recomp/mips), and pinned: code built for a set names it by that value.
 package main
 
 import "core:fmt"
 import "core:os"
 import "core:strings"
 import "ps:core"
+import "ps:recomp/mips"
 
 @(private = "file")
 failed: int
@@ -177,10 +180,34 @@ test_chains :: proc() {
 	core.mod_chains_delete(none)
 }
 
+test_hooks_hash :: proc() {
+	// Unsorted, one address hooked twice (before and after).
+	addrs := []u32{0x00123450, 0x00100008, 0x00200000, 0x00100008}
+	kinds := []core.Mod_Hook_Kind{.Replace, .Before, .Before, .After}
+	hooks := make([]core.Mod_Hook, len(addrs), context.temp_allocator)
+	for a, k in addrs {hooks[k] = {key = {addr = a}, kind = kinds[k], fn = 0x0e000000 + u32(k) * 16}}
+	h := core.mod_hooks_hash(hooks)
+	r := mips.mod_hooks_hash(slice_clone(addrs))
+	PIN :: u64(0xecf4a697e3630576)
+	check(h == r, fmt.tprintf("core %016x, recomp %016x", h, r))
+	check(h == PIN, fmt.tprintf("hash %016x, pinned %016x", h, PIN))
+	check(core.mod_hooks_hash(nil) == 0 && mips.mod_hooks_hash(nil) == 0, "no hooks hash 0")
+	one := []u32{0x00100008}
+	check(core.mod_hooks_hash(hooks[1:2]) == mips.mod_hooks_hash(one) && mips.mod_hooks_hash(one) != h, "one address")
+}
+
+@(private = "file")
+slice_clone :: proc(a: []u32) -> []u32 {
+	b := make([]u32, len(a), context.temp_allocator)
+	copy(b, a)
+	return b
+}
+
 main :: proc() {
 	test_manifest()
 	test_order()
 	test_chains()
+	test_hooks_hash()
 	free_all(context.temp_allocator)
 	if failed != 0 {os.exit(1)}
 	fmt.println("ok mod")

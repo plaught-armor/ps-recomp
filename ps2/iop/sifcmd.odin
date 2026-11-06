@@ -80,7 +80,7 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		e, i := src & 0x0fffffff, dest & 0x1fffffff
 		if src & 0x10000000 != 0 || e >= mem.RAM_SIZE || size > mem.RAM_SIZE - e || i >= IOP_RAM_SIZE || size > IOP_RAM_SIZE - i {
 			core.compat_unknown(.Iop_Other_Data, src, sub = size, pc = r[31])
-			fmt.eprintfln("iop: GetOtherData of %x bytes from EE %08x to IOP %08x out of range", size, src, dest)
+			fmt.eprintfln("iop: GetOtherData of %x bytes from EE %08x to IOP %08x out of range%s", size, src, dest, mem.mod_region_note(src))
 			return 0, true
 		}
 		copy(iop_mem(i, size), mem.ram[e:][:size])

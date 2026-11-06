@@ -6,6 +6,7 @@ import "core:strings"
 import "core:thread"
 import "core:time"
 import "ps:core"
+import "ps:ps2"
 import "ps:psx"
 import "ps:recomp/mips"
 import "ps:recomp/native"
@@ -13,18 +14,20 @@ import "ps:recomp/r3000"
 import "ps:recomp/r5900"
 import "ps:recomp/vu"
 
-// The converter child (`play --convert <disc image> <out> <vu0> <vu1>`):
-// the executable SYSTEM.CNF names, compiled to a native blob for this host
-// at out. vu0 and vu1 are a PS2 disc's VU capture files (native_captures),
-// "" for none; with either, the blob holds the VU microprograms too, the
-// captured ones and those of .vutext. A failure exits with status 1 after
-// a message (mips.fail), which is why it runs in a child.
+// The converter child (`play --convert <disc image> <out> <vu0> <vu1>
+// [<hooks>]`): the executable SYSTEM.CNF names, compiled to a native blob
+// for this host at out. vu0 and vu1 are a PS2 disc's VU capture files
+// (native_captures), "" for none; with either, the blob holds the VU
+// microprograms too, the captured ones and those of .vutext. hooks is the
+// file of the EE functions its mods hook (the recomp option mod_hooks),
+// "" or absent for none. A failure exits with status 1 after a message
+// (mips.fail), which is why it runs in a child.
 //
-// vu_only (`play --convert-vu`, the same arguments, then the run's pid)
-// compiles a PS2 disc's VU microprograms alone, VU1 code computing status
-// whatever its programs read, for a run to load beside the code it runs
-// (midload.odin).
-convert :: proc(image, out, vu0, vu1: string, vu_only := false) -> int {
+// vu_only (`play --convert-vu`, the same arguments but hooks, then the
+// run's pid) compiles a PS2 disc's VU microprograms alone, VU1 code
+// computing status whatever its programs read, for a run to load beside
+// the code it runs (midload.odin).
+convert :: proc(image, out, vu0, vu1: string, hooks := "", vu_only := false) -> int {
 	if _, ok := native.arch_of("convert", mips.HOST_ARCH); !ok {
 		return 1
 	}
@@ -39,6 +42,7 @@ convert :: proc(image, out, vu0, vu1: string, vu_only := false) -> int {
 		o.values["vu_only"] = "true"
 		o.values["vu_status"] = "all"
 	}
+	if hooks != "" {o.values["mod_hooks"] = hooks}
 	b := mips.option(o, "backend")
 	if vu_only {
 		if b != "r5900" {mips.fail("%s: a %s disc has no VU microprograms", image, b)}
@@ -127,23 +131,46 @@ compile_mods :: proc(dir, out: string) -> int {
 }
 
 // Convert the disc image in a child of this executable and store the blob
-// in the disc directory dir, its key naming the VU captures it was compiled
-// with (native_captures). The child's output goes to stderr as it comes,
+// in the disc directory dir, its key naming the VU captures and the hooked
+// set it was compiled with (native_captures). The child's output goes to
+// stderr as it comes,
 // on a terminal as one line rewritten in place. False, after a message
 // naming the child's last line, when there is no blob. A child still
 // running after deadline (0: none) is stopped (child_blob).
-convert_store :: proc(image, dir: string, deadline: time.Duration) -> bool {
-	set, caps := native_captures(dir)
+// A conversion the recompiler refuses (a hooked address inside a function,
+// not at its entry) stores no blob: each start converts again, says why and
+// interprets, until the mods change.
+convert_store :: proc(image, dir: string, ps2_disc: bool, deadline: time.Duration) -> bool {
+	// One read of the mods: the key's hooked set and the file's are the same.
+	set, caps, text := native_captures(dir, ps2_disc)
 	tmp := strings.concatenate({core.disc_path(dir, .Native, context.temp_allocator), ".convert"}, context.temp_allocator)
-	blob := child_blob({"--convert", image, tmp, caps[0], caps[1]}, tmp, "native code", "conversion", deadline) or_return
+	// The hooked set's file, for the child's recomp option mod_hooks: written
+	// whole beside it, then renamed, so the child never reads part of one.
+	hooks := strings.concatenate({tmp, ".hooks"}, context.temp_allocator)
+	args := [6]string{"--convert", image, tmp, caps[0], caps[1], hooks}
+	n := 5
+	if text != "" {
+		part := strings.concatenate({hooks, ".part"}, context.temp_allocator)
+		err := os.write_entire_file(part, transmute([]u8)text)
+		if err == nil {err = os.rename(part, hooks)}
+		if err != nil {
+			os.remove(part)
+			fmt.eprintln("play: cannot write", hooks, err)
+			return false
+		}
+		n = 6
+	}
+	defer if n == 6 {os.remove(hooks)}
+	blob := child_blob(args[:n], tmp, "native code", "conversion", deadline) or_return
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, .Native, set)
 }
 
 // Whether the disc directory dir holds a native blob this build can run,
-// compiled with the VU captures dir holds now (native_captures).
-native_cached :: proc(dir: string) -> bool {
-	set, _ := native_captures(dir)
+// compiled with the VU captures and the hooked set dir holds now
+// (native_captures).
+native_cached :: proc(dir: string, ps2_disc: bool) -> bool {
+	set, _, _ := native_captures(dir, ps2_disc)
 	return core.blob_cached(dir, core.COMMIT, .Native, set)
 }
 
@@ -153,8 +180,37 @@ native_cached :: proc(dir: string) -> bool {
 // one, and "" when neither has one, so a blob compiled without captures
 // keeps its key. A capture that grows by new entries changes its
 // fingerprint, and the blob is compiled again; one that only repeats
-// records does not (vu.capture_fingerprint). Temp allocated.
-native_captures :: proc(dir: string) -> (set: string, caps: [2]string) {
+// records does not (vu.capture_fingerprint). A PS2 disc whose mods hook EE
+// functions adds " mod_hooks <hash>" (native_hooks), so a blob built for no
+// mods keeps its key; hooks is that set's file (native_hooks). Temp
+// allocated.
+native_captures :: proc(dir: string, ps2_disc: bool) -> (set: string, caps: [2]string, hooks: string) {
+	set, caps = vu_captures(dir)
+	h: u64
+	if hooks, h = native_hooks(dir, ps2_disc); h != 0 {
+		set = fmt.tprintf("%s%smod_hooks %016x", set, set == "" ? "" : " ", h)
+	}
+	return
+}
+
+// The EE functions the mods of PS2 disc directory dir hook, one hex address
+// per line (the recomp option mod_hooks), and the hash of that set
+// (ps2.mods_read); "" and 0 for none, or a PS1 disc. Mods that cannot be
+// read hook none here: the boot says why. Temp allocated.
+native_hooks :: proc(dir: string, ps2_disc: bool) -> (text: string, hash: u64) {
+	if !ps2_disc {return}
+	set, h, err := ps2.mods_read(core.disc_path(dir, .Mods, context.temp_allocator), "")
+	if err != "" {return}
+	defer core.mod_set_delete(set)
+	if h == 0 {return}
+	b := strings.builder_make(context.temp_allocator)
+	for k in set.hooks {fmt.sbprintfln(&b, "%08x", k.key.addr)}
+	return strings.to_string(b), h
+}
+
+// native_captures' VU half.
+@(private = "file")
+vu_captures :: proc(dir: string) -> (set: string, caps: [2]string) {
 	fps: [2]string = {"-", "-"}
 	for f, unit in ([2]core.Disc_File{.Vu0_Capture, .Vu1_Capture}) {
 		path := core.disc_path(dir, f, context.temp_allocator)

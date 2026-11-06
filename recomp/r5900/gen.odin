@@ -190,6 +190,20 @@ drop_imports :: proc(funcs: ^[dynamic]^Func, quiet: bool) -> int {
 	return dropped
 }
 
+// A hooked address inside a function other than at its entry is refused:
+// that function's own code reaches it by a branch or by running on, which
+// no hook sees.
+check_hooked :: proc(funcs: []^Func, hooked: mips.Set) {
+	if len(hooked) == 0 {return}
+	for f in funcs {
+		for h in hooked {
+			if h != f.entry && f.start <= h && h < f.end {
+				mips.fail("hooked %08x is inside function %08x (only a function's entry can be hooked)", h, f.entry)
+			}
+		}
+	}
+}
+
 generate :: proc(o: mips.Options) {
 	img := mips.load_elf(o)
 	// Before vu_only too: words may touch .vutext, whose programs a mid-run
@@ -279,6 +293,8 @@ generate :: proc(o: mips.Options) {
 		append(&funcs, ..mips.build_module(RULES, img, t[0], t[1], entries, labels, calls, {}, {}))
 	}
 	n_imports := drop_imports(&funcs, mips.option_or(o, "quiet", "") == "true")
+	hooked, hooks_hash := mips.read_mod_hooks(o)
+	check_hooked(funcs[:], hooked)
 
 	// Assign packages.
 	pkg_of: map[u32]int
@@ -305,6 +321,10 @@ generate :: proc(o: mips.Options) {
 		code = new(native.Asm)
 		code^ = native.make_asm(arch, native_ram())
 		code.sigs = EE_SIGS[:]
+		// The hooked set's hash, as an import slot the runtime has only with
+		// that set's mods loaded: a blob for other mods (or none) is refused.
+		// None without hooks, so the blob is as before.
+		if hooks_hash != 0 {_ = native.imp(code, fmt.tprintf("mod_hooks:%016x", hooks_hash))}
 	}
 
 	// With coverage, native code for x64 and arm64 both: the one native_out
@@ -328,11 +348,16 @@ generate :: proc(o: mips.Options) {
 		}
 	}
 
-	// Per Asm, a label for each function's entry, for direct calls.
+	// Per Asm, a label for each function's entry, for direct calls. None
+	// for a hooked function: calls to it (and jumps to it from another
+	// function, which lower makes calls) go through cpu.call, where the
+	// runtime puts the hook.
 	entry_labels: [3]map[u32]native.Label
 	for a, x in asms {
 		if a == nil {continue}
-		for f in funcs {entry_labels[x][f.entry] = native.new_label(a)}
+		for f in funcs {
+			if f.entry not_in hooked {entry_labels[x][f.entry] = native.new_label(a)}
+		}
 	}
 
 	// Per backend, the sites that call the interpreter.
@@ -346,6 +371,7 @@ generate :: proc(o: mips.Options) {
 		e := Emitter {
 			refs   = &labels,
 			pkg_of = &pkg_of,
+			hooked = &hooked,
 			pkg    = n,
 			cycles = cycles,
 			quiet  = mips.option_or(o, "quiet", "") == "true",
@@ -373,6 +399,8 @@ generate :: proc(o: mips.Options) {
 		fmt.sbprintln(sb, vu.VU_HELPERS) // for the VU0 macro instructions
 		fmt.sbprintln(sb, vu.MACRO_HELPERS)
 		fmt.sbprintln(sb, "register :: proc() {")
+		// The hooked set built for (none: nothing, the source as before).
+		if n == 0 && hooks_hash != 0 {fmt.sbprintfln(sb, "\tcpu.mod_hooks_hash = 0x%016x", hooks_hash)}
 		for f in g {
 			fmt.sbprintfln(sb, "\tcpu.register(0x%08x, f_%08x)", f.entry, f.entry)
 			for l in interior_entries(&e, f) {

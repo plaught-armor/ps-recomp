@@ -322,11 +322,14 @@ syscall :: proc(pc: u32) {
 PRINT_MAX_WIDTH :: 64
 PRINT_MAX_STRING :: 1024
 
-// A guest C string, or ok false if it starts outside RAM. It stops at
-// `limit` bytes or the end of RAM.
+// A guest C string, or ok false if it starts outside RAM (said when it is
+// in the mod region). It stops at `limit` bytes or the end of RAM.
 guest_string :: proc(a: u32, limit: int) -> (s: string, ok: bool) {
 	p := int(a & 0x0fffffff)
-	if a == 0 || p >= mem.RAM_SIZE {return "", false}
+	if a == 0 || p >= mem.RAM_SIZE {
+		if note := mem.mod_region_note(a); note != "" {fmt.eprintfln("kernel: string %08x is not in RAM%s", a, note)}
+		return "", false
+	}
 	end := min(p + limit, mem.RAM_SIZE)
 	n := p
 	for n < end && mem.ram[n] != 0 {n += 1}
@@ -511,6 +514,7 @@ start_thread :: proc(id: i32, arg: u32) -> i64 {
 	t := thread(id)
 	if t == nil || t.status != .Dormant {return KE_ERROR}
 	t.regs = {}
+	cpu.mod_inners[t.id] = nil
 	t.regs.r[4].d[0] = cpu.sx32(arg)
 	t.regs.r[28].d[0] = cpu.sx32(t.gp)
 	t.regs.r[29].d[0] = cpu.sx32(t.stack + t.stack_size - 16)
@@ -762,11 +766,13 @@ reschedule :: proc() {
 
 @(private)
 switch_to :: proc(next: ^Thread) {
+	if cpu.mod_depth > 0 {cpu.fatal("mod: a thread switch (to thread %d) in a mod's before or after hook", next.id)}
 	when core.FLAT {
 		flat_switch(next)
 	} else {
 		cur := k.current
 		cur.regs = cpu.state
+		cpu.mod_inners[cur.id], cpu.mod_inner = cpu.mod_inner, cpu.mod_inners[next.id]
 		if cur.status == .Run {cur.status = .Ready}
 		k.current = next
 		next.status = .Run
@@ -784,6 +790,8 @@ idle_cycles: u64
 
 @(private)
 idle :: proc() {
+	// Time is frozen in a hook: no event could end the wait.
+	if cpu.mod_depth > 0 {cpu.fatal("mod: every thread waits, in a mod's before or after hook")}
 	idle_skip()
 	// The kernel idles with interrupts enabled, whatever the status of the
 	// thread that blocked last.
@@ -974,9 +982,22 @@ vblank_hook_host :: proc() {
 
 // Process due events and deliver pending interrupts. Called by recompiled
 // code whenever `state.cycles` reaches `next_event`.
+//
+// While a mod's before or after hook runs (cpu.mod_depth > 0) it handles
+// nothing: time is frozen for the hook. It notes that it was due
+// (cpu.mod_held), and runs once the hook returns (ps2/mod.odin mod_call).
+// Handlers run outside any replacement: a mod_call_original in one is
+// fatal.
 run_events :: proc() {
+	if cpu.mod_depth > 0 {
+		cpu.mod_held = true
+		cpu.next_event = max(u64)
+		return
+	}
 	if cpu.in_interrupt {return}
 	cpu.in_interrupt = true
+	inner := cpu.mod_inner
+	cpu.mod_inner = nil
 	cpu.next_event = max(u64) // handlers run without re-entering
 	// What the handlers do is the event's doing: the spin probe sees one
 	// flag for all of it (ps2/spin.odin).
@@ -1025,6 +1046,7 @@ run_events :: proc() {
 	deliver_interrupts()
 
 	cpu.in_interrupt = false
+	cpu.mod_inner = inner
 	cpu.spin_dirty = dirty | cpu.SPIN_EVENT
 	update_next_event()
 	// A handler may have readied a thread that outranks the current one.

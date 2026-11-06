@@ -45,6 +45,12 @@ Boot :: struct {
 	// the window opens, `hooks` once the game's functions are registered.
 	setup:          proc() -> bool,
 	hooks:          proc() -> bool,
+	// The directory of the EE mods to load (ps2/mod.odin; "" or a missing
+	// one none), and the disc's id, which a mod made for another disc is
+	// warned of (core.mods_read). Code built for another hooked set than
+	// the mods' (the recomp option mod_hooks) stops the boot.
+	mods:           string,
+	disc_id:        string,
 	// Called at each vblank after the host's frame (kernel.vblank_hook), on
 	// the EE thread where no microprogram runs; and when the host quits.
 	// nil none.
@@ -80,6 +86,11 @@ boot :: proc(b: Boot) -> bool {
 		return false
 	}
 	if b.cards != "" {iop.mc_root = b.cards}
+	set, hooked, merr := mods_read(b.mods, b.disc_id)
+	if merr != "" {
+		fmt.eprintln(merr)
+		return false
+	}
 	init()
 	if b.setup != nil {b.setup() or_return}
 	host.platform_init(b.title) or_return
@@ -103,7 +114,7 @@ boot :: proc(b: Boot) -> bool {
 	// what they load), so a FLAT build refers to no map_code.
 	when !core.FLAT {
 		if b.native != "" {
-			if !load_native(b.native) {
+			if !load_native(b.native, hooked) {
 				if b.native_failed != nil {b.native_failed()}
 				return false
 			}
@@ -117,6 +128,14 @@ boot :: proc(b: Boot) -> bool {
 		}
 	}
 	if b.hooks != nil {b.hooks() or_return}
+	// A blob's hooked set is checked as it loads; the registered Odin
+	// functions' here. FLAT calls none of them.
+	if !core.FLAT && b.native == "" {
+		if e := mods_check(hooked); e != "" {
+			fmt.eprintln(e)
+			return false
+		}
+	}
 	// Without a blob, a port's hooks register its recompiled functions
 	// (text_range sizes their table); with neither, nothing is.
 	if b.native == "" {
@@ -127,9 +146,17 @@ boot :: proc(b: Boot) -> bool {
 		}
 	}
 	entry, ok := mem.load_elf(elf)
-	delete(elf)
 	if !ok {
+		delete(elf)
 		fmt.eprintln("disc:", name, "is not a loadable ELF file")
+		return false
+	}
+	// The hooks name the boot program by its ELF file, and its code in RAM.
+	kernel.exec_boot_program(elf)
+	merr = mods_load(set)
+	delete(elf)
+	if merr != "" {
+		fmt.eprintln(merr)
 		return false
 	}
 	cpu.state.r[29].d[0] = mem.RAM_SIZE - 16

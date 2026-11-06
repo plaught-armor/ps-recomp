@@ -71,8 +71,8 @@ run :: proc(args: []string) -> int {
 	switch {
 	case len(args) == 1:
 		return launcher(args[0])
-	case len(args) == 6 && args[1] == "--convert":
-		return convert(args[2], args[3], args[4], args[5])
+	case (len(args) == 6 || len(args) == 7) && args[1] == "--convert":
+		return convert(args[2], args[3], args[4], args[5], args[6] if len(args) == 7 else "")
 	case len(args) == 7 && args[1] == "--convert-vu":
 		if !midload_child(args[6]) {return 1}
 		return convert(args[2], args[3], args[4], args[5], vu_only = true)
@@ -352,7 +352,7 @@ play :: proc(image: string) -> int {
 	// LEARN records nothing.
 	native_off := core.FLAT || core.env("NATIVE") == "0"
 	native := core.disc_path(dir, .Native)
-	if native_off || (!native_cached(dir) && !convert_store(image, dir, 0)) {
+	if native_off || (!native_cached(dir, cnf.ps2) && !convert_store(image, dir, cnf.ps2, 0)) {
 		native = ""
 	}
 	native_key = core.disc_path(dir, .Native_Key)
@@ -415,6 +415,8 @@ play :: proc(image: string) -> int {
 			learned_ee        = learned_ee,
 			learned_ee_failed = learned_ee_failed,
 			cards             = cards,
+			mods              = core.disc_path(dir, .Mods),
+			disc_id           = id,
 		}
 		if midload_init(image, native, capture) {
 			b.vblank = midload_vblank
