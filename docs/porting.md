@@ -244,9 +244,19 @@ but floats by position where the game's EABI counts them apart, so a mod
 must not hook or call a game function that takes or returns a float
 (`mod_api.h` says so, and how to wrap one). `mods/build.sh` builds for
 the console `mod_api.h` names (`MOD_ARCH`): an EE mod is MIPS III n32
-code, and needs llvm-objdump too. The R5900 has no 64-bit multiply or
-divide, no LL/SC and no double floats, so the build fails, naming the
-function and the instruction, when the linked mod has one.
+code with single floats only, and needs llvm-objdump too. The R5900 has
+no 64-bit multiply or divide, no LL/SC, no double floats and only part of
+the MIPS III float operations (build.sh lists the ones it has), so the
+build fails, naming the function and the instruction, when the linked mod
+has another, and names the compiler routine a double or a 64-bit integer
+to or from float would call. `(int)f` is one: it compiles to `trunc.w.s`,
+so convert with `mod_f2i` (in `mod_api.h`) or keep to integer math. On the
+EE, after hooks see a0-a7 as the function was called with. n32 code saves
+only the low 64 bits of the registers a callee keeps ($16-$23, $28,
+$30) and only the even float registers of $f20-$f31, while the game keeps
+all 128 bits and all twelve, so the runtime puts their upper halves and
+$f20-$f31 back when a replacement returns, as it puts every register
+back after a hook.
 
 Limits:
 

@@ -12,14 +12,24 @@
 // interrupt is handled while it runs (run_events holds them while
 // cpu.mod_depth > 0). So a hook changes the game only through memory. An
 // event or interrupt that comes due in a hook is handled as soon as it
-// returns. A before hook sees the function's arguments (a0-a3); an after
-// hook sees them too, and the results (v0, v1). The replacement runs on
-// the game's stack and in its time, as the function would. A hook must not
-// switch threads, start another program, or wait (fatal).
+// returns. A before hook sees the function's arguments (a0-a7, $4-$11,
+// and the game's stack); an after hook sees those registers too, and the
+// results (v0, v1). The replacement runs on the game's stack and in
+// its time, as the function would. A hook must not switch threads, start
+// another program, or wait (fatal).
+//
+// Mods are n32 code, which keeps only the low 64 bits of the registers it
+// must save ($16-$23, $28, $30: sd and ld), while the game keeps all 128
+// (lq and sq), and keeps only the even FPU registers of $f20-$f31, while
+// the game keeps all twelve. So the upper 64 bits of those integer
+// registers and all of $f20-$f31 are put back when a replacement returns,
+// as a hook's are: a mod's MMI or float code may change them. An
+// original that returns a value in one of them, as no compiled code does,
+// returns it to the replacement only, not to the game.
 //
 // A replacement calls the function it replaces with mod_call_original (a
 // call to mem.MOD_ORIGINAL): the original, with no hooks, on the arguments
-// in a0-a3 then, reached by a call (jal, jalr) only: a tail jump to it is
+// in a0-a7 and on the stack then, reached by a call (jal, jalr) only: a tail jump to it is
 // not supported. It is the innermost running replacement's. A call to it
 // from a before or after hook, from inside an original, from an interrupt
 // handler, or with no replacement running, is fatal, the same on both
@@ -288,7 +298,9 @@ mod_enter :: proc(site: int) {
 	if r, ok := c.replace.?; ok {
 		inner := cpu.Mod_Inner{site, cpu.mod_depth, cpu.mod_inner}
 		cpu.mod_inner = &inner
+		kept := mod_kept()
 		cpu.call(r.fn)
+		mod_kept_set(kept)
 		cpu.mod_inner = inner.prev
 	} else {
 		mod_original(site)
@@ -333,16 +345,48 @@ mod_original_fatal :: proc() -> ! {
 	cpu.fatal("mod: a call to mod_call_original (%08x) outside a replacement (ra %08x)", u32(mem.MOD_ORIGINAL), u32(cpu.state.r[31].d[0]))
 }
 
+// The argument registers, a0-a7.
 @(private = "file")
-mod_args :: proc() -> [4]cpu.Gpr {
-	r := &cpu.state.r
-	return {r[4], r[5], r[6], r[7]}
+Mod_Args :: [8]cpu.Gpr
+
+@(private = "file")
+mod_args :: proc() -> Mod_Args {
+	a: Mod_Args
+	copy(a[:], cpu.state.r[4:12])
+	return a
 }
 
 @(private = "file")
-mod_args_set :: proc(a: [4]cpu.Gpr) {
-	r := &cpu.state.r
-	r[4], r[5], r[6], r[7] = a[0], a[1], a[2], a[3]
+mod_args_set :: proc(a: Mod_Args) {
+	a := a
+	copy(cpu.state.r[4:12], a[:])
+}
+
+// The registers a callee saves, $16-$23, $28 and $30: their upper 64 bits,
+// which a replacement does not keep (n32).
+@(private = "file")
+MOD_SAVED :: [10]int{16, 17, 18, 19, 20, 21, 22, 23, 28, 30}
+
+// What a replacement's return puts back: the upper 64 bits of MOD_SAVED's
+// registers and the FPU registers a callee saves, $f20-$f31 (n32 keeps
+// only the even ones).
+@(private = "file")
+Mod_Kept :: struct {
+	upper: [len(MOD_SAVED)]u64,
+	f:     [12]cpu.Fpr,
+}
+
+@(private = "file")
+mod_kept :: proc() -> (m: Mod_Kept) {
+	for r, k in MOD_SAVED {m.upper[k] = cpu.state.r[r].d[1]}
+	copy(m.f[:], cpu.state.f[20:])
+	return
+}
+
+@(private = "file")
+mod_kept_set :: proc(m: Mod_Kept) {
+	for r, k in MOD_SAVED {cpu.state.r[r].d[1] = m.upper[k]}
+	for &x, k in cpu.state.f[20:] {x = m.f[k]}
 }
 
 @(private = "file")
@@ -351,9 +395,9 @@ mod_before :: proc(c: ^core.Mod_Chain) {
 }
 
 // The after hooks, each with the arguments the function had (entry) and its
-// results; then a0-a3 as the function left them.
+// results; then a0-a7 as the function left them.
 @(private = "file")
-mod_after :: proc(c: ^core.Mod_Chain, entry: [4]cpu.Gpr) {
+mod_after :: proc(c: ^core.Mod_Chain, entry: Mod_Args) {
 	if len(c.after) == 0 {return}
 	done := mod_args()
 	for f in c.after {
@@ -392,15 +436,17 @@ FLAT_MOD_MARK :: u32(2)
 // A hooked call's continuation on a flat run: the return address its mark
 // replaced, the site, mod_depth at the call, and the arguments for the
 // after hooks. replaced: the replacement runs (mod_call_original's to
-// make). orig: mod_call_original's own, which runs no after hooks. again:
-// the mark was pushed below the run's first frame (a call at depth 0), and
-// its return ends the run.
+// make), and kept is what its return puts back (mod_kept). orig:
+// mod_call_original's own, which runs no after hooks. again: the mark was
+// pushed below the run's first frame (a call at depth 0), and its return
+// ends the run.
 @(private = "file")
 Mod_Cont :: struct {
 	ret:      u32,
 	site:     int,
 	depth:    int,
-	entry:    [4]cpu.Gpr,
+	entry:    Mod_Args,
+	kept:     Mod_Kept,
 	replaced: bool,
 	orig:     bool,
 	again:    bool,
@@ -454,6 +500,7 @@ mod_flat_enter :: proc(x: ^kernel.Flat_Ctx) {
 	mod_before(c)
 	if r, rok := c.replace.?; rok {
 		mod_conts[mark >> 2].replaced = true
+		mod_conts[mark >> 2].kept = mod_kept()
 		x.pc = r.fn
 	}
 }
@@ -497,6 +544,7 @@ mod_flat_return :: proc(mark: u32) -> (ret: u32, again: bool) {
 	n := int(mark >> 2)
 	m := mod_conts[n]
 	append(&mod_conts_free, n)
+	if m.replaced {mod_kept_set(m.kept)}
 	if !m.orig {mod_after(&mod_sites[m.site].chain, m.entry)}
 	return m.ret, m.again
 }
