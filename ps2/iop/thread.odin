@@ -425,7 +425,8 @@ th_main :: proc(arg: rawptr) {
 	th_exit()
 }
 
-// FLAT: th_main and th_yield's resume for the running thread t. Its run
+// FLAT: th_main and th_yield's resume for the running thread t (a pointer
+// into iop_sched.threads, good only until the run). Its run
 // starts at its entry when it has none; else it goes on, after what its
 // stop owed (th_flat_stopped): v0, and the yield to a better thread its HLE
 // call would make once the wait returned. A run that ends is the thread's
@@ -450,7 +451,12 @@ th_flat_run :: proc(t: ^Iop_Thread) {
 				return
 			}
 		}
-		if r3000.flat_run(f.run) {th_end(t)}
+		// The run may create threads, growing iop_sched.threads: t is found
+		// again by id, not trusted past it.
+		id := t.id
+		if r3000.flat_run(f.run) {
+			if now := th_find(id); now != nil {th_end(now)}
+		}
 	}
 }
 

@@ -33,6 +33,8 @@ odin run tests/psx_cover -collection:ps=.
 odin run tests/psx_timer -collection:ps=.
 odin run tests/ps2_kernel -collection:ps=.
 odin run tests/ps2_iop -collection:ps=.
+odin run tests/iop_thread_grow -collection:ps=.
+odin run tests/iop_thread_grow -collection:ps=. -define:PS_FLAT=true
 odin run tests/ps2_interp -collection:ps=.
 odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/ee_syscall_handler -collection:ps=.
@@ -72,6 +74,7 @@ here.
 | `spu` | SPU2 voices through the port API, sound RAM in snapshots |
 | `ps2_kernel` | EE kernel threads, ExecPS2 |
 | `ps2_iop` | The IOP CPU and the IOP modules run on it |
+| `iop_thread_grow` | An IOP start that grows the thread array while it runs is removed once it returns, in the coroutine model and under FLAT: the same thread count |
 | `ps2_interp` | Whole EE functions in the interpreter |
 | `ee_syscall_handler` | A SetSyscall handler switched away from (an alarm wakes a thread of higher priority) and sleeping, in the coroutine model and under FLAT: the same log and cycles |
 | `psx_cover` | Which R3000 encodings each PS1 backend does inline |
