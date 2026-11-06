@@ -26,7 +26,7 @@ import "core:fmt"
 import "core:math/rand"
 import "core:os"
 import "core:slice"
-import "core:sys/linux"
+@(require) import "core:sys/linux" // used only under ODIN_OS == .Linux
 import "ps:core"
 import "ps:ps2"
 import "ps:ps2/vu"
