@@ -5,8 +5,9 @@
 // hooks keep GPU-side copies (one per ring slot).
 //
 // Large memory (snap_area memory and the emulated heap) has its written
-// pages tracked by the OS (rollback_<os>.odin: rb_start, and rb_scan, which
-// lists the pages written since the last scan). A shadow copy holds that
+// pages tracked per OS (rollback_<os>.odin: rb_start, and rb_scan, which
+// lists the pages written since the last scan; on wasm, which has no page
+// protection, the pages that differ from the shadow). A shadow copy holds that
 // memory as of the last commit:
 // - a commit appends the shadow's contents of each written page to the
 //   frame's undo log, then copies the page into the shadow;
@@ -135,8 +136,11 @@ rb_rewind :: proc(back: int) {
 		rb.head = (rb.head + RB_FRAMES - 1) % RB_FRAMES
 		rb.count -= 1
 	}
-	// The pages just restored match the shadow again: protect them.
-	for a in rb.areas {rb_scan(a, proc(a: Rb_Area, off: int, _: rawptr) {}, nil)}
+	// The pages just restored match the shadow again: protect them. On wasi
+	// nothing is protected, and a page that matches its shadow is not listed.
+	when ODIN_OS != .WASI {
+		for a in rb.areas {rb_scan(a, proc(a: Rb_Area, off: int, _: rawptr) {}, nil)}
+	}
 	rec := &rb.records[rb.head]
 	pos := 0
 	take_regions(rec.small[:], &pos)

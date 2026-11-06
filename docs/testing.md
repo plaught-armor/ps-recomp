@@ -36,6 +36,7 @@ odin run tests/ps2_kernel -collection:ps=.
 odin run tests/ps2_iop -collection:ps=.
 odin run tests/iop_thread_grow -collection:ps=.
 odin run tests/iop_thread_grow -collection:ps=. -define:PS_FLAT=true
+odin run tests/rollback -collection:ps=. -define:PS_FLAT=true
 odin run tests/ps2_interp -collection:ps=.
 odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/ee_syscall_handler -collection:ps=.
@@ -83,6 +84,7 @@ here.
 | `ps2_kernel` | EE kernel threads, ExecPS2 |
 | `blob_arch` | A native code header is valid only with this build's arch: arch 0 and wasm32's (4) are refused on a native build, every machine-code arch on a wasm build, and native_load refuses another arch before it maps anything |
 | `ps2_iop` | The IOP CPU and the IOP modules run on it |
+| `rollback` | Under FLAT (the build only runs that way): a rewind to a commit gives the save state taken at it, byte for byte, after the emulated heap's top block is freed and its bytes written over |
 | `iop_thread_grow` | An IOP start that grows the thread array while it runs is removed once it returns, in the coroutine model and under FLAT: the same thread count |
 | `ps2_interp` | Whole EE functions in the interpreter |
 | `ee_syscall_handler` | A SetSyscall handler switched away from (an alarm wakes a thread of higher priority) and sleeping, in the coroutine model and under FLAT: the same log and cycles |
@@ -432,6 +434,14 @@ the wasm32 arch:
 ```sh
 odin build tests/blob_arch -collection:ps=. -target:wasi_wasm32 -out:blob_arch.wasm
 node tests/wasi/run.mjs blob_arch.wasm out-test path/to/any/file
+```
+
+`tests/rollback` is pure too. As a wasi module it tests the wasm write
+tracking (core/rollback_wasi.odin), which compares pages with their shadows:
+
+```sh
+odin build tests/rollback -collection:ps=. -target:wasi_wasm32 -out:rollback.wasm
+node tests/wasi/run.mjs rollback.wasm out-test path/to/any/file
 ```
 
 ## CI
