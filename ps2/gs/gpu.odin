@@ -489,9 +489,12 @@ page_dims :: proc(psm: u32) -> (pw, ph: u32) {
 @(private)
 page_span :: proc(psm, bp, bw, y0, y1: u32) -> [2]u32 {
 	pw, ph := page_dims(psm)
-	per_row := max(bw * 64 / pw, 1)
+	// A row of pages starts per_row pages after the last (addr8 and addr4
+	// truncate an odd width to it), and runs cols pages wide.
+	per_row, cols := bw * 64 / pw, max((bw * 64 + pw - 1) / pw, 1)
 	first := bp / 32 + (y0 / ph) * per_row
-	n := (y1 / ph - y0 / ph + 1) * per_row + 1 // +1: bp need not be page-aligned
+	// One page more when bp is not page-aligned: the buffer then runs into it.
+	n := (y1 / ph - y0 / ph) * per_row + cols + (bp % 32 != 0 ? 1 : 0)
 	return {first, min(n, PAGES)}
 }
 
@@ -516,7 +519,7 @@ tex_span :: proc(t: ^Tex) -> [2]u32 {
 		if n > 0 {bp, bw = t.mtbp[n], t.mtbw[n]}
 		x1, y1 := last(t.wms, t.w, t.minu, t.maxu, n), last(t.wmt, t.h, t.minv, t.maxv, n)
 		l := page_span(t.psm, bp, bw, 0, y1)
-		l[1] = max(l[1], y1 / ph * max(bw * 64 / pw, 1) + x1 / pw + 2) // +1: bp need not be page-aligned
+		l[1] = max(l[1], y1 / ph * (bw * 64 / pw) + x1 / pw + 1 + (bp % 32 != 0 ? 1 : 0))
 		lo, hi = min(lo, l[0]), max(hi, l[0] + l[1])
 	}
 	return {lo, min(hi - lo, PAGES)}

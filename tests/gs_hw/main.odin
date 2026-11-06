@@ -5,8 +5,11 @@
 // a row in software and twice on the GPU, every GPU case against its
 // software twin, so a race between a primitive's samples and its own
 // writes shows as a mismatch. Each resolution scale runs in a child of its
-// own (the GPU GS starts once a process). Needs a Vulkan device: without
-// one it says so on stderr and exits 0, which is a skip, not a pass.
+// own (the GPU GS starts once a process). Two cases instead upload over a
+// decoded texture between two samples of it, for the pages a transfer
+// writes, one of them a single page; one draws two sprites per state, the
+// second sampling what the first wrote. Needs a Vulkan device: without one
+// it says so on stderr and exits 0, which is a skip, not a pass.
 package main
 
 import "core:fmt"
@@ -54,17 +57,20 @@ CASES := [?]Case {
 	{"z as texture", z_texture},
 	{"top pages", top_pages},
 	{"past width", past_width},
+	{"t8 odd width", t8_odd_width},
+	{"one page", one_page},
+	{"halves", halves},
 }
 
 // Local memory after each case of each software round.
 @(private = "file")
 want: [ROUNDS][len(CASES)][]u32
 
-// A picture of w x h CT32 pixels at block bp, every pixel a different
-// colour, alpha kept.
+// A picture of w x h pixels at block bp, PSMCT32 or PSMT8 (psm), every
+// pixel a different colour, alpha kept.
 @(private = "file")
-picture :: proc(bp, bw, w, h: u64) {
-	px := make([]u32, w * h, context.temp_allocator)
+picture :: proc(bp, bw, w, h: u64, psm: u64 = 0) {
+	px := make([]u32, psm == PSMT8 ? w * h / 4 : w * h, context.temp_allocator)
 	seed: u32 = 0x9e3779b9 ~ u32(bp)
 	for &v in px {
 		seed ~= seed << 13
@@ -72,7 +78,7 @@ picture :: proc(bp, bw, w, h: u64) {
 		seed ~= seed << 5
 		v = seed
 	}
-	gs.gs_write(0x50, bp << 32 | bw << 48) // BITBLTBUF: PSMCT32
+	gs.gs_write(0x50, bp << 32 | bw << 48 | psm << 56) // BITBLTBUF
 	gs.gs_write(0x51, 0) // TRXPOS
 	gs.gs_write(0x52, w | h << 32) // TRXREG
 	gs.gs_write(0x53, 0) // TRXDIR: host to local
@@ -116,6 +122,9 @@ tex0 :: proc(tbp, tbw, tw, th: u64) -> u64 {
 
 @(private = "file")
 ZMSK :: 1 << 32
+
+@(private = "file")
+PSMT8 :: 0x13
 
 // The frame as a 1024 x 512 texture, each pixel from the one below. At
 // scales 1 and 2 the GPU decodes it; at scale 3 it is too big to decode
@@ -186,6 +195,55 @@ past_width :: proc() {
 	picture(0, 4, W, 320)
 	setup(4 << 16, 0x100 | ZMSK, 0, 2 | 2 << 2 | 512 << 4 | 767 << 14 | 255 << 34, tex0(0, 4, 10, 8))
 	sprites(512 << 4 + 8, 1 << 4 + 8, 16)
+}
+
+// A decoded CT32 texture (128 x 64, page 160 up, repeat), then PSMT8 rows
+// uploaded over it at DBW 3, then the texture sampled again. A PSMT8 row of
+// pages starts DBW / 2 pages after the last but runs over two (192 texels),
+// so the upload writes page 161, which the partial decode must take again.
+@(private = "file")
+t8_odd_width :: proc() {
+	TBP :: 160 * 32
+	picture(TBP, 2, 128, 64)
+	setup(128 | 4 << 16, 0x100 | ZMSK, 0, 0, tex0(TBP, 2, 7, 6))
+	sprites(8, 8, 16)
+	picture(TBP, 3, 192, 64, PSMT8)
+	sprites(8, 8, 16)
+}
+
+// A decoded CT32 texture (128 x 64, pages 170 to 173, repeat), then one
+// page of it (171) uploaded again, then the texture sampled again: the
+// partial decode must take that page and only it.
+@(private = "file")
+one_page :: proc() {
+	TBP :: 170 * 32
+	picture(TBP, 2, 128, 64)
+	setup(128 | 4 << 16, 0x100 | ZMSK, 0, 0, tex0(TBP, 2, 7, 6))
+	sprites(8, 8, 16)
+	picture(171 * 32, 1, 64, 32)
+	sprites(8, 8, 16)
+}
+
+// The frame as a texture, region clamp, undecoded: per pass two sprites on
+// one state, the left half sampling the right and then the right half
+// sampling what the left just wrote. Neither samples pixels it writes, so
+// each must see the frame as the one before left it.
+@(private = "file")
+halves :: proc() {
+	picture(0, 4, W, 256)
+	setup(4 << 16, 0x100 | ZMSK, 0, 2 | 2 << 2 | 255 << 14 | 255 << 34, tex0(0, 4, 8, 8))
+	HW :: W / 2
+	for p in 1 ..= u64(PASSES / 4) {
+		for half in 0 ..< u64(2) {
+			x0, u0 := half * HW, (1 - half) * HW
+			gs.gs_write(0x00, 6 | 1 << 4 | 1 << 8) // PRIM: SPRITE, TME, FST
+			gs.gs_write(0x01, 0x80808080)
+			gs.gs_write(0x03, u0 << 4 + 8 | 8 << 16) // UV
+			gs.gs_write(0x05, x0 << 4 | p << 32) // XYZ2 (x0, 0)
+			gs.gs_write(0x03, (u0 + HW) << 4 + 8 | (8 + H << 4) << 16)
+			gs.gs_write(0x05, (x0 + HW) << 4 | (H << 4) << 16 | p << 32) // XYZ2 (x0 + HW, H)
+		}
+	}
 }
 
 main :: proc() {
