@@ -29,6 +29,7 @@
 package core
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 
 Snapshot :: struct {
@@ -118,7 +119,35 @@ snap_init :: proc(heap: int) {
 }
 
 emu_allocator :: proc() -> runtime.Allocator {
-	return mem.buddy_allocator(&emu_heap)
+	return {emu_alloc, &emu_heap}
+}
+
+// The buddy allocator's procedure, but a request the heap cannot serve is
+// fatal: make and append drop a failed allocation quietly (nil, or the
+// array left as it was), and the console's state would go on without what
+// it asked for.
+@(private = "file")
+emu_alloc :: proc(
+	data: rawptr,
+	mode: runtime.Allocator_Mode,
+	size, alignment: int,
+	old: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	runtime.Allocator_Error,
+) {
+	b, err := mem.buddy_allocator_proc(data, mode, size, alignment, old, old_size, loc)
+	if err == .Out_Of_Memory {
+		used := 0
+		for k := emu_heap.head; k < emu_heap.tail; k = mem.buddy_block_next(k) {
+			if !k.is_free {used += int(k.size)}
+		}
+		fmt.eprintfln("snapshot heap full: %d bytes asked at %v, %d of %d in use", size, loc, used, len(emu_heap_mem))
+		panic("snapshot heap full")
+	}
+	return b, err
 }
 
 when !FLAT {

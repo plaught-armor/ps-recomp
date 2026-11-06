@@ -77,7 +77,7 @@ here.
 
 | Test | What |
 |---|---|
-| `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading, the mod set in input records and replays, netplay HELLO checks |
+| `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading, the mod set in input records and replays, netplay HELLO checks, a full emulated heap ending the process (a child run) |
 | `native` | The machine-code emitter |
 | `ee_native` | EE instructions through the native backend against the interpreter |
 | `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store, an INTC_STAT poll and two threads at one priority handing the EE back and forth with RotateThreadReadyQueue are skipped, and end the same when the other thread rotates at two sites in turn; a counter, a GIF_STAT poll and a timer poll are not |

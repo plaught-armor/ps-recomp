@@ -124,6 +124,7 @@ sum :: proc() -> (s: u64) {
 }
 
 main :: proc() {
+	if len(os.args) == 2 && os.args[1] == "heap-full" {heap_full_child()}
 	// Plain switches first.
 	other = core.co_create(pingpong, nil)
 	y := 2.0
@@ -152,6 +153,7 @@ main :: proc() {
 	test_thumb()
 	test_record_mods()
 	test_hello()
+	test_heap_full()
 	core.snap_init(1 << 20)
 	core.snap_add(&frame)
 	ram = core.snap_area(32 * 4096)
