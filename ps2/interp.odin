@@ -183,7 +183,11 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 	case .MFC0:
 		v := c.cop0[i.rd]
 		switch i.rd {
-		case 9:  v = u32(c.cycles)
+		case 9:
+			// Count: what a loop reads here is not in the state the spin
+			// probe compares.
+			v = u32(c.cycles)
+			cpu.spin_dirty |= cpu.SPIN_SIDE
 		case 15: v = 0x2e20 // PRId
 		}
 		if i.rt != 0 {c.r[i.rt].d[0] = cpu.sx32(v)}

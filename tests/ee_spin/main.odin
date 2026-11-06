@@ -1,5 +1,5 @@
 // The EE spin skip (ps2/spin.odin) on synthetic loops through the native
-// backend, run on every target in CI. Each loop polls a RAM flag that the
+// backend and the interpreter, run on every target in CI. Each loop polls a RAM flag that the
 // last of a few kernel alarms sets, with vblanks between them; it runs once
 // with the skip on and once with it off, from the same machine state, and
 // both runs must end with the same cpu.state (cycles included), the same
@@ -8,7 +8,8 @@
 // (a pure spin, a store of the value already there) must be skipped; one
 // that changes memory (a counter) or reads a register is never skipped,
 // but for INTC_STAT, which only an event or a store changes: a loop that
-// polls it is skipped, one that polls GIF_STAT or a timer is not.
+// polls it is skipped, one that polls GIF_STAT, a timer or COP0 Count is
+// not.
 //
 // Last, two threads at one priority hand the EE back and forth with
 // RotateThreadReadyQueue: the main thread polls the flag between rotates,
@@ -122,6 +123,8 @@ main :: proc() {
 		{"INTC_STAT load", {lui(12, 0x1001), lw(9, 0xf000, 12)}, true}, // 0x1000f000
 		{"GIF_STAT load", {lw(9, 0x3020, 11)}, false},
 		{"timer load", {lw(9, 0, 11)}, false}, // T0_COUNT
+		// mfc0 t1, Count; t1 = 0 again, so only the read tells the passes apart.
+		{"Count read", {0x40000000 | 9 << 16 | 9 << 11, addiu(9, 0, 0)}, false},
 	}
 
 	arch := native.Arch(core.NATIVE_ARCH)
@@ -166,48 +169,56 @@ main :: proc() {
 
 	failed := 0
 	for l, k in loops {
-		got: [2]Result
-		for on, n in ([2]bool{true, false}) {
-			cpu.state = start
-			kernel.k.vblank_start, kernel.k.vblank_end, kernel.k.frame, kernel.k.next_alarm = vblank_start, vblank_end, frame, next_alarm
-			mem.intc_stat, mem.intc_pending, mem.gs_csr = intc_stat, 0, gs_csr
-			mem.wr32(FLAG, 0)
-			mem.wr32(SAME, 0)
-			mem.wr32(COUNT, 0)
-			n_calls = 0
-			for t in ALARMS {kernel.set_alarm(t, HANDLER, 0)}
-			ps2.spin_on, ps2.spin_tick = on, 1
-			skipped := cpu.spin_cycles
-			run := cast(proc())rawptr(code.base + uintptr(code.funcs[k].off))
-			run()
-			got[n] = {
-				state   = cpu.state,
-				same    = mem.rd32(SAME),
-				count   = mem.rd32(COUNT),
-				frame   = kernel.k.frame,
-				intc    = mem.intc_stat,
-				calls   = calls,
-				n_calls = n_calls,
-				skipped = cpu.spin_cycles - skipped,
+		// Through native code, then the interpreter (ps2/spin.odin spin_step).
+		for interp in ([2]bool{false, true}) {
+			name := interp ? fmt.tprintf("%s, interp", l.name) : l.name
+			got: [2]Result
+			for on, n in ([2]bool{true, false}) {
+				cpu.state = start
+				kernel.k.vblank_start, kernel.k.vblank_end, kernel.k.frame, kernel.k.next_alarm = vblank_start, vblank_end, frame, next_alarm
+				mem.intc_stat, mem.intc_pending, mem.gs_csr = intc_stat, 0, gs_csr
+				mem.wr32(FLAG, 0)
+				mem.wr32(SAME, 0)
+				mem.wr32(COUNT, 0)
+				n_calls = 0
+				for t in ALARMS {kernel.set_alarm(t, HANDLER, 0)}
+				ps2.spin_on, ps2.spin_tick = on, 1
+				skipped := cpu.spin_cycles
+				if interp {
+					cpu.interp_hook(CODE + 0x100 * u32(k))
+				} else {
+					run := cast(proc())rawptr(code.base + uintptr(code.funcs[k].off))
+					run()
+				}
+				got[n] = {
+					state   = cpu.state,
+					same    = mem.rd32(SAME),
+					count   = mem.rd32(COUNT),
+					frame   = kernel.k.frame,
+					intc    = mem.intc_stat,
+					calls   = calls,
+					n_calls = n_calls,
+					skipped = cpu.spin_cycles - skipped,
+				}
 			}
+			on, off := got[0], got[1]
+			if on.n_calls != len(ALARMS) || len(kernel.k.alarms) != 0 {
+				failed += 1
+				fmt.eprintfln("FAIL %s: %d alarm calls, %d alarms left", name, on.n_calls, len(kernel.k.alarms))
+			}
+			on_skipped := on.skipped
+			on.skipped = 0
+			if !runtime.memory_equal(&on, &off, size_of(Result)) {
+				failed += 1
+				fmt.eprintfln("FAIL %s: skip on and off differ", name)
+				fmt.eprintfln("  cycles %d %d, frame %d %d, intc %x %x, count %d %d, calls %v %v", on.state.cycles, off.state.cycles, on.frame, off.frame, on.intc, off.intc, on.count, off.count, on.calls, off.calls)
+			}
+			if off.skipped != 0 || (on_skipped != 0) != l.skipped {
+				failed += 1
+				fmt.eprintfln("FAIL %s: skipped %d cycles on, %d off; want skipped %v", name, on_skipped, off.skipped, l.skipped)
+			}
+			fmt.printfln("%-17s cycles %d, skipped %d (%.1f%%)", name, on.state.cycles, on_skipped, 100 * f64(on_skipped) / f64(on.state.cycles))
 		}
-		on, off := got[0], got[1]
-		if on.n_calls != len(ALARMS) || len(kernel.k.alarms) != 0 {
-			failed += 1
-			fmt.eprintfln("FAIL %s: %d alarm calls, %d alarms left", l.name, on.n_calls, len(kernel.k.alarms))
-		}
-		on_skipped := on.skipped
-		on.skipped = 0
-		if !runtime.memory_equal(&on, &off, size_of(Result)) {
-			failed += 1
-			fmt.eprintfln("FAIL %s: skip on and off differ", l.name)
-			fmt.eprintfln("  cycles %d %d, frame %d %d, intc %x %x, count %d %d, calls %v %v", on.state.cycles, off.state.cycles, on.frame, off.frame, on.intc, off.intc, on.count, off.count, on.calls, off.calls)
-		}
-		if off.skipped != 0 || (on_skipped != 0) != l.skipped {
-			failed += 1
-			fmt.eprintfln("FAIL %s: skipped %d cycles on, %d off; want skipped %v", l.name, on_skipped, off.skipped, l.skipped)
-		}
-		fmt.printfln("%-17s cycles %d, skipped %d (%.1f%%)", l.name, on.state.cycles, on_skipped, 100 * f64(on_skipped) / f64(on.state.cycles))
 	}
 
 	// The rotating threads, from the same machine state with the main

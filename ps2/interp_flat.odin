@@ -223,7 +223,9 @@ flat_reload :: proc() -> (^kernel.Flat_Ctx, u32) {
 		if x.enter {
 			x.enter = false
 			if cpu.mod_on {mod_flat_enter(x)}
-			interp_enter(x.pc)
+			// Native code at the entry is not interpreted, and traces its
+			// own entry (flat_resume runs it next).
+			if !flat_native_at(x.pc) {interp_enter(x.pc)}
 			check = true
 		} else if x.back {
 			x.back = false
@@ -259,10 +261,14 @@ flat_mod_tail :: #force_inline proc(x: ^kernel.Flat_Ctx, t: u32) -> bool {
 }
 
 // interp_body's goto_pc with nothing registered: a backward jump from pc to
-// t checks events. True when it ran them; the run goes on at x.pc.
+// t checks events, then steps the spin skip (spin_step). True when it ran
+// them; the run goes on at x.pc.
 @(private = "file")
 flat_goto :: #force_inline proc(x: ^kernel.Flat_Ctx, pc, t: u32) -> bool {
-	if t > pc || cpu.state.cycles < cpu.next_event {return false}
+	if t > pc || cpu.state.cycles < cpu.next_event {
+		spin_step(pc, t)
+		return false
+	}
 	x.pc = t
 	kernel.flat_sync()
 	kernel.run_events()

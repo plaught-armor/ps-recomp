@@ -47,6 +47,19 @@ spin_tick: i32 = 1
 // SPIN=0 sets it false (load_native).
 spin_on := true
 
+// The interpreters' spin_tick step: a taken jump from pc back to t, after
+// its events check, in a loop of fewer than SPIN_SPAN instructions, as
+// native code's (recomp/r5900/native.odin spin, with its SPIN_SPAN). It
+// covers the code no native code does: all of it with none loaded, and
+// what discovery missed (overlays, code loaded at run time).
+SPIN_SPAN :: 64
+
+spin_step :: #force_inline proc(pc, t: u32) {
+	if t > pc || pc - t >= SPIN_SPAN * 4 {return}
+	spin_tick -= 1
+	if spin_tick == 0 {spin_probe(pc)}
+}
+
 // The probe waits this many backward branches after one that fails on the
 // loop's own work, doubling each time up to the most.
 @(private = "file")

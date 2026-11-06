@@ -70,6 +70,7 @@ goto_pc :: proc(entry, pc, t: u32) -> bool {
 		return true
 	}
 	if t <= pc && cpu.state.cycles >= cpu.next_event {kernel.run_events()}
+	spin_step(pc, t)
 	return false
 }
 
