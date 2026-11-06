@@ -41,10 +41,14 @@
 // jump into an overlay function or an interpreted one is missed.
 // Recompiled code turns every jump out of a function into a call.
 //
-// Under FLAT the thunk is native code, as any recompiled function: hooks,
-// the replacement and an interpreted original run nested, so a thread
-// switch or a wait inside them is fatal, as a thread switch inside a hook
-// is in either model.
+// Under FLAT, a thunk a flat run's guest code called (not call, from host
+// code) runs its chain as a continuation (mod_flat_step): the hooks run
+// nested, as in the recursive model, and the replacement or an interpreted
+// original runs on the run, where a thread switch or a wait may stop it, as
+// it could with no mod loaded. A thunk called from host code (a hook's call,
+// an HLE stub's) runs its chain nested, and a stop inside it is fatal. So
+// does a hooked function recursing more than FLAT_HOST (4) deep: the run
+// has no continuation left for it.
 //
 // A call costs nothing more with no mods: each hooked address has a thunk
 // of its own, which knows its address, so call stores nothing.
@@ -210,15 +214,114 @@ mod_chain_mod :: proc(c: core.Mod_Chain) -> int {
 // or, with none, the call as call_slow would.
 @(private = "file")
 mod_enter :: proc(site: int) {
-	addr := mod_sites[site].addr
-	for k in mod_sites[site].runs {
-		run := &mod_runs[k]
-		if mod_resident(run.chain.key) {
-			mod_run(run, addr)
+	when core.FLAT {
+		if !flat_host_call && flat_cur != nil && flat_cur.hosts < FLAT_HOST {
+			m := (^Mod_Cont)(&flat_push_cont(FLAT_MOD).w)
+			m^ = {site = i32(site)}
+			for &a, i in m.entry {a = state.r[4 + i]}
 			return
 		}
 	}
-	call_slow(addr)
+	addr := mod_sites[site].addr
+	run := mod_pick(site)
+	if run < 0 {
+		call_slow(addr)
+		return
+	}
+	c := &mod_runs[run].chain
+	entry := mod_args()
+	mod_before(c)
+	if r, ok := c.replace.?; ok {
+		call(r.fn)
+	} else if mod_runs[run].original != nil {
+		mod_runs[run].original()
+	} else {
+		call_guest(addr)
+	}
+	mod_after(c, entry)
+}
+
+// The run of site's chain whose hooked code is in RAM now, or -1.
+@(private = "file")
+mod_pick :: proc(site: int) -> int {
+	for k in mod_sites[site].runs {
+		if mod_resident(mod_runs[k].chain.key) {return k}
+	}
+	return -1
+}
+
+@(private = "file")
+mod_args :: proc() -> [4]u32 {
+	return {state.r[4], state.r[5], state.r[6], state.r[7]}
+}
+
+@(private = "file")
+mod_before :: proc(c: ^core.Mod_Chain) {
+	for f in c.before {mod_call(f.fn)}
+}
+
+// The after hooks, each with the arguments the function had (entry) and its
+// results; then a0-a3 as the function left them.
+@(private = "file")
+mod_after :: proc(c: ^core.Mod_Chain, entry: [4]u32) {
+	if len(c.after) == 0 {return}
+	done := mod_args()
+	for f in c.after {
+		state.r[4], state.r[5], state.r[6], state.r[7] = entry[0], entry[1], entry[2], entry[3]
+		mod_call(f.fn)
+	}
+	state.r[4], state.r[5], state.r[6], state.r[7] = done[0], done[1], done[2], done[3]
+}
+
+when core.FLAT {
+	// The continuation tag of a mod thunk's chain.
+	FLAT_MOD :: 1
+
+	// A mod thunk's continuation, in Flat_Host.w: the thunk's site, the
+	// arguments it was called with, whether the replacement or the original
+	// was called, and from then the chain run (an index into mod_runs, or -1
+	// for none resident: the call as call_slow makes it). The chain is picked
+	// at that step, not at the push: a run can stop between the two, and
+	// another thread may swap the overlay in the meantime. site and run index
+	// this install's tables, so a save state that holds a Mod_Cont is only
+	// good for the same mods.
+	@(private = "file")
+	Mod_Cont :: struct {
+		site, run: i32,
+		entry:     [4]u32,
+		called:    bool,
+	}
+	#assert(size_of(Mod_Cont) <= FLAT_HOST_WORDS * 4)
+
+	// flat_step for the PS1: the step of a mod thunk's chain. The first runs
+	// the before hooks and calls the replacement or the original on the run;
+	// the next, once it returned, runs the after hooks.
+	mod_flat_step :: proc(x: ^Flat_Ctx, h: ^Flat_Host) {
+		if h.tag != FLAT_MOD {fatal("psx: flat continuation %d", h.tag)}
+		m := (^Mod_Cont)(&h.w)
+		if m.called {
+			if m.run >= 0 {mod_after(&mod_runs[m.run].chain, m.entry)}
+			flat_pop_cont()
+			return
+		}
+		m.called = true
+		m.run = i32(mod_pick(int(m.site)))
+		if m.run < 0 {
+			flat_call(mod_sites[m.site].addr, .Slow)
+			return
+		}
+		run := &mod_runs[m.run]
+		mod_before(&run.chain)
+		if r, ok := run.chain.replace.?; ok {
+			flat_call(r.fn)
+		} else if run.original != nil {
+			flat_call_native(run.original)
+			mod_after(&run.chain, m.entry)
+			flat_pop_cont()
+		} else {
+			flat_call(mod_sites[m.site].addr, .Guest)
+		}
+	}
 }
 
 @(private = "file")
@@ -228,29 +331,6 @@ mod_resident :: proc(k: core.Mod_Key) -> bool {
 		if r32(k.addr + u32(i) * 4) != w {return false}
 	}
 	return true
-}
-
-@(private = "file")
-mod_run :: proc(run: ^Mod_Run, addr: u32) {
-	c := &run.chain
-	entry := state
-	for f in c.before {
-		mod_call(f.fn)
-	}
-	if r, ok := c.replace.?; ok {
-		call(r.fn)
-	} else if run.original != nil {
-		run.original()
-	} else {
-		call_guest(addr)
-	}
-	if len(c.after) == 0 {return}
-	done := state
-	for f in c.after {
-		state.r[4], state.r[5], state.r[6], state.r[7] = entry.r[4], entry.r[5], entry.r[6], entry.r[7]
-		mod_call(f.fn)
-	}
-	state = done
 }
 
 // Call the before or after hook at fn on the mod stack, in frozen time,

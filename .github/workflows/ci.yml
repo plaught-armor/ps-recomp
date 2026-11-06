@@ -116,6 +116,7 @@ jobs:
           odin run tests/data -collection:ps=. -out:data_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/mod -collection:ps=. -out:mod_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_mod -collection:ps=. -out:psx_mod_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_mod -collection:ps=. -define:PS_FLAT=true -out:psx_mod_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_interp -collection:ps=. -out:psx_interp_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/compat -collection:ps=. -out:compat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/play -collection:ps=. -define:COMMIT=test -out:play_test${{ runner.os == 'Windows' && '.exe' || '' }}

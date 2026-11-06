@@ -164,9 +164,13 @@ Limits:
   Recompiled code turns every jump out of a function into a call.
 - A hook must not switch threads (`ChangeTh` inside one is fatal) or
   wait for an event (none comes while time is frozen).
-- `FLAT` builds install mods too, but the hooks, the replacement and an
-  interpreted original run nested, as recompiled functions do there: a
-  thread switch or a wait inside them is fatal.
+- `FLAT` builds install mods too. A guest call to a hooked function runs
+  its chain as a continuation of the flat run: the replacement or an
+  interpreted original may switch threads or wait, as with no mod. A call
+  from host code (a hook's own call, an HLE stub's) runs its chain nested,
+  where a thread switch or a wait is fatal. A hooked function recursing
+  more than 4 deep runs nested; a stop inside it is fatal. So does every
+  hook in an executable that Exec or LoadExec started.
 - IOP hooks are untested.
 
 ## Settings and memory cards

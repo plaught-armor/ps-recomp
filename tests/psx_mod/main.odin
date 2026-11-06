@@ -12,6 +12,11 @@
 //               is at the slot, else the executable's
 //   0x80012000  E, executable, recompiled: a's before hook schedules an
 //               event, raises an interrupt and clears SR
+//   0x80013000  F, executable, interpreted guest code that stops the run
+//               (a BIOS call that blocks, as ChangeTh does): before of a,
+//               after of b. FLAT only
+//   0x80014000  G, executable: b replaces it with interpreted guest code at
+//               0x80190100 that stops the run; after of a. FLAT only
 //
 // Mod functions live at 0x80180000 (recompiled) and 0x80190000
 // (interpreted). Checked: the order hooks run in; befores and afters on the
@@ -22,7 +27,11 @@
 // raises is handled only after it returns, at once, and cop0 is put back.
 // With the
 // overlay's id or D's first word changed, calls run without hooks. Install
-// errors leave nothing installed.
+// errors leave nothing installed. Under FLAT (-define:PS_FLAT=true), a guest
+// call from a flat run to F or G stops inside the original or the
+// replacement and goes on with the after hook when the run resumes; with F's
+// last CODE word changed, F stops and resumes without hooks; a call to A from
+// host code while F's run is on runs A's chain nested, at once.
 package main
 
 import "core:fmt"
@@ -46,6 +55,9 @@ check :: proc(ok: bool, what: string, loc := #caller_location) {
 EXE_A :: 0x80010000
 EXE_D :: 0x80011000
 EXE_E :: 0x80012000
+FLAT_F :: 0x80013000
+FLAT_G :: 0x80014000
+CALLER :: 0x80020000
 SLOT :: 0x80100000
 ID :: 0x3c011234
 OVL_B :: 0x80100100
@@ -62,6 +74,7 @@ M_REPLACE :: 0x80180040
 M_NEST :: 0x80180050
 M_E_BEFORE :: 0x80180060
 M_I_BEFORE :: 0x80190000
+M_I_REPLACE :: 0x80190100
 
 @(private = "file", rodata)
 CODE := [4]u32{0x27bdffe8, 0xafbf0010, 0xafb00014, 0x00000000}
@@ -94,7 +107,7 @@ hook_fn :: proc(tag: string) {
 	append(&log, fmt.aprintf("%s a0=%x v0=%x", tag, r()[4], r()[2]))
 	append(&seen.sp, u64(r()[29]))
 	append(&seen.ne, cpu.next_event)
-	r()[2], r()[4], r()[16], r()[29], r()[31] = 0xbad, 0xdead, 0x5050, r()[29] - 64, 0
+	r()[2], r()[3], r()[4], r()[16], r()[29], r()[31] = 0xbad, 0xbad, 0xdead, 0x5050, r()[29] - 64, 0
 	cpu.state.cycles += 1000
 }
 
@@ -155,6 +168,8 @@ main :: proc() {
 	put_code(EXE_A)
 	put_code(EXE_D)
 	put_code(EXE_E)
+	put_code(FLAT_F)
+	put_code(FLAT_G)
 	put_code(OVL_B)
 	put_code(OVL_C)
 	put_code(BOTH)
@@ -215,6 +230,10 @@ main :: proc() {
 		{key(BOTH), .Before, 1, M_B_BEFORE},
 		{key(BOTH, SLOT, ID), .Before, 0, M_A_BEFORE},
 		{key(EXE_E), .Before, 0, M_E_BEFORE},
+		{key(FLAT_F), .Before, 0, M_A_BEFORE},
+		{key(FLAT_F), .After, 1, M_B_AFTER},
+		{key(FLAT_G), .Replace, 1, M_I_REPLACE},
+		{key(FLAT_G), .After, 0, M_A_AFTER},
 	}
 	chains, cerr := core.mod_chains(mods, order, hooks)
 	check(cerr == "", cerr)
@@ -303,6 +322,8 @@ main :: proc() {
 	call(EXE_D, 1)
 	expect(fmt.tprintf("i< a0=1 v0=0; R a0=1 sp=%x", u32(GAME_SP)))
 
+	when core.FLAT {test_flat()}
+
 	core.mod_chains_delete(chains)
 	free_all(context.temp_allocator)
 	if failed != 0 {os.exit(1)}
@@ -351,4 +372,86 @@ test_errors :: proc(mods: []core.Mod_Manifest) {
 	cpu.mod_sp = 0
 	call(EXE_A, 5)
 	expect("P; A a0=5")
+}
+
+// Guest code for test_flat: save $ra in t3, make BIOS call B(n) (which
+// stops the run), set v0, v1 (0x77) and a0 (0x55), return through t3.
+@(private = "file")
+stopper :: proc(addr, n, v0: u32) {
+	code := [?]u32 {
+		0x03e05821, // addu t3, ra, zero
+		0x240a00b0, // addiu t2, zero, 0xb0
+		0x24090000 | n, // addiu t1, zero, n
+		0x0140f809, // jalr t2
+		0x00000000,
+		v0, // sets v0
+		0x24030077, // addiu v1, zero, 0x77
+		0x24040055, // addiu a0, zero, 0x55
+		0x01600008, // jr t3
+		0x00000000,
+	}
+	for w, k in code {put(addr + u32(k) * 4, w)}
+}
+
+// Under FLAT: CALLER, run as a flat run's base, calls the function at
+// target with a0 = 5. Its run stops inside the original or the
+// replacement, then resumes to its end.
+when core.FLAT {
+	@(private = "file")
+	test_flat :: proc() {
+		cpu.interp_run = cpu.flat_nested
+		cpu.flat_step = cpu.mod_flat_step
+		// B(44h) first calls A from host code: A's chain runs nested, at once.
+		cpu.bios_b = proc(n: u32) {
+			if n == 0x44 {cpu.call(EXE_A)}
+			append(&log, fmt.aprintf("stop %x", n))
+			cpu.flat_block("a test's stop")
+		}
+		// F's body after CODE, which took 24 bytes of stack: the delay slot of
+		// its jr t3 gives them back.
+		stopper(FLAT_F + 16, 0x42, 0x24820001) // addiu v0, a0, 1
+		put(FLAT_F + 16 + 9 * 4, 0x27bd0018) // jr t3's slot: addiu sp, sp, 24
+		stopper(M_I_REPLACE, 0x43, 0x24020099) // addiu v0, zero, 0x99
+		Case :: struct {
+			target: u32,
+			first:  string, // logged until the stop
+			rest:   string, // logged after the resume
+			v0:     u32,
+		}
+		cases := [?]Case {
+			{FLAT_F, "a< a0=5 v0=0; stop 42", "b> a0=5 v0=6", 6},
+			{FLAT_G, "stop 43", "a> a0=5 v0=99", 0x99},
+			{FLAT_F, "stop 42", "", 6}, // F's last CODE word changed: no hooks
+			{FLAT_F, "a< a0=5 v0=0; a< a0=5 v0=0; b< a0=5 v0=0; P; A a0=5; b> a0=5 v0=6; a> a0=5 v0=6; stop 44", "b> a0=5 v0=6", 6},
+		}
+		x: cpu.Flat_Ctx
+		for c, i in cases {
+			switch i {
+			case 2:
+				put(FLAT_F + 12, 0x00000021) // addu zero, zero, zero
+			case 3:
+				put(FLAT_F + 12, 0)
+				put(FLAT_F + 16 + 2 * 4, 0x24090044) // addiu t1, zero, 0x44
+			}
+			code := [?]u32 {
+				0x03e08821, // addu s1, ra, zero
+				0x24040005, // addiu a0, zero, 5
+				0x0c000000 | (c.target >> 2) & 0x3ffffff, // jal target
+				0x00000000,
+				0x02200008, // jr s1
+				0x00000000,
+			}
+			for w, k in code {put(CALLER + u32(k) * 4, w)}
+			clear(&log)
+			r()[2], r()[3], r()[29], r()[31] = 0, 0, GAME_SP, 0x80001234
+			cpu.flat_start(&x, CALLER)
+			check(!cpu.flat_run(&x), fmt.tprintf("%08x: the run stops inside", c.target))
+			expect(c.first)
+			clear(&log)
+			check(cpu.flat_run(&x), fmt.tprintf("%08x: the resumed run ends", c.target))
+			expect(c.rest)
+			check(r()[2] == c.v0 && r()[3] == 0x77 && r()[4] == 0x55 && r()[29] == GAME_SP, fmt.tprintf("%08x: v0 %x, v1 %x, a0 %x, sp %x: as the function left them, past the after hook", c.target, r()[2], r()[3], r()[4], r()[29]))
+		}
+		cpu.flat_free(&x)
+	}
 }

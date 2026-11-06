@@ -21,7 +21,12 @@ hooks_init :: proc "contextless" () {
 	cpu.bios_syscall = bios.bios_syscall
 	cpu.bios_entry = bios.bios_entry
 	cpu.irq_check = io.irq_check
-	when core.FLAT {cpu.interp_run = cpu.flat_nested} else {cpu.interp_run = cpu.interp_loop}
+	when core.FLAT {
+		cpu.interp_run = cpu.flat_nested
+		cpu.flat_step = cpu.mod_flat_step
+	} else {
+		cpu.interp_run = cpu.interp_loop
+	}
 	cpu.run_events = io.run_events
 	cpu.gte_cmd = gte.gte_cmd
 	cpu.gte_read = gte.gte_read

@@ -195,6 +195,11 @@ call :: proc(addr: u32) {
 	outer := frame_ret
 	frame_ret = state.r[31]
 	defer frame_ret = outer
+	when core.FLAT {
+		host := flat_host_call
+		flat_host_call = true
+		defer flat_host_call = host
+	}
 	if is_ram_addr(addr) && addr & 3 == 0 {
 		if fn := dispatch.fixed[fn_index(addr)]; fn != nil {
 			fn()

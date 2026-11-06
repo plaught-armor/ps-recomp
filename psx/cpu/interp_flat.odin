@@ -14,7 +14,7 @@
 //   - a continuation's (kind Cont): host code that called guest code and
 //     goes on after it returns, kept as plain data (Flat_Host) and run in
 //     steps by flat_step. A host callee that would call guest code and then
-//     wait pushes one instead (the IOP's rpc_loop).
+//     wait pushes one instead (the IOP's rpc_loop, the PS1's mod thunks).
 //
 // The owner of a set of runs (the PS1's BIOS threads, the IOP's scheduler)
 // runs one with flat_run until it ends or something stops it (flat_block:
@@ -46,6 +46,15 @@ Flat_Kind :: enum u8 {
 	Tail, // goto_target's tail call: its return ends the caller's run too
 	Jump, // jump's tail call at a run's first word, counted in tail_depth
 	Cont, // a continuation, x.host[slot]
+}
+
+// Where flat_enter looks for a callee: every table, as call does; all but
+// the fixed table, as call_slow does; or none, as call_guest does (learned
+// code, else the interpreter).
+Flat_Lookup :: enum u8 {
+	All,
+	Slow,
+	Guest,
 }
 
 Flat_Frame :: struct {
@@ -88,7 +97,7 @@ when core.FLAT {
 	flat_stop: bool
 	// The run the loop is on, nil outside one.
 	flat_cur: ^Flat_Ctx
-	// Steps the continuation h on top of x (the owner's: the IOP's).
+	// Steps the continuation h on top of x (the owner's: the IOP's, the PS1's mod_flat_step).
 	flat_step: proc(x: ^Flat_Ctx, h: ^Flat_Host)
 	// Calls returned by `jr`, those whose target was not the call's return
 	// address (the run went on at the call's, as the recursive model does),
@@ -111,6 +120,12 @@ when core.FLAT {
 	flat_native: int
 	@(private = "file")
 	flat_dummy: Interp
+	// Set while call runs a callee for host code, so a mod thunk it reaches
+	// runs its chain nested; clear when flat_enter reached the thunk from a
+	// flat run's guest code (mod_enter). Exec and LoadExec run the new
+	// executable through call, so all of it runs with this set: its hooks
+	// all run nested, and a stop inside one is fatal.
+	flat_host_call: bool
 
 	// Set up x to run the guest function at entry from the start, as call does
 	// (the call itself is made once x runs). Its shadow stack is kept.
@@ -212,10 +227,20 @@ when core.FLAT {
 
 	// From a continuation's step: call the guest function at addr, as call
 	// does; the step after it returns is the continuation's next.
-	flat_call :: proc(addr: u32) {
+	// lookup is where the callee is looked for: a mod's continuation calls the
+	// code its thunk stands in for, past the thunk.
+	flat_call :: proc(addr: u32, lookup := Flat_Lookup.All) {
 		x := flat_cur
 		if x.depth == 0 || x.frames[x.depth - 1].kind != .Cont {fatal("a flat call to %08x not from a continuation", addr)}
-		flat_enter(x, addr, 0, .Call)
+		flat_enter(x, addr, 0, .Call, lookup)
+	}
+
+	// From a continuation's step: run the native function fn now, counted as
+	// native code (a stop inside it is put off or fatal).
+	flat_call_native :: proc(fn: Func_Proc) {
+		flat_native += 1
+		fn()
+		flat_native -= 1
 	}
 
 	// True when the host callee on top of the running run did not return yet:
@@ -267,14 +292,14 @@ when core.FLAT {
 	// Host code runs now; an interpreted callee goes on at x.pc after the
 	// checks it makes on entry.
 	@(private = "file")
-	flat_enter :: proc(x: ^Flat_Ctx, addr, ret: u32, kind: Flat_Kind) {
+	flat_enter :: proc(x: ^Flat_Ctx, addr, ret: u32, kind: Flat_Kind, lookup := Flat_Lookup.All) {
 		if .Call in core.trace.active && core.trace_pc_ok(addr) {
 			core.tracef(.Call, "%08x ra=%x sp=%x a0=%x a1=%x", addr, state.r[31], state.r[29], state.r[4], state.r[5])
 		}
 		f := flat_push(x, kind, ret)
 		frame_ret = state.r[31]
 		if kind == .Jump {tail_depth += 1}
-		if is_ram_addr(addr) && addr & 3 == 0 {
+		if lookup == .All && is_ram_addr(addr) && addr & 3 == 0 {
 			if fn := dispatch.fixed[fn_index(addr)]; fn != nil {
 				f.host = true
 				flat_native += 1
@@ -283,12 +308,12 @@ when core.FLAT {
 				return
 			}
 		}
-		if host_call(addr, false) {
+		if lookup != .Guest && host_call(addr, false) {
 			f.host = true
 			host_call(addr, true)
 			return
 		}
-		if e := resolve_overlay(addr); e != nil {
+		if e := lookup != .Guest ? resolve_overlay(addr) : nil; e != nil {
 			when FALLBACK_COUNT {
 				if addr in dispatch_demoted {
 					dispatch_demoted[addr] += 1
