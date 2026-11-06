@@ -23,7 +23,23 @@ env :: proc(name: string, allocator := context.temp_allocator) -> string {
 
 // The setting `name`, and whether it is set at all (set to "" counts).
 env_lookup :: proc(name: string, allocator := context.temp_allocator) -> (value: string, ok: bool) {
-	return os.lookup_env(env_name(name), allocator)
+	key := env_name(name)
+	// On wasi, os.lookup_env finds the value but never reports it found
+	// (core/os/env_wasi.odin); the environment's list does. A name set twice
+	// is listed once there, with one of its values, where getenv takes the
+	// first.
+	when ODIN_OS == .WASI {
+		vars, err := os.environ(context.temp_allocator)
+		if err != nil {return}
+		for v in vars {
+			// An entry without "=" is not a variable, as for getenv.
+			k, sep, val := strings.partition(v, "=")
+			if sep != "" && k == key {return strings.clone(val, allocator), true}
+		}
+		return
+	} else {
+		return os.lookup_env(key, allocator)
+	}
 }
 
 // The variable's full name, for messages.
