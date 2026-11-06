@@ -112,10 +112,10 @@ platform_init :: proc(title: cstring) -> bool {
 		fmt.eprintln("sdl:", sdl.GetError())
 		return false
 	}
-	// SW=1: the software GS and SDL's renderer; otherwise the Vulkan GS
-	// at SCALE times the native resolution (default 1 headless, 3 in a
-	// window).
-	hw = core.env("SW") != "1"
+	// SW=1, and every wasm build (which has no GPU GS): the software GS and
+	// SDL's renderer; otherwise the Vulkan GS at SCALE times the native
+	// resolution (default 1 headless, 3 in a window).
+	hw = gs.HW && core.env("SW") != "1"
 	scale := core.headless ? 1 : 3
 	if v, ok := strconv.parse_int(core.env("SCALE")); ok && v >= 1 && v <= 8 {scale = v}
 	flags := sdl.WindowFlags{.RESIZABLE}

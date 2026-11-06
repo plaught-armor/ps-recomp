@@ -180,7 +180,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 |---|---|
 | `PS_DATA` | The folder where your files go. See [Where your files go](#where-your-files-go). |
 | `PS_GPU` | PS1 only. `vk` draws with Vulkan (the default). `sw` draws in software. |
-| `PS_SW` | PS2 only. `1` draws in software. Otherwise PS2 games draw with Vulkan. |
+| `PS_SW` | PS2 only. `1` draws in software. Otherwise PS2 games draw with Vulkan, except in the wasm build, which always draws in software. |
 | `PS_SCALE` | PS2 only. The window size, as a multiple of the console's resolution. 1 to 8. The default is 3. |
 | `PS_IRX` | PS2 only. By default, a game's own sound and input/output modules run on an emulated copy of the console's I/O processor. `0` turns that off: each module is answered as loaded, without running it. |
 | `PS_NATIVE` | `0` runs the game through the interpreter instead of as native code. Slower; for checking a bug. |

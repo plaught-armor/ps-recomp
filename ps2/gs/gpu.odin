@@ -18,6 +18,9 @@ import sdl "vendor:sdl2"
 import vk "vendor:vulkan"
 import "ps:core"
 
+// This build has the GPU GS (a wasm build has none: gpu_wasi.odin).
+HW :: true
+
 @(private)
 VERT_CAP :: 1 << 18 // vertices per slot (16 MiB)
 @(private)

@@ -412,7 +412,7 @@ mismatched load is fatal.
 
 `tests/wasi/play.mjs` runs play.wasm headless under Node 24 or newer, on
 the page's shim and SDL imports (`web/wasi.js`, `web/sdl.js`), with the
-software renderer. It stops at a vblank (600 by default) and writes a
+software renderer, the only one a wasm build has (no `PS_SW=1` needed). It stops at a vblank (600 by default) and writes a
 hash line every 60 frames to `<out dir>/hashes.tsv`. A wasi build is
 always FLAT, so its reference is a native FLAT run with the same settings:
 

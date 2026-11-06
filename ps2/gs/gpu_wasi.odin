@@ -1,9 +1,12 @@
-// No GPU GS on wasm (gpu.odin needs Vulkan): hw_init fails, so hw_on stays
-// false and the software GS draws; nothing else here is reached.
+// No GPU GS on wasm (gpu.odin needs Vulkan): HW is false, so the host
+// (ps2/host/platform.odin) takes the software GS with or without SW=1 and
+// nothing here is reached.
 package ps2_gs
 
 import "core:fmt"
 import sdl "vendor:sdl2"
+
+HW :: false
 
 hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
 	fmt.eprintln("gs: no GPU GS on wasm")

@@ -18,7 +18,8 @@
 // (`play --convert-vu`, the same arguments, then the run's pid). A dev build (no COMMIT)
 // converts every time. When the conversion
 // fails the game runs interpreted; a stored blob that will not load is
-// converted again on the next run.
+// converted again on the next run (on wasm, which converts nothing, the
+// next run is interpreted).
 //
 // LEARN=1 records the code a game interprets in the disc's directory, a PS1
 // game's in learn/psx.bin and a PS2 game's in learn/ps2.bin (core/learn.odin;
@@ -109,7 +110,11 @@ native_key: string
 @(private = "file")
 native_failed :: proc() {
 	os.remove(native_key)
-	fmt.eprintln("play: the stored native code would not load; it is converted again next run")
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		fmt.eprintln("play: the stored native code would not load; the next run is interpreted")
+	} else {
+		fmt.eprintln("play: the stored native code would not load; it is converted again next run")
+	}
 }
 
 // The same for the learned blob.

@@ -6,8 +6,9 @@
 //   odin build play -target:wasi_wasm32 -out:play.wasm ...
 //   node tests/wasi/play.mjs <play.wasm> <out dir> <disc image> [frames]
 //
-// The run is headless with the software renderer (PS_SW=1, PS_HEADLESS=1)
-// and ends at vblank `frames` (default 600). It dumps a hash line every 60
+// The run is headless (PS_HEADLESS=1), on the software GS that a wasm
+// build takes with no PS_SW=1 (so every run checks that default), and
+// ends at vblank `frames` (default 600). It dumps a hash line every 60
 // frames into <out dir>/hashes.tsv (PS_DUMP_HASH=1, core/dump.odin);
 // a native run with -define:PS_FLAT=true, PS_NATIVE=0 and the same PS_*
 // settings writes the same file. Other PS_* variables set here are passed
@@ -61,7 +62,6 @@ for (const e of readdirSync(dirname(image), { withFileTypes: true })) {
 }
 
 const settings = {
-	PS_SW: "1",
 	PS_HEADLESS: "1",
 	PS_FRAMES: frames,
 	// The shim's root, which is the out dir: core/dump.odin makes no
