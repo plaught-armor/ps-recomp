@@ -168,7 +168,9 @@ flat_resume :: proc() -> (x: ^kernel.Flat_Ctx, pc: u32, ok: bool) {
 				// An entry its code has no block for: interpret, rather
 				// than enter it again.
 				if e.pc == pc {return x, pc, true}
-				x.pc = e.pc
+				// A jump into a hooked function reaches its chain, as the
+				// interpreter's does (flat_mod_tail sets x.pc).
+				if !flat_mod_tail(x, e.pc) {x.pc = e.pc}
 			case .Events:
 				x.pc = e.pc
 				x.back = e.back != 0

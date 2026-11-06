@@ -26,6 +26,12 @@
 // mods_check refuses mods whose hooked set the recompiled code was not
 // built for. Fatal (a child process each): mod_call_original with no
 // replacement running, from a before hook, and from inside an original.
+//
+// Built for wasi_wasm32 (run.mjs runs it under Node) the program's unhooked
+// functions run as a wasm32 blob (wasm.odin): G_T's and G_J's jumps leave
+// native code and must reach G_A's chain. There are no child processes
+// and no disc directory there, so the fatal cases are not run and the
+// program is not started again (the host calls are).
 package main
 
 import "core:fmt"
@@ -408,11 +414,7 @@ vblank :: proc() {
 		load_exec("BOOT.ELF")
 		return
 	case 4:
-		children()
-		os.remove_all(disc)
-		if failed > 0 {os.exit(1)}
-		fmt.println("ps2_mod: ok")
-		os.exit(0)
+		finish()
 	}
 
 	// From host code.
@@ -428,8 +430,25 @@ vblank :: proc() {
 	mem.wr32(G_A + 12, w)
 	check(host_call(G_A, 9) == 10 && len(log_words()) == n + 5, "the code back: the chain")
 
-	mem.wr32(TEXT_WORD, 1)
-	start_again(7, ENTRY)
+	// wasm32 has no disc directory: the program is not started again.
+	when ODIN_ARCH == .wasm32 {
+		finish()
+	} else {
+		mem.wr32(TEXT_WORD, 1)
+		start_again(7, ENTRY)
+	}
+}
+
+// The end of the test: the fatal cases (a child process each; wasm32 starts
+// no processes), the disc directory removed, the verdict.
+finish :: proc() -> ! {
+	when ODIN_ARCH != .wasm32 {
+		children()
+		os.remove_all(disc)
+	}
+	if failed > 0 {os.exit(1)}
+	fmt.println("ps2_mod: ok")
+	os.exit(0)
 }
 
 Child :: struct {
@@ -448,34 +467,42 @@ children :: proc() {
 	}
 }
 
+// The disc directory of the LoadExecPS2 runs, a temporary one: the boot ELF
+// file and another with the same code.
+disc_files :: proc() {
+	err: os.Error
+	if disc, err = os.make_directory_temp("", "ps_ps2_mod_test_*", context.allocator); err != nil {
+		fmt.eprintln("FAIL ps2_mod: temp dir:", err)
+		os.exit(1)
+	}
+	other := make_elf(mem.ram[ENTRY:][:0x1000], 4)
+	other_prog = u32(xxhash.XXH3_64_default(other))
+	files := [2]string{"BOOT.ELF", "OTHER.ELF"}
+	for f, i in ([2][]u8{boot_elf, other}) {
+		if err = os.write_entire_file(fmt.tprintf("%s/%s", disc, files[i]), f); err != nil {
+			fmt.eprintln("FAIL ps2_mod: write", files[i], err)
+			os.exit(1)
+		}
+	}
+	iop.disc_dir = disc
+}
+
 main :: proc() {
 	ps2.init()
-	cpu.text_range(ENTRY, ENTRY + 0x1000)
+	// wasm32 runs some of the program native, which sets the range.
+	when ODIN_ARCH != .wasm32 {cpu.text_range(ENTRY, ENTRY + 0x1000)}
 	when !core.FLAT {cpu.register(G_C, fn_c)}
 	kernel.vblank_hook = vblank
 	program()
 	boot_elf = make_elf(mem.ram[ENTRY:][:0x1000], 0)
 	kernel.exec_boot_program(boot_elf)
+	when ODIN_ARCH == .wasm32 {native_program()}
 	child := len(os.args) == 2
 	if child {
 		for c in CHILDREN {if c.name == os.args[1] {mem.wr32(CHILD, c.call)}}
 	} else {
 		test_refusals()
-		err: os.Error
-		if disc, err = os.make_directory_temp("", "ps_ps2_mod_test_*", context.allocator); err != nil {
-			fmt.eprintln("FAIL ps2_mod: temp dir:", err)
-			os.exit(1)
-		}
-		other := make_elf(mem.ram[ENTRY:][:0x1000], 4)
-		other_prog = u32(xxhash.XXH3_64_default(other))
-		files := [2]string{"BOOT.ELF", "OTHER.ELF"}
-		for f, i in ([2][]u8{boot_elf, other}) {
-			if err = os.write_entire_file(fmt.tprintf("%s/%s", disc, files[i]), f); err != nil {
-				fmt.eprintln("FAIL ps2_mod: write", files[i], err)
-				os.exit(1)
-			}
-		}
-		iop.disc_dir = disc
+		when ODIN_ARCH != .wasm32 {disc_files()}
 	}
 	if err := ps2.mods_load(make_set()); err != "" {
 		fmt.eprintln("FAIL ps2_mod:", err)
