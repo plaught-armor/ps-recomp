@@ -124,8 +124,8 @@ test_order :: proc() {
 test_chains :: proc() {
 	mods := []core.Mod_Manifest{mod("a"), mod("b"), mod("c")}
 	order := []int{2, 0, 1} // c, a, b
-	f := core.Mod_Key{0, 0, 0x800f8844}
-	g := core.Mod_Key{0x801cc800, 0x27bdffd8, 0x801dc798}
+	f := core.Mod_Key{addr = 0x800f8844, sig = {0x27bdffe0, 0xafbf0018, 0, 0}}
+	g := core.Mod_Key{slot = 0x801cc800, id = 0x27bdffd8, addr = 0x801dc798, sig = {0x27bdffd8, 0xafb00010, 0, 0}}
 	hooks := []core.Mod_Hook {
 		{f, .After, 0, 0x1f400010},
 		{f, .Before, 1, 0x1f410000},
@@ -149,12 +149,15 @@ test_chains :: proc() {
 	r, ok := cg.replace.?
 	check(ok && r == core.Mod_Fn{1, 0x1f410020} && len(cg.before) == 0 && len(cg.after) == 0, "g replaced by b")
 
-	// The same address in another overlay is another function.
+	// The same address in another overlay, or with other code, is another
+	// function.
 	h := g
 	h.id = 0x27bdffe0
-	two := []core.Mod_Hook{{g, .Replace, 0, 0x1f400000}, {h, .Replace, 1, 0x1f410000}}
+	k := g
+	k.sig[3] = 1
+	two := []core.Mod_Hook{{g, .Replace, 0, 0x1f400000}, {h, .Replace, 1, 0x1f410000}, {k, .Replace, 2, 0x1f420000}}
 	chains2, err2 := core.mod_chains(mods, order, two)
-	check(err2 == "" && len(chains2) == 2, "one replace per overlay")
+	check(err2 == "" && len(chains2) == 3, "one replace per overlay and code")
 	core.mod_chains_delete(chains2)
 
 	double := []core.Mod_Hook{{g, .Before, 2, 0x1f420000}, {g, .Replace, 1, 0x1f410020}, {g, .Replace, 0, 0x1f400020}}

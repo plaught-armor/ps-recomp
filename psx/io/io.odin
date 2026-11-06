@@ -205,6 +205,12 @@ run_events :: proc() {
 		cpu.next_event = EVENT_OFF
 		return
 	}
+	if cpu.mod_depth > 0 {
+		// Inside a mod hook: handled once it returns (cpu.mod_call).
+		cpu.mod_held = true
+		cpu.next_event = EVENT_OFF
+		return
+	}
 	for {
 		due := false
 		for e in Event {

@@ -125,6 +125,50 @@ main :: proc() {
 }
 ```
 
+## Mods
+
+Mods hook guest functions without changing the port. `core/mod.odin`
+reads each mod's manifest (`mod.tsv`), orders the mods (dependencies,
+then `before` and `after`), and builds one chain per hooked function:
+before hooks in load order, at most one replacement, after hooks in
+reverse load order. A hook is keyed by the function's address, the
+overlay slot and id for overlay code, and the function's first four code
+words, as the mod was built against.
+
+On PS1, `cpu.mod_install` puts the chains in the dispatch tables, after
+the port's own hooks (`hooks`), with `cpu.mod_sp` set to the top of the
+mods' stack. Recompiled executable functions are wrapped through
+`cpu.hook`, so a port hook still runs inside the mods'. Recompiled
+overlay functions have their entry replaced, and interpreted functions
+get an entry whose original is the interpreter. A chain runs only while
+its code is in RAM: the overlay's id at its slot and the function's
+first words; otherwise the call runs as if no mod were loaded.
+
+Before and after hooks run on the mods' stack with time frozen: every
+register, the cycle count and cop0 included, is put back when a hook
+returns, so a hook changes the game only through memory. No event or
+interrupt is handled inside a hook; one that comes due there is handled
+as soon as the hook returns. An event a hook schedules counts its delay
+from the hook's own cycle count, so it lands later in game time by the
+hook's length. After hooks see the arguments (a0-a3) and the results
+(v0, v1). The replacement runs on the game's stack and in game time,
+except when it is called from inside a hook: then it runs in that hook's
+frozen time.
+An install error leaves nothing installed.
+
+Limits:
+
+- Only calls are hooked. A jump the interpreter steps into enters the
+  function without its hooks: a `j` past a run's first word, or a `jr`
+  through a register other than `$ra` to a target not in the fixed table.
+  Recompiled code turns every jump out of a function into a call.
+- A hook must not switch threads (`ChangeTh` inside one is fatal) or
+  wait for an event (none comes while time is frozen).
+- `FLAT` builds install mods too, but the hooks, the replacement and an
+  interpreted original run nested, as recompiled functions do there: a
+  thread switch or a wait inside them is fatal.
+- IOP hooks are untested.
+
 ## Settings and memory cards
 
 Build with `-define:ENV_PREFIX=GAME_` so settings read `GAME_*`. PS1 cards

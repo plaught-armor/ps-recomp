@@ -40,8 +40,11 @@ Mod_Manifest :: struct {
 
 // A guest function. PS1: the overlay at `slot` whose first word is `id`,
 // or slot = id = 0 for the executable. EE: slot 0 and id the program's.
+// sig is the function's first four code words, as the mod was built
+// against: the same address with other code is another function.
 Mod_Key :: struct {
 	slot, id, addr: u32,
+	sig:            [4]u32,
 }
 
 Mod_Hook_Kind :: enum u8 {
@@ -356,7 +359,11 @@ mod_chain :: proc(mods: []Mod_Manifest, group: []Mod_Hook, allocator := context.
 mod_key_less :: proc(a, b: Mod_Key) -> bool {
 	if a.slot != b.slot {return a.slot < b.slot}
 	if a.id != b.id {return a.id < b.id}
-	return a.addr < b.addr
+	if a.addr != b.addr {return a.addr < b.addr}
+	for k in 0 ..< 4 {
+		if a.sig[k] != b.sig[k] {return a.sig[k] < b.sig[k]}
+	}
+	return false
 }
 
 // Free what mod_chains returned.

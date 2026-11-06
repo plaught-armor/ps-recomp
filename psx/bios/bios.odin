@@ -1267,6 +1267,9 @@ change_thread :: proc(h: u32) {
 	if i == cur_thread {
 		return
 	}
+	if cpu.mod_depth > 0 {
+		cpu.fatal("ChangeTh to thread %d inside a mod hook: hooks run in frozen time and cannot switch threads (ra %#08x)", i, cpu.state.r[31])
+	}
 	when core.FLAT {cpu.flat_block("ChangeTh")}
 	// A thread that lost its slot has no TCB to save into; OpenTh may have
 	// handed it to another thread.

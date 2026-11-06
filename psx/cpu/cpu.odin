@@ -258,6 +258,15 @@ call_slow :: proc(addr: u32) {
 		e.fn()
 		return
 	}
+	call_guest(addr)
+}
+
+// Run the guest code at addr with no recompiled function standing for it:
+// its learned code, or the interpreter. What runs a hooked function no
+// recompiled code stands for (mod.odin), whose own entry in the tables is
+// the hook.
+@(private)
+call_guest :: proc(addr: u32) {
 	if run_learned(addr) {
 		return
 	}
