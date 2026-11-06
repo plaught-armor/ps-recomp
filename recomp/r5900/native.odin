@@ -139,7 +139,11 @@ native_ram :: proc() -> native.Ram {
 // An Asm for EE native code: native_ram's RAM and, on wasm32, the cycle
 // count kept in a local (native.make_asm's cached64).
 native_asm :: proc(arch: native.Arch) -> native.Asm {
-	return native.make_asm(arch, native_ram(), cached64 = CYCLES)
+	a := native.make_asm(arch, native_ram(), cached64 = CYCLES)
+	// wasm32 calls the runtime by these; every EE Asm (a disc's, learned
+	// runs', mods') makes the same calls.
+	a.sigs = EE_SIGS[:]
+	return a
 }
 
 // dst = the low (or high) word of guest register n.

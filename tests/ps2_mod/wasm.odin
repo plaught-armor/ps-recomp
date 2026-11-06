@@ -21,7 +21,6 @@ native_program :: proc() {
 	}
 	spans := [?]Span{{ENTRY, G_A - ENTRY}, {G_T, G_J - G_T}, {G_J, G_C - G_J}}
 	a := r5900.native_asm(.Wasm32)
-	a.sigs = r5900.EE_SIGS[:] // as recomp/r5900/gen.odin sets them
 	funcs: [len(spans)]native.Blob_Func
 	slow: map[string]int
 	defer delete(slow)

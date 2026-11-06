@@ -325,7 +325,6 @@ generate :: proc(o: mips.Options) {
 		}
 		code = new(native.Asm)
 		code^ = native_asm(arch)
-		code.sigs = EE_SIGS[:]
 		// The hooked set's hash, as an import slot the runtime has only with
 		// that set's mods loaded: a blob for other mods (or none) is refused.
 		// None without hooks, so the blob is as before. Not temp allocated:
