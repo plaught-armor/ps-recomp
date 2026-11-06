@@ -267,9 +267,16 @@ game to cover. It records both VUs' microcode in the disc's directory
 (`vu0-capture.bin`, `vu1-capture.bin`; ps2/vu/capture.odin). Capturing is
 off by default and is never a saved setting: a captured VU runs only in
 the interpreter, so the run is slower. Each run appends what it saw, so
-the files grow with every run and cover every part played. A run stopped
+the files grow with every run and cover every part played. Only one run at
+a time may capture into a file. A run stopped
 mid-write leaves its last record cut short; readers stop there and keep
-the rest.
+the rest, and the next capture cuts it off. Each VU's file holds at most
+2048 micro memory images; past that a run says so once and records no new
+ones, and the programs they hold stay in the interpreter.
+
+`PS_VU_CAPTURE=miss` captures without the slowdown: the VUs run the
+native code they have, and only microcode with none is recorded, so a run
+over parts already covered appends nothing.
 
 The player uses the captures too. Its next run converts the disc again
 with them, so the VU programs (the captured ones and those of

@@ -85,7 +85,8 @@
 //   records repeated, or a last record cut short, keep, and a new entry or a
 //   bad record in the middle (that file counts as none) do not. A run with a
 //   VU1 capture converts with it, runs its microprogram natively, and the
-//   next run uses the stored blob (test_vu_captures).
+//   next run uses the stored blob (test_vu_captures). A miss capture
+//   (VU_CAPTURE=miss) of a run that adds nothing appends nothing.
 // It is all removed at the end whether the test passes or fails. Build it
 // with -define:COMMIT=test: a dev build never uses a stored blob.
 package main
@@ -868,6 +869,14 @@ test_vu_captures :: proc() {
 	check(name, strings.has_suffix(string(key), fmt.tprintf(" %s\n", set)), fmt.tprintf("key %q for set %q", key, set))
 	errs = run(name, path) or_else ""
 	check(name, !strings.contains(errs, "converting") && strings.contains(errs, "native: 1 VU microprograms"), fmt.tprintf("second run:\n%s", errs))
+	// A miss capture (VU_CAPTURE=miss) of a run that adds nothing appends
+	// nothing, creates no file and keeps the blob.
+	_ = os.set_env(core.env_name("VU_CAPTURE"), "miss")
+	errs = run(name, path) or_else ""
+	os.unset_env(core.env_name("VU_CAPTURE"))
+	after, _ := os.read_entire_file(cap, context.temp_allocator)
+	vu0 := os.exists(core.disc_path(dir, .Vu0_Capture, context.temp_allocator))
+	check(name, !strings.contains(errs, "converting") && slice.equal(after, one) && !vu0, fmt.tprintf("miss capture: vu0 file %v, vu1 %d bytes of %d:\n%s", vu0, len(after), len(one), errs))
 }
 
 // img with label as its volume identifier, space padded.

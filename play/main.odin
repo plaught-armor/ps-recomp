@@ -247,10 +247,11 @@ play :: proc(image: string) -> int {
 		return 1
 	}
 	// VU_CAPTURE=1 records a PS2 game's VU microcode in its directory, where
-	// an export's port is compiled from (docs/porting.md). Only from the
-	// environment: settings.tsv goes into the export. VU0_CAPTURE or
-	// VU1_CAPTURE set already names that VU's file.
-	if cnf.ps2 && core.env("VU_CAPTURE") == "1" {
+	// an export's port is compiled from (docs/porting.md); VU_CAPTURE=miss
+	// records only what no compiled program runs (ps2/vu/capture.odin).
+	// Only from the environment: settings.tsv goes into the export.
+	// VU0_CAPTURE or VU1_CAPTURE set already names that VU's file.
+	if capture := core.env("VU_CAPTURE"); cnf.ps2 && (capture == "1" || capture == "miss") {
 		for f, unit in ([2]core.Disc_File{.Vu0_Capture, .Vu1_Capture}) {
 			name := fmt.tprintf("VU%d_CAPTURE", unit)
 			if _, set := core.env_lookup(name); set {continue}

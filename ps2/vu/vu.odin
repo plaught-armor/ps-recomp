@@ -822,7 +822,7 @@ micro_stats_print :: proc(unit: int, programs: []^Vu_Program) {
 vu1_start :: proc(addr: u32) {
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU1, t)
-	if vu1_cap.file != nil {vu_capture(&vu1, addr)}
+	if vu1_cap.on {vu_capture(&vu1, addr)}
 	if vu_check && vu1_lookup(addr & u32(len(vu1_micro) - 1) &~ 7) != nil {
 		vu1_compare(addr)
 		return
@@ -882,6 +882,9 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 				pc, exit = prog.run(pc, &budget)
 			}
 			pc &= mask
+			// A miss capture records where compiled code hands back to
+			// the interpreter with no other program to run (vu_capture).
+			if exit == .Leave && capture_of(v).on {vu_capture(v, pc, prog)}
 			// Left at once from where it was entered: no case label there.
 			when cpu.FALLBACK_COUNT {
 				if compiled && exit == .Leave && pc == entry && budget == before {
@@ -1473,11 +1476,11 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 		return true, branch
 	case 0x24: // JR
 		t := u32(vi[is]) * 8
-		if capture_of(v).file != nil {vu_capture(v, t)}
+		if capture_of(v).on {vu_capture(v, t)}
 		return true, t
 	case 0x25: // JALR
 		t := u32(vi[is]) * 8
-		if capture_of(v).file != nil {vu_capture(v, t)}
+		if capture_of(v).on {vu_capture(v, t)}
 		set_vi(vi, it, u16((pc + 16) / 8))
 		return true, t
 	case 0x28: return vi_branch(v, it, pc) == vi_branch(v, is, pc), branch // IBEQ
@@ -1552,7 +1555,7 @@ vu0_call_micro :: proc(addr: u32) {
 	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU0, t)
-	if vu0_cap.file != nil {vu_capture(&vu0, addr)}
+	if vu0_cap.on {vu_capture(&vu0, addr)}
 	if vu_check && vu0_lookup(addr & u32(len(vu0_micro) - 1) &~ 7) != nil {
 		vu0_compare(addr)
 		return

@@ -8,7 +8,9 @@
 // in a program that reads it (FSEQ, FSAND, FSOR), as compiled code computes
 // it there. Every native run must end the program, no program may call
 // the interpreter but for its status reads, and a run from
-// one of a program's leaves must leave at once. A second pass
+// one of a program's leaves must leave at once. A miss capture of VU1
+// records only what no registered program runs, once across runs
+// (test_miss_capture). A second pass
 // registers the functions as the runtime does (unless VUNATIVE=0) and runs the
 // same trials through vu0_call_micro and vu1_start, which must leave what a
 // direct call leaves; after a write into a program's micro memory, they
@@ -311,9 +313,159 @@ main :: proc() {
 		fmt.eprintln("FAIL vu_native: no program to probe")
 		dispatch_fails += 1
 	}
+	dispatch_fails += test_miss_capture(progs[:], arch)
 	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, %d failing dispatched, MAC changed in %d, VU0 I or D set in %d, VU1 in %d", arch, cases, TRIALS, fails, dispatch_fails, flagged, status_set, vu1_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
 	if vu1_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU1 I or D set in only %d trials", vu1_set); os.exit(1)}
 	if fails > 0 || slow_fails > 0 || dispatch_fails > 0 {os.exit(1)}
+}
+
+// A miss capture (VU_CAPTURE=miss, ps2/vu/capture.odin) of VU1 into a file
+// of its own: a start where a registered program holds records nothing;
+// one where its micro memory differs records the image and the start, once;
+// a reopen (the next run) appends nothing and cuts off a last record cut
+// short; and past CAPTURE_IMAGES images a start records no new image. Into
+// a second file: a compiled program that leaves to a pc outside it records
+// that pc, and so does one that leaves at once from a pair it has no label
+// for (a clamp elision leave). The failures.
+@(private = "file")
+test_miss_capture :: proc(progs: []vu_programs.Prog, arch: native.Arch) -> (fails: int) {
+	fail :: proc(fails: ^int, msg: string) {
+		fmt.eprintln("FAIL vu_native capture:", msg)
+		fails^ += 1
+	}
+	IMAGE :: 9 + 16 * 1024
+	ENTRY :: 13
+	// The file's length and its images; -1 for a record that is not whole.
+	parse :: proc(path: string) -> (n: int, images: int) {
+		data, err := os.read_entire_file(path, context.temp_allocator)
+		if err != nil {return -1, -1}
+		for pos := 0; pos < len(data); {
+			switch data[pos] {
+			case 'I': pos += IMAGE; images += 1
+			case 'E': pos += ENTRY
+			case: return -1, -1
+			}
+			if pos > len(data) {return -1, -1}
+		}
+		return len(data), images
+	}
+	prog: ^vu_programs.Prog
+	nop := -1
+	find: for &p in progs {
+		if p.unit != .VU1 {continue}
+		for w, j in p.words {
+			if j % 2 == 1 && w == vu_programs.NOP_U {prog, nop = &p, j; break find}
+		}
+	}
+	if prog == nil {
+		fail(&fails, "no VU1 program with an upper NOP")
+		return
+	}
+	dir, err := os.make_directory_temp("", "ps_vu_capture_*", context.temp_allocator)
+	if err != nil {
+		fail(&fails, fmt.tprint("no temp directory:", err))
+		return
+	}
+	path := fmt.tprintf("%s/vu1.cap", dir)
+	_ = os.set_env(core.env_name("VU1_CAPTURE"), path)
+	_ = os.set_env(core.env_name("VU_CAPTURE"), "miss")
+	defer {
+		os.unset_env(core.env_name("VU1_CAPTURE"))
+		os.unset_env(core.env_name("VU_CAPTURE"))
+		vu.vu_capture_reopen()
+		_ = os.remove_all(dir)
+	}
+	micro := ([^]u32)(&vu.vu1.micro[0])[:len(vu.vu1.micro) / 4]
+	// Load the program, with its upper NOP given dest bits (still a NOP,
+	// but no registered program holds it) unless dest is 0, and the last
+	// word of micro memory, outside every program, set to tag.
+	start :: proc(micro: []u32, prog: ^vu_programs.Prog, nop: int, dest, tag: u32) {
+		for &m in micro {m = 0}
+		copy(micro, prog.words)
+		micro[nop] = vu_programs.NOP_U | dest << 21
+		micro[len(micro) - 1] = tag
+		vu.vu1_micro_touch()
+		vu.vu1_start(prog.pcs[0])
+	}
+	vu.vu_capture_reopen()
+	start(micro, prog, nop, 0, 0)
+	// The file is made at the first record, so none exists yet.
+	if os.exists(path) {fail(&fails, "a start a program runs made a capture file")}
+	start(micro, prog, nop, 15, 0)
+	n, images := parse(path)
+	if n < IMAGE + ENTRY || images != 1 || (n - IMAGE) % ENTRY != 0 {fail(&fails, fmt.tprintf("a start no program runs left %d bytes, %d images", n, images))}
+	start(micro, prog, nop, 15, 0)
+	if again, _ := parse(path); again != n {fail(&fails, fmt.tprintf("the same start again grew the file from %d to %d bytes", n, again))}
+	vu.vu_capture_reopen()
+	start(micro, prog, nop, 15, 0)
+	if again, _ := parse(path); again != n {fail(&fails, fmt.tprintf("a second run grew the file from %d to %d bytes", n, again))}
+	// A last record cut short, then a reopen and a new image: the cut is gone.
+	if f, e := os.open(path, {.Write, .Append}); e == nil {
+		os.write(f, []u8{'E', 1, 2, 3, 4})
+		_ = os.close(f)
+	}
+	vu.vu_capture_reopen()
+	start(micro, prog, nop, 14, 0)
+	grown, more := parse(path)
+	if grown < n + IMAGE + ENTRY || more != 2 {fail(&fails, fmt.tprintf("after a cut record: %d bytes, %d images, want whole records past %d and 2 images", grown, more, n))}
+	// Images up to the cap, then one more, which runs but is not recorded.
+	for tag in 1 ..= u32(vu.CAPTURE_IMAGES - 2) {start(micro, prog, nop, 15, tag)}
+	if _, full := parse(path); full != vu.CAPTURE_IMAGES {fail(&fails, fmt.tprintf("%d images, want %d", full, vu.CAPTURE_IMAGES))}
+	at_cap, _ := parse(path)
+	start(micro, prog, nop, 15, max(u32))
+	if past, _ := parse(path); past != at_cap {fail(&fails, fmt.tprintf("past the cap the file grew from %d to %d bytes", at_cap, past))}
+
+	// The pcs of the file's entries, in order.
+	entries :: proc(path: string) -> (pcs: [dynamic]u32) {
+		pcs.allocator = context.temp_allocator
+		data, _ := os.read_entire_file(path, context.temp_allocator)
+		for pos := 0; pos < len(data); {
+			if data[pos] == 'E' && pos + ENTRY <= len(data) {append(&pcs, u32((^u32le)(&data[pos + 9])^))}
+			pos += data[pos] == 'I' ? IMAGE : ENTRY
+		}
+		return
+	}
+	path = fmt.tprintf("%s/vu1-leave.cap", dir)
+	_ = os.set_env(core.env_name("VU1_CAPTURE"), path)
+	vu.vu_capture_reopen()
+	// vi1 = TARGET / 8, then JR vi1 to a pair outside the program, which
+	// ends there; compiled with its start as its only entry.
+	TARGET :: 0x100
+	words := []u32 {
+		vu_programs.lower_op(vu_programs.IADDIU, 0, 1, 0, TARGET / 8), vu_programs.NOP_U,
+		vu_programs.lower_op(vu_programs.JR, 0, 0, 1, 0), vu_programs.NOP_U,
+		vu_programs.NOP_L, vu_programs.NOP_U,
+	}
+	a := native.make_asm(arch, r5900.native_ram())
+	off := u32(rvu.native_program(&a, words, nil, []u32{0}, .VU1, false))
+	code, err2 := core.native_load(native.make_blob(&a, nil, {}, []native.Blob_Span{{.Vu1, 0, off, []native.Blob_Range{{0, words}}}}), ps2.native_imports())
+	if err2 != "" {
+		fail(&fails, fmt.tprint("native_load:", err2))
+		return
+	}
+	vu.vu_register_native(1, {{0, words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.spans[0].off)))
+	for &m in micro {m = 0}
+	copy(micro, words)
+	micro[TARGET / 4], micro[TARGET / 4 + 1] = vu_programs.NOP_L, vu_programs.NOP_U | vu_programs.E_BIT
+	micro[TARGET / 4 + 2], micro[TARGET / 4 + 3] = vu_programs.NOP_L, vu_programs.NOP_U
+	vu.vu1_micro_touch()
+	vu.vu1_start(0)
+	if pcs := entries(path); len(pcs) != 1 || pcs[0] != TARGET {fail(&fails, fmt.tprintf("a leave to %04x outside the program recorded %v", TARGET, pcs[:]))}
+	// A clamp elision leave: the program runs there, but leaves at once.
+	elided := false
+	for &p in progs {
+		if p.unit != .VU1 || len(p.leaves) == 0 {continue}
+		for &m in micro {m = 0}
+		copy(micro, p.words)
+		vu.vu1_micro_touch()
+		vu.vu1_start(p.leaves[0])
+		pcs := entries(path)
+		if len(pcs) != 2 || pcs[1] != p.leaves[0] {fail(&fails, fmt.tprintf("a leave at once from %04x recorded %v", p.leaves[0], pcs[:]))}
+		elided = true
+		break
+	}
+	if !elided && rvu.VU_CLAMP_ELIDE {fail(&fails, "no VU1 program with a leave")}
+	return
 }
