@@ -21,8 +21,18 @@
 // each file the module wrote, and ring.pcm (every sample it queued), to
 // `file/<name>`, then window.testState() to `result`, both on the same
 // origin (tests/wasi/serve.py --play).
+//
+// Netplay, &net=<room>&player=1|2 (tests/wasi/serve.py --net): the module
+// plays that slot of a two-player session (PS_NET_PEER=<room>,
+// PS_NET_PLAYER), and its datagrams go over a WebRTC data channel to the
+// page with the other slot, found through the server's /signal in that
+// room. Host candidates only, no STUN, and /signal answers loopback only:
+// both pages on one machine.
+// In test mode the files go to `file/p<N>/<name>` and the state to
+// `result?player=<N>`.
 import { SCANCODE_OF_CODE } from "./keys.js";
-import { AUDIO, CONTROL, EV, PAD, PRESENT } from "./layout.js";
+import { AUDIO, CONTROL, EV, NET, PAD, PRESENT } from "./layout.js";
+import { serveLink } from "./net.js";
 import { Present } from "./present.js";
 import { forget, storedNames } from "./readers.js";
 
@@ -33,8 +43,20 @@ const errors = [];
 const violation = (e) => errors.push(`csp: ${e.effectiveDirective} blocked ${e.blockedURI || "inline"}`);
 document.addEventListener("securitypolicyviolation", violation);
 
+// The worker posts its output a line at a time, thousands of lines while a
+// game boots. Each line is appended as its own text node, and the log
+// scrolls at most once a frame (tick): scrolling reads the log's height,
+// which lays out the whole log, so doing it per line made the page's thread
+// fall seconds behind and starved netplay's data channel.
+let logMoved = false;
 function log(text) {
-	$("log").textContent += text;
+	$("log").append(text);
+	logMoved = true;
+}
+
+function scrollLog() {
+	if (!logMoved) return;
+	logMoved = false;
 	$("log").scrollTop = $("log").scrollHeight;
 }
 
@@ -90,6 +112,100 @@ function makeShared() {
 	Atomics.store(P, PRESENT.READING_WORD, -1);
 }
 
+// ---- netplay ----
+
+const netRoom = params.get("net");
+const netPlayer = params.get("player") ?? "1";
+let netLink = null;
+
+// The signal server's queue for this page: post sends a message to the
+// other page, next waits for one from it.
+function signalBox() {
+	const url = `signal?room=${encodeURIComponent(netRoom)}&peer=${netPlayer}`;
+	return {
+		async post(m) {
+			const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(m) });
+			if (!r.ok) throw new Error(`net: signal: ${r.status}`);
+		},
+		async next() {
+			for (;;) {
+				const r = await fetch(url);
+				if (r.status === 200) return r.json();
+				if (r.status !== 204) throw new Error(`net: signal: ${r.status}`);
+			}
+		},
+	};
+}
+
+// connect for serveLink (web/net.js): a data channel to the other page,
+// unordered and never resent, as UDP. Player 1 offers, player 2 answers;
+// each sends its description once ICE gathering is done, so the candidates
+// go with it.
+async function connectPeer(_bind, _peer, deliver) {
+	const box = signalBox();
+	const pc = new RTCPeerConnection({ iceServers: [] });
+	const gathered = () =>
+		new Promise((resolve) => {
+			const check = () => pc.iceGatheringState === "complete" && resolve();
+			pc.addEventListener("icegatheringstatechange", check);
+			check();
+		});
+	let channel;
+	const wire = (c) => {
+		channel = c;
+		c.binaryType = "arraybuffer";
+		c.onmessage = (e) => deliver(new Uint8Array(e.data));
+	};
+	if (netPlayer === "1") {
+		wire(pc.createDataChannel("net", { ordered: false, maxRetransmits: 0 }));
+		await pc.setLocalDescription(await pc.createOffer());
+		await gathered();
+		await box.post({ sdp: pc.localDescription });
+		await pc.setRemoteDescription((await box.next()).sdp);
+	} else {
+		const offered = new Promise((resolve) => pc.addEventListener("datachannel", (e) => resolve(e.channel), { once: true }));
+		await pc.setRemoteDescription((await box.next()).sdp);
+		await pc.setLocalDescription(await pc.createAnswer());
+		await gathered();
+		await box.post({ sdp: pc.localDescription });
+		wire(await offered);
+	}
+	if (channel.readyState !== "open") {
+		await new Promise((resolve, reject) => {
+			channel.onopen = resolve;
+			channel.onclose = () => reject(new Error("net: the data channel closed before it opened"));
+		});
+	}
+	channel.onclose = () => log("net: the data channel closed\n");
+	return {
+		// A datagram the channel cannot take now is dropped, as a socket's
+		// would be; the protocol resends.
+		send(d) {
+			if (channel.readyState === "open" && channel.bufferedAmount < 1 << 16) channel.send(d);
+		},
+		close() {
+			pc.close();
+		},
+	};
+}
+
+// The NET buffer for the Worker, and the link that serves it; env gets
+// the module's netplay settings. Throws when the page cannot play.
+function startNet(env) {
+	if (!crossOriginIsolated) throw new Error("net: the page is not cross-origin isolated, so netplay cannot run");
+	if (!/^[\w-]{1,64}$/.test(netRoom)) throw new Error(`net: not a room name: ${netRoom}`);
+	if (netPlayer !== "1" && netPlayer !== "2") throw new Error(`net: player ${netPlayer} is not 1 or 2`);
+	const buffer = new SharedArrayBuffer(NET.SIZE);
+	netLink = serveLink(buffer, connectPeer);
+	netLink.done.catch((e) => {
+		errors.push(String(e?.message ?? e));
+		log(`${e?.message ?? e}\n`);
+	});
+	env.PS_NET_PEER = netRoom;
+	env.PS_NET_PLAYER = netPlayer;
+	return buffer;
+}
+
 // ---- the disc ----
 
 let files = [];
@@ -129,7 +245,7 @@ async function showStored() {
 		play.type = "button";
 		play.textContent = `Play ${name} (stored)`;
 		play.disabled = worker !== null;
-		play.addEventListener("click", () => start({ wasm: "play.wasm", args: [`/disc/${name}`], stored: name }));
+		play.addEventListener("click", () => playStored(name));
 		const drop = document.createElement("button");
 		drop.type = "button";
 		drop.textContent = "Forget";
@@ -139,6 +255,63 @@ async function showStored() {
 		return li;
 	}));
 	list.hidden = names.length === 0;
+}
+
+// The build's commit (commit.txt), null for a dev build (-dirty) or none:
+// play keys stored native code by it and stores none for a dev build.
+let commit = null;
+
+// Plays a stored disc. First a Worker runs `play --convert-store`, which
+// converts the disc's code to native code and stores it in /data unless
+// this build's is there already; then the game starts and takes it.
+// While it converts the page shows the time so far and Skip, which stops
+// the conversion and plays the disc interpreted now; it is tried again on
+// the next Play. A failed conversion stores nothing (failSaves: false)
+// and the game starts interpreted. Once the Worker says {saving} it is
+// writing /data, so Skip goes away and the page waits for it.
+function playStored(name) {
+	const play = () => start({ wasm: "play.wasm", args: [`/disc/${name}`], stored: name });
+	if (commit === null) return play();
+	$("start").disabled = true;
+	for (const b of $("stored").querySelectorAll("button")) b.disabled = true;
+	const box = $("convert");
+	const skip = $("skip");
+	const t0 = performance.now();
+	let last = "";
+	const show = () => ($("convert-text").textContent =
+		`Converting ${name} to native code (${Math.round((performance.now() - t0) / 1000)} s)${last ? `: ${last}` : ""}`);
+	const timer = setInterval(show, 1000);
+	const conv = new Worker("play-worker.js", { type: "module" });
+	let over = false;
+	const finish = (note) => {
+		if (over) return;
+		over = true;
+		clearInterval(timer);
+		conv.terminate();
+		box.hidden = true;
+		skip.onclick = null;
+		play(); // clears the log, so the note goes after
+		if (note) log(note);
+	};
+	conv.onmessage = ({ data }) => {
+		if (data.log !== undefined) {
+			const line = data.log.trim().split("\n").pop();
+			if (line) last = line;
+			show();
+		} else if (data.saving !== undefined) {
+			skip.hidden = true;
+		} else if (data.done !== undefined) {
+			finish(data.done.code === 0 ? "" : `The native code was not made (${last || `exit ${data.done.code}`}); this run is interpreted.\n`);
+		} else if (data.error !== undefined) {
+			finish(`The native code was not made (${data.error.split("\n")[0]}); this run is interpreted.\n`);
+		}
+	};
+	conv.onerror = (e) => finish(`The native code was not made (${e.message || "worker failed to load"}); this run is interpreted.\n`);
+	skip.hidden = false;
+	skip.onclick = () => finish("Conversion skipped; this run is interpreted.\n");
+	show();
+	box.hidden = false;
+	conv.postMessage({ wasm: "play.wasm", args: ["--convert-store", `/disc/${name}`], stored: name, failSaves: false, ...shared });
 }
 
 // The Worker's word on the disc: stored, or why not.
@@ -367,11 +540,16 @@ function tick() {
 		}
 	}
 	pollPads();
+	scrollLog();
 	requestAnimationFrame(tick);
 }
 
 // msg: {wasm, args} plus {files} or {urls}, and in test mode {env, test}.
 function start(msg) {
+	if (netRoom !== null) {
+		msg = { ...msg, env: { ...msg.env } };
+		msg.net = startNet(msg.env);
+	}
 	$("start").disabled = true;
 	$("log").textContent = "";
 	const canvas = $("screen");
@@ -404,6 +582,7 @@ async function testState() {
 		store: storeInfo,
 		firstPresentMs,
 		files: written.map(([name, bytes]) => ({ name, size: bytes.length })),
+		net: netLink && { player: netPlayer, ...netLink.stats },
 		log: $("log").textContent,
 		errors: [...errors],
 		userAgent: navigator.userAgent,
@@ -411,7 +590,10 @@ async function testState() {
 }
 
 async function main() {
-	fetch("commit.txt").then((r) => (r.ok ? r.text() : "?")).then((t) => ($("sha").textContent = t.trim()));
+	fetch("commit.txt").then((r) => (r.ok ? r.text() : "?")).then((t) => {
+		$("sha").textContent = t.trim();
+		commit = /^[0-9a-f]{40}$/.test(t.trim()) ? t.trim() : null;
+	});
 	if (!(await isolate())) {
 		if (test) await postReport({ isolated: crossOriginIsolated, errors, userAgent: navigator.userAgent });
 		return;
@@ -483,16 +665,17 @@ async function selfTest(limit, input) {
 	while (!over()) await sleep(100);
 	await sleep(1000); // the last log lines
 	const report = await testState();
+	const dir = netRoom !== null ? `p${netPlayer}/` : "";
 	for (const [name, bytes] of written) {
-		const r = await fetch(`file/${encodeURIComponent(name)}`, { method: "POST", body: bytes }).catch((e) => e);
-		if (!r.ok) report.errors.push(`file/${name}: ${r.status ?? r.message}`);
+		const r = await fetch(`file/${dir}${encodeURIComponent(name)}`, { method: "POST", body: bytes }).catch((e) => e);
+		if (!r.ok) report.errors.push(`file/${dir}${name}: ${r.status ?? r.message}`);
 	}
 	await postReport(report);
 }
 
 // Test mode's report, to tests/wasi/serve.py.
 async function postReport(report) {
-	await fetch("result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report) })
+	await fetch(netRoom !== null ? `result?player=${encodeURIComponent(netPlayer)}` : "result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report) })
 		.catch(() => {});
 }
 

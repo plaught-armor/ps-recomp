@@ -1,6 +1,6 @@
 // The SharedArrayBuffers between the play page (main thread), its Worker
-// (web/sdl.js) and the audio worklet (web/audio.js). The page makes all
-// three before the Worker starts. Offsets are in bytes unless named WORD.
+// (web/sdl.js, web/net.js) and the audio worklet (web/audio.js). The page
+// makes them all before the Worker starts. Offsets are in bytes unless named WORD.
 
 // Control: input from the page. Main writes pads and pushes events; the
 // Worker reads them when SDL_PollEvent finds its own queue empty.
@@ -78,6 +78,38 @@ export const PRESENT = {
 };
 PRESENT.TEXTURES = PRESENT.CMDS + PRESENT.CMD_WORDS * 4 * PRESENT.CMDS_MAX;
 PRESENT.SIZE = PRESENT.SLOTS + PRESENT.SLOT_COUNT * PRESENT.SLOT_SIZE;
+
+// Net: netplay's datagrams, between the module's ps_net imports and the
+// link to the peer (web/net.js). The module writes CONFIG ("bind\npeer",
+// CONFIG_LEN bytes) and stores STATE = ASKED; the link stores OPEN or
+// FAILED, and the module stores CLOSED at the end. OUT (module to link) and
+// IN (link to module) are rings of SLOTS datagrams, each slot a u32 length
+// then the bytes; WRITE and READ are running counts, each moved by one side.
+// A full ring drops the datagram, as a socket would.
+export const NET = {
+	STATE_WORD: 0,
+	CONFIG_LEN_WORD: 1,
+	OUT_WRITE_WORD: 2,
+	OUT_READ_WORD: 3,
+	IN_WRITE_WORD: 4,
+	IN_READ_WORD: 5,
+	HEADER: 64,
+	CONFIG: 64,
+	CONFIG_MAX: 448,
+	OUT: 512,
+	SLOTS: 256, // a power of two
+	SLOT_SIZE: 1536,
+	DATAGRAM_MAX: 1532, // core/net.odin DATAGRAM_MAX
+	// STATE values.
+	IDLE: 0,
+	ASKED: 1,
+	OPEN: 2,
+	FAILED: 3,
+	CLOSED: 4,
+	OPEN_MS: 60000, // how long open waits for the link
+};
+NET.IN = NET.OUT + NET.SLOTS * NET.SLOT_SIZE;
+NET.SIZE = NET.IN + NET.SLOTS * NET.SLOT_SIZE;
 
 // Commands: CLEAR r g b a; FILL r g b a blend x y w h; COPY texture alpha
 // blend sx sy sw sh dx dy dw dh.
