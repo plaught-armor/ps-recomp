@@ -455,7 +455,9 @@ th_flat_run :: proc(t: ^Iop_Thread) {
 		// again by id, not trusted past it.
 		id := t.id
 		if r3000.flat_run(f.run) {
-			if now := th_find(id); now != nil {th_end(now)}
+			now := th_find(id)
+			assert(now != nil, "iop: the running thread gone during its run")
+			th_end(now)
 		}
 	}
 }

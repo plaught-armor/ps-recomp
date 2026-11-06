@@ -1,11 +1,12 @@
-// An IOP start that creates more threads than iop_sched.threads holds, so
-// the array grows while the start runs. Once the start returns it is
-// removed, its stack freed, and the threads it created stay, dormant. Both
-// models must end alike: the coroutine model (a default build) and FLAT
-// (-define:PS_FLAT=true), whose run once ended the start through the
-// thread's pointer from before the growth, into the freed array, so the
-// start stayed in the live one, running, with its stack. The thread count
-// is printed so the two builds' output can be compared.
+// A run that creates more threads than iop_sched.threads holds, so the
+// array grows while it runs: an IOP start, and a thread the start creates
+// and starts. Once the start returns it is removed, its stack freed; once
+// the thread returns it is dormant; the threads they created stay, dormant.
+// Both models must end alike: the coroutine model (a default build) and
+// FLAT (-define:PS_FLAT=true), whose run once ended the thread through its
+// pointer from before the growth, into the freed array, so the thread
+// stayed in the live one, running. The thread counts are printed so the
+// two builds' output can be compared.
 package main
 
 import "core:encoding/endian"
@@ -123,13 +124,31 @@ build_mod :: proc(name: string, a: ^Asm, entry: u32) -> []u8 {
 	return f
 }
 
-game :: proc(_: rawptr) {
+LW_A0_T0 :: 0x8d040000 // lw a0, 0(t0)
+SW_V0_T0 :: 0xad020000 // sw v0, 0(t0)
+
+// Code that creates n threads of entry `idle` from param `p`.
+create_n :: proc(a: ^Asm, tb, p: u32, n: int) {
+	for _ in 0 ..< n {
+		la(a, A0, p)
+		jal(a, tb)
+	}
+}
+
+// The threads are all dormant and none is a start.
+all_dormant :: proc(what: string) {
+	for t in iop.iop_sched.threads {
+		check(!t.start, fmt.tprintf("%s: the start thread is removed", what))
+		check(t.status == .Dormant, fmt.tprintf("%s: thread %d is %v, want dormant", what, t.id, t.status))
+	}
+}
+
+// "modg": the start creates N threads of one idle entry, starts none, and
+// returns 0.
+case_start :: proc() {
 	s := &iop.iop_sched
 	iop.sys_init()
 	iop.iop_loader_init()
-
-	// "modg": the start creates N threads of one idle entry, starts none,
-	// and returns 0.
 	a: Asm
 	tb := imports(&a, "thbase", 4)
 	idle := at(&a)
@@ -137,22 +156,60 @@ game :: proc(_: rawptr) {
 	p := thread_param(&a, idle, 20)
 	entry := at(&a)
 	prologue(&a)
-	for _ in 0 ..< N {
-		la(&a, A0, p)
-		jal(&a, tb)
-	}
+	create_n(&a, tb, p, N)
 	put(&a, 0x24000000 | V0 << 16) // li v0, 0
 	epilogue(&a)
-	check(cap(s.threads) < N + 1, "grow: the start's run must grow the array")
+	check(cap(s.threads) < N + 1, "start: the start's run must grow the array")
 	id, r := iop.iop_load(build_mod("modg", &a, entry), "modg", nil)
-	check(id > 0 && r == 0, "grow: modg loads")
-	fmt.printfln("threads %d", len(s.threads))
-	check(len(s.threads) == N, fmt.tprintf("grow: %d threads, want the start's %d", len(s.threads), N))
-	for t in s.threads {
-		check(!t.start, "grow: the start thread is removed")
-		check(t.status == .Dormant, fmt.tprintf("grow: thread %d is %v, want dormant", t.id, t.status))
-	}
+	check(id > 0 && r == 0, "start: modg loads")
+	fmt.printfln("start: threads %d", len(s.threads))
+	check(len(s.threads) == N, fmt.tprintf("start: %d threads, want the start's %d", len(s.threads), N))
+	all_dormant("start")
+}
 
+// "modh": the start creates and starts thread A and returns 0; A creates n
+// threads of one idle entry and returns. sys_init clears the threads but
+// keeps the array's capacity, so n is that capacity: A and its n threads
+// do not fit, and the array grows during A's run.
+case_thread :: proc() {
+	s := &iop.iop_sched
+	iop.sys_init()
+	iop.iop_loader_init()
+	n := max(N, cap(s.threads))
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	th := at(&a)
+	put(&a, 0)
+	idle := at(&a)
+	put(&a, JR_RA, 0)
+	p := thread_param(&a, idle, 20)
+	body := at(&a)
+	prologue(&a)
+	create_n(&a, tb, p, n)
+	epilogue(&a)
+	pa := thread_param(&a, body, 20)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, pa)
+	jal(&a, tb)
+	la(&a, T0, th)
+	put(&a, SW_V0_T0)
+	put(&a, LW_A0_T0)
+	put(&a, 0x24000000 | 5 << 16) // li a1, 0
+	jal(&a, tb + 8)
+	put(&a, 0x24000000 | V0 << 16) // li v0, 0
+	epilogue(&a)
+	check(cap(s.threads) < n + 1, "thread: A's run must grow the array")
+	id, r := iop.iop_load(build_mod("modh", &a, entry), "modh", nil)
+	check(id > 0 && r == 0, "thread: modh loads")
+	fmt.printfln("thread: threads %d", len(s.threads))
+	check(len(s.threads) == n + 1, fmt.tprintf("thread: %d threads, want A and its %d", len(s.threads), n))
+	all_dormant("thread")
+}
+
+game :: proc(_: rawptr) {
+	case_start()
+	case_thread()
 	if failed {os.exit(1)}
 	fmt.println("ok iop_thread_grow")
 	os.exit(0)
