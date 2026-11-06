@@ -336,6 +336,8 @@ play :: proc(image: string) -> int {
 		native_failed  = native_failed,
 		learned        = learned,
 		learned_failed = learned_failed,
+		mods           = core.disc_path(dir, .Mods),
+		disc_id        = id,
 	}
 	for &c, i in b.cards {
 		c, _ = filepath.join({cards, fmt.tprintf("slot%d.mcd", i + 1)})

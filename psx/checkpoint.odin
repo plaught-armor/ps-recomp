@@ -34,6 +34,8 @@ Checkpoint :: struct {
 	// every page the pass changed was kept.
 	ram_check:  [RAM_SIZE when RAM_KEEP_CHECK else 0]u8,
 	scratch:    [cpu.SCRATCH_SIZE]u8,
+	// The mod region (cpu.mod_ram), whole; nil with no mods.
+	mods:       []u8,
 	vram:       [render.VRAM_W * render.VRAM_H]u16,
 	// The hi-res target's saved picture, and the depth and world undo.
 	pass:       render.Pass,
@@ -55,6 +57,8 @@ Checkpoint :: struct {
 }
 
 // Memory as one game frame's drawing found it, for replaying that drawing.
+// The mod region is left out: a replay runs mod hooks on the mods' memory
+// as it is, and the pass around draw_start_load puts the region back.
 Draw_Start :: struct {
 	ram:     [cpu.RAM_SIZE]u8,
 	// ram's page versions (ram_ver).
@@ -138,6 +142,11 @@ checkpoint_save :: proc(cp: ^Checkpoint) -> bool {
 		cp.ram_check = ram
 	}
 	cp.scratch = cpu.scratch
+	if len(cp.mods) != len(cpu.mod_ram) {
+		delete(cp.mods)
+		cp.mods = make([]u8, len(cpu.mod_ram)) if cpu.mod_ram != nil else nil
+	}
+	copy(cp.mods, cpu.mod_ram)
 	cp.vram = render.vram
 	cp.pass.hi_tiles = 0
 	cp.pass.hi_swapped = false
@@ -196,6 +205,7 @@ checkpoint_restore :: proc(cp: ^Checkpoint) {
 	// ram_put_back wrote behind the guard: compare learned code again.
 	cpu.learned_epoch += 1
 	cpu.scratch = cp.scratch
+	copy(cpu.mod_ram, cp.mods)
 	render.vram = cp.vram
 	if cp.pass.hi_swapped && render.hi_saved(&cp.pass) {
 		render.targets[1].rgb, cp.pass.hi = cp.pass.hi, render.targets[1].rgb

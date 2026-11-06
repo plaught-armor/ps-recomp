@@ -156,6 +156,27 @@ except when it is called from inside a hook: then it runs in that hook's
 frozen time.
 An install error leaves nothing installed.
 
+On PS1, `play` loads the mods in the disc's data directory, `mods/`
+(`psx.mods_load`, after the port's `hooks`): every subdirectory with a
+`mod.tsv` is a mod, its code in `mod.elf` beside it. An optional
+`mods/mods.tsv` lists mod ids, one a line, in the order the user wants
+them; dependencies and `before`/`after` still come first. A manifest's
+`disc`, when set, names the disc id or its serial; another disc gets a
+warning and the mod loads anyway. Any load error stops the boot.
+
+`mod.elf` is a 32-bit little-endian MIPS executable linked inside the mod
+region, 0x1f400000 up to 4 MiB (physical; expansion 1, which no PS1 game
+uses). Its `.mod_hooks` section holds nine-word records: the kind (0
+before, 1 after, 2 replace), the hooked function's key (slot, id,
+address, four code words) and the mod function's address, which must lie
+in the ELF's segments. The region holds the mods' images where they are
+linked, a guard word, then the 16 KiB mods' stack; two mods whose images
+overlap are a load error naming both. With no mods there is no region and
+the bus is as before. Mod code runs interpreted, and LEARN skips it. A
+checkpoint pass saves and puts back the whole region; RAM dumps leave it
+out. A hook that writes the guard (overflows the stack) is fatal when it
+returns.
+
 Limits:
 
 - Only calls are hooked. A jump the interpreter steps into enters the

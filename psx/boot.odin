@@ -45,6 +45,10 @@ Boot :: struct {
 	learned_failed: proc(),
 	// The memory card images (bios.card_files); left empty, the runtime's.
 	cards:         [2]string,
+	// The game's mods directory ("" none; mods_load) and the disc's id,
+	// which a mod's manifest may name.
+	mods:          string,
+	disc_id:       string,
 	// The port's own steps, each stopping the boot on false: `setup` before
 	// the window opens, `hooks` once the game's functions (native ones
 	// included) are registered, where the port installs its replacements
@@ -109,6 +113,8 @@ run :: proc(b: Boot) -> bool {
 	}
 	if b.hooks != nil {b.hooks() or_return}
 	cpu.watch_code()
+	// After every other hook, so a mod wraps the port's.
+	mods_load(b.mods, b.disc_id) or_return
 
 	io.events_init()
 	spu.spu_init()

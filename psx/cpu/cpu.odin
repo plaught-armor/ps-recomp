@@ -300,7 +300,8 @@ run_learned :: proc(addr: u32) -> bool {
 interpret :: proc(addr: u32) {
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	when core.COMPAT_COUNT {core.compat_entry(addr)}
-	if !core.learn_on(learn_cpu) {
+	// A mod region run is not noted: learned code is the game's only.
+	if !core.learn_on(learn_cpu) || mod_ram_has(addr) {
 		interp_run(addr)
 		return
 	}

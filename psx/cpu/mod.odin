@@ -57,7 +57,8 @@ package psx_cpu
 import "core:fmt"
 import "ps:core"
 
-// Top of the stack before and after hooks run on: set before mod_install.
+// Top of the stack before and after hooks run on: set before mod_install
+// (mod_ram_load sets the mod region's).
 // A hook called while one runs (a hook's call to a hooked function) goes
 // on below that hook's stack pointer.
 mod_sp: u32
@@ -343,6 +344,7 @@ mod_call :: proc(fn: u32) {
 	mod_depth += 1
 	call(fn)
 	mod_depth -= 1
+	mod_ram_check(fn)
 	// An event the hook scheduled or an interrupt it raised (a device it
 	// wrote) lowered next_event, or came due and was held: run_events
 	// then runs as the game goes on, and handles what is due.

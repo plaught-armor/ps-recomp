@@ -330,6 +330,21 @@ load_slow :: proc(a: u32, size: u32) -> u32 {
 		return io_read(p, size)
 	case p >= 0x1fc00000 && p < 0x1fc80000:
 		return 0
+	case p - MOD_BASE < u32(len(mod_ram)):
+		o := p - MOD_BASE
+		if o > u32(len(mod_ram)) - size {
+			// As at the scratchpad's end: byte by byte.
+			v: u32
+			for j in 0 ..< size {v |= load_slow(a + j, 1) << (8 * j)}
+			return v
+		}
+		switch size {
+		case 4:
+			return u32((^u32le)(&mod_ram[o])^)
+		case 2:
+			return u32((^u16le)(&mod_ram[o])^)
+		}
+		return u32(mod_ram[o])
 	case a == 0xfffe0130:
 		return 0
 	case io_far_read != nil:
@@ -363,6 +378,20 @@ store_slow :: proc(a, v: u32, size: u32) {
 		}
 	case p >= 0x1f801000 && p < 0x1f803000:
 		io_write(p, v, size)
+	case p - MOD_BASE < u32(len(mod_ram)):
+		o := p - MOD_BASE
+		if o > u32(len(mod_ram)) - size {
+			for j in 0 ..< size {store_slow(a + j, v >> (8 * j) & 0xff, 1)}
+			return
+		}
+		switch size {
+		case 4:
+			(^u32le)(&mod_ram[o])^ = u32le(v)
+		case 2:
+			(^u16le)(&mod_ram[o])^ = u16le(v)
+		case:
+			mod_ram[o] = u8(v)
+		}
 	case a == 0xfffe0130:
 	case io_far_write != nil:
 		io_far_write(p, v, size)
