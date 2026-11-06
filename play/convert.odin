@@ -130,7 +130,8 @@ compile_mods :: proc(dir, out: string) -> int {
 	return 0
 }
 
-// Convert the disc image in a child of this executable and store the blob
+// Convert the disc image in a child of this executable (in this process in
+// a wasm32 build: convert_here) and store the blob
 // in the disc directory dir, its key naming the VU captures and the hooked
 // set it was compiled with (native_captures). The child's output goes to
 // stderr as it comes,
@@ -147,7 +148,6 @@ convert_store :: proc(image, dir: string, ps2_disc: bool, deadline: time.Duratio
 	// The hooked set's file, for the child's recomp option mod_hooks: written
 	// whole beside it, then renamed, so the child never reads part of one.
 	hooks := strings.concatenate({tmp, ".hooks"}, context.temp_allocator)
-	args := [6]string{"--convert", image, tmp, caps[0], caps[1], hooks}
 	n := 5
 	if text != "" {
 		part := strings.concatenate({hooks, ".part"}, context.temp_allocator)
@@ -161,9 +161,63 @@ convert_store :: proc(image, dir: string, ps2_disc: bool, deadline: time.Duratio
 		n = 6
 	}
 	defer if n == 6 {os.remove(hooks)}
-	blob := child_blob(args[:n], tmp, "native code", "conversion", deadline) or_return
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		blob := convert_here(image, tmp, caps, hooks if n == 6 else "") or_return
+	} else {
+		args := [6]string{"--convert", image, tmp, caps[0], caps[1], hooks}
+		blob := child_blob(args[:n], tmp, "native code", "conversion", deadline) or_return
+	}
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, .Native, set)
+}
+
+// convert_store's conversion in a wasm32 build, which cannot start a
+// child: in this process, to tmp, read back. A failure exits with status
+// 1 (convert), so this process does nothing else (`play --convert-store`):
+// it leaves tmp, which the next conversion removes first, and no key.
+@(private = "file")
+convert_here :: proc(image, tmp: string, caps: [2]string, hooks: string) -> ([]u8, bool) {
+	os.remove(tmp)
+	defer os.remove(tmp)
+	if convert(image, tmp, caps[0], caps[1], hooks) != 0 {
+		fmt.eprintln("play: no native code (the conversion failed)")
+		return nil, false
+	}
+	blob, err := os.read_entire_file(tmp, context.allocator)
+	if err != nil || !core.blob_valid(blob) {
+		delete(blob)
+		fmt.eprintln("play: no native code (the conversion wrote no valid blob)")
+		return nil, false
+	}
+	return blob, true
+}
+
+// `play --convert-store <disc image>`: the native blob of the disc image
+// stored in its directory, converted unless one this build can run is
+// there already. A wasm32 build's play runs only a stored blob (and only a
+// PS2 disc's), so the play page runs this first, in its own instance: the
+// conversion's memory is not the game's. 0 when a blob is stored, 1 when
+// none is (a dev build stores none it would use).
+convert_store_mode :: proc(image: string) -> int {
+	id, cnf, _, ok := identify(image)
+	if !ok {return 1}
+	dir, has_dir := core.disc_dir(id)
+	if !has_dir {return 1}
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		if !cnf.ps2 {
+			fmt.eprintln("play: a wasm32 build runs native code for a PS2 disc only")
+			return 1
+		}
+	}
+	if core.COMMIT == "dev" {
+		fmt.eprintln("play: a dev build stores no native code it would run")
+		return 1
+	}
+	if native_cached(dir, cnf.ps2) {
+		fmt.eprintln("play: the native code is stored already")
+		return 0
+	}
+	return 0 if convert_store(image, dir, cnf.ps2, 0) else 1
 }
 
 // Whether the disc directory dir holds a native blob this build can run,

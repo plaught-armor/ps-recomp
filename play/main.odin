@@ -74,6 +74,8 @@ run :: proc(args: []string) -> int {
 		return launcher(args[0])
 	case (len(args) == 6 || len(args) == 7) && args[1] == "--convert":
 		return convert(args[2], args[3], args[4], args[5], args[6] if len(args) == 7 else "")
+	case len(args) == 3 && args[1] == "--convert-store":
+		return convert_store_mode(args[2])
 	case len(args) == 7 && args[1] == "--convert-vu":
 		if !midload_child(args[6]) {return 1}
 		return convert(args[2], args[3], args[4], args[5], vu_only = true)
@@ -95,6 +97,7 @@ run :: proc(args: []string) -> int {
 	}
 	fmt.eprintln("usage: play")
 	fmt.eprintln("       play <disc image>")
+	fmt.eprintln("       play --convert-store <disc image>")
 	fmt.eprintln("       play --compat <disc image | directory> [frames]")
 	fmt.eprintln("       play --export <disc image> <directory>")
 	fmt.eprintln("       play --ramdiff <dump directory> <frame> <[=]frame>...")

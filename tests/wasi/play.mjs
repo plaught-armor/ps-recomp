@@ -17,8 +17,12 @@
 // at the start, or with PLAY_DATA=<dir> holding that directory's files (a
 // disc directory with a wasm32 native blob and its key, for one), as the
 // play page's /data holds what earlier runs stored (web/readers.js).
-// Prints the frame of the first present, the presents, the time and the
-// shim's call counts to stderr, and exits with play's exit code.
+// PLAY_CONVERT=1 runs `play --convert-store` on the disc instead (the play
+// page's step before a run): the blob and key it stores are written under
+// <out dir>/data. Prints the frame of the first present, the presents, the
+// time, the memory's size at the end (its high-water: wasm memory only
+// grows) and the shim's call counts to stderr, and exits with play's exit
+// code.
 //
 // With PS_NET_PEER set, netplay runs over UDP from a worker_thread
 // (netlink.mjs), so the peer can be another play.mjs or a native play.
@@ -81,7 +85,8 @@ const settings = {
 for (const [k, v] of Object.entries(env)) if (k.startsWith("PS_")) settings[k] = v;
 
 const log = (fd, text) => (fd === 1 ? stdout : stderr).write(text);
-const wasi = new Wasi({ args: ["play", "/disc/" + basename(image)], env: settings, disc, log });
+const playArgs = env.PLAY_CONVERT === "1" ? ["play", "--convert-store", "/disc/" + basename(image)] : ["play", "/disc/" + basename(image)];
+const wasi = new Wasi({ args: playArgs, env: settings, disc, log });
 // The page's buffers, which nothing reads here: present never waits for
 // a free slot, and a headless run opens no audio device.
 const sdl = new Sdl({
@@ -141,6 +146,7 @@ for (const [path, bytes] of wasi.files()) {
 	mkdirSync(dirname(to), { recursive: true });
 	writeFileSync(to, bytes);
 }
-stderr.write(`play.mjs: exit ${code}, first present ${first ? `#${first.frame} at ${first.ms} ms` : "none"}, ${sdl.frame} presents, ${ms} ms\n`);
+const mib = Math.round(instance.exports.memory.buffer.byteLength / 2 ** 20);
+stderr.write(`play.mjs: exit ${code}, first present ${first ? `#${first.frame} at ${first.ms} ms` : "none"}, ${sdl.frame} presents, ${ms} ms, memory ${mib} MiB\n`);
 stderr.write(`wasi: ${JSON.stringify(wasi.stats)}\n`);
 exit(code);
