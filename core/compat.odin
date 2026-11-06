@@ -913,9 +913,23 @@ compat_stretches :: proc() -> (list: []Compat_Stretch, other: u64) {
 // it says so with the console's state and prints the compat line.
 fatal_hook: proc(msg: string)
 
+// Called once on a fatal error, before the run exits, to end what must not
+// outlive it (play's mid-run VU conversion child and its temporary file);
+// nil none. fatal and the consoles' own fatal paths call it.
+fatal_cleanup: proc()
+
+// Call fatal_cleanup, once.
+fatal_cleanup_run :: proc() {
+	if f := fatal_cleanup; f != nil {
+		fatal_cleanup = nil
+		f()
+	}
+}
+
 // Stop the run on an error it cannot get past, through the console's fatal
 // path when it has one.
 fatal :: proc(format: string, args: ..any) -> ! {
+	fatal_cleanup_run()
 	msg := fmt.tprintf(format, ..args)
 	if fatal_hook != nil {fatal_hook(msg)}
 	fmt.eprintln(msg)

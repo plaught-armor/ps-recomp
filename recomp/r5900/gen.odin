@@ -33,6 +33,12 @@
 //                    (a missing file, ENOENT, is a warning: that microcode
 //                    runs in the interpreter)
 //   vu0_capture      optional: a VU0_CAPTURE file, the same for VU0
+//   vu_only          with native_arch: "true" compiles the VU programs
+//                    alone, as native_vu does, to a blob with no EE
+//                    function (the player's mid-run load, play/midload.odin)
+//   vu_status        with native_vu or vu_only: "all" has VU1 code compute
+//                    status even where no program reads it
+//                    (recomp/vu native_programs status_all)
 //
 // Packages hold consecutive functions up to package_insns instructions so
 // each compiles as its own module. Every package has a `register` proc
@@ -186,8 +192,14 @@ drop_imports :: proc(funcs: ^[dynamic]^Func, quiet: bool) -> int {
 
 generate :: proc(o: mips.Options) {
 	img := mips.load_elf(o)
+	// Before vu_only too: words may touch .vutext, whose programs a mid-run
+	// load must find the same as the startup conversion's.
 	if path := mips.option_or(o, "words", ""); path != "" {
 		replace_words(&img, path)
+	}
+	if mips.option_or(o, "vu_only", "") == "true" {
+		vu_only(o, img)
+		return
 	}
 	out := mips.option_or(o, "out", "")
 	runtime := mips.option_or(o, "runtime", "ps:ps2")
@@ -394,13 +406,7 @@ generate :: proc(o: mips.Options) {
 		// The VU microprograms too, with native_vu: the runtime runs them
 		// natively once it knows them (ps2/vu).
 		vus: [dynamic]native.Blob_Span
-		if mips.option_or(o, "native_vu", "") == "true" {
-			for unit in vu.Unit {
-				if !vu.native_programs(code, img, vu_capture(o, unit), unit, &vus) {
-					mips.fail("%s: bad .vutext or %v capture", img.name, unit)
-				}
-			}
-		}
+		if mips.option_or(o, "native_vu", "") == "true" {native_vus(o, img, code, &vus)}
 		if !native.write_blob(path, code, n_funcs[:], nil, vus[:]) {
 			mips.fail("cannot write %s", path)
 		}
@@ -448,6 +454,38 @@ generate :: proc(o: mips.Options) {
 	}
 	fmt.sbprintln(&sb, "}")
 	mips.write_file(mips.join(out, "all.odin"), sb.buf[:])
+}
+
+// The VU microprograms alone (vu_only), compiled for native_arch to a blob
+// at native_out with no EE function: their microcode is the same in any
+// set, and the EE code is left as it is.
+@(private = "file")
+vu_only :: proc(o: mips.Options, img: mips.Image) {
+	arch, ok := native.parse_arch(mips.option(o, "native_arch"))
+	if !ok {
+		mips.fail("%s: unknown native_arch %s", o.path, mips.option(o, "native_arch"))
+	}
+	code := new(native.Asm)
+	code^ = native.make_asm(arch, native_ram())
+	vus: [dynamic]native.Blob_Span
+	native_vus(o, img, code, &vus)
+	path := mips.option(o, "native_out")
+	if !native.write_blob(path, code, nil, nil, vus[:]) {
+		mips.fail("cannot write %s", path)
+	}
+	fmt.printfln("native: %d VU microprograms, %d bytes -> %s", len(vus), len(code.code), path)
+}
+
+// Both VUs' programs (.vutext and the captures) compiled into code, their
+// spans appended to vus; vu_status "all" has VU1 code compute status.
+@(private = "file")
+native_vus :: proc(o: mips.Options, img: mips.Image, code: ^native.Asm, vus: ^[dynamic]native.Blob_Span) {
+	status_all := mips.option_or(o, "vu_status", "") == "all"
+	for unit in vu.Unit {
+		if !vu.native_programs(code, img, vu_capture(o, unit), unit, vus, status_all) {
+			mips.fail("%s: bad .vutext or %v capture", img.name, unit)
+		}
+	}
 }
 
 // The VU0_CAPTURE or VU1_CAPTURE file for unit, or "".

@@ -19,7 +19,12 @@ import "ps:recomp/vu"
 // "" for none; with either, the blob holds the VU microprograms too, the
 // captured ones and those of .vutext. A failure exits with status 1 after
 // a message (mips.fail), which is why it runs in a child.
-convert :: proc(image, out, vu0, vu1: string) -> int {
+//
+// vu_only (`play --convert-vu`, the same arguments, then the run's pid)
+// compiles a PS2 disc's VU microprograms alone, VU1 code computing status
+// whatever its programs read, for a run to load beside the code it runs
+// (midload.odin).
+convert :: proc(image, out, vu0, vu1: string, vu_only := false) -> int {
 	if _, ok := native.arch_of("convert", mips.HOST_ARCH); !ok {
 		return 1
 	}
@@ -30,8 +35,18 @@ convert :: proc(image, out, vu0, vu1: string) -> int {
 		if vu0 != "" {o.values["vu0_capture"] = vu0}
 		if vu1 != "" {o.values["vu1_capture"] = vu1}
 	}
-	fmt.eprintln("converting", image)
-	switch b := mips.option(o, "backend"); b {
+	if vu_only {
+		o.values["vu_only"] = "true"
+		o.values["vu_status"] = "all"
+	}
+	b := mips.option(o, "backend")
+	if vu_only {
+		if b != "r5900" {mips.fail("%s: a %s disc has no VU microprograms", image, b)}
+		fmt.eprintln("converting the VU microprograms of", image)
+	} else {
+		fmt.eprintln("converting", image)
+	}
+	switch b {
 	case "r3000": r3000.generate(o)
 	case "r5900": r5900.generate(o)
 	case: mips.fail("%s: unknown backend %s", image, b)

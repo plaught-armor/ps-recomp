@@ -45,6 +45,23 @@ Boot :: struct {
 	// the window opens, `hooks` once the game's functions are registered.
 	setup:          proc() -> bool,
 	hooks:          proc() -> bool,
+	// Called at each vblank after the host's frame (kernel.vblank_hook), on
+	// the EE thread where no microprogram runs; and when the host quits.
+	// nil none.
+	vblank:         proc(),
+	quit:           proc(),
+}
+
+// Boot.vblank, and the host's vblank_hook it follows: taken once, after
+// platform_init sets it, so nothing may assign kernel.vblank_hook after the
+// boot, or Boot.vblank is dropped.
+@(private = "file")
+boot_vblank, host_vblank: proc()
+
+@(private = "file")
+vblank_chain :: proc() {
+	host_vblank()
+	boot_vblank()
 }
 
 // Set up the runtime for the game b describes and run the executable's
@@ -66,6 +83,11 @@ boot :: proc(b: Boot) -> bool {
 	init()
 	if b.setup != nil {b.setup() or_return}
 	host.platform_init(b.title) or_return
+	if b.vblank != nil {
+		host_vblank, boot_vblank = kernel.vblank_hook, b.vblank
+		kernel.vblank_hook = vblank_chain
+	}
+	host.quit_hook = b.quit
 	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
 	// native code would leave its host frames running on.
 	when core.FLAT {

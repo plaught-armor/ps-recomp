@@ -698,6 +698,42 @@ vu_register_native :: proc(unit: int, ranges: []Vu_Range, native: Vu_Native) {
 	}
 }
 
+// Whether the program of ranges reads status: FSEQ, FSAND or FSOR (lower
+// 0x14, 0x16, 0x17), not under an I bit.
+vu_reads_status :: proc(ranges: []Vu_Range) -> bool {
+	for r in ranges {
+		for k := 0; k + 1 < len(r.code); k += 2 {
+			op := r.code[k] >> 25
+			if r.code[k + 1] & (1 << 31) == 0 && (op == 0x14 || op == 0x16 || op == 0x17) {return true}
+		}
+	}
+	return false
+}
+
+// Whether a program of unit's with ranges, the same addresses and words,
+// is registered.
+vu_registered :: proc(unit: int, ranges: []Vu_Range) -> bool {
+	same :: proc(t: ^Micro_Table($N), ranges: []Vu_Range) -> bool {
+		if len(ranges) == 0 {return false}
+		// Only programs with ranges[0]'s first pair as a candidate there.
+		outer: for p in t.candidates[(ranges[0].pc / 8) % u32(N)] {
+			if len(p.ranges) != len(ranges) {continue}
+			for r, k in ranges {
+				if p.ranges[k].pc != r.pc || !slice.equal(p.ranges[k].code, r.code) {continue outer}
+			}
+			return true
+		}
+		return false
+	}
+	return same(&vu0_table, ranges) if unit == 0 else same(&vu1_table, ranges)
+}
+
+// VU1's registered programs, and whether one reads status
+// (Micro_Table.status).
+vu1_programs :: proc() -> (n: int, status: bool) {
+	return len(vu1_table.programs), vu1_table.status
+}
+
 // Candidates are longest first; of the same size, native code before Odin.
 @(private)
 micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run, native: Vu_Native = nil) {
@@ -706,14 +742,8 @@ micro_register :: proc(t: ^Micro_Table($N), ranges: []Vu_Range, run: Vu_Run, nat
 	p.ranges = slice.clone(ranges)
 	p.run = run
 	p.native = native
-	for r in ranges {
-		p.size += len(r.code) / 2
-		// FSEQ, FSAND, FSOR (lower 0x14, 0x16, 0x17), not under an I bit.
-		for k := 0; k + 1 < len(r.code); k += 2 {
-			op := r.code[k] >> 25
-			t.status ||= r.code[k + 1] & (1 << 31) == 0 && (op == 0x14 || op == 0x16 || op == 0x17)
-		}
-	}
+	for r in ranges {p.size += len(r.code) / 2}
+	t.status ||= vu_reads_status(ranges)
 	append(&t.programs, p)
 	for r in ranges {
 		for k in 0 ..< len(r.code) / 2 {

@@ -404,15 +404,93 @@ load_native :: proc(path: string) -> bool {
 register_vus :: proc(code: ^core.Native_Code) {
 	if len(code.spans) == 0 || core.env("VUNATIVE") == "0" {return}
 	n := 0
+	vu1 := false
+	status := false
 	for s in code.spans {
 		if s.kind != .Vu0 && s.kind != .Vu1 {continue} // not this runtime's
-		ranges := make([]vu.Vu_Range, s.n_ranges, context.temp_allocator)
-		for &r, k in ranges {
-			nr := code.ranges[int(s.range_first) + k]
-			r = {nr.pc, code.pool[nr.at:][:nr.n_words]}
-		}
-		vu.vu_register_native(s.kind == .Vu0 ? 0 : 1, ranges, cast(vu.Vu_Native)rawptr(code.base + uintptr(s.off)))
+		ranges := span_ranges(code, s)
+		vu.vu_register_native(s.kind == .Vu0 ? 0 : 1, ranges, span_native(code, s))
 		n += 1
+		vu1 ||= s.kind == .Vu1
+		status ||= s.kind == .Vu1 && vu.vu_reads_status(ranges)
 	}
+	vu1_elided = vu1 && !status
 	fmt.eprintfln("native: %d VU microprograms", n)
+}
+
+// Whether the startup blob's VU1 code may not keep status. recomp computes
+// status for every VU1 program of a blob when one of the programs it read
+// does; where none of the blob's registered programs reads status, it may
+// not have (a program read but not compiled can still have made it).
+@(private = "file")
+vu1_elided: bool
+
+// The VU ranges of span s, its words in code's pool (which they keep).
+@(private = "file")
+span_ranges :: proc(code: ^core.Native_Code, s: core.Native_Span) -> []vu.Vu_Range {
+	ranges := make([]vu.Vu_Range, s.n_ranges, context.temp_allocator)
+	for &r, k in ranges {
+		nr := code.ranges[int(s.range_first) + k]
+		r = {nr.pc, code.pool[nr.at:][:nr.n_words]}
+	}
+	return ranges
+}
+
+@(private = "file")
+span_native :: proc(code: ^core.Native_Code, s: core.Native_Span) -> vu.Vu_Native {
+	return cast(vu.Vu_Native)rawptr(code.base + uintptr(s.off))
+}
+
+// Register the VU microprograms of the blob at path (`play --convert-vu`)
+// beside those registered, while the game runs. Call it only where no
+// microprogram runs: between the EE's instructions, as at a vblank
+// (kernel.run_events), since a VU runs each microprogram to its end within
+// the EE instruction that starts it. Programs already registered (the same
+// addresses and words) are left, and counted in known; added counts the
+// rest. When one of those is a VU1 program that reads status and the
+// startup blob's VU1 code may not keep status (vu1_elided), none is
+// registered (skipped): code that does not keep status would then run
+// beside code that reads it. The blob's code stays mapped while a program
+// of it is registered. False, with the reason printed, when the blob cannot
+// be loaded.
+load_native_vus :: proc(path: string) -> (added, known: int, skipped, ok: bool) {
+	blob, err := os.read_entire_file(path, context.allocator)
+	if err != nil {
+		fmt.eprintfln("native: %s: %v", path, err)
+		return
+	}
+	defer delete(blob)
+	code, msg := core.native_load(blob, native_imports())
+	if msg != "" {
+		fmt.eprintfln("native: %s: %s", path, msg)
+		return
+	}
+	ok = true
+	news := make([dynamic]core.Native_Span, 0, len(code.spans), context.temp_allocator)
+	status := false
+	for s in code.spans {
+		if s.kind != .Vu0 && s.kind != .Vu1 {continue} // not this runtime's
+		ranges := span_ranges(&code, s)
+		if vu.vu_registered(s.kind == .Vu0 ? 0 : 1, ranges) {
+			known += 1
+			continue
+		}
+		append(&news, s)
+		status ||= s.kind == .Vu1 && vu.vu_reads_status(ranges)
+	}
+	skipped = status && vu1_elided
+	if skipped || len(news) == 0 {
+		core.native_free(&code)
+		return
+	}
+	for s in news {
+		vu.vu_register_native(s.kind == .Vu0 ? 0 : 1, span_ranges(&code, s), span_native(&code, s))
+	}
+	added = len(news)
+	// The ranges keep the pool and the mapping; the rest goes.
+	delete(code.funcs)
+	delete(code.ovls)
+	delete(code.spans)
+	delete(code.ranges)
+	return
 }

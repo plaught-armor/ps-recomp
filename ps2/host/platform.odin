@@ -159,6 +159,8 @@ platform_init :: proc(title: cstring) -> bool {
 	gs.replays = snaptest != {} || rbtest[1] > 0 || net_on
 	gs.state.write = gs.write
 	gs.state.transfer = gs.transfer
+	// The boot chains Boot.vblank after this (ps2/boot.odin): set here
+	// only, never after.
 	kernel.vblank_hook = vblank_frame
 	probe_init()
 	audio_init(core.headless)
@@ -173,11 +175,15 @@ platform_init :: proc(title: cstring) -> bool {
 	return true
 }
 
+// Called by quit before the counters are printed; nil none.
+quit_hook: proc()
+
 // Exit, after printing the fallback counters when built with them, the
 // VU1 program counters when VU1_STATS is set, and the unmapped access
 // counts when some went unlogged.
 @(private)
 quit :: proc(code: int) -> ! {
+	if quit_hook != nil {quit_hook()}
 	if code == 0 {thumb_save()}
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}
 	vu.vu_stats_print()

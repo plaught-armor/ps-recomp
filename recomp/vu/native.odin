@@ -1408,11 +1408,14 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 
 // The native functions of unit u's programs, the ones generate compiles
 // to Odin, appended to a's code and to spans. Their ranges point into the
-// programs' words, which stay allocated.
-native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Unit, spans: ^[dynamic]native.Blob_Span) -> bool {
+// programs' words, which stay allocated. status_all: VU1 code computes
+// status whatever the programs read (reads_status), for code the runtime
+// registers beside code compiled from another set of programs, whose
+// reads this set's elision cannot foresee.
+native_programs :: proc(a: ^native.Asm, img: mips.Image, capture: string, u: Unit, spans: ^[dynamic]native.Blob_Span, status_all := false) -> bool {
 	if u == .VU0 && capture == "" {return true}
 	progs := load_programs(img, capture, u) or_return
-	status := reads_status(progs[:], u)
+	status := status_all || reads_status(progs[:], u)
 	for p in progs {
 		rs: []native.Blob_Range
 		if p.ext == nil {

@@ -64,6 +64,14 @@ Capture :: struct {
 @(private)
 vu0_cap, vu1_cap: Capture
 
+// Records written by both units' captures this run.
+@(private = "file")
+capture_records: u64
+
+// The records both units' captures have written this run: it changes when
+// a capture grows.
+vu_capture_records :: proc() -> u64 {return capture_records}
+
 @(private)
 vu_capture_options :: proc() {
 	miss := core.env("VU_CAPTURE") == "miss"
@@ -145,6 +153,7 @@ capture_write :: proc(c: ^Capture, rec: []u8) {
 		c.file = f
 	}
 	os.write(c.file, rec)
+	capture_records += 1
 }
 
 // Mark what f holds seen and count its images, cutting off a last record

@@ -13,7 +13,10 @@
 // the user data directory (DATA) with the memory cards; later runs of the
 // same build use it. A PS2 disc's VU capture files (VU_CAPTURE, on by
 // default), once they hold microcode, go into the blob too, which is
-// compiled again when they gain some. A dev build (no COMMIT) converts every time. When the conversion
+// compiled again when they gain some. A run whose capture grows loads
+// the new programs as it goes (midload.odin), converted in a child
+// (`play --convert-vu`, the same arguments, then the run's pid). A dev build (no COMMIT)
+// converts every time. When the conversion
 // fails the game runs interpreted; a stored blob that will not load is
 // converted again on the next run.
 //
@@ -70,6 +73,9 @@ run :: proc(args: []string) -> int {
 		return launcher(args[0])
 	case len(args) == 6 && args[1] == "--convert":
 		return convert(args[2], args[3], args[4], args[5])
+	case len(args) == 7 && args[1] == "--convert-vu":
+		if !midload_child(args[6]) {return 1}
+		return convert(args[2], args[3], args[4], args[5], vu_only = true)
 	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
 		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4])
 	case len(args) == 4 && args[1] == "--mods":
@@ -399,20 +405,23 @@ play :: proc(image: string) -> int {
 	}
 	title := strings.clone_to_cstring(cnf.serial if cnf.serial != "" else id)
 	if cnf.ps2 {
+		b := ps2.Boot {
+			disc              = image,
+			title             = title,
+			native            = native,
+			native_failed     = native_failed,
+			learned           = learned,
+			learned_failed    = learned_failed,
+			learned_ee        = learned_ee,
+			learned_ee_failed = learned_ee_failed,
+			cards             = cards,
+		}
+		if midload_init(image, native, capture) {
+			b.vblank = midload_vblank
+			b.quit = midload_quit
+		}
 		// ps2.boot returns only on a failure.
-		ps2.boot(
-			{
-				disc = image,
-				title = title,
-				native = native,
-				native_failed = native_failed,
-				learned = learned,
-				learned_failed = learned_failed,
-				learned_ee = learned_ee,
-				learned_ee_failed = learned_ee_failed,
-				cards = cards,
-			},
-		)
+		ps2.boot(b)
 		return 1
 	}
 	b := psx.Boot {

@@ -199,6 +199,7 @@ trap :: proc(pc: u32) {
 // Stop the game on an error it cannot get past: say so with the registers,
 // then print the compat line (COMPAT).
 fatal :: proc(format: string, args: ..any) -> ! {
+	core.fatal_cleanup_run()
 	msg := fmt.tprintf(format, ..args)
 	fmt.eprintln("ee:", msg)
 	dump_regs()
