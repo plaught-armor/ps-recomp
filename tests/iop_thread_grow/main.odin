@@ -6,7 +6,8 @@
 // FLAT (-define:PS_FLAT=true), whose run once ended the thread through its
 // pointer from before the growth, into the freed array, so the thread
 // stayed in the live one, running. The thread counts are printed so the
-// two builds' output can be compared.
+// two builds' output can be compared. A last case checks, in both models,
+// that a thread's tail calls stay in its context across its runs.
 package main
 
 import "core:encoding/endian"
@@ -15,6 +16,7 @@ import "core:os"
 import "ps:core"
 import iop "ps:ps2/iop"
 import mem "ps:ps2/mem"
+import r3000 "ps:psx/cpu"
 
 N :: 16 // threads the start creates
 
@@ -207,9 +209,49 @@ case_thread :: proc() {
 	all_dormant("thread")
 }
 
+// "modj": the start creates and starts thread B and returns 0. B's entry
+// is `j body`, a tail call at its run's first word, and body spins. Each
+// budget takes B off the CPU one tail call deep: its count saved in its
+// context and given back when it runs again, never left on the loader.
+case_tail :: proc() {
+	s := &iop.iop_sched
+	iop.sys_init()
+	iop.iop_loader_init()
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	th := at(&a)
+	put(&a, 0)
+	body := at(&a)
+	put(&a, 0x1000ffff, 0) // b body
+	b := at(&a)
+	put_rel(&a, 0x08000000 | body >> 2, 4) // j body
+	put(&a, 0)
+	pb := thread_param(&a, b, 20)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, pb)
+	jal(&a, tb)
+	la(&a, T0, th)
+	put(&a, SW_V0_T0)
+	put(&a, LW_A0_T0)
+	put(&a, 0x24000000 | 5 << 16) // li a1, 0
+	jal(&a, tb + 8)
+	put(&a, 0x24000000 | V0 << 16) // li v0, 0
+	epilogue(&a)
+	id, r := iop.iop_load(build_mod("modj", &a, entry), "modj", nil)
+	check(id > 0 && r == 0, "tail: modj loads")
+	check(len(s.threads) == 1 && s.threads[0].status == .Ready, "tail: B spins, ready")
+	check(r3000.tail_depth == 0, "tail: B's tail call not left on the loader")
+	check(s.threads[0].ctx.tail_depth == 1, "tail: B's tail call in its context")
+	iop.th_schedule(r3000.state.cycles + 10_000)
+	check(r3000.tail_depth == 0, "tail: B's tail call not left on the loader after its next run")
+	check(s.threads[0].ctx.tail_depth == 1, "tail: B's tail call given back for its next run")
+}
+
 game :: proc(_: rawptr) {
 	case_start()
 	case_thread()
+	case_tail()
 	if failed {os.exit(1)}
 	fmt.println("ok iop_thread_grow")
 	os.exit(0)

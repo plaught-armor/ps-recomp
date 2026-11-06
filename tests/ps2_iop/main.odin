@@ -1056,6 +1056,10 @@ test_thread_budget :: proc() {
 	t := iop.th_find(iop.iop_u32(module_base(id) + th)^)
 	check(t != nil && t.status == .Ready && t.co != nil, "budget: the spinning thread stays ready with its coroutine")
 	check(t != nil && t.ctx.r[29] > t.stack && t.ctx.r[29] < t.stack + t.stacksize, "budget: its context saved")
+	// `j el` at its run's first word is a tail call each time round, so the
+	// thread spins TAIL_DEPTH_MAX deep: its own count, not the loader's.
+	check(t != nil && t.ctx.tail_depth == r3000.TAIL_DEPTH_MAX, "budget: its tail calls in its context")
+	check(r3000.tail_depth == 0, "budget: none of its tail calls left on the loader")
 	check(r3000.next_event == iop.IOP_EVENT_OFF && s.cur == 0, "budget: off after the load")
 }
 
