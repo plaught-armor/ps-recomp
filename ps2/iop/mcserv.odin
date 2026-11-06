@@ -167,7 +167,7 @@ mc_card :: proc(port: u32) -> ^map[string]Mc_Node {
 	if mc.loaded[port] {return card}
 	mc.loaded[port] = true
 	load :: proc(card: ^map[string]Mc_Node, port: u32, guest: string) {
-		infos, _ := os.read_all_directory_by_path(mc_card_path(port, guest), context.temp_allocator)
+		infos, _ := core.read_dir(mc_card_path(port, guest), context.temp_allocator)
 		for fi in infos {
 			// A write cut short by a crash; the target beside it is whole.
 			if fi.type != .Directory && strings.has_suffix(fi.name, core.ATOMIC_TMP) {continue}

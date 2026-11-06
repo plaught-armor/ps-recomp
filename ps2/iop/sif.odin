@@ -823,7 +823,7 @@ host_path :: proc(name: string) -> (string, bool) {
 	dir := disc_dir
 	for part in strings.split_iterator(&rest, "/") {
 		if part == "" || part == "." {continue}
-		entries, err := os.read_all_directory_by_path(dir, context.temp_allocator)
+		entries, err := core.read_dir(dir, context.temp_allocator)
 		if err != nil {return "", false}
 		found := false
 		for e in entries {

@@ -32,7 +32,7 @@ Mod_Set :: struct {
 // warns of none. A missing dir is no mods. err is in the temp allocator.
 mods_read :: proc(dir, disc: string, lo, hi: u32) -> (set: Mod_Set, err: string) {
 	if dir == "" || !os.is_dir(dir) {return}
-	entries, derr := os.read_all_directory_by_path(dir, context.temp_allocator)
+	entries, derr := read_dir(dir, context.temp_allocator)
 	if derr != nil {return {}, fmt.tprintf("mod: cannot read %s: %v", dir, derr)}
 	slice.sort_by(entries, proc(a, b: os.File_Info) -> bool {return a.name < b.name})
 
