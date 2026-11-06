@@ -130,8 +130,25 @@ one with WebGL2 on each animation frame, `web/present.js`).
 `Cross-Origin-Embedder-Policy: require-corp` gives that directly, and on
 one that cannot (GitHub Pages) the page registers `web/sw.js`, a service
 worker that adds the headers, and reloads once. WebKitGTK isolates a page
-through the service worker; whether Safari does is not verified. Settings and saves live in
-memory (`GetPrefPath` is `/data/`) and are lost when the page reloads.
+through the service worker; whether Safari does is not verified.
+
+The page keeps two things in the origin private file system (OPFS),
+`web/readers.js`. A disc that is started is copied there, so it can be
+played again without picking it; the Worker reads it through sync access
+handles. play's data directory (`GetPrefPath` is `/data/`: settings,
+memory cards, and any wasm32 native blobs and their keys) is mirrored
+there file for file: loaded before a run and written back when the
+module exits or fails. A run that the tab's closing cuts short stores
+nothing. A wasm32 blob is made by a native play or recomp (`--arch
+wasm32`); neither page can put one in the store yet, so outside test mode
+a game runs without one. Test mode starts from an empty `/data` and
+stores nothing, so its runs compare with native ones. The wasm build has
+no GPU GS, so a PS2 game draws in software. Netplay is not in the page
+yet.
+
+Tested: headless Brave and Firefox on Linux (`tests/wasi/serve.py --play`,
+see [testing](testing.md)). Other browsers and phones are untested. Some
+games run slowly in the page.
 
 The options file is tab-separated: a `key<TAB>value` header row, then one
 option per row; lines starting with `#` are comments. `backend` (`r3000` or
