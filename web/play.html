@@ -14,7 +14,10 @@
 <p id="isolation" hidden></p>
 <p>Plays a disc image in this tab. The disc is read here and nothing is
 sent anywhere.</p>
-<p>Settings and saves are lost when the page reloads, until browser storage comes.</p>
+<p>A disc you start is kept in this browser's storage for this site, so it
+can be played again without picking it; Forget removes it. Settings and
+saves are still lost when the page reloads.</p>
+<ul id="stored" hidden></ul>
 <label id="drop">
 <input id="disc" type="file" multiple>
 <span>Pick or drop a disc image (.iso, .bin, or a .cue with its track files)</span>

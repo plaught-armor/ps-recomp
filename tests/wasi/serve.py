@@ -4,7 +4,7 @@ browser's result.
 
     python3 tests/wasi/serve.py <page dir> <result.json> <disc file>... [--host H] [--port P] [--arch A]
     python3 tests/wasi/serve.py <page dir> <result.json> --pick [--host H] [--port P] [--arch A]
-    python3 tests/wasi/serve.py <page dir> <result.json> --play <module.wasm> [<disc file>...] [--env K=V]... [--no-input] [--seconds N] [--no-isolate]
+    python3 tests/wasi/serve.py <page dir> <result.json> --play <module.wasm> [<disc file>...] [--env K=V]... [--no-input] [--store url] [--seconds N] [--no-isolate]
 
 Open the printed URL in any browser. The page converts the first disc file,
 read by HTTP Range requests, posts the blob and its report, and the server
@@ -23,10 +23,12 @@ the page dir: play.wasm, or the gate program tests/wasi/host built there),
 on the disc files given (the module opens the .cue among them, else the
 only one), with each --env variable in its environment. --no-input stops
 the page's fake button and key presses, which change what the module does.
+The page copies the disc files into the browser's storage (OPFS) and reads
+them from there, as a picked disc is; --store url reads them by URL instead.
 The page runs it until it exits or for --seconds, then posts each file the
 module wrote, and ring.pcm (every sample it queued for the audio device),
 to /file/<name>, which the server writes beside <result.json>, and then its
-state ({isolated, frames, capture, audio, sabUpload, done, firstPresentMs,
+state ({isolated, frames, capture, audio, sabUpload, done, store, firstPresentMs,
 files, log, errors, ...}), which the server writes to <result.json>.
 Every response carries COOP, COEP and CORP, so the page is
 cross-origin isolated by the headers; --no-isolate leaves them out, so the
@@ -57,6 +59,7 @@ parser.add_argument("--play", metavar="MODULE")
 parser.add_argument("--seconds", type=int)
 parser.add_argument("--env", action="append", default=[], metavar="K=V")
 parser.add_argument("--no-input", action="store_true")
+parser.add_argument("--store", choices=["url"])
 parser.add_argument("--no-isolate", action="store_true")
 args = parser.parse_args()
 if not args.discs and not args.pick and not args.play:
@@ -208,6 +211,8 @@ if args.play:
         query += "&env=" + quote(kv, safe="")
     if args.no_input:
         query += "&input=0"
+    if args.store:
+        query += "&store=" + args.store
     if args.seconds:
         query += f"&seconds={args.seconds}"
 elif args.pick:

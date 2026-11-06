@@ -308,7 +308,13 @@ before the ring drops what does not fit) to the server, which writes them
 beside the result file. The report adds `done.compileMs` (the module's
 compile), `done.runMs` (from the module's start to its exit),
 `firstPresentMs` (from the Worker's start to the first frame the page
-sees), `frames` and `files` (each file's name and size). With
+sees), `frames` and `files` (each file's name and size). The page copies
+the served disc into the browser's storage (OPFS) first and the module
+reads it from there, as with a disc picked on the page; `store` in the
+report says how it was read: `kind` `opfs` with `copyMs` (the copy), or,
+when the copy fails (no OPFS, a full quota), `kind` `url` with the
+`error` and the browser's storage `estimate`. `--store url` skips the
+copy and reads the disc by URL (`kind` `url`). With
 `PS_DUMP=. PS_DUMP_HASH=1`, `hashes.tsv` lands beside the result file:
 
 ```sh

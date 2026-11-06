@@ -9,9 +9,11 @@
 // and the page reloads once under it.
 //
 // Test mode, play.html?test=1[&wasm=<url>][&disc=<url>...][&env=<K=V>...]
-// [&input=0][&seconds=<n>]: runs that module (play.wasm by default) on the
-// disc files read from those URLs, if any (the module's argument is the
-// .cue among them, else the only one), with those environment variables.
+// [&input=0][&store=url][&seconds=<n>]: runs that module (play.wasm by
+// default) on the disc files read from those URLs, if any (the module's
+// argument is the .cue among them, else the only one), with those
+// environment variables. The files are copied into the browser's storage
+// and read from there first, as a picked disc is, unless store=url.
 // Only test mode has the fake standard gamepad, driven by window.testPad.
 // Once the first frame is drawn the page presses A on it and the Z key for
 // half a second each (not with input=0, which leaves emulation untouched),
@@ -22,6 +24,7 @@
 import { SCANCODE_OF_CODE } from "./keys.js";
 import { AUDIO, CONTROL, EV, PAD, PRESENT } from "./layout.js";
 import { Present } from "./present.js";
+import { forget, storedNames } from "./readers.js";
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -102,6 +105,47 @@ function pick(list) {
 	$("picked").textContent = img ? `Disc: ${img.name}` + (files.length > 1 ? ` (+${files.length - 1} files)` : "") :
 		"Pick one image, or a .cue together with its track files.";
 	$("start").disabled = !img || worker !== null;
+}
+
+// ---- stored discs ----
+
+const canStore = typeof navigator.storage?.getDirectory === "function";
+let storeInfo = null; // how the running disc is read: the Worker's {store}
+
+// Lists the stored discs, each with Play and Forget, while nothing runs.
+async function showStored() {
+	if (!canStore) return;
+	const list = $("stored");
+	let names;
+	try {
+		names = await storedNames();
+	} catch (e) {
+		errors.push(`stored discs: ${e.message}`);
+		return;
+	}
+	list.replaceChildren(...names.map((name) => {
+		const li = document.createElement("li");
+		const play = document.createElement("button");
+		play.type = "button";
+		play.textContent = `Play ${name} (stored)`;
+		play.disabled = worker !== null;
+		play.addEventListener("click", () => start({ wasm: "play.wasm", args: [`/disc/${name}`], stored: name }));
+		const drop = document.createElement("button");
+		drop.type = "button";
+		drop.textContent = "Forget";
+		drop.disabled = worker !== null;
+		drop.addEventListener("click", () => forget(name).catch((e) => log(`Forget ${name}: ${e.message}\n`)).then(showStored));
+		li.append(play, " ", drop);
+		return li;
+	}));
+	list.hidden = names.length === 0;
+}
+
+// The Worker's word on the disc: stored, or why not.
+function onStore(info) {
+	storeInfo = info;
+	if (info.error) log(`The disc is not stored (${info.error}); it is read as ${info.kind === "file" ? "picked" : "served"} instead.\n`);
+	showStored();
 }
 
 // ---- the keyboard ----
@@ -288,6 +332,7 @@ function onMessage({ data }) {
 		return;
 	}
 	if (data.audio !== undefined) return startAudio(data.audio);
+	if (data.store !== undefined) return onStore(data.store);
 	if (data.fullscreen !== undefined) {
 		if (data.fullscreen && !document.fullscreenElement) $("screen").requestFullscreen?.().catch(() => {});
 		else if (!data.fullscreen && document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -305,6 +350,7 @@ function onMessage({ data }) {
 	} else {
 		return;
 	}
+	log("Reload the page to play again.\n");
 	audioContext?.close();
 	audioContext = null;
 }
@@ -336,6 +382,7 @@ function start(msg) {
 	worker.onerror = (e) => onMessage({ data: { error: e.message || "worker failed to load" } });
 	startedAt = performance.now();
 	worker.postMessage({ ...msg, ...shared });
+	for (const b of $("stored").querySelectorAll("button")) b.disabled = true;
 }
 
 // The gate's view of the run.
@@ -354,6 +401,7 @@ async function testState() {
 		audio: { ...audioStats, state: audioContext?.state ?? null },
 		sabUpload: present?.sabUpload ?? null,
 		done,
+		store: storeInfo,
 		firstPresentMs,
 		files: written.map(([name, bytes]) => ({ name, size: bytes.length })),
 		log: $("log").textContent,
@@ -383,9 +431,12 @@ async function main() {
 	});
 	$("start").addEventListener("click", () => {
 		const img = image(files);
-		start({ wasm: "play.wasm", args: [`/disc/${img.name}`], files });
+		// Asked on the click: some browsers grant it only on a user gesture.
+		if (canStore) navigator.storage.persist?.().catch(() => {});
+		start({ wasm: "play.wasm", args: [`/disc/${img.name}`], files, store: canStore ? img.name : undefined });
 	});
 	requestAnimationFrame(tick);
+	showStored();
 	if (!test) return;
 	window.testState = testState;
 	const wasm = params.get("wasm") ?? "play.wasm";
@@ -404,7 +455,8 @@ async function main() {
 		env[kv.slice(0, eq)] = kv.slice(eq + 1);
 	}
 	$("picked").textContent = `Test: ${wasm}` + (img ? ` on ${img.name}` : "");
-	start({ wasm, args: img ? [`/disc/${img.name}`] : [], urls, env, test: true });
+	const store = img && canStore && params.get("store") !== "url" ? img.name : undefined;
+	start({ wasm, args: img ? [`/disc/${img.name}`] : [], urls, store, env, test: true });
 	await selfTest(Number(params.get("seconds") ?? 20) * 1000, params.get("input") !== "0");
 }
 
