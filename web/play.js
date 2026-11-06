@@ -43,8 +43,20 @@ const errors = [];
 const violation = (e) => errors.push(`csp: ${e.effectiveDirective} blocked ${e.blockedURI || "inline"}`);
 document.addEventListener("securitypolicyviolation", violation);
 
+// The worker posts its output a line at a time, thousands of lines while a
+// game boots. Each line is appended as its own text node, and the log
+// scrolls at most once a frame (tick): scrolling reads the log's height,
+// which lays out the whole log, so doing it per line made the page's thread
+// fall seconds behind and starved netplay's data channel.
+let logMoved = false;
 function log(text) {
-	$("log").textContent += text;
+	$("log").append(text);
+	logMoved = true;
+}
+
+function scrollLog() {
+	if (!logMoved) return;
+	logMoved = false;
 	$("log").scrollTop = $("log").scrollHeight;
 }
 
@@ -471,6 +483,7 @@ function tick() {
 		}
 	}
 	pollPads();
+	scrollLog();
 	requestAnimationFrame(tick);
 }
 
