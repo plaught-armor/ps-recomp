@@ -446,22 +446,23 @@ arm64_spans :: proc(blob: []u8, funcs: []r5900.Learned, skipped: int) {
 	n := u32(len(funcs) - skipped)
 	check(h[0] == core.NATIVE_MAGIC && h[1] == core.NATIVE_VERSION && h[2] == u32(rnative.Arch.Arm64), fmt.tprintf("arm64 header %x", h[:3]))
 	check(skipped == 0, fmt.tprintf("arm64: %d functions not lowered", skipped))
-	check(h[4] == 0 && h[5] == 0 && h[6] == n && h[7] == n && h[9] > 0, fmt.tprintf("arm64 counts %v", h))
+	check(h[4] == 0 && h[5] == 0 && h[6] == 0 && h[7] == n && h[8] == n && h[10] > 0, fmt.tprintf("arm64 counts %v", h))
 	for _ in 0 ..< h[3] {
 		if at + 2 > len(blob) {break}
 		at += 2 + (int(blob[at]) | int(blob[at + 1]) << 8)
 	}
-	spans := make([][5]u32, h[6], context.temp_allocator)
+	at += 8 * int(h[4]) + 32 * int(h[5]) + 12 * int(h[6]) // funcs, overlays, interp
+	spans := make([][5]u32, h[7], context.temp_allocator)
 	for &sp in spans {for &v in sp {v = word(blob, &at)}}
-	ranges := make([][3]u32, h[7], context.temp_allocator)
+	ranges := make([][3]u32, h[8], context.temp_allocator)
 	for &r in ranges {for &v in r {v = word(blob, &at)}}
-	pool := make([]u32, h[8], context.temp_allocator)
+	pool := make([]u32, h[9], context.temp_allocator)
 	for &w in pool {w = word(blob, &at)}
-	check(at + int(h[9]) == len(blob), "arm64 blob size")
+	check(at + int(h[10]) == len(blob), "arm64 blob size")
 	for sp, k in spans {
 		if k >= len(funcs) {break}
 		f := funcs[k]
-		check(sp[0] == u32(core.Native_Kind.Ee) && sp[1] == f.entry && sp[2] < h[10] && sp[4] == 1, fmt.tprintf("arm64 span %d %v", k, sp))
+		check(sp[0] == u32(core.Native_Kind.Ee) && sp[1] == f.entry && sp[2] < h[11] && sp[4] == 1, fmt.tprintf("arm64 span %d %v", k, sp))
 		if sp[3] >= u32(len(ranges)) {continue}
 		r := ranges[sp[3]]
 		ok := r[0] == f.lo && int(r[1]) == len(f.words) && u64(r[2]) + u64(r[1]) <= u64(len(pool))
