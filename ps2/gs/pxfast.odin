@@ -4,7 +4,7 @@
 // other context takes the generic `pixel`.
 //
 // A fast proc covers a context with no fog, no alpha test (or ATST
-// ALWAYS), no destination alpha test, depth test on, no PABE, no FBA,
+// ALWAYS, or ATST GREATER with AFAIL KEEP), no destination alpha test, depth test on, no PABE, no FBA,
 // COLCLAMP on, and frame and Z formats with rows (row_init). It takes the
 // rows already at y: the rasteriser seeks them once per row (ctx_seek),
 // where `pixel` seeks them itself.
@@ -14,7 +14,9 @@ package ps2_gs
 Pixel_Proc :: #type proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32)
 
 // One fast context. tfx is -1 for no texture mapping; bl is ALPHA's
-// A, B, C and D (its low byte), 0xff for no blending; fbmsk is FBMSK != 0.
+// A, B, C and D (its low byte), 0xff for no blending; fbmsk is FBMSK != 0;
+// atst is 1 for no alpha test (or ATST ALWAYS), 6 for ATST GREATER with
+// AFAIL KEEP, tested against the context's AREF.
 Px_Fast :: struct {
 	tfx:   i32,
 	tcc:   bool,
@@ -24,24 +26,35 @@ Px_Fast :: struct {
 	bl:    u32,
 	fpsm:  u32,
 	fbmsk: bool,
+	atst:  u32,
 }
 
 // The contexts, by the pixels each drew in a profiled title (SHOT-PERF F):
-// 99.5% of its pixels between them.
+// 99.5% of its pixels between them. Then the generic contexts drawing
+// most pixels in three more titles (gh, sp, then bk), by a pixel tally.
 PX_FAST :: [?]Px_Fast {
-	{tfx = 0, tcc = true, ztst = 2, zmsk = false, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT24, fbmsk = false},
-	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x68, fpsm = PSMCT32, fbmsk = false},
-	{tfx = -1, tcc = false, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0xff, fpsm = PSMCT32, fbmsk = false},
-	{tfx = 1, tcc = true, ztst = 1, zmsk = true, zpsm = PSMZ32, bl = 0x44, fpsm = PSMCT32, fbmsk = true},
-	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false},
-	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT24, fbmsk = false},
-	{tfx = -1, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false},
-	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0xff, fpsm = PSMCT32, fbmsk = false},
+	{tfx = 0, tcc = true, ztst = 2, zmsk = false, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT24, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x68, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = -1, tcc = false, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0xff, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 1, tcc = true, ztst = 1, zmsk = true, zpsm = PSMZ32, bl = 0x44, fpsm = PSMCT32, fbmsk = true, atst = 1},
+	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT24, fbmsk = false, atst = 1},
+	{tfx = -1, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = false, ztst = 1, zmsk = true, zpsm = PSMZ16S, bl = 0xff, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = true, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0x29, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = true, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0xff, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = -1, tcc = false, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = true, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 6},
+	{tfx = -1, tcc = false, ztst = 1, zmsk = false, zpsm = PSMZ16S, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 6},
+	{tfx = 0, tcc = true, ztst = 2, zmsk = false, zpsm = PSMZ16S, bl = 0x48, fpsm = PSMCT24, fbmsk = false, atst = 1},
+	{tfx = -1, tcc = false, ztst = 1, zmsk = false, zpsm = PSMZ24, bl = 0xff, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = 0, tcc = true, ztst = 1, zmsk = false, zpsm = PSMZ24, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 1},
+	{tfx = -1, tcc = false, ztst = 2, zmsk = false, zpsm = PSMZ24, bl = 0x44, fpsm = PSMCT32, fbmsk = false, atst = 6},
 }
 
 // PX_FAST's procs, in its order.
 @(private, rodata)
-px_procs := [len(PX_FAST)]Pixel_Proc{px_0, px_1, px_2, px_3, px_4, px_5, px_6, px_7}
+px_procs := [len(PX_FAST)]Pixel_Proc{px_0, px_1, px_2, px_3, px_4, px_5, px_6, px_7, px_8, px_9, px_10, px_11, px_12, px_13, px_14, px_15, px_16}
 
 @(private)
 px_0 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 0)}
@@ -61,9 +74,28 @@ px_6 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf
 px_7 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 7)}
 
 @(private)
+px_8 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 8)}
+@(private)
+px_9 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 9)}
+@(private)
+px_10 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 10)}
+@(private)
+px_11 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 11)}
+@(private)
+px_12 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 12)}
+@(private)
+px_13 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 13)}
+@(private)
+px_14 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 14)}
+@(private)
+px_15 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 15)}
+@(private)
+px_16 :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) {px_inst(c, x, zf, col, u, v, lod, 16)}
+
+@(private)
 px_inst :: #force_inline proc(c: ^Ctx, x: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, $N: int) {
 	F :: PX_FAST
-	pixel_fast(c, x, zf, col, u, v, lod, F[N].tfx, F[N].tcc, F[N].ztst, F[N].zmsk, F[N].zpsm, F[N].bl, F[N].fpsm, F[N].fbmsk)
+	pixel_fast(c, x, zf, col, u, v, lod, F[N].tfx, F[N].tcc, F[N].ztst, F[N].zmsk, F[N].zpsm, F[N].bl, F[N].fpsm, F[N].fbmsk, F[N].atst)
 }
 
 // Forces the generic `pixel` for every context decoded from now on
@@ -75,8 +107,13 @@ px_generic: bool
 // of PX_FAST's, else `pixel`.
 @(private)
 px_pick :: proc(c: ^Ctx) -> Pixel_Proc {
-	if px_generic || c.fge || (c.ate && c.atst != 1) || c.date || !c.zte || c.pabe || c.fba || !c.colclamp {return pixel}
+	if px_generic || c.fge || c.date || !c.zte || c.pabe || c.fba || !c.colclamp {return pixel}
 	if !c.frow.ok || !c.zrow.ok {return pixel}
+	atst: u32 = 1
+	if c.ate && c.atst != 1 {
+		if c.atst != 6 || c.afail != 0 {return pixel}
+		atst = 6
+	}
 	k := Px_Fast {
 		tfx   = c.tme ? i32(c.tex.tfx) : -1,
 		tcc   = c.tme && c.tex.tcc,
@@ -86,6 +123,7 @@ px_pick :: proc(c: ^Ctx) -> Pixel_Proc {
 		bl    = c.abe ? c.a | c.b << 2 | c.c << 4 | c.d << 6 : 0xff,
 		fpsm  = c.fpsm,
 		fbmsk = c.fbmsk != 0,
+		atst  = atst,
 	}
 	for f, i in PX_FAST {
 		if f == k {return px_procs[i]}
@@ -104,9 +142,10 @@ ctx_seek :: #force_inline proc(c: ^Ctx, y: i32) {
 // pixel is read before the Z buffer is written, as the two can overlap.
 @(private)
 pixel_fast :: #force_inline proc(c: ^Ctx, x: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32,
-	$TFX: i32, $TCC: bool, $ZTST: u32, $ZMSK: bool, $ZPSM: u32, $BL: u32, $FPSM: u32, $FBMSK: bool) #no_bounds_check {
+	$TFX: i32, $TCC: bool, $ZTST: u32, $ZMSK: bool, $ZPSM: u32, $BL: u32, $FPSM: u32, $FBMSK: bool, $ATST: u32) #no_bounds_check {
 	#assert(FPSM == PSMCT32 || FPSM == PSMCT24)
 	#assert(ZTST >= 1)
+	#assert(ATST == 1 || ATST == 6)
 	px := u32(x)
 	COL_EPS :: 1.0 / 256
 	src := [4]i32{i32(col.r + COL_EPS), i32(col.g + COL_EPS), i32(col.b + COL_EPS), i32(col.a + COL_EPS)}
@@ -121,6 +160,8 @@ pixel_fast :: #force_inline proc(c: ^Ctx, x: i32, zf: f64, col: [4]f32, u, v: f3
 	} else {
 		#assert(TFX == -1)
 	}
+	// AFAIL KEEP: a failing pixel writes neither frame nor Z.
+	when ATST == 6 {if u32(src.a) <= c.aref {return}}
 
 	A :: BL & 3
 	B :: (BL >> 2) & 3

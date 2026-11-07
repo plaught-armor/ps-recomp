@@ -98,7 +98,11 @@ build :: proc(fi: int) {
 	put(0x40 + u8(n), x0 | x1 << 16 | y0 << 32 | y1 << 48) // SCISSOR
 	test: u64
 	if fast {
-		test = rndn(2) | 1 << 1 | rndn(256) << 4 | rndn(4) << 12 // ATE maybe, ATST ALWAYS
+		if f.atst == 6 {
+			test = 1 | 6 << 1 | rndn(256) << 4 // ATE, ATST GREATER, AFAIL KEEP
+		} else {
+			test = rndn(2) | 1 << 1 | rndn(256) << 4 | rndn(4) << 12 // ATE maybe, ATST ALWAYS
+		}
 		test |= 1 << 16 | u64(f.ztst) << 17
 	} else {
 		test = rnd() & 0x7ffff
