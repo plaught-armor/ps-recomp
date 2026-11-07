@@ -460,7 +460,7 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		// A rom0 module has no file here. Under PS_IRX another is read, to
 		// run it, as before. A cdrom dbcman is read for its version either
 		// way, without PS_IRX on the host side alone: the drive's state is
-		// left as it was. Only a cdrom image picks dbcman's contract.
+		// left as it was. Only a cdrom image picks dbcman's server set.
 		data: []u8
 		cd := strings.has_prefix(path, "cdrom")
 		if iop_irx && !strings.has_prefix(path, "rom0:") {
