@@ -77,6 +77,7 @@ Learn_Space :: struct {
 	cycles:    ^u64, // the processor's cycle counter
 	cpi:       u64, // the cycles its interpreter charges an instruction
 	read:      proc(addr: u32) -> u32, // a word of its memory
+	ram:       []u8, // its RAM, ram_bytes long, when the host gives it: read directly
 	ram_bytes: u32, // RAM size, a power of two: the words fetched and stamped
 	stamped:   bool, // stores are checked by RAM stamps, not the ring
 	insns:     u64, // instructions interpreted, delay slots included
@@ -254,12 +255,16 @@ learn_on :: #force_inline proc(cpu: Learn_Cpu) -> bool {
 // size of its RAM, a power of two, at physical 0 with its mirrors below
 // physical max(0x800000, ram_bytes) (the R3000 map; the EE's 32 MB has
 // none). With stamps its stores are checked by RAM stamps, else the ring.
-learn_cpu :: proc(cpu: Learn_Cpu, cycles: ^u64, cycles_per_insn: u64, read: proc(addr: u32) -> u32, ram_bytes: u32, stamps: bool) {
+// ram, when given, is that RAM itself: the words a record holds are read
+// from it rather than through read, one call per word.
+learn_cpu :: proc(cpu: Learn_Cpu, cycles: ^u64, cycles_per_insn: u64, read: proc(addr: u32) -> u32, ram_bytes: u32, stamps: bool, ram: []u8 = nil) {
 	assert(ram_bytes != 0 && ram_bytes & (ram_bytes - 1) == 0)
+	assert(ram == nil || len(ram) == int(ram_bytes))
 	s := &learn.space[cpu]
 	s.cycles = cycles
 	s.cpi = cycles_per_insn
 	s.read = read
+	s.ram = ram
 	s.ram_bytes = ram_bytes
 	s.stamped = stamps
 }
@@ -320,7 +325,7 @@ learn_frame :: #force_inline proc(h: u16, entry: u32) -> ^Learn_Frame {
 }
 
 // The interpreter fetched w, the word at pc, for f's run.
-learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) {
+learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) #no_bounds_check {
 	f.lo = min(f.lo, pc)
 	f.hi = max(f.hi, pc)
 	s := &learn.space[f.cpu]
@@ -332,7 +337,7 @@ learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) {
 	if s.fetched == nil {
 		learn_fetched_make(s)
 	}
-	if s.fetched_at[k] > f.fetch_at && s.fetched[k] != w {
+	if s.fetched[k] != w && s.fetched_at[k] > f.fetch_at {
 		f.changed = true
 	}
 	s.fetched[k] = w
@@ -348,7 +353,7 @@ learn_fetched_make :: proc(s: ^Learn_Space) {
 }
 
 // f's run stores at addr.
-learn_store :: proc(f: ^Learn_Frame, addr: u32) {
+learn_store :: proc(f: ^Learn_Frame, addr: u32) #no_bounds_check {
 	s := &learn.space[f.cpu]
 	if s.stamped {
 		w, in_ram := ram_word(s, addr)
@@ -397,7 +402,7 @@ learn_end :: proc(f: ^Learn_Frame) {
 // threads may have stored since too; a run is marked by their stores as
 // well, never missing its own.
 @(private = "file")
-learn_smc :: proc(s: ^Learn_Space, f: ^Learn_Frame) -> Learn_Flags {
+learn_smc :: proc(s: ^Learn_Space, f: ^Learn_Frame) -> Learn_Flags #no_bounds_check {
 	if s.stamped {
 		if f.hi - f.lo + 4 > LEARN_SPAN_MAX {
 			return {} // .Large: no words to check against
@@ -449,8 +454,12 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 	context.allocator = long_allocator()
 	resize(&learn.buf, LEARN_HEADER + int(n) * 4)
 	words := ([^]u32le)(raw_data(learn.buf[LEARN_HEADER:]))[:n]
-	for &w, i in words {
-		w = u32le(s.read(f.lo + u32(i) * 4))
+	if lo, ok := ram_word(s, f.lo); ok && s.ram != nil && int(lo) + int(n) <= len(s.ram) / 4 {
+		copy(learn.buf[LEARN_HEADER:], s.ram[lo * 4:][:n * 4])
+	} else {
+		for &w, i in words {
+			w = u32le(s.read(f.lo + u32(i) * 4))
+		}
 	}
 	if n != 0 && learn_refetched(s, f, words) {
 		flags += {.Smc}
@@ -486,7 +495,7 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 // saw another word than an earlier fetch there, or the last fetch of a word
 // since the run began is not that word.
 @(private = "file")
-learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> bool {
+learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> bool #no_bounds_check {
 	if f.changed {
 		return true
 	}
@@ -495,7 +504,7 @@ learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> boo
 	}
 	for w, i in words {
 		k, in_ram := ram_word(s, f.lo + u32(i) * 4)
-		if in_ram && s.fetched_at[k] > f.fetch_at && s.fetched[k] != u32(w) {
+		if in_ram && s.fetched[k] != u32(w) && s.fetched_at[k] > f.fetch_at {
 			return true
 		}
 	}
