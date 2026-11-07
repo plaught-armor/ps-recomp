@@ -56,6 +56,11 @@ Learn_Key :: struct {
 	hash:  u64,
 }
 
+// r's identity.
+learn_key :: proc(r: Learn_Record) -> Learn_Key {
+	return {r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash}
+}
+
 // Writes a record's header into h (LEARN_HEADER bytes).
 learn_header :: proc(h: []u8, cpu: Learn_Cpu, flags: Learn_Flags, entry, lo, n: u32, hash: u64) {
 	h[0] = LEARN_TAG
@@ -111,7 +116,7 @@ learn_compact :: proc(data: []u8) -> (out: []u8, n: int) {
 	keep := make([dynamic]Learn_Record, context.temp_allocator)
 	size := 0
 	for r in recs {
-		key := Learn_Key{r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash}
+		key := learn_key(r)
 		if key in seen {continue}
 		seen[key] = true
 		append(&keep, r)

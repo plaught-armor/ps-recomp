@@ -1,7 +1,8 @@
 // A mid-run learned compile for play.mjs, on a worker_thread (the module
 // blocks the main one): runs `play --learned psx` on another instance of
 // the module, with the records and interp list play passed (web/learn.js),
-// and delivers its blob, or a failure, through the LEARN buffer. The main
+// and delivers its blob, or a failure, through the LEARN buffer, for its
+// compile's generation. The main
 // thread sees none of this thread's events, so every failure is caught and
 // delivered here, and the log goes straight to fd 2.
 import { writeSync } from "node:fs";
@@ -11,7 +12,7 @@ import { Native } from "../../web/native.js";
 import { NO_NET } from "../../web/net.js";
 import { Wasi } from "../../web/wasi.js";
 
-const { buffer, module, records, interp } = workerData;
+const { buffer, gen, module, records, interp } = workerData;
 const say = (text) => writeSync(2, text);
 let blob = null;
 try {
@@ -34,4 +35,4 @@ try {
 } catch (e) {
 	say(`learnlink: ${e?.stack ?? e}\n`);
 }
-learnDeliver(buffer, blob, say);
+learnDeliver(buffer, blob, say, gen);

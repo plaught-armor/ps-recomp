@@ -32,7 +32,7 @@
 // `result?player=<N>`.
 import { SCANCODE_OF_CODE } from "./keys.js";
 import { LEARN_ARGS, LEARN_OUT, learnDeliver, learnSeed } from "./learn.js";
-import { AUDIO, CONTROL, EV, LEARN, NET, PAD, PRESENT } from "./layout.js";
+import { AUDIO, CONTROL, EV, NET, PAD, PRESENT } from "./layout.js";
 import { serveLink } from "./net.js";
 import { Present } from "./present.js";
 import { forget, storedNames } from "./readers.js";
@@ -105,7 +105,6 @@ function makeShared() {
 		control: new SharedArrayBuffer(CONTROL.SIZE),
 		audio: new SharedArrayBuffer(AUDIO.SIZE),
 		present: new SharedArrayBuffer(PRESENT.SIZE),
-		learn: new SharedArrayBuffer(LEARN.SIZE),
 	};
 	ctl = new Int32Array(shared.control);
 	ctlView = new DataView(shared.control);
@@ -534,16 +533,27 @@ function onMessage({ data }) {
 // A mid-run learned compile the play Worker asked for (web/learn.js): run
 // `play --learned psx` in a Worker of its own (an `out` run) and hand its
 // blob to the play Worker. Its log goes to the page's; the instantiate's
-// time is said, for the cost of a mid-run compile on this browser.
-function learnCompile({ records, interp }) {
+// time is said, for the cost of a mid-run compile on this browser. One
+// compile Worker runs at a time: a new compile, or a new run (start),
+// ends the one before, whose blob would be dropped anyway (its generation
+// is not the one in flight).
+let learnConv = null;
+function learnStop() {
+	learnConv?.terminate();
+	learnConv = null;
+}
+function learnCompile({ records, interp, buffer, gen }) {
+	learnStop();
 	const t0 = performance.now();
 	const conv = new Worker("play-worker.js", { type: "module" });
+	learnConv = conv;
 	let over = false;
 	const finish = (blob) => {
 		if (over) return;
 		over = true;
 		conv.terminate();
-		learnDeliver(shared.learn, blob, log);
+		if (learnConv === conv) learnConv = null;
+		learnDeliver(buffer, blob, log, gen);
 	};
 	conv.onmessage = ({ data }) => {
 		if (data.log !== undefined) {
@@ -559,6 +569,10 @@ function learnCompile({ records, interp }) {
 	};
 	conv.onerror = (e) => {
 		log(`play: mid-run learned compile failed: ${e.message || "worker failed to load"}\n`);
+		finish(null);
+	};
+	conv.onmessageerror = () => {
+		log("play: mid-run learned compile failed: a message from its worker could not be read\n");
 		finish(null);
 	};
 	conv.postMessage({ wasm: "play.wasm", args: LEARN_ARGS.slice(1), out: true, seed: learnSeed(records, interp) }, [records.buffer, interp.buffer]);
@@ -586,6 +600,7 @@ function start(msg) {
 		msg = { ...msg, env: { ...msg.env } };
 		msg.net = startNet(msg.env);
 	}
+	learnStop();
 	$("start").disabled = true;
 	$("log").textContent = "";
 	const canvas = $("screen");
