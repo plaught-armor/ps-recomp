@@ -11,6 +11,7 @@
 //   - Two versions at one entry: each runs native while RAM holds its words.
 //   - A record stored into (.Smc, .Smc_Unknown) or too large (.Large) is not
 //     compiled (core.learn_compilable).
+//   - A blob of no functions loads, with no code to map.
 //   - A run wasm32 cannot lower (a SYSCALL in a delay slot) gets no span and
 //     is counted.
 package main
@@ -166,6 +167,8 @@ game :: proc(_: rawptr) {
 			fmt.eprintln("FAIL ee_learned: no temp directory:", err)
 			os.exit(1)
 		}
+		// A blob of no functions (every record stored into) has no code.
+		check(ps2.load_learned(write_blob(tmp, "empty.bin", {})), "load empty")
 		loop := CODE_LOOP
 		check(ps2.load_learned(write_blob(tmp, "a.bin", {{LOOP, LOOP, loop[:]}})), "load")
 		v0, native_ran = run()

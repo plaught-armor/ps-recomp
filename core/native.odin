@@ -175,6 +175,9 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	}
 	code.pool = make([]u32, n_pool)
 	for &w in code.pool {w, _ = word(blob, &at)}
+	// No code (a learned blob of no functions): nothing to map, and no
+	// function can point into it (its offsets are below limit, 0).
+	if size == 0 {return code, ""}
 	when ODIN_ARCH == .wasm32 {
 		vals := make([]u32, n_imports, context.temp_allocator)
 		for name, k in slots {
@@ -251,10 +254,12 @@ perf_map :: proc(code: Native_Code, end: int) {
 
 // Free what native_load returned: the mapped code and the tables.
 native_free :: proc(code: ^Native_Code) {
-	when ODIN_ARCH == .wasm32 {
-		wasm_release(u32(code.base))
-	} else {
-		unmap_code(rawptr(code.base), code.size)
+	if code.base != 0 {
+		when ODIN_ARCH == .wasm32 {
+			wasm_release(u32(code.base))
+		} else {
+			unmap_code(rawptr(code.base), code.size)
+		}
 	}
 	delete(code.funcs)
 	delete(code.ovls)
