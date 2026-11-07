@@ -70,6 +70,7 @@ MIDLEARN_RECORDS :: 480
 Midload_Learned :: struct {
 	dir:     string,
 	records:   string, // the LEARN file
+	stored:    []native.Blob_Interp, // the stored blob's interp list (psx_stored_interp)
 	covered:   map[core.Learn_Key]bool, // the records a loaded blob was compiled from
 	// The compile in flight: its generation, its records, as a LEARN
 	// stream, their keys, the interp list it leaves out, its key and
@@ -106,10 +107,21 @@ midlearn_init :: proc(dir, records: string, startup: bool) -> bool {
 		cleanup = midlearn_cleanup,
 		report  = midlearn_report,
 	}
-	if !midload_begin(job) {return false}
+	// The stored blob's interp list, read once (psx_stored_interp): no
+	// compile can start without it.
+	stored, ok := psx_stored_interp(dir, context.allocator)
+	if !ok {
+		fmt.eprintln("play: mid-run learned loading off: no interp list")
+		return false
+	}
+	if !midload_begin(job) {
+		delete(stored)
+		return false
+	}
 	mlrn = {
 		dir     = dir,
 		records = records,
+		stored  = stored,
 	}
 	if startup {
 		data, err := os.read_entire_file(records, context.temp_allocator)
@@ -127,6 +139,13 @@ midlearn_init :: proc(dir, records: string, startup: bool) -> bool {
 // records are covered.
 midlearn_uncover :: proc() {
 	clear(&mlrn.covered)
+}
+
+// psx_interp, from the list read at init: the known thread switches as
+// they are now on it.
+@(private = "file")
+midlearn_interp :: proc() -> []native.Blob_Interp {
+	return psx_interp_with(mlrn.dir, mlrn.stored)
 }
 
 @(private = "file")
@@ -165,8 +184,7 @@ midlearn_start :: proc() -> Midload_Start {
 		append(&kept, r)
 	}
 	if len(kept) == 0 {return .Not}
-	interp, iok := psx_interp(mlrn.dir)
-	if !iok {return .Not}
+	interp := midlearn_interp()
 	set, _ := learned_set(kept[:], .Psx, interp)
 	midlearn_cleanup()
 	for r in kept {
@@ -225,8 +243,7 @@ midlearn_poll :: proc(timeout: time.Duration) -> Midload_Poll {
 @(private = "file")
 midlearn_take :: proc(blob: []u8, start: time.Tick) -> Midload_Poll {
 	defer midlearn_cleanup()
-	interp, iok := psx_interp(mlrn.dir)
-	if !iok {return .Failed}
+	interp := midlearn_interp()
 	when core.COMMIT == "test" {
 		// MIDLEARN_STALE=1: as if a thread switch were made known while
 		// the compile ran (tests/wasi).

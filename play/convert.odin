@@ -354,10 +354,18 @@ vu_captures :: proc(dir: string) -> (set: string, caps: [2]string) {
 }
 
 // What a wasm32 build's PS1 runs leave to the interpreter: the functions the
-// disc directory's stored blob left (core.native_interp) and the known
-// thread switches (core.known_switches), each an entry alone. Temp
-// allocated; false after a message.
+// disc directory's stored blob left (psx_stored_interp) and the known
+// thread switches (psx_interp_with). Temp allocated; false after a message.
 psx_interp :: proc(dir: string) -> ([]native.Blob_Interp, bool) {
+	stored, ok := psx_stored_interp(dir)
+	if !ok {return nil, false}
+	return psx_interp_with(dir, stored), true
+}
+
+// The functions the disc directory's stored blob left to the interpreter
+// (core.native_interp), in allocator; false after a message. The blob is
+// the run's, so they stay as they are for the run.
+psx_stored_interp :: proc(dir: string, allocator := context.temp_allocator) -> ([]native.Blob_Interp, bool) {
 	static, rerr := os.read_entire_file(core.disc_path(dir, .Native, context.temp_allocator), context.temp_allocator)
 	if rerr != nil {
 		fmt.eprintln("learned: no native blob to read the interpreted entries from", rerr)
@@ -368,11 +376,20 @@ psx_interp :: proc(dir: string) -> ([]native.Blob_Interp, bool) {
 		fmt.eprintln("learned: native blob:", ierr)
 		return nil, false
 	}
+	out := make([]native.Blob_Interp, len(stored), allocator)
+	for v, k in stored {out[k] = {v.entry, v.lo, v.hi}}
+	return out, true
+}
+
+// stored (psx_stored_interp), then the known thread switches
+// (core.known_switches), each an entry alone, which a run adds to as it
+// goes. Temp allocated.
+psx_interp_with :: proc(dir: string, stored: []native.Blob_Interp) -> []native.Blob_Interp {
 	known := core.known_switches(dir)
 	out := make([]native.Blob_Interp, len(stored) + len(known), context.temp_allocator)
-	for v, k in stored {out[k] = {v.entry, v.lo, v.hi}}
+	copy(out, stored)
 	for e, k in known {out[len(stored) + k] = {e, e, e}}
-	return out, true
+	return out
 }
 
 // What cpu's learned runs leave to the interpreter (learned_store's
