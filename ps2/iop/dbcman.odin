@@ -56,10 +56,13 @@
 //   the socket's A or B, a toggle shared by both ports picking which and
 //   flipping each time; the EE takes the buffer with the larger number, and
 //   two equal ones as a failure.
-// - A port is ready from the start until command 13. On a port not ready,
-//   any command but 4 and 13 sets result 0 and sends the status as it
-//   stands: number, index and extra bytes from the last command, so the
-//   EE reads it as failed.
+// - A card is new to the driver from the start until command 13
+//   acknowledges it. (mc2_d also marks a card new when one is attached and
+//   authenticates; the card here is never taken out, so only the start
+//   does.) While the card is new, any command but 4 and 13 sets result 2,
+//   returns 2 as the RPC reply, and sends the status as it stands: number,
+//   index and extra bytes from the last command, so the EE reads it as
+//   failed.
 // - Otherwise the command is taken: the extra bytes cleared, 0x2080
 //   written at +8 of the request, result 1, the index set, the number
 //   counted. With ECC on (and always for command 8) each page carries 3
@@ -86,9 +89,9 @@
 //   match), and backup block 2 is erased.
 // - 3 answers the card's size in the extra bytes: page size 512 (u16), 16
 //   pages a block (u16), 0x4000 pages (u32).
-// - 4 answers 2 for a ready card, 1 for one not ready; 12, the card's
-//   authentication, the same. 13 clears ready, 1. The card is never taken
-//   out, so a port stays not ready after 13.
+// - 4 answers 2 for a new card, 1 for one acknowledged. 12, the card's
+//   authentication, answers 2, a PS2 card. 13 acknowledges the card, 1.
+//   The card is never taken out, so it stays acknowledged after 13.
 // - 5 looks for an interrupted write in the marker pages of backup block 2:
 //   1 when page 0's first word is -1 (erased); 0 when its block lies past
 //   the total; 1 when page 1's is -1 or another block, backup block 2
@@ -227,7 +230,7 @@ dbc_logged: struct {
 dbcman_init :: proc() {
 	dbc = {pad = DBC_DS1O_D}
 	for &s in dbc.sockets {s.driver = -1}
-	mc2 = {ready = true}
+	mc2 = {fresh = true}
 }
 
 // A module load, its IRX `image` when one was read: the copy the EE made to
@@ -560,7 +563,7 @@ Mc2_Params :: struct {
 mc2: struct {
 	status:        Mc2_Status,
 	toggle:        u32, // 0: the next status goes to A
-	ready:         [MCRAW_PORTS]bool,
+	fresh:         [MCRAW_PORTS]bool, // the card new to the driver, until 13
 	page, verify:  [MC2_BUF]u8, // the page buffer and the read-back one
 	port:          int,
 	p:             Mc2_Params,
@@ -602,10 +605,10 @@ mc2_push :: proc(d: int) {
 mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 	st := &mc2.status
 	port := int(DBC_DRIVERS[d].port) - 2
-	if !mc2.ready[port] && cmd != 4 && cmd != 13 {
-		st.result = 0
+	if mc2.fresh[port] && cmd != 4 && cmd != 13 {
+		st.result = 2
 		mc2_push(d)
-		return 0
+		return 2
 	}
 	st.extra = {}
 	endian.unchecked_put_u32le(buf[8:], 0x2080)
@@ -654,7 +657,8 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 		return st.result
 	case 2: st.result = mc2_write_blocks(data)
 	case 3: copy(st.extra[:], MC2_SPEC[:])
-	case 4, 12: st.result = 2 if mc2.ready[port] else 1
+	case 4: st.result = 2 if mc2.fresh[port] else 1
+	case 12: st.result = 2
 	case 5:
 		r, blk := mc2_backup_check()
 		st.result = r
@@ -676,7 +680,7 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 			}
 		}
 	case 13:
-		mc2.ready[port] = false
+		mc2.fresh[port] = false
 	case:
 		// Logged once per command: the row's first hit.
 		if !core.compat_unknown(.Sif_Rpc, DBC_SID, sub = cmd) && core.compat.calls[{.Sif_Rpc, DBC_SID, cmd}].n <= 1 {fmt.eprintfln("mc2: unknown command %d", cmd)}
