@@ -119,6 +119,19 @@ load_native :: proc(path: string, standalone := false, skip: []u32 = nil) -> boo
 			if !skipped(skip, o.addr) {append(&ovls, cpu.Ovl_Entry{o.addr, o.slot, o.id, o.sig, fn(code, o.off)})}
 		}
 		cpu.register_overlay_funcs(ovls[:])
+		when core.FLAT {
+			// What the blob left to the interpreter and the skipped
+			// entries: LEARN notes no run there (cpu.flat_interp).
+			interp, ierr := core.native_interp(blob)
+			if ierr != "" {
+				fmt.eprintfln("native: %s: %s", path, ierr)
+				return false
+			}
+			delete(cpu.flat_interp)
+			cpu.flat_interp = make([]core.Native_Interp, len(interp) + len(skip))
+			copy(cpu.flat_interp, interp)
+			for e, k in skip {cpu.flat_interp[len(interp) + k] = {e, e, e}}
+		}
 		fmt.eprintfln("native: %d functions from %s, standalone", len(funcs) + len(ovls), path)
 		return true
 	}

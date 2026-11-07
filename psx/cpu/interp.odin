@@ -156,6 +156,16 @@ signed_imm :: #force_inline proc(w: u32) -> u32 {
 	return u32(i32(i16(u16(w))))
 }
 
+// The word w about to run stores: note the address in f's run (core
+// learn_store), before the store, as w's registers hold it.
+@(private)
+learn_store_of :: #force_inline proc(f: ^core.Learn_Frame, w: u32) {
+	switch w >> 26 {
+	case 0x28, 0x29, 0x2a, 0x2b, 0x2e, 0x3a: // SB SH SWL SW SWR SWC2
+		core.learn_store(f, state.r[(w >> 21) & 31] + signed_imm(w))
+	}
+}
+
 // Execute the word w at pc, the last of pending instructions run since the
 // last charge.
 @(private)
@@ -170,12 +180,7 @@ interp_exec :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	rt := (w >> 16) & 31
 	imm := signed_imm(w)
 	addr := r[rs] + imm
-	if st.learn != nil {
-		switch w >> 26 {
-		case 0x28, 0x29, 0x2a, 0x2b, 0x2e, 0x3a: // SB SH SWL SW SWR SWC2
-			core.learn_store(st.learn, addr)
-		}
-	}
+	if st.learn != nil {learn_store_of(st.learn, w)}
 	// What a load or a store off RAM sees beyond state.cycles goes to the
 	// bus as k, which only its slow path adds (bus.odin load_slow): the
 	// interpreters run every instruction through here, and RAM hits are most

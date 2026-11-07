@@ -299,6 +299,26 @@ learn_begin :: proc(cpu: Learn_Cpu, entry: u32) -> ^Learn_Frame {
 	return f
 }
 
+// f's run as a handle an interpreter keeps in its own records (the FLAT
+// interpreter's shadow stack, psx/cpu/interp_flat.odin): 0 for none.
+learn_handle :: #force_inline proc(f: ^Learn_Frame) -> u16 {
+	return f == nil ? 0 : f.slot + 1
+}
+
+// The run of handle h, begun from entry, or nil: none, or one that is not in
+// progress. A record put back by a snapshot can hold the handle of a run
+// that ended since, whose frame another run may hold now.
+learn_frame :: #force_inline proc(h: u16, entry: u32) -> ^Learn_Frame {
+	if h == 0 {
+		return nil
+	}
+	f := &learn.pool[h - 1]
+	if !learn.used[h - 1] || f.entry != entry {
+		return nil
+	}
+	return f
+}
+
 // The interpreter fetched w, the word at pc, for f's run.
 learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) {
 	f.lo = min(f.lo, pc)
