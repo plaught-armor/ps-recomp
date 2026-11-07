@@ -85,8 +85,10 @@ goto_ :: proc(l: ^Lowering, src, t: u32) {
 	put(l, {kind = .Return})
 }
 
+// f's steps, in context.temp_allocator, as is all else lower takes (but
+// f.warnings): its callers free it per function (native_func, emit_func).
 lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step {
-	pcs := make([]u32, len(f.insns))
+	pcs := make([]u32, len(f.insns), context.temp_allocator)
 	n := 0
 	for pc in f.insns {
 		pcs[n] = pc
@@ -95,14 +97,15 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step 
 	slice.sort(pcs)
 	l := Lowering {
 		f      = f,
+		insns  = make(map[u32]Insn, len(f.insns), context.temp_allocator),
 		cycles = cycles,
+		steps  = make([dynamic]Step, context.temp_allocator),
 		exact  = exact,
 	}
-	defer delete(l.insns)
 	for pc, i in f.insns {
 		l.insns[pc] = decode(pc, i.w)
 	}
-	skip_delay: Set
+	skip_delay := make(Set, context.temp_allocator)
 	for idx := 0; idx < len(pcs); {
 		pc := pcs[idx]
 		idx += 1

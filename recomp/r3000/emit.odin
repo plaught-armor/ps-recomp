@@ -1,5 +1,6 @@
 package r3000
 
+import "base:runtime"
 import "core:fmt"
 import "core:slice"
 import "core:strings"
@@ -263,6 +264,7 @@ trace_stmt :: proc(pc: u32) -> string {
 
 // Odin source for a lowered function: one switch case per block.
 emit_func :: proc(f: ^Func, out: ^strings.Builder, name: string, patches: []Patch, cycles: int) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD() // lower's steps
 	line(out, "%s :: proc() {{", name)
 	line(out, "\tc := &cpu.state")
 	line(out, "\tif c.cycles >= cpu.next_event {io.run_events()}")

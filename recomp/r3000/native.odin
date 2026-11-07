@@ -949,20 +949,19 @@ is_ident :: proc(s: string) -> bool {
 // the cycles up to them (Step.seen); false for the IOP.
 //
 // The temp memory it takes is freed at its return: nothing temp outlives a
-// function. The only temp in a function's compile is the native backend's
-// layout of the function before it (wasm_finalize, run from func_begin), its
-// maps and lists used up there; lower, go, events and the switch code take
-// none. Temp taken before the call is kept. Only the default temp allocator
-// frees here; another (play's learned_compile_here arena) keeps it all.
+// function. Its compile's maps and lists are temp: lower's steps and what
+// lower takes, the labels, pcs and ifs here, and the native backend's layout
+// of the function before it (wasm_finalize, run from func_begin), each used
+// up within; go, events and the switch code take none. Temp taken before
+// the call is kept. Only the default temp allocator frees here; another
+// keeps it all until its owner frees it.
 native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exact := true) -> u32 {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	steps := lower(f, patches, cycles, exact)
 	a.charge_at = CYCLES
 	defer a.charge = 0
-	labels: map[u32]native.Label
-	defer delete(labels)
-	pcs: [dynamic]u32
-	defer delete(pcs)
+	labels := make(map[u32]native.Label, context.temp_allocator)
+	pcs := make([dynamic]u32, context.temp_allocator)
 	for s in steps {
 		if s.kind == .Case {
 			labels[s.target] = native.new_label(a)
@@ -975,8 +974,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exa
 	go(a, f, labels, f.entry)
 	// Open ifs: the label each one ends at, or -1 for a group (Branch,
 	// Jump_Reg) that only scopes t.
-	ifs: [dynamic]native.Label
-	defer delete(ifs)
+	ifs := make([dynamic]native.Label, context.temp_allocator)
 	// The block so far always leaves; else it ends like the Odin switch case,
 	// which runs the case again (pc is still the block's own).
 	leaves := true

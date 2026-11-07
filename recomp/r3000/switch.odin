@@ -1,5 +1,6 @@
 package r3000
 
+import "base:runtime"
 import "core:slice"
 import "../mips"
 import "../native"
@@ -186,10 +187,10 @@ run_switches :: proc(f: ^mips.Func, s: Interp_Set) -> bool {
 // not proven but that f loads anywhere with 0xa0 or 0xb0 counts too.
 @(private = "file")
 switches_here :: proc(f: ^mips.Func) -> bool {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	A0 :: 4
 	tables: bit_set[0 ..< 32] // registers f loads with 0xa0 or 0xb0
-	starts: map[u32]struct{} // the pcs blocks start at
-	defer delete(starts)
+	starts := make(map[u32]struct{}, context.temp_allocator) // the pcs blocks start at
 	starts[f.entry] = {}
 	for _, i in f.insns {
 		if v, ok := li_value(i.w); ok && (v == 0xa0 || v == 0xb0) {tables += {int((i.w >> 16) & 31)}}
