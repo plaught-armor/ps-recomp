@@ -413,6 +413,17 @@ Linux it dies with its run, and a run removes the temporary files
 (`ps-vu-<pid>-*.bin` in `TMPDIR`) of runs that were killed before
 removing theirs.
 
+A PS1 game's run that records its code and runs learned code loads its
+new records the same way (play/midload_learned.odin): once they have
+stopped growing for 300 frames, the records no loaded blob covers, at
+most 480 per compile, go to a child (`play --learned-midload <records>
+<out> <run pid>`) through a temporary file (`ps-learn-<pid>-*` in
+`TMPDIR`), and the run loads the blob the child writes. Nothing is
+stored; the next run compiles its own set as before. The same switches
+apply: `PS_MIDLOAD=0`, `PS_MIDLOAD_WAIT=1`, a `PS_DUMP` or `PS_SHOT` run
+waits, and netplay and rollback runs never load mid-run. Only Linux is
+tested; a macOS build compiles it, unrun, and Windows is unchecked.
+
 Only one run at a time captures into a file: a run locks each file it
 opens or makes until it ends, and a second run that finds the file locked
 does not capture. The lock is taken on Linux and macOS, not on Windows,
