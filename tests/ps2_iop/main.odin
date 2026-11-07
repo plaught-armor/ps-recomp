@@ -237,6 +237,7 @@ game :: proc(_: rawptr) {
 	test_vblank_handlers()
 	test_fallback()
 	test_usbd()
+	test_boot_gaps()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -3213,6 +3214,139 @@ test_usbd :: proc() {
 	check(start_calls("usb4", 4) > 0, "usbd: a start that calls sceUsbdRegisterLdd loads")
 	check(start_calls("usb5", 5) > 0, "usbd: a start that calls sceUsbdUnregisterLdd loads")
 	check(start_calls("usb6", 6) <= 0, "usbd: a start that calls usbd 6 still fails")
+}
+
+// The calls a boot can make before its first frame that the HLE served none
+// of: secrman's card handlers and its card authentication, which no card
+// answers; cdvdman's Stop, Pause, Break and ReadClock and the status they
+// leave; ChangeThreadPriority and ReferThreadStatus by retail's rules and
+// layout; sceSdGetCoreAttr giving back what Set left, and sceSdPitch2Note;
+// memmove in both directions.
+test_boot_gaps :: proc() {
+	fresh()
+	a: Asm
+	sm := imports(&a, "secrman", 4, 5, 6)
+	entry := at(&a)
+	prologue(&a)
+	jal(&a, sm)
+	put(&a, 0)
+	jal(&a, sm + 8)
+	put(&a, 0)
+	jal(&a, sm + 16) // its 0 the start's v0
+	put(&a, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("mods", &a, entry), "mods", nil)
+	check(id > 0, "boot: SecrSetMcCommandHandler, SecrSetMcDevIDHandler and SecrAuthCard each give 0")
+
+	cd :: proc(fno: u32, a0: u32 = 0) -> u32 {
+		r3000.state.r[4] = a0
+		v, ok := iop.cdvdman_fn(fno)
+		check(ok, "boot: a served cdvdman call")
+		return v
+	}
+	P :: 0x00040000
+	iop.iop_cd = {}
+	check(cd(28) == iop.CD_STAT_PAUSE, "boot: the disc spins at first")
+	check(cd(15) == 1 && cd(28) == iop.CD_STAT_STOP, "boot: sceCdStop stops it")
+	check(iop.iop_cd.n_pending == 0, "boot: no callback without one set")
+	iop.iop_cd.callback = 0x1000
+	check(cd(38) == 1 && cd(28) == iop.CD_STAT_PAUSE, "boot: sceCdPause spins it up again")
+	check(cd(15) == 1 && cd(5) == 1 && cd(28) == iop.CD_STAT_PAUSE, "boot: so does sceCdStandby")
+	check(iop.iop_cd.n_pending == 3 && iop.iop_cd.pending[0] == iop.CD_FUNC_PAUSE && iop.iop_cd.pending[1] == iop.CD_FUNC_STOP, "boot: Pause and Stop owe their callbacks")
+	check(cd(39) == 1 && iop.iop_cd.n_pending == 3, "boot: sceCdBreak, nothing to break")
+	iop.iop_cd = {}
+	for i in u32(0) ..< 3 {iop.iop_u32(P + 4 * i)^ = 0xffffffff}
+	check(cd(24, P) == 1 && iop.iop_u32(P)^ == 0 && iop.iop_u32(P + 4)^ == 0 && iop.iop_u32(P + 8)^ == 0xffffffff, "boot: sceCdReadClock, eight zero bytes")
+
+	fresh()
+	s := &iop.iop_sched
+	base :: proc(fno, a0, a1: u32) -> u32 {
+		r3000.state.r[4], r3000.state.r[5] = a0, a1
+		v, ok := iop.th_base(fno)
+		check(ok, "boot: a served thbase call")
+		return v
+	}
+	t := iop.th_new(0x1000, 0x2000, 0x100, 0x80, 20)
+	u := iop.th_new(0x1100, 0x2100, 0x200, 0x80, 30)
+	tid, uid := t.id, u.id
+	check(base(14, tid, 40) == neg(-iop.KE_DORMANT), "boot: a dormant thread's priority stays")
+	check(base(14, tid + 100, 40) == neg(-iop.KE_UNKNOWN_THID), "boot: an unknown thread")
+	check(base(14, tid, 127) == neg(-iop.KE_ILLEGAL_PRIORITY), "boot: a priority past the lowest")
+	check(base(14, 0, 40) == 0, "boot: the loader's own is taken")
+	check(base(6, tid, 0) == 0 && base(6, uid, 0) == 0, "boot: StartThread")
+	t, u = iop.th_find(tid), iop.th_find(uid)
+	s.resched = false
+	check(base(14, uid, 40) == 0 && u.prio == 40 && !s.resched, "boot: a ready thread's priority on the loader")
+	s.cur = tid
+	t.status = .Run
+	check(base(14, uid, 0) == 0 && u.prio == 20 && !s.resched, "boot: priority 0 is the caller's, and an equal readies no switch")
+	check(base(14, uid, 10) == 0 && u.prio == 10 && s.resched, "boot: a better one than the caller's is switched to")
+	s.resched = false
+	u.status, u.sema = .Wait, 7
+	check(base(14, uid, 50) == 0 && u.prio == 50 && u.status == .Wait, "boot: a waiter keeps waiting")
+	check(base(14, 0, 25) == 0 && t.prio == 25 && t.status == .Run, "boot: the caller keeps the CPU when no ready thread is as good")
+	s.intr = true
+	check(base(14, uid, 40) == neg(-iop.KE_ILLEGAL_CONTEXT) && u.prio == 50, "boot: ChangeThreadPriority in a handler is illegal")
+	check(base(22, uid, P) == neg(-iop.KE_ILLEGAL_CONTEXT), "boot: so is ReferThreadStatus")
+	s.intr = false
+
+	info :: proc(i: u32) -> u32 {return iop.iop_u32(P + 4 * i)^}
+	for i in u32(0) ..< 18 {iop.iop_u32(P + 4 * i)^ = 0xffffffff}
+	u.attr, u.option, u.wakeups = 0x02000000, 9, 2
+	check(base(22, uid, P) == 0, "boot: ReferThreadStatus")
+	check(info(0) == 0x02000000 && info(1) == 9 && info(2) == 4 && info(3) == 0x1100 && info(4) == u.stack && info(5) == 0x200 && info(6) == 0x80, "boot: a thread's attributes by retail's layout")
+	check(info(7) == 30 && info(8) == 50 && info(9) == 3 && info(10) == 7 && info(11) == 2 && info(12) == 0 && info(16) == 0 && info(17) == 0xffffffff, "boot: its priorities and semaphore wait, the rest 0")
+	u.status = .Sleep
+	base(22, uid, P)
+	check(info(2) == 4 && info(9) == 1 && info(10) == 0, "boot: a sleeper")
+	u.status, u.sema = .Evf, 3
+	base(22, uid, P)
+	check(info(2) == 4 && info(9) == 4 && info(10) == 3, "boot: an event flag's waiter")
+	check(base(22, 0, P) == 0 && info(2) == 1 && info(8) == 25 && info(9) == 0, "boot: thid 0 the caller, running")
+	check(base(22, tid + 100, P) == neg(-iop.KE_UNKNOWN_THID), "boot: an unknown thread's status")
+	s.cur = 0
+	check(base(22, 0, P) == 0 && info(2) == 1 && info(7) == iop.IOP_START_PRIO && info(3) == 0, "boot: the loader's")
+	t.status = .Dormant
+	check(base(6, tid, 0) == 0 && t.prio == 20, "boot: StartThread gives back the priority it was made with")
+
+	C_EFFECT_ENABLE, C_IRQ_ENABLE, C_MUTE, C_NOISE_CLK, C_SPDIF :: u32(0x2), u32(0x4), u32(0x6), u32(0x8), u32(0xa) // libsd's core attributes
+	sd :: proc(fno, a0: u32, a1: u32 = 0, a2: u32 = 0) -> u32 {
+		r3000.state.r[4], r3000.state.r[5], r3000.state.r[6] = a0, a1, a2
+		v, ok := iop.libsd_fn(fno)
+		check(ok, "boot: a served libsd call")
+		return v
+	}
+	sd(11, C_MUTE, 2)
+	sd(11, C_MUTE | 1, 3)
+	sd(11, C_NOISE_CLK, 0x7f)
+	sd(11, C_NOISE_CLK | 1, 0)
+	sd(11, C_IRQ_ENABLE, 0)
+	sd(11, C_IRQ_ENABLE | 1, 1)
+	sd(11, C_EFFECT_ENABLE | 1, 0)
+	check(sd(12, C_MUTE | 1) == 1 && sd(12, C_MUTE) == 0, "boot: MUTE per core, its bit 0")
+	check(sd(12, C_NOISE_CLK) == 0x3f && sd(12, C_NOISE_CLK | 1) == 0, "boot: NOISE_CLK's six bits")
+	check(sd(12, C_IRQ_ENABLE | 1) == 1 && sd(12, C_IRQ_ENABLE) == 0, "boot: IRQ_ENABLE")
+	sd(11, C_EFFECT_ENABLE, 1)
+	check(sd(12, C_EFFECT_ENABLE) == 1 && sd(12, C_EFFECT_ENABLE | 1) == 0, "boot: EFFECT_ENABLE")
+	sd(11, C_SPDIF, 0x102)
+	sd(11, C_SPDIF, 0x5)
+	check(sd(12, C_SPDIF) == 0x102, "boot: SPDIF keeps a known out mode only")
+	check(sd(14, 60, 0, 0x1000) == 60 << 8 && sd(14, 60, 0, 0x2000) == 72 << 8 && sd(14, 60, 0, 0x4000) == sd(14, 60, 0, 0x3fff), "boot: sceSdPitch2Note, pitch 0x1000 the center, its octave above, 0x3fff the most")
+	p := sd(13, 60, 0, 67)
+	n := sd(14, 60, 0, p)
+	check(n >> 8 == 67 || n >> 8 == 66 && n & 0xff >= 0x7c, "boot: sceSdPitch2Note undoes sceSdNote2Pitch")
+
+	iop.iop_u32(P)^, iop.iop_u32(P + 4)^ = 0x03020100, 0x07060504
+	sys :: proc(a0, a1, a2: u32) -> u32 {
+		r3000.state.r[4], r3000.state.r[5], r3000.state.r[6] = a0, a1, a2
+		v, ok := iop.sysclib_fn(13)
+		check(ok, "boot: a served sysclib call")
+		return v
+	}
+	bytes :: proc() -> [8]u8 {return transmute([8]u8)[2]u32{iop.iop_u32(P)^, iop.iop_u32(P + 4)^}}
+	check(sys(P + 2, P, 5) == P + 2 && bytes() == [8]u8{0, 1, 0, 1, 2, 3, 4, 7}, "boot: memmove up over itself")
+	check(sys(P, P + 2, 5) == P && bytes() == [8]u8{0, 1, 2, 3, 4, 3, 4, 7}, "boot: memmove down over itself")
+	check(sys(P, P + 4, 0xffffffff) == P && sys(0, P, 4) == 0 && bytes() == [8]u8{0, 1, 2, 3, 4, 3, 4, 7}, "boot: memmove copies none for n <= 0 or a null dst")
 }
 
 // The calls an audio service's module needs at load and in play: CpuEnableIntr

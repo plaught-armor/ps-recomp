@@ -104,10 +104,12 @@ vblank_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if i < 0 {return ke(KE_NOTFOUND_HANDLER), true}
 		vbl_remove(i)
 		return KE_OK, true
+	case 4, 5, 6, 7: // WaitVblankStart, WaitVblankEnd, WaitVblank, WaitNonVblank
+		edge, set := vblank_wait_for(fno, r3000.state.cycles * IOP_EE_RATIO)
+		if set {return th_wait_until(0), true}
+		return th_wait_until((edge + IOP_EE_RATIO - 1) / IOP_EE_RATIO), true
 	}
-	edge, set := vblank_wait_for(fno, r3000.state.cycles * IOP_EE_RATIO)
-	if set {return th_wait_until(0), true}
-	return th_wait_until((edge + IOP_EE_RATIO - 1) / IOP_EE_RATIO), true
+	return 0, false
 }
 
 // What function fno (4 to 7) called at EE cycle `now` waits for: the edge, or

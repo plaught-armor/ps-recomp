@@ -124,6 +124,7 @@ Iop_Thread :: struct {
 	attr, option:           u32,
 	entry, stack, stacksize: u32,
 	gp, prio:               u32,
+	init_prio:              u32, // what it was made with, StartThread's again
 	status:                 Th_Status,
 	start:                  bool, // a module's start
 	exit_delete:            bool, // removed once it is dormant
@@ -262,7 +263,7 @@ sema_find :: proc(id: u32) -> ^Iop_Sema {
 // A dormant thread; its context starts with `gp` and the stack's top.
 th_new :: proc(entry, stack, stacksize, gp, prio: u32) -> ^Iop_Thread {
 	s := &iop_sched
-	append(&s.threads, Iop_Thread{id = s.next_thid, entry = entry, stack = stack, stacksize = stacksize, gp = gp, prio = prio})
+	append(&s.threads, Iop_Thread{id = s.next_thid, entry = entry, stack = stack, stacksize = stacksize, gp = gp, prio = prio, init_prio = prio})
 	s.next_thid += 1
 	t := &s.threads[len(s.threads) - 1]
 	th_reset(t)
@@ -883,11 +884,66 @@ sema_delete :: proc(i: int) {
 Fno_Set :: bit_set[0 ..< 64; u64]
 Th_Lib :: enum u8 {Base, Semap, Event}
 
+// ReferThreadStatus's iop_thread_info_t at `info` for thread id: attr,
+// option, status, entry, stack, stacksize, gp, initPriority,
+// currentPriority, waitType, waitId and wakeupCount, the rest 0 (no
+// register context or run clock is kept here). The loader, id 0, shows as
+// running at IOP_START_PRIO with nothing else known. A wait shows as
+// retail's kind: sleep 1, delay 2 (a vblank wait too, which retail waits
+// on an event flag for), semaphore 3 (sio2man's lock too, a semaphore in
+// retail's), event flag 4 (an RPC's wait too, with no id here).
+@(private = "file")
+th_refer :: proc(id, info: u32) -> u32 {
+	TS_RUN :: 1
+	TS_READY :: 2
+	TS_WAIT :: 4
+	TS_DORMANT :: 0x10
+	TSW_SLEEP :: 1
+	TSW_DELAY :: 2
+	TSW_SEMA :: 3
+	TSW_EVENTFLAG :: 4
+	t := th_find(id)
+	if t == nil && id != 0 {return ke(KE_UNKNOWN_THID)}
+	for &b in iop_ram_at(info, 0x44) {b = 0}
+	if t == nil {
+		w32(info + 8, TS_RUN)
+		w32(info + 0x1c, IOP_START_PRIO)
+		w32(info + 0x20, IOP_START_PRIO)
+		return KE_OK
+	}
+	status, wait_type, wait_id: u32
+	switch t.status {
+	case .Dormant: status = TS_DORMANT
+	case .Ready: status = TS_READY
+	case .Run: status = TS_RUN
+	case .Sleep: status, wait_type = TS_WAIT, TSW_SLEEP
+	case .Delay: status, wait_type = TS_WAIT, TSW_DELAY
+	case .Wait:
+		status, wait_type, wait_id = TS_WAIT, TSW_SEMA, t.sema
+		if t.sema == 0 {wait_type = TSW_EVENTFLAG} // th_rpc_wait
+	case .Evf: status, wait_type, wait_id = TS_WAIT, TSW_EVENTFLAG, t.sema
+	case .Lock: status, wait_type = TS_WAIT, TSW_SEMA
+	}
+	w32(info, t.attr)
+	w32(info + 4, t.option)
+	w32(info + 8, status)
+	w32(info + 0xc, t.entry)
+	w32(info + 0x10, t.stack)
+	w32(info + 0x14, t.stacksize)
+	w32(info + 0x18, t.gp)
+	w32(info + 0x1c, t.init_prio)
+	w32(info + 0x20, t.prio)
+	w32(info + 0x24, wait_type)
+	w32(info + 0x28, wait_id)
+	w32(info + 0x2c, t.wakeups)
+	return KE_OK
+}
+
 // The calls of each library retail's threadman checks the context of, of
 // those served here, and which of them are its i-variants.
 @(rodata)
 TH_CHECKED := [Th_Lib]Fno_Set {
-	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 16, 20, 24, 25, 26, 33},
+	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 20, 22, 24, 25, 26, 33},
 	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
 	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
 }
@@ -950,6 +1006,7 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if t == nil {return ke(KE_UNKNOWN_THID), true}
 		if t.status != .Dormant {return ke(KE_NOT_DORMANT), true}
 		th_reset(t)
+		t.prio = t.init_prio
 		if fno == 6 {
 			t.ctx.r[4] = a1
 		} else {
@@ -968,6 +1025,35 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		t.status = .Dormant
 		th_stop(t)
 		return KE_OK, true
+	case 14: // ChangeThreadPriority(thid, prio): prio 0 the caller's own
+		t := th_find(s.cur if a0 == 0 else a0)
+		c := th_find(s.cur)
+		if t == nil {
+			// The loader's priority is IOP_START_PRIO for good: a start's
+			// change of its own is taken and changes nothing.
+			if a0 == 0 {return KE_OK, true}
+			return ke(KE_UNKNOWN_THID), true
+		}
+		prio := a1
+		if prio == 0 {prio = c.prio if c != nil else t.prio}
+		if prio < PRIO_HIGHEST || prio > PRIO_LOWEST {return ke(KE_ILLEGAL_PRIORITY), true}
+		#partial switch t.status {
+		case .Dormant: return ke(KE_DORMANT), true
+		case .Run:
+			// The caller keeps the CPU while it stays better than every
+			// ready thread, else goes to the tail of its new priority's.
+			t.prio = prio
+			if b := th_pick(); b != nil && b.prio <= prio {
+				th_ready(t)
+				th_yield()
+			}
+		case .Ready:
+			t.prio = prio
+			th_ready(t)
+			if c != nil && prio < c.prio {s.resched = true}
+		case: t.prio = prio // a waiter: its wait's queue is by priority at the signal (sema_waiter)
+		}
+		return KE_OK, true
 	case 16: // RotateThreadReadyQueue(prio): the caller yields to its equals
 		if t := th_find(s.cur); t != nil {
 			th_ready(t)
@@ -976,6 +1062,8 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return KE_OK, true
 	case 20: // GetThreadId
 		return s.cur, true
+	case 22: // ReferThreadStatus(thid, iop_thread_info_t *): thid 0 the caller
+		return th_refer(s.cur if a0 == 0 else a0, a1), true
 	case 24: // SleepThread
 		return th_sleep(), true
 	case 25, 26: // WakeupThread(thid), iWakeupThread(thid)

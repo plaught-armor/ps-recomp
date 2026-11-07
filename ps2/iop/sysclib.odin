@@ -209,6 +209,11 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		src := ram(a1, a2)
 		copy(ram_w(a0, u32(len(src))), src)
 		return a0, true
+	case 13: // memmove(dst, src, n): an overlapping copy as if through a buffer; n <= 0 copies none. A null dst copies none and gives 0
+		if a0 == 0 {return 0, true}
+		src := ram(a1, u32(max(i32(a2), 0)))
+		copy(ram_w(a0, u32(len(src))), src)
+		return a0, true
 	case 14: // memset(dst, c, n)
 		for &b in ram_w(a0, a2) {b = u8(a1)}
 		return a0, true

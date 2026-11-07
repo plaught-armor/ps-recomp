@@ -58,7 +58,7 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		sd_lib_init()
 		s^ = {}
 		return 0, true
-	case 5 ..= 11: // sceSdSet/GetParam, Switch, Addr, SetCoreAttr(entry[, value])
+	case 5 ..= 12: // sceSdSet/GetParam, Switch, Addr, CoreAttr(entry[, value])
 		return sd_entry(fno, a0, a1), true
 	case 15: // sceSdProcBatch(sceSdBatch *, returns, count)
 		return sd_proc_batch(a0, a1, a2), true
@@ -68,6 +68,8 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		p, found := sd_note_pitch(u16(a0), u16(a1), u16(a2), i16(a3))
 		if !found {libsd_unknown(fno, a3 & 0xffff)}
 		return p, true
+	case 14: // sceSdPitch2Note(center note, center fine, pitch)
+		return sd_pitch_note(a0, a1, a2), true
 	case 17: // sceSdVoiceTrans(channel, mode, iop address, spu address, size): done at once
 		size := r32(r[29] + 16)
 		if a1 & 3 > 1 {return 0, true}
@@ -114,8 +116,8 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 
 // libsd's set and get calls on one entry, for libsd_fn and the batches:
 // sceSdSetParam (fno 5), GetParam (6), SetSwitch (7), GetSwitch (8),
-// SetAddr (9), GetAddr (10), SetCoreAttr (11) and GetCoreAttr (12, which
-// only a batch reaches). What a get reads, 0 for a set.
+// SetAddr (9), GetAddr (10), SetCoreAttr (11) and GetCoreAttr (12). What a
+// get reads, 0 for a set.
 @(private = "file")
 sd_entry :: proc(fno, entry, value: u32) -> u32 {
 	v, found := u32(0), true
@@ -131,6 +133,7 @@ sd_entry :: proc(fno, entry, value: u32) -> u32 {
 		v, found = sd_get_addr(entry)
 		if !found {v, found = sd_get_addr_extra(entry)}
 	case 11: found = sd_core_attr(entry, value)
+	case 12: v, found = sd_get_core_attr(entry)
 	case: found = false
 	}
 	if !found {libsd_unknown(fno, entry)}
@@ -297,13 +300,58 @@ sd_note_pitch :: proc(center_note, center_fine, note: u16, fine: i16) -> (pitch:
 		f += (q + 1) * 128
 	}
 	if u32(semi) >= 12 || u32(f) >= 128 {return 0, false}
-	ratio := math.floor(0x8000 * math.pow(2, f64(semi) / 12)) * math.floor(0x8000 * math.pow(2, f64(f) / 1536))
-	p := u32(ratio) >> 16
+	p := (sd_semi_ratio(semi) * sd_fine_ratio(f)) >> 16
 	if shift < 0 {
 		s := u32(-shift)
 		p = (p + 1 << ((s - 1) & 31)) >> (s & 31)
 	}
 	return p & 0xffff, true
+}
+
+// The ratios of retail libsd's pitch tables, as 0x8000 is 1: a semitone's
+// (0 to 11), 0x8000 times 2 to the semitone/12, and a fine's (0 to 127,
+// 128ths of a semitone), 0x8000 times 2 to the fine/1536, each rounded down.
+@(private = "file")
+sd_semi_ratio :: proc(semi: i32) -> u32 {return u32(math.floor(0x8000 * math.pow(2, f64(semi) / 12)))}
+@(private = "file")
+sd_fine_ratio :: proc(fine: i32) -> u32 {return u32(math.floor(0x8000 * math.pow(2, f64(fine) / 1536)))}
+
+// sceSdPitch2Note's note for `pitch`, the note played at 0x1000 being
+// `center_note` and `center_fine`, as retail libsd computes it: the note in
+// the high byte, its fine in 128ths of a semitone, even, in the low. A pitch
+// past 0x3fff is 0x3fff. Its top bit gives the octave; the pitch shifted up
+// to bit 15 falls between two semitone ratios, the lower its semitone, and
+// that over the semitone's ratio, as 0x8000 is 1, between two fine ratios,
+// the lower its fine. The fine plus 1 adds to center_fine, whole semitones
+// carrying into the note, which adds to center_note, the octave counted from
+// 12 (0x1000's top bit) as 12 semitones each. The sums wrap, as retail's 32
+// bits do, and only the low 16 are given.
+@(private = "file")
+sd_pitch_note :: proc(center_note, center_fine, pitch: u32) -> u32 {
+	p := min(pitch & 0xffff, 0x3fff)
+	oct: u32
+	for b in u32(0) ..< 14 {
+		if p >> b & 1 != 0 {oct = b}
+	}
+	m := (p << (15 - oct)) & 0xffff
+	semi: i32
+	for i := i32(11); i >= 0; i -= 1 {
+		if m >= sd_semi_ratio(i) {
+			semi = i
+			break
+		}
+	}
+	r := ((m << 15) / sd_semi_ratio(semi)) & 0xffff
+	fine: i32
+	for j := i32(127); j >= 0; j -= 1 {
+		if r >= sd_fine_ratio(j) {
+			fine = j
+			break
+		}
+	}
+	f := center_fine + u32(fine) + 1
+	note := center_note + u32(semi) + oct * 12 - 144 + ((f & 0xffff) >> 7)
+	return ((note << 8) + (f & 0x7e)) & 0xfffe
 }
 
 // sceSdEffectAttr as words: core, mode, depth (L in the low 16 bits, R in

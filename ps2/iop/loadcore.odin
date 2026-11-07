@@ -633,6 +633,15 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		case 4, 5: // sceUsbdRegisterLdd(ops), sceUsbdUnregisterLdd(ops)
 			return 0, true
 		}
+	case "secrman":
+		// A memory card's authentication over SIO2, which no card answers here
+		// (sio2_frame): the HLE's cards are mcserv's alone, over its RPC.
+		switch fno {
+		case 4, 5: // SecrSetMcCommandHandler(func), SecrSetMcDevIDHandler(func): kept for 6 to talk to the card through
+			return 0, true
+		case 6: // SecrAuthCard(port, slot, cnum): 0, the handshake failed, as retail's when no card answers
+			return 0, true
+		}
 	case "thbase":
 		return th_base(fno)
 	case "thsemap":

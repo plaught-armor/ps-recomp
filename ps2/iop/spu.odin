@@ -85,6 +85,9 @@ spu: struct {
 	block:  [2]Sdr_Block, // the block transfers, per channel
 	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
 	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
+	mute:      u8, // the cores with MUTE set, a bit each, ATTR bit 14; nothing is muted by it here (libsd)
+	noise_clk: [2]u8, // NOISE_CLK, ATTR bits 8 to 13, per core; no voice plays noise here (libsd)
+	spdif:     u16, // SPDIF_MODE as libsd last took it; the S/PDIF out it picks is not modelled
 	// The EE cycle at which the input area's read or the output areas'
 	// write reaches IRQA, per core whose bit irq_watch has and whose IRQA
 	// is in those areas, else max(u64) (sd_in_arm).
@@ -1040,7 +1043,10 @@ sd_get_addr_extra :: proc(id: u32) -> (u32, bool) {
 }
 
 // sceSdSetCoreAttr(entry, value) for EFFECT_ENABLE and IRQ_ENABLE; MUTE,
-// NOISE_CLK and SPDIF are taken and change nothing.
+// NOISE_CLK and SPDIF are kept for sd_get_core_attr and change nothing else.
+// MUTE takes the value's bit 0 and NOISE_CLK its low 6 bits, as retail's
+// ATTR does; SPDIF only an out mode retail knows (0, 1, 2 or 15 in the low 4
+// bits), any other changing nothing, as retail's refuses it.
 sd_core_attr :: proc(entry, value: u32) -> bool {
 	c := entry & 1
 	switch entry &~ 1 {
@@ -1049,10 +1055,29 @@ sd_core_attr :: proc(entry, value: u32) -> bool {
 		spu.irq_watch &~= 1 << c
 		if value != 0 {spu.irq_watch |= 1 << c}
 		sd_in_arm(c)
-	case SD_C_MUTE, SD_C_NOISE_CLK, SD_C_SPDIF:
+	case SD_C_MUTE: spu.mute = spu.mute &~ (1 << c) | u8(value & 1) << c
+	case SD_C_NOISE_CLK: spu.noise_clk[c] = u8(value & 0x3f)
+	case SD_C_SPDIF:
+		switch value & 0xf {
+		case 0, 1, 2, 0xf: spu.spdif = u16(value)
+		}
 	case: return false
 	}
 	return true
+}
+
+// sceSdGetCoreAttr(entry): what sd_core_attr keeps, EFFECT_ENABLE and
+// IRQ_ENABLE as 1 or 0; SPDIF is not per core.
+sd_get_core_attr :: proc(entry: u32) -> (u32, bool) {
+	c := entry & 1
+	switch entry &~ 1 {
+	case SD_C_EFFECT_ENABLE: return u32(spu.effect[c]), true
+	case SD_C_IRQ_ENABLE: return u32(spu.irq_watch >> c & 1), true
+	case SD_C_MUTE: return u32(spu.mute >> c & 1), true
+	case SD_C_NOISE_CLK: return u32(spu.noise_clk[c]), true
+	case SD_C_SPDIF: return u32(spu.spdif), true
+	}
+	return 0, false
 }
 
 // sceSdClearEffectWorkArea(core, ...): the work area zeroed, mode and
@@ -1070,6 +1095,7 @@ sd_clear_effect :: proc(core: u32) {
 // kept 0, the zero state, as their value at power on is not known.
 sd_lib_init :: proc() {
 	spu.irqa, spu.irq_watch, spu.in_irq, spu.bvol = {}, 0, {max(u64), max(u64)}, {}
+	spu.mute, spu.noise_clk = 0, {} // retail's init sets ATTR to the core's enable alone; SPDIF it keeps
 	spu.block = {}
 	for &c in spu.switches {c = {.PMON = 0, .NON = 0, .VMIXL = 0xffffff, .VMIXEL = 0xffffff, .VMIXR = 0xffffff, .VMIXER = 0xffffff}}
 }

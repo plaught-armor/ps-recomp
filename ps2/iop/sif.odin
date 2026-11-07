@@ -900,12 +900,12 @@ cdvd_init_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	switch fno {
-	case 0x01: // ReadClock {result, clock[8]}
+	case 0x01: // ReadClock {result, clock[CD_CLOCK]}
 		w[0], w[1], w[2] = 1, 0, 0
 	case 0x03: w[0] = cd_disk_type() // GetDiskType
 	case 0x04: w[0] = 0 // GetError
 	case 0x05: w[0], w[1] = 1, 0 // TrayReq {result, tray check}
-	case 0x0c: w[0] = CD_STAT_PAUSE // Status
+	case 0x0c: w[0] = cd_status() // Status
 	case 0x16, 0x22, 0x23: w[0] = 1 // Break, MMode, ChangeThreadPriority
 	case 0x27: // ReadDvdDualInfo {result, on_dual, layer1_start}
 		on_dual, layer1 := cd_dual_info()

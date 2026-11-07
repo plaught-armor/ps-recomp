@@ -24,10 +24,12 @@ ENODEV :: 19
 // date[8], flag}.
 CD_FILE :: 0x24
 
-// The function codes a command's callback gets, retail's for sceCdRead and
-// sceCdStandby.
+// The function codes a command's callback gets, retail's for sceCdRead,
+// sceCdStandby, sceCdStop and sceCdPause.
 CD_FUNC_READ :: 1
 CD_FUNC_STANDBY :: 5
+CD_FUNC_STOP :: 6
+CD_FUNC_PAUSE :: 7
 
 // The disk types cdvdman's sceCdGetDiskType and cdvdfsv's GetDiskType
 // answer (cd_disk_type): a PS2 CD, one with audio tracks, and a PS2 DVD.
@@ -35,11 +37,19 @@ CD_DISK_PS2_CD :: 0x12
 CD_DISK_PS2_CDDA :: 0x13
 CD_DISK_PS2_DVD :: 0x14
 
-// The drive status cdvdman's sceCdStatus and cdvdfsv's S-command Status
-// answer: paused, the disc spun up with no command running. Commands finish
-// in their call here, so the drive is never seen reading, seeking or
-// stopped, and the tray is never open.
+// The drive statuses cdvdman's sceCdStatus and cdvdfsv's S-command Status
+// answer (cd_status): stopped, the disc not spinning, after sceCdStop, and
+// paused, spun up with no command running, else. Commands finish in their
+// call here, so the drive is never seen reading or seeking, and the tray is
+// never open.
+CD_STAT_STOP :: 0x00
 CD_STAT_PAUSE :: 0x0a
+
+// The 8 bytes sceCdReadClock and cdvdfsv's S-command ReadClock write, the
+// drive's clock {stat, second, minute, hour, pad, day, month, year} in BCD:
+// all 0, a clock with no time, the same on every run so replays and netplay
+// peers agree.
+CD_CLOCK :: 8
 
 // The most callback runs one tick can owe: commands made faster than ticks
 // run their callbacks.
@@ -49,6 +59,7 @@ Iop_Cd :: struct {
 	callback:  u32, // IOP address; 0 is none
 	n_pending: u32,
 	pending:   [CD_PENDING]u32, // the function codes of the completed commands' callbacks not yet run, first made first
+	stopped:   bool, // sceCdStop stopped the disc, and no command has spun it up since
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -62,6 +73,7 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 4: // sceCdInit(mode): 1 for every mode. 0 waits for the drive, always ready here; 5 shuts down, nothing held
 		return 1, true
 	case 5: // sceCdStandby: spins the disc up, done here; 1, the command accepted
+		iop_cd.stopped = false
 		cd_done(CD_FUNC_STANDBY)
 		return 1, true
 	case 6: // sceCdRead(lsn, sectors, buffer, sceCdRMode *{trycount, spindlctrl, datapattern})
@@ -80,6 +92,7 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			disc_sectors(a0 + k, sector[:])
 			copy(iop_ram_at(a2 + k * DISC_SECTOR, DISC_SECTOR), sector[:])
 		}
+		iop_cd.stopped = false
 		cd_done(CD_FUNC_READ)
 		return 1, true
 	case 8: // sceCdGetError: none
@@ -92,8 +105,21 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return cd_disk_type(), true
 	case 13: // sceCdDiskReady(mode): 2, ready
 		return 2, true
+	case 15: // sceCdStop: stops the disc, done here; 1, the command accepted
+		iop_cd.stopped = true
+		cd_done(CD_FUNC_STOP)
+		return 1, true
+	case 24: // sceCdReadClock(sceCdCLOCK *): 1, the clock read
+		for &b in iop_ram_at(a0, CD_CLOCK) {b = 0}
+		return 1, true
 	case 28: // sceCdStatus
-		return CD_STAT_PAUSE, true
+		return cd_status(), true
+	case 38: // sceCdPause: spins the disc up and holds it there, done here; 1, the command accepted
+		iop_cd.stopped = false
+		cd_done(CD_FUNC_PAUSE)
+		return 1, true
+	case 39: // sceCdBreak: 1. No command runs here for it to break, so no callback comes of it
+		return 1, true
 	case 37: // sceCdCallback(func): the previous func. Retail returns 0 and sets nothing while a command is busy; none is here
 		old := iop_cd.callback
 		iop_cd.callback = a0
@@ -162,6 +188,11 @@ cd_done :: proc(code: u32) {
 	iop_wake_set()
 }
 
+// The drive's status, as CD_STAT_STOP and CD_STAT_PAUSE say.
+cd_status :: proc() -> u32 {
+	return CD_STAT_STOP if iop_cd.stopped else CD_STAT_PAUSE
+}
+
 // When, in EE cycles, the callback runs owed are due: at once (the IOP's
 // clock) while one is; max(u64) when none is.
 cd_next_ee :: proc() -> u64 {
@@ -193,9 +224,14 @@ cd_intr_run :: proc() {
 // After a failed load: puts the callback and the runs owed back as they
 // were when the load began (`saved`) if the callback lies in `freed`, the
 // memory its undo frees. The load's own runs go; those owed before it stay,
-// to run with the callback put back.
+// to run with the callback put back. The drive stays as it is: the disc's
+// spin is not the load's to undo.
 cd_undo :: proc(saved: Iop_Cd, freed: []Sys_Block) {
-	if sys_in(freed, iop_cd.callback) {iop_cd = saved}
+	if sys_in(freed, iop_cd.callback) {
+		stopped := iop_cd.stopped
+		iop_cd = saved
+		iop_cd.stopped = stopped
+	}
 }
 
 // Function fno of ioman, as stdio_fn. Results as fileio_server's.
