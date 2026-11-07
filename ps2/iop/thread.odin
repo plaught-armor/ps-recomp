@@ -73,6 +73,7 @@ KE_NO_MEMORY :: -400
 KE_ILLEGAL_ATTR :: -401
 KE_ILLEGAL_ENTRY :: -402
 KE_ILLEGAL_PRIORITY :: -403
+KE_ILLEGAL_STACK_SIZE :: -404
 KE_ILLEGAL_THID :: -406
 KE_UNKNOWN_THID :: -407
 KE_UNKNOWN_SEMID :: -408
@@ -95,10 +96,20 @@ KE_RELEASE_WAIT :: -418
 PRIO_HIGHEST :: 1
 @(private = "file")
 PRIO_LOWEST :: 126
-// The top part of a new thread's stack that CreateThread leaves out of its
-// 0xff fill.
+// The attr bits this ROM's CreateThread takes: 0x8, 0x01000000 and
+// 0x02000000 (user mode, assembler and C entry) and the top three. Any
+// other bit is refused with KE_ILLEGAL_ATTR, the no-fill 0x100000 and
+// clear-stack 0x200000 among them, so every thread's stack is filled.
+@(private = "file")
+TH_ATTR_OK :: 0xe300_0008
+// The least stack CreateThread takes, and the top part of it left out of
+// the 0xff fill.
+@(private = "file")
+TH_STACK_MIN :: 0x130
 @(private = "file")
 TH_STACK_TOP :: 0x30
+@(private = "file")
+SA_ATTR_OK :: 0x101
 @(private = "file")
 SA_THPRI :: 1 // a semaphore's waiters by priority, else first come
 @(private = "file")
@@ -721,6 +732,7 @@ th_rpc_wake :: proc(id: u32) {
 
 // WakeupThread(id): readies thread id if it sleeps, else counts a wakeup.
 th_wakeup :: proc(id: u32) -> u32 {
+	if id == 0 {return ke(KE_ILLEGAL_THID)}
 	t := th_find(id)
 	if t == nil {return ke(KE_UNKNOWN_THID)}
 	if t.id == iop_sched.cur {return ke(KE_ILLEGAL_THID)}
@@ -1067,20 +1079,26 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	if th_wrong_context(.Base, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
 	switch fno {
 	case 4: // CreateThread(iop_thread_t *): attr, option, entry, stacksize, priority
-		entry, size, prio := r32(a0 + 8), r32(a0 + 12), r32(a0 + 16)
-		if entry == 0 || entry & 3 != 0 {return ke(KE_ILLEGAL_ENTRY), true}
+		// Retail checks the attr, the priority, the entry's alignment (0 is
+		// taken) and the stack size in that order, then writes the size,
+		// rounded up to 256, back to the caller's struct before it takes
+		// the stack. The stack is filled with 0xff but for its top 0x30.
+		attr, entry, size, prio := r32(a0), r32(a0 + 8), r32(a0 + 12), r32(a0 + 16)
+		if attr &~ TH_ATTR_OK != 0 {return ke(KE_ILLEGAL_ATTR), true}
 		if prio < PRIO_HIGHEST || prio > PRIO_LOWEST {return ke(KE_ILLEGAL_PRIORITY), true}
-		stack := sys_alloc(.High, size)
-		if stack == 0 || size == 0 {return ke(KE_NO_MEMORY), true}
-		// Retail fills a new stack with 0xff but for its top 0x30 bytes, so
-		// what a thread reads from stack it never wrote is 0xff, not 0.
+		if entry & 3 != 0 {return ke(KE_ILLEGAL_ENTRY), true}
+		if size < TH_STACK_MIN {return ke(KE_ILLEGAL_STACK_SIZE), true}
 		size = (size + SYS_ALIGN - 1) &~ (SYS_ALIGN - 1)
-		if size > TH_STACK_TOP {for &b in ram_w(stack, size - TH_STACK_TOP) {b = 0xff}}
+		w32(a0 + 12, size)
+		stack := sys_alloc(.High, size)
+		if stack == 0 {return ke(KE_NO_MEMORY), true}
+		for &b in ram_w(stack, size - TH_STACK_TOP) {b = 0xff}
 		t := th_new(entry, stack, size, r[28], prio)
 		t.attr, t.option = r32(a0), r32(a0 + 4)
 		if cpu.debug >= 1 {fmt.eprintfln("iop: thread %d entry %x prio %d stack %x", t.id, entry, prio, size)}
 		return t.id, true
 	case 5: // DeleteThread(thid)
+		if a0 == 0 {return ke(KE_ILLEGAL_THID), true}
 		t := th_find(a0)
 		if t == nil {return ke(KE_UNKNOWN_THID), true}
 		if t.status != .Dormant {return ke(KE_NOT_DORMANT), true}
@@ -1088,6 +1106,7 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		th_remove(t.id)
 		return KE_OK, true
 	case 6, 7: // StartThread(thid, arg), StartThreadArgs(thid, args, argp)
+		if a0 == 0 {return ke(KE_ILLEGAL_THID), true}
 		t := th_find(a0)
 		if t == nil {return ke(KE_UNKNOWN_THID), true}
 		if t.status != .Dormant {return ke(KE_NOT_DORMANT), true}
@@ -1104,6 +1123,7 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		th_exit(delete = fno == 9)
 		return ke(KE_ILLEGAL_CONTEXT), true
 	case 10, 11: // TerminateThread(thid), iTerminateThread(thid)
+		if a0 == 0 {return ke(KE_ILLEGAL_THID), true}
 		t := th_find(a0)
 		if t == nil {return ke(KE_UNKNOWN_THID), true}
 		if t.id == s.cur {return ke(KE_ILLEGAL_THID), true}
@@ -1205,6 +1225,8 @@ th_semap :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	if th_wrong_context(.Semap, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
 	switch fno {
 	case 4: // CreateSema(iop_sema_t *): attr, option, initial, max
+		// Retail takes only SA_THPRI and SA_IHTHPRI; the counts go unchecked.
+		if r32(a0) &~ SA_ATTR_OK != 0 {return ke(KE_ILLEGAL_ATTR), true}
 		append(&s.semas, Iop_Sema{s.next_semid, r32(a0), r32(a0 + 4), i32(r32(a0 + 8)), i32(r32(a0 + 12)), i32(r32(a0 + 8))})
 		s.next_semid += 1
 		return s.next_semid - 1, true
