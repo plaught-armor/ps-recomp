@@ -146,7 +146,7 @@ midload_vu_take :: proc(state: os.Process_State) -> Midload_Poll {
 	} else {
 		defer midload_vu_remove()
 		if !state.exited || state.exit_code != 0 {
-			fmt.eprintfln("play: mid-run VU conversion failed (exit %d)", state.exit_code)
+			fmt.eprintfln("play: mid-run VU conversion failed (%s)", midload_ended(state))
 			return .Failed
 		}
 		added, known, skipped, ok := ps2.load_native_vus(mv.tmp)

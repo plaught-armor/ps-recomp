@@ -78,7 +78,7 @@ midlearn_host_poll :: proc(timeout: time.Duration) -> Midload_Poll {
 		return .Lost
 	}
 	if !state.exited || state.exit_code != 0 {
-		fmt.eprintfln("play: mid-run learned compile failed (exit %d)", state.exit_code)
+		fmt.eprintfln("play: mid-run learned compile failed (%s)", midload_ended(state))
 		midlearn_cleanup()
 		return .Failed
 	}
