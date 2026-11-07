@@ -183,6 +183,13 @@ mod_func_at :: #force_inline proc(addr: u32) -> cpu.Func_Proc {
 	return mod_funcs[off >> 2]
 }
 
+// Whether mod_func_at can find native code at addr, by one compare: false
+// for an addr whose offset is outside the region, or with none loaded. A
+// true one is not yet in the region (mod_off decides that).
+mod_func_near :: #force_inline proc(addr: u32) -> bool {
+	return (addr & 0x0fff_ffff) - MOD_BASE < u32(len(mod_funcs)) << 2
+}
+
 // mod_func_at, counted as a call when there is code.
 mod_native :: #force_inline proc(addr: u32) -> cpu.Func_Proc {
 	fn := mod_func_at(addr)
