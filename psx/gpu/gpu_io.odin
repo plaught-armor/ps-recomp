@@ -47,21 +47,46 @@ xfer_rect :: proc(w1, w2: u32) -> Vram_Xfer {
 	return {x = i32(w1 & 0x3ff), y = i32((w1 >> 16) & 0x1ff), w = w, h = h}
 }
 
+// Write pixels px of upload t from its next one on, a VRAM row's run at
+// a time; how many it took and whether the upload wants more.
 @(private)
-upload_pixel :: proc(t: ^Vram_Xfer, p: u16) -> bool {
-	x := t.x + t.pos % t.w
-	y := t.y + t.pos / t.w
-	render.raster_sync()
-	if !(render.gpu.check_mask && render.vram_at(x, y)^ & 0x8000 != 0) {
-		render.vram_put(x, y, render.gpu.set_mask ? p | 0x8000 : p)
+upload_pixels :: proc(t: ^Vram_Xfer, px: []u16) -> (used: int, more: bool) {
+	total := t.w * t.h
+	for used < len(px) && t.pos < total {
+		col := t.pos % t.w
+		x := t.x + col
+		n := min(int(t.w - col), len(px) - used, int(render.VRAM_W - (x & (render.VRAM_W - 1))))
+		render.vram_put_run(x, t.y + t.pos / t.w, px[used:][:n])
+		t.pos += i32(n)
+		used += n
 	}
-	t.pos += 1
-	return t.pos < t.w * t.h
+	return used, t.pos < total
+}
+
+// As gp0_write for each of words in turn, an upload's pixels a run at a
+// time. A word whose low pixel ends an upload has its high one dropped.
+gp0_write_words :: proc(words: []u32) {
+	for i := 0; i < len(words); {
+		if !gp.uploading {
+			gp0_write(words[i])
+			i += 1
+			continue
+		}
+		px: [512]u16
+		n := min(len(words) - i, len(px) / 2)
+		for w, j in words[i:][:n] {
+			px[2 * j], px[2 * j + 1] = u16(w), u16(w >> 16)
+		}
+		used: int
+		used, gp.uploading = upload_pixels(&gp.upload, px[:2 * n])
+		i += (used + 1) / 2
+	}
 }
 
 gp0_write :: proc(w: u32) {
 	if gp.uploading {
-		gp.uploading = upload_pixel(&gp.upload, u16(w)) && upload_pixel(&gp.upload, u16(w >> 16))
+		px := [2]u16{u16(w), u16(w >> 16)}
+		_, gp.uploading = upload_pixels(&gp.upload, px[:])
 		return
 	}
 	if gp.need == 0 && !gp.polyline {

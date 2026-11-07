@@ -2454,6 +2454,34 @@ vram_put :: proc(x, y: i32, c: u16) #no_bounds_check {
 	}
 }
 
+// As vram_put for each of px from x, y rightward, which stay in one VRAM
+// row (x & (VRAM_W - 1) + len(px) <= VRAM_W), under the GPU's mask bits: a
+// pixel whose VRAM pixel has bit 15 set under check_mask is kept, and each
+// written one gets bit 15 under set_mask (an upload's pixels).
+vram_put_run :: proc(x0, y: i32, px: []u16) #no_bounds_check {
+	n := i32(len(px))
+	x := x0 & (VRAM_W - 1)
+	assert(x + n <= VRAM_W, "a VRAM run leaves its row")
+	raster_sync()
+	hi_touch(x, y, n, 1)
+	row := vram[(y & (VRAM_H - 1)) * VRAM_W + x:][:n]
+	set: u16 = gpu.set_mask ? 0x8000 : 0
+	t := &targets[1]
+	k := t.shift
+	for p, i in px {
+		if gpu.check_mask && row[i] & 0x8000 != 0 {continue}
+		c := p | set
+		row[i] = c
+		if target_count == 2 {
+			for dy in 0 ..< i32(1) << k {
+				for dx in 0 ..< i32(1) << k {
+					t.rgb[target_index(t, (x + i32(i)) << k + dx, y << k + dy)] = hi_pixel(c)
+				}
+			}
+		}
+	}
+}
+
 // Most extra pictures between two game frames: one per repeated vblank of a
 // game frame up to 4 vblanks long.
 EXTRA_FRAMES :: 3

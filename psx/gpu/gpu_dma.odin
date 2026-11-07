@@ -97,9 +97,15 @@ dma_gpu :: proc(c: ^io.Dma_Channel) {
 		n := io.dma_words(c)
 		a := c.madr & 0x1ffffc
 		if c.chcr & 1 != 0 {
-			for _ in 0 ..< n {
-				gp0_write(cpu.r32(a))
-				a += 4
+			words: [256]u32
+			for left := int(n); left > 0; {
+				k := min(left, len(words))
+				for &w in words[:k] {
+					w = cpu.r32(a)
+					a += 4
+				}
+				gp0_write_words(words[:k])
+				left -= k
 			}
 		} else {
 			for _ in 0 ..< n {

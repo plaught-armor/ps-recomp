@@ -34,6 +34,7 @@ odin run tests/psx_unaligned -collection:ps=.
 odin run tests/psx_gte -collection:ps=.
 odin run tests/psx_cover -collection:ps=.
 odin run tests/psx_timer -collection:ps=.
+odin run tests/psx_gpu_upload -collection:ps=.
 odin run tests/ps2_kernel -collection:ps=.
 odin run tests/ps2_iop -collection:ps=.
 odin run tests/iop_thread_grow -collection:ps=.
@@ -111,6 +112,7 @@ here.
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
+| `psx_gpu_upload` | VRAM uploads a run at a time, as a pixel at a time: row wrap, a dropped half word, mask bits |
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |
 | `psx_interp` | The PS1 interpreter's jumps into the BIOS |
