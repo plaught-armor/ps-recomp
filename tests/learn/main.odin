@@ -10,7 +10,10 @@
 // .Smc, whether RAM no longer holds a word it fetched or a word it fetched
 // twice changed between, and a word an earlier run fetched as another does
 // not; a run carried on through a compat probe's branches (learn_hold)
-// notes nothing of them; a range over
+// notes nothing of them; the run stamps wrapping (learn_epoch_skip) leave
+// a run in progress across the wrap .Smc, forget a word fetched as another
+// before it, and still see a word changed between two fetches after it; a
+// range over
 // LEARN_SPAN_MAX is .Large with no words; a run begun with every frame in
 // use is not noted; a run still in progress at the report is written
 // .Open; a record's words copied from RAM (learn_cpu's ram) are those
@@ -203,6 +206,31 @@ main :: proc() {
 		core.learn_fetch(f, 0xb004, word(0xb004))
 		core.learn_end(f)
 	}
+	// The run stamps wrap, as after 4G runs begun. A run begun before the
+	// wrap and ending after it is .Smc, as it forgot what it fetched. A word
+	// fetched as another by a run that ended before the wrap (itself .Smc,
+	// as RAM no longer holds it) leaves a run after it clean, as a run
+	// before it would. A word fetched twice after the wrap and changed
+	// between still marks its run.
+	{
+		core.learn_epoch_skip(.Psx, max(u32) - 2)
+		f := core.learn_begin(.Psx, 0xc100)
+		core.learn_fetch(f, 0xc100, word(0xc100))
+		p := core.learn_begin(.Psx, 0xc000)
+		core.learn_fetch(p, 0xc000, word(0xc000) ~ 0xffff)
+		core.learn_end(p)
+		q := core.learn_begin(.Psx, 0xc004) // the wrap
+		core.learn_fetch(q, 0xc000, word(0xc000))
+		core.learn_fetch(q, 0xc004, word(0xc004))
+		core.learn_end(q)
+		core.learn_fetch(f, 0xc104, word(0xc104))
+		core.learn_end(f)
+		run(.Psx, 0xd004, {0xd004})
+		g := core.learn_begin(.Psx, 0xd000)
+		core.learn_fetch(g, 0xd000, word(0xd000) ~ 0xffff)
+		core.learn_fetch(g, 0xd000, word(0xd000))
+		core.learn_end(g)
+	}
 	// A run that never returns is written at the report.
 	{
 		f := core.learn_begin(.Psx, 0x7000)
@@ -242,6 +270,11 @@ main :: proc() {
 		{.Ee, {}, 0x8004, 0x8004, 3},
 		{.Ee, {}, 0x6000, 0x6000, 1},
 		{.Ee, {}, 0xb000, 0xb000, 2},
+		{.Psx, {.Smc}, 0xc000, 0xc000, 1},
+		{.Psx, {}, 0xc004, 0xc000, 2},
+		{.Psx, {.Smc}, 0xc100, 0xc100, 2},
+		{.Psx, {}, 0xd004, 0xd004, 1},
+		{.Psx, {.Smc}, 0xd000, 0xd000, 1},
 		{.Psx, {.Open}, 0x7000, 0x7000, 2},
 	}
 	data, rerr := os.read_entire_file(path, context.allocator)
