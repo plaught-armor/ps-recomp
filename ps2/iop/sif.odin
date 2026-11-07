@@ -457,13 +457,14 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		fmt.eprintfln("sif: load module \"%s\"", cstring(&buf[8]))
 		path := strings.truncate_to_byte(string(buf[8:][:252]), 0)
 		args := buf[0x104:][:min(w[0], 252)]
-		dbcman_module(path)
+		// A rom0 module has no file here; a disc one is read for its image.
+		data: []u8
+		if !strings.has_prefix(path, "rom0:") {data, _ = disc_file(path, context.temp_allocator)}
+		dbcman_module(path, data)
 		w[0] = 2
 		w[1] = 0
-		if iop_irx && !strings.has_prefix(path, "rom0:") {
-			if data, ok := disc_file(path, context.temp_allocator); ok && iop_runs(data) {
-				if id, result := iop_load(data, path, args); id >= 0 {w[0], w[1] = u32(id), result}
-			}
+		if iop_irx && data != nil && iop_runs(data) {
+			if id, result := iop_load(data, path, args); id >= 0 {w[0], w[1] = u32(id), result}
 		}
 		return true
 	case 1: // LoadElf {unused, unused, path[252], section[252]}, reply
