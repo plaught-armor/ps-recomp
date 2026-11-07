@@ -210,6 +210,30 @@ Mod_Inner :: struct {
 mod_inner: ^Mod_Inner
 mod_inners: [256]^Mod_Inner
 
+// ---------------------------------------------------------------- unwind
+
+// The calls the EE interpreter's runs are inside (ps2 interp_body),
+// innermost first, on the host stack: the address each returns to and the
+// guest sp at the call, so a `jr $ra` to an outer call's return address
+// with that call's sp (a longjmp) returns there instead of to its own
+// caller. target is the address called; direct: the run that made the call
+// was itself called by the record below, with no host code between. Each
+// thread has its own (interp_tops by thread id, swapped by the kernel's
+// thread switch); an exec starts with none. Emulated: the records are on
+// the coroutines' stacks, which snapshots hold. Unused under FLAT, whose
+// runs keep the chain as data (kernel.Flat_Ctx).
+Interp_Frame :: struct {
+	ret, sp, target: u32,
+	direct:          bool,
+	prev:            ^Interp_Frame,
+}
+interp_top: ^Interp_Frame
+interp_tops: [256]^Interp_Frame
+
+// The most calls an unwind looks through, both interpreters: past it a
+// `jr $ra` returns as before.
+UNWIND_MAX :: 64
+
 bad_insn :: proc(pc, w: u32) {
 	fatal("invalid instruction %08x at %08x", w, pc)
 }
@@ -299,4 +323,8 @@ cpu_snap :: proc() {
 	core.snap_add(&next_event)
 	core.snap_add(&in_interrupt)
 	core.snap_add(&reported)
+	when !core.FLAT {
+		core.snap_add(&interp_top)
+		core.snap_add(&interp_tops)
+	}
 }

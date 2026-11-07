@@ -35,7 +35,9 @@ Flat_End :: enum u8 {
 // One guest run: where it is, and the return addresses of the calls it is
 // inside, innermost last. A call returns to the address it pushed at the
 // first `jr $ra` (or ERET) at its depth, whatever $ra holds then, as the
-// interpreter's host frames do (ps2/interp_call.odin interp_body, `.Jr`).
+// interpreter's host frames do (ps2/interp_call.odin interp_body, `.Jr`),
+// unless $ra and sp are an outer call's: a longjmp, which unwinds to it
+// (ps2/interp_flat.odin flat_unwind).
 Flat_Ctx :: struct {
 	pc:    u32,
 	depth: u32,
@@ -45,9 +47,11 @@ Flat_Ctx :: struct {
 	// register other than $ra: the second (a backward jump's) comes first.
 	back:  bool,
 	end:   Flat_End,
-	// The return addresses; len is the capacity. On the emulated heap, so a
-	// snapshot holds them with the rest of the machine.
+	// The return addresses, and the guest sp at each call (an unwind's
+	// check, ps2/interp_flat.odin flat_unwind); len is the capacity. On the
+	// emulated heap, so a snapshot holds them with the rest of the machine.
 	ret:   []u32,
+	sp:    []u32,
 }
 
 // Emulated state: a snapshot holds it with the rest of the machine.
@@ -129,6 +133,7 @@ FLAT_HOST_TAIL :: u32(1)
 flat_push :: proc(x: ^Flat_Ctx, ret, t: u32) {
 	if int(x.depth) == len(x.ret) {flat_grow(x, t)}
 	x.ret[x.depth] = ret
+	x.sp[x.depth] = u32(cpu.state.r[29].d[0])
 	x.depth += 1
 	cpu.flat_max_depth = max(cpu.flat_max_depth, x.depth)
 	x.pc = t
@@ -140,10 +145,13 @@ flat_grow :: proc(x: ^Flat_Ctx, t: u32) {
 	n := max(2 * len(x.ret), FLAT_DEPTH_MIN)
 	if n > FLAT_DEPTH_MAX {cpu.fatal("guest calls nested %d deep at %08x", FLAT_DEPTH_MAX, t)}
 	ret, err := make([]u32, n, core.emu_allocator())
-	if err != nil {cpu.fatal("flat: a shadow stack of %d not allocated", n)}
+	sp, err_sp := make([]u32, n, core.emu_allocator())
+	if err != nil || err_sp != nil {cpu.fatal("flat: a shadow stack of %d not allocated", n)}
 	copy(ret, x.ret)
+	copy(sp, x.sp)
 	delete(x.ret, core.emu_allocator())
-	x.ret = ret
+	delete(x.sp, core.emu_allocator())
+	x.ret, x.sp = ret, sp
 }
 
 // A syscall the program installed (SetSyscall) at pc runs its handler fn,

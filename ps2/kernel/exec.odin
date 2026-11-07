@@ -163,6 +163,8 @@ exec_reset :: proc(what: string) {
 	if cpu.mod_depth > 0 {cpu.fatal("mod: %s in a mod's before or after hook", what)}
 	// The new program runs inside no replacement.
 	cpu.mod_inner, cpu.mod_inners = nil, {}
+	// Nor inside any interpreted call.
+	cpu.interp_top, cpu.interp_tops = nil, {}
 	reap()
 	cur := k.current
 	cur.wakeups = 0
