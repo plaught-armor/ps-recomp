@@ -91,6 +91,9 @@ imports :: proc(types: ^map[string]typeid = nil) -> map[string]u64 {
 	f(&m, types, "gte.cmd_rtps", gte.cmd_rtps)
 	f(&m, types, "gte.cmd_rtpt", gte.cmd_rtpt)
 	f(&m, types, "gte.cmd_mvmva", gte.cmd_mvmva)
+	// load_learned_blob and load_mods put run_events in this slot, in a
+	// wasm32 call of R3000_SIGS' signature for it: the same type.
+	#assert(type_of(run_events) == type_of(io.run_events))
 	f(&m, types, "io.run_events", io.run_events)
 	return m
 }

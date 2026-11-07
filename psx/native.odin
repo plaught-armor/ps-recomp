@@ -65,8 +65,9 @@ import native "native"
 // Replace the registered functions with the native code in the file at
 // path, or with standalone, register its functions where none are. False,
 // with the reason printed, when it cannot be used; the Odin functions then
-// stay, and a standalone game has none to run.
-load_native :: proc(path: string, standalone := false) -> bool {
+// stay, and a standalone game has none to run. The functions entered at an
+// address of skip are not put in: they stay interpreted, or the Odin ones.
+load_native :: proc(path: string, standalone := false, skip: []u32 = nil) -> bool {
 	if core.env("NATIVE") == "0" {
 		if standalone {
 			fmt.eprintfln("native: %s: NATIVE=0, and the build has no Odin functions", path)
@@ -89,20 +90,36 @@ load_native :: proc(path: string, standalone := false) -> bool {
 	fn :: proc(code: core.Native_Code, off: u32) -> cpu.Func_Proc {
 		return cast(cpu.Func_Proc)rawptr(code.base + uintptr(off))
 	}
+	skipped :: proc(skip: []u32, addr: u32) -> bool {
+		for e in skip {
+			if e == addr {return true}
+		}
+		return false
+	}
+	left := 0
+	for f in code.funcs {
+		if skipped(skip, f.addr) {left += 1}
+	}
+	for o in code.ovls {
+		if skipped(skip, o.addr) {left += 1}
+	}
+	if left > 0 {
+		fmt.eprintfln("native: %s: %d functions left to the interpreter (known thread switches)", path, left)
+	}
 	if standalone {
-		funcs := make([]cpu.Func_Entry, len(code.funcs))
+		funcs := make([dynamic]cpu.Func_Entry, 0, len(code.funcs))
 		defer delete(funcs)
-		for f, k in code.funcs {
-			funcs[k] = {f.addr, fn(code, f.off)}
+		for f in code.funcs {
+			if !skipped(skip, f.addr) {append(&funcs, cpu.Func_Entry{f.addr, fn(code, f.off)})}
 		}
-		cpu.register_funcs(funcs)
-		ovls := make([]cpu.Ovl_Entry, len(code.ovls))
+		cpu.register_funcs(funcs[:])
+		ovls := make([dynamic]cpu.Ovl_Entry, 0, len(code.ovls))
 		defer delete(ovls)
-		for o, k in code.ovls {
-			ovls[k] = {o.addr, o.slot, o.id, o.sig, fn(code, o.off)}
+		for o in code.ovls {
+			if !skipped(skip, o.addr) {append(&ovls, cpu.Ovl_Entry{o.addr, o.slot, o.id, o.sig, fn(code, o.off)})}
 		}
-		cpu.register_overlay_funcs(ovls)
-		fmt.eprintfln("native: %d functions from %s, standalone", len(code.funcs) + len(code.ovls), path)
+		cpu.register_overlay_funcs(ovls[:])
+		fmt.eprintfln("native: %d functions from %s, standalone", len(funcs) + len(ovls), path)
 		return true
 	}
 	// A function the build does not have means the blob is from other code:
@@ -126,13 +143,14 @@ load_native :: proc(path: string, standalone := false) -> bool {
 		return false
 	}
 	for f in code.funcs {
-		cpu.hook(f.addr, fn(code, f.off))
+		if !skipped(skip, f.addr) {cpu.hook(f.addr, fn(code, f.off))}
 	}
 	for o in code.ovls {
+		if skipped(skip, o.addr) {continue}
 		for &e in cpu.dispatch.overlay[o.addr] {
 			if ovl_match(e, o) {e.fn = fn(code, o.off)}
 		}
 	}
-	fmt.eprintfln("native: %d functions from %s", len(code.funcs) + len(code.ovls), path)
+	fmt.eprintfln("native: %d functions from %s", len(code.funcs) + len(code.ovls) - left, path)
 	return true
 }

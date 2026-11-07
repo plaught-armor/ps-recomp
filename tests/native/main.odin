@@ -1265,6 +1265,9 @@ bad_blobs :: proc(blob: []u8, imports: map[string]u64) {
 		{-1, 0, "short blob"},
 		{36, n_pool + 1, "pool count past the file"},
 		{24, 0xffffffff, "huge interp count"},
+		// Counts whose table sizes wrap a 32-bit int back to the true total.
+		{16, get(blob, 16) + 0x20000000, "function count 2^29 over"},
+		{36, n_pool + 0x40000000, "pool count 2^30 over"},
 		{28, 0xffffffff, "huge span count"},
 		{spans_at, u32(max(core.Native_Kind)) + 1, "unknown span kind"},
 		{spans_at + 8, get(blob, 44), "span function at the import slots"},

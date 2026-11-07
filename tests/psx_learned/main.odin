@@ -23,6 +23,12 @@
 //     a LEARN file's compilable PS1 runs become rows of lrn_NN/funcs.odin
 //     that learned.odin registers; with none, learned.odin registers none
 //     and no package is left behind.
+//   - A wasm32 blob leaves to the interpreter a run that may switch
+//     threads: one at an interpreted entry or inside an interpreted
+//     function, one that calls a run that switches (to a fixed point), and
+//     one that calls an entry the Switches file names (core.known_switches,
+//     which keeps each entry once). A syscall or A/B table call switches
+//     unless its block proves a0 or t1 another function number.
 package main
 
 import "core:fmt"
@@ -222,6 +228,7 @@ main :: proc() {
 
 	test_first_wins()
 	test_recomp(tmp)
+	test_switches(tmp)
 
 	if os.remove_all(tmp) != nil {
 		check(false, fmt.tprintf("cannot remove %s", tmp))
@@ -229,7 +236,7 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; the first function for the same code wins; the recompiler writes the compilable runs as learned functions")
+	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads to the interpreter")
 }
 
 // words at LOOP as one recompiled function.
@@ -306,4 +313,74 @@ test_recomp :: proc(tmp: string) {
 	text = read_text(reg)
 	check(strings.contains(text, "register_learned :: proc() {\n}\n") && !strings.contains(text, "import"), "learned.odin with no runs")
 	check(!os.exists(funcs), "lrn_00/funcs.odin left behind")
+}
+
+// The runs a wasm32 blob of runs leaves to the interpreter, given interp.
+@(private = "file")
+switch_skips :: proc(runs: []r3000.Learned, interp: []native.Blob_Interp) -> int {
+	n := 0
+	b := r3000.learned_blob(runs, .Wasm32, interp = interp, skipped = &n)
+	delete(b)
+	return n
+}
+
+@(private = "file")
+test_switches :: proc(tmp: string) {
+	JR_RA :: 0x03e00008
+	ret := [?]u32{JR_RA, 0}
+	plain := [?]r3000.Learned{{0x80020000, 0x80020000, ret[:]}}
+	check(switch_skips(plain[:], nil) == 0, "plain run left to the interpreter")
+
+	// H1: the run's entry is interpreted, or its words lie inside an
+	// interpreted function (a loop head or the return point after a jal).
+	at_entry := [?]native.Blob_Interp{{0x80020000, 0x80020000, 0x80020000}}
+	check(switch_skips(plain[:], at_entry[:]) == 1, "run at an interpreted entry compiled")
+	inside := [?]r3000.Learned{{0x80022010, 0x80022010, ret[:]}}
+	holder := [?]native.Blob_Interp{{0x80022000, 0x80022000, 0x80022040}}
+	check(switch_skips(inside[:], holder[:]) == 1, "run inside an interpreted function compiled")
+	check(switch_skips(plain[:], holder[:]) == 0, "run outside the interpreted function left")
+
+	// H2: A calls B, B switches (a syscall); A comes first, so leaving it
+	// takes a second pass.
+	a := [?]u32{0x0c009000, 0, JR_RA, 0} // jal 0x80024000
+	b := [?]u32{0x0000000c, JR_RA, 0} // syscall
+	chain := [?]r3000.Learned{{0x80023000, 0x80023000, a[:]}, {0x80024000, 0x80024000, b[:]}, plain[0]}
+	check(switch_skips(chain[:], nil) == 2, "run calling a learned run that switches compiled")
+
+	// M4: a function number proven in the block (the delay slot too) is
+	// no switch unless it is one; one not proven is.
+	Stub :: struct {
+		words: []u32,
+		skips: int,
+		what:  string,
+	}
+	stubs := [?]Stub {
+		{{0x24040001, 0x0000000c, JR_RA, 0}, 0, "EnterCriticalSection"},
+		{{0x24040003, 0x0000000c, JR_RA, 0}, 1, "ChangeThreadSubFunction"},
+		{{0x02002021, 0x0000000c, JR_RA, 0}, 1, "syscall with a0 moved"},
+		{{0x240a00b0, 0x01400008, 0x2409000b}, 0, "B(0Bh)"},
+		{{0x240a00b0, 0x01400008, 0x24090010}, 1, "B(10h) ChangeTh"},
+		{{0x240a00b0, 0x01400008, 0x01204821}, 1, "B call with t1 moved"},
+		{{0x240a00a0, 0x01400008, 0x24090044}, 0, "A(44h)"},
+		{{0x240a00a0, 0x01400008, 0x24090043}, 1, "A(43h) Exec"},
+		{{0x240a00a0, 0x01400008, 0x24090051}, 1, "A(51h) LoadExec"},
+	}
+	for st in stubs {
+		run := [?]r3000.Learned{{0x80027000, 0x80027000, st.words}}
+		check(switch_skips(run[:], nil) == st.skips, fmt.tprintf("%s: %d left, want %d", st.what, switch_skips(run[:], nil), st.skips))
+	}
+
+	// M3(ii): a fatal's entries, kept once, leave a run that calls one.
+	dir, _ := filepath.join({tmp, "switches"}, context.temp_allocator)
+	check(os.make_directory(dir) == nil, "make the switches directory")
+	SWITCHED :: 0x80026000
+	check(core.known_switches_add(dir, {SWITCHED, 0, SWITCHED}), "write the known switches")
+	check(core.known_switches_add(dir, {SWITCHED}), "write the known switches again")
+	known := core.known_switches(dir)
+	check(len(known) == 1 && known[0] == SWITCHED, fmt.tprintf("known switches %x, want one %x", known, SWITCHED))
+	c := [?]u32{0x0c009800, 0, JR_RA, 0} // jal SWITCHED
+	caller := [?]r3000.Learned{{0x80025000, 0x80025000, c[:]}}
+	check(switch_skips(caller[:], nil) == 0, "caller left with no known switches")
+	healed := [?]native.Blob_Interp{{SWITCHED, SWITCHED, SWITCHED}}
+	check(switch_skips(caller[:], healed[:]) == 1, "run calling a known switch compiled")
 }

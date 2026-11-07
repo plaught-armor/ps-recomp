@@ -45,6 +45,12 @@ Native_Range :: struct {
 	pc, n_words, at: u32,
 }
 
+// A function the blob's compiler left to the interpreter: its entry and
+// its code's bytes [lo, hi).
+Native_Interp :: struct {
+	entry, lo, hi: u32,
+}
+
 Native_Code :: struct {
 	base:   uintptr, // a function is at base + off (wasm32: table index)
 	size:   int, // bytes of code at base, for unmap_code (wasm32: functions)
@@ -91,6 +97,7 @@ native_slots :: proc(blob: []u8) -> (h: [NATIVE_HEADER / 4]u32, slots: []string,
 	if h[2] != NATIVE_ARCH {
 		return h, nil, 0, fmt.tprintf("built for arch %d, this host runs %d", h[2], NATIVE_ARCH)
 	}
+	if u64(h[3]) > u64(len(blob)) {return h, nil, 0, "short import table"}
 	slots = make([]string, h[3], context.temp_allocator)
 	for &name in slots {
 		if at + 2 > len(blob) {return h, nil, 0, "short import table"}
@@ -103,18 +110,31 @@ native_slots :: proc(blob: []u8) -> (h: [NATIVE_HEADER / 4]u32, slots: []string,
 	return h, slots, at, ""
 }
 
-// The entries the blob's compiler left to the interpreter on purpose
+// Whether the tables the header h counts fill the blob's n bytes from at.
+// In u64, each count first checked against n: int is 32 bits on wasm32,
+// where a product or the sum would wrap.
+@(private = "file")
+native_tables_fit :: proc(h: [NATIVE_HEADER / 4]u32, at, n: int) -> bool {
+	for k in 4 ..< 11 {
+		if u64(h[k]) > u64(n) {return false}
+	}
+	sum := 8 * u64(h[4]) + 32 * u64(h[5]) + 12 * u64(h[6]) + 20 * u64(h[7]) + 12 * u64(h[8]) + 4 * u64(h[9]) + u64(h[10])
+	return sum == u64(n - at)
+}
+
+// The functions the blob's compiler left to the interpreter on purpose
 // (recomp/native/blob.odin), temp allocated; err as native_slots, or for
 // tables that do not fit the blob.
-native_interp :: proc(blob: []u8) -> (interp: []u32, err: string) {
+native_interp :: proc(blob: []u8) -> (interp: []Native_Interp, err: string) {
 	h, _, at, serr := native_slots(blob)
 	if serr != "" {return nil, serr}
+	if !native_tables_fit(h, at, len(blob)) {return nil, "bad table sizes"}
 	at += 8 * int(h[4]) + 32 * int(h[5])
-	if at + 4 * int(h[6]) > len(blob) {return nil, "bad table sizes"}
-	interp = make([]u32, h[6], context.temp_allocator)
+	interp = make([]Native_Interp, h[6], context.temp_allocator)
+	word :: proc(b: []u8) -> u32 {return u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24}
 	for &v, k in interp {
-		b := blob[at + 4 * k:]
-		v = u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
+		b := blob[at + 12 * k:]
+		v = {word(b), word(b[4:]), word(b[8:])}
 	}
 	return interp, ""
 }
@@ -132,9 +152,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	if serr != "" {return {}, serr}
 	n_imports, n_funcs, n_ovls, n_interp := h[3], h[4], h[5], h[6]
 	n_spans, n_ranges, n_pool, size, imports_at := h[7], h[8], h[9], h[10], h[11]
-	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_interp) * 4 + int(n_spans) * 20 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
-		return {}, "bad table sizes"
-	}
+	if !native_tables_fit(h, at, len(blob)) {return {}, "bad table sizes"}
 	// A function's offset is below imports_at; on wasm32 there is no slot
 	// table (imports_at is 0), and offsets are checked once the module says
 	// how many functions it has.
@@ -170,7 +188,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		o.off, _ = word(blob, &at)
 		if o.off >= limit {return code, "function outside the code"}
 	}
-	at += 4 * int(n_interp) // for compilers only (native_interp)
+	at += 12 * int(n_interp) // for compilers only (native_interp)
 	code.spans = make([]Native_Span, n_spans)
 	for &s in code.spans {
 		kind, _ := word(blob, &at)

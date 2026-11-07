@@ -15,6 +15,8 @@
 //     thumb.ppm            the picture a run last showed (thumb.odin)
 //     play.log             what the last run the launcher started printed
 //     press.txt            a PRESS script for compatibility runs
+//     switches.<arch>.txt  native entries a thread switch was fatal under
+//                          (wasm32, known_switches)
 //
 // <data> is the DATA setting, else SDL's per-user directory for ps-recomp
 // (~/.local/share/ps-recomp, ~/Library/Application Support/ps-recomp,
@@ -24,6 +26,7 @@ package core
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 import sdl "vendor:sdl2"
 
@@ -57,6 +60,7 @@ Disc_File :: enum {
 	Play_Log,
 	Vu0_Capture,
 	Vu1_Capture,
+	Switches,
 }
 
 DISC_FILES :: [Disc_File]string {
@@ -84,6 +88,7 @@ DISC_FILES :: [Disc_File]string {
 	.Play_Log        = "play.log",
 	.Vu0_Capture     = "vu0-capture.bin",
 	.Vu1_Capture     = "vu1-capture.bin",
+	.Switches        = "switches." + NATIVE_ARCH_NAME + ".txt",
 }
 
 // The data directory, created if missing. False, after a message, when it
@@ -228,4 +233,48 @@ make_dir :: proc(path: string) -> bool {
 	}
 	fmt.eprintln("cannot create", path, err)
 	return false
+}
+
+// The native entries a thread switch was fatal under (a wasm32 PS1 run,
+// psx/cpu flat_block), which play leaves to the interpreter on the runs
+// after: one hex address a line in the disc directory's Switches file.
+// Temp allocated; none when the file is missing. A line that is no address
+// is skipped.
+known_switches :: proc(dir: string) -> []u32 {
+	data, err := os.read_entire_file(disc_path(dir, .Switches, context.temp_allocator), context.temp_allocator)
+	if err != nil {return nil}
+	out := make([dynamic]u32, context.temp_allocator)
+	text := string(data)
+	for line in strings.split_lines_iterator(&text) {
+		v, ok := strconv.parse_u64_of_base(strings.trim_space(line), 16)
+		if ok && v <= u64(max(u32)) {append(&out, u32(v))}
+	}
+	return out[:]
+}
+
+// Add entries (0s skipped) to the Switches file (known_switches), each
+// once. False, after a message, when it cannot be written.
+known_switches_add :: proc(dir: string, entries: []u32) -> bool {
+	old := known_switches(dir)
+	sb := strings.builder_make(context.temp_allocator)
+	for e in old {fmt.sbprintfln(&sb, "%08x", e)}
+	n := 0
+	outer: for e, k in entries {
+		if e == 0 {continue}
+		for o in old {
+			if o == e {continue outer}
+		}
+		for p in entries[:k] {
+			if p == e {continue outer}
+		}
+		fmt.sbprintfln(&sb, "%08x", e)
+		n += 1
+	}
+	if n == 0 {return true}
+	path := disc_path(dir, .Switches, context.temp_allocator)
+	if err := write_file_atomic(path, transmute([]u8)strings.to_string(sb)); err != nil {
+		fmt.eprintln("cannot write", path, err)
+		return false
+	}
+	return true
 }
