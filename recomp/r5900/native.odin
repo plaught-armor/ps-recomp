@@ -1665,6 +1665,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			} else {
 				// to the return address: no call (flat_loop's .Jalr)
 				skip := native.new_label(a)
+				native.mov(a, .B, .T)
 				native.set_cond_imm(a, .Eq, .B, s.n)
 				native.br_zero(a, .B, skip, nonzero = true)
 				native.mov(a, .A, .T)

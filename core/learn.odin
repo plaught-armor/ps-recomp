@@ -441,6 +441,24 @@ learn_end :: proc(f: ^Learn_Frame) {
 	s := &learn.space[f.cpu]
 	s.runs += 1
 	learn_write(s, f, learn_smc(s, f))
+	learn_free(f)
+}
+
+// f's run jumped away for good (a coroutine switch: what it fetches next
+// is another run's code): write it as .Open now, with what it fetched so
+// far, as learn_report would. f is not used after; the run is counted
+// open, not returned.
+learn_cut :: proc(f: ^Learn_Frame) {
+	if learn_held.on {
+		return // in a probe's branch: learn_release puts f back
+	}
+	s := &learn.space[f.cpu]
+	learn_write(s, f, learn_smc(s, f) + {.Open})
+	learn_free(f)
+}
+
+@(private = "file")
+learn_free :: proc(f: ^Learn_Frame) {
 	learn.used[f.slot] = false
 	learn.free[learn.n_free] = f.slot
 	learn.n_free += 1

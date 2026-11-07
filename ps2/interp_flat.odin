@@ -275,7 +275,7 @@ flat_reload :: proc() -> (^kernel.Flat_Ctx, u32) {
 		check := false
 		if x.enter {
 			x.enter = false
-			if x.depth == 0 {x.ra = u32(cpu.state.r[31].d[0])}
+			if x.depth == 0 {x.ra, x.ra_sp = u32(cpu.state.r[31].d[0]), u32(cpu.state.r[29].d[0])}
 			if cpu.mod_on {
 				mod_flat_enter(x)
 				// A call into the mod region, counted as the recursive
@@ -364,32 +364,33 @@ flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 	return flat_end(x)
 }
 
-// The longjmps shown so far, each kind once under PS_DEBUG: not state.
+// The longjmps shown so far, each kind once under PS_DEBUG (a search past
+// cpu.UNWIND_MAX once always): not state.
 @(private = "file")
 flat_unwind_shown: bit_set[enum {Done, Host, Max, Jump, Under}]
 
 // interp_body's unwind (interp_unwind_find) on the shadow stacks, for a
-// `jr $ra` to ra, not the innermost call's return address (x.ra at depth 0):
-// the innermost of the cpu.UNWIND_MAX calls returning to ra with the guest
-// sp now becomes the innermost, the calls above it dropped, when none
-// between was made by the host or is a hooked call's (FLAT_HOST_TAIL,
-// FLAT_MOD_MARK). The search goes on into the runs x is nested in (the
-// host's, kernel.flat.nest, then the thread's), each one past host code.
-// Else the return pops the innermost as before, except when no call
-// returns to ra at all, with any sp: true, a jump there.
+// `jr $ra` to ra, not with the innermost call's return address and sp
+// (x.ra and x.ra_sp at depth 0): the innermost of the cpu.UNWIND_MAX calls
+// returning to ra with the guest sp now becomes the innermost, the calls
+// above it dropped, when none between was made by the host or is a hooked
+// call's (FLAT_HOST_TAIL, FLAT_MOD_MARK). A call that returns to ra with
+// another sp is no match. The search goes on into the runs x is nested in
+// (the host's, kernel.flat.nest, then the thread's), each one past host
+// code. Else the return pops the innermost as before, except when no call
+// matches: true, a jump there.
 @(private = "file")
 flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) -> bool {
 	MARKS :: kernel.FLAT_HOST_TAIL | FLAT_MOD_MARK
+	sp := u32(cpu.state.r[29].d[0])
 	if x.depth > 0 {
 		r := x.ret[x.depth - 1]
-		if r == ra || r & MARKS != 0 {return false}
-	} else if ra == x.ra {
+		if r == ra && x.sp[x.depth - 1] == sp || r & MARKS != 0 {return false}
+	} else if ra == x.ra && sp == x.ra_sp {
 		return false
 	}
 	assert(x == kernel.flat_ctx())
-	sp := u32(cpu.state.r[29].d[0])
 	ok := true
-	seen := false
 	n := 1
 	nest := kernel.flat.nest_depth
 	for j := 0; j <= nest; j += 1 {
@@ -402,7 +403,7 @@ flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) -> bool {
 		}
 		for k := top; k >= 0; k -= 1 {
 			if n == cpu.UNWIND_MAX {
-				if cpu.debug >= 1 && .Max not_in flat_unwind_shown {
+				if .Max not_in flat_unwind_shown {
 					flat_unwind_shown += {.Max}
 					fmt.eprintfln("ee: jr $ra to %08x: no call returns there in the %d innermost; returning as before", ra, cpu.UNWIND_MAX)
 				}
@@ -414,9 +415,7 @@ flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) -> bool {
 				ok = false
 				continue
 			}
-			if r != ra {continue}
-			seen = true
-			if c.sp[k] != sp {continue}
+			if r != ra || c.sp[k] != sp {continue}
 			if !ok {
 				if cpu.debug >= 1 && .Host not_in flat_unwind_shown {
 					flat_unwind_shown += {.Host}
@@ -431,9 +430,7 @@ flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) -> bool {
 			x.depth = u32(k) + 1
 			return false
 		}
-		if c.ra == ra {seen = true} // the run's own return: host code
 	}
-	if seen {return false}
 	if !ok {
 		if cpu.debug >= 1 && .Under not_in flat_unwind_shown {
 			flat_unwind_shown += {.Under}

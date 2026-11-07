@@ -7,7 +7,8 @@
 // lone lwl, lwr, swl and swr what the bus's do. Also the native backend's
 // inline div and divu against cpu.div and cpu.divu, mfc0 against cpu.mfc0,
 // and its aligned loads and stores, lwc2 and swc2 too, against the bus and
-// the memory itself in and around the scratchpad.
+// the memory itself in and around the scratchpad. And its jalr: to its own
+// return address no call, elsewhere a call.
 package main
 
 import "core:fmt"
@@ -326,6 +327,57 @@ check_native :: proc() {
 	cpu.cop0 = {}
 }
 
+// A jalr whose target is its own return address is no call (the get-pc
+// idiom); one to anywhere else calls, whatever the host's scratch registers
+// hold. The delay slots leave the return address in a scratch register on
+// the way to a1, so a compare against a stale one shows.
+@(private = "file")
+check_jalr :: proc() {
+	OUT :: u32(0x80001000)
+	JALR_A0 :: 0x0080f809
+	addu :: proc(rd, rs, rt: u32) -> u32 {return rs << 21 | rt << 16 | rd << 11 | 0x21}
+	or_ :: proc(rd, rs, rt: u32) -> u32 {return rs << 21 | rt << 16 | rd << 11 | 0x25}
+	Prog :: struct {
+		at:   u32,
+		slot: u32, // the jalr's delay slot
+		self: bool, // a0 is the return address
+	}
+	progs := [?]Prog {
+		{0x80003000, addu(5, 6, 7), false},
+		{0x80003100, addu(5, 7, 6), false},
+		{0x80003200, or_(5, 7, 0), false},
+		{0x80003300, 0, true},
+	}
+	na := native.make_asm(native.Arch(core.NATIVE_ARCH), r3000.native_ram(), r3000.NATIVE_CACHED[:])
+	blob_funcs: [len(progs)]native.Blob_Func
+	for p, k in progs {
+		words := [?]u32{JALR_A0, p.slot, JR_RA, 0, 0}
+		blob_funcs[k] = {p.at, r3000.native_func(&na, build(p.at, words[:]), nil, 1)}
+		free_all(context.temp_allocator)
+	}
+	code, err := core.native_load(native.make_blob(&na, blob_funcs[:], {}), psx_native.imports())
+	if err != "" {
+		fmt.eprintln("FAIL psx_unaligned: native_load:", err)
+		os.exit(1)
+	}
+	@(static) called: u32
+	run_before := cpu.interp_run
+	defer cpu.interp_run = run_before
+	cpu.interp_run = proc(start: u32) {called = start}
+	cpu.register_funcs(nil)
+	cpu.next_event = max(u64)
+	for p, k in progs {
+		ret := p.at + 8
+		cpu.state.r[4], cpu.state.r[7], cpu.state.r[31] = p.self ? ret : OUT, ret, 0
+		called = 0
+		(cast(proc())rawptr(code.base + uintptr(code.funcs[k].off)))()
+		want_called := p.self ? 0 : OUT
+		if called != want_called || cpu.state.r[31] != ret {
+			fail("native jalr a0 = %08x, slot %08x: called %08x ra %08x, want %08x %08x", cpu.state.r[4], p.slot, called, cpu.state.r[31], want_called, ret)
+		}
+	}
+}
+
 // A lone lwl, lwr, swl and swr as native code against cpu.lwl and the
 // others at every address and 3 past it, which reaches the I/O word: a
 // load, one whose delay slot reads the old value, one with rt the base
@@ -540,6 +592,7 @@ main :: proc() {
 	check_bus()
 	check_straddle()
 	check_native()
+	check_jalr()
 	check_lone()
 	check_scratch()
 	if failed != 0 {

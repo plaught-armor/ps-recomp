@@ -47,9 +47,11 @@ Flat_Ctx :: struct {
 	// register other than $ra: the second (a backward jump's) comes first.
 	back:  bool,
 	end:   Flat_End,
-	// $ra as the run began (flat_reload): a `jr $ra` there at depth 0 ends
-	// it, as it returns from interp_body's outermost run.
+	// $ra and sp as the run began (flat_reload): a `jr $ra` there with
+	// that sp at depth 0 ends it, as it returns from interp_body's
+	// outermost run.
 	ra:    u32,
+	ra_sp: u32,
 	// The return addresses, and the guest sp at each call (an unwind's
 	// check, ps2/interp_flat.odin flat_unwind); len is the capacity. On the
 	// emulated heap, so a snapshot holds them with the rest of the machine.

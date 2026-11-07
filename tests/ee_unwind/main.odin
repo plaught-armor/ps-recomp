@@ -13,12 +13,25 @@
 // a jump there (NOWHERE, which goes back to main by a plain jump, the calls
 // it left open); to a coroutine's entry no call returns to (CO), whose
 // later `jr $ra` to main's call with its sp unwinds there; with another sp
-// than main's call; with main's call the last that the search reaches
-// (cpu.UNWIND_MAX) and one past it; from a SetSyscall handler, whose call
-// by the kernel is host code the jump must not cross, and from it to
-// NOWHERE, a return as before with that host code under it; and a bgezal, jal and
-// jalr each to its own return address (pc + 8, a get-pc idiom), which only
-// set $ra and go on there, no call.
+// than main's call, no call's: a jump there; with main's call the last that
+// the search reaches (cpu.UNWIND_MAX) and one past it; from a SetSyscall
+// handler, whose call by the kernel is host code the jump must not cross,
+// and from it to NOWHERE, a return as before with that host code under it.
+//
+// With the argument learn (the coroutine model only; FLAT notes no runs),
+// the cases run under LEARN: C's run, which jumps to NOWHERE and to CO
+// (another fiber's code), ends at the jump, written .Open, so no record
+// for C holds words outside C.
+//
+// With the argument getpc, a bgezal, jal and jalr each to its own return
+// address (pc + 8, a get-pc idiom) only set $ra and go on there: no call,
+// so no more than G's own call is ever open.
+//
+// With the argument frames, two calls return to the same address with
+// other sps (Q calling itself): the innermost `jr $ra`s to that address
+// with the outer one's sp. A return needs the return address and the sp
+// both: it unwinds to the outer call, so the run that goes on there (and
+// hangs) has one call open less than a return from the innermost leaves.
 //
 // With the argument away, it calls a function that jumps back to the call
 // instead of returning, over and over: each call is left open until the
@@ -31,6 +44,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "ps:core"
 import "ps:ps2"
 import cpu "ps:ps2/cpu"
@@ -45,6 +59,7 @@ HANDLER :: u32(0x00100780) // the installed syscall's: calls R
 NOWHERE :: u32(0x00100800) // a jump target no call returns to
 CO :: u32(0x00100880) // a coroutine's entry no call returns to
 FN_G :: u32(0x00100900) // the links to pc + 8
+FN_Q :: u32(0x00100a00) // frames: calls itself
 DATA :: u32(0x00180000)
 MODE :: DATA + 0x0 // 0: C returns; else it jumps
 TGT :: DATA + 0x4 // the $ra C jumps with
@@ -54,7 +69,14 @@ RES :: DATA + 0x10 // each case's s2
 RET :: DATA + 0xc0 // main's return address from its call
 DONE :: DATA + 0x100
 FRAMES :: DATA + 0x1000 // R's saved $ra, growing down (s1)
+STACK :: DATA + 0x2000 // frames: main's sp
 SYSCALL_N :: 0xa0
+// getpc: main's call of G the only one open (were the links calls, 4).
+GETPC_OPEN :: 1
+// frames: at the hang, main's call of the outer Q and its call of the
+// middle one, the innermost's call unwound (a return from the innermost
+// would leave the middle one's run, 3).
+FRAMES_OPEN :: 2
 
 ZERO :: 0
 V1 :: 3
@@ -82,7 +104,6 @@ Case :: struct {
 	to:          Target,
 	depth:       u32,
 	syscall:     bool, // main calls W, whose syscall's handler calls R
-	getpc:       bool, // no call: the links to pc + 8, each s2 += 11
 	want:        u32,
 }
 
@@ -91,12 +112,11 @@ CASES :: [?]Case {
 	{mode = 1, depth = 2, want = 0}, // unwound to main, 2 calls below C's caller
 	{mode = 1, depth = 2, to = .Nowhere, want = 50}, // no call returns there: a jump
 	{mode = 1, depth = 2, to = .Co, want = 1000}, // a jump, then unwound to main
-	{mode = 1, depth = 2, delta = 16, want = 2}, // another sp
+	{mode = 1, depth = 2, delta = 16, want = 0}, // another sp: a jump to main's
 	{mode = 1, depth = cpu.UNWIND_MAX - 1, want = 0}, // main's call the UNWIND_MAX-th
 	{mode = 1, depth = cpu.UNWIND_MAX, want = cpu.UNWIND_MAX}, // one past
 	{mode = 1, depth = 2, syscall = true, want = 102}, // past host code: W counts 100
 	{mode = 1, depth = 2, syscall = true, to = .Nowhere, want = 102}, // host code under: no jump
-	{getpc = true, want = 33}, // bgezal, jal, jalr to pc + 8
 }
 
 i_type :: proc(op, rs, rt: u32, imm: i32) -> u32 {return op << 26 | rs << 21 | rt << 16 | (u32(imm) & 0xffff)}
@@ -151,13 +171,6 @@ program :: proc() {
 	li(&a, A1, HANDLER)
 	put(&a, addiu(V1, ZERO, 0x74), SYSCALL) // SetSyscall
 	for c, k in cases {
-		if c.getpc {
-			put(&a, addiu(S2, ZERO, 0), jal(FN_G), NOP)
-			li(&a, T7, DATA)
-			put(&a, sw(S2, RES - DATA + 4 * u32(k), T7))
-			put(&a, addu(SP, S0, ZERO))
-			continue
-		}
 		li(&a, T7, DATA)
 		li(&a, T0, c.mode)
 		put(&a, sw(T0, MODE - DATA, T7))
@@ -229,27 +242,6 @@ program :: proc() {
 	pop_ra(&a)
 	put(&a, JR_RA, NOP)
 
-	// G: the links to pc + 8, each s2 += 1 in its slot, += 10 after it,
-	// += $ra less pc + 8 (0 when it was set). It returns with sp 16 below
-	// its call's: were a link a call, its record's would be the innermost
-	// return address, not G's, and with G's sp another, the return would
-	// go back to after that link (the search's another-sp case), which
-	// would count again.
-	a = {FN_G}
-	put(&a, addiu(SP, SP, -16))
-	push_ra(&a)
-	for n in 0 ..< 3 {
-		if n == 2 {li(&a, T0, a.pc + 8 + 8)} // jalr's: past the li
-		link := a.pc
-		put(&a, n == 0 ? bgezal_zero_8 : n == 1 ? jal(a.pc + 8) : jalr(T0), addiu(S2, S2, 1))
-		assert(a.pc == link + 8)
-		put(&a, addiu(S2, S2, 10))
-		li(&a, T1, link + 8)
-		put(&a, subu(T2, RA, T1), addu(S2, S2, T2))
-	}
-	pop_ra(&a)
-	put(&a, JR_RA, NOP)
-
 	// NOWHERE: s2 = 50, then back to main by a plain jump.
 	a = {NOWHERE}
 	li(&a, T7, DATA)
@@ -270,6 +262,97 @@ program_away :: proc() {
 	a = {FN_F}
 	li(&a, RA, ENTRY)
 	put(&a, JR_RA, NOP)
+}
+
+// getpc: main calls G and stores s2. G: the links to pc + 8, each s2 += 1
+// in its slot, += 10 after it, += $ra less pc + 8 (0 when it was set): 33.
+// Were a link a call, each would be a run of its own, open under G's.
+program_getpc :: proc() {
+	a := Asm{ENTRY}
+	li(&a, S1, FRAMES)
+	put(&a, addiu(S2, ZERO, 0), jal(FN_G), NOP)
+	li(&a, T7, DATA)
+	put(&a, sw(S2, RES - DATA, T7))
+	put(&a, addiu(T0, ZERO, 1), sw(T0, DONE - DATA, T7))
+	put(&a, i_type(4, ZERO, ZERO, -1), NOP) // hang
+	a = {FN_G}
+	push_ra(&a)
+	for n in 0 ..< 3 {
+		if n == 2 {li(&a, T0, a.pc + 8 + 8)} // jalr's: past the li
+		link := a.pc
+		put(&a, n == 0 ? bgezal_zero_8 : n == 1 ? jal(a.pc + 8) : jalr(T0), addiu(S2, S2, 1))
+		assert(a.pc == link + 8)
+		put(&a, addiu(S2, S2, 10))
+		li(&a, T1, link + 8)
+		put(&a, subu(T2, RA, T1), addu(S2, S2, T2))
+	}
+	pop_ra(&a)
+	put(&a, JR_RA, NOP)
+}
+
+vblank_getpc :: proc() {
+	if mem.rd32(DONE) == 0 {
+		if kernel.k.frame > 60 {
+			fmt.eprintln("fail: not done after 60 frames")
+			os.exit(1)
+		}
+		return
+	}
+	got, open := mem.rd32(RES), open_max()
+	if got != 33 || open != GETPC_OPEN {
+		fmt.eprintfln("fail: s2 %d, want 33; %d calls open at most, want %d", got, open, GETPC_OPEN)
+		os.exit(1)
+	}
+	fmt.printfln("ee_unwind getpc: ok (s2 33, %d calls open at most)", open)
+	os.exit(0)
+}
+
+// The calls open now, either model.
+open_now :: proc() -> u32 {
+	when core.FLAT {return kernel.flat_ctx().depth} else {return cpu.interp_top == nil ? 0 : cpu.interp_top.depth}
+}
+
+// frames: main calls Q(4). Q: sp -= 16 and its $ra saved there; a0 -= 1;
+// with a0 left, Q again, and after it (XQ) DONE += 1 and a hang. The
+// innermost Q instead sets sp to its caller's caller's (32 above its own:
+// the sp at the call of its caller, which returns to XQ too) and `jr $ra`,
+// to XQ: with the sp of that call, not its own (16 above), so that call's
+// caller's run goes on at XQ. A registered host probe would not do: FLAT
+// interprets every call.
+program_frames :: proc() {
+	a := Asm{ENTRY}
+	li(&a, SP, STACK)
+	li(&a, A0, 4)
+	put(&a, jal(FN_Q), NOP)
+	put(&a, i_type(4, ZERO, ZERO, -1), NOP) // hang: not reached
+	a = {FN_Q}
+	put(&a, addiu(SP, SP, -16), sw(RA, 0, SP), addiu(A0, A0, -1))
+	leaf := a.pc + 12 * 4
+	beq(&a, A0, ZERO, leaf)
+	put(&a, NOP, jal(FN_Q), NOP)
+	li(&a, T7, DATA) // XQ
+	put(&a, lw(T0, DONE - DATA, T7), addiu(T0, T0, 1), sw(T0, DONE - DATA, T7))
+	put(&a, i_type(4, ZERO, ZERO, -1), NOP) // hang
+	assert(a.pc <= leaf)
+	for a.pc < leaf {put(&a, NOP)}
+	put(&a, addiu(SP, SP, 32), JR_RA, NOP)
+}
+
+vblank_frames :: proc() {
+	if mem.rd32(DONE) == 0 {
+		if kernel.k.frame > 60 {
+			fmt.eprintln("fail: not done after 60 frames")
+			os.exit(1)
+		}
+		return
+	}
+	done, open := mem.rd32(DONE), open_now()
+	if done != 1 || open != FRAMES_OPEN {
+		fmt.eprintfln("fail: XQ ran %d times, want 1; %d calls open at its hang, want %d", done, open, FRAMES_OPEN)
+		os.exit(1)
+	}
+	fmt.printfln("ee_unwind frames: ok (%d calls open at the hang)", open)
+	os.exit(0)
 }
 
 // The most calls open at once, either model.
@@ -315,6 +398,38 @@ vblank_cap :: proc() {
 	}
 }
 
+// learn: C's records, each within C, one of them .Open.
+learn_dir, learn_path: string
+vblank_learn :: proc() {
+	if mem.rd32(DONE) == 0 {
+		vblank()
+		return
+	}
+	core.learn_report()
+	data, err := os.read_entire_file(learn_path, context.allocator)
+	os.remove_all(learn_dir)
+	if err != nil {
+		fmt.eprintln("fail: no LEARN file:", err)
+		os.exit(1)
+	}
+	recs, bad := core.learn_read(data)
+	n, open := 0, 0
+	for r in recs {
+		if r.entry != FN_C {continue}
+		n += 1
+		if .Open in r.flags {open += 1}
+		if r.lo < FN_C || r.lo + 4 * u32(len(r.words)) > FN_W {
+			fmt.eprintfln("fail: a record for C holds %08x..%08x, outside C", r.lo, r.lo + 4 * u32(len(r.words)))
+			os.exit(1)
+		}
+	}
+	if bad != 0 || n == 0 || open == 0 {
+		fmt.eprintfln("fail: %d bad records, %d for C, %d of them .Open", bad, n, open)
+		os.exit(1)
+	}
+	vblank()
+}
+
 vblank :: proc() {
 	done := mem.rd32(DONE)
 	if done == 0 {
@@ -351,6 +466,31 @@ main :: proc() {
 		core.fatal_cleanup = cap_fatal
 		kernel.vblank_hook = vblank_cap
 		program_cap()
+	} else if mode == "learn" {
+		when core.FLAT {
+			fmt.eprintln("fail: learn: the coroutine model only")
+			os.exit(1)
+		}
+		dir, err := os.make_directory_temp("", "ps_ee_unwind_*", context.allocator)
+		if err != nil {
+			fmt.eprintln("fail: no temp directory:", err)
+			os.exit(1)
+		}
+		learn_dir = dir
+		learn_path, _ = filepath.join({dir, "learn.bin"}, context.allocator)
+		if !core.learn_open_path(learn_path, {.Ee}) {
+			os.remove_all(learn_dir)
+			os.exit(1)
+		}
+		core.learn_cpu(.Ee, &cpu.state.cycles, cpu.CYCLES_PER_INSN, proc(a: u32) -> u32 {return mem.rd32(a)}, mem.RAM_SIZE, false)
+		kernel.vblank_hook = vblank_learn
+		program()
+	} else if mode == "getpc" {
+		kernel.vblank_hook = vblank_getpc
+		program_getpc()
+	} else if mode == "frames" {
+		kernel.vblank_hook = vblank_frames
+		program_frames()
 	} else if mode == "away" {
 		kernel.vblank_hook = vblank_away
 		program_away()

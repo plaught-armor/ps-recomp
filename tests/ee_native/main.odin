@@ -3,7 +3,9 @@
 // instruction, then jr $ra), assembled by r5900.native_func for the host and
 // loaded with the runtime's imports; from the same registers, the native
 // function and ps2.exec_insn must leave the same cpu.state. A jal is a
-// direct call when its target is in the blob, else cpu.call.
+// direct call when its target is in the blob, else cpu.call. A jalr to its
+// own return address is no call, and one elsewhere calls whatever the host's
+// scratch registers hold.
 package main
 
 import "base:runtime"
@@ -1176,7 +1178,8 @@ main :: proc() {
 		}
 	}
 	failed += check_calls(arch)
-	checks += 2
+	failed += check_jalr(arch)
+	checks += 2 + JALR_CHECKS
 	if failed != 0 {
 		fmt.eprintfln("%d of %d checks failed", failed, checks)
 		os.exit(1)
@@ -1239,6 +1242,70 @@ check_calls :: proc(arch: native.Arch) -> (failed: int) {
 		if got != want {
 			failed += 1
 			fmt.eprintfln("FAIL jal %08x: r3 r2 ra %x, want %x", progs[k].words[0], got, want)
+		}
+	}
+	return
+}
+
+// A jalr whose target is its own return address is no call (the get-pc
+// idiom); one to anywhere else calls, whatever the host's scratch registers
+// hold. The delay slots leave the return address in a scratch register on
+// the way to r5, so a compare against a stale one shows.
+@(private = "file")
+JALR_CHECKS :: 4
+
+@(private = "file")
+check_jalr :: proc(arch: native.Arch) -> (failed: int) {
+	OUT :: u32(0x00200000)
+	JALR_R4 :: 0x0080f809
+	JR_RA :: 0x03e00008
+	daddu :: proc(rd, rs, rt: u32) -> u32 {return rs << 21 | rt << 16 | rd << 11 | 0x2d}
+	or_ :: proc(rd, rs, rt: u32) -> u32 {return rs << 21 | rt << 16 | rd << 11 | 0x25}
+	Prog :: struct {
+		at:   u32,
+		slot: u32, // the jalr's delay slot
+		self: bool, // r4 is the return address
+	}
+	progs := [JALR_CHECKS]Prog {
+		{0x00201000, daddu(5, 6, 7), false},
+		{0x00201100, daddu(5, 7, 6), false},
+		{0x00201200, or_(5, 7, 0), false},
+		{0x00201300, 0, true},
+	}
+	a := r5900.native_asm(arch)
+	funcs: [len(progs)]native.Blob_Func
+	slow: map[string]int
+	defer delete(slow)
+	for p, k in progs {
+		words := [4]u32{JALR_R4, p.slot, JR_RA, 0}
+		data: [len(words) * 4]u8
+		for w, n in words {
+			data[4 * n], data[4 * n + 1], data[4 * n + 2], data[4 * n + 3] = u8(w), u8(w >> 8), u8(w >> 16), u8(w >> 24)
+		}
+		f := mips.func_make(p.at, p.at + len(data))
+		mips.discover(r5900.RULES, {base = p.at, data = data[:]}, f, {})
+		funcs[k] = {p.at, r5900.native_func(&a, f, {}, 1, &slow)[0].off}
+		free_all(context.temp_allocator)
+	}
+	code, err := core.native_load(native.make_blob(&a, funcs[:], {}), ps2.native_imports())
+	if err != "" {
+		fmt.eprintln("native_load:", err)
+		os.exit(1)
+	}
+	cpu.text_range(OUT, 0x00201400)
+	cpu.register(OUT, proc() {cpu.state.r[3].d[0] += 0x100})
+	for p, k in progs {
+		cpu.state = {}
+		ret := u64(p.at + 8)
+		cpu.state.r[4].d[0] = p.self ? ret : u64(OUT)
+		cpu.state.r[7].d[0] = ret
+		run := cast(proc())rawptr(code.base + uintptr(code.funcs[k].off))
+		run()
+		want := [2]u64{p.self ? 0 : 0x100, ret}
+		got := [2]u64{cpu.state.r[3].d[0], cpu.state.r[31].d[0]}
+		if got != want {
+			failed += 1
+			fmt.eprintfln("FAIL jalr r4 = %x, slot %08x: r3 ra %x, want %x", cpu.state.r[4].d[0], p.slot, got, want)
 		}
 	}
 	return
