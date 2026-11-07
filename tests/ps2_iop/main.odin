@@ -282,6 +282,7 @@ game :: proc(_: rawptr) {
 	test_boot_gaps()
 	test_card_dirty()
 	test_mc2()
+	test_sd_mvol() // last: it leaves the master volumes off unity
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -3958,6 +3959,27 @@ test_msgbx :: proc() {
 	}
 	cap_ok &&= w(base, brk[0]) == base + brk[2] && w(base, brk[2]) == base + brk[1]
 	check(cap_ok, "msgbx: a send into a ring with no way back to the last goes in as the newest, counted once")
+}
+
+test_sd_mvol :: proc() {
+	// MVOLL and MVOLR read back exactly as set, per core, a sweep's bit 15
+	// kept. A game that saves the master volume, mutes, then restores the
+	// saved value depends on it.
+	mvol_set :: proc(id, value: u32) {
+		r3000.state.r[4], r3000.state.r[5] = id, value
+		iop.libsd_fn(5)
+	}
+	mvol_get :: proc(id: u32) -> u32 {
+		r3000.state.r[4] = id
+		v, _ := iop.libsd_fn(6)
+		return v
+	}
+	mvol_set(0x0901, 0x3fff)
+	mvol_set(0x0a01, 0x8123)
+	mvol_set(0x0900, 0x1234)
+	check(mvol_get(0x0901) == 0x3fff && mvol_get(0x0a01) == 0x8123 && mvol_get(0x0900) == 0x1234, "libsd: sceSdGetParam reads MVOLL and MVOLR as set")
+	mvol_set(0x0901, 0)
+	check(mvol_get(0x0901) == 0 && mvol_get(0x0a01) == 0x8123, "libsd: a master volume set to 0 reads 0, the other side kept")
 }
 
 // The calls an audio service's module needs at load and in play: CpuEnableIntr
