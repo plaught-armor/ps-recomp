@@ -103,7 +103,7 @@ here.
 | `spu` | SPU2 voices through the port API, sound RAM in snapshots |
 | `ps2_kernel` | EE kernel threads, ExecPS2 |
 | `blob_arch` | A native code header is valid only with this build's arch: arch 0 and wasm32's (4) are refused on a native build, every machine-code arch on a wasm build, and native_load refuses another arch before it maps anything |
-| `ps2_iop` | The IOP CPU and the IOP modules run on it |
+| `ps2_iop` | The IOP CPU and the IOP modules run on it, and the raw memory card image behind the HLE card driver |
 | `rollback` | Under FLAT (the build only runs that way): a rewind to a commit gives the save state taken at it, byte for byte, after the emulated heap's top block is freed and its bytes written over, and with a block made in heap pages no scan had read, over a freed one's bytes |
 | `iop_thread_grow` | An IOP start that grows the thread array while it runs is removed once it returns, in the coroutine model and under FLAT: the same thread count |
 | `ps2_interp` | Whole EE functions in the interpreter |
