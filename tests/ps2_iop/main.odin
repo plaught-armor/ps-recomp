@@ -252,6 +252,7 @@ game :: proc(_: rawptr) {
 	test_alarm()
 	test_wakeup_cancel()
 	test_release_wait()
+	test_create_thread()
 	test_vblank()
 	test_vblank_handlers()
 	test_fallback()
@@ -6186,6 +6187,54 @@ test_wakeup_cancel :: proc() {
 	s.cur, t.wakeups = id, 2
 	check(tb_call(27, 0) == 2 && t.wakeups == 0, "cancel wakeup: thread 0 is the caller")
 	s.cur = cur
+	fresh()
+}
+
+// thbase 4 CreateThread against this ROM's: the attr, the priority, the
+// entry's alignment and the stack size checked in that order, with entry 0
+// taken and attr 0x100000 refused; the stack size rounded up to 256 and
+// written back, the stack 0xff but for its top 0x30. Thread id 0 is -406 on
+// thbase 5, 6, 7, 10, 11, 25 and 26, and CreateSema takes no attr bit
+// outside 0x101.
+test_create_thread :: proc() {
+	fresh()
+	P :: 0x00040000
+	create :: proc(attr, entry, size, prio: u32) -> u32 {
+		for w, i in ([5]u32{attr, 0, entry, size, prio}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+		return tb_call(4, P)
+	}
+	ill :: proc(e: i32) -> u32 {return neg(-e)}
+	check(create(0x100000, 0x1000, 0x800, 20) == ill(iop.KE_ILLEGAL_ATTR), "CreateThread: attr 0x100000 is refused")
+	check(create(0x10, 0x1002, 0x10, 0) == ill(iop.KE_ILLEGAL_ATTR), "CreateThread: the attr is checked first")
+	check(create(0, 0x1002, 0x10, 0) == ill(iop.KE_ILLEGAL_PRIORITY), "CreateThread: then the priority")
+	check(create(0, 0x1000, 0x800, 127) == ill(iop.KE_ILLEGAL_PRIORITY), "CreateThread: no priority past the lowest")
+	check(create(0, 0x1002, 0x10, 20) == ill(iop.KE_ILLEGAL_ENTRY), "CreateThread: then the entry's alignment")
+	check(create(0, 0x1000, 0x12f, 20) == ill(iop.KE_ILLEGAL_STACK_SIZE), "CreateThread: then a stack under 0x130")
+	check(iop.iop_u32(P + 12)^ == 0x12f, "CreateThread: a refused size is not written back")
+	// Where the stack will go, cleared so the unfilled top shows.
+	at := iop.sys_alloc(.High, 0x200)
+	check(at != 0 && iop.sys_free(at), "CreateThread: a stack's place")
+	for i in u32(0) ..< 0x200 / 4 {iop.iop_u32(at + 4 * i)^ = 0}
+	tid := create(0x02000008, 0, 0x130, 20)
+	check(i32(tid) > 0, "CreateThread: entry 0 and the least stack are taken")
+	t := iop.th_find(tid)
+	check(t != nil && t.stack == at && t.stacksize == 0x200 && iop.iop_u32(P + 12)^ == 0x200, "CreateThread: the size rounded up to 256 and written back")
+	top := t.stack + 0x200 - 0x30
+	check(iop.iop_u32(t.stack)^ == 0xffffffff && iop.iop_u32(top - 4)^ == 0xffffffff, "CreateThread: the stack is filled with 0xff")
+	check(iop.iop_u32(top)^ == 0 && iop.iop_u32(top + 0x2c)^ == 0, "CreateThread: but for its top 0x30")
+	for fno in ([5]u32{5, 6, 7, 10, 25}) {check(tb_call(fno, 0) == ill(iop.KE_ILLEGAL_THID), "thbase: thread 0 is -406")}
+	iop.iop_sched.intr = true
+	for fno in ([2]u32{11, 26}) {check(tb_call(fno, 0) == ill(iop.KE_ILLEGAL_THID), "thbase: thread 0 is -406 from a handler")}
+	iop.iop_sched.intr = false
+	sema :: proc(attr: u32) -> u32 {
+		for w, i in ([4]u32{attr, 0, 0, 1}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+		r3000.state.r[4] = P
+		v, ok := iop.th_semap(4)
+		check(ok, "CreateSema: served")
+		return v
+	}
+	check(sema(2) == ill(iop.KE_ILLEGAL_ATTR) && sema(0x200) == ill(iop.KE_ILLEGAL_ATTR), "CreateSema: an attr bit outside 0x101 is refused")
+	check(i32(sema(0x101)) > 0, "CreateSema: SA_THPRI and SA_IHTHPRI are taken")
 	fresh()
 }
 

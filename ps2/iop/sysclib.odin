@@ -9,14 +9,14 @@ import cpu "../cpu"
 import r3000 "ps:psx/cpu"
 
 // `n` bytes of IOP RAM from `a`, fewer where RAM ends, only read.
-@(private = "file")
+@(private)
 ram :: proc(a, n: u32) -> []u8 {
 	w := a & (IOP_RAM_SIZE - 1)
 	return iop_ram[w:][:min(n, IOP_RAM_SIZE - w)]
 }
 
 // ram's bytes, to be written: as iop_mem, their pages are touched first.
-@(private = "file")
+@(private)
 ram_w :: proc(a, n: u32) -> []u8 {
 	b := ram(a, n)
 	r3000.ram_touch(a & (IOP_RAM_SIZE - 1), u32(len(b)))
