@@ -702,7 +702,7 @@ module_buffer_load :: proc(buf: u32) -> u32 {
 	x, ok := irx_parse(data)
 	if !ok {return ke(KE_ILLEGAL_OBJECT)}
 	data = data[:irx_extent(data, x)]
-	dbcman_module(strings.trim_space(x.name))
+	dbcman_module(strings.trim_space(x.name), data)
 	if !iop_runs(data) {return IOP_SONY_ID}
 	if x.name == "" {x.name = fmt.tprintf("irx@%x", buf)}
 	core.compat_code_load()

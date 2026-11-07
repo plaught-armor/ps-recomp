@@ -7020,8 +7020,20 @@ test_dbcman :: proc() {
 	check(r[0x208c / 4] == 1, "dbcman 1.x 0x8000131c: a driver call")
 	iop.dbcman_module("ds2o_d")
 	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 1.x: no image, still 1.x; ds2o_d served as ds1o_d")
+	mid_off :: proc(buf: []u8) -> bool {return !iop.sif.servers[iop.DBC_SID_MID](0, buf, 0x90) && pad_cmd(buf, 0, 0, 0x0101800c) == 1}
 	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
-	check(!iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x90) && pad_cmd(buf[:], 0, 0, 0x0101800c) == 1, "dbcman: an unknown major, the 2.x calls")
+	check(mid_off(buf[:]), "dbcman: a 2.x image, the 2.x calls")
+	iop.dbcman_module(`cdrom0:\MODULES\DBCMAN.IRX;1`, dbc_image(0x0102))
+	check(!mid_off(buf[:]), "dbcman: a disc path load's image picks the 1.x calls")
+	iop.dbcman_module("rom0:DBCMAN")
+	check(mid_off(buf[:]), "dbcman: a dbcman load with no image, the 2.x calls")
+	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+	iop.dbcman_module("dbc.irx", dbc_image(0x0301))
+	check(mid_off(buf[:]), "dbcman: an unknown major, the 2.x calls")
+	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+	iop.dbcman_module("rom0:SIO2MAN")
+	check(!mid_off(buf[:]), "dbcman: another module's load keeps the contract")
+	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
 
 	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
 }
