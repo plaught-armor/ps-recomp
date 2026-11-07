@@ -539,6 +539,7 @@ start_thread :: proc(id: i32, arg: u32) -> i64 {
 	if t == nil || t.status != .Dormant {return KE_ERROR}
 	t.regs = {}
 	cpu.mod_inners[t.id] = nil
+	cpu.interp_tops[t.id] = nil
 	t.regs.r[4].d[0] = cpu.sx32(arg)
 	t.regs.r[28].d[0] = cpu.sx32(t.gp)
 	t.regs.r[29].d[0] = cpu.sx32(t.stack + t.stack_size - 16)
@@ -797,6 +798,7 @@ switch_to :: proc(next: ^Thread) {
 		cur := k.current
 		cur.regs = cpu.state
 		cpu.mod_inners[cur.id], cpu.mod_inner = cpu.mod_inner, cpu.mod_inners[next.id]
+		cpu.interp_tops[cur.id], cpu.interp_top = cpu.interp_top, cpu.interp_tops[next.id]
 		if cur.status == .Run {cur.status = .Ready}
 		k.current = next
 		next.status = .Run

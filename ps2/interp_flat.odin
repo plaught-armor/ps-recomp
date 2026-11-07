@@ -11,6 +11,8 @@
 // its exit (cpu.native_exit) leaves to the runner.
 package ps2
 
+import "core:fmt"
+
 import cpu "cpu"
 import kernel "kernel"
 import mem "mem"
@@ -307,10 +309,12 @@ flat_goto :: #force_inline proc(x: ^kernel.Flat_Ctx, pc, t: u32) -> bool {
 // interp_body's return to its caller does. At depth 0 it ends the run:
 // false for a nested run, which returns to the host. A return address
 // marked by a hooked call (FLAT_MOD_MARK) runs its after hooks first
-// (mod_flat_return), and may end the run.
+// (mod_flat_return), and may end the run. A `jr $ra` to an outer call's
+// return address unwinds to it first (flat_unwind).
 @(private = "file")
 flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 	if x.depth > 0 {
+		if jr && x.ret[x.depth - 1] != ra {flat_unwind(x, ra)}
 		x.depth -= 1
 		ret := x.ret[x.depth]
 		for ret & FLAT_MOD_MARK != 0 {
@@ -326,6 +330,54 @@ flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 		return true
 	}
 	return flat_end(x)
+}
+
+// The longjmps shown so far, each kind once under PS_DEBUG: not state.
+@(private = "file")
+flat_unwind_shown: bit_set[enum {Done, Host, Max}]
+
+// interp_body's unwind (interp_unwind_find) on x's shadow stack, for a
+// `jr $ra` to ra, not the innermost call's return address: the innermost of
+// the cpu.UNWIND_MAX calls returning to ra with the guest sp now becomes the
+// innermost, the calls above it dropped, when none between was made by the
+// host or is a hooked call's (FLAT_HOST_TAIL, FLAT_MOD_MARK). Else the
+// return pops the innermost as before.
+@(private = "file")
+flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) {
+	MARKS :: kernel.FLAT_HOST_TAIL | FLAT_MOD_MARK
+	if x.ret[x.depth - 1] & MARKS != 0 {return}
+	sp := u32(cpu.state.r[29].d[0])
+	ok := true
+	n := 1
+	for k := int(x.depth) - 2; k >= 0; k -= 1 {
+		if n == cpu.UNWIND_MAX {
+			if cpu.debug >= 1 && .Max not_in flat_unwind_shown {
+				flat_unwind_shown += {.Max}
+				fmt.eprintfln("ee: jr $ra to %08x: no call returns there in the %d innermost; returning as before", ra, cpu.UNWIND_MAX)
+			}
+			return
+		}
+		n += 1
+		r := x.ret[k]
+		if r & MARKS != 0 {
+			ok = false
+			continue
+		}
+		if r != ra || x.sp[k] != sp {continue}
+		if !ok {
+			if cpu.debug >= 1 && .Host not_in flat_unwind_shown {
+				flat_unwind_shown += {.Host}
+				fmt.eprintfln("ee: jr $ra to %08x: the call %d out returns there, past host code; returning as before", ra, n)
+			}
+			return
+		}
+		if cpu.debug >= 1 && .Done not_in flat_unwind_shown {
+			flat_unwind_shown += {.Done}
+			fmt.eprintfln("ee: jr $ra to %08x: unwound to the call %d out", ra, n)
+		}
+		x.depth = u32(k) + 1
+		return
+	}
 }
 
 // The end of run x, at depth 0: false for a nested run.
