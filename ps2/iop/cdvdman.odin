@@ -46,10 +46,21 @@ CD_STAT_STOP :: 0x00
 CD_STAT_PAUSE :: 0x0a
 
 // The 8 bytes sceCdReadClock and cdvdfsv's S-command ReadClock write, the
-// drive's clock {stat, second, minute, hour, pad, day, month, year} in BCD:
-// all 0, a clock with no time, the same on every run so replays and netplay
-// peers agree.
+// drive's clock {stat, second, minute, hour, pad, day, month, year} in BCD.
 CD_CLOCK :: 8
+
+// The clock both write (cd_clock_write): 2004-01-01 12:00:00, fixed so every
+// run, replay and netplay peer reads the same, and a date a real drive
+// gives. All 0, day 0 of month 0, drives games' date arithmetic negative:
+// Metal Gear Solid 3 turns it into a time before its epoch, indexes a table
+// with the negative remainder and corrupts its heap.
+CD_CLOCK_TIME :: [CD_CLOCK]u8{0, 0x00, 0x00, 0x12, 0, 0x01, 0x01, 0x04}
+
+// Writes CD_CLOCK_TIME to out, CD_CLOCK bytes.
+cd_clock_write :: proc(out: []u8) {
+	t := CD_CLOCK_TIME
+	copy(out, t[:])
+}
 
 // The most callback runs one tick can owe: commands made faster than ticks
 // run their callbacks.
@@ -109,7 +120,7 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		cd_done(CD_FUNC_STOP)
 		return 1, true
 	case 24: // sceCdReadClock(sceCdCLOCK *): 1, the clock read
-		for &b in iop_ram_at(a0, CD_CLOCK) {b = 0}
+		cd_clock_write(iop_ram_at(a0, CD_CLOCK))
 		return 1, true
 	case 28: // sceCdStatus
 		return cd_status(), true

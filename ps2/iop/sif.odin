@@ -999,7 +999,8 @@ cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	switch fno {
 	case 0x01: // ReadClock {result, clock[CD_CLOCK]}
-		w[0], w[1], w[2] = 1, 0, 0
+		w[0] = 1
+		cd_clock_write(buf[4:][:CD_CLOCK])
 	case 0x03: w[0] = cd_disk_type() // GetDiskType
 	case 0x04: w[0] = 0 // GetError
 	case 0x05: w[0], w[1] = 1, 0 // TrayReq {result, tray check}
