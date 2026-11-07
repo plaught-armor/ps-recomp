@@ -134,7 +134,7 @@ tile_at :: #force_inline proc(t: ^Tex, n, x, y, xe, ye: u32) -> ^[256]u32 #no_bo
 @(private)
 texel :: #force_inline proc(t: ^Tex, n, x, y: u32) -> u32 #no_bounds_check {
 	p := tile_at(t, n, x, y, x, y)
-	if p == nil {return fetch(t, n, x, y)}
+	if p == nil {return fetch_direct(t, n, x, y)}
 	return p[(y & 15) << 4 | (x & 15)]
 }
 

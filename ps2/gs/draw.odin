@@ -502,6 +502,21 @@ fetch :: proc(t: ^Tex, n, x, y: u32) -> u32 #no_bounds_check {
 	return expand16(t, e & 0xffff)
 }
 
+// fetch, inlined for the formats a bypassed level samples most (a level
+// the context also draws to, as render-to-texture feedback does): CT32 and
+// T8. Every other format calls fetch.
+@(private)
+fetch_direct :: #force_inline proc(t: ^Tex, n, x, y: u32) -> u32 #no_bounds_check {
+	switch t.psm {
+	case PSMCT32: return vram[addr32(PSMCT32, t.mtbp[n], t.mtbw[n], x, y)]
+	case PSMT8:
+		e := clut[(t.csa * 16 + u32(vram8()[addr8(t.mtbp[n], t.mtbw[n], x, y)])) & 511]
+		if t.cpsm == PSMCT32 {return e}
+		return expand16(t, e & 0xffff)
+	}
+	return fetch(t, n, x, y)
+}
+
 @(private)
 expand16 :: #force_inline proc(t: ^Tex, c: u32) -> u32 {
 	rgb := (c & 0x1f) << 3 | (c & 0x3e0) << 6 | (c & 0x7c00) << 9
