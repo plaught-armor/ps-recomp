@@ -107,17 +107,21 @@ interp_call :: proc(entry: u32) {
 	// Learned code for the words RAM holds at entry now runs in place of the
 	// interpreter (learned.odin).
 	if fn := learned_find(entry); fn != nil {
+		lr := cpu.Learned_Run{interp_run(entry), entry, cpu.learned_top}
+		cpu.learned_top = &lr
 		fn()
+		cpu.learned_top = lr.prev
 		return
 	}
 	interp_enter(entry)
 	if cpu.state.cycles >= cpu.next_event {kernel.run_events()}
+	run := interp_run(entry)
 	if !core.learn_on(.Ee) {
-		interp_body(entry, nil)
+		interp_body(entry, nil, run, entry)
 		return
 	}
 	f := core.learn_begin(.Ee, entry)
-	f = interp_body(entry, f)
+	f = interp_body(entry, f, run, entry)
 	if f != nil {core.learn_end(f)}
 }
 
@@ -151,22 +155,40 @@ learn_note :: proc(f: ^core.Learn_Frame, i: r5900.Insn) {
 	}
 }
 
-// The run from entry; lf is its LEARN frame, nil without LEARN. Returns
-// the frame still to end: nil once a jump away cut it (core.learn_cut).
+// The facts of the run called at entry, taken at its call (cpu.Interp_Run).
 @(private = "file")
-interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame) -> (lf: ^core.Learn_Frame) {
+interp_run :: proc(entry: u32) -> cpu.Interp_Run {
+	ra, sp := u32(cpu.state.r[31].d[0]), u32(cpu.state.r[29].d[0])
+	top := cpu.interp_top
+	tight := top == nil ? entry == cpu.interp_base : !top.barrier && top.target == entry && top.ret == ra && top.sp == sp
+	return {ra = ra, sp = sp, gaps = (top == nil ? 0 : top.gaps) + (tight ? 0 : 1), direct = !cpu.mod_on && (top == nil || !top.barrier)}
+}
+
+// A learned function's `jr $ra` at pc, before it returns (recomp/r5900
+// native.odin): one to another address than its own return address with
+// another sp is an interpreted run's (interp_body), with the function's run.
+// An unwind to an outer call returns from it at once (cpu.unwinding); a
+// jump interprets on from there, in the learned function's place, and
+// returns when that run does. Under FLAT, which never runs learned code,
+// and from code no interp_call entered, nothing.
+learned_jr :: proc(pc: u32) {
+	lr := cpu.learned_top
+	if lr == nil {return}
+	t := u32(cpu.state.r[31].d[0])
+	if t == lr.ra && u32(cpu.state.r[29].d[0]) == lr.sp || !interp_unwind_find(t, lr.direct, lr.gaps) {return}
+	if goto_pc(lr.entry, pc, t) {return}
+	interp_body(lr.entry, nil, lr.run, t)
+}
+
+// The run of the function at entry (run, from interp_run), from pc; lf is
+// its LEARN frame, nil without LEARN. Returns the frame still to end: nil
+// once a jump away cut it (core.learn_cut).
+@(private = "file")
+interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame, run: cpu.Interp_Run, start: u32) -> (lf: ^core.Learn_Frame) {
 	lf = lf_in
 	c := &cpu.state
-	pc := entry
-	// Its return address; whether no host code's call is under it (direct:
-	// mods' chains count as one); and the gaps of host code under it
-	// (cpu.Interp_Frame): one more than the top record's when the call into
-	// it is not that record's, or with none, not the thread's base.
-	ra, sp := u32(c.r[31].d[0]), u32(c.r[29].d[0])
-	top := cpu.interp_top
-	direct := !cpu.mod_on && (top == nil || !top.barrier)
-	tight := top == nil ? entry == cpu.interp_base : !top.barrier && top.target == entry && top.ret == ra && top.sp == sp
-	gaps := (top == nil ? 0 : top.gaps) + (tight ? 0 : 1)
+	pc := start
+	ra, sp, direct, gaps := run.ra, run.sp, run.direct, run.gaps
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
 		if lf != nil {learn_note(lf, i)}

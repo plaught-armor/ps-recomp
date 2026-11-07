@@ -15,7 +15,8 @@ Learned :: struct {
 // while RAM holds the words at lo (ps2/learned.odin). Each run's code is
 // found from its entry within its words; a branch or jump out of them (a
 // path the run never took) goes through cpu.jump_unknown, and every call
-// through cpu.call, so code outside the words is looked up as it is then.
+// through cpu.call, so code outside the words is looked up as it is then;
+// each `jr $ra` calls ps2.learned_jr before it returns (native_func).
 // Two runs at one entry with other words are two spans. A run native_func
 // cannot lower for arch (nil: wasm32's exact lowering) gets no span and
 // stays interpreted; skipped counts them. In context.allocator.
@@ -33,7 +34,7 @@ learned_blob :: proc(runs: []Learned, arch: native.Arch) -> (blob: []u8, skipped
 		}
 		f := mips.func_make(r.entry, r.lo + 4 * u32(len(r.words)), r.lo)
 		mips.discover(RULES, img, f, nil)
-		fs := native_func(&a, f, nil, CYCLES_PER_INSN, &slow)
+		fs := native_func(&a, f, nil, CYCLES_PER_INSN, &slow, learned = true)
 		if fs == nil {
 			skipped += 1
 		} else {

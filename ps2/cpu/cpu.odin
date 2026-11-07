@@ -268,6 +268,30 @@ interp_top: ^Interp_Frame
 // cleared within one call chain: not state.
 unwinding: bool
 interp_tops: [256]^Interp_Frame
+
+// A run's own facts, an interpreted one's (ps2 interp_body) or a learned
+// function's: its return address and the guest sp at its call; whether no
+// host code's call is under it (direct: mods' chains count as one); and the
+// gaps under it (Interp_Frame): one more than the top record's when the call
+// into it is not that record's, or with none, not the thread's base.
+Interp_Run :: struct {
+	ra, sp, gaps: u32,
+	direct:       bool,
+}
+
+// A learned function running (ps2 interp_call), so its `jr $ra` to another
+// address than run.ra with another sp than run.sp unwinds or jumps as an
+// interpreted run's does (ps2 learned_jr): learned code makes its calls as
+// native code does, with no Interp_Frame, so its own return is the only
+// one to check. Each thread has its own (learned_tops by thread id,
+// swapped with interp_top); like those records, on the coroutines' stacks.
+Learned_Run :: struct {
+	using run: Interp_Run,
+	entry:     u32,
+	prev:      ^Learned_Run,
+}
+learned_top: ^Learned_Run
+learned_tops: [256]^Learned_Run
 // The most records any chain held (printed as the game ends: not state).
 interp_max_depth: u32
 // Barrier records host_call pushed (printed as the game ends: not state).
@@ -396,5 +420,7 @@ cpu_snap :: proc() {
 	when !core.FLAT {
 		core.snap_add(&interp_top)
 		core.snap_add(&interp_tops)
+		core.snap_add(&learned_top)
+		core.snap_add(&learned_tops)
 	}
 }

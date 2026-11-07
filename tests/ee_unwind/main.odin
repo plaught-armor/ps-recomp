@@ -55,6 +55,11 @@
 // register and calls R's native code, and a handler's call of R(2) is
 // unwound past both native R frames: each must give the thunk its values
 // back, as the epilogue that the unwind leaves through restores them.
+//
+// With the argument learned (the coroutine model only), C is learned code
+// run native: its own `jr $ra` (a host return in native code) must unwind
+// and jump as the interpreted C's does (ps2 learned_jr), so every case
+// ends as in the default run.
 package main
 
 import "core:fmt"
@@ -498,12 +503,20 @@ vblank :: proc() {
 		fmt.printfln("ee_unwind native: ok (%d native calls)", cpu.learned_calls)
 		os.exit(0)
 	}
+	if learned_c_on {
+		if cpu.learned_calls == 0 || cpu.interp_unwinds == 0 || cpu.interp_jumps == 0 {
+			fmt.eprintfln("fail: %d native calls of C, %d unwinds, %d jumps", cpu.learned_calls, cpu.interp_unwinds, cpu.interp_jumps)
+			os.exit(1)
+		}
+		fmt.printfln("ee_unwind learned: ok (%d native calls)", cpu.learned_calls)
+		os.exit(0)
+	}
 	fmt.println("ee_unwind: ok")
 	os.exit(0)
 }
 
-// Whether R runs native (the argument native).
-native_on: bool
+// Whether R runs native (the argument native), or C (learned).
+native_on, learned_c_on: bool
 
 // Compile the words lo..hi, entered at lo, to native code and load them
 // (ps2 learned.odin): run in place of the interpreter while RAM holds them.
@@ -693,6 +706,15 @@ main :: proc() {
 	} else if mode == "frames" {
 		kernel.vblank_hook = vblank_frames
 		program_frames()
+	} else if mode == "learned" {
+		when core.FLAT {
+			fmt.eprintln("fail: learned: the coroutine model only")
+			os.exit(1)
+		}
+		learned_c_on = true
+		kernel.vblank_hook = vblank
+		program()
+		load_native(FN_C, FN_W)
 	} else if mode == "native" || mode == "stale" {
 		when core.FLAT {
 			fmt.eprintln("fail: native code: the coroutine model only")

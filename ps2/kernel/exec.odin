@@ -165,6 +165,7 @@ exec_reset :: proc(what: string) {
 	cpu.mod_inner, cpu.mod_inners = nil, {}
 	// Nor inside any interpreted call.
 	cpu.interp_top, cpu.interp_tops = nil, {}
+	cpu.learned_top, cpu.learned_tops = nil, {}
 	reap()
 	cur := k.current
 	cur.wakeups = 0

@@ -9,7 +9,7 @@ Step_Kind :: enum u8 {
 	Case,     // block at `target`; `check`: the previous block falls into it; `n`: 1 where the runner goes on (exact: every block)
 	Op,       // instruction `i` (no control transfer)
 	Cycles,   // charge `n` cycles
-	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead
+	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead; else `n`: the `jr $ra`'s pc (0: no `jr`)
 	Goto,     // pc = `target` within the function (exact: or outside it); `check`: run due events first; `n`: the jump's pc
 	Call,     // call the function at `target`, returning to `n`
 	Branch,   // t := the condition of branch `i`, up to the matching End
@@ -219,7 +219,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 				put(&l, {kind = .End})
 			} else if i.rs == 31 {
 				delay(&l, d, slot_op)
-				put(&l, {kind = .Return})
+				put(&l, {kind = .Return, n = pc})
 			} else {
 				put(&l, {kind = .Jump_Reg, n = u32(i.rs)})
 				delay(&l, d, slot_op)
