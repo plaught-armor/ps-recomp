@@ -38,6 +38,7 @@ TIMR_HOLD :: 8
 // Mode bits: compare and overflow interrupts, which a running mode with
 // either enables.
 TIMR_CMP :: 0x58 // interrupt on compare, the counter restarting, repeated
+TIMR_RESET :: 0x08 // the counter restarts at its compare
 TIMR_INTR :: 0x30
 // The most compare handlers one tick runs: a timer far behind its compares
 // (the EE stalled, a load ran) skips the rest.
@@ -234,7 +235,6 @@ tim_period :: proc(id, compare: u32) -> u64 {
 // count it stopped at.
 @(private = "file")
 tim_count :: proc(i: u32) -> u32 {
-	TIMR_RESET :: 0x08 // the counter restarts at its compare
 	t := &iop_timr.t[i]
 	if t.mode == 0 || t.scale == 0 {return t.count}
 	n := (r3000.state.cycles - t.start) / u64(t.scale)
@@ -411,7 +411,9 @@ tim_intr :: proc(i: u32) {
 		return
 	}
 	t.compare = next
-	t.start = t.due
+	// A counter that restarts at the compare was 0 there; one that runs
+	// free to its width keeps its start.
+	if t.mode & TIMR_RESET != 0 {t.start = t.due}
 	t.due += tim_period(tim_id(i), next)
 }
 

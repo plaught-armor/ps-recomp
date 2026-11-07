@@ -5926,6 +5926,19 @@ test_timrman :: proc() {
 	tm(t, 24, TIMER5)
 	r3000.state.cycles = cur + 1600
 	check(tm(t, 10, TIMER5) == 250, "timrman: a stopped counter holds")
+	// A compare handler always sets the restart (TIMR_CMP), so a counter
+	// that runs free past a compare is set by hand: after its handler at
+	// 1000 it counts on from its start, not from the compare.
+	tm(t, 20, TIMER5, 1000, b + h, 0)
+	cur = r3000.state.cycles
+	tm(t, 23, TIMER5)
+	iop.iop_timr.t[5].mode &~= iop.TIMR_RESET
+	iop.iop_u32(b + d + 8)^ = 1000
+	iop.iop_tick((cur + 1000) * 8)
+	iop.iop_u32(b + d + 8)^ = 0
+	r3000.state.cycles = cur + 1250
+	check(iop.iop_timr.t[5].mode != 0 && tm(t, 10, TIMER5) == 1250, "timrman: a counter without the restart runs on past a compare")
+	tm(t, 24, TIMER5)
 	tm(t, 20, TIMER2, 0, 0, 0)
 	cur = r3000.state.cycles
 	tm(t, 23, TIMER2)
