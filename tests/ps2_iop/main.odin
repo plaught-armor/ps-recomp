@@ -3232,6 +3232,23 @@ test_c1_gaps :: proc() {
 	id, _ := iop.iop_load(build_mod("modg", &a, entry), "modg", nil)
 	check(id > 0, "c1: a start that calls CpuEnableIntr loads")
 
+	// CpuDisableIntr, CpuEnableIntr, then CpuDisableIntr again, whose v0
+	// (KE_OK, no state kept) the start returns: a start returning other than
+	// 0 does not stay resident
+	b: Asm
+	di := imports(&b, "intrman", 8, 9)
+	entry = at(&b)
+	prologue(&b)
+	jal(&b, di)
+	put(&b, 0)
+	jal(&b, di + 8)
+	put(&b, 0)
+	jal(&b, di)
+	put(&b, 0)
+	epilogue(&b)
+	id, _ = iop.iop_load(build_mod("modh", &b, entry), "modh", nil)
+	check(id > 0, "c1: CpuDisableIntr, CpuEnableIntr, CpuDisableIntr each give KE_OK")
+
 	P :: 0x00040000
 	r := &r3000.state.r
 	for w, i in ([4]u32{1, 7, 2, 5}) {iop.iop_u32(P + 4 * u32(i))^ = w}

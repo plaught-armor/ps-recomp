@@ -613,7 +613,9 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		}
 	case "intrman":
 		switch fno {
-		case 9: // CpuEnableIntr: nothing holds interrupts off
+		case 8, 9: // CpuDisableIntr, CpuEnableIntr: the HLE keeps no interrupt
+			// state (17 and 18 neither), so neither is ever already done; retail's
+			// KE_CPUDI for a second disable never comes back
 			return KE_OK, true
 		case 17: // CpuSuspendIntr(int *state): no interrupts to hold off
 			if a0 != 0 {w32(a0, 0)}
