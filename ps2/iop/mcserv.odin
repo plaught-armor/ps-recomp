@@ -74,16 +74,11 @@ mc: struct {
 	dir_pos: int,
 }
 
-// Guest paths changed on the host, per port, each with the rollback commit
-// it was last changed at; kept while a rewind can still reach back past it.
-// Host state (host allocator, not registered with snap_add): a rewind must
-// not forget what reached the host.
+// Guest paths changed on the host, per port (card_dirty.odin).
 @(private = "file")
-mc_dirty: [MC_PORTS]map[string]u64
+mc_dirty: [MC_PORTS]Card_Dirty(string)
 
-// Rollback commits so far, and whether each port's host root exists.
-@(private = "file")
-mc_commits: u64
+// Whether each port's host root exists.
 @(private = "file")
 mc_root_made: [MC_PORTS]bool
 
@@ -208,11 +203,7 @@ mc_sync :: proc(port: u32, guest: string) {
 // Note a guest path whose host copy changed.
 @(private = "file")
 mc_mark :: proc(port: u32, guest: string) {
-	if entry, ok := &mc_dirty[port][guest]; ok {
-		entry^ = mc_commits
-		return
-	}
-	mc_dirty[port][strings.clone(guest, core.host_allocator)] = mc_commits
+	card_dirty_note(&mc_dirty[port], guest)
 }
 
 // Make the host copy of a guest path match the card. A host entry of the
@@ -540,53 +531,28 @@ mcserv_snap :: proc() {
 mcserv_init :: proc() {
 	for port in 0 ..< u32(MC_PORTS) {
 		mc_card(port)
-		mc_dirty[port] = make(map[string]u64, core.host_allocator)
+		card_dirty_init(&mc_dirty[port])
 	}
 	context.allocator = core.host_allocator
 	append(&core.snap_hooks, core.Snap_Hook{save = mc_committed, load = mc_rewound})
 }
 
-// After a snapshot is saved. A rollback commit: forget paths last changed
-// before any frame a rewind can still reach. While host writes are off,
-// rewinds skip their repair, so the paths are kept for when they come on.
+// After a snapshot is saved: a rollback commit (card_dirty_committed).
 @(private = "file")
 mc_committed :: proc(id: int) {
-	if id < core.RB_HOOK_ID || core.host_writes_off {return}
-	mc_commits += 1
-	for port in 0 ..< u32(MC_PORTS) {
-		dirty := &mc_dirty[port]
-		if len(dirty) == 0 {continue}
-		old := make([dynamic]string, context.temp_allocator)
-		for path, at in dirty {
-			if mc_commits - at > core.RB_FRAMES {append(&old, path)}
-		}
-		for path in old {
-			key, _ := delete_key(dirty, path)
-			delete(key, core.host_allocator)
-		}
-	}
+	for port in 0 ..< u32(MC_PORTS) {card_dirty_committed(&mc_dirty[port], id)}
 }
 
 // After a snapshot is restored. A rollback: rewrite each host path changed
-// within reach of a rewind from the restored card, parents before children,
-// and removals children first; the paths stay noted, since a deeper rewind
-// may follow. A save state: leave the host card alone (the load also drops
-// the frames rollback held, so no rewind reaches back past it).
+// within reach of a rewind from the restored card (card_dirty_rewound),
+// parents before children, and removals children first. A save state: leave
+// the host card alone.
 @(private = "file")
 mc_rewound :: proc(id: int) {
 	for port in 0 ..< u32(MC_PORTS) {
-		dirty := &mc_dirty[port]
-		if id < core.RB_HOOK_ID {
-			for path in dirty {delete(path, core.host_allocator)}
-			clear(dirty)
-			continue
-		}
-		if core.host_writes_off {continue}
-		paths, _ := slice.map_keys(dirty^, context.temp_allocator)
-		slice.sort(paths)
+		paths := card_dirty_rewound(&mc_dirty[port], id)
 		for path in paths {
 			if _, _, ok := mc_node(port, path); ok {mc_write_host(port, path)}
-			dirty[path] = mc_commits
 		}
 		#reverse for path in paths {
 			if _, _, ok := mc_node(port, path); !ok {mc_write_host(port, path)}

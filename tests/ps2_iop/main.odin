@@ -105,6 +105,12 @@
 // call and skip one larger than their buffer; delete unbinds. The disc's
 // device modules are Sony ones, a trailing space in a name included.
 //
+// card dirty tracking: a rollback commit forgets a key RB_FRAMES commits
+// after it last changed, not before; a rollback rewind returns the keys
+// sorted and keeps them, restamped; a save-state load forgets them all;
+// while host writes are off a commit counts nothing and a rewind returns
+// none. String keys are the store's own copies.
+//
 // sdrdrv: a user command handler's slot, range and previous handler; an
 // EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
 //
@@ -257,6 +263,7 @@ game :: proc(_: rawptr) {
 	test_fallback()
 	test_usbd()
 	test_boot_gaps()
+	test_card_dirty()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -6739,4 +6746,40 @@ test_dbcman :: proc() {
 	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001315}].n == 1, "dbcman 0x1315: a row")
 
 	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
+}
+
+test_card_dirty :: proc() {
+	RB :: core.RB_HOOK_ID
+	d: iop.Card_Dirty(u32)
+	iop.card_dirty_init(&d)
+	iop.card_dirty_note(&d, 7)
+	iop.card_dirty_note(&d, 3)
+	for _ in 0 ..< core.RB_FRAMES {iop.card_dirty_committed(&d, RB)}
+	check(len(d.at) == 2, "card dirty: a key stays RB_FRAMES commits")
+	keys := iop.card_dirty_rewound(&d, RB)
+	check(len(keys) == 2 && keys[0] == 3 && keys[1] == 7, "card dirty: a rewind returns the keys sorted")
+	check(d.at[3] == d.commits && d.at[7] == d.commits, "card dirty: a rewind restamps the keys")
+	for _ in 0 ..< core.RB_FRAMES {iop.card_dirty_committed(&d, RB)}
+	iop.card_dirty_note(&d, 7)
+	iop.card_dirty_committed(&d, RB)
+	check(len(d.at) == 1 && 7 in d.at, "card dirty: a key goes RB_FRAMES + 1 commits after its last change")
+	iop.card_dirty_committed(&d, 0)
+	n := d.commits
+	core.host_writes_off = true
+	iop.card_dirty_committed(&d, RB)
+	check(d.commits == n && iop.card_dirty_rewound(&d, RB) == nil && len(d.at) == 1, "card dirty: host writes off, no commit, no rewind keys")
+	core.host_writes_off = false
+	check(d.commits == n, "card dirty: a save-state snapshot is not a commit")
+	check(iop.card_dirty_rewound(&d, 0) == nil && len(d.at) == 0, "card dirty: a save-state load forgets every key")
+
+	s: iop.Card_Dirty(string)
+	iop.card_dirty_init(&s)
+	buf := [4]u8{'a', '/', 'b', 0}
+	iop.card_dirty_note(&s, string(buf[:3]))
+	buf[0] = 'z'
+	iop.card_dirty_note(&s, "c")
+	keys2 := iop.card_dirty_rewound(&s, RB)
+	check(len(keys2) == 2 && keys2[0] == "a/b" && keys2[1] == "c", "card dirty: a string key is the store's own copy")
+	iop.card_dirty_rewound(&s, 0)
+	check(len(s.at) == 0, "card dirty: a save-state load frees the string keys")
 }
