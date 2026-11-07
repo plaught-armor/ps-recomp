@@ -223,6 +223,7 @@ game :: proc(_: rawptr) {
 	test_rpc_pool_kept()
 	test_c1_gaps()
 	test_msgbx()
+	test_start_intr()
 	test_call_context()
 	test_sifman()
 	test_sif_dma_intr()
@@ -3374,6 +3375,44 @@ test_boot_gaps :: proc() {
 	check(sys(P + 2, P, 5) == P + 2 && bytes() == [8]u8{0, 1, 0, 1, 2, 3, 4, 7}, "boot: memmove up over itself")
 	check(sys(P, P + 2, 5) == P && bytes() == [8]u8{0, 1, 2, 3, 4, 3, 4, 7}, "boot: memmove down over itself")
 	check(sys(P, P + 4, 0xffffffff) == P && sys(0, P, 4) == 0 && bytes() == [8]u8{0, 1, 2, 3, 4, 3, 4, 7}, "boot: memmove copies none for n <= 0 or a null dst")
+}
+
+// A start that spins on a flag its libsd transfer handler sets, as a sound
+// driver syncs a voice transfer: the handler runs between the start's
+// slices, so the start returns.
+test_start_intr :: proc() {
+	fresh()
+	a: Asm
+	sd := imports(&a, "libsd", 17, 26)
+	flag := at(&a)
+	put(&a, 0)
+	src := at(&a)
+	put(&a, 0, 0, 0, 0, 0, 0, 0, 0)
+	h := at(&a) // the handler: flag = 1, returns 0
+	la(&a, T0, flag)
+	li(&a, T2, 1)
+	put(&a, 0xad000000 | T2 << 16, JR_RA, 0x24020000) // sw t2, 0(t0); jr ra; li v0, 0
+	entry := at(&a)
+	put(&a, 0x27bdffe0, 0xafbf001c) // addiu sp, sp, -32; sw ra, 28(sp)
+	li(&a, A0, 0)
+	la(&a, A1, h)
+	li(&a, A2, 0)
+	jal(&a, sd + 8) // sceSdSetTransIntrHandler(0, h, 0)
+	li(&a, T2, 32)
+	put(&a, 0xafa00010 | T2 << 16) // sw t2, 16(sp): the size
+	li(&a, A0, 0)
+	li(&a, A1, 0)
+	la(&a, A2, src)
+	li32(&a, 7, 0x5000)
+	jal(&a, sd) // sceSdVoiceTrans(0, write, src, 0x5000, 32)
+	spin := at(&a)
+	lw_at(&a, T2, flag)
+	put(&a, 0x11400000 | (spin - at(&a) - 4) / 4 & 0xffff, 0) // beqz t2, spin
+	li(&a, V0, 0)
+	put(&a, 0x8fbf001c, JR_RA, 0x27bd0020) // lw ra, 28(sp); jr ra; addiu sp, sp, 32
+	id, _ := iop.iop_load(build_mod("modsp", &a, entry), "modsp", nil)
+	check(id > 0, "start: a start spinning on its transfer handler's flag returns")
+	check(id > 0 && iop.iop_u32(module_base(id) + flag)^ == 1, "start: the handler set the flag")
 }
 
 // thmsgbx in a start: CreateMbx gives an id; SendMbx queues first come, or by

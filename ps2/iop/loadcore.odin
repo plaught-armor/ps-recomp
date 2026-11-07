@@ -309,7 +309,14 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	th_ready(st)
 	s.start_done = false
 	iop_sync(cpu.state.cycles)
-	th_schedule(r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN)
+	// In slices, so the libsd handlers raised meanwhile run between them: a
+	// start can spin on what a voice transfer's handler sets
+	end := r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN
+	for {
+		th_schedule(min(end, r3000.state.cycles + IOP_SLICE))
+		if !s.budget || r3000.state.cycles >= end || (s.start_done && l.failed) {break}
+		if iop_sd.pending != 0 {sd_intr_run(cpu.state.cycles)}
+	}
 	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
 		return fail(key, x.name, "start ran out of its budget", mark)
