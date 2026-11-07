@@ -3628,7 +3628,14 @@ test_boot_gaps :: proc() {
 	check(cd(6, 0) == 1 && cd(28) == iop.CD_STAT_PAUSE, "boot: a read spins a stopped disc up")
 	iop.iop_cd = {}
 	for i in u32(0) ..< 3 {iop.iop_u32(P + 4 * i)^ = 0xffffffff}
-	check(cd(24, P) == 1 && iop.iop_u32(P)^ == 0 && iop.iop_u32(P + 4)^ == 0 && iop.iop_u32(P + 8)^ == 0xffffffff, "boot: sceCdReadClock, eight zero bytes")
+	// 2004-01-01 12:00:00 in BCD {stat, s, m, h, pad, day, month, year}.
+	CLOCK :: [8]u8{0, 0x00, 0x00, 0x12, 0, 0x01, 0x01, 0x04}
+	clock := CLOCK
+	check(cd(24, P) == 1 && slice.equal(([^]u8)(iop.iop_u32(P))[:8], clock[:]) && iop.iop_u32(P + 8)^ == 0xffffffff, "boot: sceCdReadClock, 2004-01-01 12:00:00 in eight bytes")
+	sbuf: [16]u8
+	for &b in sbuf {b = 0xee}
+	rcok := iop.sif.servers[0x80000593](0x01, sbuf[:], 0)
+	check(rcok && (^u32)(&sbuf[0])^ == 1 && slice.equal(sbuf[4:12], clock[:]) && sbuf[12] == 0xee, "boot: S-command ReadClock, 1 and the same clock")
 
 	fresh()
 	s := &iop.iop_sched
