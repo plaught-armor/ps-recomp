@@ -161,7 +161,7 @@ interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame) -> (lf: ^core.Learn_Fr
 	// between, such as native code, or a mod's chain, could be.
 	ra, sp := u32(c.r[31].d[0]), u32(c.r[29].d[0])
 	top := cpu.interp_top
-	direct := !cpu.mod_on && (top == nil ? entry == cpu.interp_base : top.target == entry && top.ret == ra && top.sp == sp)
+	direct := !cpu.mod_on && (top == nil ? entry == cpu.interp_base : !top.barrier && top.target == entry && top.ret == ra && top.sp == sp)
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
 		if lf != nil {learn_note(lf, i)}
@@ -261,13 +261,19 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool) -> bool {
 // returns to t with another sp is no match. Else the `jr` returns as
 // before, except when no record matches and every run down to the thread's
 // base was called directly: true, a jump. With host code under a run, t
-// may be a native caller's return address.
+// may be a native caller's return address. A barrier record (host code's
+// call) is host code under every run above it, and not counted.
 @(private = "file")
 interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 	sp := u32(cpu.state.r[29].d[0])
 	ok := direct
 	n := 0
 	for f := cpu.interp_top; f != nil; f = f.prev {
+		// Host code's call (cpu.host_call): nothing past it is unwound to.
+		if f.barrier {
+			ok = false
+			continue
+		}
 		if n == cpu.UNWIND_MAX {
 			if .Max not_in unwind_shown {
 				unwind_shown += {.Max}

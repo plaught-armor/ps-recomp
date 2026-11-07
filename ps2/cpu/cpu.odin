@@ -158,6 +158,28 @@ call :: proc(addr: u32) {
 	fatal("call to unknown function %08x (ra %08x)", addr, u32(state.r[31].d[0]))
 }
 
+// cpu.call from host code that runs guest code and goes on after it (an
+// interrupt handler, a syscall the program installed): a barrier record
+// marks it on the chain, so an unwind never goes past it (ps2
+// interp_unwind_find) and a run it enters is not direct.
+host_call :: proc(addr: u32) {
+	when core.FLAT {
+		call(addr)
+	} else {
+		fr := Interp_Frame {
+			target  = addr,
+			sp      = u32(state.r[29].d[0]),
+			depth   = interp_top == nil ? 0 : interp_top.depth,
+			barrier = true,
+			prev    = interp_top,
+		}
+		interp_top = &fr
+		interp_barriers += 1
+		call(addr)
+		interp_top = fr.prev
+	}
+}
+
 // cpu.call for a thread's entry (the kernel's thread start, ExecPS2, the boot).
 thread_call :: proc(addr: u32) {
 	interp_base = addr
@@ -230,14 +252,17 @@ mod_inners: [256]^Mod_Inner
 // runs keep the chain as data (kernel.Flat_Ctx).
 Interp_Frame :: struct {
 	ret, sp, target: u32,
-	depth:           u32, // records in the chain, this one included
+	depth:           u32, // records in the chain, this one included (barriers not counted)
 	direct:          bool,
+	barrier:         bool, // host code's call (host_call), no interpreted run's
 	prev:            ^Interp_Frame,
 }
 interp_top: ^Interp_Frame
 interp_tops: [256]^Interp_Frame
 // The most records any chain held (printed as the game ends: not state).
 interp_max_depth: u32
+// Barrier records host_call pushed (printed as the game ends: not state).
+interp_barriers: u64
 
 // The entry of the thread starting now (thread_call): an interpreted run
 // entered there with no records open is the thread's base, with only the

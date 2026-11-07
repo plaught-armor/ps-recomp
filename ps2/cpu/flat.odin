@@ -47,6 +47,6 @@ flat_print :: proc() {
 		fmt.eprintfln("ipu flat: %d re-runs, %d quadwords replayed, %d quadwords since a checkpoint at most", ipu_reruns, ipu_replayed, ipu_journal_max)
 		if iop_flat_print != nil {iop_flat_print()}
 	} else {
-		fmt.eprintfln("ee interp: %d calls open at most", interp_max_depth)
+		fmt.eprintfln("ee interp: %d calls open at most, %d barrier records", interp_max_depth, interp_barriers)
 	}
 }
