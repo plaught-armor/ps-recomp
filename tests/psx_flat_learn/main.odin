@@ -157,8 +157,13 @@ run :: proc(path: string) {
 	stop_at = G
 	check(!start(&x, F), "F stops at G's entry")
 	check_file(path, {}, "F stopped")
+	// The other thread runs on its own registers, as a thread switch
+	// saves and restores them: F's $ra (G's return) must be there again
+	// as F goes on, since a `jr $ra` is a plain jump to it.
+	saved := cpu.state.r
 	check(start(&y, H), "H ends")
 	check_file(path, {{H, {}, 6}}, "H returned")
+	cpu.state.r = saved
 	when core.FLAT {
 		check(cpu.flat_run(&x), "F ends after the resume")
 	}
