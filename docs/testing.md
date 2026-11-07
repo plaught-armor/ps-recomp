@@ -531,11 +531,14 @@ play.mjs is passed on to the module.
 
 A wasm PS1 run that records its code and runs learned code compiles its
 new records mid-run (play/midload_learned.odin): once they have stopped
-growing for 300 frames, the records of the entries no loaded blob covers
-go to another instance of the module (`play --learned psx`), in a Worker
-on the page (web/learn.js) and in a worker_thread under play.mjs
-(`tests/wasi/learnlink.mjs`), and the run loads the blob it hands back.
-Nothing is stored; the next run compiles its own set as before. A run
+growing for 300 frames, the records no loaded blob covers, at most 480
+per compile, go to another instance of the module (`play --learned psx`),
+in a Worker on the page (web/learn.js) and in a worker_thread under
+play.mjs (`tests/wasi/learnlink.mjs`), and the run loads the blob it hands
+back. Nothing is stored; the next run compiles its own set as before.
+`node tests/wasi/learn.mjs` checks the handoff: a late blob, from a
+compile before the one in flight or from the run before, is dropped, and
+an empty, failed or oversized one fails. A run
 with `PS_DUMP` waits for each compile, so its hashes match a run with
 `PS_MIDLOAD=0`. Netplay and rollback runs never load mid-run. With
 `COMMIT=test`, `PS_MIDLEARN_CHECK=1` compiles each set in the run too and

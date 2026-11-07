@@ -6,11 +6,18 @@
 // compiles the records to a learned blob and runs them native
 // (learned_blob). Until then that code runs in the interpreter. So while the
 // game runs, once its records have stopped growing, the host compiles the
-// records of the entries no loaded blob covers yet, all records of each, in
-// a worker of its own (`play --learned psx <records> <out> <interp>`, through
-// the "system:ps_learn" imports: web/learn.js), and the run loads the blob it
-// returns. Nothing is stored: the next run compiles its own set, by its own
-// key (learned_blob), as it would have.
+// records no loaded blob was compiled from (a new body at an entry one
+// covers among them) in a worker of its own (`play --learned psx <records>
+// <out> <interp>`, through the "system:ps_learn" imports: web/learn.js), and
+// the run loads the blob it returns. Nothing is stored: the next run
+// compiles its own set, by its own key (learned_blob), as it would have.
+//
+// A compile takes at most MIDLEARN_RECORDS records, so a load costs this
+// thread no more than the largest measured; the rest go in another, after
+// MIDLOAD_FRAMES more vblanks. A blob over the host's size is not compiled
+// again until the records grow. Each load's code stays loaded, with the
+// wasm instance and table range it was linked into (psx/native): one per
+// load, which never repeats a record, so they are bounded by the records.
 //
 // The blob is for the code the snapshot's interp list (psx_interp) left to
 // the interpreter. A thread switch this run makes known (native_switched)
@@ -35,15 +42,16 @@ foreign import ps_learn "system:ps_learn"
 @(default_calling_convention = "contextless")
 foreign ps_learn {
 	// Start compiling the LEARN records rec and the interp list interp
-	// (native.Blob_Interp each) in the host's worker: 0 started, -1 a host
-	// that compiles nothing.
+	// (native.Blob_Interp each) in the host's worker: the compile's
+	// generation (> 0), or -1 for a host that compiles nothing.
 	@(link_name = "start")
 	learn_host_start :: proc(rec: [^]u8, rec_len: i32, interp: [^]u8, interp_len: i32) -> i32 ---
-	// Wait up to timeout_ms for the compile: -1 still running, -2 failed,
-	// -3 a blob over the host's size, dropped; else the blob's size,
-	// copied to buf (and taken) only when cap holds it.
+	// Wait up to timeout_ms for compile gen: -1 still running, -2 failed
+	// (an empty blob too), -3 a blob over the host's size, dropped; else
+	// the blob's size, copied to buf (and taken) only when cap holds it. A
+	// blob of another compile (one from before, late) is dropped.
 	@(link_name = "poll")
-	learn_host_poll :: proc(buf: [^]u8, cap: i32, timeout_ms: i32) -> i32 ---
+	learn_host_poll :: proc(buf: [^]u8, cap: i32, timeout_ms: i32, gen: i32) -> i32 ---
 }
 
 @(private = "file")
@@ -53,20 +61,30 @@ LEARN_FAILED :: -2
 @(private = "file")
 LEARN_OVERSIZED :: -3
 
+// The most records one compile takes: the lod set the first measured load
+// had (480 records, 14.5 ms on the play thread; bof4's 28 took 3.7 ms,
+// ff7's 23 took 3.5 ms).
+MIDLEARN_RECORDS :: 480
+
 @(private = "file")
 Midload_Learned :: struct {
 	dir:     string,
-	records: string, // the LEARN file
-	covered: map[u32]bool, // the entries a loaded blob was compiled from
-	// The compile in flight: its records, as a LEARN stream, their
-	// entries, the interp list it leaves out and its key.
-	stream:  [dynamic]u8,
-	entries: [dynamic]u32,
-	interp:  []native.Blob_Interp,
-	set:     string,
-	loads:   int, // blobs loaded
-	recs:    int, // the records they were compiled from
-	stale:   int, // blobs dropped as stale
+	records:   string, // the LEARN file
+	covered:   map[core.Learn_Key]bool, // the records a loaded blob was compiled from
+	// The compile in flight: its generation, its records, as a LEARN
+	// stream, their keys, the interp list it leaves out, its key and
+	// whether records were left for another.
+	gen:       i32,
+	stream:    [dynamic]u8,
+	keys:      [dynamic]core.Learn_Key,
+	interp:    []native.Blob_Interp,
+	set:       string,
+	more:      bool,
+	rounds:    u64, // loads that left records for another (midlearn_grown)
+	oversized: u64, // the record count when a blob was over the host's size (0 none)
+	loads:     int, // blobs loaded
+	recs:      int, // the records they were compiled from
+	stale:     int, // blobs dropped as stale
 }
 
 @(private = "file")
@@ -98,7 +116,7 @@ midlearn_init :: proc(dir, records: string, startup: bool) -> bool {
 		if err == nil {
 			recs, _ := core.learn_read(data, context.temp_allocator)
 			for r in recs {
-				if r.cpu == .Psx {mlrn.covered[r.entry] = true}
+				if r.cpu == .Psx {mlrn.covered[core.learn_key(r)] = true}
 			}
 		}
 	}
@@ -106,14 +124,14 @@ midlearn_init :: proc(dir, records: string, startup: bool) -> bool {
 }
 
 // The stored learned blob would not load (learned_failed): none of its
-// entries are covered.
+// records are covered.
 midlearn_uncover :: proc() {
 	clear(&mlrn.covered)
 }
 
 @(private = "file")
 midlearn_grown :: proc() -> u64 {
-	return core.learn_count(.Psx)
+	return core.learn_count(.Psx) + mlrn.rounds
 }
 
 @(private = "file")
@@ -121,9 +139,12 @@ midlearn_report :: proc(fails: int) {
 	fmt.eprintfln("play: mid-run learned loads: %d (%d records), %d stale, %d failed", mlrn.loads, mlrn.recs, mlrn.stale, fails)
 }
 
-// Start the host compiling the records of the entries no loaded blob covers.
+// Start the host compiling the records no loaded blob covers, the first
+// MIDLEARN_RECORDS of them.
 @(private = "file")
 midlearn_start :: proc() -> Midload_Start {
+	count := core.learn_count(.Psx)
+	if mlrn.oversized != 0 && count <= mlrn.oversized {return .Not}
 	data, err := os.read_entire_file(mlrn.records, context.temp_allocator)
 	if err != nil {
 		fmt.eprintln("play: mid-run learned compile: cannot read", mlrn.records, err)
@@ -134,8 +155,14 @@ midlearn_start :: proc() -> Midload_Start {
 	defer delete(compact)
 	recs, _ := core.learn_read(compact, context.temp_allocator)
 	kept := make([dynamic]core.Learn_Record, context.temp_allocator)
+	more := false
 	for r in recs {
-		if r.cpu == .Psx && r.entry not_in mlrn.covered {append(&kept, r)}
+		if r.cpu != .Psx || core.learn_key(r) in mlrn.covered {continue}
+		if len(kept) == MIDLEARN_RECORDS {
+			more = true
+			break
+		}
+		append(&kept, r)
 	}
 	if len(kept) == 0 {return .Not}
 	interp, iok := psx_interp(mlrn.dir)
@@ -147,13 +174,15 @@ midlearn_start :: proc() -> Midload_Start {
 		resize(&mlrn.stream, at + core.LEARN_HEADER + 4 * len(r.words))
 		core.learn_header(mlrn.stream[at:][:core.LEARN_HEADER], r.cpu, r.flags, r.entry, r.lo, u32(len(r.words)), r.hash)
 		copy(mlrn.stream[at + core.LEARN_HEADER:], ([^]u8)(raw_data(r.words))[:4 * len(r.words)])
-		append(&mlrn.entries, r.entry)
+		append(&mlrn.keys, core.learn_key(r))
 	}
+	mlrn.more = more
 	mlrn.interp = make([]native.Blob_Interp, len(interp))
 	copy(mlrn.interp, interp)
 	mlrn.set = fmt.aprint(set)
 	bytes := learned_interp_bytes(mlrn.interp)
-	if learn_host_start(raw_data(mlrn.stream), i32(len(mlrn.stream)), raw_data(bytes), i32(len(bytes))) != 0 {
+	mlrn.gen = learn_host_start(raw_data(mlrn.stream), i32(len(mlrn.stream)), raw_data(bytes), i32(len(bytes)))
+	if mlrn.gen <= 0 {
 		fmt.eprintln("play: mid-run learned loading off: this host has no worker to compile in")
 		midlearn_cleanup()
 		return .Off
@@ -164,15 +193,18 @@ midlearn_start :: proc() -> Midload_Start {
 // Wait up to timeout for the host's compile, taking its blob when it is done.
 @(private = "file")
 midlearn_poll :: proc(timeout: time.Duration) -> Midload_Poll {
-	n := learn_host_poll(nil, 0, i32(time.duration_milliseconds(timeout)))
+	n := learn_host_poll(nil, 0, i32(time.duration_milliseconds(timeout)), mlrn.gen)
 	switch n {
 	case LEARN_RUNNING:
 		return .Running
-	case LEARN_FAILED:
+	case LEARN_FAILED, 0:
 		fmt.eprintln("play: mid-run learned compile failed")
+		midlearn_cleanup()
 		return .Failed
 	case LEARN_OVERSIZED:
-		// The host said so, once.
+		// The host said so, once; not again until the records grow.
+		mlrn.oversized = core.learn_count(.Psx)
+		midlearn_cleanup()
 		return .Failed
 	}
 	if n < 0 {
@@ -182,7 +214,7 @@ midlearn_poll :: proc(timeout: time.Duration) -> Midload_Poll {
 	start := time.tick_now()
 	blob := make([]u8, n)
 	defer delete(blob)
-	if learn_host_poll(raw_data(blob), n, 0) != n {
+	if learn_host_poll(raw_data(blob), n, 0, mlrn.gen) != n {
 		fmt.eprintln("play: mid-run learned compile: the host's blob went away")
 		return .Lost
 	}
@@ -221,7 +253,8 @@ midlearn_take :: proc(blob: []u8, start: time.Tick) -> Midload_Poll {
 		}
 	}
 	if !psxnative.load_learned_blob(blob, "the mid-run learned code") {return .Failed}
-	for e in mlrn.entries {mlrn.covered[e] = true}
+	for k in mlrn.keys {mlrn.covered[k] = true}
+	if mlrn.more {mlrn.rounds += 1}
 	mlrn.loads += 1
 	mlrn.recs += len(recs)
 	fmt.eprintfln("play: mid-run learned load: %d records, %.1f ms on this thread", len(recs), time.duration_milliseconds(time.tick_since(start)))
@@ -241,7 +274,9 @@ midlearn_stop :: proc(quit: bool) -> bool {
 @(private = "file")
 midlearn_cleanup :: proc() {
 	clear(&mlrn.stream)
-	clear(&mlrn.entries)
+	clear(&mlrn.keys)
+	mlrn.gen = 0
+	mlrn.more = false
 	delete(mlrn.interp)
 	mlrn.interp = nil
 	delete(mlrn.set)

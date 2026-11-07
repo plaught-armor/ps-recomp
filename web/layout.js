@@ -114,11 +114,15 @@ NET.SIZE = NET.IN + NET.SLOTS * NET.SLOT_SIZE;
 // Learn: a mid-run learned compile's blob, from the page (or Node's
 // learnlink.mjs) to the play Worker (web/learn.js). STATE_WORD guards the
 // blob: only the deliverer writes it, from EMPTY, and the Worker reads it
-// only once READY.
+// only once READY. GEN_WORD names the compile in flight: a blob delivered
+// for another is dropped. The play Worker makes the buffer at its first
+// compile, so a run that compiles nothing mid-run has none.
 export const LEARN = {
 	STATE_WORD: 0, // EMPTY, WRITING, READY or TAKEN (web/learn.js)
 	LEN_WORD: 1, // the blob's size, or FAILED or OVERSIZED
 	WARNED_WORD: 2, // 1 once an oversized blob was said
+	GEN_WORD: 3, // the compile in flight, counted from 1
+	BLOB_GEN_WORD: 4, // the compile the blob is from
 	DATA: 32,
 	DATA_MAX: 16 * 1024 * 1024,
 };

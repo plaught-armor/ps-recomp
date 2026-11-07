@@ -72,15 +72,15 @@ async function discFor({ files, urls, store: name, stored }) {
 // times. failSaves: false stores /data back only when the module exits
 // with 0 (`play --convert-store`, whose failure leaves its temporary file
 // there). Before /data is stored the page gets {saving}: from then on
-// stopping the Worker could cut a write short. learn: the LEARN buffer,
-// for a mid-run learned compile (web/learn.js), which goes to the page as
-// {learn: {records, interp}}.
+// stopping the Worker could cut a write short. A mid-run learned compile
+// (web/learn.js) goes to the page as {learn: {records, interp, buffer,
+// gen}}: the LEARN buffer, made at the first, and the compile's generation.
 //
 // out: a tool run, as a mid-run learned compile's (web/learn.js): no disc,
 // no store and no window; /data holds only seed (path -> bytes), and done
 // carries what the module wrote there as files.
 onmessage = async ({ data }) => {
-	const { wasm, args, env = {}, test = false, failSaves = true, control, audio, present, net: netBuffer, learn: learnBuffer, out = false, seed } = data;
+	const { wasm, args, env = {}, test = false, failSaves = true, control, audio, present, net: netBuffer, out = false, seed } = data;
 	let wasi = null;
 	let disc = null;
 	const ring = [];
@@ -111,12 +111,12 @@ onmessage = async ({ data }) => {
 		const bytes = await response.arrayBuffer();
 		const module = await WebAssembly.compile(bytes);
 		const net = netBuffer ? new NetImports(netBuffer, await buildId(bytes)) : null;
-		const learn = learnBuffer
-			? new LearnImports(learnBuffer, (records, interp) => {
-					postMessage({ learn: { records, interp } }, [records.buffer, interp.buffer]);
+		const learn = out
+			? null
+			: new LearnImports((records, interp, buffer, gen) => {
+					postMessage({ learn: { records, interp, buffer, gen } }, [records.buffer, interp.buffer]);
 					return true;
-				})
-			: null;
+				});
 		times.compileMs = Math.round(performance.now() - t0);
 		const log = (_fd, text) => postMessage({ log: text });
 		if (out) {

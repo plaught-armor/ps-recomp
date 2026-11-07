@@ -38,7 +38,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { argv, env, exit, stderr, stdout } from "node:process";
 import { Worker } from "node:worker_threads";
 import { LearnImports } from "../../web/learn.js";
-import { AUDIO, CONTROL, LEARN, NET, PRESENT } from "../../web/layout.js";
+import { AUDIO, CONTROL, NET, PRESENT } from "../../web/layout.js";
 import { Native } from "../../web/native.js";
 import { buildId, NetImports, NO_NET } from "../../web/net.js";
 import { Sdl } from "../../web/sdl.js";
@@ -139,9 +139,8 @@ if (settings.PS_NET_PEER !== undefined) {
 // The worker is made inside the start import, while the module blocks this
 // thread: its 'error' and 'message' events are never seen here, so
 // learnlink.mjs catches everything and delivers a failure itself.
-const learnBuffer = new SharedArrayBuffer(LEARN.SIZE);
-const learn = new LearnImports(learnBuffer, (records, interp) => {
-	new Worker(new URL("learnlink.mjs", import.meta.url), { workerData: { buffer: learnBuffer, module, records, interp } }).unref();
+const learn = new LearnImports((records, interp, buffer, gen) => {
+	new Worker(new URL("learnlink.mjs", import.meta.url), { workerData: { buffer, gen, module, records, interp } }).unref();
 	return true;
 });
 const instance = await WebAssembly.instantiate(module, {

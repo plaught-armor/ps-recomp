@@ -41,6 +41,8 @@ Learn_Cpu :: learnfile.Learn_Cpu
 Learn_Flag :: learnfile.Learn_Flag
 Learn_Flags :: learnfile.Learn_Flags
 Learn_Record :: learnfile.Learn_Record
+Learn_Key :: learnfile.Learn_Key
+learn_key :: learnfile.learn_key
 LEARN_SPAN_MAX :: learnfile.LEARN_SPAN_MAX
 LEARN_HEADER :: learnfile.LEARN_HEADER
 LEARN_TAG :: learnfile.LEARN_TAG
