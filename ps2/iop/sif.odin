@@ -111,6 +111,7 @@ sif_init :: proc() {
 	sif.servers[PADMAN_SID_101] = padman_server_101
 	sif.servers[0x80000900] = mtap_server
 	sif.servers[DBC_SID] = dbcman_server
+	sif.servers[DBC_SID_MID] = dbcman_mid_server
 	sif.servers[DBC_SID_BIG] = dbcman_big_server
 	sif.servers[DBC_SID_FAST0] = dbcman_fast_server
 	sif.servers[DBC_SID_FAST1] = dbcman_fast_server
@@ -482,7 +483,7 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		if cpu.debug >= 1 {fmt.eprintfln("sif: load module buffer %x \"%s\"", w[0], name)}
 		data := iop_mem(w[0], IOP_RAM_SIZE)
 		args := buf[0x104:][:min(w[1], 252)]
-		dbcman_module(name)
+		dbcman_module(name, data)
 		w[0] = 2
 		w[1] = 0
 		if iop_irx && iop_runs(data) {
