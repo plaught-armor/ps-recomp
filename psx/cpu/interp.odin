@@ -6,6 +6,11 @@
 // which is what the PS1 and the IOP both set interp_run to.
 // A link to its own return address (pc + 8: a get-pc idiom) is no call:
 // the link register set, the delay slot run, on at pc + 8.
+// A `jr` is a plain jump; only one to the run's return address (frame_ret)
+// returns. A `jr $ra` elsewhere is either a return past the run's caller to
+// an outer call still open (a function that pops its caller's frame and
+// returns for it), which unwinds to that call (interp_unwind_find), or a
+// jump, as any other `jr`.
 // Plain jumps stay inside the interpreter unless they land on a function the
 // dispatcher knows, in which case they become a tail call. A `j` at a run's
 // first word is a tail call too: that is an import stub patched to
@@ -35,6 +40,7 @@
 //     its entry, so events are never starved.
 package psx_cpu
 
+import "core:fmt"
 import "ps:core"
 
 @(private)
@@ -50,6 +56,50 @@ Interp :: struct {
 	pending: u64,
 	// The run's LEARN frame (core/learn.odin); nil without LEARN.
 	learn:   ^core.Learn_Frame,
+	// The run is the direct callee of an interpreted call (its record on top
+	// of interp_top): a `jr $ra` in it may unwind past it.
+	tight:   bool,
+}
+
+// An interpreted call still open, kept on the host stack of interp_call for
+// the time the callee runs. The records form a chain, innermost first.
+@(private)
+Interp_Frame :: struct {
+	// Where the caller goes on, and its $sp then.
+	ret, sp: u32,
+	// The callee.
+	target:  u32,
+	// The caller run was tight: the record below is its own caller's.
+	tight:   bool,
+	// jump's tail call at a run's first word: its return is the caller's
+	// caller's, so no `jr` unwinds to it.
+	tail:    bool,
+	prev:    ^Interp_Frame,
+}
+
+// The innermost interpreted call open, nil none.
+@(private)
+interp_top: ^Interp_Frame
+// The call a `jr $ra` unwinds to: the runs above it end, it goes on.
+@(private)
+interp_unwind: ^Interp_Frame
+// The callee interp_call is calling now, 0 none. A run that starts there
+// with its record's $ra and $sp is that record's callee (tight). It is kept
+// as a value so a run never reads a record before it knows the record is
+// its own.
+@(private)
+interp_next: u32
+// Records a `jr $ra` may pass on its way to an outer call (a bound only;
+// none nests that deep).
+INTERP_UNWIND_MAX :: 64
+// `jr $ra` not to frame_ret: those that unwound to an outer call, and those
+// that went on as a jump.
+interp_unwinds, interp_jumps: u64
+
+// Say the `jr $ra` counts (at quit, in both builds; under FLAT from flat_print).
+interp_print :: proc() {
+	who := learn_cpu == .Iop ? "iop" : "psx"
+	fmt.eprintfln("%s jr $ra: %d unwinds to an outer call, %d jumps", who, interp_unwinds, interp_jumps)
 }
 
 interp_loop :: proc(start: u32) {
@@ -58,6 +108,11 @@ interp_loop :: proc(start: u32) {
 		start = start,
 		learn = core.learn_take(learn_cpu),
 	}
+	if interp_next == start {
+		top := interp_top
+		st.tight = top != nil && top.target == start && top.ret == state.r[31] && top.sp == state.r[29]
+	}
+	interp_next = 0
 	events_due()
 	for !st.done {
 		w := lw(st.pc)
@@ -135,9 +190,59 @@ jump :: proc(st: ^Interp, pc, target: u32) {
 	}
 	branch(st, false, 0)
 	tail_depth += 1
-	call(target)
+	interp_call(st, state.r[31], target, true)
 	tail_depth -= 1
 	st.done = true
+}
+
+// Call t from the run st, its caller going on at ret, with a record open
+// for the time t runs. True when a `jr $ra` unwound past st: the run ends.
+@(private)
+interp_call :: proc(st: ^Interp, ret, t: u32, tail := false) -> bool {
+	fr := Interp_Frame {
+		ret    = ret,
+		sp     = state.r[29],
+		target = t,
+		tight  = st.tight,
+		tail   = tail,
+		prev   = interp_top,
+	}
+	interp_top = &fr
+	interp_next = t
+	call(t)
+	interp_next = 0
+	interp_top = fr.prev
+	if interp_unwind == nil {return false}
+	if interp_unwind == &fr {
+		interp_unwind = nil
+		return false
+	}
+	st.done = true
+	return true
+}
+
+// A `jr $ra` to t, not frame_ret, in the run st: true when t is the return
+// address of an outer call still open, with the $sp it was made with, that
+// st's records reach: its runs above it end (interp_unwind), and it goes
+// on at t. Else it is a jump.
+@(private)
+interp_unwind_find :: proc(st: ^Interp, t: u32) -> bool {
+	if st.tight {
+		f := interp_top
+		for _ in 0 ..< INTERP_UNWIND_MAX {
+			if f == nil {break}
+			if !f.tail && f.ret == t && f.sp == state.r[29] {
+				interp_unwind = f
+				interp_unwinds += 1
+				st.done = true
+				return true
+			}
+			if !f.tight {break}
+			f = f.prev
+		}
+	}
+	interp_jumps += 1
+	return false
 }
 
 // A jump to a function, or to a BIOS vector or table stub (no guest code
@@ -197,7 +302,7 @@ interp_exec :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	case 0x03:
 		r[31] = pc + 8
 		branch(st, false, 0)
-		if t := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2); t != pc + 8 {call(t)}
+		if t := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2); t != pc + 8 {interp_call(st, pc + 8, t)}
 	case 0x04:
 		branch(st, r[rs] == r[rt], pc + 4 + (imm << 2))
 	case 0x05:
@@ -285,7 +390,7 @@ interp_special :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	case 0x08:
 		t := r[rs]
 		branch(st, false, 0)
-		if rs == 31 || t == frame_ret {
+		if t == frame_ret || rs == 31 && interp_unwind_find(st, t) {
 			st.done = true
 		} else {
 			events_due()
@@ -295,7 +400,7 @@ interp_special :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 		t := r[rs]
 		r[rd] = pc + 8
 		branch(st, false, 0)
-		if t != pc + 8 {call(t)}
+		if t != pc + 8 {interp_call(st, pc + 8, t)}
 	case 0x0c:
 		ahead := access_cycles(pending)
 		state.cycles += ahead
@@ -351,7 +456,7 @@ interp_regimm :: proc(st: ^Interp, pc, w: u32) {
 		r[31] = pc + 8
 		branch(st, false, 0)
 		if taken && target != pc + 8 {
-			call(target)
+			interp_call(st, pc + 8, target)
 		}
 		return
 	}

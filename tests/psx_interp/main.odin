@@ -54,7 +54,8 @@ FN_THREAD :: 0x80001200
 @(private = "file")
 turns: int
 
-// nop; jal FN_CYCLES; nop; jr ra; nop.
+// nop; jal FN_CYCLES; nop; jr s0; nop, with s0 the caller's $ra (the jal
+// links $ra to the jr itself).
 @(private = "file")
 JAL_CYCLES :: 0x80001300
 
@@ -142,10 +143,10 @@ main :: proc() {
 		check("thread turns after syscall 3", u32(turns), u32(want))
 	}
 
-	for w, k in ([?]u32{0, 0x0c000000 | (FN_CYCLES & 0x3ffffff) >> 2, 0, 0x03e00008, 0}) {
+	for w, k in ([?]u32{0, 0x0c000000 | (FN_CYCLES & 0x3ffffff) >> 2, 0, 0x02000008, 0}) {
 		cpu.w32(JAL_CYCLES + 4 * u32(k), w)
 	}
-	r[31] = RA
+	r[16], r[31] = RA, RA
 	start := cpu.state.cycles
 	cpu.call(JAL_CYCLES)
 	check("cycles at a jal's callee", u32(entry_cycles - start), 3 * cpu.CYCLES_PER_INSN)

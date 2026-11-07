@@ -412,7 +412,7 @@ fatal :: proc(format: string, args: ..any) -> ! {
 	msg := fmt.tprintf(format, ..args)
 	fmt.eprintln("fatal:", msg)
 	ram_dump_env()
-	when core.FLAT {flat_print()}
+	when core.FLAT {flat_print()} else {interp_print()}
 	core.learn_report()
 	core.compat_report(msg)
 	os.exit(1)

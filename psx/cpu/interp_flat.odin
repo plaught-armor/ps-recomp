@@ -63,6 +63,7 @@ Flat_Frame :: struct {
 	ret:   u32, // where the caller goes on (Call)
 	start: u32, // the caller run's first word
 	outer: u32, // frame_ret before the call, put back as it returns
+	sp:    u32, // the caller's $sp at the call (a `jr $ra` unwinding to it, flat_unwind)
 	kind:  Flat_Kind,
 	host:  bool, // the callee is host code
 	// Cont: its index in Flat_Ctx.host. Else the callee's LEARN run
@@ -300,6 +301,7 @@ when core.FLAT {
 		when core.FLAT {
 			who := learn_cpu == .Iop ? "iop" : "psx"
 			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run", who, flat_returns, flat_mismatch, flat_max_depth, flat_late)
+			interp_print()
 		}
 	}
 
@@ -308,7 +310,7 @@ when core.FLAT {
 	flat_push :: proc(x: ^Flat_Ctx, kind: Flat_Kind, ret: u32) -> ^Flat_Frame {
 		if int(x.depth) == len(x.frames) {flat_grow(x)}
 		f := &x.frames[x.depth]
-		f^ = {ret = ret, start = x.start, outer = frame_ret, kind = kind}
+		f^ = {ret = ret, start = x.start, outer = frame_ret, sp = state.r[29], kind = kind}
 		x.depth += 1
 		if x.depth > flat_max_depth {flat_max_depth = x.depth}
 		return f
@@ -548,6 +550,29 @@ when core.FLAT {
 		if !x.ended && t != x.pc && (x.depth == 0 || x.frames[x.depth - 1].kind != .Cont) {flat_mismatch += 1}
 	}
 
+	// A `jr $ra` to t, not frame_ret: when t is the return address of a
+	// call still open, with the $sp it was made with, that the records of
+	// interpreted calls on top of x reach, the runs above it end and it goes
+	// on at t (interp_unwind_find). Else false: a jump. A record whose callee
+	// is host code, a continuation's or a run's first ends the search, as a
+	// run not tight does in the recursive model.
+	@(private = "file")
+	flat_unwind :: proc(x: ^Flat_Ctx, t: u32, $L: bool) -> bool {
+		sp := state.r[29]
+		lo := x.depth > INTERP_UNWIND_MAX ? x.depth - INTERP_UNWIND_MAX : 0
+		for i := x.depth; i > lo; i -= 1 {
+			f := &x.frames[i - 1]
+			if f.host || f.kind != .Call && f.kind != .Jump {break}
+			if f.kind == .Call && f.ret == t && f.sp == sp {
+				for x.depth >= i {flat_pop(x, L)}
+				interp_unwinds += 1
+				return true
+			}
+		}
+		interp_jumps += 1
+		return false
+	}
+
 	// With L (LEARN on, flat_learning), every word fetched and every store
 	// is noted in the run on top (lf); the loop without pays nothing for it.
 	// flat_dummy's learn stays nil, so interp_exec notes nothing here and
@@ -577,8 +602,10 @@ when core.FLAT {
 				case 0x08:
 					t := r[rs]
 					flat_slot(x, pc, L, lf)
-					if rs == 31 || t == frame_ret {
+					if t == frame_ret {
 						flat_return(x, t, L)
+						settle = true
+					} else if rs == 31 && flat_unwind(x, t, L) {
 						settle = true
 					} else {
 						settle = !flat_goto(x, pc, t, true)
@@ -661,5 +688,5 @@ when core.FLAT {
 		}
 	}
 
-	#assert(size_of(Flat_Frame) == 16)
+	#assert(size_of(Flat_Frame) == 20)
 }

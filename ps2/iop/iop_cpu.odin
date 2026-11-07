@@ -58,6 +58,7 @@ iop_cpu_init :: proc() {
 		cpu.iop_flat_print = r3000.flat_print
 	} else {
 		r3000.interp_run = r3000.interp_loop
+		cpu.iop_flat_print = r3000.interp_print
 	}
 	r3000.run_events = proc() {}
 	r3000.gte_cmd = nil

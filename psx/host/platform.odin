@@ -998,7 +998,7 @@ platform_frame :: proc() {
 		if !failed {thumb_save()}
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
-		when core.FLAT {cpu.flat_print()}
+		when core.FLAT {cpu.flat_print()} else {cpu.interp_print()}
 		if quit_hook != nil {quit_hook()}
 		core.learn_report()
 		core.compat_report()
