@@ -531,10 +531,18 @@ expand16 :: #force_inline proc(t: ^Tex, c: u32) -> u32 {
 
 // The texel colour at level-0 texel coordinates (u, v) and level of
 // detail `lod`: LOD <= 0 magnifies level 0 with MMAG, otherwise MMIN picks
-// the filter and how levels 0..MXL are used. RGBA in lanes 0..3.
+// the filter and how levels 0..MXL are used. RGBA in lanes 0..3. Level 0
+// is inlined into the pixel loop, which then saves no registers per pixel;
+// the mipmap filters stay a call.
 @(private)
-sample :: proc(t: ^Tex, u, v: f32, lod: i32) -> #simd[4]i32 {
+sample :: #force_inline proc(t: ^Tex, u, v: f32, lod: i32) -> #simd[4]i32 {
 	if lod <= 0 {return sample_level(t, 0, u, v, t.bilinear)}
+	return sample_min(t, u, v, lod)
+}
+
+// `sample` for LOD > 0: MMIN's filter.
+@(private)
+sample_min :: proc(t: ^Tex, u, v: f32, lod: i32) -> #simd[4]i32 {
 	bil := t.mmin == 1 || t.mmin >= 4
 	switch t.mmin {
 	case 2, 4: // MIPMAP_NEAREST: the nearest level
