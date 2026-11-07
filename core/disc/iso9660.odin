@@ -8,13 +8,15 @@ import "core:encoding/endian"
 import "core:strings"
 
 // A file or directory: its name (no `;1` version), first LBA and size in
-// bytes, and the layer whose volume holds it.
+// bytes, the layer whose volume holds it, and its record's recording date
+// {years since 1900, month, day, hour, minute, second, GMT offset}.
 Entry :: struct {
 	name:  string,
 	lba:   u32,
 	size:  u32,
 	dir:   bool,
 	layer: u8,
+	date:  [7]u8,
 }
 
 // The most components a path may have.
@@ -161,6 +163,7 @@ record :: proc(rec: []u8, base, limit: u32) -> (e: Entry, ok: bool) {
 	rel, _ := endian.get_u32(rec[2:6], .Little)
 	e.size, _ = endian.get_u32(rec[10:14], .Little)
 	e.dir = rec[25] & 2 != 0
+	copy(e.date[:], rec[18:25])
 	sectors := (u64(e.size) + DATA - 1) / DATA
 	if u64(base) + u64(rel) + sectors > u64(limit) {
 		return {}, false

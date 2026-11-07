@@ -109,6 +109,7 @@ import "core:encoding/endian"
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:strings"
 import "ps:core"
 import "ps:core/disc"
 import iop "ps:ps2/iop"
@@ -228,6 +229,7 @@ game :: proc(_: rawptr) {
 	test_vblank_samples()
 	test_cdvdman()
 	test_cdvd_search_server()
+	test_fileio_getstat()
 	test_cd_type()
 	test_sdrdrv()
 	test_sdr_thread()
@@ -4353,6 +4355,75 @@ SECTOR :: 2048
 // cdvdfsv's SearchFile server on a dual-layer image, the EE request in buf
 // and its record written at an EE address: the old 0x124 request with its
 // 0x20 record, 0x128 on the first layer, and any nonzero layer the second.
+// fileio GETSTAT (fno 12): the reply carries the result, the EE stat
+// buffer's address and the stat, as the cdrom device fills it.
+test_fileio_getstat :: proc() {
+	dir, err := os.make_directory_temp("", "ps_iop_stat_test_*", context.allocator)
+	if err != nil {
+		check(false, "getstat: no temp directory")
+		return
+	}
+	defer os.remove_all(dir)
+	iso := discimg.make_iso(discimg.CNF_PS2)
+	root := discimg.sector(iso, 20)
+	rec := root[strings.index(string(root), "Big.Bin;1") - 33:]
+	copy(rec[18:25], []u8{99, 12, 31, 23, 59, 58, 0}) // 1999-12-31 23:59:58
+	path := fmt.tprintf("%s/cd.iso", dir)
+	_ = os.write_entire_file(path, iso)
+	if !iop.disc_image_open(path) {
+		check(false, "getstat: the image opens")
+		return
+	}
+	defer iop.disc_image_close() // before the directory is removed
+	iop.fileio_reset()
+	fresh()
+
+	REPLY :: 0x00100800
+	STAT :: 0x00100a00
+	fio := iop.sif.servers[0x80000001]
+	init: [8]u8
+	(^u32)(&init[0])^ = REPLY
+	check(fio(255, init[:], 8), "getstat: fileio init answers")
+	// Sends the name with STAT as the EE buffer; the reply's result, its
+	// stat address and the stat.
+	stat :: proc(fio: iop.Rpc_Server, name: string) -> (result: i32, at: u32, st: []u8) {
+		buf: [0x110]u8
+		w := ([^]u32)(raw_data(buf[:]))
+		w[0], w[1], w[2], w[3] = 0xe, 0x00100900, 4, STAT
+		copy(buf[0x10:], name)
+		for i in u32(0) ..< 0x58 / 4 {mem.wr32(REPLY + 4 * i, 0xaaaaaaaa)}
+		check(fio(12, buf[:], 0x110) && w[0] == 1, "getstat: fno 12 answers")
+		r := mem.ram_slice(REPLY, 0x58)
+		check(endian.unchecked_get_u32le(r[4:]) == 12, "getstat: the reply's command")
+		return i32(endian.unchecked_get_u32le(r[0x10:])), endian.unchecked_get_u32le(r[0x14:]), r[0x18:]
+	}
+	u32_at :: proc(b: []u8, at: int) -> u32 {return endian.unchecked_get_u32le(b[at:])}
+
+	res, at, st := stat(fio, "cdrom0:\\BIG.BIN;1")
+	time := []u8{0, 58, 59, 23, 31, 12, 1999 & 0xff, 1999 >> 8}
+	check(res == 1 && at == STAT, "getstat: a file is found, 1, the reply names the EE buffer")
+	check(u32_at(st, 0) == 0x2124 && u32_at(st, 4) == 0 && u32_at(st, 8) == discimg.BIG, "getstat: a file's mode, attr and size")
+	check(slice.equal(st[0x0c:0x14], time) && slice.equal(st[0x14:0x1c], time) && slice.equal(st[0x1c:0x24], time), "getstat: ctime, atime and mtime are the record's date")
+	check(slice.all_of(st[0x24:0x40], 0), "getstat: hisize and the private words are 0")
+	res, _, st = stat(fio, "cdrom0:\\DATA")
+	check(res == 1 && u32_at(st, 0) == 0x116d && u32_at(st, 8) == disc.DATA, "getstat: a directory's mode and size")
+	check(slice.equal(st[0x0c:0x14], []u8{0, 0, 0, 0, 0, 0, 1900 & 0xff, 1900 >> 8}), "getstat: a zero date is 1900")
+	res, _, st = stat(fio, "cdrom:\\DATA\\SUB.TXT")
+	check(res == 1 && u32_at(st, 0) == 0x2124 && u32_at(st, 8) == u32(len(discimg.SUB)), "getstat: no version and no unit find the file")
+	for name in ([]string{"cdrom0:", "cdrom0:.", "cdrom0:\\.", "cdrom0:\\"}) {
+		res, _, st = stat(fio, name)
+		check(res == 1 && u32_at(st, 0) == 0x116d, fmt.tprintf("getstat: %q is the root", name))
+	}
+	res, _, st = stat(fio, "cdrom0:\\NOPE.BIN;1")
+	check(res == -2 && u32_at(st, 0) == 0, "getstat: a missing file is -ENOENT, no stat")
+	res, _, _ = stat(fio, "cdrom1:\\BIG.BIN;1")
+	check(res == -2, "getstat: unit 1 is the second layer, none on this disc")
+	for name in ([]string{"host:x", "mc0:x", "x"}) {
+		res, _, _ = stat(fio, name)
+		check(res == -19, fmt.tprintf("getstat: %q is another device, -ENODEV", name))
+	}
+}
+
 test_cdvd_search_server :: proc() {
 	dir, err := os.make_directory_temp("", "ps_iop_search_test_*", context.allocator)
 	if err != nil {

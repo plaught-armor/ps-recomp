@@ -590,6 +590,7 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	}
 	result: i32
 	extra: [3]u32 // READ: unaligned head/tail sizes (zero: data goes straight to RAM)
+	stat: [FIO_STAT]u8 // GETSTAT: the reply carries it after the EE address
 	switch fno {
 	case 0: // OPEN {hdr, flags, mode, name[0x400], slot}
 		result = fileio_open(string(cstring(&buf[0x14])), w[3])
@@ -608,15 +609,23 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		result = -EBADF
 	case 4: // SEEK {hdr, fd, offset, whence, slot}
 		result = fileio_seek(w[3], i32(w[4]), w[5])
+	case 12: // GETSTAT {hdr, EE stat buffer, name[0x100]}
+		result = fileio_getstat(string(cstring(&buf[0x10])), stat[:])
+		extra[0] = w[3]
 	case:
 		return false
 	}
 	if cpu.debug == 2 {fmt.eprintfln("fileio: fno %d fd %d -> %d", fno, i32(w[3]), result)}
 	if fileio.reply_buf != 0 {
-		r := ([^]u32)(raw_data(mem.ram_slice(fileio.reply_buf, 0x20)))
+		// GETSTAT's reply is {hdr, result, EE stat buffer, stat}: the EE
+		// handler copies the stat to that buffer.
+		size := u32(fno == 12 ? 0x18 + FIO_STAT : 0x20)
+		reply := mem.ram_slice(fileio.reply_buf, size)
+		r := ([^]u32)(raw_data(reply))
 		r[0], r[1], r[2], r[3] = w[0], fno, w[1], w[2]
 		r[4] = u32(result)
-		r[5], r[6], r[7] = extra[0], extra[1], extra[2]
+		r[5] = extra[0]
+		if fno == 12 {copy(reply[0x18:], stat[:])} else {r[6], r[7] = extra[1], extra[2]}
 	}
 	sif_reply(FILEIO_REPLY, 0, {})
 	w[0] = 1 // accepted; zero makes the EE library return EAGAIN
@@ -687,6 +696,78 @@ disc_open :: proc(path: string) -> (f: ^os.File, err: os.Error) {
 	f = os.open(path) or_return
 	disc_files[strings.clone(path)] = f
 	return f, nil
+}
+
+// The iox_stat_t of a disc file or directory, as the cdrom device of the
+// CDVDMAN a game's IOPRP image holds fills it: mode 0x2124 for a file, 0x116d
+// (directory, executable) for a directory, its size, and its record's
+// date {0, second, minute, hour, day, month, year (u16)} as ctime, atime and
+// mtime; attr, hisize and the private words 0. The device's unit is the
+// layer. 1 when found; -ENOENT when not, -ENODEV on a device other than
+// cdrom, as ioman answers a name no device has; stat is left alone then.
+FIO_STAT :: 0x40
+@(private)
+fileio_getstat :: proc(name: string, stat: []u8) -> i32 {
+	colon := strings.index_byte(name, ':')
+	dev := strings.trim_right(name[:max(colon, 0)], "0123456789")
+	unit := name[len(dev):max(colon, 0)]
+	if dev != "cdrom" || len(unit) > 1 {
+		fmt.eprintfln("fileio: getstat \"%s\" on no device here", name)
+		return -ENODEV
+	}
+	e, ok := disc_entry(name, unit == "" ? 0 : unit[0] - '0')
+	if !ok {
+		fmt.eprintfln("fileio: getstat \"%s\" not found", name)
+		return -ENOENT
+	}
+	w := ([^]u32)(raw_data(stat))
+	w[0] = e.dir ? 0x116d : 0x2124
+	w[2] = e.size
+	if image.volume != 0 {
+		d := e.date
+		year := u16(d[0]) + 1900
+		time := [8]u8{0, d[5], d[4], d[3], d[2], d[1], u8(year), u8(year >> 8)}
+		for at in ([3]int{0x0c, 0x14, 0x1c}) {copy(stat[at:], time[:])}
+	}
+	return 1
+}
+
+// The disc file or directory by its IOP name in a layer's volume. Under
+// disc_dir it has no LBA and no date, which a host directory does not keep.
+@(private)
+disc_entry :: proc(name: string, layer: u8 = 0) -> (e: disc.Entry, ok: bool) {
+	if layer > 1 {return {}, false}
+	root := disc_root(name)
+	if image.volume != 0 {return disc_lookup(root ? "\\" : name, layer)}
+	if layer != 0 {return {}, false}
+	path := disc_dir
+	if p, sub := host_path(name); sub {path = p} else if !root {return {}, false}
+	if os.is_dir(path) {return {dir = true}, true}
+	f, err := disc_open(path)
+	if err != nil {return {}, false}
+	size, _ := os.file_size(f)
+	return {size = u32(size)}, true
+}
+
+// Whether an IOP name is the disc's root: nothing, `.` or `\` after the
+// device, as cdvdman takes them.
+@(private)
+disc_root :: proc(name: string) -> bool {
+	path := name[strings.index_byte(name, ':') + 1:]
+	return path == "" || path == "." || path == "\\." || path == "\\"
+}
+
+// The entry of the disc image at an IOP name in a layer's volume, cached.
+@(private)
+disc_lookup :: proc(name: string, layer: u8) -> (e: disc.Entry, ok: bool) {
+	context.allocator = core.host_allocator
+	cached: bool
+	e, cached = image_found[layer][name]
+	if !cached {
+		e = disc.find(&image, name, layer = layer) or_return
+		image_found[layer][strings.clone(name)] = e
+	}
+	return e, true
 }
 
 @(private)
@@ -768,12 +849,7 @@ disc_find :: proc(name: string, layer: u8 = 0) -> (file: Disc_File, path: string
 		size, _ := os.file_size(f)
 		return {f, 0, size}, path, true
 	}
-	context.allocator = core.host_allocator
-	e, cached := image_found[layer][name]
-	if !cached {
-		e = disc.find(&image, name, layer = layer) or_return
-		image_found[layer][strings.clone(name)] = e
-	}
+	e := disc_lookup(name, layer) or_return
 	t := disc.track_of(&image, e.lba)
 	if e.dir || t == nil {return {}, "", false}
 	return {t.file, e.lba, i64(e.size)}, "", true
