@@ -65,7 +65,9 @@ Flat_Frame :: struct {
 	outer: u32, // frame_ret before the call, put back as it returns
 	kind:  Flat_Kind,
 	host:  bool, // the callee is host code
-	slot:  u8,   // Cont: its index in Flat_Ctx.host
+	// Cont: its index in Flat_Ctx.host. Else the callee's LEARN run
+	// (core.learn_handle), 0 none: ended as the record pops.
+	slot:  u16,
 }
 
 // A continuation: what host code needs to go on after the guest code it
@@ -111,6 +113,15 @@ when core.FLAT {
 	flat_late: u64
 	@(private = "file")
 	flat_late_owed: bool // the running run has one put off, counted
+	// LEARN notes the runs of this flat_run (learn_on as it began): its
+	// loop is the one that fetches into them (flat_loop's learn).
+	@(private = "file")
+	flat_learning: bool
+	// What a standalone native blob leaves to the interpreter (its
+	// interp list and the known thread switches; psx load_native): a run
+	// from one of these entries, or inside one of these ranges, is not
+	// noted, as a default build runs that code native and notes none of it.
+	flat_interp: []core.Native_Interp
 
 	@(private = "file")
 	flat_nest: [FLAT_NEST]Flat_Ctx
@@ -164,7 +175,8 @@ when core.FLAT {
 	flat_run :: proc(x: ^Flat_Ctx) -> bool {
 		if flat_cur != nil {fatal("a flat run started inside another")}
 		flat_cur = x
-		flat_loop(x)
+		flat_learning = core.learn_on(learn_cpu)
+		if flat_learning {flat_loop(x, true)} else {flat_loop(x, false)}
 		flat_cur = nil
 		flat_stop = false
 		flat_late_owed = false
@@ -191,10 +203,11 @@ when core.FLAT {
 		flat_cur = x
 		x.pending, x.depth, x.hosts = 0, 0, 0
 		x.enter, x.goto_owed, x.ended = false, false, false
-		flat_push(x, .Base, 0)
+		f := flat_push(x, .Base, 0)
 		x.pc, x.start = addr, addr
+		flat_learn_begin(f, addr)
 		events_due()
-		flat_loop(x)
+		if flat_learning {flat_loop(x, true)} else {flat_loop(x, false)}
 		if !x.ended {fatal("guest code at %08x the host called stopped", addr)}
 		flat_nest_depth -= 1
 		flat_cur = outer
@@ -243,7 +256,7 @@ when core.FLAT {
 		slot := x.hosts
 		x.hosts += 1
 		f := flat_push(x, .Cont, 0)
-		f.slot = u8(slot)
+		f.slot = u16(slot)
 		h := &x.host[slot]
 		h^ = {tag = tag}
 		return h
@@ -372,18 +385,53 @@ when core.FLAT {
 		when FALLBACK_COUNT {fallback_interp[addr] += 1}
 		when core.COMPAT_COUNT {core.compat_entry(addr)}
 		x.pc, x.start = addr, addr
+		flat_learn_begin(f, addr)
 		events_due()
+	}
+
+	// The interpreted callee of f, from entry, begins a LEARN run: not a mod
+	// region's, as interpret notes none (learned code is the game's only).
+	@(private = "file")
+	flat_learn_begin :: #force_inline proc(f: ^Flat_Frame, entry: u32) {
+		if flat_learning && core.learn_on(learn_cpu) && !mod_ram_has(entry) && !flat_interp_has(entry) {
+			f.slot = core.learn_handle(core.learn_begin(learn_cpu, entry))
+		}
+	}
+
+	// Whether entry is one flat_interp holds: an entry, or inside a range.
+	@(private = "file")
+	flat_interp_has :: proc(entry: u32) -> bool {
+		for v in flat_interp {
+			if entry == v.entry || entry >= v.lo && entry < v.hi {return true}
+		}
+		return false
+	}
+
+	// The LEARN run of the record on top of x, nil none: what its guest
+	// code fetches and stores into.
+	@(private = "file")
+	flat_learn_top :: #force_inline proc(x: ^Flat_Ctx) -> ^core.Learn_Frame {
+		if x.depth == 0 {return nil}
+		f := &x.frames[x.depth - 1]
+		if f.host || f.kind == .Cont {return nil}
+		return core.learn_frame(f.slot, x.start)
 	}
 
 	// The innermost call returns: pop its record, and as a tail call's return
 	// ends its caller's run too, that one's. The run goes on where the last
 	// popped record's caller does, or has ended.
 	@(private = "file")
-	flat_pop :: proc(x: ^Flat_Ctx) {
+	flat_pop :: proc(x: ^Flat_Ctx, $L: bool) {
 		for {
 			if x.depth == 0 {fatal("flat: return with no call")}
 			x.depth -= 1
 			f := x.frames[x.depth]
+			// The callee's run returned: x.start is its first word.
+			when L {
+				if !f.host && f.kind != .Cont {
+					if lf := core.learn_frame(f.slot, x.start); lf != nil {core.learn_end(lf)}
+				}
+			}
 			frame_ret = f.outer
 			x.pc, x.start = f.ret, f.start
 			switch f.kind {
@@ -411,7 +459,7 @@ when core.FLAT {
 	// callees, step continuations, follow an owed jump. False when x stopped or
 	// ended.
 	@(private = "file")
-	flat_settle :: proc(x: ^Flat_Ctx) -> bool {
+	flat_settle :: proc(x: ^Flat_Ctx, $L: bool) -> bool {
 		for {
 			if flat_stop || x.ended {return false}
 			if x.enter {
@@ -422,7 +470,7 @@ when core.FLAT {
 			if x.depth > 0 {
 				f := &x.frames[x.depth - 1]
 				if f.host {
-					flat_pop(x)
+					flat_pop(x, L)
 					continue
 				}
 				if f.kind == .Cont {
@@ -445,11 +493,14 @@ when core.FLAT {
 
 	// The delay slot of the branch at pc, then the block's charge (branch).
 	@(private = "file")
-	flat_slot :: #force_inline proc(x: ^Flat_Ctx, pc: u32) {
+	flat_slot :: #force_inline proc(x: ^Flat_Ctx, pc: u32, $L: bool, lf: ^core.Learn_Frame) {
 		slot := pc + 4
 		w := lw(slot)
 		x.pc = slot + 4
 		x.pending += 1
+		when L {
+			if lf != nil {core.learn_fetch(lf, slot, w)}
+		}
 		if .Interp in core.trace.active && core.trace_pc_ok(slot) {
 			core.tracef(.Interp, "%08x %08x (delay)", slot, w)
 		}
@@ -461,6 +512,9 @@ when core.FLAT {
 			case 0x08, 0x09, 0x0c, 0x0d:
 				fatal("flat: control transfer %08x in the delay slot at %08x", w, slot)
 			}
+		}
+		when L {
+			if lf != nil {learn_store_of(lf, w)}
 		}
 		interp_exec(&flat_dummy, slot, w, x.pending)
 		state.r[0] = 0
@@ -488,21 +542,30 @@ when core.FLAT {
 
 	// `jr` to t ended the run on top: return.
 	@(private = "file")
-	flat_return :: #force_inline proc(x: ^Flat_Ctx, t: u32) {
+	flat_return :: #force_inline proc(x: ^Flat_Ctx, t: u32, $L: bool) {
 		flat_returns += 1
-		flat_pop(x)
+		flat_pop(x, L)
 		if !x.ended && t != x.pc && (x.depth == 0 || x.frames[x.depth - 1].kind != .Cont) {flat_mismatch += 1}
 	}
 
+	// With L (LEARN on, flat_learning), every word fetched and every store
+	// is noted in the run on top (lf); the loop without pays nothing for it.
+	// flat_dummy's learn stays nil, so interp_exec notes nothing here and
+	// its own check costs the loop without nothing either.
 	@(private = "file")
-	flat_loop :: proc(x: ^Flat_Ctx) {
+	flat_loop :: proc(x: ^Flat_Ctx, $L: bool) {
 		r := &state.r
-		if !flat_settle(x) {return}
+		if !flat_settle(x, L) {return}
+		lf: ^core.Learn_Frame
+		when L {lf = flat_learn_top(x)}
 		for {
 			pc := x.pc
 			w := lw(pc)
 			x.pc = pc + 4
 			x.pending += 1
+			when L {
+				if lf != nil {core.learn_fetch(lf, pc, w)}
+			}
 			if .Interp in core.trace.active && core.trace_pc_ok(pc) {
 				core.tracef(.Interp, "%08x %08x", pc, w)
 			}
@@ -513,9 +576,9 @@ when core.FLAT {
 				switch w & 0x3f {
 				case 0x08:
 					t := r[rs]
-					flat_slot(x, pc)
+					flat_slot(x, pc, L, lf)
 					if rs == 31 || t == frame_ret {
-						flat_return(x, t)
+						flat_return(x, t, L)
 						settle = true
 					} else {
 						settle = !flat_goto(x, pc, t, true)
@@ -524,7 +587,7 @@ when core.FLAT {
 					t := r[rs]
 					r[(w >> 11) & 31] = pc + 8
 					r[0] = 0
-					flat_slot(x, pc)
+					flat_slot(x, pc, L, lf)
 					flat_enter(x, t, pc + 8, .Call)
 					settle = true
 				case 0x0c, 0x0d:
@@ -541,18 +604,18 @@ when core.FLAT {
 				taken := (rt & 1 != 0) == (i32(r[(w >> 21) & 31]) >= 0)
 				if rt & 0x1e == 0x10 {
 					r[31] = pc + 8
-					flat_slot(x, pc)
+					flat_slot(x, pc, L, lf)
 					if taken {
 						flat_enter(x, target, pc + 8, .Call)
 						settle = true
 					}
 				} else {
-					flat_slot(x, pc)
+					flat_slot(x, pc, L, lf)
 					if taken {settle = !flat_goto(x, pc, target, false)}
 				}
 			case 0x02:
 				target := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2)
-				flat_slot(x, pc)
+				flat_slot(x, pc, L, lf)
 				if pc != x.start || tail_depth >= TAIL_DEPTH_MAX {
 					settle = !flat_goto(x, pc, target, false)
 				} else {
@@ -561,7 +624,7 @@ when core.FLAT {
 				}
 			case 0x03:
 				r[31] = pc + 8
-				flat_slot(x, pc)
+				flat_slot(x, pc, L, lf)
 				flat_enter(x, (pc & 0xf0000000) | ((w & 0x3ffffff) << 2), pc + 8, .Call)
 				settle = true
 			case 0x04 ..= 0x07:
@@ -574,17 +637,23 @@ when core.FLAT {
 				case: taken = i32(rs) > 0
 				}
 				target := pc + 4 + (signed_imm(w) << 2)
-				flat_slot(x, pc)
+				flat_slot(x, pc, L, lf)
 				if taken {settle = !flat_goto(x, pc, target, false)}
 			case 0x10:
 				interp_exec(&flat_dummy, pc, w, x.pending)
 				r[0] = 0
 				settle = flat_stop
 			case:
+				when L {
+					if lf != nil {learn_store_of(lf, w)}
+				}
 				interp_exec(&flat_dummy, pc, w, x.pending)
 				r[0] = 0
 			}
-			if settle && !flat_settle(x) {return}
+			if settle {
+				if !flat_settle(x, L) {return}
+				when L {lf = flat_learn_top(x)}
+			}
 		}
 	}
 

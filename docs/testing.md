@@ -28,6 +28,7 @@ odin run tests/psx_fallback -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/psx_codewatch -collection:ps=.
 odin run tests/psx_codewatch -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/psx_learned -collection:ps=.
+odin run tests/psx_flat_learn -collection:ps=. -define:PS_FLAT=true
 odin run tests/iop_learned -collection:ps=.
 odin run tests/ee_learned -collection:ps=.
 odin run tests/psx_unaligned -collection:ps=.
@@ -111,6 +112,7 @@ here.
 | `psx_fallback` | The PS1 ways out of recompiled code and their counts |
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |
 | `psx_learned` | Learned PS1 runs compiled, run native only while RAM holds their code |
+| `psx_flat_learn` | LEARN under FLAT (FLAT builds only): a run on the shadow stack when its flat run stops stays open across the stop and is written once when it returns, covering the words fetched on both sides, a store another thread made into it meanwhile marking it `.Smc`; a run from code a standalone blob left to the interpreter (an entry, or inside a range) not written; a run that never returns is written `.Open` at the report |
 | `iop_learned` | Learned IOP runs native only while IOP RAM holds their code, through host writes and snapshot loads |
 | `ee_learned` | Learned EE runs native, where no function is registered, only while RAM holds their code, through host and DMA writes and snapshot loads, one version per code at an entry; runs stored into or too large are not compiled |
 | `psx_unaligned` | Fused PS1 unaligned words |

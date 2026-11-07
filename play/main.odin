@@ -405,7 +405,8 @@ play :: proc(image: string) -> int {
 	// stored blob under FLAT: a PS2 disc's, whose functions are steps of
 	// the FLAT runner, or a PS1 disc's and its learned code, whose
 	// functions it calls (psx/cpu/interp_flat.odin). The blob runs only
-	// stored, as a wasm build cannot start the converter child.
+	// stored, as a wasm build cannot start the converter child. With the
+	// PS1 blob it records LEARN as a default build does (below).
 	native_off := core.FLAT || core.env("NATIVE") == "0"
 	native := core.disc_path(dir, .Native)
 	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
@@ -428,6 +429,10 @@ play :: proc(image: string) -> int {
 	learned_on := !native_off && learn_env != "0"
 	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
 		learned_on = !cnf.ps2 && native != "" && core.env("LEARN") != "0"
+		// It records a PS1 game's runs where it runs learned code: with no
+		// blob every function is interpreted, and its records would be
+		// the whole game's, not the code a default build interprets.
+		learn_env = core.env("LEARN") if learned_on else "0"
 	}
 	learned, learned_ee: string
 	if learned_on {

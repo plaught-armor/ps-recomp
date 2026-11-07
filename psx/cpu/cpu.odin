@@ -304,8 +304,11 @@ run_learned :: proc(addr: u32) -> bool {
 interpret :: proc(addr: u32) {
 	when FALLBACK_COUNT {fallback_interp[addr] += 1}
 	when core.COMPAT_COUNT {core.compat_entry(addr)}
-	// A mod region run is not noted: learned code is the game's only.
-	if !core.learn_on(learn_cpu) || mod_ram_has(addr) {
+	// Inside a flat run the run is noted on its own record (flat_nested). A
+	// mod region run is not noted: learned code is the game's only.
+	nested := false
+	when core.FLAT {nested = flat_cur != nil}
+	if nested || !core.learn_on(learn_cpu) || mod_ram_has(addr) {
 		interp_run(addr)
 		return
 	}
