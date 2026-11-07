@@ -586,7 +586,8 @@ mc2_erase :: proc(blk: i32) -> bool {return mcraw_erase(mc2.port, u32(blk * mc2.
 @(private = "file")
 mc2_fill :: proc(data: []u8, off: int) -> bool {
 	size := int(mc2.p.size)
-	if size < 0 || size > MC2_BUF || off + size > len(data) {return false}
+	// The ECC goes after the data: the two must fit the page buffer.
+	if size < 0 || int(mc2.xfer) > MC2_BUF || off + size > len(data) {return false}
 	copy(mc2.page[:size], data[off:][:size])
 	mc2_ecc_set(mc2.page[:])
 	return true
