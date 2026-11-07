@@ -1073,8 +1073,9 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 			if a0 != 0 {w32(a0, off ? 0 : INTR_ON_STATE)}
 			th_intr_set(true)
 			return off ? ke(KE_CPUDI) : KE_OK, true
-		case 18: // CpuResumeIntr(state): back to what state says
-			th_intr_set(a0 & INTR_ON_STATE != INTR_ON_STATE)
+		case 18: // CpuResumeIntr(state): back to what state says, its bit 0
+			// as the register takes it, whatever the caller built
+			th_intr_set(a0 & INTR_ON_STATE == 0)
 			return KE_OK, true
 		case 23: // QueryIntrContext
 			return iop_query_intr_context(), true

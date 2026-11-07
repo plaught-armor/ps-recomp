@@ -196,7 +196,10 @@ cd_spin :: proc() {
 
 // The drive's ready register as sceCdDiskReady mode 8 reads it: the ready
 // bit (0x40) set and the busy bit (0x80) clear, the two the other modes test.
-// The low bits are not modelled.
+// The low bits are not modelled, so a caller comparing the whole byte sees
+// a value no drive gives. Mode 8 is XCDVDMAN's (and NCDVDMAN's), the cdvdman
+// a disc boot loads (the ROM's EELOADCNF); the boot-time CDVDMAN has none
+// and answers every mode as the others.
 CD_READY_REG :: 0x40
 
 // The drive's status, as CD_STAT_STOP and CD_STAT_PAUSE say.
