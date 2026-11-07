@@ -6933,6 +6933,10 @@ test_mc2 :: proc() {
 	whole := true
 	for j in 0 ..< 16 {whole &&= slice.equal(b3[j * PG:][:512], old[j * 512:][:512])}
 	check(whole, "mc2 2: each page of the block")
+	big := mc2_pages(64, 1)
+	big.size = 0x420 // its ECC past the driver's page buffer
+	wide: [0x420]u8
+	check(mc2_cmd(buf[:], 0, 2, big, wide[:]) == 0 && iop.mcraw[0].blocks[4] == nil, "mc2 2: a page and ECC too large for the page buffer fails, nothing written")
 	ab: [512]u8
 	for &x in ab {x = 0xab}
 	check(mc2_cmd(buf[:], 0, 2, mc2_pages(49, 1, 1022, 1023), ab[:]) == 1, "mc2 2 with backup: 1")
