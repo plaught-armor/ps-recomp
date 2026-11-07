@@ -77,9 +77,9 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 }
 
 // compile_learned's blob, in context.allocator; false after a message.
-// interp: the program's entries its static blob left to the interpreter
-// (core.native_interp), for a PS1 run to leave too (r3000.learned_blob).
-learned_compile :: proc(cpu: core.Learn_Cpu, records: string, interp: []u32 = nil) -> ([]u8, bool) {
+// interp: the program's code left to the interpreter (psx_interp), for a
+// PS1 run to leave too (r3000.learned_blob).
+learned_compile :: proc(cpu: core.Learn_Cpu, records: string, interp: []native.Blob_Interp = nil) -> ([]u8, bool) {
 	data, err := os.read_entire_file(records, context.allocator)
 	if err != nil {
 		fmt.eprintln("learned: cannot read", records, err)
@@ -330,12 +330,43 @@ vu_captures :: proc(dir: string) -> (set: string, caps: [2]string) {
 	return fmt.tprintf("vu0 %s vu1 %s", fps[0], fps[1]), caps
 }
 
+// What a wasm32 build's PS1 runs leave to the interpreter: the functions the
+// disc directory's stored blob left (core.native_interp) and the known
+// thread switches (core.known_switches), each an entry alone. Temp
+// allocated; false after a message.
+psx_interp :: proc(dir: string) -> ([]native.Blob_Interp, bool) {
+	static, rerr := os.read_entire_file(core.disc_path(dir, .Native, context.temp_allocator), context.temp_allocator)
+	if rerr != nil {
+		fmt.eprintln("learned: no native blob to read the interpreted entries from", rerr)
+		return nil, false
+	}
+	stored, ierr := core.native_interp(static)
+	if ierr != "" {
+		fmt.eprintln("learned: native blob:", ierr)
+		return nil, false
+	}
+	known := core.known_switches(dir)
+	out := make([]native.Blob_Interp, len(stored) + len(known), context.temp_allocator)
+	for v, k in stored {out[k] = {v.entry, v.lo, v.hi}}
+	for e, k in known {out[len(stored) + k] = {e, e, e}}
+	return out, true
+}
+
+// What cpu's learned runs leave to the interpreter (learned_store's
+// interp): psx_interp for a wasm32 build's PS1 runs, else none.
+learned_interp :: proc(dir: string, cpu: core.Learn_Cpu) -> ([]native.Blob_Interp, bool) {
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		if cpu == .Psx {return psx_interp(dir)}
+	}
+	return nil, true
+}
+
 // Compile the LEARN file at records in a child of this executable (as
 // convert_store; in this process in a wasm32 build, which cannot start one)
 // and store the blob of learned functions in the disc directory dir, its
 // key naming the records by set. False, after a message, when there is no
-// blob.
-learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: time.Duration) -> bool {
+// blob. interp: as learned_compile's, for a wasm32 build's PS1 runs.
+learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: time.Duration, interp: []native.Blob_Interp = nil) -> bool {
 	l := learned_files(cpu)
 	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
 		// Under a temp allocator of its own, as convert_here: the compile
@@ -348,22 +379,7 @@ learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: 
 			defer mem.dynamic_arena_destroy(&scratch)
 			context.temp_allocator = mem.dynamic_arena_allocator(&scratch)
 			// A PS1 run under FLAT cannot switch threads inside native
-			// code: the runs that may are left out, by the entries the
-			// stored blob left (play runs learned code only with it).
-			interp: []u32
-			if cpu == .Psx {
-				static, rerr := os.read_entire_file(core.disc_path(dir, .Native, context.temp_allocator), context.temp_allocator)
-				if rerr != nil {
-					fmt.eprintln("learned: no native blob to read the interpreted entries from", rerr)
-					return false
-				}
-				ierr: string
-				interp, ierr = core.native_interp(static)
-				if ierr != "" {
-					fmt.eprintln("learned: native blob:", ierr)
-					return false
-				}
-			}
+			// code: the runs that may are left out, by interp.
 			blob, ok = learned_compile(cpu, records, interp)
 		}
 		if !ok {return false}

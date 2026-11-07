@@ -11,7 +11,7 @@ import "core:slice"
 //   imports  n_imports names, each a u16 length and the bytes
 //   funcs    n_funcs of {addr, off}
 //   ovls     n_ovls of {addr, slot, id, sig[4], off}
-//   interp   n_interp addrs
+//   interp   n_interp of {entry, lo, hi}
 //   spans    n_spans of {kind, entry, off, range_first, n_ranges}
 //   ranges   n_ranges of {pc, n_words, at}
 //   pool     n_pool words
@@ -25,8 +25,9 @@ import "core:slice"
 // 0, pc in micro memory), or a processor's function entered at entry (pc
 // in its address space).
 //
-// interp lists entries the compiler left to the interpreter on purpose,
-// for a later compile of the same program to leave too: a PS1 program's
+// interp lists functions the compiler left to the interpreter on purpose,
+// each its entry and its code's bytes [lo, hi), for a later compile of the
+// same program to leave too, along with code inside them: a PS1 program's
 // on wasm32, the functions that may switch threads (recomp/r3000
 // thread_switches).
 BLOB_MAGIC :: 0x4e525350 // "PSRN"
@@ -51,6 +52,11 @@ Blob_Ovl :: struct {
 	off:            u32,
 }
 
+// A function left to the interpreter: its entry and code bytes [lo, hi).
+Blob_Interp :: struct {
+	entry, lo, hi: u32,
+}
+
 // A range of memory a span was compiled from.
 Blob_Range :: struct {
 	pc:    u32,
@@ -64,7 +70,7 @@ Blob_Span :: struct {
 }
 
 // Also returns the code's size: the machine code, or the wasm32 module.
-write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil, interp: []u32 = nil) -> (code_size: int, ok: bool) {
+write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil, interp: []Blob_Interp = nil) -> (code_size: int, ok: bool) {
 	b := make_blob(a, funcs, ovls, spans, interp)
 	defer delete(b)
 	// The header's code_size, its eleventh field.
@@ -73,7 +79,7 @@ write_blob :: proc(path: string, a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, 
 }
 
 // The file's bytes, in context.allocator; finishes a.
-make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil, interp: []u32 = nil) -> []u8 {
+make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_Span = nil, interp: []Blob_Interp = nil) -> []u8 {
 	code, imports_at := finish(a)
 	// The pool, each distinct range's words once, keyed by their bytes.
 	pool: [dynamic]u32
@@ -112,7 +118,11 @@ make_blob :: proc(a: ^Asm, funcs: []Blob_Func, ovls: []Blob_Ovl, spans: []Blob_S
 		for w in o.sig {put(&b, w)}
 		put(&b, o.off)
 	}
-	for v in interp {put(&b, v)}
+	for v in interp {
+		put(&b, v.entry)
+		put(&b, v.lo)
+		put(&b, v.hi)
+	}
 	first := 0
 	for s in spans {
 		put(&b, u32(s.kind))

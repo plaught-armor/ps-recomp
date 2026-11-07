@@ -57,6 +57,7 @@ import "core:fmt"
 import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "ps:core"
@@ -111,6 +112,22 @@ run :: proc(args: []string) -> int {
 // not used twice.
 @(private = "file")
 native_key: string
+
+// The disc directory whose known thread switches native_switched adds to.
+@(private = "file")
+switches_dir: string
+
+// A wasm32 build's PS1 thread switch was fatal under native code
+// (psx.Boot.native_switched): its native entries are kept, for the runs
+// after to leave to the interpreter (core.known_switches).
+@(private = "file")
+native_switched :: proc(entries: []u32) {
+	// One row per crash: native code calling native code is not in entries,
+	// so a deeper caller is found by a later crash, one level each.
+	if core.known_switches_add(switches_dir, entries) {
+		fmt.eprintfln("play: known thread switch row %08x (%d known); this native code is left to the interpreter from the next run", entries, len(core.known_switches(switches_dir)))
+	}
+}
 
 @(private = "file")
 native_failed :: proc() {
@@ -226,13 +243,20 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile: bool, deadline: 
 	if len(keys) == 0 {
 		return ""
 	}
-	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(([^]u8)(raw_data(keys))[:len(keys) * size_of(Key)]))
+	key := slice.clone_to_dynamic(([^]u8)(raw_data(keys))[:len(keys) * size_of(Key)], context.temp_allocator)
+	// A wasm32 build's PS1 runs leave out what interp holds, so the blob
+	// is for it too: a convert with other patches or overlays, or a known
+	// switch added, compiles again.
+	interp, iok := learned_interp(dir, cpu)
+	if !iok {return ""}
+	append(&key, ..slice.to_bytes(interp))
+	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(key[:]))
 	if !core.blob_cached(dir, core.COMMIT, l.kind, set) {
 		if !compile {
 			fmt.eprintln("play: no learned code (not compiled in the compat run)")
 			return ""
 		}
-		if !learned_store(cpu, records, dir, set, deadline) {
+		if !learned_store(cpu, records, dir, set, deadline, interp) {
 			return ""
 		}
 	}
@@ -485,6 +509,11 @@ play :: proc(image: string) -> int {
 		disc_id            = id,
 		mods_native        = mods_native,
 		mods_native_failed = mods_native_failed,
+	}
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		switches_dir = dir
+		b.native_skip = slice.clone(core.known_switches(dir))
+		b.native_switched = native_switched
 	}
 	for &c, i in b.cards {
 		c, _ = filepath.join({cards, fmt.tprintf("slot%d.mcd", i + 1)})

@@ -178,7 +178,17 @@ generate :: proc(o: mips.Options) {
 	}
 	if p.code != nil && p.code.arch == .Wasm32 {
 		p.interp = thread_switches(mods)
-		fmt.printfln("native: %d functions that may switch threads left to the interpreter", len(p.interp))
+		// How many of them a data word points at: called through a
+		// register, perhaps, a path thread_switches does not follow.
+		ptrs: Set
+		defer delete(ptrs)
+		mips.data_pointers(p.exe, lo, hi, &ptrs)
+		for ov in p.overlays {mips.data_pointers(ov.img, lo, hi, &ptrs)}
+		pointed := 0
+		for e in p.interp {
+			if e in ptrs {pointed += 1}
+		}
+		fmt.printfln("native: %d functions that may switch threads left to the interpreter, %d of them pointed at by data", len(p.interp), pointed)
 	}
 	recomp_exe(&p, mods[0])
 	if p.overlays != nil {
@@ -191,14 +201,27 @@ generate :: proc(o: mips.Options) {
 	write_learned(p.out, p.runtime, runs, package_insns)
 	if p.code != nil {
 		path := mips.option(o, "native_out")
-		interp := make([]u32, len(p.interp))
-		n := 0
-		for e in p.interp {
-			interp[n] = e
-			n += 1
+		// Each function left, its entry and code, once per module that
+		// has it, by entry.
+		interp: [dynamic]native.Blob_Interp
+		defer delete(interp)
+		for funcs in mods {
+			for f in funcs {
+				if f.entry in p.interp {append(&interp, native.Blob_Interp{f.entry, f.start, f.end})}
+			}
 		}
-		slice.sort(interp)
-		size, ok := native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:], interp = interp)
+		slice.sort_by(interp[:], proc(a, b: native.Blob_Interp) -> bool {
+			return a.entry < b.entry || (a.entry == b.entry && (a.lo < b.lo || (a.lo == b.lo && a.hi < b.hi)))
+		})
+		n := 0
+		for v, k in interp {
+			if k == 0 || v != interp[n - 1] {
+				interp[n] = v
+				n += 1
+			}
+		}
+		resize(&interp, n)
+		size, ok := native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:], interp = interp[:])
 		if !ok {
 			mips.fail("cannot write %s", path)
 		}
@@ -327,7 +350,10 @@ recomp_overlays :: proc(p: ^Program, mods: [][]^Func, package_insns: int) {
 			}
 			e := &emitted[key]
 			// Native code once per key, for the first entry not left to
-			// the interpreter.
+			// the interpreter. Safe only while interp is keyed by address,
+			// not per module: an entry left in one overlay is left in every
+			// overlay with the same key, so no module's native code for the
+			// key comes from a function another module leaves.
 			native_ok := p.code != nil && f.entry not_in p.interp
 			if native_ok && !e.native {
 				e.off, e.native = native_func(p.code, f, p.patches, p.cycles), true
