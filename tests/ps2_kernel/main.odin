@@ -16,7 +16,9 @@
 // with no image or no version in it. The EE timers fire their compare and
 // overflow events at the cycle the count gets there, raising their INTC only
 // when the flag was clear; a flag clears where T_MODE is written 1, and
-// T_ZRET resets the count at compare.
+// T_ZRET resets the count at compare. SetVTLBRefillHandler and
+// SetVCommonHandler store a handler only for their own causes and return it,
+// or 0 for a cause out of range.
 package main
 
 import "core:fmt"
@@ -372,6 +374,28 @@ dma_stat_test :: proc() {
 	fmt.println("ok SifDmaStat")
 }
 
+// SetVTLBRefillHandler (0x0d) takes causes 1-3, SetVCommonHandler (0x0e)
+// causes 4-13; each returns the handler it stored, or 0 and stores nothing.
+exc_handler_test :: proc() {
+	FN :: 0x00140000
+	for n in u32(0) ..= 15 {
+		for sc in ([2]u32{0x0d, 0x0e}) {
+			fn := FN + n * 0x10 + sc
+			before := n <= kernel.EXC_LAST ? kernel.k.exc_handlers[n] : 0
+			want: u32 = 0
+			if sc == 0x0d && n >= 1 && n <= 3 || sc == 0x0e && n >= 4 && n <= 13 {want = fn}
+			if got := sys(sc, n, fn); got != i64(want) {fail("fail: syscall %x cause %d returned %x, want %x", sc, n, got, want)}
+			if n > kernel.EXC_LAST {continue}
+			after := kernel.k.exc_handlers[n]
+			if want != 0 && after != fn {fail("fail: syscall %x cause %d stored %x, want %x", sc, n, after, fn)}
+			if want == 0 && after != before {fail("fail: syscall %x cause %d changed the table to %x", sc, n, after)}
+		}
+	}
+	// A second call replaces the first, still returning the new handler.
+	if got := sys(0x0e, 9, FN); got != FN || kernel.k.exc_handlers[9] != FN {fail("fail: replacing cause 9 returned %x", got)}
+	fmt.println("ok exception handlers")
+}
+
 // An IOP reset to `path`, a packet SifSetDma (0x77) sends to the IOP's
 // command buffer, then LOADFILE's version handshake (fno 255).
 reset_version :: proc(path: string) -> string {
@@ -515,6 +539,7 @@ main :: proc() {
 	setup_test()
 	boot_args_test()
 	dma_stat_test()
+	exc_handler_test()
 	loadfile_version_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.

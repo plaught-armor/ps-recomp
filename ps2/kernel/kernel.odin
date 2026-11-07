@@ -101,6 +101,9 @@ k: struct {
 	vblank_end:   u64,
 	frame:        u64,
 	exec:         Exec_State, // exec.odin
+	// Exception handlers a program installed with SetVTLBRefillHandler and
+	// SetVCommonHandler, by ExcCode (set_exception_handler).
+	exc_handlers: [EXC_LAST + 1]u32,
 }
 
 KE_OK :: 0
@@ -146,7 +149,7 @@ kernel_init :: proc() {
 // number, ps2sdk names, handler, size, verdict against this file, note):
 //   awk -F'\t' '$5=="UNHANDLED" {n=$2; gsub(/-/,"",n); if (n=="") n="?";
 //     printf "\t%s = \"%s\",\n", $1, n}' ee_syscalls.tsv
-// then 0x75 (_print) removed, since this file implements it.
+// then 0x75 (_print), 0x0d and 0x0e removed, since this file implements them.
 @(rodata)
 ROM_ONLY_SYSCALLS := [0x83]string {
 	0x01 = "ResetEE",
@@ -155,8 +158,6 @@ ROM_ONLY_SYSCALLS := [0x83]string {
 	0x0a = "AddSbusIntcHandler",
 	0x0b = "RemoveSbusIntcHandler",
 	0x0c = "Interrupt2Iop",
-	0x0d = "SetVTLBRefillHandler",
-	0x0e = "SetVCommonHandler",
 	0x0f = "SetVInterruptHandler",
 	0x3b = "RFU059",
 	0x49 = "iDeleteSema",
@@ -229,6 +230,8 @@ syscall :: proc(pc: u32) {
 	case 0x07: exec_ps2(a0, a2, a3); return
 	case 0x04: // Exit
 		cpu.fatal("program exited with %d", i32(a0))
+	case 0x0d: ret = i64(set_exception_handler(a0, a1, 1, 3)) // SetVTLBRefillHandler
+	case 0x0e: ret = i64(set_exception_handler(a0, a1, 4, EXC_LAST)) // SetVCommonHandler
 	case 0x10: ret = add_handler(&k.intc, a0, a1, a3)
 	case 0x11: ret = remove_handler(&k.intc, a0, i32(a1))
 	case 0x12: ret = add_handler(&k.dmac, a0, a1, a3)
@@ -315,6 +318,27 @@ syscall :: proc(pc: u32) {
 	}
 	_ = t0
 	c.r[2].d[0] = u64(ret)
+}
+
+// The highest ExcCode the kernel's exception table has a slot for: 13, trap.
+EXC_LAST :: 13
+
+// SetVTLBRefillHandler (causes 1-3, the TLB misses and modification) and
+// SetVCommonHandler (causes 4-13: address and bus errors, syscall, break,
+// reserved instruction, coprocessor unusable, overflow, trap) put a raw
+// handler in the kernel's table, which the common exception vector jumps
+// to with the registers as the exception left them. As retail does, a cause
+// in range stores `fn` and returns it (not the handler it replaced); a cause
+// out of range stores nothing and returns 0.
+//
+// The handler is stored but never called. This EE raises no TLB, address,
+// bus, coprocessor or overflow exception, and a syscall is served by
+// `syscall`. A break or a taken trap stops the run (cpu.brk, cpu.trap)
+// instead of entering the program's vector.
+set_exception_handler :: proc(cause, fn, first, last: u32) -> u32 {
+	if cause < first || cause > last {return 0}
+	k.exc_handlers[cause] = fn
+	return fn
 }
 
 // _print's limits: the guest controls the format, so widths and string
