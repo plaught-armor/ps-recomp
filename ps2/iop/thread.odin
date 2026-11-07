@@ -395,6 +395,8 @@ iop_wake_set :: proc() {
 // pending read callback, then sifman's DMA completion callbacks due, then the
 // vblank handlers due, then its threads for a slice.
 iop_tick :: proc(now: u64) {
+	t := cpu.prof_start()
+	defer cpu.prof_end(.IOP, t)
 	iop_sync(now)
 	sd_intr_run(now)
 	tim_intr_run()

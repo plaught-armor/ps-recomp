@@ -87,6 +87,7 @@ platform_init :: proc(title: cstring) -> bool {
 	core.learn_open()
 	core.learn_cpu(.Ee, &cpu.state.cycles, cpu.CYCLES_PER_INSN, proc(a: u32) -> u32 {return mem.rd32(a)}, mem.RAM_SIZE, false)
 	stats = core.env("STATS") == "1"
+	cpu.prof_on = stats
 	// PACE=<hz> paces a headless run too (netplay tests; a different
 	// rate on each peer stands in for clock drift).
 	if core.headless {pace = strconv.parse_int(core.env("PACE")) or_else 0}
@@ -228,18 +229,22 @@ vblank_frame :: proc() {
 	gs.skip_present = rerun
 	gs.skip_readout = core.headless && !readout_due()
 	gs.skip_wanted = core.headless && !draw_due()
+	// PRESENT: the readout to gs.screen and the window's upload and present.
+	pt := cpu.prof_start()
 	w, h := gs.scanout()
 	shown = {w, h}
+	if w > 0 && h > 0 && !core.headless && !hw && !rerun {
+		sdl.UpdateTexture(tex, nil, &gs.screen, gs.DISP_W * 4)
+		src := sdl.Rect{0, 0, i32(w), i32(h)}
+		sdl.RenderClear(ren)
+		sdl.RenderCopy(ren, tex, &src, nil)
+		sdl.RenderPresent(ren)
+	}
+	cpu.prof_end(.PRESENT, pt)
 	core.compat_vblank(u64(vblank), w > 0 && h > 0, mem.ram)
 	if w > 0 && h > 0 {
-		if !core.headless && !hw && !rerun {
-			sdl.UpdateTexture(tex, nil, &gs.screen, gs.DISP_W * 4)
-			src := sdl.Rect{0, 0, i32(w), i32(h)}
-			sdl.RenderClear(ren)
-			sdl.RenderCopy(ren, tex, &src, nil)
-			sdl.RenderPresent(ren)
-		}
 		frame += 1
+		if stats {stats_frame()}
 		core.input_script_frame(u64(frame), mem.ram)
 		snaptest_frame()
 		if rbtest[1] > 0 {rbtest_frame()}
@@ -307,23 +312,43 @@ vblank_frame :: proc() {
 		if late > length {last = now}
 	}
 	if d := time.tick_diff(now, last); d > 0 {time.sleep(d)}
+	if stats {stats_pace += time.tick_since(now)}
 }
 
 // STATS=1: every STATS_FRAMES presented frames, host frame rate and the
 // share of guest time the kernel skipped with every thread waiting, and the
-// share the spin skip (ps2/spin.odin) jumped.
+// share the spin skip (ps2/spin.odin) jumped; then the frame's host time in
+// ms: the work per presented frame (wall less the pacing sleep), and its
+// split into the cpu.Prof sections, the rollback commits, and the rest (the
+// EE's own code, native or interpreted, and what no section covers).
 @(private)
 stats: bool
 @(private)
 STATS_FRAMES :: 300
+@(private)
+stats_pace: time.Duration // slept pacing the frame rate, in all
+@(private)
+stats_work: [STATS_FRAMES]f64 // ms of work per presented frame, by frame % STATS_FRAMES
+
+// A presented frame's work: the time since the last one, less the pacing.
+@(private)
+stats_frame :: proc() {
+	@(static) t0: time.Tick
+	@(static) pace0: time.Duration
+	now := time.tick_now()
+	if t0 != {} {stats_work[frame % STATS_FRAMES] = time.duration_milliseconds(time.tick_diff(t0, now) - (stats_pace - pace0))}
+	t0, pace0 = now, stats_pace
+}
 
 @(private)
 print_stats :: proc() {
 	@(static) t0: time.Tick
-	@(static) cyc0, idle0, spin0, tsc0: u64
+	@(static) cyc0, idle0, spin0, tsc0, top0: u64
 	@(static) prof0: [cpu.Prof]u64
+	@(static) pace0, rb0: time.Duration
 	now := time.tick_now()
-	tsc := cpu.prof_start()
+	tsc := cpu.prof_now()
+	rb := core.rb_stats().total
 	if t0 != {} {
 		secs := time.duration_seconds(time.tick_diff(t0, now))
 		cyc, idl := cpu.state.cycles - cyc0, kernel.idle_cycles - idle0
@@ -335,8 +360,26 @@ print_stats :: proc() {
 		}
 		a := core.audio_take_stats()
 		fmt.eprintfln("  audio dry %d dropped %d low %.0f ms", a.dry, a.dropped, a.low_ms)
+		// The sections' clock (cpu.prof_now) spans the same wall as secs.
+		wall := 1000 * secs / f64(STATS_FRAMES)
+		share := wall / f64(max(tsc - tsc0, 1))
+		pace_ms := time.duration_milliseconds(stats_pace - pace0) / f64(STATS_FRAMES)
+		rb_ms := time.duration_milliseconds(rb - rb0) / f64(STATS_FRAMES)
+		work := stats_work
+		slice.sort(work[:])
+		sum, over := 0.0, 0
+		for w in work {
+			sum += w
+			if w > 1000.0 / 60 {over += 1}
+		}
+		fmt.eprintf("stats: ms/frame  work %.2f p95 %.2f max %.2f  over 16.7 ms %d/%d  EE+rest %.2f  RB %.2f", sum / f64(STATS_FRAMES),
+			work[STATS_FRAMES * 95 / 100], work[STATS_FRAMES - 1], over, STATS_FRAMES,
+			wall - pace_ms - rb_ms - f64(cpu.prof_top - top0) * share, rb_ms)
+		for p in cpu.Prof {fmt.eprintf("  %v %.2f", p, f64(cpu.prof[p] - prof0[p]) * share)}
+		fmt.eprintfln("  pace %.2f", pace_ms)
 	}
 	t0, cyc0, idle0, spin0, tsc0, prof0 = now, cpu.state.cycles, kernel.idle_cycles, cpu.spin_cycles, tsc, cpu.prof
+	top0, pace0, rb0 = cpu.prof_top, stats_pace, rb
 }
 
 // SNAPTEST=<save>,<load>: save state at presented frame <save>, load it
