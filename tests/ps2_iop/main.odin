@@ -192,6 +192,7 @@ game :: proc(_: rawptr) {
 	test_irx()
 	test_loader_snap()
 	test_loader()
+	test_modload()
 	test_threads()
 	test_failed_paths()
 	test_irx_mem_size()
@@ -817,6 +818,132 @@ test_loader :: proc() {
 	check(ids == -1 && core.compat.calls[key].n == 1, "loader: a spinning start runs out of its budget")
 	check(blocks_equal(before, iop.sys_blocks[:]), "loader: the spinning module freed")
 	check(r3000.next_event == iop.IOP_EVENT_OFF, "loader: the budget is off after a start")
+}
+
+// ------------------------------------------------------------- modload
+
+// A module started from another's start: "inner" registers "libi"; with
+// `gap` it then calls sysmem 99, which the HLE lacks. Its start returns
+// `v0`. Named `name`.
+mod_inner :: proc(name: string, gap: bool, v0: u32) -> []u8 {
+	a: Asm
+	lc := imports(&a, "loadcore", 6)
+	sm := imports(&a, "sysmem", 99)
+	tbl, ptr := exports(&a, "libi")
+	a.w[ptr] = at(&a)
+	put(&a, JR_RA, 0x24020700)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, tbl)
+	jal(&a, lc)
+	if gap {jal(&a, sm)}
+	li(&a, V0, v0)
+	epilogue(&a)
+	return build_mod(name, &a, entry)
+}
+
+// "pldm", as PLD.IRX loads: LoadModuleBuffer(buf) to word 0, FreeSysMemory
+// (buf), StartModule(id, 0, 0, 0, &word 2) to word 1, StartModule of the same
+// id again to word 3, of an id never loaded to word 4. Its start returns 0.
+// The words' offset.
+mod_pldm :: proc(buf: u32) -> (f: []u8, d: u32) {
+	a: Asm
+	ml := imports(&a, "modload", 10, 8)
+	sm := imports(&a, "sysmem", 5)
+	d = at(&a)
+	put(&a, 0, 0, 0x5a5a5a5a, 0, 0, 0)
+	entry := at(&a)
+	put(&a, 0x27bdffe0, 0xafbf001c) // addiu sp, sp, -32; sw ra, 28(sp)
+	abs :: proc(a: ^Asm, rt, v: u32) {put(a, 0x3c000000 | rt << 16 | v >> 16, 0x34000000 | rt << 21 | rt << 16 | v & 0xffff)}
+	abs(&a, A0, buf)
+	jal(&a, ml)
+	store_v0(&a, d)
+	abs(&a, A0, buf)
+	jal(&a, sm)
+	start :: proc(a: ^Asm, ml, d, id_at, out: u32, id: u32 = 0) {
+		if id_at != 0 {lw_at(a, A0, d)} else {li(a, A0, id)}
+		li(a, A1, 0)
+		li(a, A2, 0)
+		li(a, A3, 0)
+		la(a, T0, d + 8)
+		put(a, 0xafa80010) // sw t0, 16(sp)
+		jal(a, ml + 8)
+		store_v0(a, out)
+	}
+	start(&a, ml, d, 1, d + 4)
+	start(&a, ml, d, 1, d + 12)
+	start(&a, ml, d, 0, d + 16, 0x999)
+	li(&a, V0, 0)
+	put(&a, 0x8fbf001c, JR_RA, 0x27bd0020) // lw ra, 28(sp); jr ra; addiu sp, sp, 32
+	return build_mod("pldm", &a, entry), d
+}
+
+// Loads pldm with `inner` in a buffer of its own; pldm's id and result, and
+// its words' address.
+run_pldm :: proc(inner: []u8) -> (id: i32, result, words: u32) {
+	buf := iop.sys_alloc(.High, u32(len(inner)))
+	copy(iop.iop_mem(buf, u32(len(inner))), inner)
+	f, d := mod_pldm(buf)
+	id, result = iop.iop_load(f, "pldm", nil)
+	return id, result, module_base(id) + d
+}
+
+libi_registered :: proc() -> bool {
+	for &b in iop.iop_loader.libs {
+		if string(b.name[:4]) == "libi" {return true}
+	}
+	return false
+}
+
+test_modload :: proc() {
+	l := &iop.iop_loader
+	w :: proc(words: u32, i: u32) -> u32 {return iop.iop_u32(words + 4 * i)^}
+	KE_ERROR :: 0xffffffff
+	ALREADY :: transmute(u32)i32(-206)
+	UNKNOWN :: transmute(u32)i32(-202)
+
+	// A start that loads and starts another module: StartModule waits for
+	// the inner start, its result written, the inner module resident.
+	fresh()
+	ido, ro, d := run_pldm(mod_inner("inner", false, 0x100))
+	idi := i32(w(d, 0))
+	check(ido > 0 && ro == 0, "modload: pldm starts resident")
+	check(idi > 0 && idi != ido, fmt.tprintf("modload: LoadModuleBuffer gives inner an id of its own (%d, pldm %d)", idi, ido))
+	check(w(d, 1) == u32(idi) && w(d, 2) == 0x100, fmt.tprintf("modload: StartModule returns the id, the result written (%x %x)", w(d, 1), w(d, 2)))
+	check(w(d, 3) == ALREADY, "modload: a second StartModule is KE_ALREADY_STARTED")
+	check(w(d, 4) == UNKNOWN, "modload: StartModule of an id never loaded is KE_UNKNOWN_MODULE")
+	check(module_base(idi) != 0 && libi_registered(), "modload: inner kept, its library registered")
+	check(l.depth == 0 && l.loading == 0, "modload: no start under way after the load")
+	inner_base := module_base(idi)
+
+	// An inner start that calls what the HLE lacks: only its frame undone,
+	// pldm loads.
+	fresh()
+	key := core.Compat_Key{.Iop_Call, core.compat_name("sysmem"), 99}
+	n := core.compat.calls[key].n
+	ido, ro, d = run_pldm(mod_inner("inner", true, 0))
+	idi = i32(w(d, 0))
+	check(ido > 0 && ro == 0, "modload: pldm loads although inner's start failed")
+	check(core.compat.calls[key].n == n + 1, "modload: inner's gap is one compat row")
+	check(w(d, 1) == KE_ERROR && w(d, 2) == 0x5a5a5a5a, "modload: the failed StartModule is KE_ERROR, no result written")
+	check(!libi_registered() && module_base(idi) == 0, "modload: inner's registration and module undone")
+	check(!iop.sys_in(iop.sys_blocks[:], inner_base), "modload: inner's image freed")
+	check(w(d, 3) == UNKNOWN, "modload: a failed module is gone for StartModule")
+	check(module_base(ido) != 0 && l.depth == 0, "modload: pldm kept")
+
+	// NO_RESIDENT_END from the inner start.
+	fresh()
+	ido, ro, d = run_pldm(mod_inner("inner", false, 1))
+	idi = i32(w(d, 0))
+	check(ido > 0 && w(d, 1) == u32(idi) && w(d, 2) == 1, "modload: NO_RESIDENT_END is the result")
+	check(module_base(idi) == 0 && !libi_registered(), "modload: a NO_RESIDENT_END inner is dropped")
+	check(!iop.sys_in(iop.sys_blocks[:], inner_base), "modload: its image freed")
+
+	// A Sony module: not run, the id 2, a resident result.
+	fresh()
+	ido, ro, d = run_pldm(mod_inner("cdvdfsv", false, 0x100))
+	check(ido > 0 && w(d, 0) == 2 && w(d, 1) == 2 && w(d, 2) == 0, "modload: a Sony module is id 2, started resident")
+	check(!libi_registered(), "modload: a Sony module's start does not run")
 }
 
 slice_clone :: proc(b: []iop.Sys_Block) -> []iop.Sys_Block {

@@ -111,6 +111,7 @@ Th_Status :: enum u8 {
 	Lock, // on sio2man's transfer lock (th_lock)
 	Sleep,
 	Delay, // on DelayThread, until wake_at
+	Start, // in StartModule, until the start it runs returns
 }
 
 Th_Context :: struct {
@@ -191,7 +192,7 @@ iop_sched: struct {
 	cur:                  u32, // the running thread, 0 on the loader
 	resched:              bool, // a thread of better priority than cur became ready
 	budget:               bool, // the load's budget is spent
-	start_done:           bool, // the start returned, its v0 in start_result
+	start_done:           bool, // the EE load's start returned, its v0 in start_result
 	start_result:         u32,
 	intr:                 bool, // a handler runs, on intr_co
 	intr_stop:            Intr_Stop, // why it was stopped
@@ -337,7 +338,7 @@ th_schedule :: proc(until: u64, idle := false) {
 	s.resched = false
 	r3000.next_event = until
 	r3000.run_events = th_budget
-	for !s.budget && !(s.start_done && iop_loader.failed) {
+	for !s.budget && !(s.start_done && load_ee_failed()) {
 		th_due()
 		t := th_pick()
 		if t == nil {
@@ -356,7 +357,12 @@ th_schedule :: proc(until: u64, idle := false) {
 			core.co_switch(t.co)
 		}
 		s.cur = 0
-		if t = th_find(id); t != nil && t.status == .Dormant {th_stop(t)}
+		if t = th_find(id); t != nil && t.status == .Dormant {
+			// A StartModule's start ended: its caller wakes, and a failed
+			// one's undo may have deleted it.
+			if t.start {load_start_finish(id)}
+			if t = th_find(id); t != nil {th_stop(t)}
+		}
 	}
 	th_due()
 	r3000.next_event = IOP_EVENT_OFF
@@ -630,6 +636,16 @@ th_wait :: proc(status: Th_Status, sema: u32 = 0) -> u32 {
 	return th_find(s.cur).wake
 }
 
+// StartModule's caller waits for the start it runs (load_start_finish).
+th_start_wait :: proc() -> u32 {
+	return th_wait(.Start)
+}
+
+// Thread id, waiting in StartModule, wakes with v.
+th_start_wake :: proc(id, v: u32) {
+	if t := th_find(id); t != nil && t.status == .Start {th_wake(t, v)}
+}
+
 // SleepThread: the running thread sleeps, unless a wakeup came while it was
 // awake, which it uses up. What its sleep returns.
 th_sleep :: proc() -> u32 {
@@ -704,11 +720,7 @@ th_exit :: proc(delete := false) {
 // Thread t ends: dormant, and a start's v0 is its result.
 @(private = "file")
 th_end :: proc(t: ^Iop_Thread, delete := false) {
-	s := &iop_sched
-	if t.start {
-		s.start_done = true
-		s.start_result = r3000.state.r[2]
-	}
+	if t.start {load_start_end(t.id, r3000.state.r[2])}
 	t.status = .Dormant
 	t.exit_delete ||= delete
 }
@@ -723,11 +735,9 @@ th_call_failed :: proc() {
 	}
 	t := th_find(iop_sched.cur)
 	if t == nil || t.start {
-		l := &iop_loader
-		l.failed = true
-		l.gaps += 1
-		if t != nil && l.gaps >= IOP_START_GAPS {
-			fmt.eprintfln("iop: start stopped after %d failed calls", l.gaps)
+		gaps := load_gap(t.id if t != nil else 0)
+		if t != nil && gaps >= IOP_START_GAPS {
+			fmt.eprintfln("iop: start stopped after %d failed calls", gaps)
 			th_exit()
 		}
 		return
@@ -939,6 +949,7 @@ th_refer :: proc(id, info: u32) -> u32 {
 	case .Run: status = TS_RUN
 	case .Sleep: status, wait_type = TS_WAIT, TSW_SLEEP
 	case .Delay: status, wait_type = TS_WAIT, TSW_DELAY
+	case .Start: status, wait_type = TS_WAIT, TSW_EVENTFLAG // modload's own event flag
 	case .Wait:
 		status, wait_type, wait_id = TS_WAIT, TSW_SEMA, t.sema
 		if t.sema == 0 {wait_type = TSW_EVENTFLAG} // th_rpc_wait

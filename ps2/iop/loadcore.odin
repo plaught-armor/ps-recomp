@@ -21,6 +21,13 @@
 // made and the memory it allocated, its own image included. What it wrote to
 // memory stays. A path whose load failed is not run again until a library
 // registers or a load succeeds, either of which may let it link.
+//
+// A start can load modules itself, through modload: LoadModuleBuffer links
+// an image as a module not yet started, and StartModule runs its start as a
+// thread of its own while the caller waits, as retail's modload does. Each
+// start under way is a frame (Load_Frame), nested in the one under it, with
+// its own undo: a StartModule whose start fails undoes only its frame, and
+// its caller sees KE_ERROR.
 package ps2_iop
 
 import "core:fmt"
@@ -83,7 +90,11 @@ Hle_Stub :: struct {
 
 Iop_Module :: struct {
 	id, base, size: u32,
-	argv:           u32, // its argument block
+	argv:           u32, // its argument block, 0 until its start is made
+	entry, gp:      u32, // absolute
+	started:        bool, // its start was made (StartModule refuses a second)
+	hash:           u64, // its file's, for failed_key
+	name:           [32]u8, // its module info's, NUL-padded, cut at 32
 }
 
 Iop_Patch :: struct {
@@ -91,37 +102,63 @@ Iop_Patch :: struct {
 	words: [2]u32, // as they were
 }
 
-// Emulated state, in the emu heap: snapshotted (sif_snap).
-iop_loader: struct {
+// The state before a load, which its failure restores (undo_restore): the
+// loader's, sysmem's, the handlers sifcmd, libsd and sdrdrv hold, the
+// timers, cdvdman's callback, the RPC servers and queues, the user table's
+// words and which fds were open.
+Load_Undo :: struct {
 	libs:    [dynamic]Iop_Lib,
 	pending: [dynamic]Iop_Import,
-	stubs:   map[u32]Hle_Stub, // by physical address
+	stubs:   map[u32]Hle_Stub,
 	modules: [dynamic]Iop_Module,
 	next_id: u32,
-	// During a load: its module, whether it failed, the stubs it patched,
-	// and the state before it, which a failure restores (undo_restore): the
-	// loader's, sysmem's, the handlers sifcmd, libsd and sdrdrv hold, the
-	// timers, cdvdman's callback, the RPC servers and queues, the user
-	// table's words and which fds were open.
-	loading: u32,
-	failed:  bool,
-	gaps:    u32, // the HLE calls the start made that failed
-	patches: [dynamic]Iop_Patch,
-	undo:    struct {
-		libs:    [dynamic]Iop_Lib,
-		pending: [dynamic]Iop_Import,
-		stubs:   map[u32]Hle_Stub,
-		blocks:  [dynamic]Sys_Block,
-		sifcmd:  Iop_Sifcmd,
-		sif_tab: [dynamic]u32,
-		sd:      Iop_Sd,
-		sdr:     Iop_Sdr,
-		timr:    Iop_Timr,
-		cd:      Iop_Cd,
-		vbl:     Iop_Vblank,
-		rpc:     Iop_Rpc,
-		open:    [dynamic]bool, // by fd
-	},
+	blocks:  [dynamic]Sys_Block,
+	sifcmd:  Iop_Sifcmd,
+	sif_tab: [dynamic]u32,
+	sd:      Iop_Sd,
+	sdr:     Iop_Sdr,
+	timr:    Iop_Timr,
+	cd:      Iop_Cd,
+	vbl:     Iop_Vblank,
+	rpc:     Iop_Rpc,
+	open:    [dynamic]bool, // by fd
+}
+
+// A start under way: the EE's load (iop_load) or a StartModule a thread
+// called. Its module and start thread, who waits for it, whether the start
+// failed, the stubs it patched, the state before it, and the threads,
+// semaphores and event flags it may make (th_mark).
+Load_Frame :: struct {
+	id:        u32, // the module
+	thid:      u32, // its start's thread, 0 until made
+	waiter:    u32, // StartModule's caller; 0 for the EE's load
+	result_at: u32, // where StartModule puts the start's result, 0 for nowhere
+	ee:        bool, // the EE's load, else a StartModule
+	failed:    bool,
+	gaps:      u32, // the HLE calls the start made that failed
+	result:    u32, // what the start returned
+	mark:      Th_Mark,
+	patches:   [dynamic]Iop_Patch,
+	undo:      Load_Undo,
+}
+
+// The most starts under way at once: an EE load, the StartModule its start
+// calls, the one that start calls, and so on.
+IOP_LOAD_DEPTH :: 8
+
+// Emulated state, in the emu heap: snapshotted (sif_snap).
+iop_loader: struct {
+	libs:         [dynamic]Iop_Lib,
+	pending:      [dynamic]Iop_Import,
+	stubs:        map[u32]Hle_Stub, // by physical address
+	modules:      [dynamic]Iop_Module,
+	next_id:      u32,
+	// The starts under way, innermost last, each begun inside the one under
+	// it; `loading` is the innermost's module, 0 when none is. A frame's
+	// slot keeps its arrays when it ends, for the next.
+	frames:       [IOP_LOAD_DEPTH]Load_Frame,
+	depth:        int,
+	loading:      u32,
 	// The images whose load failed, keyed by failed_key.
 	failed_paths: map[string]Failed_Path,
 }
@@ -160,8 +197,8 @@ iop_loader_init :: proc() {
 	clear(&iop_loader.stubs)
 	clear(&iop_loader.modules)
 	iop_loader.next_id = IOP_FIRST_ID
+	iop_loader.depth = 0
 	iop_loader.loading = 0
-	iop_loader.failed = false
 	failed_paths_clear()
 	th_init()
 	iop_sifcmd = {}
@@ -173,11 +210,40 @@ iop_loader_init :: proc() {
 	iop_rpc = {}
 }
 
-// The failed_paths key of image `data` loaded as `path`: two builds of one
-// module under one name are two images.
+// The failed_paths key of an image loaded as `path`, `hash` its bytes'
+// (XXH3): two builds of one module under one name are two images.
 @(private = "file")
-failed_key :: proc(path: string, data: []u8, allocator := context.temp_allocator) -> string {
-	return fmt.aprintf("%s#%016x", path, xxhash.XXH3_64_default(data), allocator = allocator)
+failed_key :: proc(path: string, hash: u64, allocator := context.temp_allocator) -> string {
+	return fmt.aprintf("%s#%016x", path, hash, allocator = allocator)
+}
+
+// Whether the image of `key` is not run again: it failed IOP_LOAD_FAILS
+// times, or since nothing registered or loaded. Said once; each refusal is
+// an Iop_Fallback row.
+@(private = "file")
+failed_refused :: proc(key, name: string) -> bool {
+	l := &iop_loader
+	f, again := l.failed_paths[key]
+	if !again || f.retry && f.fails < IOP_LOAD_FAILS {return false}
+	if !f.told {
+		fmt.eprintfln("iop: \"%s\" failed before, not run again", name)
+		f.told = true
+		l.failed_paths[key] = f
+	}
+	core.compat_unknown(.Iop_Fallback, core.compat_name(name))
+	return true
+}
+
+// The image of `key` failed: an Iop_Fallback row, and it is not run again
+// until failed_paths_retry.
+@(private = "file")
+failed_add :: proc(key, name: string) {
+	core.compat_unknown(.Iop_Fallback, core.compat_name(name))
+	paths := &iop_loader.failed_paths
+	f, again := paths[key]
+	f.fails += 1
+	f.retry = false
+	if again {paths[key] = f} else {paths[strings.clone(key)] = f}
 }
 
 @(private = "file")
@@ -247,66 +313,27 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	if x.name == "" {x.name = path}
 	core.compat_code_load()
 	l := &iop_loader
-	key := failed_key(path, data)
-	if f, again := l.failed_paths[key]; again && (!f.retry || f.fails >= IOP_LOAD_FAILS) {
-		if !f.told {
-			fmt.eprintfln("iop: \"%s\" failed before, not run again", path)
-			f.told = true
-			l.failed_paths[key] = f
-		}
+	hash := xxhash.XXH3_64_default(data)
+	key := failed_key(path, hash)
+	if failed_refused(key, x.name) {return KE_ERROR, 0}
+	if l.depth == IOP_LOAD_DEPTH {
+		fmt.eprintfln("iop: load of \"%s\" refused: %d starts under way", x.name, l.depth)
 		core.compat_unknown(.Iop_Fallback, core.compat_name(x.name))
 		return KE_ERROR, 0
 	}
 	s := &iop_sched
-	mark := th_mark()
-	fail :: proc(key, name, why: string, mark: Th_Mark) -> (i32, u32) {
-		fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
-		th_undo(mark)
-		undo_restore()
-		core.compat_unknown(.Iop_Fallback, core.compat_name(name))
-		paths := &iop_loader.failed_paths
-		f, again := paths[key]
-		f.fails += 1
-		f.retry = false
-		if again {paths[key] = f} else {paths[strings.clone(key)] = f}
+	fail :: proc(key, name, why: string) -> (i32, u32) {
+		load_fail(frame_ee(), key, name, why)
 		return KE_ERROR, 0
 	}
-	undo_save()
 	defer iop_wake_set()
-	clear(&l.patches)
-	l.loading = l.next_id
-	l.failed, l.gaps = false, 0
-	defer l.loading = 0
-	size, fits := irx_mem_size(x)
-	if !fits {return fail(key, x.name, fmt.tprintf("memory size %#x", x.mem_size), mark)}
-	if cpu.debug >= 1 && size != x.text_size + x.data_size + x.bss_size {
-		fmt.eprintfln("iop: \"%s\" holds %#x bytes, its module info says %#x", x.name, size, x.text_size + x.data_size + x.bss_size)
-	}
-	m := Iop_Module {
-		id   = l.next_id,
-		size = size,
-	}
-	m.base = sys_alloc(.Low, m.size)
-	if m.base == 0 {return fail(key, x.name, "no memory", mark)}
-	img := iop_mem(m.base, m.size)
-	copy(img, data[x.file_off:][:x.file_size])
-	slice.zero(img[x.file_size:])
-	if err, detail := irx_relocate(data, img, m.base); err != .None {
-		if err == .Type {core.compat_unknown(.Irx_Reloc, detail)}
-		return fail(key, x.name, fmt.tprintf("relocation %v %#x", err, detail), mark)
-	}
-	tables := irx_tables(img[:min(x.text_size, m.size)], m.base, context.temp_allocator)
-	for &t in tables {
-		if t.imports {link_imports(m.base + t.off, &t)}
-	}
-	m.argv = argv_block(path, args)
-	stack := sys_alloc(.High, IOP_START_STACK)
-	if m.argv == 0 || stack == 0 {return fail(key, x.name, "no memory", mark)}
-	st := th_new(m.base + x.entry, stack, IOP_START_STACK, m.base + x.gp, IOP_START_PRIO)
-	st.start, st.exit_delete = true, true
-	st.ctx.r[4] = r32(m.argv)
-	st.ctx.r[5] = m.argv + 4
-	th_ready(st)
+	f := frame_push(l.next_id, ee = true)
+	l.next_id += 1
+	m, why := module_link(data, x, f.id)
+	if why != "" {return fail(key, x.name, why)}
+	m.hash = hash
+	f.thid = module_start(&m, path, args)
+	if f.thid == 0 {return fail(key, x.name, "no memory")}
 	s.start_done = false
 	iop_sync(cpu.state.cycles)
 	// In slices, so libsd's interrupt handlers due meanwhile run between
@@ -320,19 +347,19 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	for {
 		th_schedule(min(end, r3000.state.cycles + IOP_SLICE))
 		slices += 1
-		if !s.budget || r3000.state.cycles >= end || (s.start_done && l.failed) {break}
+		if !s.budget || r3000.state.cycles >= end || (s.start_done && load_ee_failed()) {break}
 		sd_intr_run(r3000.state.cycles * IOP_EE_RATIO)
 	}
 	if slices > 1 {fmt.eprintfln("iop: start of \"%s\" ran %d slices", x.name, slices)}
 	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
-		return fail(key, x.name, "start ran out of its budget", mark)
+		return fail(key, x.name, "start ran out of its budget")
 	}
 	if !s.start_done {
 		core.compat_unknown(.Iop_Blocked, core.compat_name(x.name))
-		return fail(key, x.name, "start waits with no thread ready", mark)
+		return fail(key, x.name, "start waits with no thread ready")
 	}
-	if l.failed {return fail(key, x.name, "start called what the HLE lacks", mark)}
+	if load_ee_failed() {return fail(key, x.name, "start called what the HLE lacks")}
 	if s.budget {
 		// The start returned, so the load succeeds; the threads it left ready
 		// stay so, their context saved, for a later load to run on.
@@ -340,8 +367,9 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		fmt.eprintfln("iop: threads of \"%s\" ran out of the budget", x.name)
 	}
 	failed_paths_retry()
-	l.next_id += 1
+	frame_pop(frame_ee())
 	result = s.start_result
+	m.started = true
 	if result & 3 == NO_RESIDENT_END {
 		module_drop(m)
 	} else {
@@ -349,6 +377,312 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	}
 	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" at %x id %d start %x", x.name, m.base, m.id, result)}
 	return i32(m.id), result
+}
+
+// Links IRX file `data`, module info `x`, as module `id`: its image
+// allocated low, copied, relocated and its imports linked. Why it failed, ""
+// when it did not; a failed link frees the image and links nothing.
+@(private = "file")
+module_link :: proc(data: []u8, x: Irx, id: u32) -> (m: Iop_Module, why: string) {
+	size, fits := irx_mem_size(x)
+	if !fits {return m, fmt.tprintf("memory size %#x", x.mem_size)}
+	if cpu.debug >= 1 && size != x.text_size + x.data_size + x.bss_size {
+		fmt.eprintfln("iop: \"%s\" holds %#x bytes, its module info says %#x", x.name, size, x.text_size + x.data_size + x.bss_size)
+	}
+	m = {
+		id   = id,
+		size = size,
+	}
+	copy(m.name[:], x.name)
+	m.base = sys_alloc(.Low, m.size)
+	if m.base == 0 {return m, "no memory"}
+	img := iop_mem(m.base, m.size)
+	copy(img, data[x.file_off:][:x.file_size])
+	slice.zero(img[x.file_size:])
+	if err, detail := irx_relocate(data, img, m.base); err != .None {
+		if err == .Type {core.compat_unknown(.Irx_Reloc, detail)}
+		sys_free(m.base)
+		return m, fmt.tprintf("relocation %v %#x", err, detail)
+	}
+	m.entry, m.gp = m.base + x.entry, m.base + x.gp
+	tables := irx_tables(img[:min(x.text_size, m.size)], m.base, context.temp_allocator)
+	for &t in tables {
+		if t.imports {link_imports(m.base + t.off, &t)}
+	}
+	return m, ""
+}
+
+// Makes module m's start thread, argv[0] `path` and then `args`, ready at
+// IOP_START_PRIO. Its id, or 0 when memory ran out.
+@(private = "file")
+module_start :: proc(m: ^Iop_Module, path: string, args: []u8) -> u32 {
+	m.argv = argv_block(path, args)
+	stack := sys_alloc(.High, IOP_START_STACK)
+	if m.argv == 0 || stack == 0 {return 0}
+	st := th_new(m.entry, stack, IOP_START_STACK, m.gp, IOP_START_PRIO)
+	st.start, st.exit_delete = true, true
+	st.ctx.r[4] = r32(m.argv)
+	st.ctx.r[5] = m.argv + 4
+	th_ready(st)
+	return st.id
+}
+
+@(private = "file")
+module_index :: proc(id: u32) -> int {
+	for m, i in iop_loader.modules {
+		if m.id == id {return i}
+	}
+	return -1
+}
+
+// ------------------------------------------------------------- load frames
+
+// A start begins: the state now is what its failure restores.
+@(private = "file")
+frame_push :: proc(id: u32, ee: bool) -> ^Load_Frame {
+	l := &iop_loader
+	assert(l.depth < IOP_LOAD_DEPTH, "iop: starts nested too deep")
+	f := &l.frames[l.depth]
+	l.depth += 1
+	f.id, f.thid, f.waiter, f.result_at, f.ee = id, 0, 0, 0, ee
+	f.failed, f.gaps, f.result = false, 0, 0
+	f.mark = th_mark()
+	clear(&f.patches)
+	undo_save(&f.undo)
+	l.loading = id
+	return f
+}
+
+// Frame i ends. The stubs it patched go to the frame under it, whose failure
+// puts them back too.
+@(private = "file")
+frame_pop :: proc(i: int) {
+	l := &iop_loader
+	if i > 0 {append(&l.frames[i - 1].patches, ..l.frames[i].patches[:])}
+	gone := l.frames[i]
+	copy(l.frames[i:l.depth - 1], l.frames[i + 1:l.depth])
+	l.frames[l.depth - 1] = gone
+	l.depth -= 1
+	l.loading = l.frames[l.depth - 1].id if l.depth > 0 else 0
+}
+
+// The frame of start thread `thid`, -1 for none.
+@(private = "file")
+frame_of :: proc(thid: u32) -> int {
+	l := &iop_loader
+	for i in 0 ..< l.depth {
+		if thid != 0 && l.frames[i].thid == thid {return i}
+	}
+	return -1
+}
+
+// The EE load's frame, -1 when none runs.
+@(private = "file")
+frame_ee :: proc() -> int {
+	l := &iop_loader
+	for i in 0 ..< l.depth {
+		if l.frames[i].ee {return i}
+	}
+	return -1
+}
+
+// Frame i failed: what it and the frames inside it did is undone, the
+// threads, semaphores and event flags they made deleted, and its image of
+// `key` is not run again (failed_add).
+@(private = "file")
+load_fail :: proc(i: int, key, name, why: string) {
+	l := &iop_loader
+	fmt.eprintfln("iop: load of \"%s\" failed: %s", name, why)
+	// The inner frames' patches go to frame i, newest last, so the restore
+	// puts them back first.
+	for l.depth > i + 1 {frame_pop(l.depth - 1)}
+	th_undo(l.frames[i].mark)
+	undo_restore(&l.frames[i])
+	frame_pop(i)
+	failed_add(key, name)
+}
+
+// A start's thread `thid` ended, its v0 `v`: the EE load's start is done
+// (iop_sched.start_done), a StartModule's keeps its result for
+// load_start_finish.
+load_start_end :: proc(thid, v: u32) {
+	i := frame_of(thid)
+	if i < 0 {return}
+	f := &iop_loader.frames[i]
+	f.result = v
+	if f.ee {iop_sched.start_done, iop_sched.start_result = true, v}
+}
+
+// Whether the EE load's start called what the HLE lacks.
+load_ee_failed :: proc() -> bool {
+	i := frame_ee()
+	return i >= 0 && iop_loader.frames[i].failed
+}
+
+// An HLE call failed in start thread `thid`, or with 0 on the loader in the
+// innermost start: its frame fails once the start returns. The calls that
+// failed in that start so far.
+load_gap :: proc(thid: u32) -> u32 {
+	l := &iop_loader
+	i := frame_of(thid) if thid != 0 else l.depth - 1
+	if i < 0 {return 0}
+	f := &l.frames[i]
+	f.failed = true
+	f.gaps += 1
+	return f.gaps
+}
+
+// From the scheduler: StartModule's start thread `thid` ended, dormant. A
+// start that called nothing the HLE lacks has its module started, or dropped
+// when it returned NO_RESIDENT_END, its result written where StartModule was
+// told, and the caller wakes with the module's id. One that did fails as a
+// load does, only its frame undone, the module gone, and the caller wakes
+// with KE_ERROR. A frame with a later one inside it (an EE load begun while
+// it waited) is not undone, as that would undo the later one too: its
+// failure is only a row, the module kept.
+load_start_finish :: proc(thid: u32) {
+	l := &iop_loader
+	i := frame_of(thid)
+	if i < 0 || l.frames[i].ee {return}
+	f := l.frames[i] // its scalars: the slot moves when the frame ends
+	k := module_index(f.id)
+	assert(k >= 0, "iop: a started module not loaded")
+	m := l.modules[k]
+	name := lib_name32(&m.name)
+	if !f.failed {
+		if f.result_at != 0 {w32(f.result_at, f.result)}
+		failed_paths_retry()
+		frame_pop(i)
+		if f.result & 3 == NO_RESIDENT_END {module_drop(m)}
+		if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" at %x id %d started %x", name, m.base, m.id, f.result)}
+		th_start_wake(f.waiter, m.id)
+		return
+	}
+	key := failed_key(name, m.hash)
+	if i == l.depth - 1 {
+		load_fail(i, key, name, "start called what the HLE lacks")
+		module_drop(m)
+	} else {
+		fmt.eprintfln("iop: start of \"%s\" failed under a later load, not undone", name)
+		core.compat_unknown(.Iop_Fallback, core.compat_name(name))
+		frame_pop(i)
+	}
+	th_start_wake(f.waiter, ke(KE_ERROR))
+}
+
+@(private = "file")
+lib_name32 :: proc(n: ^[32]u8) -> string {
+	return strings.truncate_to_byte(string(n[:]), 0)
+}
+
+// ------------------------------------------------------------- modload
+
+// The id LOADFILE and LoadModuleBuffer answer for a module not run here.
+@(private = "file")
+IOP_SONY_ID :: 2
+
+KE_ILLEGAL_OBJECT :: -201
+KE_UNKNOWN_MODULE :: -202
+KE_ALREADY_STARTED :: -206
+
+// modload's LoadModuleBuffer (10) and StartModule (8), as a start that loads
+// modules itself calls them (PLD.IRX). Numbers as modload's export table.
+@(private = "file")
+modload_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
+	r := &r3000.state.r
+	if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT), true}
+	switch fno {
+	case 8: // StartModule(modid, name, arglen, args, int *result)
+		return module_start_call(r[4], r[5], r[6], r[7], r32(r[29] + 16))
+	case 10: // LoadModuleBuffer(buffer)
+		return module_buffer_load(r[4]), true
+	}
+	return 0, false
+}
+
+// LoadModuleBuffer: links the IRX image at `buf`, which the caller may free
+// once it returns, as a module not yet started; its id. A Sony module is not
+// run (iop_runs): IOP_SONY_ID. An image that failed before is refused
+// (failed_refused); one whose link fails is a failed path.
+@(private = "file")
+module_buffer_load :: proc(buf: u32) -> u32 {
+	l := &iop_loader
+	data := iop_mem(buf, IOP_RAM_SIZE)
+	x, ok := irx_parse(data)
+	if !ok {return ke(KE_ILLEGAL_OBJECT)}
+	if !iop_runs(data) {return IOP_SONY_ID}
+	if x.name == "" {x.name = fmt.tprintf("irx@%x", buf)}
+	core.compat_code_load()
+	// The file's bytes up to its image's end: what follows is not the file's.
+	hash := xxhash.XXH3_64_default(data[:x.file_off + x.file_size])
+	key := failed_key(x.name, hash)
+	if failed_refused(key, x.name) {return ke(KE_ERROR)}
+	m, why := module_link(data, x, l.next_id)
+	if why != "" {
+		fmt.eprintfln("iop: load of \"%s\" failed: %s", x.name, why)
+		failed_add(key, x.name)
+		return ke(KE_ERROR)
+	}
+	m.hash = hash
+	l.next_id += 1
+	append(&l.modules, m)
+	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" at %x id %d loaded", x.name, m.base, m.id)}
+	return m.id
+}
+
+// StartModule: runs module id's start as a thread of its own, argv[0]
+// `name_at`'s string (the module's name when 0) and then the arglen bytes
+// at `args_at`, while the caller waits for it to return (load_start_finish),
+// as retail's modload runs it on its loader thread. One start at a time
+// besides the EE load's: a StartModule from another thread while one runs
+// is a gap, as is one past IOP_LOAD_DEPTH.
+@(private = "file")
+module_start_call :: proc(id, name_at, arglen, args_at, result_at: u32) -> (v0: u32, ok: bool) {
+	l := &iop_loader
+	s := &iop_sched
+	if s.cur == 0 {return ke(KE_ILLEGAL_CONTEXT), true}
+	if id == IOP_SONY_ID {
+		if result_at != 0 {w32(result_at, RESIDENT_END)}
+		return id, true
+	}
+	k := module_index(id)
+	if k < 0 {return ke(KE_UNKNOWN_MODULE), true}
+	if l.modules[k].started {return ke(KE_ALREADY_STARTED), true}
+	if l.depth > 0 && !l.frames[l.depth - 1].ee && l.frames[l.depth - 1].thid != s.cur {
+		fmt.eprintfln("iop: StartModule of %d from thread %d while another start runs", id, s.cur)
+		return 0, false
+	}
+	if l.depth == IOP_LOAD_DEPTH {
+		fmt.eprintfln("iop: StartModule of %d: %d starts under way", id, l.depth)
+		return 0, false
+	}
+	m := l.modules[k]
+	f := frame_push(id, ee = false)
+	f.waiter, f.result_at = s.cur, result_at
+	// The module's image and record are the start's: its failure takes them.
+	for b, j in f.undo.blocks {
+		if b.addr == m.base {
+			ordered_remove(&f.undo.blocks, j)
+			break
+		}
+	}
+	for u, j in f.undo.modules {
+		if u.id == id {
+			ordered_remove(&f.undo.modules, j)
+			break
+		}
+	}
+	l.modules[k].started = true
+	name := lib_name32(&m.name)
+	path := cstr(name_at) if name_at != 0 else name
+	args := iop_mem(args_at, arglen) if arglen > 0 else nil
+	f.thid = module_start(&l.modules[k], path, args)
+	if f.thid == 0 {
+		load_fail(l.depth - 1, failed_key(name, m.hash), name, "no memory")
+		module_drop(m)
+		return ke(KE_NO_MEMORY), true
+	}
+	return th_start_wait(), true
 }
 
 // {argc, argv[]...} then the strings: argv[0] the path, the rest `args`.
@@ -418,7 +752,7 @@ link_stub :: proc(stub: u32, lib: Iop_Lib, fno: u32) -> bool {
 		return false
 	}
 	f := r32(lib.table + 20 + 4 * fno)
-	append(&l.patches, Iop_Patch{stub, {r32(stub), r32(stub + 4)}})
+	if l.depth > 0 {append(&l.frames[l.depth - 1].patches, Iop_Patch{stub, {r32(stub), r32(stub + 4)}})}
 	w32(stub, 0x08000000 | (f >> 2) & 0x3ffffff)
 	w32(stub + 4, 0)
 	delete_key(&l.stubs, phys(stub))
@@ -444,13 +778,14 @@ module_drop :: proc(m: Iop_Module) {
 		if in_m(a, m) {append(&drop, a)}
 	}
 	for a in drop {delete_key(&l.stubs, a)}
+	if k := module_index(m.id); k >= 0 {ordered_remove(&l.modules, k)}
+	// A failed start's restore may have freed them already.
 	sys_free(m.base)
-	sys_free(m.argv)
+	if m.argv != 0 {sys_free(m.argv)}
 }
 
 @(private = "file")
-undo_save :: proc() {
-	u := &iop_loader.undo
+undo_save :: proc(u: ^Load_Undo) {
 	clear(&u.libs)
 	append(&u.libs, ..iop_loader.libs[:])
 	clear(&u.pending)
@@ -459,6 +794,9 @@ undo_save :: proc() {
 	append(&u.blocks, ..sys_blocks[:])
 	clear(&u.stubs)
 	for a, s in iop_loader.stubs {u.stubs[a] = s}
+	clear(&u.modules)
+	append(&u.modules, ..iop_loader.modules[:])
+	u.next_id = iop_loader.next_id
 	u.sifcmd, u.sd, u.sdr, u.timr, u.cd, u.rpc = iop_sifcmd, iop_sd, iop_sdr, iop_timr, iop_cd, iop_rpc
 	u.vbl = iop_vbl
 	clear(&u.sif_tab)
@@ -470,17 +808,21 @@ undo_save :: proc() {
 }
 
 @(private = "file")
-undo_restore :: proc() {
+undo_restore :: proc(f: ^Load_Frame) {
 	l := &iop_loader
-	#reverse for p in l.patches {
+	u := &f.undo
+	#reverse for p in f.patches {
 		w32(p.stub, p.words[0])
 		w32(p.stub + 4, p.words[1])
 	}
-	clear(&l.patches)
+	clear(&f.patches)
 	clear(&l.libs)
-	append(&l.libs, ..l.undo.libs[:])
+	append(&l.libs, ..u.libs[:])
 	clear(&l.pending)
-	append(&l.pending, ..l.undo.pending[:])
+	append(&l.pending, ..u.pending[:])
+	clear(&l.modules)
+	append(&l.modules, ..u.modules[:])
+	l.next_id = u.next_id
 	// What the load allocated, which is freed below: no handler is left
 	// pointing there (cdvdman's callback included), the timers it allocated
 	// are as they were, the RPC servers and queues it removed are back
@@ -490,24 +832,24 @@ undo_restore :: proc() {
 	// started or woke, and fds open before it that it closed or moved.
 	freed := make([dynamic]Sys_Block, 0, len(sys_blocks), context.temp_allocator)
 	for b in sys_blocks {
-		if !slice.contains(l.undo.blocks[:], b) && b.addr != iop_sifcmd.rpc_pool {append(&freed, b)}
+		if !slice.contains(u.blocks[:], b) && b.addr != iop_sifcmd.rpc_pool {append(&freed, b)}
 	}
-	sifcmd_undo(l.undo.sifcmd, l.undo.sif_tab[:], freed[:])
-	sd_undo(l.undo.sd, freed[:])
-	sdr_undo(l.undo.sdr, freed[:])
-	tim_undo(l.undo.timr, freed[:])
-	cd_undo(l.undo.cd, freed[:])
-	vbl_undo(l.undo.vbl, freed[:])
-	rpc_undo(l.undo.rpc, freed[:])
+	sifcmd_undo(u.sifcmd, u.sif_tab[:], freed[:])
+	sd_undo(u.sd, freed[:])
+	sdr_undo(u.sdr, freed[:])
+	tim_undo(u.timr, freed[:])
+	cd_undo(u.cd, freed[:])
+	vbl_undo(u.vbl, freed[:])
+	rpc_undo(u.rpc, freed[:])
 	for &f, i in fileio.files {
-		if f.f != nil && (i >= len(l.undo.open) || !l.undo.open[i]) {f = {}}
+		if f.f != nil && (i >= len(u.open) || !u.open[i]) {f = {}}
 	}
 	clear(&sys_blocks)
-	append(&sys_blocks, ..l.undo.blocks[:])
+	append(&sys_blocks, ..u.blocks[:])
 	// The RPC client's pool stays where it is, however late it was allocated.
 	if p := iop_sifcmd.rpc_pool; p != 0 && !sys_in(sys_blocks[:], p) {sys_alloc(.Addr, RPC_PKTS * RPC_PKT_SIZE, p)}
 	clear(&l.stubs)
-	for a, s in l.undo.stubs {l.stubs[a] = s}
+	for a, s in u.stubs {l.stubs[a] = s}
 }
 
 // ------------------------------------------------------------- the HLE
@@ -607,6 +949,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		case 14: // Kprintf: the IOP's debug console, which nothing shows
 			return 0, true
 		}
+	case "modload":
+		return modload_fn(fno)
 	case "loadcore":
 		switch fno {
 		case 4, 5: // FlushIcache, FlushDcache: no caches here
