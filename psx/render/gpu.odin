@@ -2473,6 +2473,18 @@ vram_put_run :: proc(x0, y: i32, px: []u16) #no_bounds_check {
 	k := t.shift
 	side := i32(1) << k
 	at := ((y & (VRAM_H - 1)) << k) * t.w + x << k
+	if !gpu.check_mask && hi && k == 1 {
+		// The usual 2x target: each pixel a 2x2 block.
+		top := t.rgb[at:][:2 * n]
+		bottom := t.rgb[at + t.w:][:2 * n]
+		for p, i in px {
+			c := p | set
+			row[i] = c
+			h := hi_pixel(c)
+			top[2 * i], top[2 * i + 1], bottom[2 * i], bottom[2 * i + 1] = h, h, h, h
+		}
+		return
+	}
 	for p, i in px {
 		if gpu.check_mask && row[i] & 0x8000 != 0 {continue}
 		c := p | set
