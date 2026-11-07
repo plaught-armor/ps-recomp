@@ -51,6 +51,10 @@ odin run tests/ee_syscall_handler -collection:ps=.
 odin run tests/ee_syscall_handler -collection:ps=. -define:PS_FLAT=true
 odin run tests/ee_unwind -collection:ps=.
 odin run tests/ee_unwind -collection:ps=. -define:PS_FLAT=true
+odin run tests/ee_unwind -collection:ps=. -- away
+odin run tests/ee_unwind -collection:ps=. -define:PS_FLAT=true -- away
+odin run tests/ee_unwind -collection:ps=. -- cap
+odin run tests/ee_unwind -collection:ps=. -define:PS_FLAT=true -- cap
 odin run tests/psx_bios -collection:ps=.
 odin run tests/psx_bios_libc -collection:ps=.
 odin run tests/disc -collection:ps=.
@@ -110,7 +114,7 @@ here.
 | `iop_thread_grow` | An IOP start that grows the thread array while it runs is removed once it returns, in the coroutine model and under FLAT: the same thread count |
 | `ps2_interp` | Whole EE functions in the interpreter |
 | `ee_syscall_handler` | A SetSyscall handler switched away from (an alarm wakes a thread of higher priority) and sleeping, in the coroutine model and under FLAT: the same log and cycles |
-| `ee_unwind` | A `jr $ra` to an outer call's return address with that call's sp (a longjmp), in the coroutine model and under FLAT: it unwinds there 2 calls down and at the search's last call (`UNWIND_MAX`), and returns as before for a plain return, an address no call returns to, another sp, one call past the search, and past a SetSyscall handler's host call |
+| `ee_unwind` | A `jr $ra` to an outer call's return address with that call's sp (a longjmp), in the coroutine model and under FLAT: it unwinds there 2 calls down and at the search's last call (`UNWIND_MAX`), and returns as before for a plain return, another sp, one call past the search, and past a SetSyscall handler's host call; to an address no call returns to it jumps, the calls left open, and a coroutine's later `jr $ra` to an outer call unwinds there; a bgezal, jal or jalr to its own return address is no call. `away`: calls that jump back instead of returning leave at most `UNWIND_MAX` + 1 open. `cap`: endless recursion is a fatal at the chain's cap (`INTERP_DEPTH_MAX`, `FLAT_DEPTH_MAX` under FLAT) |
 | `psx_cover` | Which R3000 encodings each PS1 backend does inline |
 | `psx_fallback` | The PS1 ways out of recompiled code and their counts |
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |

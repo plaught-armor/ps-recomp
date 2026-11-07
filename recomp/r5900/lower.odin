@@ -163,8 +163,13 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 			}
 			flush(l)
 		}
+		// A link to the link's own return address (pc + 8, a get-pc idiom)
+		// is no call: $ra set, the delay slot run, on at pc + 8, as the
+		// interpreters run it.
 		taken :: proc(l: ^Lowering, i: Insn) {
-			if i.link {
+			if i.link && i.target == i.pc + 8 {
+				goto_(l, i.pc, i.target)
+			} else if i.link {
 				put(l, {kind = .Call, target = i.target, n = i.pc + 8})
 			} else {
 				goto_(l, i.pc, i.target)
@@ -199,7 +204,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 		case .Call:
 			put(&l, {kind = .Link, n = 31, target = ret})
 			delay(&l, d, slot_op)
-			put(&l, {kind = .Call, target = i.target, n = ret})
+			if i.target != ret {put(&l, {kind = .Call, target = i.target, n = ret})}
 		case .Jalr:
 			put(&l, {kind = .Jump_Reg, n = u32(i.rs)})
 			if i.rd != 0 {put(&l, {kind = .Link, n = u32(i.rd), target = ret})}

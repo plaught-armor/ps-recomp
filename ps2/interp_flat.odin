@@ -70,9 +70,11 @@ flat_loop :: proc() {
 			if !i.likely || taken {delay_slot(pc + 4, nil)}
 			if !taken {
 				pc = ret
-			} else if i.link {
+			} else if i.link && i.target != ret {
 				flat_enter(x, ret, i.target)
 					if x, pc, ok = flat_resume(); !ok {return}
+			} else if i.link {
+				pc = ret
 			} else if flat_mod_tail(x, i.target) {
 					if x, pc, ok = flat_resume(); !ok {return}
 			} else if flat_goto(x, pc, i.target) {
@@ -100,20 +102,43 @@ flat_loop :: proc() {
 		case .Call:
 			c.r[31].d[0] = u64(ret)
 			delay_slot(pc + 4, nil)
+			if i.target == ret {
+				pc = ret
+				continue
+			}
 			flat_enter(x, ret, i.target)
 			if x, pc, ok = flat_resume(); !ok {return}
 		case .Jalr:
 			t := u32(c.r[i.rs].d[0])
 			if i.rd != 0 {c.r[i.rd].d[0] = u64(ret)}
 			delay_slot(pc + 4, nil)
+			if t == ret {
+				pc = ret
+				continue
+			}
 			flat_enter(x, ret, t)
 			if x, pc, ok = flat_resume(); !ok {return}
 		case .Jr:
 			t := u32(c.r[i.rs].d[0])
 			delay_slot(pc + 4, nil)
-			if i.rs == 31 {
+			if i.rs == 31 && !flat_unwind(x, t) {
 				if !flat_return(x, true, t) {return}
 				if x, pc, ok = flat_resume(); !ok {return}
+				continue
+			}
+			if i.rs == 31 {
+				// No call returns to t: a jump there, as interp_body's.
+				if flat_mod_tail(x, t) {
+					if x, pc, ok = flat_resume(); !ok {return}
+				} else if flat_goto(x, pc, t) {
+					if x, pc, ok = flat_resume(); !ok {return}
+				} else {
+					pc = t
+					if flat_native_at(pc) {
+						x.pc = pc
+						if x, pc, ok = flat_resume(); !ok {return}
+					}
+				}
 				continue
 			}
 			// interp_body's two checks: the events check of every such
@@ -189,8 +214,15 @@ flat_resume :: proc() -> (x: ^kernel.Flat_Ctx, pc: u32, ok: bool) {
 				kernel.run_events()
 				kernel.flat_commit()
 			case .Call:
-				flat_enter(x, e.arg, e.pc)
+				// a jalr to its own return address: no call (.Jalr above)
+				if e.arg == e.pc {
+					x.pc = e.pc
+				} else {
+					flat_enter(x, e.arg, e.pc)
+				}
 			case .Return:
+				// Native code's `jr $ra` returns, whatever it jumps to.
+				flat_unwind(x, e.pc)
 				flat_return(x, true, e.pc) or_return
 			case .Sys:
 				x.pc = e.pc
@@ -243,6 +275,7 @@ flat_reload :: proc() -> (^kernel.Flat_Ctx, u32) {
 		check := false
 		if x.enter {
 			x.enter = false
+			if x.depth == 0 {x.ra = u32(cpu.state.r[31].d[0])}
 			if cpu.mod_on {
 				mod_flat_enter(x)
 				// A call into the mod region, counted as the recursive
@@ -310,11 +343,10 @@ flat_goto :: #force_inline proc(x: ^kernel.Flat_Ctx, pc, t: u32) -> bool {
 // false for a nested run, which returns to the host. A return address
 // marked by a hooked call (FLAT_MOD_MARK) runs its after hooks first
 // (mod_flat_return), and may end the run. A `jr $ra` to an outer call's
-// return address unwinds to it first (flat_unwind).
+// return address has unwound to it first (flat_unwind).
 @(private = "file")
 flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 	if x.depth > 0 {
-		if jr && x.ret[x.depth - 1] != ra {flat_unwind(x, ra)}
 		x.depth -= 1
 		ret := x.ret[x.depth]
 		for ret & FLAT_MOD_MARK != 0 {
@@ -334,50 +366,79 @@ flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 
 // The longjmps shown so far, each kind once under PS_DEBUG: not state.
 @(private = "file")
-flat_unwind_shown: bit_set[enum {Done, Host, Max}]
+flat_unwind_shown: bit_set[enum {Done, Host, Max, Jump}]
 
-// interp_body's unwind (interp_unwind_find) on x's shadow stack, for a
-// `jr $ra` to ra, not the innermost call's return address: the innermost of
-// the cpu.UNWIND_MAX calls returning to ra with the guest sp now becomes the
-// innermost, the calls above it dropped, when none between was made by the
-// host or is a hooked call's (FLAT_HOST_TAIL, FLAT_MOD_MARK). Else the
-// return pops the innermost as before.
+// interp_body's unwind (interp_unwind_find) on the shadow stacks, for a
+// `jr $ra` to ra, not the innermost call's return address (x.ra at depth 0):
+// the innermost of the cpu.UNWIND_MAX calls returning to ra with the guest
+// sp now becomes the innermost, the calls above it dropped, when none
+// between was made by the host or is a hooked call's (FLAT_HOST_TAIL,
+// FLAT_MOD_MARK). The search goes on into the runs x is nested in (the
+// host's, kernel.flat.nest, then the thread's), each one past host code.
+// Else the return pops the innermost as before, except when no call
+// returns to ra at all, with any sp: true, a jump there.
 @(private = "file")
-flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) {
+flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) -> bool {
 	MARKS :: kernel.FLAT_HOST_TAIL | FLAT_MOD_MARK
-	if x.ret[x.depth - 1] & MARKS != 0 {return}
+	if x.depth > 0 {
+		r := x.ret[x.depth - 1]
+		if r == ra || r & MARKS != 0 {return false}
+	} else if ra == x.ra {
+		return false
+	}
+	assert(x == kernel.flat_ctx())
 	sp := u32(cpu.state.r[29].d[0])
 	ok := true
+	seen := false
 	n := 1
-	for k := int(x.depth) - 2; k >= 0; k -= 1 {
-		if n == cpu.UNWIND_MAX {
-			if cpu.debug >= 1 && .Max not_in flat_unwind_shown {
-				flat_unwind_shown += {.Max}
-				fmt.eprintfln("ee: jr $ra to %08x: no call returns there in the %d innermost; returning as before", ra, cpu.UNWIND_MAX)
-			}
-			return
-		}
-		n += 1
-		r := x.ret[k]
-		if r & MARKS != 0 {
+	nest := kernel.flat.nest_depth
+	for j := 0; j <= nest; j += 1 {
+		c := j < nest ? &kernel.flat.nest[nest - 1 - j] : &kernel.flat.ee[kernel.k.current.id]
+		top := int(c.depth) - 1
+		if j == 0 {
+			top -= 1
+		} else {
 			ok = false
-			continue
 		}
-		if r != ra || x.sp[k] != sp {continue}
-		if !ok {
-			if cpu.debug >= 1 && .Host not_in flat_unwind_shown {
-				flat_unwind_shown += {.Host}
-				fmt.eprintfln("ee: jr $ra to %08x: the call %d out returns there, past host code; returning as before", ra, n)
+		for k := top; k >= 0; k -= 1 {
+			if n == cpu.UNWIND_MAX {
+				if cpu.debug >= 1 && .Max not_in flat_unwind_shown {
+					flat_unwind_shown += {.Max}
+					fmt.eprintfln("ee: jr $ra to %08x: no call returns there in the %d innermost; returning as before", ra, cpu.UNWIND_MAX)
+				}
+				return false
 			}
-			return
+			n += 1
+			r := c.ret[k]
+			if r & MARKS != 0 {
+				ok = false
+				continue
+			}
+			if r != ra {continue}
+			seen = true
+			if c.sp[k] != sp {continue}
+			if !ok {
+				if cpu.debug >= 1 && .Host not_in flat_unwind_shown {
+					flat_unwind_shown += {.Host}
+					fmt.eprintfln("ee: jr $ra to %08x: the call %d out returns there, past host code; returning as before", ra, n)
+				}
+				return false
+			}
+			if cpu.debug >= 1 && .Done not_in flat_unwind_shown {
+				flat_unwind_shown += {.Done}
+				fmt.eprintfln("ee: jr $ra to %08x: unwound to the call %d out", ra, n)
+			}
+			x.depth = u32(k) + 1
+			return false
 		}
-		if cpu.debug >= 1 && .Done not_in flat_unwind_shown {
-			flat_unwind_shown += {.Done}
-			fmt.eprintfln("ee: jr $ra to %08x: unwound to the call %d out", ra, n)
-		}
-		x.depth = u32(k) + 1
-		return
+		if c.ra == ra {seen = true} // the run's own return: host code
 	}
+	if seen {return false}
+	if cpu.debug >= 1 && .Jump not_in flat_unwind_shown {
+		flat_unwind_shown += {.Jump}
+		fmt.eprintfln("ee: jr $ra to %08x: no call returns there; a jump", ra)
+	}
+	return true
 }
 
 // The end of run x, at depth 0: false for a nested run.

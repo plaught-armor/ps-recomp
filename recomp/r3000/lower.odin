@@ -214,7 +214,10 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step 
 				put(&l, {kind = .Link, n = 31, target = ret})
 			}
 			delay(&l, d, slot_op)
-			if link {
+			if link && i.target == ret {
+				// a link to its own return address (a get-pc idiom): no
+				// call, both ways on at pc + 8, as the interpreter runs it
+			} else if link {
 				put(&l, {kind = .Call_If, target = i.target})
 			} else {
 				put(&l, {kind = .If_Taken})
@@ -232,14 +235,14 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step 
 		case .Call:
 			put(&l, {kind = .Link, n = 31, target = ret})
 			delay(&l, d, slot_op)
-			put(&l, {kind = .Call, target = i.target})
+			if i.target != ret {put(&l, {kind = .Call, target = i.target})}
 		case .Jalr:
 			put(&l, {kind = .Jump_Reg, n = i.rs})
 			if i.rd != 0 {
 				put(&l, {kind = .Link, n = i.rd, target = ret})
 			}
 			delay(&l, d, slot_op)
-			put(&l, {kind = .Call_Reg})
+			put(&l, {kind = .Call_Reg, target = ret})
 			put(&l, {kind = .End})
 		case .Jr:
 			if i.rs == 31 {

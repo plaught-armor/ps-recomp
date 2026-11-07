@@ -588,8 +588,10 @@ when core.FLAT {
 					r[(w >> 11) & 31] = pc + 8
 					r[0] = 0
 					flat_slot(x, pc, L, lf)
-					flat_enter(x, t, pc + 8, .Call)
-					settle = true
+					if t != pc + 8 {
+						flat_enter(x, t, pc + 8, .Call)
+						settle = true
+					}
 				case 0x0c, 0x0d:
 					interp_exec(&flat_dummy, pc, w, x.pending)
 					r[0] = 0
@@ -605,7 +607,7 @@ when core.FLAT {
 				if rt & 0x1e == 0x10 {
 					r[31] = pc + 8
 					flat_slot(x, pc, L, lf)
-					if taken {
+					if taken && target != pc + 8 {
 						flat_enter(x, target, pc + 8, .Call)
 						settle = true
 					}
@@ -625,8 +627,10 @@ when core.FLAT {
 			case 0x03:
 				r[31] = pc + 8
 				flat_slot(x, pc, L, lf)
-				flat_enter(x, (pc & 0xf0000000) | ((w & 0x3ffffff) << 2), pc + 8, .Call)
-				settle = true
+				if t := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2); t != pc + 8 {
+					flat_enter(x, t, pc + 8, .Call)
+					settle = true
+				}
 			case 0x04 ..= 0x07:
 				rs, rt := r[(w >> 21) & 31], r[(w >> 16) & 31]
 				taken: bool

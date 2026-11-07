@@ -634,7 +634,7 @@ emit_func :: proc(e: ^Emitter, f: ^Func) {
 			put(&body, tab, fmt.tprintf("t := %s", R32(u8(s.n))))
 			append(&open, s.kind)
 		case .Call_Reg:
-			put(&body, tab, "cpu.call(t)")
+			put(&body, tab, fmt.tprintf("if t != %s {{cpu.call(t)}}", hexu(s.n)))
 		case .Goto_Reg:
 			put(&body, tab, "pc = t")
 			put(&body, tab, "if c.cycles >= cpu.next_event {kernel.run_events()}")

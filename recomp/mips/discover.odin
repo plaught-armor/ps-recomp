@@ -688,13 +688,14 @@ image_range :: proc(img: Image) -> (lo, hi: u32) {
 // The jal targets of the code in [lo, hi). A target whose first four words
 // in the image are zero is not a function: it is padding the executable
 // leaves for code loaded there later (a PS1 overlay slot), which the
-// runtime finds by other means.
+// runtime finds by other means. A jal to its own return address is no
+// call (a get-pc idiom) and adds nothing.
 call_targets :: proc(img: Image, lo, hi: u32) -> Set {
 	out: Set
 	for a := lo; a < hi; a += 4 {
 		if w, ok := word(img, a); ok && w >> 26 == 3 {
 			t := (a + 4) & 0xf0000000 | (w & 0x3ffffff) << 2
-			if !zero_words(img, t) {
+			if t != a + 8 && !zero_words(img, t) {
 				out[t] = {}
 			}
 		}
