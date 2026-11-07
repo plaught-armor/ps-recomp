@@ -1195,7 +1195,12 @@ sema_waiter :: proc(m: Iop_Sema) -> ^Iop_Thread {
 
 // ------------------------------------------------------------- thmsgbx
 
+MBA_THPRI :: 1 // waiters by priority, else first come: no waiter here
 MBA_MSPRI :: 4 // a box's messages queue by priority, else first come
+// The most messages a box's list is walked over: as many as IOP RAM holds,
+// so a list the guest looped by hand ends.
+@(private = "file")
+MBX_WALK_MAX :: IOP_RAM_SIZE / 8
 
 // Function fno of thmsgbx, as th_base: CreateMbx, SendMbx and PollMbx. No
 // ReceiveMbx here, so no thread ever waits on a box and a send only queues.
@@ -1205,6 +1210,7 @@ th_msgbx :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	if th_wrong_context(.Msgbx, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
 	switch fno {
 	case 4: // CreateMbx(iop_mbx_t *): attr, option
+		if r32(a0) &~ (MBA_THPRI | MBA_MSPRI) != 0 {return ke(KE_ILLEGAL_ATTR), true}
 		append(&s.mbxs, Iop_Mbx{id = s.next_mbxid, attr = r32(a0), option = r32(a0 + 4)})
 		s.next_mbxid += 1
 		return s.next_mbxid - 1, true
@@ -1213,6 +1219,7 @@ th_msgbx :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if m == nil {return ke(KE_UNKNOWN_MBXID), true}
 		mbx_put(m, a1)
 		return KE_OK, true
+	// recvmsg is written unchecked, null too, as retail's PollMbx does.
 	case 9: // PollMbx(void **recvmsg, mbxid): the first message, or NOMSG
 		m := mbx_find(a1)
 		if m == nil {return ke(KE_UNKNOWN_MBXID), true}
@@ -1235,13 +1242,27 @@ mbx_find :: proc(id: u32) -> ^Iop_Mbx {
 }
 
 // Queues message `msg` in box `m`: last, or under MBA_MSPRI after every
-// message of the same or a better (lower) priority.
+// message of the same or a better (lower) priority. A message already in
+// the box stays where it is: queued again its next word would loop the
+// list, so the host would walk it forever; refused, the guest only waits.
 @(private = "file")
 mbx_put :: proc(m: ^Iop_Mbx, msg: u32) {
+	at := m.head
+	for _ in 0 ..< MBX_WALK_MAX {
+		if at == 0 {break}
+		if at == msg {
+			fmt.eprintfln("iop: message %x sent again to box %d, still queued: refused", msg, m.id)
+			return
+		}
+		at = r32(at)
+	}
 	prio := u8(r32(msg + 4))
 	prev, next := u32(0), m.head
 	if m.attr & MBA_MSPRI != 0 {
-		for next != 0 && u8(r32(next + 4)) <= prio {prev, next = next, r32(next)}
+		for _ in 0 ..< MBX_WALK_MAX {
+			if next == 0 || u8(r32(next + 4)) > prio {break}
+			prev, next = next, r32(next)
+		}
 	} else {
 		prev, next = m.tail, 0
 	}

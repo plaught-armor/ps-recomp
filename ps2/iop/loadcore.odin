@@ -309,14 +309,21 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	th_ready(st)
 	s.start_done = false
 	iop_sync(cpu.state.cycles)
-	// In slices, so the libsd handlers raised meanwhile run between them: a
-	// start can spin on what a voice transfer's handler sets
+	// In slices, so libsd's interrupt handlers due meanwhile run between
+	// them, by the IOP's clock, the EE's standing still over the load: a
+	// start can spin on what a voice transfer's handler sets. Only libsd's:
+	// no timer, CD, SIF DMA or vblank handler runs before the start ends.
+	// Each slice end schedules as iop_tick's does, so a thread whose wake
+	// passed takes over there, not at the start's end.
 	end := r3000.state.cycles + IOP_START_BUDGET * r3000.CYCLES_PER_INSN
+	slices := 0
 	for {
 		th_schedule(min(end, r3000.state.cycles + IOP_SLICE))
+		slices += 1
 		if !s.budget || r3000.state.cycles >= end || (s.start_done && l.failed) {break}
-		if iop_sd.pending != 0 {sd_intr_run(cpu.state.cycles)}
+		sd_intr_run(r3000.state.cycles * IOP_EE_RATIO)
 	}
+	if slices > 1 {fmt.eprintfln("iop: start of \"%s\" ran %d slices", x.name, slices)}
 	if !s.start_done && s.budget {
 		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
 		return fail(key, x.name, "start ran out of its budget", mark)

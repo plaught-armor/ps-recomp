@@ -3414,6 +3414,43 @@ test_start_intr :: proc() {
 	id, _ := iop.iop_load(build_mod("modsp", &a, entry), "modsp", nil)
 	check(id > 0, "start: a start spinning on its transfer handler's flag returns")
 	check(id > 0 && iop.iop_u32(module_base(id) + flag)^ == 1, "start: the handler set the flag")
+	test_start_block_cross()
+}
+
+// A start that spins on what its block transfer's handler sets at the first
+// half-buffer crossing: the crossing comes due by the IOP's clock, the EE's
+// standing still over the load, and its handler runs between slices.
+test_start_block_cross :: proc() {
+	fresh()
+	a: Asm
+	sd := imports(&a, "libsd", 18, 26)
+	flag := at(&a)
+	put(&a, 0)
+	buf := at(&a)
+	for _ in 0 ..< 0x100 {put(&a, 0)}
+	h := at(&a) // the handler: flag = 1, returns 0
+	la(&a, T0, flag)
+	li(&a, T2, 1)
+	put(&a, 0xad000000 | T2 << 16, JR_RA, 0x24020000) // sw t2, 0(t0); jr ra; li v0, 0
+	entry := at(&a)
+	put(&a, 0x27bdffe0, 0xafbf001c) // addiu sp, sp, -32; sw ra, 28(sp)
+	li(&a, A0, 0)
+	la(&a, A1, h)
+	li(&a, A2, 0)
+	jal(&a, sd + 8) // sceSdSetTransIntrHandler(0, h, 0)
+	put(&a, 0xafa00010) // sw zero, 16(sp): the start address
+	li(&a, A0, 0)
+	li(&a, A1, 0x10)
+	la(&a, A2, buf)
+	li32(&a, 7, 0x400)
+	jal(&a, sd) // sceSdBlockTrans(0, loop, buf, 0x400, 0)
+	spin := at(&a)
+	lw_at(&a, T2, flag)
+	put(&a, 0x11400000 | (spin - at(&a) - 4) / 4 & 0xffff, 0) // beqz t2, spin
+	li(&a, V0, 0)
+	put(&a, 0x8fbf001c, JR_RA, 0x27bd0020) // lw ra, 28(sp); jr ra; addiu sp, sp, 32
+	id, _ := iop.iop_load(build_mod("modbt", &a, entry), "modbt", nil)
+	check(id > 0 && iop.iop_u32(module_base(id) + flag)^ == 1, "start: a start spinning on its block transfer's crossing returns, the handler run")
 }
 
 // thmsgbx in a start: CreateMbx gives an id; SendMbx queues first come, or by
@@ -3424,7 +3461,7 @@ test_msgbx :: proc() {
 	mb := imports(&a, "thmsgbx", 4, 6, 9)
 	create, send, poll := mb, mb + 8, mb + 16
 	param := at(&a)
-	put(&a, 0, 0, 4, 0) // attr, option: first come, then MBA_MSPRI
+	put(&a, 0, 0, 4, 0, 2, 0) // attr, option: first come, MBA_MSPRI, then a bit retail lacks
 	msg: [3]u32
 	prio := [3]u32{5, 1, 3}
 	for &m, i in msg {
@@ -3432,7 +3469,7 @@ test_msgbx :: proc() {
 		put(&a, 0xffffffff, prio[i]) // next (a send sets it), priority
 	}
 	ids := at(&a)
-	put(&a, 0, 0)
+	put(&a, 0, 0, 0)
 	out := at(&a) // per box, per poll: v0, the message it took
 	for _ in 0 ..< 16 {put(&a, 0)}
 	entry := at(&a)
@@ -3441,7 +3478,8 @@ test_msgbx :: proc() {
 		la(&a, A0, param + 8 * b)
 		jal(&a, create)
 		store_v0(&a, ids + 4 * b)
-		for m in msg {
+		// The first message sent again while still queued: refused.
+		for m in ([4]u32{msg[0], msg[1], msg[2], msg[0]}) {
 			lw_at(&a, A0, ids + 4 * b)
 			la(&a, A1, m)
 			jal(&a, send)
@@ -3454,6 +3492,9 @@ test_msgbx :: proc() {
 			store_v0(&a, o)
 		}
 	}
+	la(&a, A0, param + 16)
+	jal(&a, create)
+	store_v0(&a, ids + 8)
 	li(&a, V0, 0)
 	epilogue(&a)
 	id, _ := iop.iop_load(build_mod("mbx", &a, entry), "mbx", nil)
@@ -3461,6 +3502,7 @@ test_msgbx :: proc() {
 	check(id > 0, "msgbx: a start that creates, sends and polls loads")
 	w :: proc(base, off: u32) -> u32 {return iop.iop_u32(base + off)^}
 	check(w(base, ids) == 1 && w(base, ids + 4) == 2, "msgbx: CreateMbx gives ids 1 and 2")
+	check(w(base, ids + 8) == transmute(u32)i32(-401), "msgbx: CreateMbx refuses an attr bit retail lacks")
 	nomsg := transmute(u32)i32(-424)
 	for b in 0 ..< u32(2) {
 		orders := [2][3]u32{{msg[0], msg[1], msg[2]}, {msg[1], msg[2], msg[0]}}
@@ -3471,7 +3513,7 @@ test_msgbx :: proc() {
 			got &&= w(base, o) == 0 && w(base, o + 4) == base + order[p]
 		}
 		got &&= w(base, out + 32 * b + 24) == nomsg && w(base, out + 32 * b + 28) == 0
-		check(id > 0 && got, "msgbx: PollMbx takes first come, by priority under MBA_MSPRI, then NOMSG" if b == 1 else "msgbx: PollMbx takes the messages first come, then NOMSG")
+		check(id > 0 && got, "msgbx: PollMbx takes first come, by priority under MBA_MSPRI, then NOMSG, a resend refused" if b == 1 else "msgbx: PollMbx takes the messages first come, then NOMSG, a resend refused")
 	}
 }
 
