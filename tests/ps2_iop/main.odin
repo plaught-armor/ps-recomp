@@ -239,6 +239,9 @@ game :: proc(_: rawptr) {
 	test_sdr_thread()
 	test_timrman()
 	test_system_time()
+	test_alarm()
+	test_wakeup_cancel()
+	test_release_wait()
 	test_vblank()
 	test_vblank_handlers()
 	test_fallback()
@@ -5952,6 +5955,123 @@ test_system_time :: proc() {
 	check(lo == 0x2345_6789 && hi == 1 && lib_call(b + tb, fnos[:], 43) == lo, "thbase: GetSystemTimeLow is GetSystemTime's low word")
 	r3000.state.cycles = C + 1000
 	check(lib_call(b + tb, fnos[:], 43) == lo + 1000, "thbase: GetSystemTimeLow tracks the clock")
+}
+
+// thbase fno with a0..a2, from the context iop_sched.intr names.
+tb_call :: proc(fno: u32, a0: u32 = 0, a1: u32 = 0, a2: u32 = 0) -> u32 {
+	r := &r3000.state.r
+	r[4], r[5], r[6] = a0, a1, a2
+	v, ok := iop.th_base(fno)
+	check(ok, "thbase: a served call")
+	return v
+}
+
+// thbase 35 SetAlarm against ps2sdk's thbase: a thread's call only; a clock
+// under 100 microseconds raised to it and written back, one with a high word
+// kept; a second alarm of the same handler and argument -104; the handler
+// at the due cycle, its argument in a0, its v0 the next alarm counted from
+// this one and raised to the minimum, 0 ending it; the loader's reset and a
+// failed load's undo, of an alarm whose handler it frees, ending alarms.
+test_alarm :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	// "moda": d {count, a0, v0, clock lo, clock hi}; h counts, records a0
+	// and returns d's v0.
+	a: Asm
+	d := at(&a)
+	put(&a, 0, 0, 0, 0, 0)
+	h := at(&a)
+	la(&a, T0, d)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0xad040004, 0x8d020008, JR_RA, 0) // sw a0, 4(t0); lw v0, 8(t0); jr ra
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("moda", &a, entry), "moda", nil)
+	b := module_base(id)
+	word :: proc(at: u32) -> u32 {return iop.iop_u32(at)^}
+	clock := b + d + 12
+	x := &iop.iop_timr
+	MIN :: u64(iop.ALARM_MIN)
+	check(id > 0 && MIN == 3686, "alarm: the module loads, the minimum 100 microseconds")
+
+	iop.iop_sched.intr = true
+	check(tb_call(35, clock, b + h, 0x55) == neg(-iop.KE_ILLEGAL_CONTEXT) && x.nalarm == 0, "alarm: SetAlarm in a handler is illegal")
+	iop.iop_sched.intr = false
+	C :: u64(100_000)
+	r3000.state.cycles = C
+	iop.iop_u32(clock)^ = 10
+	check(tb_call(35, clock, b + h, 0x55) == 0 && word(clock) == u32(MIN), "alarm: set, its short clock raised and written back")
+	check(x.nalarm == 1 && x.alarms[0].due == C + MIN && iop.tim_next_ee() == (C + MIN) * 8 && iop.iop_wake_ee == (C + MIN) * 8, "alarm: due at the minimum, the wake there")
+	check(tb_call(35, clock, b + h, 0x55) == neg(104) && x.nalarm == 1, "alarm: the same handler and argument again is -104")
+	iop.iop_u32(clock)^, iop.iop_u32(clock + 4)^ = 5, 1
+	check(tb_call(35, clock, b + h, 0x66) == 0 && word(clock) == 5 && x.alarms[1].due == C + 1 << 32 + 5, "alarm: another argument; a clock with a high word kept")
+
+	iop.iop_u32(b + d + 8)^ = 10
+	iop.iop_tick((C + MIN - 1) * 8)
+	check(word(b + d) == 0, "alarm: no handler before it is due")
+	iop.iop_tick((C + MIN) * 8)
+	check(word(b + d) == 1 && word(b + d + 4) == 0x55, "alarm: the handler when due, its argument in a0")
+	check(x.nalarm == 2 && iop.tim_next_ee() == (C + 2 * MIN) * 8, "alarm: a v0 under the minimum raised to it, counted from the last")
+	iop.iop_u32(b + d + 8)^ = 0
+	iop.iop_tick((C + 2 * MIN) * 8)
+	check(word(b + d) == 2 && x.nalarm == 1 && x.alarms[0].arg == 0x66, "alarm: v0 0 ends it")
+	check(tb_call(35, clock, b + h, 0x55) == 0 && x.nalarm == 2, "alarm: an ended alarm set again")
+
+	// The undo of a load that freed the handler ends its alarms; one whose
+	// handler and argument lie outside stays.
+	iop.iop_u32(clock)^, iop.iop_u32(clock + 4)^ = 1000, 0
+	check(tb_call(35, clock, 0x1000, 0x2000) == 0 && x.nalarm == 3, "alarm: one outside the module")
+	saved := x^
+	iop.tim_undo(saved, {{b, at(&a), 0}})
+	check(x.nalarm == 1 && x.alarms[0].handler == 0x1000, "alarm: a failed load's undo ends the alarms of the memory it frees")
+
+	fresh()
+	check(iop.iop_timr.nalarm == 0 && iop.tim_next_ee() == max(u64), "alarm: the loader's reset clears the alarms")
+}
+
+// thbase 27 CancelWakeupThread: a thread's call only; the thread's wakeups,
+// 0 the caller's, returned and cleared; an unknown thread -407.
+test_wakeup_cancel :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	t := iop.th_new(0x1000, 0x2000, 0x100, 0, 10)
+	id := t.id
+	t.wakeups = 3
+	s.intr = true
+	check(tb_call(27, id) == neg(-iop.KE_ILLEGAL_CONTEXT) && t.wakeups == 3, "cancel wakeup: in a handler illegal")
+	s.intr = false
+	check(tb_call(27, id) == 3 && t.wakeups == 0 && tb_call(27, id) == 0, "cancel wakeup: the count returned and cleared")
+	check(tb_call(27, id + 1) == neg(-iop.KE_UNKNOWN_THID), "cancel wakeup: an unknown thread")
+	cur := s.cur
+	s.cur, t.wakeups = id, 2
+	check(tb_call(27, 0) == 2 && t.wakeups == 0, "cancel wakeup: thread 0 is the caller")
+	s.cur = cur
+	fresh()
+}
+
+// thbase 19 iReleaseWaitThread: a handler's call only; thread 0 -406, an
+// unknown thread -407, one not waiting -416; a waiting thread, of any wait,
+// ready with its wait returning KE_RELEASE_WAIT.
+test_release_wait :: proc() {
+	fresh()
+	s := &iop.iop_sched
+	t := iop.th_new(0x1000, 0x2000, 0x100, 0, 10)
+	id := t.id
+	t.status = .Sleep
+	check(tb_call(19, id) == neg(-iop.KE_ILLEGAL_CONTEXT) && t.status == .Sleep, "release wait: on a thread illegal")
+	s.intr = true
+	check(tb_call(19, 0) == neg(-iop.KE_ILLEGAL_THID) && tb_call(19, id + 1) == neg(-iop.KE_UNKNOWN_THID), "release wait: thread 0, an unknown thread")
+	check(tb_call(19, id) == 0 && t.status == .Ready && t.wake == neg(-iop.KE_RELEASE_WAIT), "release wait: a sleeper ready, its wait KE_RELEASE_WAIT")
+	check(tb_call(19, id) == neg(-iop.KE_NOT_WAIT), "release wait: a ready thread is not waiting")
+	for st in ([?]iop.Th_Status{.Wait, .Evf, .Delay, .Start}) {
+		t.status, t.wake = st, 0
+		check(tb_call(19, id) == 0 && t.status == .Ready && t.wake == neg(-iop.KE_RELEASE_WAIT), fmt.tprintf("release wait: a %v wait released", st))
+	}
+	t.status = .Dormant
+	check(tb_call(19, id) == neg(-iop.KE_NOT_WAIT), "release wait: a dormant thread is not waiting")
+	s.intr = false
+	fresh()
 }
 
 // The EE kernel's next vblank start and end the vblank test hands the IOP

@@ -88,6 +88,8 @@ KE_EVF_MULTI :: -422
 KE_EVF_ILPAT :: -423
 KE_MBOX_NOMSG :: -424
 KE_WAIT_DELETE :: -425
+KE_NOT_WAIT :: -416
+KE_RELEASE_WAIT :: -418
 
 @(private = "file")
 PRIO_HIGHEST :: 1
@@ -727,6 +729,21 @@ th_wakeup :: proc(id: u32) -> u32 {
 	return KE_OK
 }
 
+// iReleaseWaitThread(id): thread id's wait, of any kind, ends with
+// KE_RELEASE_WAIT. A StartModule caller released so returns at once; the
+// start it ran goes on, and its end finds no caller to wake.
+th_release_wait :: proc(id: u32) -> u32 {
+	if id == 0 {return ke(KE_ILLEGAL_THID)}
+	t := th_find(id)
+	if t == nil {return ke(KE_UNKNOWN_THID)}
+	#partial switch t.status {
+	case .Wait, .Evf, .Lock, .Sleep, .Delay, .Start:
+		th_wake(t, ke(KE_RELEASE_WAIT))
+		return KE_OK
+	}
+	return ke(KE_NOT_WAIT)
+}
+
 // Ends the running thread; the loader drops its coroutine. A start's end
 // is its return, v0 its result. Under FLAT it stops the thread's run and
 // returns.
@@ -1001,14 +1018,14 @@ th_refer :: proc(id, info: u32) -> u32 {
 // those served here, and which of them are its i-variants.
 @(rodata)
 TH_CHECKED := [Th_Lib]Fno_Set {
-	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 20, 22, 24, 25, 26, 33},
+	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 19, 20, 22, 24, 25, 26, 27, 33, 35},
 	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
 	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
 	.Msgbx = {4, 6, 9},
 }
 @(rodata)
 TH_IVAR := [Th_Lib]Fno_Set {
-	.Base  = {11, 26},
+	.Base  = {11, 19, 26},
 	.Semap = {7, 12},
 	.Event = {7, 9, 14},
 	.Msgbx = {},
@@ -1136,8 +1153,16 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return th_refer(s.cur if a0 == 0 else a0, a1), true
 	case 24: // SleepThread
 		return th_sleep(), true
+	case 19: // iReleaseWaitThread(thid): a handler ends thid's wait
+		return th_release_wait(a0), true
 	case 25, 26: // WakeupThread(thid), iWakeupThread(thid)
 		return th_wakeup(a0), true
+	case 27: // CancelWakeupThread(thid): thid 0 the caller; its wakeups, now none
+		t := th_find(s.cur if a0 == 0 else a0)
+		if t == nil {return ke(KE_UNKNOWN_THID), true}
+		n := t.wakeups
+		t.wakeups = 0
+		return n, true
 	case 33: // DelayThread(usec)
 		if t := th_find(s.cur); t != nil {t.wake_at = r3000.state.cycles + u64(a0) * (IOP_CLOCK / 1000) / 1000}
 		return th_wait(.Delay), true
@@ -1155,6 +1180,8 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		w32(a1, u32(c / IOP_CLOCK))
 		w32(a2, u32(c % IOP_CLOCK * 1_000_000 / IOP_CLOCK))
 		return KE_OK, true
+	case 35: // SetAlarm(iop_sys_clock_t *, handler, arg)
+		return alarm_set(a0, a1, a2), true
 	case 43: // GetSystemTimeLow: the system clock's low 32 bits, as 34 gives them
 		return u32(r3000.state.cycles), true
 	}

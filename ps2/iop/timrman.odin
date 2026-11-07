@@ -8,6 +8,12 @@
 // timer's counter restarts at each compare; 0 stops the timer. A timer set
 // to count another source, or gated, is set up and started as on retail and
 // never fires, with a compat row.
+//
+// thbase's alarms (SetAlarm) run on the same path. Retail's thbase keeps
+// them on a hardware timer of its own, which no module sees allocated; here
+// each is due at an IOP cycle and its handler runs from tim_intr_run, after
+// the timers' compares, on the handler coroutine. The handler's v0 is the
+// next alarm, counted from this one, no sooner than ALARM_MIN; 0 ends it.
 package ps2_iop
 
 import "core:fmt"
@@ -36,6 +42,12 @@ TIMR_INTR :: 0x30
 // The most compare handlers one tick runs: a timer far behind its compares
 // (the EE stalled, a load ran) skips the rest.
 TIMR_INTR_MAX :: 16
+// The most alarms set at once. Retail takes each from its heap, so only
+// running out of it refuses one; no disc seen sets more than a few.
+ALARM_N :: 32
+// The soonest an alarm comes, in IOP cycles: retail's 100 microseconds
+// (USec2SysClock(100)), which a shorter SetAlarm or handler v0 is raised to.
+ALARM_MIN :: 100 * IOP_CLOCK / 1_000_000
 
 // A timer as the hardware has it: its registers' base, the sources it
 // counts, its width, the most its prescaler divides by.
@@ -73,9 +85,19 @@ Iop_Timer :: struct {
 	due:     u64, // the IOP cycle of the next compare, while armed
 }
 
+// A thbase alarm: SetAlarm's handler and argument, due at an IOP cycle.
+Iop_Alarm :: struct {
+	handler, arg: u32, // IOP addresses
+	due:          u64,
+	seq:          u32, // orders alarms due together: the earlier set runs first
+}
+
 Iop_Timr :: struct {
-	t:     [TIMR_N]Iop_Timer,
-	armed: u8, // the timers whose compare handler fires: bit by index
+	t:      [TIMR_N]Iop_Timer,
+	armed:  u8, // the timers whose compare handler fires: bit by index
+	alarms: [ALARM_N]Iop_Alarm,
+	nalarm: u32, // alarms[:nalarm] are set
+	seq:    u32, // the next alarm's seq
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -204,19 +226,98 @@ tim_arm :: proc() {
 	}
 }
 
-// When, in EE cycles, a timer's compare is due next; max(u64) when none is.
+// When, in EE cycles, a timer's compare or an alarm is due next; max(u64)
+// when none is.
 tim_next_ee :: proc() -> u64 {
-	if iop_timr.armed == 0 {return max(u64)}
 	t := max(u64)
+	for a in iop_timr.alarms[:iop_timr.nalarm] {t = min(t, a.due * IOP_EE_RATIO)}
+	if iop_timr.armed == 0 {return t}
 	for x, i in iop_timr.t {
 		if iop_timr.armed & (1 << u32(i)) != 0 {t = min(t, x.due * IOP_EE_RATIO)}
 	}
 	return t
 }
 
+// SetAlarm(clock, handler, arg): an alarm `clock`'s 64-bit count of IOP
+// cycles from now, raised to ALARM_MIN in the guest's clock as retail
+// does. KE_FOUND_HANDLER when handler and arg already have one.
+alarm_set :: proc(clock, handler, arg: u32) -> u32 {
+	x := &iop_timr
+	for a in x.alarms[:x.nalarm] {
+		if a.handler == handler && a.arg == arg {return ke(KE_FOUND_HANDLER)}
+	}
+	if x.nalarm == ALARM_N {return ke(KE_NO_MEMORY)}
+	lo, hi := r32(clock), r32(clock + 4)
+	if hi == 0 && lo < ALARM_MIN {
+		lo = ALARM_MIN
+		w32(clock, lo)
+	}
+	alarm_add({handler = handler, arg = arg, due = r3000.state.cycles + (u64(hi) << 32 | u64(lo))})
+	iop_wake_set()
+	return KE_OK
+}
+
+@(private = "file")
+alarm_add :: proc(a: Iop_Alarm) {
+	x := &iop_timr
+	x.alarms[x.nalarm] = a
+	x.alarms[x.nalarm].seq = x.seq
+	x.nalarm += 1
+	x.seq += 1
+}
+
+@(private = "file")
+alarm_remove :: proc(i: u32) {
+	x := &iop_timr
+	x.nalarm -= 1
+	x.alarms[i] = x.alarms[x.nalarm]
+}
+
+// Runs the alarms due by the IOP's clock, earliest first, at most
+// TIMR_INTR_MAX; the rest run at the next tick. Each is off its list while
+// its handler runs, as on retail, so the handler may set it again; its v0
+// then puts it back. A handler stopped for waiting or a call the HLE lacks
+// ends its alarm.
+@(private = "file")
+alarm_run :: proc() {
+	x := &iop_timr
+	now := r3000.state.cycles
+	for _ in 0 ..< TIMR_INTR_MAX {
+		first := -1
+		for a, i in x.alarms[:x.nalarm] {
+			if a.due > now {continue}
+			b := x.alarms[first] if first >= 0 else Iop_Alarm{}
+			if first < 0 || a.due < b.due || a.due == b.due && a.seq < b.seq {first = i}
+		}
+		if first < 0 {return}
+		a := x.alarms[first]
+		alarm_remove(u32(first))
+		next: u32
+		switch th_intr(a.handler, a.arg, 0) {
+		case .None:
+			next = iop_sched.intr_v0
+		case .Blocked:
+			core.compat_unknown(.Iop_Timer_Intr, a.handler, pc = a.handler)
+			fmt.eprintfln("iop: alarm handler at %x blocked", a.handler)
+		case .Call:
+			fmt.eprintfln("iop: alarm handler at %x stopped", a.handler)
+		}
+		if next == 0 || x.nalarm == ALARM_N {continue}
+		a.due += u64(max(next, ALARM_MIN))
+		alarm_add(a)
+	}
+}
+
 // Runs the compare handlers due by the IOP's clock, earliest first, at most
 // TIMR_INTR_MAX; a timer still behind then has its missed compares dropped.
+// Then the alarms due (alarm_run).
 tim_intr_run :: proc() {
+	tim_cmp_run()
+	alarm_run()
+}
+
+@(private = "file")
+tim_cmp_run :: proc() {
 	if iop_timr.armed == 0 {return}
 	now := r3000.state.cycles
 	for _ in 0 ..< TIMR_INTR_MAX {
@@ -265,10 +366,15 @@ tim_intr :: proc(i: u32) {
 
 // After a failed load: puts back, as it was when the load began (`saved`),
 // each timer the load allocated, or left with its handler or argument in
-// `freed`, the memory its undo frees.
+// `freed`, the memory its undo frees. An alarm whose handler or argument is
+// in `freed` ends; one the load set with both outside it stays.
 tim_undo :: proc(saved: Iop_Timr, freed: []Sys_Block) {
 	for &t, i in iop_timr.t {
 		if t.use > saved.t[i].use || sys_in(freed, t.handler) || sys_in(freed, t.arg) {t = saved.t[i]}
 	}
 	tim_arm()
+	for i := iop_timr.nalarm; i > 0; i -= 1 {
+		a := iop_timr.alarms[i - 1]
+		if sys_in(freed, a.handler) || sys_in(freed, a.arg) {alarm_remove(i - 1)}
+	}
 }
