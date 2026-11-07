@@ -11,7 +11,8 @@ import "ps:core"
 flat_returns, flat_mismatch: u64
 // The deepest shadow return stack of any run.
 flat_max_depth: u32
-// The IOP's counts (r3000.flat_print), set once the IOP is (iop_cpu_init).
+// The IOP's counts (r3000.flat_print, or r3000.interp_print without FLAT),
+// set once the IOP is (iop_cpu_init).
 iop_flat_print: proc()
 // IPU commands re-run from a checkpoint after input ran dry, the quadwords
 // they replayed, and the most quadwords pulled since any one checkpoint
@@ -49,5 +50,6 @@ flat_print :: proc() {
 	} else {
 		fmt.eprintfln("ee interp: %d calls open at most, %d barrier records", interp_max_depth, interp_barriers)
 		fmt.eprintfln("ee interp: %d unwinds (%d across native code), %d jumps (%d across native code), %d jumps refused at NATIVE_STALE_MAX", interp_unwinds, interp_unwinds_native, interp_jumps, interp_jumps_native, interp_stale)
+		if iop_flat_print != nil {iop_flat_print()}
 	}
 }
