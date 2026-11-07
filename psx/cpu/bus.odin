@@ -147,45 +147,45 @@ in_scratch :: #force_inline proc(a: u32) -> (u32, bool) {
 	return a & (SCRATCH_SIZE - 1), a & SCRATCH_MASK == SCRATCH_BASE
 }
 
-lw :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
+lw :: #force_inline proc(a: u32, k: u64 = 0) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok {
 		return u32((^u32le)(&ram[o])^)
 	}
 	if o, ok := in_scratch(a); ok && o <= SCRATCH_SIZE - 4 {
 		return u32((^u32le)(&scratch[o])^)
 	}
-	return load_slow(a, 4)
+	return load_slow(a, 4, k)
 }
 
-lhu :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
+lhu :: #force_inline proc(a: u32, k: u64 = 0) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok {
 		return u32((^u16le)(&ram[o])^)
 	}
 	if o, ok := in_scratch(a); ok && o <= SCRATCH_SIZE - 2 {
 		return u32((^u16le)(&scratch[o])^)
 	}
-	return load_slow(a, 2) & 0xffff
+	return load_slow(a, 2, k) & 0xffff
 }
 
-lh :: #force_inline proc(a: u32) -> u32 {
-	return u32(i32(i16(lhu(a))))
+lh :: #force_inline proc(a: u32, k: u64 = 0) -> u32 {
+	return u32(i32(i16(lhu(a, k))))
 }
 
-lbu :: #force_inline proc(a: u32) -> u32 #no_bounds_check {
+lbu :: #force_inline proc(a: u32, k: u64 = 0) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok {
 		return u32(ram[o])
 	}
 	if o, ok := in_scratch(a); ok {
 		return u32(scratch[o])
 	}
-	return load_slow(a, 1) & 0xff
+	return load_slow(a, 1, k) & 0xff
 }
 
-lb :: #force_inline proc(a: u32) -> u32 {
-	return u32(i32(i8(lbu(a))))
+lb :: #force_inline proc(a: u32, k: u64 = 0) -> u32 {
+	return u32(i32(i8(lbu(a, k))))
 }
 
-sw :: #force_inline proc(a, v: u32) #no_bounds_check {
+sw :: #force_inline proc(a, v: u32, k: u64 = 0) #no_bounds_check {
 	if core.trace.watching {trace_store(a, v, 4)}
 	if o, ok := in_ram(a); ok && cop0.sr & 0x10000 == 0 {
 		ram_guard(o)
@@ -196,10 +196,10 @@ sw :: #force_inline proc(a, v: u32) #no_bounds_check {
 		(^u32le)(&scratch[o])^ = u32le(v)
 		return
 	}
-	store_slow(a, v, 4)
+	store_slow(a, v, 4, k)
 }
 
-sh :: #force_inline proc(a, v: u32) #no_bounds_check {
+sh :: #force_inline proc(a, v: u32, k: u64 = 0) #no_bounds_check {
 	if core.trace.watching {trace_store(a, v & 0xffff, 2)}
 	if o, ok := in_ram(a); ok && cop0.sr & 0x10000 == 0 {
 		ram_guard(o)
@@ -210,10 +210,10 @@ sh :: #force_inline proc(a, v: u32) #no_bounds_check {
 		(^u16le)(&scratch[o])^ = u16le(v)
 		return
 	}
-	store_slow(a, v & 0xffff, 2)
+	store_slow(a, v & 0xffff, 2, k)
 }
 
-sb :: #force_inline proc(a, v: u32) {
+sb :: #force_inline proc(a, v: u32, k: u64 = 0) {
 	if core.trace.watching {trace_store(a, v & 0xff, 1)}
 	if o, ok := in_ram(a); ok && cop0.sr & 0x10000 == 0 {
 		ram_guard(o)
@@ -224,11 +224,11 @@ sb :: #force_inline proc(a, v: u32) {
 		scratch[o] = u8(v)
 		return
 	}
-	store_slow(a, v & 0xff, 1)
+	store_slow(a, v & 0xff, 1, k)
 }
 
-lwl :: proc(a, cur: u32) -> u32 {
-	w := lw(a & ~u32(3))
+lwl :: proc(a, cur: u32, k: u64 = 0) -> u32 {
+	w := lw(a & ~u32(3), k)
 	switch a & 3 {
 	case 0:
 		return (cur & 0x00ffffff) | (w << 24)
@@ -240,8 +240,8 @@ lwl :: proc(a, cur: u32) -> u32 {
 	return w
 }
 
-lwr :: proc(a, cur: u32) -> u32 {
-	w := lw(a & ~u32(3))
+lwr :: proc(a, cur: u32, k: u64 = 0) -> u32 {
+	w := lw(a & ~u32(3), k)
 	switch a & 3 {
 	case 1:
 		return (cur & 0xff000000) | (w >> 8)
@@ -253,9 +253,9 @@ lwr :: proc(a, cur: u32) -> u32 {
 	return w
 }
 
-swl :: proc(a, v: u32) {
+swl :: proc(a, v: u32, k: u64 = 0) {
 	al := a & ~u32(3)
-	w := lw(al)
+	w := lw(al, k)
 	switch a & 3 {
 	case 0:
 		w = (w & 0xffffff00) | (v >> 24)
@@ -266,12 +266,12 @@ swl :: proc(a, v: u32) {
 	case 3:
 		w = v
 	}
-	sw(al, w)
+	sw(al, w, k)
 }
 
-swr :: proc(a, v: u32) {
+swr :: proc(a, v: u32, k: u64 = 0) {
 	al := a & ~u32(3)
-	w := lw(al)
+	w := lw(al, k)
 	switch a & 3 {
 	case 0:
 		w = v
@@ -282,32 +282,38 @@ swr :: proc(a, v: u32) {
 	case 3:
 		w = (w & 0x00ffffff) | (v << 24)
 	}
-	sw(al, w)
+	sw(al, w, k)
 }
 
 // The word at a, aligned or not: lwl a+3 then lwr a, which recompiled code
 // fuses into one access (recomp/r3000 lower.odin fuse_pair). In RAM with
 // the word inside one page it is read in place.
-lw_u :: proc(a: u32) -> u32 #no_bounds_check {
+lw_u :: proc(a: u32, k: u64 = 0) -> u32 #no_bounds_check {
 	if o, ok := in_ram(a); ok && o & (RAM_PAGE - 1) <= RAM_PAGE - 4 {
 		return u32(intrinsics.unaligned_load((^u32le)(&ram[o])))
 	}
-	return lwr(a, lwl(a + 3, 0))
+	return lwr(a, lwl(a + 3, 0, k), k)
 }
 
 // Store the word v at a, aligned or not: swl a+3 then swr a.
-sw_u :: proc(a, v: u32) #no_bounds_check {
+sw_u :: proc(a, v: u32, k: u64 = 0) #no_bounds_check {
 	if o, ok := in_ram(a); ok && o & (RAM_PAGE - 1) <= RAM_PAGE - 4 && !core.trace.watching && cop0.sr & 0x10000 == 0 {
 		ram_guard(o)
 		intrinsics.unaligned_store((^u32le)(&ram[o]), u32le(v))
 		return
 	}
-	swl(a + 3, v)
-	swr(a, v)
+	swl(a + 3, v, k)
+	swr(a, v, k)
 }
 
+// An access off RAM: the cycles counter raised by k for it (k: the cycles of
+// the instructions before it in its block and its own, which the Odin code
+// from the recompiler has not charged yet; recomp/r3000/lower.odin
+// Step.seen), so a counter read sees them.
 @(private)
-load_slow :: proc(a: u32, size: u32) -> u32 {
+load_slow :: proc(a: u32, size: u32, k: u64 = 0) -> u32 {
+	state.cycles += k
+	defer state.cycles -= k
 	p := a & 0x1fffffff
 	switch {
 	case a & SCRATCH_MASK == SCRATCH_BASE:
@@ -355,7 +361,9 @@ load_slow :: proc(a: u32, size: u32) -> u32 {
 }
 
 @(private)
-store_slow :: proc(a, v: u32, size: u32) {
+store_slow :: proc(a, v: u32, size: u32, k: u64 = 0) {
+	state.cycles += k
+	defer state.cycles -= k
 	if cop0.sr & 0x10000 != 0 {
 		return // cache isolated: BIOS cache flush, writes go nowhere
 	}

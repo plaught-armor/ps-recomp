@@ -143,13 +143,15 @@ a64_state_store :: proc(a: ^Asm, off: u32, src: Reg) {
 	ldst(a, 0xb9000000, A64_REG[src], S, off, 4)
 }
 
-a64_state_add64 :: proc(a: ^Asm, off: u32, v: u32) {
+a64_state_add64 :: proc(a: ^Asm, off: u32, v: u32, sub: bool) {
 	ldst(a, 0xf9400000, T0, S, off, 8)
 	if v < 4096 {
-		emit32(a, 0x91000000 | v << 10 | T0 << 5 | T0) // add x12, x12, #v
+		op := u32(0xd1000000 if sub else 0x91000000)
+		emit32(a, op | v << 10 | T0 << 5 | T0) // sub or add x12, x12, #v
 	} else {
 		movw(a, T1, v)
-		rrr(a, 0x8b000000, T0, T0, T1) // add x12, x12, x13
+		op := u32(0xcb000000 if sub else 0x8b000000)
+		rrr(a, op, T0, T0, T1) // sub or add x12, x12, x13
 	}
 	ldst(a, 0xf9000000, T0, S, off, 8)
 }

@@ -204,6 +204,13 @@ Asm :: struct {
 	// function that makes no RAM access, whose slot nothing changes while
 	// it runs.
 	pin:       string,
+	// A guest access's runtime call runs with the 64-bit state field at
+	// charge_at raised by charge, undone after it (access_call): the
+	// cycles of the instructions since the counter was last charged, the
+	// access's own included, which the caller sets before each access.
+	// The fast path in place does not touch the counter. 0: none.
+	charge:    u32,
+	charge_at: u32,
 	// The runtime procedures call may name, with their signatures: wasm32
 	// declares each call's type from them (x64 and arm64 do not read them).
 	sigs:      []Sig,
@@ -247,6 +254,7 @@ Slow :: struct {
 	base:   string, // import: the address off counts from, else the state
 	unal:   Unal,
 	state:  string, // wasm32: the state import its B64 and B128 fields are in
+	charge: u32, // Asm.charge at the access, for the runtime call
 }
 
 // Guest RAM that load and store reach in place, without calling the bus
@@ -562,18 +570,26 @@ state_store_imm :: proc(a: ^Asm, off: u32, v: u32) {
 	}
 }
 
-// The 64-bit field at `off` of the guest state += v; not a cached 32-bit
-// one (the cached 64-bit one is fine).
-state_add64 :: proc(a: ^Asm, off: u32, v: u32) {
+// The 64-bit field at `off` of the guest state += v (sub: -= v); not a
+// cached 32-bit one (the cached 64-bit one is fine).
+state_add64 :: proc(a: ^Asm, off: u32, v: u32, sub := false) {
 	assert(cache_index(a, off) < 0 && cache_index(a, off + 4) < 0, "native: add64 of a cached field")
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_state_add64(a, off, v)
+		x64_state_add64(a, off, v, sub)
 	case .Arm64:
-		a64_state_add64(a, off, v)
+		a64_state_add64(a, off, v, sub)
 	case .Wasm32:
-		wasm_state_add64(a, off, v)
+		wasm_state_add64(a, off, v, sub)
 	}
+}
+
+// call, for the runtime call of a guest access: with v, the counter at
+// a.charge_at goes up by v for the call (Asm.charge).
+access_call :: proc(a: ^Asm, v: u32, name: string, args: ..Reg) {
+	if v != 0 {state_add64(a, a.charge_at, v)}
+	call(a, name, ..args)
+	if v != 0 {state_add64(a, a.charge_at, v, sub = true)}
 }
 
 mov_imm :: proc(a: ^Asm, dst: Reg, v: u32) {
@@ -1073,10 +1089,10 @@ load :: proc(a: ^Asm, w: Width, signed: bool, slow: string) {
 	assert(w <= .B32, "native: load width")
 	pin_check(a)
 	if a.ram.base == "" {
-		call(a, slow, .A)
+		access_call(a, a.charge, slow, .A)
 		return
 	}
-	s := Slow{slow = slow, w = w, signed = signed}
+	s := Slow{slow = slow, w = w, signed = signed, charge = a.charge}
 	if a.arch == .Wasm32 {
 		wasm_load(a, s)
 		return
@@ -1104,10 +1120,10 @@ load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 	pin_check(a)
 	if a.ram.base == "" {
 		mov_imm(a, .B, n)
-		call(a, slow, .A, .B)
+		access_call(a, a.charge, slow, .A, .B)
 		return
 	}
-	s := Slow{slow = slow, w = w, off = off, n = n, base = base}
+	s := Slow{slow = slow, w = w, off = off, n = n, base = base, charge = a.charge}
 	if a.arch == .Wasm32 {
 		wasm_load(a, s)
 		return
@@ -1133,11 +1149,11 @@ load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 store :: proc(a: ^Asm, w: Width, slow: string) {
 	pin_check(a)
 	if a.ram.base == "" {
-		call(a, slow, .A, .B)
+		access_call(a, a.charge, slow, .A, .B)
 		return
 	}
 	assert(w <= .B32, "native: store width")
-	s := Slow{slow = slow, store = true, w = w}
+	s := Slow{slow = slow, store = true, w = w, charge = a.charge}
 	if a.arch == .Wasm32 {
 		wasm_slow_call(a, s)
 		return
@@ -1155,10 +1171,10 @@ store_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, zero := false,
 	pin_check(a)
 	if a.ram.base == "" {
 		mov_imm(a, .B, n)
-		call(a, slow, .A, .B)
+		access_call(a, a.charge, slow, .A, .B)
 		return
 	}
-	s := Slow{slow = slow, store = true, w = w, off = off, n = n, zero = zero, base = base}
+	s := Slow{slow = slow, store = true, w = w, off = off, n = n, zero = zero, base = base, charge = a.charge}
 	if a.arch == .Wasm32 {
 		wasm_slow_call(a, s)
 		return
@@ -1178,10 +1194,10 @@ unaligned :: proc(a: ^Asm, op: Unal, off, n: u32, slow: string) {
 	_, _, _, store := unal_shape(op)
 	if a.ram.base == "" {
 		mov_imm(a, .B, n)
-		call(a, slow, .A, .B)
+		access_call(a, a.charge, slow, .A, .B)
 		return
 	}
-	s := Slow{slow = slow, store = store, w = .B64, off = off, n = n, unal = op}
+	s := Slow{slow = slow, store = store, w = .B64, off = off, n = n, unal = op, charge = a.charge}
 	if a.arch == .Wasm32 {
 		wasm_slow_call(a, s)
 		return
@@ -1325,11 +1341,11 @@ emit_slow :: proc(a: ^Asm, s: Slow) {
 	}
 	if s.w >= .B64 {
 		mov_imm(a, .B, s.n)
-		call(a, s.slow, .A, .B)
+		access_call(a, s.charge, s.slow, .A, .B)
 	} else if s.store {
-		call(a, s.slow, .A, .B)
+		access_call(a, s.charge, s.slow, .A, .B)
 	} else {
-		call(a, s.slow, .A)
+		access_call(a, s.charge, s.slow, .A)
 	}
 	switch a.arch {
 	case .X64_SysV, .X64_Win:

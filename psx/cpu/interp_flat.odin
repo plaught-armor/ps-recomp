@@ -430,7 +430,7 @@ when core.FLAT {
 				fatal("flat: control transfer %08x in the delay slot at %08x", w, slot)
 			}
 		}
-		interp_exec(&flat_dummy, slot, w)
+		interp_exec(&flat_dummy, slot, w, x.pending)
 		state.r[0] = 0
 		state.cycles += x.pending * CYCLES_PER_INSN
 		x.pending = 0
@@ -496,11 +496,11 @@ when core.FLAT {
 					flat_enter(x, t, pc + 8, .Call)
 					settle = true
 				case 0x0c, 0x0d:
-					interp_exec(&flat_dummy, pc, w)
+					interp_exec(&flat_dummy, pc, w, x.pending)
 					r[0] = 0
 					settle = flat_stop
 				case:
-					interp_exec(&flat_dummy, pc, w)
+					interp_exec(&flat_dummy, pc, w, x.pending)
 					r[0] = 0
 				}
 			case 0x01:
@@ -545,11 +545,11 @@ when core.FLAT {
 				flat_slot(x, pc)
 				if taken {settle = !flat_goto(x, pc, target, false)}
 			case 0x10:
-				interp_exec(&flat_dummy, pc, w)
+				interp_exec(&flat_dummy, pc, w, x.pending)
 				r[0] = 0
 				settle = flat_stop
 			case:
-				interp_exec(&flat_dummy, pc, w)
+				interp_exec(&flat_dummy, pc, w, x.pending)
 				r[0] = 0
 			}
 			if settle && !flat_settle(x) {return}

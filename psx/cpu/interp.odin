@@ -14,14 +14,18 @@
 // code compiled from the same words) see the same cycles everywhere:
 //   - instructions are charged when their block ends: at a branch or jump,
 //     after its delay slot and before anything follows it (a call, a tail
-//     call, a return, the target). An access, a syscall or a cop0 move in
-//     the block sees the cycles of the block's start.
+//     call, a return, the target).
+//   - an access (a load or a store), a syscall or a cop0 move sees the
+//     cycles of every instruction before it and its own, as if each were
+//     charged as it ran: they are added for the access and taken off after
+//     it (access_cycles). Every change to the cycles is a sum, or a max with
+//     a later event (the BIOS's wait), so taking them off leaves what a
+//     charge at the block's end adds back. The IOP's accesses see the
+//     cycles of the block's start, as the PS2's learned IOP code does.
 //   - due events run on entry, on a taken branch or jump back (its target
 //     at or before it) and on a jump through a register other than $ra.
 //     Every loop has such a jump or a call, and a call's callee checks on
 //     its entry, so events are never starved.
-// One difference is left: recompiled code also charges when a block falls
-// through into a label, which the interpreter cannot see.
 package psx_cpu
 
 import "ps:core"
@@ -57,10 +61,17 @@ interp_loop :: proc(start: u32) {
 		if .Interp in core.trace.active && core.trace_pc_ok(pc) {
 			core.tracef(.Interp, "%08x %08x", pc, w)
 		}
-		interp_exec(&st, pc, w)
+		interp_exec(&st, pc, w, st.pending)
 		state.r[0] = 0
 	}
 	charge(&st)
+}
+
+// The cycles an access at the end of pending instructions run since the
+// last charge sees beyond state.cycles (see above): none on the IOP.
+@(private)
+access_cycles :: #force_inline proc(pending: u64) -> u64 {
+	return learn_cpu == .Iop ? 0 : pending * CYCLES_PER_INSN
 }
 
 // Charge the instructions run since the last charge.
@@ -91,7 +102,7 @@ branch :: proc(st: ^Interp, taken: bool, target: u32) {
 	if .Interp in core.trace.active && core.trace_pc_ok(slot) {
 		core.tracef(.Interp, "%08x %08x (delay)", slot, w)
 	}
-	interp_exec(st, slot, w)
+	interp_exec(st, slot, w, st.pending)
 	state.r[0] = 0
 	charge(st)
 	if taken {
@@ -140,8 +151,10 @@ signed_imm :: #force_inline proc(w: u32) -> u32 {
 	return u32(i32(i16(u16(w))))
 }
 
+// Execute the word w at pc, the last of pending instructions run since the
+// last charge.
 @(private)
-interp_exec :: proc(st: ^Interp, pc, w: u32) {
+interp_exec :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	when FALLBACK_COUNT {
 		fallback_interp_insns += 1
 		if mod_ram_has(pc) {fallback_mod_insns += 1}
@@ -158,6 +171,15 @@ interp_exec :: proc(st: ^Interp, pc, w: u32) {
 			core.learn_store(st.learn, addr)
 		}
 	}
+	ahead: u64 // the cycles this access sees beyond state.cycles
+	switch w >> 26 {
+	case 0x10, 0x20 ..= 0x2e, 0x32, 0x3a:
+		ahead = access_cycles(pending)
+	case 0x00:
+		if w & 0x3f == 0x0c {ahead = access_cycles(pending)} // syscall
+	}
+	state.cycles += ahead
+	defer state.cycles -= ahead
 	switch w >> 26 {
 	case 0x00:
 		interp_special(st, pc, w)

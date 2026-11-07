@@ -9,8 +9,8 @@ import "core:slice"
 Step_Kind :: enum u8 {
 	Case,       // block at `target`; `check`: the previous block falls into it
 	Trace,      // per-block trace hook for `target`
-	Op,         // instruction `i` (no control transfer)
-	Load_Delay, // load `i`, then `slot` sees the old value; `check`: rt gets the load
+	Op,         // instruction `i` (no control transfer); `seen`: see below
+	Load_Delay, // load `i`, then `slot` sees the old value; `check`: rt gets the load; `seen`, `slot_seen`: see below
 	Bad,        // reserved instruction `i`
 	Cycles,     // charge `n` cycles
 	Return,
@@ -27,13 +27,20 @@ Step_Kind :: enum u8 {
 	End,
 }
 
+// An access (a load or a store), a syscall or a cop0 move in an Op or a
+// Load_Delay sees `seen` cycles (the slot's, `slot_seen`) beyond the ones
+// charged so far: those of the block's instructions up to it, its own
+// included, as the interpreter's do (psx/cpu/interp.odin). A backend adds
+// them for its runtime call and takes them off after it. 0 when lowered
+// for the IOP, whose accesses see the block's start.
 Step :: struct {
-	kind:    Step_Kind,
-	check:   bool,
-	n:       u32,
-	target:  u32,
-	i, slot: Insn,
-	cond:    string,
+	kind:            Step_Kind,
+	check:           bool,
+	n:               u32,
+	target:          u32,
+	i, slot:         Insn,
+	cond:            string,
+	seen, slot_seen: u32,
 }
 
 @(private = "file")
@@ -44,6 +51,14 @@ Lowering :: struct {
 	steps:     [dynamic]Step,
 	open_case: bool, // current block can fall into the next label
 	pending:   int, // instructions not yet charged
+	exact:     bool, // accesses see the cycles up to them (Step.seen)
+}
+
+// The cycles an access at the end of the block's first `at` uncharged
+// instructions sees (Step.seen).
+@(private = "file")
+seen :: proc(l: ^Lowering, at: int) -> u32 {
+	return l.exact ? u32(at * l.cycles) : 0
 }
 
 @(private = "file")
@@ -70,7 +85,7 @@ goto_ :: proc(l: ^Lowering, src, t: u32) {
 	put(l, {kind = .Return})
 }
 
-lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
+lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step {
 	pcs := make([]u32, len(f.insns))
 	n := 0
 	for pc in f.insns {
@@ -81,6 +96,7 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 	l := Lowering {
 		f      = f,
 		cycles = cycles,
+		exact  = exact,
 	}
 	defer delete(l.insns)
 	for pc, i in f.insns {
@@ -124,6 +140,8 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 		if i.kind == .Alu || i.kind == .Sys || i.kind == .Bad {
 			// The last instruction i stands for: a fused pair ends at pc + 4.
 			last := pc
+			// A fused pair's one access sees the count at its first word.
+			at := l.pending
 			if p, ok := fuse_pair(&l, i, patches); ok {
 				i = p
 				last = pc + 4
@@ -143,8 +161,8 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 					// The slot instruction reads the old value. If it also
 					// writes rt, its write wins and the loaded value is lost
 					// (the load still happens: I/O reads have side effects).
-					put(&l, {kind = .Load_Delay, i = i, slot = nxt, check = rt not_in nxt.writes})
 					l.pending += 1
+					put(&l, {kind = .Load_Delay, i = i, slot = nxt, check = rt not_in nxt.writes, seen = seen(&l, at), slot_seen = seen(&l, l.pending)})
 					idx += 1
 					continue
 				}
@@ -156,7 +174,7 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 				l.open_case = false
 				continue
 			}
-			put(&l, {kind = .Op, i = i})
+			put(&l, {kind = .Op, i = i, seen = seen(&l, at)})
 			if is_break_1(i) {
 				flush(&l)
 				put(&l, {kind = .Return})
@@ -180,7 +198,7 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 		ret := pc + 8
 		delay :: proc(l: ^Lowering, d: Insn, slot_op: bool) {
 			if slot_op {
-				put(l, {kind = .Op, i = d})
+				put(l, {kind = .Op, i = d, seen = seen(l, l.pending)})
 			}
 			flush(l)
 		}
@@ -248,8 +266,8 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int) -> []Step {
 			} else {
 				put(&l, {kind = .Case, target = pc + 4})
 				put(&l, {kind = .Trace, target = pc + 4})
-				put(&l, {kind = .Op, i = d})
 				l.pending += 1
+				put(&l, {kind = .Op, i = d, seen = seen(&l, l.pending)})
 				l.open_case = true
 			}
 		}

@@ -610,9 +610,9 @@ word_u :: proc(a: ^native.Asm, store: bool) {
 	native.jmp(a, done)
 	native.bind(a, split)
 	if store {
-		native.call(a, slow, .A, .B)
+		native.access_call(a, a.charge, slow, .A, .B)
 	} else {
-		native.call(a, slow, .A)
+		native.access_call(a, a.charge, slow, .A)
 	}
 	native.bind(a, done)
 }
@@ -729,7 +729,8 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 			}
 			result(a, rd, ld)
 		case 12:
-			call_imm(a, "cpu.syscall", i.pc)
+			native.mov_imm(a, .A, i.pc)
+			native.access_call(a, a.charge, "cpu.syscall", .A)
 		case 13:
 			native.mov_imm(a, .A, i.pc)
 			native.mov_imm(a, .B, i.w >> 6 & 0xfffff)
@@ -777,7 +778,7 @@ op :: proc(a: ^native.Asm, i: Insn, ld := false) -> bool {
 		case rs == 4:
 			native.mov_imm(a, .A, rd)
 			get(a, .B, rt)
-			native.call(a, "cpu.mtc0", .A, .B)
+			native.access_call(a, a.charge, "cpu.mtc0", .A, .B)
 		case rs == 16 && i.fn == 16:
 			native.call(a, "cpu.rfe")
 		case:
@@ -899,9 +900,12 @@ is_ident :: proc(s: string) -> bool {
 	return s != ""
 }
 
-// Machine code for f into a; returns its code offset.
-native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int) -> u32 {
-	steps := lower(f, patches, cycles)
+// Machine code for f into a; returns its code offset. exact: accesses see
+// the cycles up to them (Step.seen); false for the IOP.
+native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exact := true) -> u32 {
+	steps := lower(f, patches, cycles, exact)
+	a.charge_at = CYCLES
+	defer a.charge = 0
 	labels: map[u32]native.Label
 	defer delete(labels)
 	pcs: [dynamic]u32
@@ -942,11 +946,16 @@ native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int) -> 
 			call_imm(a, "cpu.trace_block", s.target)
 			native.bind(a, skip)
 		case .Op:
+			a.charge = s.seen
 			if !op(a, s.i) {bad(a, s.i)}
+			a.charge = 0
 		case .Load_Delay:
+			a.charge = s.seen
 			ok := op(a, s.i, ld = true)
 			assert(ok, "native: load delay on a non-load")
+			a.charge = s.slot_seen
 			if !op(a, s.slot) {bad(a, s.slot)}
+			a.charge = 0
 			if s.check {set(a, s.i.rt, .LD)}
 		case .Bad:
 			bad(a, s.i)

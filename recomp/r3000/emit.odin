@@ -50,11 +50,18 @@ one :: proc(format: string, args: ..any) -> []string {
 	return slice.clone([]string{fmt.aprintf(format, ..args)})
 }
 
-// Odin statements for a non-control-transfer instruction.
+// Odin statements for a non-control-transfer instruction, whose access, syscall
+// or cop0 move sees k cycles beyond the ones charged (Step.seen): the bus
+// procedures take them, a syscall or mtc0 has them added around it.
 @(private = "file")
-emit_op :: proc(i: Insn) -> []string {
+emit_op :: proc(i: Insn, k: u32) -> []string {
 	op, rs, rt, rd, sa := i.op, i.rs, i.rt, i.rd, i.sa
 	f :: fmt.aprintf
+	ks := k != 0 ? f(", %d", k) : "" // the bus procedures' k
+	around :: proc(k: u32, call: string) -> []string {
+		if k == 0 {return slice.clone([]string{call})}
+		return slice.clone([]string{fmt.aprintf("c.cycles += %d", k), call, fmt.aprintf("c.cycles -= %d", k)})
+	}
 	switch {
 	case op == 0:
 		switch i.fn {
@@ -110,7 +117,7 @@ emit_op :: proc(i: Insn) -> []string {
 		case 43:
 			return set_reg(rd, f("%s < %s ? 1 : 0", R(rs), R(rt)))
 		case 12:
-			return one("cpu.syscall(%s)", hexu(i.pc))
+			return around(k, fmt.aprintf("cpu.syscall(%s)", hexu(i.pc)))
 		case 13:
 			return one("cpu.brk(%s, 0x%x)", hexu(i.pc), i.w >> 6 & 0xfffff)
 		}
@@ -143,7 +150,7 @@ emit_op :: proc(i: Insn) -> []string {
 		case rs == 0:
 			return set_reg(rt, f("cpu.mfc0(%d)", rd))
 		case rs == 4:
-			return one("cpu.mtc0(%d, %s)", rd, R(rt))
+			return around(k, fmt.aprintf("cpu.mtc0(%d, %s)", rd, R(rt)))
 		case rs == 16 && i.fn == 16:
 			return one("cpu.rfe()")
 		}
@@ -160,21 +167,21 @@ emit_op :: proc(i: Insn) -> []string {
 	case is_load_op(op):
 		a := addr_expr(i)
 		if i.pair {
-			return set_reg(rt, f("cpu.lw_u(%s)", a), true)
+			return set_reg(rt, f("cpu.lw_u(%s%s)", a, ks), true)
 		}
 		switch op {
 		case 0x22, 0x26:
-			return set_reg(rt, f("cpu.%s(%s, %s)", op == 0x22 ? "lwl" : "lwr", a, R(rt)), true)
+			return set_reg(rt, f("cpu.%s(%s, %s%s)", op == 0x22 ? "lwl" : "lwr", a, R(rt), ks), true)
 		}
 		names := [7]string{"lb", "lh", "", "lw", "lbu", "lhu", ""}
-		return set_reg(rt, f("cpu.%s(%s)", names[op - 0x20], a), true)
+		return set_reg(rt, f("cpu.%s(%s%s)", names[op - 0x20], a, ks), true)
 	case is_store_op(op):
 		names := [7]string{"sb", "sh", "swl", "sw", "", "", "swr"}
-		return one("cpu.%s(%s, %s)", "sw_u" if i.pair else names[op - 0x28], addr_expr(i), R(rt))
+		return one("cpu.%s(%s, %s%s)", "sw_u" if i.pair else names[op - 0x28], addr_expr(i), R(rt), ks)
 	case op == 0x32:
-		return one("%s, cpu.lw(%s))", gte_put(rt), addr_expr(i))
+		return one("%s, cpu.lw(%s%s))", gte_put(rt), addr_expr(i), ks)
 	case op == 0x3a:
-		return one("cpu.sw(%s, %s)", addr_expr(i), gte_get(rt))
+		return one("cpu.sw(%s, %s%s)", addr_expr(i), gte_get(rt), ks)
 	}
 	return one("cpu.bad_insn(%s, %s)", hexu(i.pc), hexu(i.w))
 }
@@ -284,15 +291,15 @@ emit_func :: proc(f: ^Func, out: ^strings.Builder, name: string, patches: []Patc
 		case .Trace:
 			put(out, depth, trace_stmt(s.target))
 		case .Op:
-			for st in emit_op(s.i) {
+			for st in emit_op(s.i, s.seen) {
 				put(out, depth, st)
 			}
 		case .Load_Delay:
-			stmts := emit_op(s.i)
+			stmts := emit_op(s.i, s.seen)
 			_, _, expr := strings.partition(stmts[0], " = ")
 			put(out, depth, "{")
 			put(out, depth, concat("ld := ", expr))
-			for st in emit_op(s.slot) {
+			for st in emit_op(s.slot, s.slot_seen) {
 				put(out, depth, st)
 			}
 			if s.check {

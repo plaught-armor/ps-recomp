@@ -25,6 +25,20 @@ sb :: proc(a, v: u32) {cpu.sb(a, v)}
 sh :: proc(a, v: u32) {cpu.sh(a, v)}
 @(private = "file")
 sw :: proc(a, v: u32) {cpu.sw(a, v)}
+// Without the Odin code's k (cpu.load_slow): native code raises the cycles
+// itself (recomp/native access_call).
+@(private = "file")
+lwl :: proc(a, cur: u32) -> u32 {return cpu.lwl(a, cur)}
+@(private = "file")
+lwr :: proc(a, cur: u32) -> u32 {return cpu.lwr(a, cur)}
+@(private = "file")
+swl :: proc(a, v: u32) {cpu.swl(a, v)}
+@(private = "file")
+swr :: proc(a, v: u32) {cpu.swr(a, v)}
+@(private = "file")
+lw_u :: proc(a: u32) -> u32 {return cpu.lw_u(a)}
+@(private = "file")
+sw_u :: proc(a, v: u32) {cpu.sw_u(a, v)}
 
 // The runtime procedures and variables native code imports, by name.
 imports :: proc() -> map[string]u64 {
@@ -48,12 +62,12 @@ imports :: proc() -> map[string]u64 {
 	m["cpu.sb"] = p(rawptr(sb))
 	m["cpu.sh"] = p(rawptr(sh))
 	m["cpu.sw"] = p(rawptr(sw))
-	m["cpu.lwl"] = p(rawptr(cpu.lwl))
-	m["cpu.lwr"] = p(rawptr(cpu.lwr))
-	m["cpu.swl"] = p(rawptr(cpu.swl))
-	m["cpu.swr"] = p(rawptr(cpu.swr))
-	m["cpu.lw_u"] = p(rawptr(cpu.lw_u))
-	m["cpu.sw_u"] = p(rawptr(cpu.sw_u))
+	m["cpu.lwl"] = p(rawptr(lwl))
+	m["cpu.lwr"] = p(rawptr(lwr))
+	m["cpu.swl"] = p(rawptr(swl))
+	m["cpu.swr"] = p(rawptr(swr))
+	m["cpu.lw_u"] = p(rawptr(lw_u))
+	m["cpu.sw_u"] = p(rawptr(sw_u))
 	m["cpu.syscall"] = p(rawptr(cpu.syscall))
 	m["cpu.brk"] = p(rawptr(cpu.brk))
 	m["cpu.cop0"] = p(&cpu.cop0)

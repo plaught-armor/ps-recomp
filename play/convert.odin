@@ -86,7 +86,8 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	} else {
 		funcs := make([]r3000.Learned, len(runs))
 		for r, k in runs {funcs[k] = {r.entry, r.lo, r.words}}
-		blob = r3000.learned_blob(funcs, arch)
+		// The IOP's accesses see the block's start (psx/cpu/interp.odin).
+		blob = r3000.learned_blob(funcs, arch, exact = cpu != .Iop)
 	}
 	if werr := os.write_entire_file(out, blob); werr != nil {
 		fmt.eprintln("learned: cannot write", out, werr)

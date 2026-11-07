@@ -17,8 +17,9 @@ Learned :: struct {
 // while memory holds the words at lo (psx/native/learned.odin). Each
 // run's code is found from its entry within its words; a branch or jump
 // out of them (a path the run never took) goes through cpu.jump_unknown,
-// which interprets from there. In context.allocator.
-learned_blob :: proc(runs: []Learned, arch: native.Arch) -> []u8 {
+// which interprets from there. In context.allocator. exact: accesses see
+// the cycles up to them (Step.seen); false for the IOP's runs.
+learned_blob :: proc(runs: []Learned, arch: native.Arch, exact := true) -> []u8 {
 	a := native.make_asm(arch, native_ram(), NATIVE_CACHED[:])
 	spans := make([]native.Blob_Span, len(runs))
 	defer delete(spans)
@@ -32,7 +33,7 @@ learned_blob :: proc(runs: []Learned, arch: native.Arch) -> []u8 {
 		mips.discover(RULES, img, f, nil)
 		ranges := make([]native.Blob_Range, 1)
 		ranges[0] = {r.lo, r.words}
-		spans[k] = {.Psx, r.entry, native_func(&a, f, nil, CYCLES_PER_INSN), ranges}
+		spans[k] = {.Psx, r.entry, native_func(&a, f, nil, CYCLES_PER_INSN, exact), ranges}
 	}
 	b := native.make_blob(&a, nil, nil, spans)
 	for s in spans {delete(s.ranges)}

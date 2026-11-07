@@ -34,6 +34,8 @@ odin run tests/psx_unaligned -collection:ps=.
 odin run tests/psx_gte -collection:ps=.
 odin run tests/psx_cover -collection:ps=.
 odin run tests/psx_timer -collection:ps=.
+odin run tests/psx_access_cycles -collection:ps=.
+odin run tests/psx_access_cycles -collection:ps=. -define:PS_FLAT=true
 odin run tests/psx_gpu_upload -collection:ps=.
 odin run tests/ps2_kernel -collection:ps=.
 odin run tests/ps2_iop -collection:ps=.
@@ -112,6 +114,7 @@ here.
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
+| `psx_access_cycles` | The cycles a PS1 load or store off RAM sees, interpreted and learned alike, in the coroutine model and under FLAT: every instruction before it and its own, right after a label the block before falls into, in a delay slot, and as a load and the instruction after it |
 | `psx_gpu_upload` | VRAM uploads a run at a time, as a pixel at a time: row wrap, a dropped half word, mask bits |
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |
@@ -164,6 +167,16 @@ The branches count nothing, note no learn records, write no card or
 progress file, and push no sound, so the run after a probe is the run
 without one (`PS_DUMP_HASH` is the same with `PS_COMPAT_PROBE=0`). A
 warm run has no new entry pcs, so it is quiet whenever it loads no IRX.
+
+### Timing a run
+
+Time a run warm: run it once cold first, so it records the code it
+interprets, then time a second run, which compiles those records and runs
+them natively. A cold run spends its time in the interpreter on code the
+next run will not interpret, so a speed compared from cold runs measures
+how much each side interprets, not its code. Learned code and the
+interpreter see the same cycles at every access (psx/cpu/interp.odin), so
+a warm run and a cold one of a PS1 disc play the same.
 
 ### Press scripts with conditions
 

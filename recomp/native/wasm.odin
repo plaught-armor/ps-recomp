@@ -667,11 +667,11 @@ wasm_state_store :: proc(a: ^Asm, off: u32, src: Reg) {
 	wa_mem(a, I32_STORE, 2, off)
 }
 
-wasm_state_add64 :: proc(a: ^Asm, off, v: u32) {
+wasm_state_add64 :: proc(a: ^Asm, off, v: u32, sub: bool) {
 	if off == a.cached64 {
 		wa_get(a, L_C64)
 		wa_i64(a, i64(v))
-		emit8(a, I64_ADD)
+		emit8(a, I64_SUB if sub else I64_ADD)
 		wa_set(a, L_C64)
 		return
 	}
@@ -679,7 +679,7 @@ wasm_state_add64 :: proc(a: ^Asm, off, v: u32) {
 	wa_state(a)
 	wa_mem(a, I64_LOAD, 3, off)
 	wa_i64(a, i64(v))
-	emit8(a, I64_ADD)
+	emit8(a, I64_SUB if sub else I64_ADD)
 	wa_mem(a, I64_STORE, 3, off)
 }
 
@@ -1257,7 +1257,11 @@ wa_field :: proc(a: ^Asm, s: Slow) -> int {
 wa_slow_seq :: proc(a: ^Asm, s: Slow) {
 	s := s
 	if s.w >= .B64 || s.unal != .None {s.state = a.state}
-	at := slow_path(a, s)
+	// The routine only says whether the runtime call is needed: one for
+	// every charge.
+	key := s
+	key.charge = 0
+	at := slow_path(a, key)
 	wa_get(a, wa_reg(.A))
 	if s.store && s.w <= .B32 {wa_get(a, wa_reg(.B))} else {wa_i32(a, 0)}
 	wa_call_label(a, at)
@@ -1277,11 +1281,11 @@ wa_slow_seq :: proc(a: ^Asm, s: Slow) {
 wa_runtime :: proc(a: ^Asm, s: Slow) {
 	if s.w >= .B64 {
 		mov_imm(a, .B, s.n)
-		call(a, s.slow, .A, .B)
+		access_call(a, s.charge, s.slow, .A, .B)
 	} else if s.store {
-		call(a, s.slow, .A, .B)
+		access_call(a, s.charge, s.slow, .A, .B)
 	} else {
-		call(a, s.slow, .A)
+		access_call(a, s.charge, s.slow, .A)
 	}
 }
 

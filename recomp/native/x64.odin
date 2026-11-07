@@ -204,9 +204,9 @@ x64_state_store_imm :: proc(a: ^Asm, off: u32, v: u32) {
 	emit32(a, v)
 }
 
-x64_state_add64 :: proc(a: ^Asm, off: u32, v: u32) {
+x64_state_add64 :: proc(a: ^Asm, off: u32, v: u32, sub: bool) {
 	assert(v < 1 << 31, "native: add64 immediate")
-	op_state(a, true, 0x81, 0, off)
+	op_state(a, true, 0x81, 5 if sub else 0, off) // sub or add qword [rbx + off], imm32
 	emit32(a, v)
 }
 
