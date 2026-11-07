@@ -44,6 +44,7 @@ flat_loop :: proc() {
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
 		c.cycles += cpu.CYCLES_PER_INSN
+		when mem.MOD_PROBE {if mem.mod_ram_has(pc) {mem.mod_probe.interp += 1}}
 		ret := pc + 8
 		switch i.kind {
 		case .Alu:
@@ -162,12 +163,20 @@ flat_resume :: proc() -> (x: ^kernel.Flat_Ctx, pc: u32, ok: bool) {
 			f := flat_lookup(pc)
 			if f == nil {break}
 			e := &cpu.native_exit
+			when mem.MOD_PROBE {mem.mod_probe.enters[int(mem.mod_ram_has(pc))] += 1}
 			(cast(Wasm_Func)rawptr(f))(pc)
 			switch e.reason {
 			case .None:
 				// An entry its code has no block for: interpret, rather
 				// than enter it again.
-				if e.pc == pc {return x, pc, true}
+				if e.pc == pc {
+					when mem.MOD_PROBE {
+						in_mod := mem.mod_ram_has(pc)
+						mem.mod_probe.left[int(in_mod)] += 1
+						if in_mod && mem.mod_func_words(pc) == 0 {mem.mod_probe.mid += 1}
+					}
+					return x, pc, true
+				}
 				// A jump into a hooked function reaches its chain, as the
 				// interpreter's does (flat_mod_tail sets x.pc).
 				if !flat_mod_tail(x, e.pc) {x.pc = e.pc}
@@ -209,6 +218,7 @@ flat_native_at :: #force_inline proc(t: u32) -> bool {
 @(private = "file")
 flat_lookup :: #force_inline proc(pc: u32) -> cpu.Func_Proc {
 	if f := cpu.lookup(pc); f != nil {return f}
+	when mem.MOD_PROBE {mem.mod_probe.fallback[int(mem.mod_ram_has(pc))] += 1}
 	return mem.mod_func_at(pc)
 }
 
@@ -307,6 +317,7 @@ flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 			if ret, again = mod_flat_return(ret); again {return flat_end(x)}
 		}
 		x.pc = ret &~ kernel.FLAT_HOST_TAIL
+		when mem.MOD_PROBE {if mem.mod_ram_has(x.pc) {mem.mod_probe.returns += 1}}
 		if jr && ret & kernel.FLAT_HOST_TAIL == 0 {
 			cpu.flat_returns += 1
 			if ra != x.pc {cpu.flat_mismatch += 1}

@@ -64,6 +64,23 @@ mod_spans: []Mod_Span
 mod_funcs: []cpu.Func_Proc
 mod_native_calls, mod_interp_calls: u64
 
+// -define:MOD_PROBE=true: counts of where a FLAT wasm32 run's time with mods
+// goes (ps2/interp_flat.odin), printed with mod_print. Off, none is kept.
+MOD_PROBE :: #config(MOD_PROBE, false)
+Mod_Probe :: struct {
+	// Native enters, and those that left at once (no block at the pc, so
+	// it is interpreted): [0] the game's code, [1] a mod's. mid: of a mod's
+	// that left, those at a pc no mod function starts at.
+	enters, left: [2]u64,
+	mid:          u64,
+	// Returns into the region, and instructions interpreted in it.
+	returns, interp: u64,
+	// mod_func_at fallbacks after the call table missed: [0] at a pc
+	// outside the region, [1] in it.
+	fallback: [2]u64,
+}
+mod_probe: Mod_Probe
+
 // Each mod's image and id, for the message of a store into its code.
 @(private = "file")
 Mod_Owner :: struct {
@@ -177,6 +194,13 @@ mod_native :: #force_inline proc(addr: u32) -> cpu.Func_Proc {
 mod_print :: proc() {
 	if mod_ram == nil {return}
 	fmt.eprintfln("mod: %d interpreted calls into the region, %d native calls", mod_interp_calls, mod_native_calls)
+	when MOD_PROBE {
+		p := &mod_probe
+		fmt.eprintfln(
+			"mod probe: enters game %d mod %d; left at once game %d mod %d (mid-body %d); returns into the region %d; interpreted in it %d; fallbacks outside %d inside %d",
+			p.enters[0], p.enters[1], p.left[0], p.left[1], p.mid, p.returns, p.interp, p.fallback[0], p.fallback[1],
+		)
+	}
 }
 
 // For the message of a host view of guest memory (a kernel string, a SIF
