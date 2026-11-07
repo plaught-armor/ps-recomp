@@ -972,6 +972,41 @@ gif_tte :: proc() {
 	}
 }
 
+// fromSPR in interleave mode, as one game sends a column of an image: 6
+// quadwords in blocks of TQWC 2, skipping SQWC 3 of memory after each, so
+// rows of 2 at 0x3000, 0x3050 and 0x30a0 with the gaps left as they were,
+// and MADR past the last skip; the scratchpad read straight through. TQWC 0
+// sends all of QWC as one block, skipping once.
+@(private = "file")
+spr_interleave :: proc() {
+	if mem.ram == nil {mem.mem_init()}
+	defer mem.hw_reg(0xe030)^ = 0
+	for i in 0 ..< 6 {mem.spr[i * 16] = u8(0x10 + i)}
+	start :: proc(sqwc, qwc: u32) {
+		mem.hw_reg(0xe030)^ = sqwc
+		for i in 0 ..< 0x100 {mem.ram[0x3000 + i] = 0xee}
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x00)^ = 0x108 // STR, interleave
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x10)^ = 0x3000
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x20)^ = qwc
+		mem.dma_reg(mem.DMA_FROM_SPR, 0x80)^ = 0
+		dma.dma_from_spr()
+	}
+	start(2 << 16 | 3, 6)
+	want := [?]u8{0x10, 0x11, 0xee, 0xee, 0xee, 0x12, 0x13, 0xee, 0xee, 0xee, 0x14, 0x15, 0xee}
+	for w, i in want {
+		if mem.ram[0x3000 + i * 16] != w {fail("fromSPR interleave: qword %d at %x is %x, want %x", i, 0x3000 + i * 16, mem.ram[0x3000 + i * 16], w)}
+	}
+	madr, sadr := mem.dma_reg(mem.DMA_FROM_SPR, 0x10)^, mem.dma_reg(mem.DMA_FROM_SPR, 0x80)^
+	if madr != 0x30f0 || sadr != 0x60 || mem.dma_reg(mem.DMA_FROM_SPR, 0x20)^ != 0 {
+		fail("fromSPR interleave: MADR %x SADR %x, want 30f0 60, QWC 0", madr, sadr)
+	}
+	start(3, 4)
+	for i in 0 ..< 4 {
+		if mem.ram[0x3000 + i * 16] != u8(0x10 + i) {fail("fromSPR interleave TQWC 0: qword %d is %x, want %x", i, mem.ram[0x3000 + i * 16], 0x10 + i)}
+	}
+	if mem.dma_reg(mem.DMA_FROM_SPR, 0x10)^ != 0x3070 {fail("fromSPR interleave TQWC 0: MADR %x, want 3070", mem.dma_reg(mem.DMA_FROM_SPR, 0x10)^)}
+}
+
 // The GIF draining an MFIFO ring of 16 quadwords at 0x100000 that fromSPR
 // fills: the drain stops on an empty ring with STR set and MEIS raised, a
 // cnt tag's data wraps at the ring's top mid-transfer, each fromSPR transfer
@@ -1148,6 +1183,7 @@ main :: proc() {
 	ibit()
 	gif_paths()
 	gif_tte()
+	spr_interleave()
 	mfifo()
 	mfifo_hold()
 	window()

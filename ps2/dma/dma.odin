@@ -252,25 +252,40 @@ mfifo_run :: proc(ch: u32) -> bool {
 
 // ------------------------------------------------------------ scratchpad
 
-// fromSPR, normal mode: QWC quadwords from SADR in scratchpad to MADR.
+// fromSPR: QWC quadwords from SADR in scratchpad to MADR. Normal mode sends
+// them in one block. Interleave mode sends blocks of D_SQWC.TQWC (all QWC
+// when 0) and skips D_SQWC.SQWC quadwords of memory after each block, so it
+// writes a rectangle of rows; the scratchpad side stays linear, as toSPR's
+// interleave reads it (PCSX2 _SPR0interleave). Chain mode is not done.
 // No bounds checks here: the scratchpad offset is masked and the RAM slice
 // is 16 bytes long; ram_slice still checks the guest address.
 dma_from_spr :: proc() #no_bounds_check {
 	madr := mem.dma_reg(mem.DMA_FROM_SPR, 0x10)
 	qwc := mem.dma_reg(mem.DMA_FROM_SPR, 0x20)
 	sadr := mem.dma_reg(mem.DMA_FROM_SPR, 0x80)
-	if (mem.dma_reg(mem.DMA_FROM_SPR, 0)^ >> 2) & 3 != 0 {
-		fmt.eprintln("dma: fromSPR chain mode unsupported")
-	}
+	mode := (mem.dma_reg(mem.DMA_FROM_SPR, 0)^ >> 2) & 3
+	if mode == 1 {fmt.eprintln("dma: fromSPR chain mode unsupported")}
+	if mode == 3 {fmt.eprintln("dma: fromSPR mode 3 unsupported")}
 	n := qwc^ & 0xffff
-	if cpu.debug >= 2 {fmt.eprintfln("dma: fromSPR %04x -> %08x qwc %d", sadr^, madr^, n)}
+	tqwc, skip := n, u32(0)
+	if mode == 2 {
+		sqwc := mem.hw_reg(0xe030)^
+		skip = sqwc & 0xff
+		if t := (sqwc >> 16) & 0xff; t != 0 {tqwc = t}
+	}
+	if cpu.debug >= 2 {fmt.eprintfln("dma: fromSPR %04x -> %08x qwc %d block %d skip %d", sadr^, madr^, n, tqwc, skip)}
 	// Under MFD, a transfer into the ring wraps at its top (_SPR0chain).
 	ring := (mem.hw_reg(D_CTRL)^ >> 2) & 3 != 0 && ring_mask() != 0 && in_ring(madr^)
-	for _ in 0 ..< n {
-		s := sadr^ & (mem.SPR_SIZE - 16)
-		intrinsics.unaligned_store((^u128)(&mem.ram_slice(mem.dma_addr(madr^), 16)[0]), intrinsics.unaligned_load((^u128)(&mem.spr[s])))
-		madr^ = ring ? ring_wrap(madr^ + 16) : madr^ + 16
-		sadr^ = (sadr^ + 16) & (mem.SPR_SIZE - 16)
+	for n > 0 {
+		k := min(n, tqwc)
+		for _ in 0 ..< k {
+			s := sadr^ & (mem.SPR_SIZE - 16)
+			intrinsics.unaligned_store((^u128)(&mem.ram_slice(mem.dma_addr(madr^), 16)[0]), intrinsics.unaligned_load((^u128)(&mem.spr[s])))
+			madr^ = ring ? ring_wrap(madr^ + 16) : madr^ + 16
+			sadr^ = (sadr^ + 16) & (mem.SPR_SIZE - 16)
+		}
+		if skip != 0 {madr^ = ring ? ring_wrap(madr^ + skip * 16) : madr^ + skip * 16}
+		n -= k
 	}
 	qwc^ = 0
 	mfifo_resume()
