@@ -1765,6 +1765,19 @@ rect_rows :: proc($P: typeid, $F: Plot_Flags, ra: ^Raster, m: ^Prim_Mode, x0, y0
 	xe := ((min(x0 + w - 1, st.x2) + 1) << k) - 1
 	ys := max(y0, st.y1) << k
 	ye := ((min(y0 + h - 1, st.y2) + 1) << k) - 1
+	when P == u16 && (F == {} || F == {.Generic}) {
+		// A solid untextured rectangle that none of plot's per-pixel cases
+		// (portal, ghost, depth doors, mask check) touch is a fill.
+		e := ra.e
+		fill := e.portal == nil && !(e.see_active && !e.see_direct) && !e.depth_on
+		when F == {.Generic} {
+			fill = fill && !m.textured && !m.semi && !m.raw && !st.check_mask
+		}
+		if fill {
+			rect_fill(ra, m.dither, F == {} || st.set_mask, xs, xe, ys, ye, r, g, b)
+			return
+		}
+	}
 	du: i32 = st.flip_x ? -1 : 1
 	dv: i32 = st.flip_y ? -1 : 1
 	for y := ys; y <= ye; y += 1 {
@@ -1781,6 +1794,31 @@ rect_rows :: proc($P: typeid, $F: Plot_Flags, ra: ^Raster, m: ^Prim_Mode, x0, y0
 			for x := xs; x <= xe; x += 1 {
 				plot(P, F, ra, m, x, y, r, g, b, 0, 0, 0)
 			}
+		}
+	}
+}
+
+// rect_rows' target pixels xs ..< xe + 1, ys ..< ye + 1 of a 15-bit pass as
+// plot writes a solid untextured pixel: the 8-bit color cut to 5 bits after
+// the dither offset at the pixel (dither on), bit 15 under set.
+@(private)
+rect_fill :: proc(ra: ^Raster, dither, set: bool, xs, xe, ys, ye: i32, r, g, b: i32) #no_bounds_check {
+	t := ra.t
+	pix := target_pix(t, u16)
+	mask: u16 = set ? 0x8000 : 0
+	for y := ys; y <= ye; y += 1 {
+		if !raster_mine(ra, y) {
+			continue
+		}
+		// The row's colors by x & 3.
+		cs: [4]u16
+		for &c, j in cs {
+			d := dither ? DITHER[y & 3][j] : 0
+			c = to5(r, d) | to5(g, d) << 5 | to5(b, d) << 10 | mask
+		}
+		row := pix[(y & (t.h - 1)) * t.w:][:t.w]
+		for x := xs; x <= xe; x += 1 {
+			row[x & (t.w - 1)] = cs[x & 3]
 		}
 	}
 }
