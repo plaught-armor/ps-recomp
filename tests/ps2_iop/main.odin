@@ -2313,7 +2313,9 @@ test_sifcmd :: proc() {
 
 // sceSifGetOtherData copies EE RAM to IOP RAM in the call, through the EE's
 // uncached alias and to the IOP's kseg0 one; a source or destination past
-// RAM, or a source in the EE's registers, is a row and copies nothing.
+// RAM, or a source in the EE's registers, is a row and copies nothing. rd
+// gets a packet of the RPC pool, its rpc_id, and the waiting thread, all ones
+// under NOWAIT; the packet is given back at once.
 test_other_data :: proc() {
 	fresh()
 	fnos := [?]u32{23}
@@ -2321,18 +2323,30 @@ test_other_data :: proc() {
 	sc := imports(&a, "sifcmd", ..fnos[:])
 	dst := at(&a)
 	put(&a, 0, 0, 0, 0, 0x77777777)
+	rd := at(&a)
+	put(&a, 0, 0, 0)
+	stk := at(&a)
+	put(&a, 0, 0, 0, 0, 0)
 	entry := at(&a)
 	put(&a, JR_RA, 0x24020000)
 	id, _ := iop.iop_load(build_mod("modg", &a, entry), "modg", nil)
 	b := module_base(id)
+	r3000.state.r[29] = b + stk
 	u := proc(at: u32) -> u32 {return iop.iop_u32(at)^}
 	EE_SRC :: 0x00100400
 	for i in u32(0) ..< 5 {mem.wr32(EE_SRC + 4 * i, 0x11111111 * (i + 1))}
+	rd_at := b + rd
 	get :: proc(stubs, src, dest, size: u32) -> u32 {
 		fnos := [?]u32{23}
-		return lib_call(stubs, fnos[:], 23, 0, src, dest, size)
+		return lib_call(stubs, fnos[:], 23, r3000.state.r[29] - 12, src, dest, size)
 	}
+	check(rd_at == r3000.state.r[29] - 12, "GetOtherData: rd sits below the stack")
 	check(id > 0 && get(b + sc, 0x20000000 | EE_SRC, 0x80000000 | (b + dst), 16) == 0, "GetOtherData: returns 0")
+	pool := iop.iop_sifcmd.rpc_pool
+	check(pool != 0 && u(rd_at) == pool && u(rd_at + 4) == iop.iop_sifcmd.rpc_id && u(rd_at + 8) == iop.iop_sched.cur, "GetOtherData: rd holds the packet, its rpc_id and the waiter")
+	check(u(pool + iop.PK_REC_ID) & iop.PK_IN_USE == 0, "GetOtherData: the packet is given back")
+	iop.iop_u32(b + stk + 16)^ = iop.RPC_NOWAIT
+	check(get(b + sc, EE_SRC, b + dst, 16) == 0 && u(rd_at) == pool && u(rd_at + 8) == 0xffffffff, "GetOtherData: NOWAIT, no waiter")
 	check(u(b + dst) == 0x11111111 && u(b + dst + 12) == 0x44444444 && u(b + dst + 16) == 0x77777777, "GetOtherData: 16 bytes copied, no more")
 	iop.iop_u32(b + dst)^ = 0
 	rows :: proc(src, size: u32) -> u64 {return core.compat.calls[core.Compat_Key{.Iop_Other_Data, src, size}].n}
@@ -4029,10 +4043,22 @@ test_call_context :: proc() {
 }
 
 // sceSifInit finds SIF set up, as at boot, and sceSifCheckInit says so.
+// SetDma refuses more tags than retail's queue holds; DmaStat finds every
+// transfer done.
 test_sifman :: proc() {
 	v5, ok5 := iop.sifman_fn(5)
 	v29, ok29 := iop.sifman_fn(29)
 	check(ok5 && v5 == 1 && ok29 && v29 == 1, "sifman: sceSifInit returns the flag set at boot, sceSifCheckInit it")
+	dma :: proc(fno, a0, a1: u32) -> u32 {
+		r3000.state.r[4], r3000.state.r[5] = a0, a1
+		v, ok := iop.sifman_fn(fno)
+		check(ok, "sifman: served")
+		return v
+	}
+	check(dma(7, 0, iop.SIF_DMA_TAGS + 1) == 0, "sifman: SetDma of more tags than the queue holds sends nothing, 0")
+	id := dma(7, 0, 0)
+	check(id != 0 && dma(7, 0, 0xffffffff) != 0, "sifman: SetDma of 0 or fewer tags sends nothing, an id")
+	check(dma(8, id, 0) == 0xffffffff && dma(8, 0, 0) == 0xffffffff, "sifman: DmaStat, done, the channel idle")
 }
 
 SIFMAN_FNOS := [?]u32{7, 32}

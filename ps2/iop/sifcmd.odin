@@ -19,6 +19,9 @@ IOP_SYS_CMDS :: 32
 // per-buffer list holds.
 SIF_DMA_CBS :: 32
 
+// The tags retail's sceSifSetDma queue holds.
+SIF_DMA_TAGS :: 32
+
 Iop_Sifcmd :: struct {
 	user_tab:  u32, // the module's table, IOP address
 	user_size: u32, // its entries
@@ -74,7 +77,11 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 14, 17, 19, 22, 24, 25:
 		return sifrpc_fn(fno)
 	case 23: // sceSifGetOtherData(rd, src, dest, size, mode): done at once
+		// rd filled as retail fills it, -1 with no packet free (rpc_other_data).
+		// Retail asks the EE for the bytes with system command 0x8000000C; the
+		// HLE copies them itself and sends nothing.
 		src, dest, size := a1, a2, r[7]
+		if !rpc_other_data(a0, r32(r[29] + 16)) {return ke(KE_ERROR), true}
 		// EE RAM by its low 28 bits, as the EE's DMA addresses it; bit 28 names
 		// registers or scratchpad, never RAM. IOP RAM by its physical address.
 		e, i := src & 0x0fffffff, dest & 0x1fffffff
@@ -97,9 +104,19 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 5: // sceSifInit: SIF is set up at boot, so retail finds its flag set and returns it
 		return 1, true
 	case 7: // sceSifSetDma(SifDmaTransfer_t *, count): {src, dest, size, attr}
-		id, _, _ := sifman_dma(r[4], r[5])
+		// Retail queues the tags for the channel, SIF_DMA_TAGS at most, and
+		// returns 0, nothing sent, for more than are free. Ours are sent at
+		// once, so all are free. A count of 0 or less sends nothing and still
+		// gets an id.
+		n := i32(r[5])
+		if n > SIF_DMA_TAGS {return 0, true}
+		id, _, _ := sifman_dma(r[4], u32(max(n, 0)))
 		return id, true
-	case 8: // sceSifDmaStat(id): done
+	case 8: // sceSifDmaStat(id): -1, done
+		// Retail: 1 while the id's batch is queued behind a running one, 0
+		// while it runs, -1 once done, and -1 for any id while the channel
+		// is idle. A transfer here is done when it is set, so the channel is
+		// always idle.
 		return ke(-1), true
 	case 29: // sceSifCheckInit: the flag sceSifInit sets, set at boot
 		return 1, true
