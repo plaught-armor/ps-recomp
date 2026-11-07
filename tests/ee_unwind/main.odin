@@ -15,7 +15,8 @@
 // later `jr $ra` to main's call with its sp unwinds there; with another sp
 // than main's call; with main's call the last that the search reaches
 // (cpu.UNWIND_MAX) and one past it; from a SetSyscall handler, whose call
-// by the kernel is host code the jump must not cross; and a bgezal, jal and
+// by the kernel is host code the jump must not cross, and from it to
+// NOWHERE, a return as before with that host code under it; and a bgezal, jal and
 // jalr each to its own return address (pc + 8, a get-pc idiom), which only
 // set $ra and go on there, no call.
 //
@@ -94,6 +95,7 @@ CASES :: [?]Case {
 	{mode = 1, depth = cpu.UNWIND_MAX - 1, want = 0}, // main's call the UNWIND_MAX-th
 	{mode = 1, depth = cpu.UNWIND_MAX, want = cpu.UNWIND_MAX}, // one past
 	{mode = 1, depth = 2, syscall = true, want = 102}, // past host code: W counts 100
+	{mode = 1, depth = 2, syscall = true, to = .Nowhere, want = 102}, // host code under: no jump
 	{getpc = true, want = 33}, // bgezal, jal, jalr to pc + 8
 }
 

@@ -210,7 +210,7 @@ exec_switch :: proc(entry: u32, file: Maybe(u32)) {
 		t.co = core.co_create(proc(arg: rawptr) {
 			th := (^Thread)(arg)
 			reap()
-			cpu.call(th.entry)
+			cpu.thread_call(th.entry)
 			cpu.fatal("program %08x started by ExecPS2 returned", th.entry)
 		}, t)
 		core.co_switch(t.co)

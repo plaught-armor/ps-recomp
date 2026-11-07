@@ -84,7 +84,7 @@ run :: proc(entry: u32) -> ! {
 		flat_run()
 	} else {
 		t.co = core.co_create(proc(arg: rawptr) {
-			cpu.call(u32(uintptr(arg)))
+			cpu.thread_call(u32(uintptr(arg)))
 			cpu.fatal("entry returned")
 		}, rawptr(uintptr(entry)), core.emu_allocator())
 		core.snap_run(t.co)

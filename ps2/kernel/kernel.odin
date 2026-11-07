@@ -528,7 +528,7 @@ thread_main :: proc(arg: rawptr) {
 	t := (^Thread)(arg)
 	reap()
 	for {
-		cpu.call(t.entry)
+		cpu.thread_call(t.entry)
 		t.status = .Dormant
 		reschedule()
 	}

@@ -366,7 +366,7 @@ flat_return :: proc(x: ^kernel.Flat_Ctx, jr: bool, ra: u32) -> bool {
 
 // The longjmps shown so far, each kind once under PS_DEBUG: not state.
 @(private = "file")
-flat_unwind_shown: bit_set[enum {Done, Host, Max, Jump}]
+flat_unwind_shown: bit_set[enum {Done, Host, Max, Jump, Under}]
 
 // interp_body's unwind (interp_unwind_find) on the shadow stacks, for a
 // `jr $ra` to ra, not the innermost call's return address (x.ra at depth 0):
@@ -434,6 +434,13 @@ flat_unwind :: proc(x: ^kernel.Flat_Ctx, ra: u32) -> bool {
 		if c.ra == ra {seen = true} // the run's own return: host code
 	}
 	if seen {return false}
+	if !ok {
+		if cpu.debug >= 1 && .Under not_in flat_unwind_shown {
+			flat_unwind_shown += {.Under}
+			fmt.eprintfln("ee: jr $ra to %08x: no call returns there, host code under the run; returning as before", ra)
+		}
+		return false
+	}
 	if cpu.debug >= 1 && .Jump not_in flat_unwind_shown {
 		flat_unwind_shown += {.Jump}
 		fmt.eprintfln("ee: jr $ra to %08x: no call returns there; a jump", ra)
