@@ -315,6 +315,11 @@ test_sysmem :: proc() {
 	check(iop.sys_alloc(.Low, 0x40000) == 0x40100, "sysmem: freed block merges with its gap")
 	largest, total := iop.sys_free_sizes()
 	check(largest == 0x1ffe00 - 0xc0100 && total == largest, "sysmem: free sizes")
+	iop.sys_init()
+	check(iop.iop_heap_alloc_at(1, 0x100, 0) == 0x1fff00, "heap rpc alloc_at: high")
+	check(iop.iop_heap_alloc_at(2, 0x100, 0x80080000) == 0x80000, "heap rpc alloc_at: fixed address, kseg0 masked")
+	check(iop.iop_heap_alloc_at(0, 0x100, 0x12345) == 0x40000, "heap rpc alloc_at: low ignores the address")
+	check(iop.iop_heap_alloc_at(3, 0x100, 0) == 0, "heap rpc alloc_at: unknown kind gets 0")
 }
 
 IRX_BASE :: 0x40000

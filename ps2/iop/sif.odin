@@ -941,6 +941,15 @@ iop_heap_alloc :: proc(req: u32) -> u32 {
 	return a
 }
 
+// The heap server's AllocSysMemory: kind is Sys_Alloc's number, addr is
+// used only by .Addr. A kind past .Addr gets 0, as the IOP's own call does.
+iop_heap_alloc_at :: proc(kind, req, addr: u32) -> u32 {
+	if kind > u32(Sys_Alloc.Addr) {return 0}
+	a := sys_alloc(Sys_Alloc(kind), req, addr & 0x1fffffff)
+	if cpu.debug >= 1 {fmt.eprintfln("sif: iop heap alloc %d %x at %x -> %x", kind, req, addr, a)}
+	return a
+}
+
 iop_heap_free :: proc(a: u32) {
 	newest := a == iop_heap_last && a != 0
 	if newest {iop_heap_last = 0}
@@ -958,6 +967,8 @@ iop_heap_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 2: // free {address} -> 0
 		iop_heap_free(w[0])
 		w[0] = 0
+	case 4: // alloc with a placement {size, type, address} -> address, 0 on failure
+		w[0] = iop_heap_alloc_at(w[1], w[0], w[2])
 	case:
 		return false
 	}
