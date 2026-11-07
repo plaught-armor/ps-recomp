@@ -622,15 +622,23 @@ unpack :: #force_inline proc(c: u32) -> [4]i32 {
 
 // ---------------------------------------------------------------- pixels
 
+// An interpolated color to integers, all four lanes in one truncation
+// (cvttps2dq, wasm's i32x4.trunc_sat_f32x4_s).
+// The GS interpolates colors in fixed point, so equal vertex colors stay
+// exact. Float barycentrics can land just below (128 -> 127.99999); the
+// small bias keeps truncation from dropping a whole step, which breaks
+// alpha tests against the vertex value.
+@(private)
+col_int :: #force_inline proc "contextless" (col: [4]f32) -> [4]i32 {
+	COL_EPS :: 1.0 / 256
+	v := transmute(#simd[4]f32)col + #simd[4]f32{COL_EPS, COL_EPS, COL_EPS, COL_EPS}
+	return transmute([4]i32)cast(#simd[4]i32)v
+}
+
 @(private)
 pixel :: proc(c: ^Ctx, x, y: i32, zf: f64, col: [4]f32, u, v: f32, lod: i32, fogf: f32) #no_bounds_check {
 	px, py := u32(x), u32(y)
-	// The GS interpolates colors in fixed point, so equal vertex colors stay
-	// exact. Float barycentrics can land just below (128 -> 127.99999); the
-	// small bias keeps truncation from dropping a whole step, which breaks
-	// alpha tests against the vertex value.
-	COL_EPS :: 1.0 / 256
-	src := [4]i32{i32(col.r + COL_EPS), i32(col.g + COL_EPS), i32(col.b + COL_EPS), i32(col.a + COL_EPS)}
+	src := col_int(col)
 
 	if c.tme {
 		t := transmute([4]i32)sample(&c.tex, u, v, lod)

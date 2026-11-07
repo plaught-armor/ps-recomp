@@ -147,8 +147,7 @@ pixel_fast :: #force_inline proc(c: ^Ctx, x: i32, zf: f64, col: [4]f32, u, v: f3
 	#assert(ZTST >= 1)
 	#assert(ATST == 1 || ATST == 6)
 	px := u32(x)
-	COL_EPS :: 1.0 / 256
-	src := [4]i32{i32(col.r + COL_EPS), i32(col.g + COL_EPS), i32(col.b + COL_EPS), i32(col.a + COL_EPS)}
+	src := col_int(col)
 	when TFX == 0 { // MODULATE
 		t := transmute([4]i32)sample(&c.tex, u, v, lod)
 		for k in 0 ..< 3 {src[k] = min((t[k] * src[k]) >> 7, 255)}
