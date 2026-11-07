@@ -597,9 +597,27 @@ convert_rows :: proc(c: ^Convert, r0, r1: i32) #no_bounds_check {
 	o := int(r0) * int(fw)
 	for row in r0 ..< r1 {
 		if depth24 {
+			if row > r0 && row >> k == (row - 1) >> k {
+				// The same VRAM row as the one above: its copy.
+				copy(dst[o:][:fw], dst[o - int(fw):][:fw])
+				o += int(fw)
+				continue
+			}
 			vy := (y + row >> k) & (render.VRAM_H - 1)
 			bytes := ([^]u8)(&render.vram[vy * render.VRAM_W])[:render.VRAM_W * 2]
 			start := int(x) * 2
+			if start + int(c.w) * 3 <= render.VRAM_W * 2 {
+				// No wrap: each 3-byte pixel 1 << k times.
+				src := bytes[start:][:int(c.w) * 3]
+				for i := 0; i < len(src); i += 3 {
+					p := u32(src[i]) << 16 | u32(src[i + 1]) << 8 | u32(src[i + 2])
+					for _ in 0 ..< 1 << k {
+						dst[o] = p
+						o += 1
+					}
+				}
+				continue
+			}
 			for px in 0 ..< int(fw) {
 				b := start + (px >> k) * 3
 				r := u32(bytes[b % (render.VRAM_W * 2)])
