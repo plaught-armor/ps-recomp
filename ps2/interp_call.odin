@@ -13,7 +13,8 @@
 // (interp_unwind_find). Host code between them stops it: the `jr` returns
 // as before (shown once under PS_DEBUG). One that no call returns to (a
 // coroutine's resume) is a jump there, the calls it is inside left open
-// until a later `jr $ra` returns to one of them.
+// until a later `jr $ra` returns to one of them, when only the thread's
+// start is host code under the run: else it may return to native code.
 //
 // A link branch or `jal` / `jalr` to its own return address (bal .+8, which
 // reads the pc into $ra) only links: no call, as on the console.
@@ -41,7 +42,7 @@ interp_unwind: ^cpu.Interp_Frame
 
 // The longjmps shown so far, each kind once under PS_DEBUG: not state.
 @(private = "file")
-unwind_shown: bit_set[enum {Done, Native, Max, Jump}]
+unwind_shown: bit_set[enum {Done, Native, Max, Jump, Under}]
 
 @(private)
 branch_taken :: proc(i: r5900.Insn) -> bool {
@@ -150,10 +151,11 @@ interp_body :: proc(entry: u32, lf: ^core.Learn_Frame) {
 	c := &cpu.state
 	pc := entry
 	// Its return address, and whether the call into it is the top record
-	// (cpu.Interp_Frame): host code between, or a mod's chain, could be.
+	// (cpu.Interp_Frame), or with none, the thread's base: host code
+	// between, such as native code, or a mod's chain, could be.
 	ra := u32(c.r[31].d[0])
 	top := cpu.interp_top
-	direct := !cpu.mod_on && top != nil && top.target == entry && top.ret == ra && top.sp == u32(c.r[29].d[0])
+	direct := !cpu.mod_on && (top == nil ? entry == cpu.interp_base : top.target == entry && top.ret == ra && top.sp == u32(c.r[29].d[0]))
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
 		if lf != nil {learn_note(lf, i)}
@@ -244,7 +246,9 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool) -> bool {
 // cpu.UNWIND_MAX records above returning to t with the guest sp now is the
 // call to unwind to (interp_unwind), when every run above it was called
 // directly (direct, then each record's). Else the `jr` returns as before,
-// except when no record returns to t at all, with any sp: true, a jump.
+// except when no record returns to t at all, with any sp, and every run
+// down to the thread's base was called directly: true, a jump. With host
+// code under a run, t may be a native caller's return address.
 @(private = "file")
 interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 	sp := u32(cpu.state.r[29].d[0])
@@ -279,6 +283,13 @@ interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 		ok = ok && f.direct
 	}
 	if seen {return false}
+	if !ok {
+		if cpu.debug >= 1 && .Under not_in unwind_shown {
+			unwind_shown += {.Under}
+			fmt.eprintfln("ee: jr $ra to %08x: no call returns there, host code under the run; returning as before", t)
+		}
+		return false
+	}
 	if cpu.debug >= 1 && .Jump not_in unwind_shown {
 		unwind_shown += {.Jump}
 		fmt.eprintfln("ee: jr $ra to %08x: no call returns there; a jump", t)

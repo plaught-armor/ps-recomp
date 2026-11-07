@@ -158,6 +158,12 @@ call :: proc(addr: u32) {
 	fatal("call to unknown function %08x (ra %08x)", addr, u32(state.r[31].d[0]))
 }
 
+// cpu.call for a thread's entry (the kernel's thread start, ExecPS2, the boot).
+thread_call :: proc(addr: u32) {
+	interp_base = addr
+	call(addr)
+}
+
 // A jump inside a function to an address that is no label of it. Discovery
 // splits a function after a mid-body `jr $ra`, so switch cases past it land
 // in what was recompiled as another function: continue there as a tail call
@@ -232,6 +238,12 @@ interp_top: ^Interp_Frame
 interp_tops: [256]^Interp_Frame
 // The most records any chain held (printed as the game ends: not state).
 interp_max_depth: u32
+
+// The entry of the thread starting now (thread_call): an interpreted run
+// entered there with no records open is the thread's base, with only the
+// kernel's host code under it (ps2 interp_body). Not state: read only as a
+// run starts, right after thread_call sets it.
+interp_base: u32
 
 // The most calls an unwind looks through, both interpreters: past it a
 // `jr $ra` returns as before.
