@@ -88,6 +88,30 @@
 //
 // The fall-through decodes 0x1014 as a delay slot first; the branch to it
 // still walks on to 0x1018.
+//
+// Then the same on a fifth image (code only), first for a secondary's probe,
+// function 0x100c in range 0x1000, extra label 0x1020:
+//
+//   0x100c  beqz $a0, 0x101c; nop
+//   0x1014  li $v0, 2
+//   0x1018  j 0x1100                        out; its delay slot, 0x101c, is
+//   0x101c  li $v0, 3                         also the branch's target
+//   0x1020  li $v0, 4; jr $ra; nop          E, an extra label reached only
+//                                             by walking on from 0x101c
+//
+// The probe walks on from 0x101c, so it keeps E. Then for the computed
+// sweep, function 0x1040, no extra labels:
+//
+//   0x1040  beqz $a0, 0x1054; nop
+//   0x1048  lw $v0, 0($a0); nop
+//   0x1050  j 0x1100                        its delay slot, 0x1054, is
+//   0x1054  li $v0, 3                         also the branch's target
+//   0x1058  jr $v0                          reached only from 0x1054
+//   0x105c  b 0x1068                          its delay slot, no start
+//   0x1060  li $v0, 4; nop...                 swept as code
+//
+// Walking on from 0x1054 meets `jr $v0`, so the sweep runs. It starts no
+// walk at the delay slot 0x105c, so 0x1060 is no slot of that `b`.
 package main
 
 import "core:fmt"
@@ -260,6 +284,28 @@ main :: proc() {
 	check(0x1018 in b.insns && 0x101c in b.insns && 0x1020 in b.insns, "delay-slot target: 0x1018 after it not walked")
 	mips.func_free(b)
 	delete(slot)
+
+	five := make([]u8, 0x70)
+	put(five, 0x100c, 0x10800003, NOP, 0x24020002, j(0x1100), 0x24020003, 0x24020004, JR_RA, NOP) // beq $a0, $0, 0x101c
+	put(five, 0x1040, 0x10800004, NOP, 0x8c820000, NOP, j(0x1100), 0x24020003) // beq $a0, $0, 0x1054
+	put(five, 0x1058, 0x00400008, 0x10000002, 0x24020004) // jr $v0; b 0x1068
+	fives := mips.Image {
+		base     = 0x1000,
+		data     = five,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(five)), data = five, flags = mips.SHF_ALLOC | mips.SHF_EXEC}},
+	}
+	p := mips.func_make(0x100c, 0x102c, 0x1000)
+	mips.discover(r5900.RULES, fives, p, {0x1020})
+	check(0x101c in p.labels && 0x101c in p.delay, "probe: 0x101c not a label in a delay slot")
+	check(0x1020 in p.labels && 0x1020 in p.insns && 0x1024 in p.insns, "probe: dropped the extra label 0x1020 after the delay-slot target")
+	mips.func_free(p)
+	k := mips.func_make(0x1040, 0x1070)
+	mips.discover(r5900.RULES, fives, k, {})
+	check(0x1054 in k.labels && 0x1054 in k.delay && 0x1058 in k.insns, "sweep: 0x1058 after the delay-slot target not walked")
+	check(k.computed, "sweep: `jr $v0` after the delay-slot target not seen")
+	check(0x1060 in k.labels && 0x1060 not_in k.delay, "sweep: walked from the delay slot 0x105c")
+	mips.func_free(k)
+	delete(five)
 
 	if failed != 0 {
 		os.exit(1)
