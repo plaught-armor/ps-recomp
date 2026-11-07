@@ -434,7 +434,7 @@ build_file :: proc(name: string, text: []u32, rels: []Rel, entry: u32) -> []u8 {
 	// module info: entry, gp, text, data, bss, version, name
 	for v, i in ([?]u32{0, entry, 0x8010, text_size, 0, 0x40}) {w32(f, 0x74 + u32(i) * 4, v)}
 	w16(f, 0x74 + 24, 0x0102)
-	copy(f[0x74 + 26:][:8], name)
+	copy(f[0x74 + 26:TEXT], name)
 	for v, i in text {w32(f, TEXT + u32(i) * 4, v)}
 	for r, i in rels {
 		w32(f, rel + u32(i) * 8, r.off)
@@ -6994,45 +6994,48 @@ test_dbcman :: proc() {
 	call(buf[:], 0x1315, 0)
 	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001315}].n == 1, "dbcman 0x1315: a row")
 
-	// The contract, by the dbcman export library of the image loaded: 1.02
-	// serves the 1.x calls; a name alone changes nothing.
-	dbc_image :: proc(version: u32) -> []u8 {
-		return build_file("Dbc_Manager", {EXPORT, 0, version, 0x6d636264, 0x00006e61, 0}, {}, 0) // "dbcman"
+	// The server set, by the Dbc_Manager module version of the image loaded:
+	// 0x301 serves the 131b set; a name alone changes nothing. Each image
+	// exports dbcman 1.02, as every retail one does.
+	dbc_image :: proc(version: u16) -> []u8 {
+		f := build_file("Dbc_Manager", {EXPORT, 0, 0x0102, 0x6d636264, 0x00006e61, 0}, {}, 0) // "dbcman"
+		endian.put_u16(f[0x74 + 24:], .Little, version)
+		return f
 	}
-	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+	iop.dbcman_module("dbc.irx", dbc_image(0x301))
 	call(buf[:], 0x1363)
-	check(w[0] == 0x310, "dbcman 1.x 0x1363: version 0x310")
+	check(w[0] == 0x310, "dbcman 131b 0x1363: version 0x310")
 	for &b in buf {b = 0}
 	w[0], w[1] = 0, 0x0101800c
 	iop.sif.servers[iop.DBC_SID](0x8000131a, buf[:], 0x280)
-	check(r[0x20c / 4] == 1 && w[2] == 1 && buf[0xc] == 1 && w[0x8c / 4] == 0, "dbcman 1.x 0x131a: the result at +0x20c, the size at +8, the data at +0xc")
+	check(r[0x20c / 4] == 1 && w[2] == 1 && buf[0xc] == 1 && w[0x8c / 4] == 0, "dbcman 131b 0x131a: the result at +0x20c, the size at +8, the data at +0xc")
 	clear(&core.compat.calls)
 	for &b in buf {b = 0xee}
 	iop.sif.servers[iop.DBC_SID](0x80001319, buf[:], 0x90)
 	iop.sif.servers[iop.DBC_SID](0x80001319, buf[:], 0x90)
-	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001319}].n == 2 && w[0x8c / 4] == 0xeeeeeeee && w[1] == 0xeeeeeeee, "dbcman 1.x 0x1319: not served, a row, the buffer left")
-	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x0101800c) == 0 && r[0x108c / 4] == 1 && buf[0xc] == 1, "dbcman 1.x 0x8000131b: a driver call, the result at +0x108c")
+	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001319}].n == 2 && w[0x8c / 4] == 0xeeeeeeee && w[1] == 0xeeeeeeee, "dbcman 131b 0x1319: not served, a row, the buffer left")
+	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x0101800c) == 0 && r[0x108c / 4] == 1 && buf[0xc] == 1, "dbcman 131b 0x8000131b: a driver call, the result at +0x108c")
 	for &b in buf {b = 0}
 	w[0], w[1] = 0, 0x0101800c
-	check(iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x1094) && w[0x108c / 4] == 0, "dbcman 1.x 0x8000131b: over 0x1090 bytes, not served")
-	check(!iop.sif.servers[iop.DBC_SID_FAST0](0, buf[:], 0x90), "dbcman 1.x: no fast server")
+	check(iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x1094) && w[0x108c / 4] == 0, "dbcman 131b 0x8000131b: over 0x1090 bytes, not served")
+	check(!iop.sif.servers[iop.DBC_SID_FAST0](0, buf[:], 0x90), "dbcman 131b: no fast server")
 	iop.sif.servers[iop.DBC_SID_BIG](0, buf[:], 0x2090)
-	check(r[0x208c / 4] == 1, "dbcman 1.x 0x8000131c: a driver call")
+	check(r[0x208c / 4] == 1, "dbcman 131b 0x8000131c: a driver call")
 	iop.dbcman_module("ds2o_d")
-	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 1.x: no image, still 1.x; ds2o_d served as ds1o_d")
+	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 131b: no image, still 131b; ds2o_d served as ds1o_d")
 	mid_off :: proc(buf: []u8) -> bool {return !iop.sif.servers[iop.DBC_SID_MID](0, buf, 0x90) && pad_cmd(buf, 0, 0, 0x0101800c) == 1}
-	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
-	check(mid_off(buf[:]), "dbcman: a 2.x image, the 2.x calls")
-	iop.dbcman_module(`cdrom0:\MODULES\DBCMAN.IRX;1`, dbc_image(0x0102))
-	check(!mid_off(buf[:]), "dbcman: a disc path load's image picks the 1.x calls")
+	iop.dbcman_module("dbc.irx", dbc_image(0x310))
+	check(mid_off(buf[:]), "dbcman: a 0x310 image, the fast set")
+	iop.dbcman_module(`cdrom0:\MODULES\DBCMAN.IRX;1`, dbc_image(0x301))
+	check(!mid_off(buf[:]), "dbcman: a disc path load's image picks the 131b set")
 	iop.dbcman_module("rom0:DBCMAN")
-	check(mid_off(buf[:]), "dbcman: a dbcman load with no image, the 2.x calls")
-	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
-	iop.dbcman_module("dbc.irx", dbc_image(0x0301))
-	check(mid_off(buf[:]), "dbcman: an unknown major, the 2.x calls")
-	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+	check(mid_off(buf[:]), "dbcman: a dbcman load with no image, the fast set")
+	iop.dbcman_module("dbc.irx", dbc_image(0x301))
+	iop.dbcman_module("dbc.irx", dbc_image(0x320))
+	check(mid_off(buf[:]), "dbcman: an unknown module version, the fast set")
+	iop.dbcman_module("dbc.irx", dbc_image(0x301))
 	iop.dbcman_module("rom0:SIO2MAN")
-	check(!mid_off(buf[:]), "dbcman: another module's load keeps the contract")
+	check(!mid_off(buf[:]), "dbcman: another module's load keeps the set")
 
 	// Through the loadfile server, PS_IRX=0: a cdrom dbcman's file is read
 	// for its version, leaving the drive as it was; a rom0 or host one has no
@@ -7051,27 +7054,27 @@ test_dbcman :: proc() {
 		iop.disc_dir = dir
 		iop.iop_irx = false
 		defer iop.iop_irx = true
-		_ = os.write_entire_file(fmt.tprintf("%s/DBCMAN.IRX", dir), dbc_image(0x0102))
-		iop.dbcman_module("dbc.irx", dbc_image(0x0201))
+		_ = os.write_entire_file(fmt.tprintf("%s/DBCMAN.IRX", dir), dbc_image(0x301))
+		iop.dbcman_module("dbc.irx", dbc_image(0x310))
 		iop.iop_cd.stopped = true
 		load(buf[:], `cdrom0:\DBCMAN.IRX;1`)
-		check(!mid_off(buf[:]), "dbcman: a cdrom load's file picks the 1.x calls")
+		check(!mid_off(buf[:]), "dbcman: a cdrom load's file picks the 131b set")
 		check(iop.iop_cd.stopped, "dbcman: a cdrom load leaves the drive stopped")
 		load(buf[:], "rom0:DBCMAN")
-		check(mid_off(buf[:]), "dbcman: a rom0 load through the server, the 2.x calls")
-		iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+		check(mid_off(buf[:]), "dbcman: a rom0 load through the server, the fast set")
+		iop.dbcman_module("dbc.irx", dbc_image(0x301))
 		load(buf[:], "host0:DBCMAN.IRX")
-		check(mid_off(buf[:]), "dbcman: a host load takes no disc image, the 2.x calls")
+		check(mid_off(buf[:]), "dbcman: a host load takes no disc image, the fast set")
 		iop.iop_cd.stopped = false
 	}
 
-	// LoadModuleBuffer: the image the EE copied over picks the contract.
-	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
-	check(load_buffer(dbc_image(0x0102)) == {2, 0} && !mid_off(buf[:]), "dbcman: a buffer load's image picks the 1.x calls")
+	// LoadModuleBuffer: the image the EE copied over picks the set.
+	iop.dbcman_module("dbc.irx", dbc_image(0x310))
+	check(load_buffer(dbc_image(0x301)) == {2, 0} && !mid_off(buf[:]), "dbcman: a buffer load's image picks the 131b set")
 	iop.dbcman_init()
 	create(buf[:], 1, 0, PAD_A, PAD_B)
-	check(mid_off(buf[:]), "dbcman: init serves the 2.x calls again")
-	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
+	check(mid_off(buf[:]), "dbcman: init serves the fast set again")
+	iop.dbcman_module("dbc.irx", dbc_image(0x310))
 
 	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
 }
