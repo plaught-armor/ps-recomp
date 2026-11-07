@@ -621,6 +621,12 @@ convert_rows :: proc(c: ^Convert, r0, r1: i32) #no_bounds_check {
 				}
 				continue
 			}
+			if x << k + fw <= t.w {
+				// No wrap: a straight run the compiler can widen.
+				for c, i in line[x << k:][:fw] {dst[o + i] = c & 0xffffff}
+				o += int(fw)
+				continue
+			}
 			for px in 0 ..< fw {
 				dst[o] = line[(x << k + px) & (t.w - 1)] & 0xffffff
 				o += 1

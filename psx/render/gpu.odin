@@ -2466,17 +2466,22 @@ vram_put_run :: proc(x0, y: i32, px: []u16) #no_bounds_check {
 	hi_touch(x, y, n, 1)
 	row := vram[(y & (VRAM_H - 1)) * VRAM_W + x:][:n]
 	set: u16 = gpu.set_mask ? 0x8000 : 0
+	// The hi-res target is VRAM << k on each axis, so the run's blocks
+	// stay in its rows too: block i's top left at at + i << k.
+	hi := target_count == 2
 	t := &targets[1]
 	k := t.shift
+	side := i32(1) << k
+	at := ((y & (VRAM_H - 1)) << k) * t.w + x << k
 	for p, i in px {
 		if gpu.check_mask && row[i] & 0x8000 != 0 {continue}
 		c := p | set
 		row[i] = c
-		if target_count == 2 {
-			for dy in 0 ..< i32(1) << k {
-				for dx in 0 ..< i32(1) << k {
-					t.rgb[target_index(t, (x + i32(i)) << k + dx, y << k + dy)] = hi_pixel(c)
-				}
+		if hi {
+			h := hi_pixel(c)
+			o := at + i32(i) << k
+			for dy in 0 ..< side {
+				for &q in t.rgb[o + dy * t.w:][:side] {q = h}
 			}
 		}
 	}
