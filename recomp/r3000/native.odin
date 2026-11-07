@@ -7,6 +7,7 @@
 // lists them. A patch condition must name a bool variable there.
 package r3000
 
+import "base:runtime"
 import "core:slice"
 import "../mips"
 import "../native"
@@ -946,7 +947,15 @@ is_ident :: proc(s: string) -> bool {
 
 // Machine code for f into a; returns its code offset. exact: accesses see
 // the cycles up to them (Step.seen); false for the IOP.
+//
+// The temp memory it takes is freed at its return: nothing temp outlives a
+// function. The only temp in a function's compile is the native backend's
+// layout of the function before it (wasm_finalize, run from func_begin), its
+// maps and lists used up there; lower, go, events and the switch code take
+// none. Temp taken before the call is kept. Only the default temp allocator
+// frees here; another (play's learned_compile_here arena) keeps it all.
 native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exact := true) -> u32 {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	steps := lower(f, patches, cycles, exact)
 	a.charge_at = CYCLES
 	defer a.charge = 0
