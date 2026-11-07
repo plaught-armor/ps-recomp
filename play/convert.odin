@@ -1,6 +1,7 @@
 package play
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:thread"
@@ -194,11 +195,22 @@ convert_store :: proc(image, dir: string, ps2_disc: bool, deadline: time.Duratio
 // child: in this process, to tmp, read back. A failure exits with status
 // 1 (convert), so this process does nothing else (`play --convert-store`):
 // it leaves tmp, which the next conversion removes first, and no key.
+// The conversion frees the temp allocator as it goes (once per function),
+// so it runs under one of its own: the caller's temp data, the key's set
+// and the paths among it, outlive it.
 @(private = "file")
 convert_here :: proc(image, tmp: string, caps: [2]string, hooks: string) -> ([]u8, bool) {
 	os.remove(tmp)
 	defer os.remove(tmp)
-	if convert(image, tmp, caps[0], caps[1], hooks) != 0 {
+	status: int
+	{
+		scratch: mem.Dynamic_Arena
+		mem.dynamic_arena_init(&scratch)
+		defer mem.dynamic_arena_destroy(&scratch)
+		context.temp_allocator = mem.dynamic_arena_allocator(&scratch)
+		status = convert(image, tmp, caps[0], caps[1], hooks)
+	}
+	if status != 0 {
 		fmt.eprintln("play: no native code (the conversion failed)")
 		return nil, false
 	}
