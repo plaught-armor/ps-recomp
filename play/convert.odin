@@ -59,14 +59,37 @@ convert :: proc(image, out, vu0, vu1: string, hooks := "", vu_only := false) -> 
 	return 0
 }
 
-// The learned child (`play --learned <psx | iop | ee> <records> <out>`):
-// the runs of the PS1, IOP or EE processor in the LEARN file at records
-// that native code can stand for (core.learn_compilable), compiled to a
-// blob of learned functions for this host at out (psx/native/learned.odin;
-// the EE's, ps2/learned.odin). The PS1 and the IOP both run the R3000 of
-// psx_cpu, so one compiler serves them; the EE's is recomp/r5900.
-compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
-	blob, ok := learned_compile(cpu, records)
+// The learned child (`play --learned <psx | iop | ee> <records> <out>
+// [interp]`): the runs of the PS1, IOP or EE processor in the LEARN file at
+// records that native code can stand for (core.learn_compilable), compiled
+// to a blob of learned functions for this host at out
+// (psx/native/learned.odin; the EE's, ps2/learned.odin). The PS1 and the
+// IOP both run the R3000 of psx_cpu, so one compiler serves them; the EE's
+// is recomp/r5900. interp, a file of native.Blob_Interp as learned_store
+// passes them (learned_interp_bytes), is the code a PS1 run leaves to the
+// interpreter: a wasm32 build's mid-run compile in a worker
+// (midload_learned.odin) passes it.
+compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string, interp_path := "") -> int {
+	data, err := os.read_entire_file(records, context.allocator)
+	if err != nil {
+		fmt.eprintln("learned: cannot read", records, err)
+		return 1
+	}
+	defer delete(data)
+	interp: []native.Blob_Interp
+	if interp_path != "" {
+		bytes, ierr := os.read_entire_file(interp_path, context.allocator)
+		if ierr != nil {
+			fmt.eprintln("learned: cannot read", interp_path, ierr)
+			return 1
+		}
+		if len(bytes) % size_of(native.Blob_Interp) != 0 {
+			fmt.eprintfln("learned: %s: %d bytes, not a list of interpreted entries", interp_path, len(bytes))
+			return 1
+		}
+		interp = ([^]native.Blob_Interp)(raw_data(bytes))[:len(bytes) / size_of(native.Blob_Interp)]
+	}
+	blob, ok := learned_compile(cpu, data, interp)
 	if !ok {return 1}
 	defer delete(blob)
 	if werr := os.write_entire_file(out, blob); werr != nil {
@@ -76,16 +99,16 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 	return 0
 }
 
-// compile_learned's blob, in context.allocator; false after a message.
-// interp: the program's code left to the interpreter (psx_interp), for a
-// PS1 run to leave too (r3000.learned_blob).
-learned_compile :: proc(cpu: core.Learn_Cpu, records: string, interp: []native.Blob_Interp = nil) -> ([]u8, bool) {
-	data, err := os.read_entire_file(records, context.allocator)
-	if err != nil {
-		fmt.eprintln("learned: cannot read", records, err)
-		return nil, false
-	}
-	defer delete(data)
+// The bytes of an interp list, as compile_learned reads them.
+learned_interp_bytes :: proc(interp: []native.Blob_Interp) -> []u8 {
+	return ([^]u8)(raw_data(interp))[:len(interp) * size_of(native.Blob_Interp)]
+}
+
+// compile_learned's blob of the LEARN records in data, in
+// context.allocator; false after a message. interp: the program's code
+// left to the interpreter (psx_interp), for a PS1 run to leave too
+// (r3000.learned_blob).
+learned_compile :: proc(cpu: core.Learn_Cpu, data: []u8, interp: []native.Blob_Interp = nil) -> ([]u8, bool) {
 	recs, _ := core.learn_read(data)
 	runs, large, smc := core.learn_compilable(recs[:], cpu)
 	arch, ok := native.arch_of("learned", mips.HOST_ARCH)
@@ -361,6 +384,16 @@ learned_interp :: proc(dir: string, cpu: core.Learn_Cpu) -> ([]native.Blob_Inter
 	return nil, true
 }
 
+// learned_compile in this process, under a temp allocator of its own, as
+// convert_here: the compile takes temp memory per function and frees none.
+learned_compile_here :: proc(cpu: core.Learn_Cpu, data: []u8, interp: []native.Blob_Interp) -> ([]u8, bool) {
+	scratch: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&scratch)
+	defer mem.dynamic_arena_destroy(&scratch)
+	context.temp_allocator = mem.dynamic_arena_allocator(&scratch)
+	return learned_compile(cpu, data, interp)
+}
+
 // Compile the LEARN file at records in a child of this executable (as
 // convert_store; in this process in a wasm32 build, which cannot start one)
 // and store the blob of learned functions in the disc directory dir, its
@@ -369,19 +402,15 @@ learned_interp :: proc(dir: string, cpu: core.Learn_Cpu) -> ([]native.Blob_Inter
 learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: time.Duration, interp: []native.Blob_Interp = nil) -> bool {
 	l := learned_files(cpu)
 	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
-		// Under a temp allocator of its own, as convert_here: the compile
-		// takes temp memory per function and frees none.
-		blob: []u8
-		ok: bool
-		{
-			scratch: mem.Dynamic_Arena
-			mem.dynamic_arena_init(&scratch)
-			defer mem.dynamic_arena_destroy(&scratch)
-			context.temp_allocator = mem.dynamic_arena_allocator(&scratch)
-			// A PS1 run under FLAT cannot switch threads inside native
-			// code: the runs that may are left out, by interp.
-			blob, ok = learned_compile(cpu, records, interp)
+		// A PS1 run under FLAT cannot switch threads inside native code:
+		// the runs that may are left out, by interp.
+		data, err := os.read_entire_file(records, context.allocator)
+		if err != nil {
+			fmt.eprintln("learned: cannot read", records, err)
+			return false
 		}
+		blob, ok := learned_compile_here(cpu, data, interp)
+		delete(data)
 		if !ok {return false}
 	} else {
 		tmp := strings.concatenate({core.disc_path(dir, l.blob, context.temp_allocator), ".compile"}, context.temp_allocator)

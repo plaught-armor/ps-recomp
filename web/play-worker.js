@@ -2,6 +2,7 @@
 // same imports) on web/wasi.js and web/sdl.js. It never yields while the
 // module runs; the page reaches it only through the SharedArrayBuffers.
 import { buildId, NetImports, NO_NET } from "./net.js";
+import { LearnImports, NO_LEARN, NO_SDL } from "./learn.js";
 import { dataLoad, dataSave, discOf, openStored, store } from "./readers.js";
 import { Native } from "./native.js";
 import { Sdl } from "./sdl.js";
@@ -71,9 +72,15 @@ async function discFor({ files, urls, store: name, stored }) {
 // times. failSaves: false stores /data back only when the module exits
 // with 0 (`play --convert-store`, whose failure leaves its temporary file
 // there). Before /data is stored the page gets {saving}: from then on
-// stopping the Worker could cut a write short.
+// stopping the Worker could cut a write short. learn: the LEARN buffer,
+// for a mid-run learned compile (web/learn.js), which goes to the page as
+// {learn: {records, interp}}.
+//
+// out: a tool run, as a mid-run learned compile's (web/learn.js): no disc,
+// no store and no window; /data holds only seed (path -> bytes), and done
+// carries what the module wrote there as files.
 onmessage = async ({ data }) => {
-	const { wasm, args, env = {}, test = false, failSaves = true, control, audio, present, net: netBuffer } = data;
+	const { wasm, args, env = {}, test = false, failSaves = true, control, audio, present, net: netBuffer, learn: learnBuffer, out = false, seed } = data;
 	let wasi = null;
 	let disc = null;
 	const ring = [];
@@ -90,6 +97,7 @@ onmessage = async ({ data }) => {
 	};
 	// The files for the page, copied out of the shim's buffers.
 	const written = () => {
+		if (out && wasi !== null) return [...wasi.files(wasi.data)].map(([name, bytes]) => [name, bytes.slice()]);
 		if (!test || wasi === null) return undefined;
 		const out = [...wasi.files()].map(([name, bytes]) => [name, bytes.slice()]);
 		out.push(["ring.pcm", concat(ring)]);
@@ -103,14 +111,25 @@ onmessage = async ({ data }) => {
 		const bytes = await response.arrayBuffer();
 		const module = await WebAssembly.compile(bytes);
 		const net = netBuffer ? new NetImports(netBuffer, await buildId(bytes)) : null;
+		const learn = learnBuffer
+			? new LearnImports(learnBuffer, (records, interp) => {
+					postMessage({ learn: { records, interp } }, [records.buffer, interp.buffer]);
+					return true;
+				})
+			: null;
 		times.compileMs = Math.round(performance.now() - t0);
 		const log = (_fd, text) => postMessage({ log: text });
-		disc = await discFor(data);
-		postMessage({ store: disc.info });
+		if (out) {
+			disc = { disc: new Map(), close() {} };
+		} else {
+			disc = await discFor(data);
+			postMessage({ store: disc.info });
+		}
 		wasi = new Wasi({ args: [wasm.replace(/\.wasm$/, ""), ...args], env, disc: disc.disc, log });
 		// /data from the store (readers.js), but in test mode, whose runs start
 		// from an empty /data so they compare with native ones.
-		if (!test && typeof navigator.storage?.getDirectory === "function") {
+		if (seed) wasi.seed(seed);
+		if (!test && !out && typeof navigator.storage?.getDirectory === "function") {
 			try {
 				stored = await dataLoad();
 				wasi.seed(stored);
@@ -120,17 +139,19 @@ onmessage = async ({ data }) => {
 			}
 		}
 		const tee = test ? (samples) => ring.push(samples.slice()) : null;
-		const sdl = new Sdl({ control, audio, present, post: (m) => postMessage(m), tee });
+		const sdl = out ? null : new Sdl({ control, audio, present, post: (m) => postMessage(m), tee });
 		const native = new Native({ log: (text) => postMessage({ log: text }) });
 		const instance = await WebAssembly.instantiate(module, {
 			...wasi.imports,
-			"system:SDL2": sdl.imports,
+			"system:SDL2": sdl?.imports ?? NO_SDL,
 			"system:ps_native": native.imports,
 			"system:ps_net": net?.imports ?? NO_NET,
+			"system:ps_learn": learn?.imports ?? NO_LEARN,
 		});
-		sdl.attach(instance);
+		sdl?.attach(instance);
 		native.attach(instance);
 		net?.attach(instance);
+		learn?.attach(instance);
 		t1 = performance.now();
 		const code = wasi.run(instance);
 		times.runMs = Math.round(performance.now() - t1);
@@ -146,3 +167,4 @@ onmessage = async ({ data }) => {
 		disc?.close();
 	}
 };
+

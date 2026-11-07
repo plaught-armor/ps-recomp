@@ -529,6 +529,20 @@ cmp out-wasm/hashes.tsv out-native/hashes.tsv
 Both runs start from an empty data directory. A `PS_*` variable set for
 play.mjs is passed on to the module.
 
+A wasm PS1 run that records its code and runs learned code compiles its
+new records mid-run (play/midload_learned.odin): once they have stopped
+growing for 300 frames, the records of the entries no loaded blob covers
+go to another instance of the module (`play --learned psx`), in a Worker
+on the page (web/learn.js) and in a worker_thread under play.mjs
+(`tests/wasi/learnlink.mjs`), and the run loads the blob it hands back.
+Nothing is stored; the next run compiles its own set as before. A run
+with `PS_DUMP` waits for each compile, so its hashes match a run with
+`PS_MIDLOAD=0`. Netplay and rollback runs never load mid-run. With
+`COMMIT=test`, `PS_MIDLEARN_CHECK=1` compiles each set in the run too and
+logs whether the worker's blob is the same, and `PS_MIDLEARN_STALE=1`
+makes each blob stale, so it is dropped. A `COMMIT=test` build finds only
+a native blob whose key names `test`.
+
 A headless PS2 game never presents, so its present count stays 0. To count
 presents, run it with `PS_HEADLESS=0 node tests/wasi/play.mjs ...`: slower,
 and the hashes are the same.
