@@ -10,7 +10,10 @@
 // stubs, which log each access's address (or a tag) and cycles:
 // interpreted, then as a learned function (native code from the same
 // words). Both logs are the exact counts, and the cycles after the call
-// match. Before the fix, learned code had charged the instructions before
+// match. The loop sets the syscall's a0 (7: none of the ones cpu.syscall
+// does itself) in the syscall's block, which proves it no thread switch
+// (recomp/r3000/switch.odin); otherwise a wasm32 blob leaves the run to the
+// interpreter. Before the fix, learned code had charged the instructions before
 // the label when the block fell into it, and the interpreter had not.
 //
 // Run it on the host, plain and FLAT, and built for wasi_wasm32 (run.mjs),
@@ -51,14 +54,15 @@ CODE := [?]u32 {
 	0x954b1120, // 0c L: lhu t3, 0x1120(t2)   right after the label
 	0xad491124, // 10 sw t1, 0x1124(t2)
 	0x40806000, // 14 mtc0 zero, sr           irq_check
-	0x0000000c, // 18 syscall                 a0 = 7: bios_syscall
-	0x2529ffff, // 1c addiu t1, t1, -1
-	0x8d4d1120, // 20 lw t5, 0x1120(t2)
-	0xad4d1128, // 24 sw t5, 0x1128(t2)       sees the old t5: a load delay
-	0x1520fff8, // 28 bne t1, zero, L
-	0x8d4c1128, // 2c lw t4, 0x1128(t2)       in the delay slot
-	0x03e00008, // 30 jr ra
-	0x00000000, // 34 nop
+	0x24040007, // 18 addiu a0, zero, 7       proves the syscall no thread switch
+	0x0000000c, // 1c syscall                 a0 = 7: bios_syscall
+	0x2529ffff, // 20 addiu t1, t1, -1
+	0x8d4d1120, // 24 lw t5, 0x1120(t2)
+	0xad4d1128, // 28 sw t5, 0x1128(t2)       sees the old t5: a load delay
+	0x1520fff7, // 2c bne t1, zero, L
+	0x8d4c1128, // 30 lw t4, 0x1128(t2)       in the delay slot
+	0x03e00008, // 34 jr ra
+	0x00000000, // 38 nop
 }
 
 // The access log: the address and the cycles of each I/O access, or a tag
@@ -107,7 +111,6 @@ run :: proc() -> ([]Access, u64, bool) {
 	cpu.state.r = {}
 	cpu.state.cycles = 0
 	cpu.state.r[29], cpu.state.r[31] = 0x801ff000, 0x80000ff0
-	cpu.state.r[4] = 7 // the syscall's a0: none of the ones cpu.syscall does itself
 	hits := cpu.learned_hits
 	cpu.call(LOOP)
 	out := make([]Access, len(log))
@@ -125,11 +128,11 @@ want_log :: proc() -> []Access {
 		append(&out, Access{0x1f801120, (n + 1) * cpu.CYCLES_PER_INSN}) // lhu
 		append(&out, Access{0x1f801124, (n + 2) * cpu.CYCLES_PER_INSN}) // sw
 		append(&out, Access{SR_WRITE, (n + 3) * cpu.CYCLES_PER_INSN}) // mtc0
-		append(&out, Access{SYSCALL, (n + 4) * cpu.CYCLES_PER_INSN}) // syscall
-		append(&out, Access{0x1f801120, (n + 6) * cpu.CYCLES_PER_INSN}) // lw
-		append(&out, Access{0x1f801128, (n + 7) * cpu.CYCLES_PER_INSN}) // sw, the load's next
-		append(&out, Access{0x1f801128, (n + 9) * cpu.CYCLES_PER_INSN}) // lw, the delay slot
-		n += 9
+		append(&out, Access{SYSCALL, (n + 5) * cpu.CYCLES_PER_INSN}) // syscall, after the addiu
+		append(&out, Access{0x1f801120, (n + 7) * cpu.CYCLES_PER_INSN}) // lw
+		append(&out, Access{0x1f801128, (n + 8) * cpu.CYCLES_PER_INSN}) // sw, the load's next
+		append(&out, Access{0x1f801128, (n + 10) * cpu.CYCLES_PER_INSN}) // lw, the delay slot
+		n += 10
 	}
 	return out[:]
 }
@@ -154,7 +157,7 @@ main :: proc() {
 		(^u32le)(&cpu.ram[(LOOP & 0x1fffff) + u32(k) * 4])^ = u32le(w)
 	}
 	want := want_log()
-	want_end := u64(3 + 3 * 9 + 2) * cpu.CYCLES_PER_INSN
+	want_end := u64(3 + 3 * 10 + 2) * cpu.CYCLES_PER_INSN
 
 	interp, interp_end, ran := run()
 	check(!ran, "a learned function ran before any was loaded")
