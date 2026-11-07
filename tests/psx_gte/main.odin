@@ -379,7 +379,9 @@ main :: proc() {
 	for f in Form {
 		for r in u32(0) ..< 32 {
 			code := [?]u32{word(f, r), 0, JR_RA, 0, 0}
-			b := strings.builder_make(context.temp_allocator)
+			// On the heap: emit_func's temp guard frees what out grows into.
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
 			r3000.emit_func(build(0x80002000, code[:]), &b, "f", nil, 1)
 			name, reg := emitted_gte_call(strings.to_string(b))
 			ctl := f == .Ctc2 || f == .Cfc2
@@ -442,7 +444,8 @@ main :: proc() {
 	}
 	for c in cmds {
 		code := [?]u32{c.w, 0, JR_RA, 0, 0}
-		b := strings.builder_make(context.temp_allocator)
+		b := strings.builder_make() // on the heap, as above
+		defer strings.builder_destroy(&b)
 		r3000.emit_func(build(0x80002000, code[:]), &b, "f", nil, 1)
 		name, arg := emitted_gte_call(strings.to_string(b))
 		if name != c.name || arg != (c.whole ? c.w & 0x1ffffff : 0) {
