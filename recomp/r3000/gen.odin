@@ -27,7 +27,9 @@
 //   patches          optional: patch points (at, cond, target)
 //   quiet            optional: `true` leaves out per-function warnings
 //   native_arch      optional: also compile to machine code, for x64_sysv,
-//                    x64_win or arm64 (psx/native.odin loads it)
+//                    x64_win, arm64 or wasm32 (psx/native.odin loads it;
+//                    wasm32 leaves functions that may switch threads to the
+//                    interpreter, switch.odin)
 //   native_out       with native_arch: the file the machine code goes to
 //
 // Every module is split with references from the whole program: overlays
@@ -95,6 +97,9 @@ Program :: struct {
 	code:     ^native.Asm, // nil without native_arch
 	n_funcs:  [dynamic]native.Blob_Func,
 	n_ovls:   [dynamic]native.Blob_Ovl,
+	// Entries left to the interpreter on purpose (thread_switches on
+	// wasm32), into the blob's interp list.
+	interp:   Set,
 }
 
 // The overlays/manifest.tsv files (file, slot), each at its slot and named
@@ -129,11 +134,8 @@ generate :: proc(o: mips.Options) {
 		if !ok {
 			mips.fail("%s: unknown native_arch %s", o.path, s)
 		}
-		if arch == .Wasm32 {
-			mips.fail("%s: no wasm32 native backend for the R3000 yet", o.path)
-		}
 		p.code = new(native.Asm)
-		p.code^ = native.make_asm(arch, native_ram(), NATIVE_CACHED[:])
+		p.code^ = native_asm(arch)
 	}
 	p.overlays = load_overlays(o)
 	if path := mips.option_or(o, "funcs", ""); path != "" {
@@ -169,9 +171,18 @@ generate :: proc(o: mips.Options) {
 		program_refs(&p.refs, ov.img, lo, hi)
 	}
 	package_insns := mips.parse_int(mips.option_or(o, "package_insns", fmt.tprint(PACKAGE_INSNS)))
-	recomp_exe(&p, code_lo, code_hi)
+	mods := make([][]^Func, 1 + len(p.overlays))
+	mods[0] = exe_funcs(&p, code_lo, code_hi)
+	for ov, k in p.overlays {
+		mods[1 + k] = overlay_funcs(&p, ov)
+	}
+	if p.code != nil && p.code.arch == .Wasm32 {
+		p.interp = thread_switches(mods)
+		fmt.printfln("native: %d functions that may switch threads left to the interpreter", len(p.interp))
+	}
+	recomp_exe(&p, mods[0])
 	if p.overlays != nil {
-		recomp_overlays(&p, package_insns)
+		recomp_overlays(&p, mods[1:], package_insns)
 	}
 	runs: []Learned
 	if path := mips.option_or(o, "learned", ""); path != "" {
@@ -180,7 +191,14 @@ generate :: proc(o: mips.Options) {
 	write_learned(p.out, p.runtime, runs, package_insns)
 	if p.code != nil {
 		path := mips.option(o, "native_out")
-		size, ok := native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:])
+		interp := make([]u32, len(p.interp))
+		n := 0
+		for e in p.interp {
+			interp[n] = e
+			n += 1
+		}
+		slice.sort(interp)
+		size, ok := native.write_blob(path, p.code, p.n_funcs[:], p.n_ovls[:], interp = interp)
 		if !ok {
 			mips.fail("cannot write %s", path)
 		}
@@ -205,9 +223,9 @@ warn :: proc(p: ^Program, f: ^Func) {
 	}
 }
 
-// The executable into <out>/exe.odin.
+// The executable's functions.
 @(private = "file")
-recomp_exe :: proc(p: ^Program, code_lo, code_hi: u32) {
+exe_funcs :: proc(p: ^Program, code_lo, code_hi: u32) -> []^Func {
 	img := p.exe
 	ptrs: Set
 	mips.data_pointers(img, code_lo, code_hi, &ptrs)
@@ -215,7 +233,36 @@ recomp_exe :: proc(p: ^Program, code_lo, code_hi: u32) {
 	known: Set
 	known[img.entry] = {}
 	entries, calls, guessed := mips.module_entries(RULES, img, code_lo, code_hi, p.listed["ram"][:], p.refs, known)
-	funcs := mips.build_module(RULES, img, code_lo, code_hi, entries, ptrs, calls, p.refs, guessed)
+	return mips.build_module(RULES, img, code_lo, code_hi, entries, ptrs, calls, p.refs, guessed)
+}
+
+// An overlay's functions, past its id word at the slot.
+@(private = "file")
+overlay_funcs :: proc(p: ^Program, o: Overlay) -> []^Func {
+	img := o.img
+	slot, hi := mips.image_range(img)
+	ptrs: Set
+	mips.data_pointers(img, slot, hi, &ptrs)
+	// Code may follow a header of strings or tables; its first function
+	// can be reached only through pointers built at run time. Header
+	// data precedes it, so it skips the fall-through check.
+	known: Set
+	for a := slot + 4; a < hi; a += 4 {
+		if mips.is_prologue(img, a) {
+			known[mips.function_start(img, a, slot + 4)] = {}
+			break
+		}
+	}
+	entries, calls, guessed := mips.module_entries(RULES, img, slot + 4, hi, p.listed[o.name][:], p.refs, known)
+	for k in known {
+		calls[k] = {}
+	}
+	return mips.build_module(RULES, img, slot + 4, hi, entries, ptrs, calls, p.refs, guessed)
+}
+
+// The executable's functions funcs into <out>/exe.odin.
+@(private = "file")
+recomp_exe :: proc(p: ^Program, funcs: []^Func) {
 	b := strings.builder_make()
 	line(&b, "%s\npackage rec\n", REC_HEADER)
 	runtime_imports(&b, p.runtime, 0)
@@ -225,7 +272,7 @@ recomp_exe :: proc(p: ^Program, code_lo, code_hi: u32) {
 	for f, k in funcs {
 		names[k] = fmt.aprintf("f_%08x", f.entry)
 		emit_func(f, &b, names[k], p.patches, p.cycles)
-		if p.code != nil {
+		if p.code != nil && f.entry not_in p.interp {
 			append(&p.n_funcs, native.Blob_Func{f.entry, native_func(p.code, f, p.patches, p.cycles)})
 		}
 		warn(p, f)
@@ -243,41 +290,26 @@ recomp_exe :: proc(p: ^Program, code_lo, code_hi: u32) {
 	fmt.printfln("exe: %d functions, %d instructions", len(funcs), n)
 }
 
-// Every overlay into <out>/ovl_NN/funcs.odin, packages of about
+// Every overlay, its functions in mods, into <out>/ovl_NN/funcs.odin, packages of about
 // package_insns instructions each (separate LLVM modules build in
 // parallel), and <out>/overlays.odin. Identical functions are emitted once.
 @(private = "file")
-recomp_overlays :: proc(p: ^Program, package_insns: int) {
+recomp_overlays :: proc(p: ^Program, mods: [][]^Func, package_insns: int) {
 	packages: [dynamic]^Package
 	Emitted :: struct {
 		pkg, name: string,
 		off:       u32, // native code
+		native:    bool, // off is set
 	}
 	emitted: map[string]Emitted
 	cur: ^Package
 	size := package_insns
 	total := 0
-	for o in p.overlays {
+	for o, m in p.overlays {
 		img := o.img
-		slot, hi := mips.image_range(img)
+		slot, _ := mips.image_range(img)
 		ov_id, _ := mips.word(img, slot)
-		ptrs: Set
-		mips.data_pointers(img, slot, hi, &ptrs)
-		// Code may follow a header of strings or tables; its first function
-		// can be reached only through pointers built at run time. Header
-		// data precedes it, so it skips the fall-through check.
-		known: Set
-		for a := slot + 4; a < hi; a += 4 {
-			if mips.is_prologue(img, a) {
-				known[mips.function_start(img, a, slot + 4)] = {}
-				break
-			}
-		}
-		entries, calls, guessed := mips.module_entries(RULES, img, slot + 4, hi, p.listed[o.name][:], p.refs, known)
-		for k in known {
-			calls[k] = {}
-		}
-		funcs := mips.build_module(RULES, img, slot + 4, hi, entries, ptrs, calls, p.refs, guessed)
+		funcs := mods[m]
 		if size >= package_insns {
 			cur = new(Package)
 			cur.name = fmt.aprintf("ovl_%02d", len(packages))
@@ -289,15 +321,17 @@ recomp_overlays :: proc(p: ^Program, package_insns: int) {
 			if key not_in emitted {
 				emit_func(f, &cur.body, key, p.patches, p.cycles)
 				warn(p, f)
-				off: u32
-				if p.code != nil {
-					off = native_func(p.code, f, p.patches, p.cycles)
-				}
-				emitted[key] = {cur.name, key, off}
+				emitted[key] = {cur.name, key, 0, false}
 				size += len(f.insns)
 				total += len(f.insns)
 			}
-			e := emitted[key]
+			e := &emitted[key]
+			// Native code once per key, for the first entry not left to
+			// the interpreter.
+			native_ok := p.code != nil && f.entry not_in p.interp
+			if native_ok && !e.native {
+				e.off, e.native = native_func(p.code, f, p.patches, p.cycles), true
+			}
 			ref := e.name
 			if e.pkg != cur.name {
 				ref = fmt.aprintf("%s.%s", e.pkg, e.name)
@@ -310,7 +344,7 @@ recomp_overlays :: proc(p: ^Program, package_insns: int) {
 				s = hexu(w)
 				words[k] = w
 			}
-			if p.code != nil {
+			if native_ok {
 				append(&p.n_ovls, native.Blob_Ovl{f.entry, slot, ov_id, words, e.off})
 			}
 			append(&cur.rows, fmt.aprintf("\t{{%s, %s, %s, {{%s}}, %s}},", hexu(f.entry), hexu(slot), hexu(ov_id), strings.join(sig[:], ", "), ref))

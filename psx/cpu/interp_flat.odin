@@ -25,6 +25,8 @@ package psx_cpu
 
 @(require) import "core:fmt" // used only under FLAT
 
+@(require) import "core:strings" // used only under FLAT
+
 @(require) import "base:runtime" // used only under FLAT
 
 import "ps:core"
@@ -118,6 +120,12 @@ when core.FLAT {
 	// frames a stop would leave running on.
 	@(private = "file")
 	flat_native: int
+	// The entries of the native functions flat_enter and flat_call_native
+	// run now, outermost first (the first FLAT_NAMED of flat_native; 0 for
+	// one flat_call_native names none), which flat_block's fatal names.
+	// Native code's own calls to native code do not pass here.
+	@(private = "file")
+	flat_native_at: [FLAT_NAMED]u32
 	@(private = "file")
 	flat_dummy: Interp
 	// Set while call runs a callee for host code, so a mod thunk it reaches
@@ -193,8 +201,24 @@ when core.FLAT {
 	flat_block :: proc(what: string) {
 		if flat_cur == nil {fatal("%s outside a flat run", what)}
 		if flat_nest_depth > 0 {fatal("%s inside a guest call made by host code (FLAT runs those nested)", what)}
-		if flat_native > 0 {fatal("%s inside native code (FLAT)", what)}
+		if flat_native > 0 {
+			b := strings.builder_make(context.temp_allocator)
+			for e, k in flat_native_at[:min(flat_native, FLAT_NAMED)] {
+				fmt.sbprintf(&b, "%s%08x", " > " if k > 0 else "", e)
+			}
+			fatal("%s inside native code (FLAT), entered at %s, ra %08x", what, strings.to_string(b), state.r[31])
+		}
 		flat_stop = true
+	}
+
+	@(private = "file")
+	FLAT_NAMED :: 16
+
+	// Count native code entered at addr in, for flat_block.
+	@(private = "file")
+	flat_native_in :: #force_inline proc(addr: u32) {
+		if flat_native < FLAT_NAMED {flat_native_at[flat_native] = addr}
+		flat_native += 1
 	}
 
 	// Whether flat_block may stop the running run now: on its own guest code,
@@ -238,7 +262,7 @@ when core.FLAT {
 	// From a continuation's step: run the native function fn now, counted as
 	// native code (a stop inside it is put off or fatal).
 	flat_call_native :: proc(fn: Func_Proc) {
-		flat_native += 1
+		flat_native_in(0)
 		fn()
 		flat_native -= 1
 	}
@@ -302,7 +326,7 @@ when core.FLAT {
 		if lookup == .All && is_ram_addr(addr) && addr & 3 == 0 {
 			if fn := dispatch.fixed[fn_index(addr)]; fn != nil {
 				f.host = true
-				flat_native += 1
+				flat_native_in(addr)
 				fn()
 				flat_native -= 1
 				return
@@ -323,14 +347,14 @@ when core.FLAT {
 			}
 			if e.slot == e.addr {code_promote(e)}
 			f.host = true
-			flat_native += 1
+			flat_native_in(addr)
 			e.fn()
 			flat_native -= 1
 			return
 		}
 		if learned_loaded {
 			f.host = true
-			flat_native += 1
+			flat_native_in(addr)
 			ok := run_learned(addr)
 			flat_native -= 1
 			if ok {return}

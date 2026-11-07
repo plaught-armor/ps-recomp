@@ -56,9 +56,9 @@ Native_Code :: struct {
 }
 
 NATIVE_MAGIC :: 0x4e525350 // "PSRN"
-NATIVE_VERSION :: 3
+NATIVE_VERSION :: 4
 // Bytes of the header: magic, version, arch, then the counts and sizes.
-NATIVE_HEADER :: 44
+NATIVE_HEADER :: 48
 
 // The blob arch of a wasm build (recomp/native Arch .Wasm32): its code is
 // a module whose functions the host puts in the runtime's function table
@@ -103,6 +103,22 @@ native_slots :: proc(blob: []u8) -> (h: [NATIVE_HEADER / 4]u32, slots: []string,
 	return h, slots, at, ""
 }
 
+// The entries the blob's compiler left to the interpreter on purpose
+// (recomp/native/blob.odin), temp allocated; err as native_slots, or for
+// tables that do not fit the blob.
+native_interp :: proc(blob: []u8) -> (interp: []u32, err: string) {
+	h, _, at, serr := native_slots(blob)
+	if serr != "" {return nil, serr}
+	at += 8 * int(h[4]) + 32 * int(h[5])
+	if at + 4 * int(h[6]) > len(blob) {return nil, "bad table sizes"}
+	interp = make([]u32, h[6], context.temp_allocator)
+	for &v, k in interp {
+		b := blob[at + 4 * k:]
+		v = u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
+	}
+	return interp, ""
+}
+
 // Map the blob's code; `imports` gives each slot's value (an address or a
 // constant). The tables are allocated with context.allocator.
 native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, err: string) {
@@ -114,9 +130,9 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 	}
 	h, slots, at, serr := native_slots(blob)
 	if serr != "" {return {}, serr}
-	n_imports, n_funcs, n_ovls := h[3], h[4], h[5]
-	n_spans, n_ranges, n_pool, size, imports_at := h[6], h[7], h[8], h[9], h[10]
-	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_spans) * 20 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
+	n_imports, n_funcs, n_ovls, n_interp := h[3], h[4], h[5], h[6]
+	n_spans, n_ranges, n_pool, size, imports_at := h[7], h[8], h[9], h[10], h[11]
+	if int(n_funcs) * 8 + int(n_ovls) * 32 + int(n_interp) * 4 + int(n_spans) * 20 + int(n_ranges) * 12 + int(n_pool) * 4 + int(size) != len(blob) - at {
 		return {}, "bad table sizes"
 	}
 	// A function's offset is below imports_at; on wasm32 there is no slot
@@ -154,6 +170,7 @@ native_load :: proc(blob: []u8, imports: map[string]u64) -> (code: Native_Code, 
 		o.off, _ = word(blob, &at)
 		if o.off >= limit {return code, "function outside the code"}
 	}
+	at += 4 * int(n_interp) // for compilers only (native_interp)
 	code.spans = make([]Native_Span, n_spans)
 	for &s in code.spans {
 		kind, _ := word(blob, &at)

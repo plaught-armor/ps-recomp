@@ -66,16 +66,31 @@ convert :: proc(image, out, vu0, vu1: string, hooks := "", vu_only := false) -> 
 // the EE's, ps2/learned.odin). The PS1 and the IOP both run the R3000 of
 // psx_cpu, so one compiler serves them; the EE's is recomp/r5900.
 compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
+	blob, ok := learned_compile(cpu, records)
+	if !ok {return 1}
+	defer delete(blob)
+	if werr := os.write_entire_file(out, blob); werr != nil {
+		fmt.eprintln("learned: cannot write", out, werr)
+		return 1
+	}
+	return 0
+}
+
+// compile_learned's blob, in context.allocator; false after a message.
+// interp: the program's entries its static blob left to the interpreter
+// (core.native_interp), for a PS1 run to leave too (r3000.learned_blob).
+learned_compile :: proc(cpu: core.Learn_Cpu, records: string, interp: []u32 = nil) -> ([]u8, bool) {
 	data, err := os.read_entire_file(records, context.allocator)
 	if err != nil {
 		fmt.eprintln("learned: cannot read", records, err)
-		return 1
+		return nil, false
 	}
+	defer delete(data)
 	recs, _ := core.learn_read(data)
 	runs, large, smc := core.learn_compilable(recs[:], cpu)
 	arch, ok := native.arch_of("learned", mips.HOST_ARCH)
 	if !ok {
-		return 1
+		return nil, false
 	}
 	blob: []u8
 	skipped := 0 // runs the EE's compiler left to the interpreter
@@ -93,14 +108,10 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 		// r3000.state.cycles = w on an idle wait from inside a run, to stop
 		// doing so: a set, not a sum or a max, breaks adding the block's
 		// cycles for an access and taking them off after it.
-		blob = r3000.learned_blob(funcs, arch, exact = cpu != .Iop)
+		blob = r3000.learned_blob(funcs, arch, exact = cpu != .Iop, interp = interp, skipped = &skipped)
 	}
-	if werr := os.write_entire_file(out, blob); werr != nil {
-		fmt.eprintln("learned: cannot write", out, werr)
-		return 1
-	}
-	fmt.eprintfln("learned: %d functions from %d records (not compiled: %d stored into their code, %d large, %d not lowered)", len(runs) - skipped, len(recs), smc, large, skipped)
-	return 0
+	fmt.eprintfln("learned: %d functions from %d records (not compiled: %d stored into their code, %d large, %d not lowered or left to the interpreter)", len(runs) - skipped, len(recs), smc, large, skipped)
+	return blob, true
 }
 
 // The mods in dir, read for a PS2 game's EE when ee, else for a PS1 game.
@@ -242,8 +253,8 @@ convert_here :: proc(image, tmp: string, caps: [2]string, hooks: string) -> ([]u
 
 // `play --convert-store <disc image>`: the native blob of the disc image
 // stored in its directory, converted unless one this build can run is
-// there already. A wasm32 build's play runs only a stored blob (and only a
-// PS2 disc's), so the play page runs this first, in its own instance: the
+// there already. A wasm32 build's play runs only a stored blob, so the
+// play page runs this first, in its own instance: the
 // conversion's memory is not the game's. 0 when a blob is stored, 1 when
 // none is (a dev build stores none it would use).
 convert_store_mode :: proc(image: string) -> int {
@@ -251,12 +262,6 @@ convert_store_mode :: proc(image: string) -> int {
 	if !ok {return 1}
 	dir, has_dir := core.disc_dir(id)
 	if !has_dir {return 1}
-	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
-		if !cnf.ps2 {
-			fmt.eprintln("play: a wasm32 build runs native code for a PS2 disc only")
-			return 1
-		}
-	}
 	if core.COMMIT == "dev" {
 		fmt.eprintln("play: a dev build stores no native code it would run")
 		return 1
@@ -326,13 +331,46 @@ vu_captures :: proc(dir: string) -> (set: string, caps: [2]string) {
 }
 
 // Compile the LEARN file at records in a child of this executable (as
-// convert_store) and store the blob of learned functions in the disc
-// directory dir, its key naming the records by set. False, after a
-// message, when there is no blob.
+// convert_store; in this process in a wasm32 build, which cannot start one)
+// and store the blob of learned functions in the disc directory dir, its
+// key naming the records by set. False, after a message, when there is no
+// blob.
 learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: time.Duration) -> bool {
 	l := learned_files(cpu)
-	tmp := strings.concatenate({core.disc_path(dir, l.blob, context.temp_allocator), ".compile"}, context.temp_allocator)
-	blob := child_blob({"--learned", l.name, records, tmp}, tmp, "learned code", "compile", deadline) or_return
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		// Under a temp allocator of its own, as convert_here: the compile
+		// takes temp memory per function and frees none.
+		blob: []u8
+		ok: bool
+		{
+			scratch: mem.Dynamic_Arena
+			mem.dynamic_arena_init(&scratch)
+			defer mem.dynamic_arena_destroy(&scratch)
+			context.temp_allocator = mem.dynamic_arena_allocator(&scratch)
+			// A PS1 run under FLAT cannot switch threads inside native
+			// code: the runs that may are left out, by the entries the
+			// stored blob left (play runs learned code only with it).
+			interp: []u32
+			if cpu == .Psx {
+				static, rerr := os.read_entire_file(core.disc_path(dir, .Native, context.temp_allocator), context.temp_allocator)
+				if rerr != nil {
+					fmt.eprintln("learned: no native blob to read the interpreted entries from", rerr)
+					return false
+				}
+				ierr: string
+				interp, ierr = core.native_interp(static)
+				if ierr != "" {
+					fmt.eprintln("learned: native blob:", ierr)
+					return false
+				}
+			}
+			blob, ok = learned_compile(cpu, records, interp)
+		}
+		if !ok {return false}
+	} else {
+		tmp := strings.concatenate({core.disc_path(dir, l.blob, context.temp_allocator), ".compile"}, context.temp_allocator)
+		blob := child_blob({"--learned", l.name, records, tmp}, tmp, "learned code", "compile", deadline) or_return
+	}
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, l.kind, set)
 }

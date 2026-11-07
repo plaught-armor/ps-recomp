@@ -375,15 +375,17 @@ play :: proc(image: string) -> int {
 			}
 		}
 	}
-	// NATIVE=0 runs the game interpreted, as a FLAT build always does
-	// (core/flat.odin): it has neither recompiled nor learned code, and
-	// LEARN records nothing. The one exception is a wasm32 build's PS2
-	// blob, whose functions are steps of the FLAT runner; it runs only
+	// NATIVE=0 runs the game interpreted, as a native FLAT build always
+	// does (core/flat.odin): it has neither recompiled nor learned code, and
+	// LEARN records nothing. The exception is a wasm32 build, which runs a
+	// stored blob under FLAT: a PS2 disc's, whose functions are steps of
+	// the FLAT runner, or a PS1 disc's and its learned code, whose
+	// functions it calls (psx/cpu/interp_flat.odin). The blob runs only
 	// stored, as a wasm build cannot start the converter child.
 	native_off := core.FLAT || core.env("NATIVE") == "0"
 	native := core.disc_path(dir, .Native)
 	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
-		if !cnf.ps2 || core.env("NATIVE") == "0" || !native_cached(dir, cnf.ps2) {native = ""}
+		if core.env("NATIVE") == "0" || !native_cached(dir, cnf.ps2) {native = ""}
 	} else {
 		if native_off || (!native_cached(dir, cnf.ps2) && !convert_store(image, dir, cnf.ps2, 0)) {
 			native = ""
@@ -393,11 +395,18 @@ play :: proc(image: string) -> int {
 	// Learned code runs on a PS1 game, and on a PS2 game's IOP and EE,
 	// unless NATIVE=0 or LEARN=0; found before LEARN opens the records,
 	// which compacting rewrites. A compat child's parent compiled it already
-	// (compat_disc): one that failed there is not tried again here.
+	// (compat_disc): one that failed there is not tried again here. A wasm32
+	// build runs a PS1 game's only, from records another build made, and
+	// only with the stored blob, whose interp list the compile leaves out
+	// as it does (learned_store).
 	learn_cpu := core.Learn_Cpu.Iop if cnf.ps2 else .Psx
 	learn_env := "0" if core.FLAT else core.env("LEARN")
+	learned_on := !native_off && learn_env != "0"
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		learned_on = !cnf.ps2 && native != "" && core.env("LEARN") != "0"
+	}
 	learned, learned_ee: string
-	if !native_off && learn_env != "0" {
+	if learned_on {
 		learned = learned_blob(dir, learn_cpu, !compat_child(), 0)
 		if cnf.ps2 {learned_ee = learned_blob(dir, .Ee, !compat_child(), 0)}
 	}
