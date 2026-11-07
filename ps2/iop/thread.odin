@@ -69,6 +69,7 @@ IOP_INTR_BUDGET :: 1 << 20
 IOP_INTR_STACK :: IOP_CMDBUF
 
 KE_ILLEGAL_CONTEXT :: -100
+KE_CPUDI :: -102
 KE_NO_MEMORY :: -400
 KE_ILLEGAL_ATTR :: -401
 KE_ILLEGAL_ENTRY :: -402
@@ -153,6 +154,7 @@ Iop_Thread :: struct {
 	evf_bits, evf_mode:     u32, // an event flag wait's pattern and mode
 	evf_res:                u32, // and where its met bits go, 0 for nowhere
 	wakeups:                u32, // WakeupThread calls while it was awake
+	intr_off:               bool, // it turned interrupts off (th_intr_off)
 	wake:                   u32, // what its wait returns
 	wake_at:                u64, // when its Delay ends, IOP cycles
 	ctx:                    Th_Context,
@@ -207,6 +209,7 @@ iop_sched: struct {
 	lock_holder:          u32, // the thread that last took it, 0 when given back
 	head, tail:           i64, // the next seq at a queue's head, at its tail
 	cur:                  u32, // the running thread, 0 on the loader
+	loader_intr_off:      bool, // the loader turned interrupts off (th_intr_off)
 	resched:              bool, // a thread of better priority than cur became ready
 	budget:               bool, // the load's budget is spent
 	start_done:           bool, // the EE load's start returned, its v0 in start_result
@@ -312,6 +315,34 @@ th_reset :: proc(t: ^Iop_Thread) {
 	t.ctx.r[28] = t.gp
 	t.ctx.r[29] = t.stack + t.stacksize - 16
 	t.wakeups = 0
+	t.intr_off = false
+}
+
+// The interrupt state CpuSuspendIntr stores when interrupts were on: the
+// status bits retail tests for that. Off, it stores 0.
+INTR_ON_STATE :: 0x404
+
+// Whether the running context has turned interrupts off with
+// CpuDisableIntr or CpuSuspendIntr. Retail keeps this in each thread's saved
+// status, so it is per thread here and the loader's own; a handler always
+// runs with them off. Nothing in the HLE is held off by it: it only shapes
+// what those calls return.
+th_intr_off :: proc() -> bool {
+	s := &iop_sched
+	if s.intr {return true}
+	if t := th_find(s.cur); t != nil {return t.intr_off}
+	return s.loader_intr_off
+}
+
+// Sets th_intr_off for the running context; a handler's stays off.
+th_intr_set :: proc(off: bool) {
+	s := &iop_sched
+	if s.intr {return}
+	if t := th_find(s.cur); t != nil {
+		t.intr_off = off
+	} else {
+		s.loader_intr_off = off
+	}
 }
 
 th_ready :: proc(t: ^Iop_Thread, head := false) {
