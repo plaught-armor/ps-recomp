@@ -1511,6 +1511,56 @@ test_sysclib :: proc() {
 	check(call(19, TOP - 0x10000, A, 0x7fffffff, 5) == 0x7fffffff, "sysclib: sprintf with width 0x7fffffff returns the count")
 	check(ram[TOP - 1] == ' ' && ram[TOP - 0x10000] == ' ', "sysclib: sprintf with width 0x7fffffff stops at RAM's end")
 
+	// strtol as the kernel's: '-' flips per sign and '+' is none, a bad base
+	// is 10, the 0x, 0b and o prefixes override any base, 32-bit wrap, and
+	// *end past whatever was taken, digits or not.
+	Strtol :: struct {
+		s:    string,
+		base: u32,
+		v:    u32,
+		end:  u32, // characters taken
+		what: string,
+	}
+	for c in ([]Strtol{
+			{"  --12x", 10, 12, 6, "two '-' cancel, space skipped"},
+			{"-7", 10, 0xfffffff9, 2, "one '-' negates"},
+			{"+5", 10, 0, 0, "'+' is no sign"},
+			{"017", 0, 17, 3, "base 0 is 10, no octal"},
+			{"12", 1, 12, 2, "base 1 is 10"},
+			{"12", 37, 12, 2, "base 37 is 10"},
+			{"z", 36, 35, 1, "base 36 takes z"},
+			{"0x1F", 10, 31, 4, "0x makes base 16 over 10"},
+			{"0X1f", 8, 31, 4, "0X makes base 16 over 8"},
+			{"0b101", 16, 5, 5, "0b makes base 2 over 16"},
+			{"0B12", 10, 1, 3, "0B makes base 2"},
+			{"o17", 0, 15, 3, "o makes base 8"},
+			{"O8", 10, 0, 1, "O makes base 8, 8 no digit"},
+			{"0o7", 10, 0, 1, "o after 0 is no prefix"},
+			{"4294967297", 10, 1, 10, "the value wraps at 32 bits"},
+			{"0x", 10, 0, 2, "a prefix with no digit stays taken"},
+			{" \t-z", 10, 0, 3, "no digit: end past space and sign"},
+		}) {
+		put_str(A, c.s)
+		ram[C], ram[C + 1], ram[C + 2], ram[C + 3] = 0xee, 0xee, 0xee, 0xee
+		v := call(36, A, C, c.base)
+		end := u32(ram[C]) | u32(ram[C + 1]) << 8 | u32(ram[C + 2]) << 16 | u32(ram[C + 3]) << 24
+		check(v == c.v && end == A + c.end, fmt.tprintf("sysclib: strtol %q base %d, %s: %x end +%d", c.s, c.base, c.what, v, end - A))
+	}
+	ram[C] = 0xee
+	check(call(36, 0, C, 10) == 0 && ram[C] == 0xee, "sysclib: strtol of null is 0, *end left")
+	put_str(A, "42")
+	check(call(36, A, 0, 10) == 42, "sysclib: strtol with a null end")
+
+	// memcpy and memset: a null dst does nothing (memcpy gives 0), n <= 0
+	// touches nothing, either way dst back.
+	ram[0], ram[A] = 0x5a, 0x11
+	put_str(B, "q")
+	check(call(12, 0, B, 1) == 0 && ram[0] == 0x5a, "sysclib: memcpy to null copies none, gives 0")
+	check(call(12, A, B, 0xfffffffc) == A && ram[A] == 0x11, "sysclib: memcpy of negative n copies none")
+	check(call(14, 0, 0x77, 1) == 0 && ram[0] == 0x5a, "sysclib: memset of null sets none")
+	check(call(14, A, 0, 0xfffffffc) == A && ram[A] == 0x11, "sysclib: memset of negative n sets none")
+	check(call(14, A, 0x33, 1) == A && ram[A] == 0x33 && call(12, A, B, 1) == A && ram[A] == 'q', "sysclib: memset and memcpy of one byte")
+
 	// wmemset: n/4 words of the word, n's low 2 bits dropped, dst returned;
 	// an unaligned dst a row; a run to RAM's end.
 	for &c in ram[A:][:12] {c = 7}
