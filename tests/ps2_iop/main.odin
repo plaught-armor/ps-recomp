@@ -7033,6 +7033,44 @@ test_dbcman :: proc() {
 	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
 	iop.dbcman_module("rom0:SIO2MAN")
 	check(!mid_off(buf[:]), "dbcman: another module's load keeps the contract")
+
+	// Through the loadfile server, PS_IRX=0: a cdrom dbcman's file is read
+	// for its version, leaving the drive as it was; a rom0 or host one has no
+	// image.
+	load :: proc(buf: []u8, path: string) {
+		for &b in buf[:0x200] {b = 0}
+		copy(buf[8:][:252], path)
+		iop.sif.servers[0x80000006](0, buf, 0x200)
+	}
+	if dir, err := os.make_directory_temp("", "ps_iop_dbc_test_*", context.allocator); err != nil {
+		check(false, "dbcman: no temp directory")
+	} else {
+		defer os.remove_all(dir)
+		saved := iop.disc_dir
+		defer iop.disc_dir = saved
+		iop.disc_dir = dir
+		iop.iop_irx = false
+		defer iop.iop_irx = true
+		_ = os.write_entire_file(fmt.tprintf("%s/DBCMAN.IRX", dir), dbc_image(0x0102))
+		iop.dbcman_module("dbc.irx", dbc_image(0x0201))
+		iop.iop_cd.stopped = true
+		load(buf[:], `cdrom0:\DBCMAN.IRX;1`)
+		check(!mid_off(buf[:]), "dbcman: a cdrom load's file picks the 1.x calls")
+		check(iop.iop_cd.stopped, "dbcman: a cdrom load leaves the drive stopped")
+		load(buf[:], "rom0:DBCMAN")
+		check(mid_off(buf[:]), "dbcman: a rom0 load through the server, the 2.x calls")
+		iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+		load(buf[:], "host0:DBCMAN.IRX")
+		check(mid_off(buf[:]), "dbcman: a host load takes no disc image, the 2.x calls")
+		iop.iop_cd.stopped = false
+	}
+
+	// LoadModuleBuffer: the image the EE copied over picks the contract.
+	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
+	check(load_buffer(dbc_image(0x0102)) == {2, 0} && !mid_off(buf[:]), "dbcman: a buffer load's image picks the 1.x calls")
+	iop.dbcman_init()
+	create(buf[:], 1, 0, PAD_A, PAD_B)
+	check(mid_off(buf[:]), "dbcman: init serves the 2.x calls again")
 	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
 
 	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")

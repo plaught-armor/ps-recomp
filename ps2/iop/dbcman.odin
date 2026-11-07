@@ -216,8 +216,9 @@ dbc: struct {
 // version was.
 @(private = "file")
 dbc_logged: struct {
-	fnos:    Dbc_Fnos,
-	version: bool,
+	fnos:     Dbc_Fnos,
+	version:  bool, // an unknown major
+	no_image: bool,
 }
 
 dbcman_init :: proc() {
@@ -227,29 +228,29 @@ dbcman_init :: proc() {
 }
 
 // A module load, its IRX `image` when one was read: the copy the EE made to
-// the IOP, or a disc file a path names. An image that exports the dbcman
-// library picks the contract served from then on: 1.x for major version 1,
-// 2.x for 2, and 2.x, logged once, for any other. A dbcman load with no image
-// to read (a rom0 path, or a disc file that cannot be read) takes 2.x, logged
-// once. Any other load leaves the contract as it is.
+// the IOP, or the cdrom file a path names (loadfile_server). An image that
+// exports the dbcman library picks the contract served from then on: 1.x for
+// major version 1, 2.x for 2, and 2.x, logged once, for any other. A dbcman
+// load with no image to read (a rom0 or host path, or a disc file that cannot
+// be read) takes 2.x, logged once. Any other load leaves the contract as it
+// is.
 //
 // The pad driver the load names, by file or module name (ds1o_d, ds2o_d,
 // or ds2u or ds2u_d, ignoring case and any directory, extension or
 // version), is the one served from then on, its frame counters at 0 as its
 // start leaves them. Other names change nothing.
 dbcman_module :: proc(path: string, image: []u8 = nil) {
-	name := path[strings.last_index_any(path, `\/:`) + 1:]
-	name, _, _ = strings.partition(name, ".")
+	name := dbc_module_name(path)
 	if v, ok := dbc_export_version(image); ok {
 		dbc.contract = .V1 if v >> 8 == 1 else .V2
-		if v >> 8 > 2 && !dbc_logged.version {
+		if v >> 8 != 1 && v >> 8 != 2 && !dbc_logged.version {
 			dbc_logged.version = true
 			fmt.eprintfln("dbcman: export library version %d.%02x not known; serving the 2.x calls", v >> 8, v & 0xff)
 		}
 	} else if strings.equal_fold(name, "dbcman") {
 		dbc.contract = .V2
-		if !dbc_logged.version {
-			dbc_logged.version = true
+		if !dbc_logged.no_image {
+			dbc_logged.no_image = true
 			fmt.eprintfln("dbcman: no image of %s to read the version of; serving the 2.x calls", path)
 		}
 	}
@@ -259,6 +260,17 @@ dbcman_module :: proc(path: string, image: []u8 = nil) {
 	case: return
 	}
 	dbc.frame = {}
+}
+
+// Whether a load of `path` names the dbcman module.
+dbcman_named :: proc(path: string) -> bool {return strings.equal_fold(dbc_module_name(path), "dbcman")}
+
+// A load's file or module name: no directory, extension or version.
+@(private = "file")
+dbc_module_name :: proc(path: string) -> string {
+	name := path[strings.last_index_any(path, `\/:`) + 1:]
+	name, _, _ = strings.partition(name, ".")
+	return name
 }
 
 // The version of the dbcman export library in IRX `image`, if it has one.
