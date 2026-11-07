@@ -3679,7 +3679,12 @@ test_boot_gaps :: proc() {
 	s.intr = true
 	check(base(14, uid, 40) == neg(-iop.KE_ILLEGAL_CONTEXT) && u.prio == 50, "boot: ChangeThreadPriority in a handler is illegal")
 	check(base(22, uid, P) == neg(-iop.KE_ILLEGAL_CONTEXT), "boot: so is ReferThreadStatus")
+	check(base(42, 0, 0) == neg(-iop.KE_ILLEGAL_CONTEXT), "boot: and GetThreadCurrentPriority")
 	s.intr = false
+	check(base(42, 0, 0) == 25, "boot: GetThreadCurrentPriority is the caller's priority as changed")
+	s.cur = 0
+	check(base(42, 0, 0) == iop.IOP_START_PRIO, "boot: the loader's is IOP_START_PRIO")
+	s.cur = tid
 
 	info :: proc(i: u32) -> u32 {return iop.iop_u32(P + 4 * i)^}
 	for i in u32(0) ..< 18 {iop.iop_u32(P + 4 * i)^ = 0xffffffff}
@@ -4082,7 +4087,7 @@ test_call_context :: proc() {
 	threads, semas := len(s.threads), len(s.semas)
 	s.intr = true
 	check(query(qs) == 1, "context: QueryIntrContext in a handler")
-	for fno in ([10]u32{4, 5, 6, 7, 10, 16, 20, 24, 25, 33}) {check(base(fno, tid) == ill, "context: a thread's thbase call in a handler is illegal")}
+	for fno in ([11]u32{4, 5, 6, 7, 10, 16, 20, 24, 25, 33, 42}) {check(base(fno, tid) == ill, "context: a thread's thbase call in a handler is illegal")}
 	for fno in ([5]u32{4, 5, 6, 8, 9}) {check(sema(fno, semid) == ill, "context: a thread's thsemap call in a handler is illegal")}
 	t := iop.th_find(tid)
 	check(len(s.threads) == threads && len(s.semas) == semas && t != nil && t.status == .Dormant, "context: a refused call makes, starts and deletes nothing")
