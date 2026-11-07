@@ -916,7 +916,7 @@ test_modload :: proc() {
 	check(l.depth == 0 && l.loading == 0, "modload: no start under way after the load")
 	inner_base := module_base(idi)
 
-	// An inner start that calls what the HLE lacks: only its frame undone,
+	// An inner start that calls what the HLE lacks: only its module dropped,
 	// pldm loads.
 	fresh()
 	key := core.Compat_Key{.Iop_Call, core.compat_name("sysmem"), 99}
@@ -925,7 +925,7 @@ test_modload :: proc() {
 	idi = i32(w(d, 0))
 	check(ido > 0 && ro == 0, "modload: pldm loads although inner's start failed")
 	check(core.compat.calls[key].n == n + 1, "modload: inner's gap is one compat row")
-	check(w(d, 1) == KE_ERROR && w(d, 2) == 0x5a5a5a5a, "modload: the failed StartModule is KE_ERROR, no result written")
+	check(w(d, 1) == KE_ERROR && w(d, 2) == 0, "modload: the failed StartModule is KE_ERROR, the start's result written as retail writes it")
 	check(!libi_registered() && module_base(idi) == 0, "modload: inner's registration and module undone")
 	check(!iop.sys_in(iop.sys_blocks[:], inner_base), "modload: inner's image freed")
 	check(w(d, 3) == UNKNOWN, "modload: a failed module is gone for StartModule")
@@ -944,6 +944,81 @@ test_modload :: proc() {
 	ido, ro, d = run_pldm(mod_inner("cdvdfsv", false, 0x100))
 	check(ido > 0 && w(d, 0) == 2 && w(d, 1) == 2 && w(d, 2) == 0, "modload: a Sony module is id 2, started resident")
 	check(!libi_registered(), "modload: a Sony module's start does not run")
+
+	// Another thread terminates the inner start while it sleeps: the caller
+	// wakes with KE_ERROR, no result written, the module dropped.
+	fresh()
+	inner := mod_sleeper()
+	buf := iop.sys_alloc(.High, u32(len(inner)))
+	copy(iop.iop_mem(buf, u32(len(inner))), inner)
+	f: []u8
+	f, d = mod_pldt(buf)
+	ido, ro = iop.iop_load(f, "pldt", nil)
+	d += module_base(ido)
+	idi = i32(w(d, 0))
+	check(ido > 0 && ro == 0 && idi > 0, "modload: pldt loads, the sleeper linked")
+	check(w(d, 2) == 0, fmt.tprintf("modload: TerminateThread of the start is KE_OK (%x)", w(d, 2)))
+	check(w(d, 1) == KE_ERROR && w(d, 4) == 0x5a5a5a5a, fmt.tprintf("modload: the terminated start's StartModule is KE_ERROR, no result (%x %x)", w(d, 1), w(d, 4)))
+	check(module_base(idi) == 0 && !libi_registered() && l.depth == 0, "modload: the terminated start's module dropped, its frame gone")
+	waiting := false
+	for t in iop.iop_sched.threads {waiting ||= t.status == .Start}
+	check(!waiting, "modload: no thread left in StartModule")
+}
+
+// "sleeper": registers libi, then sleeps in its start.
+mod_sleeper :: proc() -> []u8 {
+	a: Asm
+	lc := imports(&a, "loadcore", 6)
+	tb := imports(&a, "thbase", 24)
+	tbl, ptr := exports(&a, "libi")
+	a.w[ptr] = at(&a)
+	put(&a, JR_RA, 0x24020700)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, tbl)
+	jal(&a, lc)
+	jal(&a, tb)
+	li(&a, V0, 0)
+	epilogue(&a)
+	return build_mod("sleeper", &a, entry)
+}
+
+// "pldt": LoadModuleBuffer(buf) to word 0, then makes and starts thread K
+// (priority 20), its id to word 3, and StartModule(id, 0, 0, 0, &word 4) to
+// word 1. The start runs first and sleeps; K, ready once both wait,
+// terminates it by its id, the one after its own, the result to word 2.
+mod_pldt :: proc(buf: u32) -> (f: []u8, d: u32) {
+	a: Asm
+	ml := imports(&a, "modload", 10, 8)
+	tb := imports(&a, "thbase", 4, 6, 10, 20)
+	d = at(&a)
+	put(&a, 0, 0, 0, 0, 0x5a5a5a5a)
+	ek := at(&a)
+	prologue(&a)
+	jal(&a, tb + 24)
+	put(&a, 0x24440001) // addiu a0, v0, 1
+	jal(&a, tb + 16)
+	store_v0(&a, d + 8)
+	epilogue(&a)
+	pk := thread_param(&a, ek, 20)
+	entry := at(&a)
+	put(&a, 0x27bdffe0, 0xafbf001c) // addiu sp, sp, -32; sw ra, 28(sp)
+	put(&a, 0x3c000000 | A0 << 16 | buf >> 16, 0x34000000 | A0 << 21 | A0 << 16 | buf & 0xffff)
+	jal(&a, ml)
+	store_v0(&a, d)
+	call_addr(&a, tb, pk, d + 12)
+	call_word(&a, tb + 8, d + 12)
+	lw_at(&a, A0, d)
+	li(&a, A1, 0)
+	li(&a, A2, 0)
+	li(&a, A3, 0)
+	la(&a, T0, d + 16)
+	put(&a, 0xafa80010) // sw t0, 16(sp)
+	jal(&a, ml + 8)
+	store_v0(&a, d + 4)
+	li(&a, V0, 0)
+	put(&a, 0x8fbf001c, JR_RA, 0x27bd0020) // lw ra, 28(sp); jr ra; addiu sp, sp, 32
+	return build_mod("pldt", &a, entry), d
 }
 
 slice_clone :: proc(b: []iop.Sys_Block) -> []iop.Sys_Block {

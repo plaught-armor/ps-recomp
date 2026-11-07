@@ -516,6 +516,22 @@ rpc_thread_gone :: proc(id: u32) {
 	}
 }
 
+// Drops each queue in `freed`, memory being freed, or whose thread is gone
+// (rpc_gone), and each server with its descriptor, function or buffer there.
+rpc_drop_in :: proc(freed: []Sys_Block) {
+	s := &iop_rpc
+	for i := s.n_queues - 1; i >= 0; i -= 1 {
+		if i >= s.n_queues {continue}
+		q := s.queues[i]
+		if sys_in(freed, q.qd) || th_find(q.thread) == nil {rpc_gone(q.qd)}
+	}
+	for i := s.n_servers - 1; i >= 0; i -= 1 {
+		if i >= s.n_servers {continue}
+		sd := s.servers[i].sd
+		if sys_in(freed, sd) || sys_in(freed, r32(sd + 4)) || sys_in(freed, r32(sd + 8)) {rpc_drop_server(i)}
+	}
+}
+
 // After a failed load: drops each queue in `freed`, the memory its undo
 // frees, or whose thread the undo deleted (rpc_gone), and each server with
 // its descriptor, function or buffer there. Then what the load removed
@@ -529,16 +545,7 @@ rpc_thread_gone :: proc(id: u32) {
 rpc_undo :: proc(saved: Iop_Rpc, freed: []Sys_Block) {
 	s, saved := &iop_rpc, saved
 	was := saved.queues[:saved.n_queues]
-	for i := s.n_queues - 1; i >= 0; i -= 1 {
-		if i >= s.n_queues {continue}
-		q := s.queues[i]
-		if sys_in(freed, q.qd) || th_find(q.thread) == nil {rpc_gone(q.qd)}
-	}
-	for i := s.n_servers - 1; i >= 0; i -= 1 {
-		if i >= s.n_servers {continue}
-		sd := s.servers[i].sd
-		if sys_in(freed, sd) || sys_in(freed, r32(sd + 4)) || sys_in(freed, r32(sd + 8)) {rpc_drop_server(i)}
-	}
+	rpc_drop_in(freed)
 
 	queues: [IOP_RPC_QUEUES]Iop_Rpc_Queue
 	n := 0

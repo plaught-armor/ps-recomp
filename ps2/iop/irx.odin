@@ -102,6 +102,25 @@ irx_mem_size :: proc(x: Irx) -> (size: u32, ok: bool) {
 	return u32(n), true
 }
 
+// Where IRX file `data`, module info `x`, ends: the furthest end of its ELF
+// header, program headers, segments, section headers and the sections that
+// hold bytes, as far as `data` goes. A file in memory names no length of
+// its own.
+irx_extent :: proc(data: []u8, x: Irx) -> u32 {
+	SHT_NOBITS :: 8
+	h, _ := mem.elf_header(data)
+	end := max(u64(52), u64(h.phoff) + u64(h.phnum) * 32, u64(x.file_off) + u64(x.file_size))
+	if h.shnum > 0 && h.shentsize == 40 && irx_in(data, h.shoff, h.shnum * 40) {
+		end = max(end, u64(h.shoff) + u64(h.shnum) * 40)
+		for s in 0 ..< h.shnum {
+			sh := h.shoff + s * 40
+			if irx_u32(data, sh + 4) == SHT_NOBITS {continue}
+			end = max(end, u64(irx_u32(data, sh + 16)) + u64(irx_u32(data, sh + 20)))
+		}
+	}
+	return u32(min(end, u64(len(data))))
+}
+
 // Applies every SHT_REL section of file `data` to `img`, the module's text
 // and data already copied to `base` (bss zeroed). On an error `img` may be
 // partly relocated; the caller frees it.

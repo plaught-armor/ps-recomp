@@ -530,6 +530,7 @@ th_drop :: proc(t: ^Iop_Thread) {
 // to be deleted; the RPC queues it served go (rpc_thread_gone).
 @(private = "file")
 th_stop :: proc(t: ^Iop_Thread) {
+	if t.start {load_start_gone(t.id)}
 	rpc_thread_gone(t.id)
 	th_drop(t)
 	if t.exit_delete {th_remove(t.id)}
@@ -643,7 +644,31 @@ th_start_wait :: proc() -> u32 {
 
 // Thread id, waiting in StartModule, wakes with v.
 th_start_wake :: proc(id, v: u32) {
-	if t := th_find(id); t != nil && t.status == .Start {th_wake(t, v)}
+	if th_start_waits(id) {th_wake(th_find(id), v)}
+}
+
+// Whether thread id is there and waits in StartModule.
+th_start_waits :: proc(id: u32) -> bool {
+	t := th_find(id)
+	return t != nil && t.status == .Start
+}
+
+// Deletes each thread but `keep` and the running one whose stack lies in
+// `blocks`, which a failed StartModule frees: their RPC queues go, and the
+// transfer lock one holds is given back.
+th_kill_in :: proc(blocks: []Sys_Block, keep: u32) {
+	s := &iop_sched
+	kill := make([dynamic]u32, 0, 8, context.temp_allocator)
+	for t in s.threads {
+		if t.id != keep && t.id != s.cur && sys_in(blocks, t.stack) {append(&kill, t.id)}
+	}
+	for id in kill {
+		t := th_find(id)
+		if t == nil {continue} // a start's failure deleted it already
+		if s.lock_holder == id {th_unlock()}
+		t.status, t.exit_delete = .Dormant, true
+		th_stop(t)
+	}
 }
 
 // SleepThread: the running thread sleeps, unless a wakeup came while it was
@@ -852,6 +877,7 @@ th_undo :: proc(m: Th_Mark) {
 	for i := len(s.threads) - 1; i >= 0; i -= 1 {
 		t := &s.threads[i]
 		if t.id < thid {continue}
+		if t.start {load_start_gone(t.id)}
 		th_drop(t)
 		ordered_remove(&s.threads, i)
 	}
@@ -1033,6 +1059,7 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		t := th_find(a0)
 		if t == nil {return ke(KE_UNKNOWN_THID), true}
 		if t.status != .Dormant {return ke(KE_NOT_DORMANT), true}
+		if t.start {load_start_gone(t.id)}
 		th_remove(t.id)
 		return KE_OK, true
 	case 6, 7: // StartThread(thid, arg), StartThreadArgs(thid, args, argp)

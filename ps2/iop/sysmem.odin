@@ -22,6 +22,7 @@ Sys_Alloc :: enum u32 {
 
 Sys_Block :: struct {
 	addr, size: u32,
+	owner:      u32, // the IOP thread that allocated it, 0 for none (the HLE, the EE)
 }
 
 // Emulated state: the array's storage is in the emu heap, so it is
@@ -70,7 +71,7 @@ sys_alloc :: proc(kind: Sys_Alloc, req: u32, addr: u32 = 0) -> u32 {
 		}
 	}
 	if !found {return 0}
-	if size > 0 {inject_at(&sys_blocks, i, Sys_Block{at, size})}
+	if size > 0 {inject_at(&sys_blocks, i, Sys_Block{at, size, iop_sched.cur})}
 	return at
 }
 
