@@ -250,6 +250,42 @@ the IOP on PS2; psx/cpu/cpu.odin report_once), with `PS_DUMP_HASH=1` too.
 A run that interprets many functions writes many: about 545 MB in a
 3600-frame PS2 run.
 
+## What a disc calls that the HLE lacks
+
+`tools/hle_scan` reads discs, without running them, for the calls their
+own code makes into Sony code, and checks each one against what the HLE
+serves. Run it from the repository root, since it reads the HLE's
+sources:
+
+```
+odin run tools/hle_scan -collection:ps=. -- [-bios <ROM0>] <disc> ...
+```
+
+It looks at every ELF that starts on a word boundary in a disc's files,
+and at each module of a ROMDIR image (an `IOPRP*.IMG`). A module is
+Sony's or the game's as LOADFILE judges it (`iop.iop_runs`); an IOPRP
+image's modules are Sony's, as the HLE stands in for them at an IOP
+reset. Only the
+game's modules run on the R3000, so the IOP rows are their imports of
+Sony libraries: one row per library, major version and function number,
+with the discs and modules that import it, `hle` (`y`, `n`, or `major`
+when only another major is served), and `start`, the discs where a call
+graph walk from a module's entry reaches the call. That walk follows
+`jal`, `bal` and `j`, but not calls through a register, so a call it
+does not reach may still run at start. The EE rows are the syscall
+numbers loaded into v1 just before a `syscall`: the kernel library's
+wrappers, which a program links whether or not it calls them. The PS1 rows are the
+A0/B0/C0 calls of each PS-X EXE. Missing rows sort first, and then by
+how many discs need them.
+
+What is served is read from the switch statements: `hle_fn` and the
+procs its cases hand `fno` to, the kernel's `switch abs(n)`, and
+`bios_a`/`bios_b`/`bios_c` with `a0_from_b0`. A served case may still
+refuse some arguments. Modules inside compressed archives are not seen.
+`-bios` takes a retail ROM for reference only (never commit it): the
+`rom` column says whether the ROM's module exports the function, and
+the per-library summary gives its export count.
+
 ## Netplay on one machine
 
 Two headless players on loopback test rollback netplay (core/net.odin)
