@@ -21,6 +21,9 @@
 package play
 
 import "core:fmt"
+import "core:os"
+import "core:strconv"
+import "core:strings"
 import "core:time"
 import "ps:core"
 
@@ -187,4 +190,48 @@ midload_poll :: proc(timeout: time.Duration) {
 midload_stop :: proc(quit: bool) {
 	ml.running = false
 	if !ml.job.stop(quit) {ml.stuck = true}
+}
+
+// A job's temporary file in the temporary directory, named for its prefix
+// (one per job, such as "ps-vu-") and this run's pid, with the extension
+// ext: <prefix><pid>-<random><ext>. Allocated; false after a message, which
+// names the job's step. midload_tmp_sweep removes the ones a run that ended
+// left.
+@(private)
+midload_tmp :: proc(prefix, ext, step: string) -> (string, bool) {
+	f, err := os.create_temp_file("", fmt.tprintf("%s%d-*%s", prefix, os.get_pid(), ext))
+	if err != nil {
+		fmt.eprintfln("play: mid-run %s: no temporary file: %v", step, err)
+		return "", false
+	}
+	path := strings.clone(os.name(f))
+	_ = os.close(f)
+	return path, true
+}
+
+// Remove the temporary file at path^ (midload_tmp), if any, and forget it.
+@(private)
+midload_tmp_remove :: proc(path: ^string) {
+	if path^ == "" {return}
+	_ = os.remove(path^)
+	delete(path^)
+	path^ = ""
+}
+
+// Remove the temporary files with prefix of runs that have ended (killed,
+// or a panic, before they removed theirs): those named for a pid no
+// process has, last written before this run started.
+@(private)
+midload_tmp_sweep :: proc(prefix: string) {
+	dir, err := os.temp_directory(context.temp_allocator)
+	if err != nil {return}
+	fis, _ := os.read_all_directory_by_path(dir, context.temp_allocator)
+	start, self := time.now(), os.get_pid()
+	for fi in fis {
+		if !strings.has_prefix(fi.name, prefix) {continue}
+		pid, _, _ := strings.partition(fi.name[len(prefix):], "-")
+		n, ok := strconv.parse_int(pid, 10)
+		if !ok || n == self || time.diff(fi.modification_time, start) <= 0 || !midload_pid_gone(n) {continue}
+		_ = os.remove(fi.fullpath)
+	}
 }

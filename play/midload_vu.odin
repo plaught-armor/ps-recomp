@@ -27,16 +27,15 @@ package play
 
 import "core:fmt"
 import "core:os"
-import "core:strings"
 import "core:strconv"
 import "core:time"
 import "ps:core"
 @(require) import "ps:ps2" // used only without FLAT
 @(require) import vu "ps:ps2/vu" // used only without FLAT
 
-// The prefix of the child's temporary blob, before the run's pid.
+// The prefix of the child's temporary blob (midload_tmp).
 @(private = "file")
-MIDLOAD_TMP :: "ps-vu-"
+MIDLOAD_VU_TMP :: "ps-vu-"
 
 @(private = "file")
 Midload_Vu :: struct {
@@ -78,7 +77,7 @@ midload_init :: proc(image, native, capture: string) -> bool {
 		}
 		if !midload_begin(job) {return false}
 		mv = {image = image, self = self}
-		midload_vu_sweep()
+		midload_tmp_sweep(MIDLOAD_VU_TMP)
 		return true
 	}
 }
@@ -121,19 +120,16 @@ midload_vu_stop :: proc(_: bool) -> bool {
 // Start the child converting the captures into a new temporary file.
 @(private = "file")
 midload_vu_start :: proc() -> Midload_Start {
-	f, err := os.create_temp_file("", fmt.tprintf("%s%d-*.bin", MIDLOAD_TMP, os.get_pid()))
-	if err != nil {
-		fmt.eprintln("play: mid-run VU conversion: no temporary file:", err)
-		return .Not
-	}
-	mv.tmp = strings.clone(os.name(f))
-	_ = os.close(f)
+	tmp, ok := midload_tmp(MIDLOAD_VU_TMP, ".bin", "VU conversion")
+	if !ok {return .Not}
+	mv.tmp = tmp
 	caps: [2]string
 	for &c, unit in caps {
 		c = core.env(fmt.tprintf("VU%d_CAPTURE", unit))
 		if !os.exists(c) {c = ""}
 	}
 	ppid := fmt.tprint(os.get_pid())
+	err: os.Error
 	mv.child, err = os.process_start({command = {mv.self, "--convert-vu", mv.image, mv.tmp, caps[0], caps[1], ppid}, stdout = os.stderr, stderr = os.stderr})
 	if err != nil {
 		fmt.eprintln("play: mid-run VU conversion: cannot start the child:", err)
@@ -173,28 +169,7 @@ midload_vu_take :: proc(state: os.Process_State) -> Midload_Poll {
 
 @(private = "file")
 midload_vu_remove :: proc() {
-	if mv.tmp == "" {return}
-	_ = os.remove(mv.tmp)
-	delete(mv.tmp)
-	mv.tmp = ""
-}
-
-// Remove the temporary blobs of runs that have ended (killed, or a panic,
-// before they removed theirs): those named for a pid no process has, last
-// written before this run started.
-@(private = "file")
-midload_vu_sweep :: proc() {
-	dir, err := os.temp_directory(context.temp_allocator)
-	if err != nil {return}
-	fis, _ := os.read_all_directory_by_path(dir, context.temp_allocator)
-	start, self := time.now(), os.get_pid()
-	for fi in fis {
-		if !strings.has_prefix(fi.name, MIDLOAD_TMP) {continue}
-		pid, _, _ := strings.partition(fi.name[len(MIDLOAD_TMP):], "-")
-		n, ok := strconv.parse_int(pid, 10)
-		if !ok || n == self || time.diff(fi.modification_time, start) <= 0 || !midload_pid_gone(n) {continue}
-		_ = os.remove(fi.fullpath)
-	}
+	midload_tmp_remove(&mv.tmp)
 }
 
 // The --convert-vu child's start, given its run's pid: on Linux it dies
