@@ -15,7 +15,8 @@
 // changed mid-run by a store no interpreter notes (recompiled code, a DMA,
 // the host): a callee patching its caller's calls, say, and the caller
 // restoring them later. Each RAM word keeps the word last fetched there and
-// when, so the check is exact; a fetch outside RAM (a ROM) is not checked.
+// the stamp of the latest run begun then (Learn_Fetch), so the check is
+// exact; a fetch outside RAM (a ROM) is not checked.
 //
 // How stores are checked depends on the processor (learn_cpu). With RAM
 // stamps (PS1, IOP), each RAM word keeps the number of the last store into
@@ -71,8 +72,17 @@ Learn_Frame :: struct {
 	entry:  u32,
 	lo, hi: u32, // the lowest and highest word fetched
 	log_at:   u64, // Learn_Space.seq when the run began
-	fetch_at: u64, // Learn_Space.insns when the run began
+	epoch:    u32, // its stamp, Learn_Space.epoch when it began
 	changed:  bool, // a fetch saw another word than an earlier one there
+}
+
+// A RAM word's last fetch: the word, and the stamp of the latest run begun
+// then (Learn_Space.epoch). A fetch since run f began has at >= f.epoch, and
+// one before it less: stamps only grow, and f's is the next. 0: none since
+// learning began or the stamps last wrapped (learn_epoch_wrap).
+Learn_Fetch :: struct {
+	w:  u32,
+	at: u32,
 }
 
 @(private = "file")
@@ -97,10 +107,9 @@ Learn_Space :: struct {
 	// With RAM stamps: per RAM word, the seq of the last store into it (0:
 	// none since learning began).
 	stamps:    []u64,
-	// Per RAM word, the word last fetched there and the insns count of
-	// that fetch (0: none since learning began).
-	fetched:    []u32,
-	fetched_at: []u64,
+	epoch:     u32, // the stamp of the latest run begun, from 1
+	// Per RAM word, its last fetch.
+	fetched:   []Learn_Fetch,
 	// Without: the store addresses, a ring of LEARN_STORES_MAX; a run looks
 	// back over those since it began. Never cleared, as a run that never
 	// returns must not hold it.
@@ -144,9 +153,9 @@ learn_held: struct {
 	pooled:  bool,
 	handoff: [Learn_Cpu]^Learn_Frame,
 	scratch: [Learn_Cpu]struct {
-		fetched:            []u32,
-		fetched_at, stamps: []u64,
-		log:                []u32,
+		fetched: []Learn_Fetch,
+		stamps:  []u64,
+		log:     []u32,
 	},
 }
 
@@ -179,15 +188,14 @@ learn_hold :: proc() {
 		}
 		x := &h.scratch[cpu]
 		if x.fetched == nil {
-			x.fetched = make([]u32, s.ram_bytes / 4, long_allocator())
-			x.fetched_at = make([]u64, s.ram_bytes / 4, long_allocator())
+			x.fetched = make([]Learn_Fetch, s.ram_bytes / 4, long_allocator())
 			if s.stamped {
 				x.stamps = make([]u64, s.ram_bytes / 4, long_allocator())
 			} else {
 				x.log = make([]u32, LEARN_STORES_MAX, long_allocator())
 			}
 		}
-		s.fetched, s.fetched_at, s.stamps, s.log = x.fetched, x.fetched_at, x.stamps, x.log
+		s.fetched, s.stamps, s.log = x.fetched, x.stamps, x.log
 	}
 }
 
@@ -306,13 +314,17 @@ learn_begin :: proc(cpu: Learn_Cpu, entry: u32) -> ^Learn_Frame {
 	if s.fetched == nil {
 		learn_fetched_make(s)
 	}
+	if s.epoch == max(u32) {
+		learn_epoch_wrap(s, cpu)
+	}
+	s.epoch += 1
 	learn.n_free -= 1
 	k := learn.free[learn.n_free]
 	learn.used[k] = true
 	s.begun += 1
 	s.begin_seq = s.seq
 	f := &learn.pool[k]
-	f^ = {cpu = cpu, slot = k, entry = entry, lo = entry, hi = entry, log_at = s.seq, fetch_at = s.insns}
+	f^ = {cpu = cpu, slot = k, entry = entry, lo = entry, hi = entry, log_at = s.seq, epoch = s.epoch}
 	return f
 }
 
@@ -346,11 +358,10 @@ learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) #no_bounds_check 
 	if !in_ram {
 		return
 	}
-	if s.fetched[k] != w && s.fetched_at[k] > f.fetch_at {
+	if s.fetched[k].w != w && s.fetched[k].at >= f.epoch {
 		f.changed = true
 	}
-	s.fetched[k] = w
-	s.fetched_at[k] = s.insns
+	s.fetched[k] = {w, s.epoch}
 }
 
 // Made at a processor's first run, so learn_fetch never checks: a frame of
@@ -359,8 +370,34 @@ learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) #no_bounds_check 
 // of the RAM code is fetched from.
 @(private = "file")
 learn_fetched_make :: proc(s: ^Learn_Space) {
-	s.fetched = make([]u32, s.ram_bytes / 4, long_allocator())
-	s.fetched_at = make([]u64, s.ram_bytes / 4, long_allocator())
+	s.fetched = make([]Learn_Fetch, s.ram_bytes / 4, long_allocator())
+}
+
+// cpu's stamps are used up (4G runs begun): every fetch is forgotten, made
+// again as none, and they start again at 1. A run of cpu in progress
+// forgets what it fetched before, so it is marked as changed (.Smc), never
+// clean. Not in a probe's branches, where no run begins.
+@(private = "file")
+learn_epoch_wrap :: proc(s: ^Learn_Space, cpu: Learn_Cpu) {
+	assert(!learn_held.on)
+	delete(s.fetched, long_allocator())
+	learn_fetched_make(s)
+	if x := &learn_held.scratch[cpu]; x.fetched != nil {
+		delete(x.fetched, long_allocator())
+		x.fetched = make([]Learn_Fetch, s.ram_bytes / 4, long_allocator())
+	}
+	for used, k in learn.used {
+		if used && learn.pool[k].cpu == cpu {
+			learn.pool[k].changed = true
+		}
+	}
+	s.epoch = 0
+}
+
+// Set cpu's run stamp to epoch, as if that many runs had begun since the
+// stamps last wrapped: tests/learn forces the wrap with it.
+learn_epoch_skip :: proc(cpu: Learn_Cpu, epoch: u32) {
+	learn.space[cpu].epoch = epoch
 }
 
 // f's run stores at addr.
@@ -512,7 +549,7 @@ learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> boo
 	}
 	for w, i in words {
 		k, in_ram := ram_word(s, f.lo + u32(i) * 4)
-		if in_ram && s.fetched[k] != u32(w) && s.fetched_at[k] > f.fetch_at {
+		if in_ram && s.fetched[k].w != u32(w) && s.fetched[k].at >= f.epoch {
 			return true
 		}
 	}
