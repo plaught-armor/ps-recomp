@@ -423,10 +423,18 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 	for y in miny ..= maxy {
 		w0, w1, w2 := e0.w, e1.w, e2.w
 		ctx_seek(c, y)
+		// Each w steps by one rounded subtraction of the same dy, so it moves
+		// one way only, and each edge's test passes on one run of x: the
+		// three pass together on one run, which ends at the first pixel
+		// that fails after one that passed.
+		inside := false
 		for x in minx ..= maxx {
 			defer {w0 -= e0.dy; w1 -= e1.dy; w2 -= e2.dy}
-			if w0 < 0 || w1 < 0 || w2 < 0 {continue}
-			if (w0 == 0 && !e0.bias) || (w1 == 0 && !e1.bias) || (w2 == 0 && !e2.bias) {continue}
+			if w0 < 0 || w1 < 0 || w2 < 0 || (w0 == 0 && !e0.bias) || (w1 == 0 && !e1.bias) || (w2 == 0 && !e2.bias) {
+				if inside {break}
+				continue
+			}
+			inside = true
 			l0, l1, l2 := w0 * inv, w1 * inv, w2 * inv
 			f0, f1, f2 := f32(l0), f32(l1), f32(l2)
 			z := a.z * l0 + b.z * l1 + d.z * l2
