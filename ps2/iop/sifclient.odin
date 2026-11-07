@@ -216,6 +216,20 @@ rpc_client_freed :: proc(freed: []Sys_Block) {
 	if woke {iop_wake_set()}
 }
 
+// sceSifGetOtherData's receive data `rd` (a SifRpcReceiveData_t), as retail
+// fills it from the packet it takes for the request: the packet, its rpc_id
+// (the value, not its address as a client's), and the thread that waits, all
+// ones under NOWAIT. The copy is done at once here, so the packet is given
+// back at once and nobody waits. False with no packet free.
+rpc_other_data :: proc(rd, mode: u32) -> bool {
+	pkt := rpc_pkt_new(rd)
+	if pkt == 0 {return false}
+	w32(rd + CL_RPC_ID, r32(pkt + PK_RPC_ID))
+	w32(rd + CL_WAITER, 0xffffffff if mode & RPC_NOWAIT != 0 else iop_sched.cur)
+	rpc_pkt_free(pkt)
+	return true
+}
+
 @(private = "file")
 rpc_pkt_free :: proc(pkt: u32) {
 	w32(pkt + PK_REC_ID, r32(pkt + PK_REC_ID) &~ PK_IN_USE)
