@@ -1,6 +1,19 @@
 // HLE dbcman (module version 0x310) and the device drivers behind it: a pad
-// driver (ds1o_d or ds2u) and the memory card driver mc2_d, so none of these
-// modules, nor sio2d under them, runs on the IOP.
+// driver (ds1o_d, ds2o_d or ds2u) and the memory card driver mc2_d, so none
+// of these modules, nor sio2d under them, runs on the IOP.
+//
+// Two contracts, keyed on the major version of the dbcman export library in
+// the image the game loads (dbcman_module); each is a row of DBC_ROWS:
+// - 2.x, the default: control server 0x80001300 with every call below, the
+//   large driver-call server 0x8000131c and the fast ones 0x8000131e/f.
+// - 1.x (export library 1.02): 0x80001300 serving CreateSocket,
+//   DeleteSocket, GetBoundDriver, SetFlagBuffer, DriverFn3 and the version
+//   only, DriverFn3's result at +0x20c of its 0x280-byte buffer; the
+//   driver-call servers 0x8000131b (requests of up to 0x1090 bytes) and
+//   0x8000131c. No fast servers.
+// The calls 1.x shares with 2.x take the same layouts. A control call a
+// contract does not serve is logged once and its buffer left as sent; a
+// driver-call server it has not is unserved, as without a handler.
 //
 // dbcman binds EE sockets to IOP drivers. The EE creates a socket with a
 // filter (driver type, port and slot, sub id, name: the match flags pick
@@ -99,10 +112,34 @@ import "ps:core"
 import mem "../mem"
 
 DBC_SID :: 0x80001300
+DBC_SID_MID :: 0x8000131b // 1.x: driver calls of up to 0x1090 bytes
 DBC_SID_BIG :: 0x8000131c // driver calls of up to 0x2090 bytes
 DBC_SID_FAST0 :: 0x8000131e // driver calls of up to 0x90 bytes
 DBC_SID_FAST1 :: 0x8000131f
+// Both contracts answer 0x1363 with this: the EE library of either checks
+// only the major version, 3. Retail's 1.02 module answers 0x301.
 DBC_VERSION :: 0x310
+
+// What one contract serves (see the header).
+Dbc_Rows :: struct {
+	fnos:      Dbc_Fnos, // control calls served, by fno - 0x1300
+	fn3_at:    u32, // where DriverFn3's result goes
+	mid, fast: bool, // 0x8000131b; 0x8000131e/f
+}
+
+// A full set serves every fno, even one past it.
+Dbc_Fnos :: bit_set[0 ..< 128;u128]
+
+Dbc_Contract :: enum u8 {
+	V2,
+	V1,
+}
+
+@(rodata)
+DBC_ROWS := [Dbc_Contract]Dbc_Rows {
+	.V2 = {fnos = ~Dbc_Fnos{}, fn3_at = 0x8c, fast = true},
+	.V1 = {fnos = {0x01, 0x02, 0x03, 0x04, 0x1a, 0x63}, fn3_at = 0x20c, mid = true},
+}
 
 DBC_SOCKETS :: 16
 DBC_PAD :: 1 // driver types
@@ -139,7 +176,8 @@ Dbc_Pad_Driver :: struct {
 	filler: [4]u8,
 }
 
-// ds1o_d leaves a DualShock in analog mode: 6 poll bytes. ds2u puts it in
+// ds1o_d leaves a DualShock in analog mode: 6 poll bytes; ds2o_d, the pad
+// driver loaded with the 1.x dbcman, is served as it. ds2u puts it in
 // DualShock 2 mode: 18, the pressures too. Neither module checks the
 // pressures against the buttons in a way pad_poll_bytes' could fail (ds2u
 // sets a pressure of 0 for a held button to 1, and of a released one to 0).
@@ -170,6 +208,16 @@ dbc: struct {
 	// keep it in their port state and clear it when the pad goes.
 	frame:    [len(DBC_DRIVERS)]u32,
 	pad:      Dbc_Pad_Driver,
+	contract: Dbc_Contract,
+}
+
+// Host diagnostics, not emulated state: the unserved control fnos logged
+// (fno - 0x1300; any other fno is 127's), and whether an unknown export
+// version was.
+@(private = "file")
+dbc_logged: struct {
+	fnos:    Dbc_Fnos,
+	version: bool,
 }
 
 dbcman_init :: proc() {
@@ -178,19 +226,42 @@ dbcman_init :: proc() {
 	mc2 = {ready = true}
 }
 
-// A module load: the pad driver it names, by file or module name (ds1o_d,
+// A module load, its IRX `image` when the EE copied one to the IOP. An image
+// that exports the dbcman library picks the contract served from then on:
+// 1.x for major version 1, 2.x for any other, logged once. Without an image
+// the contract stays as it is.
+//
+// The pad driver the load names, by file or module name (ds1o_d, ds2o_d,
 // or ds2u or ds2u_d, ignoring case and any directory, extension or
 // version), is the one served from then on, its frame counters at 0 as its
 // start leaves them. Other names change nothing.
-dbcman_module :: proc(path: string) {
+dbcman_module :: proc(path: string, image: []u8 = nil) {
+	if v, ok := dbc_export_version(image); ok {
+		dbc.contract = .V1 if v >> 8 == 1 else .V2
+		if v >> 8 != 1 && !dbc_logged.version {
+			dbc_logged.version = true
+			fmt.eprintfln("dbcman: export library version %d.%02x not known; serving the 2.x calls", v >> 8, v & 0xff)
+		}
+	}
 	name := path[strings.last_index_any(path, `\/:`) + 1:]
 	name, _, _ = strings.partition(name, ".")
 	switch {
-	case strings.equal_fold(name, "ds1o_d"): dbc.pad = DBC_DS1O_D
+	case strings.equal_fold(name, "ds1o_d") || strings.equal_fold(name, "ds2o_d"): dbc.pad = DBC_DS1O_D
 	case strings.equal_fold(name, "ds2u") || strings.equal_fold(name, "ds2u_d"): dbc.pad = DBC_DS2U
 	case: return
 	}
 	dbc.frame = {}
+}
+
+// The version of the dbcman export library in IRX `image`, if it has one.
+@(private = "file")
+dbc_export_version :: proc(image: []u8) -> (version: u16, ok: bool) {
+	x := irx_parse(image) or_return
+	text := image[x.file_off:][:min(x.text_size, x.file_size)]
+	for &t in irx_tables(text, 0, context.temp_allocator) {
+		if !t.imports && strings.truncate_to_byte(string(t.name[:]), 0) == "dbcman" {return t.version, true}
+	}
+	return
 }
 
 dbcman_snap :: proc() {
@@ -290,6 +361,16 @@ dbc_pad_block :: proc(p: []u8, player: int, frame: u32) {
 dbcman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	r := ([^]i32)(raw_data(buf)) // result words
+	rows := &DBC_ROWS[dbc.contract]
+	if k := int(fno & 0xffff) - 0x1300; !dbc_serves(rows.fnos, k) {
+		bit := k if 0 <= k && k < 128 else 127
+		if bit not_in dbc_logged.fnos {
+			dbc_logged.fnos += {bit}
+			fmt.eprintfln("dbcman: fno %08x not served by the %v calls; the buffer left as sent", fno, dbc.contract)
+		}
+		core.compat_unknown(.Sif_Rpc, DBC_SID, sub = fno)
+		return true
+	}
 	switch fno & 0xffff {
 	case 0x1301: // CreateSocket {flags, type, port, slot, sub, name[16], _, A, B} -> +0x24
 		i := 0
@@ -331,8 +412,10 @@ dbcman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		dbc_flags_push()
 		w[0] = 1
 	case 0x1317: w[1] = 0 // Status: unsupported, always 0
-	case 0x1319, 0x131a: // DriverFn5, DriverFn3 {socket, cmd, size, param...} -> +0x8c
-		r[0x8c / 4] = dbc_call(w[0], w[1], buf, ping = fno & 0xffff == 0x131a)
+	case 0x1319: // DriverFn5 {socket, cmd, size, param...} -> +0x8c
+		r[0x8c / 4] = dbc_call(w[0], w[1], buf)
+	case 0x131a: // DriverFn3 {socket, cmd, size, param...} -> the contract's place
+		r[rows.fn3_at / 4] = dbc_call(w[0], w[1], buf, ping = true)
 	case 0x131d: // FindSocketByDevice {_, _, _, _, port, slot} -> +4
 		r[1] = DBC_NO_DRIVER
 		for drv, d in DBC_DRIVERS {
@@ -350,24 +433,37 @@ dbcman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	return true
 }
 
+// Whether `fnos` serves control fno 0x1300 + k.
+@(private = "file")
+dbc_serves :: proc(fnos: Dbc_Fnos, k: int) -> bool {
+	if 0 <= k && k < 128 {return k in fnos}
+	return fnos == ~Dbc_Fnos{}
+}
+
 // The driver-call servers: a DriverFn5 request, its result at the end of the
-// buffer. A request larger than the buffer is not served.
+// buffer. A request larger than the buffer is not served. A server the
+// contract has not is unserved, as without a handler.
 @(private)
 dbcman_fast_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
-	if send_size <= 0x90 {
-		w := ([^]u32)(raw_data(buf))
-		r := ([^]i32)(raw_data(buf))
-		r[0x8c / 4] = dbc_call(w[0], w[1], buf)
-	}
-	return true
+	return DBC_ROWS[dbc.contract].fast && dbc_driver_call(buf, send_size, 0x90)
+}
+
+@(private)
+dbcman_mid_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
+	return DBC_ROWS[dbc.contract].mid && dbc_driver_call(buf, send_size, 0x1090)
 }
 
 @(private)
 dbcman_big_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
-	if send_size <= 0x2090 {
+	return dbc_driver_call(buf, send_size, 0x2090)
+}
+
+@(private = "file")
+dbc_driver_call :: proc(buf: []u8, send_size, size: u32) -> bool {
+	if send_size <= size {
 		w := ([^]u32)(raw_data(buf))
 		r := ([^]i32)(raw_data(buf))
-		r[0x208c / 4] = dbc_call(w[0], w[1], buf)
+		r[(size - 4) / 4] = dbc_call(w[0], w[1], buf)
 	}
 	return true
 }
