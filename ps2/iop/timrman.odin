@@ -116,21 +116,18 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		for i in TIMR_ORDER {
 			hw, t := TIMR_HW[i], &iop_timr.t[i]
 			if t.use != 0 || u32(hw.sources) & a0 == 0 || u32(hw.bits) != a1 || u32(hw.prescale) < a2 {continue}
-			// stopped, no setup, no handler; compare and arg kept
-			t.use, t.mode, t.setup, t.scale = 1, 0, 0, 0
-			t.cmp, t.handler, t.due = 0, 0, 0
+			// As retail: only marked in use, its registers and state as they were
+			t.use = 1
 			return tim_id(i), true
 		}
 		return ke(KE_NO_TIMER), true
-	case 6: // FreeHardTimer(id)
+	case 6: // FreeHardTimer(id): as retail, the whole id must name a timer,
+		// KE_NO_TIMER when none or it is not in use; only its use count drops,
+		// the timer left running as it was
 		if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT), true}
 		t := tim_find(a0)
-		if t == nil || t.use == 0 {return ke(KE_ILLEGAL_TIMERID), true}
+		if t == nil || a0 != tim_id((a0 >> 28) - 1) || t.use == 0 {return ke(KE_NO_TIMER), true}
 		t.use -= 1
-		if t.use == 0 {
-			t.mode, t.cmp, t.handler, t.arg = 0, 0, 0, 0
-			tim_arm()
-		}
 		return KE_OK, true
 	case 10: // GetTimerCounter(id): the counter's register, read as the id's base names it, no check
 		i := (a0 >> 28) - 1
