@@ -1,7 +1,7 @@
 // Counts for a FLAT run (core/flat.odin), printed as the game ends.
 package ps2_cpu
 
-@(require) import "core:fmt" // used only under FLAT
+import "core:fmt"
 
 import "ps:core"
 
@@ -46,5 +46,7 @@ flat_print :: proc() {
 		fmt.eprintfln("ee flat: %d returns, %d with $ra not the call's return address, %d deep at most", flat_returns, flat_mismatch, flat_max_depth)
 		fmt.eprintfln("ipu flat: %d re-runs, %d quadwords replayed, %d quadwords since a checkpoint at most", ipu_reruns, ipu_replayed, ipu_journal_max)
 		if iop_flat_print != nil {iop_flat_print()}
+	} else {
+		fmt.eprintfln("ee interp: %d calls open at most", interp_max_depth)
 	}
 }

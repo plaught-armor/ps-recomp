@@ -224,15 +224,28 @@ mod_inners: [256]^Mod_Inner
 // runs keep the chain as data (kernel.Flat_Ctx).
 Interp_Frame :: struct {
 	ret, sp, target: u32,
+	depth:           u32, // records in the chain, this one included
 	direct:          bool,
 	prev:            ^Interp_Frame,
 }
 interp_top: ^Interp_Frame
 interp_tops: [256]^Interp_Frame
+// The most records any chain held (printed as the game ends: not state).
+interp_max_depth: u32
 
 // The most calls an unwind looks through, both interpreters: past it a
 // `jr $ra` returns as before.
 UNWIND_MAX :: 64
+
+// The most records a chain holds, each a run's host frames on its thread's
+// coroutine stack (core.CO_STACK, 8 MiB): past it the call is fatal. A call
+// whose callee jumps away and never returns leaves its record open (ps2
+// interp_call: a `jr $ra` no call returns to), so a loop of those would
+// grow the host stack without end. Measured on linux amd64 (the distance
+// between nested records): a record takes 2656 bytes with -o:speed, 672
+// with -o:none. With 4 KiB each for those and any native code between,
+// 8 MiB less 1 MiB of headroom holds 1792.
+INTERP_DEPTH_MAX :: 1792
 
 bad_insn :: proc(pc, w: u32) {
 	fatal("invalid instruction %08x at %08x", w, pc)

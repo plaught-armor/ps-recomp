@@ -1663,8 +1663,13 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				exit(a, .Call, .T, s.n)
 				leaves = true
 			} else {
+				// to the return address: no call (flat_loop's .Jalr)
+				skip := native.new_label(a)
+				native.set_cond_imm(a, .Eq, .B, s.n)
+				native.br_zero(a, .B, skip, nonzero = true)
 				native.mov(a, .A, .T)
 				native.call(a, "cpu.call", .A)
+				native.bind(a, skip)
 			}
 		case .Goto_Reg:
 			if wasm {

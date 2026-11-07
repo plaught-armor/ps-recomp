@@ -4,6 +4,8 @@
 // It follows the same calling convention as recompiled code: `jal`/`jalr`
 // become host calls through `call`, and `jr $ra` returns from interp_loop,
 // which is what the PS1 and the IOP both set interp_run to.
+// A link to its own return address (pc + 8: a get-pc idiom) is no call:
+// the link register set, the delay slot run, on at pc + 8.
 // Plain jumps stay inside the interpreter unless they land on a function the
 // dispatcher knows, in which case they become a tail call. A `j` at a run's
 // first word is a tail call too: that is an import stub patched to
@@ -190,7 +192,7 @@ interp_exec :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	case 0x03:
 		r[31] = pc + 8
 		branch(st, false, 0)
-		call((pc & 0xf0000000) | ((w & 0x3ffffff) << 2))
+		if t := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2); t != pc + 8 {call(t)}
 	case 0x04:
 		branch(st, r[rs] == r[rt], pc + 4 + (imm << 2))
 	case 0x05:
@@ -288,7 +290,7 @@ interp_special :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 		t := r[rs]
 		r[rd] = pc + 8
 		branch(st, false, 0)
-		call(t)
+		if t != pc + 8 {call(t)}
 	case 0x0c:
 		ahead := access_cycles(pending)
 		state.cycles += ahead
@@ -343,7 +345,7 @@ interp_regimm :: proc(st: ^Interp, pc, w: u32) {
 	if rt & 0x1e == 0x10 {
 		r[31] = pc + 8
 		branch(st, false, 0)
-		if taken {
+		if taken && target != pc + 8 {
 			call(target)
 		}
 		return

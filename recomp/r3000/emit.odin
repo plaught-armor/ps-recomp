@@ -343,7 +343,7 @@ emit_func :: proc(f: ^Func, out: ^strings.Builder, name: string, patches: []Patc
 			put(out, depth, fmt.aprintf("t: u32 = %s", R(s.n)))
 			append(&ifs, false)
 		case .Call_Reg:
-			put(out, depth, "cpu.call(t)")
+			put(out, depth, fmt.aprintf("if t != %s {{cpu.call(t)}}", hexu(s.target)))
 		case .Goto_Reg:
 			put(out, depth, "pc = t")
 			put(out, depth, "if c.cycles >= cpu.next_event {io.run_events()}")

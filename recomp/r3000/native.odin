@@ -995,8 +995,13 @@ native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exa
 			get(a, .T, s.n)
 			append(&ifs, -1)
 		case .Call_Reg:
+			// to the return address: no call (the interpreter's jalr)
+			skip := native.new_label(a)
+			native.set_cond_imm(a, .Eq, .B, s.target)
+			native.br_zero(a, .B, skip, nonzero = true)
 			native.mov(a, .A, .T)
 			native.call(a, "cpu.call", .A)
+			native.bind(a, skip)
 		case .Goto_Reg:
 			events(a)
 			if lookup < 0 {lookup = native.new_label(a)}
