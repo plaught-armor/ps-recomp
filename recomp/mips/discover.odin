@@ -136,7 +136,7 @@ discover :: proc(r: Rules, img: Image, f: ^Func, extra_labels: []u32) {
 		walk(r, img, probe, &probe_work, &probe_seen)
 		if !probe.computed {
 			for a in all {
-				if a in probe_seen {
+				if a in probe_seen || a in probe.delay {
 					append(&kept, a)
 				}
 			}
@@ -158,7 +158,7 @@ discover :: proc(r: Rules, img: Image, f: ^Func, extra_labels: []u32) {
 	if f.computed && len(all) == 0 {
 		clear(&work)
 		for a := f.start; a < f.end; a += 4 {
-			if a not_in seen {
+			if a not_in seen && a not_in f.delay {
 				append(&work, a)
 			}
 		}
@@ -200,11 +200,12 @@ walk :: proc(r: Rules, img: Image, f: ^Func, work: ^[dynamic]u32, seen: ^Set) {
 				break
 			}
 			if has_delay(i) {
+				// The slot stays out of seen, as in reached_code: a branch to
+				// it still walks on from there.
 				d := pc + 4
 				if inside(f, d) && d not_in f.insns {
 					if dw, d_ok := word(img, d); d_ok {
 						f.insns[d] = r.decode(d, dw)
-						seen[d] = {}
 					}
 				}
 				f.delay[d] = {}

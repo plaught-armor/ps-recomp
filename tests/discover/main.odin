@@ -75,6 +75,19 @@
 // T keeps D (the probe reached it) and drops L; D is walked as code before
 // the `j` claims it as a delay slot, so 0x102c is decoded and labelled. S's
 // probe meets `jr $v0`, so S keeps Q.
+//
+// Then mips.discover on a branch into a later jump's delay slot, on a fourth
+// image (code only), function 0x1000:
+//
+//   0x1000  beqz $a0, 0x1014; nop
+//   0x1008  li $v0, 1; li $v0, 2
+//   0x1010  j 0x1024                        its delay slot, 0x1014, is
+//   0x1014  li $v0, 3                         also the branch's target
+//   0x1018  li $v0, 4; jr $ra; nop          reached only by walking on
+//   0x1024  jr $ra; nop                       from 0x1014
+//
+// The fall-through decodes 0x1014 as a delay slot first; the branch to it
+// still walks on to 0x1018.
 package main
 
 import "core:fmt"
@@ -232,6 +245,21 @@ main :: proc() {
 	check(0x104c in s.labels && 0x104c in s.insns && 0x1050 in s.insns, "computed secondary: lost the case 0x104c")
 	mips.func_free(s)
 	delete(sec)
+
+	slot := make([]u8, 0x30)
+	put(slot, 0x1000, 0x10800004, NOP, 0x24020001, 0x24020002, j(0x1024), 0x24020003) // beq $a0, $0, 0x1014
+	put(slot, 0x1018, 0x24020004, JR_RA, NOP, JR_RA, NOP)
+	slots := mips.Image {
+		base     = 0x1000,
+		data     = slot,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(slot)), data = slot, flags = mips.SHF_ALLOC | mips.SHF_EXEC}},
+	}
+	b := mips.func_make(0x1000, 0x1030)
+	mips.discover(r5900.RULES, slots, b, {})
+	check(0x1014 in b.labels && 0x1014 in b.delay, "delay-slot target: 0x1014 not a label in a delay slot")
+	check(0x1018 in b.insns && 0x101c in b.insns && 0x1020 in b.insns, "delay-slot target: 0x1018 after it not walked")
+	mips.func_free(b)
+	delete(slot)
 
 	if failed != 0 {
 		os.exit(1)
