@@ -457,10 +457,18 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		fmt.eprintfln("sif: load module \"%s\"", cstring(&buf[8]))
 		path := strings.truncate_to_byte(string(buf[8:][:252]), 0)
 		args := buf[0x104:][:min(w[0], 252)]
-		// A rom0 module has no file here; a disc one is read for its image.
+		// A rom0 module has no file here. Under PS_IRX another is read, to
+		// run it, as before. A cdrom dbcman is read for its version either
+		// way, without PS_IRX on the host side alone: the drive's state is
+		// left as it was. Only a cdrom image picks dbcman's contract.
 		data: []u8
-		if !strings.has_prefix(path, "rom0:") {data, _ = disc_file(path, context.temp_allocator)}
-		dbcman_module(path, data)
+		cd := strings.has_prefix(path, "cdrom")
+		if iop_irx && !strings.has_prefix(path, "rom0:") {
+			data, _ = disc_file(path, context.temp_allocator)
+		} else if cd && dbcman_named(path) {
+			data, _ = disc_file(path, context.temp_allocator, spin = false)
+		}
+		dbcman_module(path, data if cd else nil)
 		w[0] = 2
 		w[1] = 0
 		if iop_irx && data != nil && iop_runs(data) {
@@ -867,10 +875,12 @@ disc_find :: proc(name: string, layer: u8 = 0) -> (file: Disc_File, path: string
 	return {t.file, e.lba, i64(e.size)}, "", true
 }
 
-// Read len(buf) bytes from byte pos of a disc file; the count read.
+// Read len(buf) bytes from byte pos of a disc file; the count read. The
+// drive spins up, as a game's read spins it, unless `spin` is false (a read
+// for the host's own use).
 @(private)
-disc_file_read :: proc(file: Disc_File, pos: i64, buf: []u8) -> int {
-	cd_spin()
+disc_file_read :: proc(file: Disc_File, pos: i64, buf: []u8, spin := true) -> int {
+	if spin {cd_spin()}
 	if image.volume != 0 {
 		return disc.read_at(&image, file.lba, pos, buf)
 	}
@@ -879,11 +889,11 @@ disc_file_read :: proc(file: Disc_File, pos: i64, buf: []u8) -> int {
 }
 
 // The bytes of a file of the disc, by its IOP or ISO9660 name: how a port
-// loads its executable (disc_boot) from the disc.
-disc_file :: proc(name: string, allocator := context.allocator) -> (data: []u8, ok: bool) {
+// loads its executable (disc_boot) from the disc. `spin` as disc_file_read.
+disc_file :: proc(name: string, allocator := context.allocator, spin := true) -> (data: []u8, ok: bool) {
 	file, _ := disc_find(name) or_return
 	data = make([]u8, file.size, allocator)
-	if disc_file_read(file, 0, data) != len(data) {
+	if disc_file_read(file, 0, data, spin) != len(data) {
 		delete(data, allocator)
 		return nil, false
 	}
