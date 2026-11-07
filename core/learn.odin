@@ -303,6 +303,9 @@ learn_begin :: proc(cpu: Learn_Cpu, entry: u32) -> ^Learn_Frame {
 		s.dropped += 1
 		return nil
 	}
+	if s.fetched == nil {
+		learn_fetched_make(s)
+	}
 	learn.n_free -= 1
 	k := learn.free[learn.n_free]
 	learn.used[k] = true
@@ -343,9 +346,6 @@ learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) #no_bounds_check 
 	if !in_ram {
 		return
 	}
-	if s.fetched == nil {
-		learn_fetched_make(s)
-	}
 	if s.fetched[k] != w && s.fetched_at[k] > f.fetch_at {
 		f.changed = true
 	}
@@ -353,8 +353,10 @@ learn_fetch :: #force_inline proc(f: ^Learn_Frame, pc, w: u32) #no_bounds_check 
 	s.fetched_at[k] = s.insns
 }
 
-// Untouched pages of the zeroed arrays are never committed: the host keeps
-// only those of the RAM code is fetched from.
+// Made at a processor's first run, so learn_fetch never checks: a frame of
+// cpu means its arrays exist (learn_hold's scratch ones, too). Untouched
+// pages of the zeroed arrays are never committed: the host keeps only those
+// of the RAM code is fetched from.
 @(private = "file")
 learn_fetched_make :: proc(s: ^Learn_Space) {
 	s.fetched = make([]u32, s.ram_bytes / 4, long_allocator())
@@ -507,9 +509,6 @@ learn_write :: proc(s: ^Learn_Space, f: ^Learn_Frame, flags: Learn_Flags) {
 learn_refetched :: proc(s: ^Learn_Space, f: ^Learn_Frame, words: []u32le) -> bool #no_bounds_check {
 	if f.changed {
 		return true
-	}
-	if s.fetched == nil {
-		return false
 	}
 	for w, i in words {
 		k, in_ram := ram_word(s, f.lo + u32(i) * 4)
