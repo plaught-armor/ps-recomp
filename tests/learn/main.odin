@@ -13,7 +13,9 @@
 // notes nothing of them; a range over
 // LEARN_SPAN_MAX is .Large with no words; a run begun with every frame in
 // use is not noted; a run still in progress at the report is written
-// .Open; and a reader drops a truncated record, one whose words do not
+// .Open; a record's words copied from RAM (learn_cpu's ram) are those
+// read word by word, through RAM's mirrors and for a range that crosses
+// RAM's end or lies outside it; and a reader drops a truncated record, one whose words do not
 // match its hash, and a record of the previous stream version. The
 // directory is removed at the end whether the test passes or fails.
 package main
@@ -39,6 +41,16 @@ check :: proc(ok: bool, what: string, loc := #caller_location) {
 @(private = "file")
 word :: proc(a: u32) -> u32 {
 	return a ~ 0xdead0000
+}
+
+// The PS1 RAM of the copy case: words of a running hash, so a word taken
+// from the wrong place differs.
+@(private = "file")
+ram: [2 * 1024 * 1024]u8
+
+@(private = "file")
+ram_read :: proc(a: u32) -> u32 {
+	return u32((^u32le)(&ram[a & (len(ram) - 4)])^)
 }
 
 // One run from entry fetching each of pcs and storing at each of stores.
@@ -260,6 +272,55 @@ main :: proc() {
 	empty[0] = 'C'
 	recs, bad = core.learn_read(empty[:])
 	check(bad == 1 && len(recs) == 0, fmt.tprintf("old version: %d bad, %d records", bad, len(recs)))
+
+	// learn_write copies a record's words from RAM when learn_cpu is given
+	// it, else reads them word by word. The same runs through both: the
+	// second writes nothing, every record it would write being the first's
+	// key (words and hash included), and the records hold RAM's words.
+	{
+		for k in 0 ..< len(ram) / 4 {
+			(^u32le)(&ram[4 * k])^ = u32le(u32(k) * 0x9e37_79b1 ~ 0x5bd1_e995)
+		}
+		copy_path, _ := filepath.join({tmp, "copy.bin"}, context.allocator)
+		check(core.learn_open_path(copy_path, {.Psx}), "open for the copy")
+		// KSEG0, a mirror, KSEG1, across RAM's end (read: it wraps) and
+		// outside RAM (read).
+		runs := [][]u32 {
+			{0x8001_0000, 0x8001_0004, 0x8001_000c},
+			{0x0060_2000, 0x0060_2008},
+			{0xa003_0000, 0xa003_0010},
+			{0x801f_fff8, 0x8020_0004},
+			{0x1f80_0100, 0x1f80_0104},
+		}
+		learned :: proc(runs: [][]u32) {
+			for pcs in runs {
+				f := core.learn_begin(.Psx, pcs[0])
+				for pc in pcs {core.learn_fetch(f, pc, ram_read(pc))}
+				core.learn_end(f)
+			}
+		}
+		core.learn_cpu(.Psx, &cycles, 1, ram_read, len(ram), true, ram[:])
+		learned(runs)
+		core.learn_cpu(.Psx, &cycles, 1, ram_read, len(ram), true)
+		learned(runs)
+		core.learn_report()
+		copied, cerr := os.read_entire_file(copy_path, context.allocator)
+		check(cerr == nil, "read back the copy")
+		copy_recs, _ := core.learn_read(copied)
+		n := 0
+		for r in copy_recs {
+			mine := false
+			for pcs in runs {mine ||= r.entry == pcs[0]}
+			if !mine {continue} // the report's .Open run, again
+			n += 1
+			ok := true
+			for v, j in r.words {
+				ok &&= v == ram_read(r.lo + u32(j) * 4)
+			}
+			check(ok, fmt.tprintf("copy: record %08x %v n %d is not RAM's words", r.entry, r.flags, len(r.words)))
+		}
+		check(n == len(runs), fmt.tprintf("copy: %d records, want %d (one per run, the read path's the same)", n, len(runs)))
+	}
 
 	if os.remove_all(tmp) != nil {
 		check(false, fmt.tprintf("cannot remove %s", tmp))
