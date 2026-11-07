@@ -52,6 +52,50 @@ native_ram :: proc() -> native.Ram {
 @(rodata)
 NATIVE_CACHED := [?]u32{4 * 2, 4 * 3, 4 * 4, 4 * 16}
 
+// The runtime procedures native code calls, as wasm32 calls them: the
+// count of their i32 arguments and whether they return one. psx/native's
+// imports gives their types; tests/wasm_sigs checks they agree.
+R3000_SIGS := [?]native.Sig {
+	{"cpu.lb", 1, true},
+	{"cpu.lh", 1, true},
+	{"cpu.lw", 1, true},
+	{"cpu.lbu", 1, true},
+	{"cpu.lhu", 1, true},
+	{"cpu.sb", 2, false},
+	{"cpu.sh", 2, false},
+	{"cpu.sw", 2, false},
+	{"cpu.lwl", 2, true},
+	{"cpu.lwr", 2, true},
+	{"cpu.swl", 2, false},
+	{"cpu.swr", 2, false},
+	{"cpu.lw_u", 1, true},
+	{"cpu.sw_u", 2, false},
+	{"cpu.syscall", 1, false},
+	{"cpu.brk", 2, false},
+	{"cpu.mtc0", 2, false},
+	{"cpu.rfe", 0, false},
+	{"cpu.bad_insn", 2, false},
+	{"cpu.call", 1, false},
+	{"cpu.jump_unknown", 2, false},
+	{"cpu.trace_block", 1, false},
+	{"gte.gte_read", 1, true},
+	{"gte.gte_write", 2, false},
+	{"gte.gte_cmd", 1, false},
+	{"gte.cmd_rtps", 1, false},
+	{"gte.cmd_rtpt", 1, false},
+	{"gte.cmd_mvmva", 1, false},
+	{"io.run_events", 0, false},
+}
+
+// An Asm for R3000 native code (a disc's, learned runs', mods'): native_ram's
+// RAM, NATIVE_CACHED's registers, and on wasm32 the calls by R3000_SIGS.
+native_asm :: proc(arch: native.Arch) -> native.Asm {
+	a := native.make_asm(arch, native_ram(), NATIVE_CACHED[:])
+	a.sigs = R3000_SIGS[:]
+	a.ctx_only = true // the core calls a function as a Func_Proc
+	return a
+}
+
 @(private = "file")
 get :: proc(a: ^native.Asm, dst: native.Reg, n: u32) {
 	if n == 0 {

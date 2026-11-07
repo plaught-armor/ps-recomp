@@ -20,7 +20,7 @@ Learned :: struct {
 // which interprets from there. In context.allocator. exact: accesses see
 // the cycles up to them (Step.seen); false for the IOP's runs.
 learned_blob :: proc(runs: []Learned, arch: native.Arch, exact := true) -> []u8 {
-	a := native.make_asm(arch, native_ram(), NATIVE_CACHED[:])
+	a := native_asm(arch)
 	spans := make([]native.Blob_Span, len(runs))
 	defer delete(spans)
 	for r, k in runs {

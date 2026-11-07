@@ -215,6 +215,9 @@ Asm :: struct {
 	// declares each call's type from them (x64 and arm64 do not read them).
 	sigs:      []Sig,
 	sig_index: map[string]int,
+	// wasm32: a generated function has type (ctx: i32) -> (), an Odin
+	// proc(), and takes no entry pc (entry_pc is then unavailable).
+	ctx_only:  bool,
 	wa:        Wasm, // wasm32 only
 }
 

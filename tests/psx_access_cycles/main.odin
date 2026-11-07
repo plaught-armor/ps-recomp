@@ -14,32 +14,20 @@
 // the label when the block fell into it, and the interpreter had not.
 //
 // Run it on the host, plain and FLAT, and built for wasi_wasm32 (run.mjs),
-// which checks the interpreted log only: the r3000 has no wasm32 import
-// signatures yet, so there is no PS1 wasm32 blob. The Odin-source emitter
-// (recomp/r3000/emit.odin) is not run here: tests/psx_learned only checks
-// the text of the learned rows it writes, and no test compiles them. The
-// static code a port compiles from it runs in a port's own checks (the
-// BoF4 port's tests/local/ref).
+// whose learned function is wasm32 code (recomp/r3000 R3000_SIGS). The
+// Odin-source emitter (recomp/r3000/emit.odin) is not run here:
+// tests/psx_learned only checks the text of the learned rows it writes, and
+// no test compiles them. The static code a port compiles from it runs in a
+// port's own checks (the BoF4 port's tests/local/ref).
 package main
 
 import "core:fmt"
 import "core:os"
-import "core:path/filepath"
 import "ps:core"
 import cpu "ps:psx/cpu"
 import psx_native "ps:psx/native"
 import "ps:recomp/native"
 import "ps:recomp/r3000"
-
-// The learned half is not built on WASI (no r3000 wasm32 signatures), so
-// these imports stand unused there.
-when ODIN_OS == .WASI {
-	_ :: filepath
-	_ :: core
-	_ :: psx_native
-	_ :: native
-	_ :: r3000
-}
 
 @(private = "file")
 failed: int
@@ -173,30 +161,15 @@ main :: proc() {
 	check(same(interp, want), fmt.tprintf("interpreted log %v, want %v", interp, want))
 	check(interp_end == want_end, fmt.tprintf("interpreted cycles %d, want %d", interp_end, want_end))
 
-	// The r3000 has no wasm32 import signatures (recomp/native/wasm.odin
-	// wasm_call; only the EE's are set), so no PS1 wasm32 blob is built yet:
-	// on wasi_wasm32 only the interpreted half runs.
-	when ODIN_OS != .WASI {
-		tmp, err := os.make_directory_temp("", "ps_access_cycles_*", context.allocator)
-		if err != nil {
-			fmt.eprintln("FAIL psx_access_cycles: no temp directory:", err)
-			os.exit(1)
-		}
-		path, _ := filepath.join({tmp, "learned.bin"}, context.allocator)
-		blob := r3000.learned_blob({{LOOP, LOOP, code[:]}}, native.Arch(core.NATIVE_ARCH))
-		check(os.write_entire_file(path, blob) == nil, "write the blob")
-		check(psx_native.load_learned(path), "load the blob")
-		learned, learned_end, native_ran := run()
-		check(native_ran, "the learned function did not run")
-		check(same(learned, want), fmt.tprintf("learned log %v, want %v", learned, want))
-		check(learned_end == want_end, fmt.tprintf("learned cycles %d, want %d", learned_end, want_end))
-
-		if os.remove_all(tmp) != nil {
-			check(false, fmt.tprintf("cannot remove %s", tmp))
-		}
-	}
+	// The blob from memory (load_learned_blob): wasi has no temp directory.
+	blob := r3000.learned_blob({{LOOP, LOOP, code[:]}}, native.Arch(core.NATIVE_ARCH))
+	check(psx_native.load_learned_blob(blob, "learned"), "load the blob")
+	learned, learned_end, native_ran := run()
+	check(native_ran, "the learned function did not run")
+	check(same(learned, want), fmt.tprintf("learned log %v, want %v", learned, want))
+	check(learned_end == want_end, fmt.tprintf("learned cycles %d, want %d", learned_end, want_end))
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.printfln("ok psx_access_cycles: an access sees the cycles up to it and its own, right after a fallthrough label, in a delay slot and a load delay's, an SR write and a syscall too, %s", ODIN_OS == .WASI ? "interpreted (no PS1 wasm32 blob yet)" : "interpreted and learned alike")
+	fmt.println("ok psx_access_cycles: an access sees the cycles up to it and its own, right after a fallthrough label, in a delay slot and a load delay's, an SR write and a syscall too, interpreted and learned alike")
 }

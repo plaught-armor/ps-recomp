@@ -21,6 +21,13 @@ load_learned :: proc(path: string) -> bool {
 		return false
 	}
 	defer delete(blob)
+	return load_learned_blob(blob, path)
+}
+
+// load_learned of a blob in memory, which it does not keep; name stands
+// for it in the messages.
+load_learned_blob :: proc(blob: []u8, name: string) -> bool {
+	path := name
 	// Through the hook, which is the IOP's when the R3000 is the IOP
 	// (ps2/iop/iop_cpu.odin) and io.run_events for the PS1.
 	m := imports()
