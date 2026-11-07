@@ -75,6 +75,7 @@ EE_SIGS := [?]native.Sig {
 	{"kernel.trace_call", 1, false},
 	{"kernel.run_events", 0, false},
 	{"ps2.mod_call_original", 0, false}, // mods blobs only
+	{"ps2.learned_jr", 1, false}, // learned blobs only, not wasm32's
 	{"ps2.spin_probe", 1, false},
 	{"ps2.exec_op", 3, false},
 	{"ps2.ld", 2, false},
@@ -1535,7 +1536,10 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 // table and call it (nothing registers over the native functions after
 // load_native). With mods (a mod's own code, mods_blob), a jal to
 // MOD_ORIGINAL calls ps2.mod_call_original direct, where cpu.call would
-// miss its table and reach it through the interpreter hook.
+// miss its table and reach it through the interpreter hook. With learned
+// (learned_blob's code), each `jr $ra` calls ps2.learned_jr first, so one
+// to another address than the function's own return address unwinds or
+// jumps as the interpreter's does: static native code's never needs to.
 //
 // On wasm32 the code is a step of the FLAT runner: one function, entered
 // at the block of its pc parameter, that runs until the interpreter has
@@ -1545,7 +1549,7 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 // the runner goes on at), all at the function's offset (its index). A short
 // backward Goto spins (ps2/spin.odin) as on x64. nil when lower cannot
 // lower f for it: f is interpreted.
-native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil, mods := false) -> []native.Blob_Func {
+native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil, mods := false, learned := false) -> []native.Blob_Func {
 	wasm := a.arch == .Wasm32
 	steps := lower(f, cycles, quiet = true, exact = wasm) // emit_func warned
 	if steps == nil {return nil}
@@ -1623,6 +1627,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			if wasm {
 				exit(a, .Eret if s.check else .Return)
 			} else {
+				if learned && s.n != 0 {call_imm(a, "ps2.learned_jr", s.n)}
 				native.ret(a)
 			}
 			leaves = true
