@@ -244,8 +244,11 @@ mod_inners: [256]^Mod_Inner
 // innermost first, on the host stack: the address each returns to and the
 // guest sp at the call, so a `jr $ra` to an outer call's return address
 // with that call's sp (a longjmp) returns there instead of to its own
-// caller. target is the address called; direct: the run that made the call
-// was itself called by the record below, with no host code between. Each
+// caller. target is the address called; direct: no host code's call
+// (barrier) is under the run that made the call, so an unwind may return
+// past the native code between (unwinding); gaps: the runs down to the
+// thread's base, this one's included, with host code between one and the
+// record below (native code, or the kernel's at the base). Each
 // thread has its own (interp_tops by thread id, swapped by the kernel's
 // thread switch); an exec starts with none. Emulated: the records are on
 // the coroutines' stacks, which snapshots hold. Unused under FLAT, whose
@@ -253,16 +256,26 @@ mod_inners: [256]^Mod_Inner
 Interp_Frame :: struct {
 	ret, sp, target: u32,
 	depth:           u32, // records in the chain, this one included (barriers not counted)
+	gaps:            u32,
 	direct:          bool,
 	barrier:         bool, // host code's call (host_call), no interpreted run's
 	prev:            ^Interp_Frame,
 }
 interp_top: ^Interp_Frame
+// Set while an unwind returns to an outer call (ps2 interp_call): native
+// code tests it after each guest call (recomp/r5900 native.odin) and
+// recompiled Odin code too (emit.odin), and returns at once. Set and
+// cleared within one call chain: not state.
+unwinding: bool
 interp_tops: [256]^Interp_Frame
 // The most records any chain held (printed as the game ends: not state).
 interp_max_depth: u32
 // Barrier records host_call pushed (printed as the game ends: not state).
 interp_barriers: u64
+// Unwinds and jumps (ps2 interp_unwind_find), all and those across native
+// code's calls, and jumps refused at NATIVE_STALE_MAX (printed as the game
+// ends: not state).
+interp_unwinds, interp_unwinds_native, interp_jumps, interp_jumps_native, interp_stale: u64
 
 // The entry of the thread starting now (thread_call): an interpreted run
 // entered there with no records open is the thread's base, with only the
@@ -273,6 +286,13 @@ interp_base: u32
 // The most calls an unwind looks through, both interpreters: past it a
 // `jr $ra` returns as before.
 UNWIND_MAX :: 64
+
+// The most host code gaps (Interp_Frame.gaps) a jump leaves open under
+// its run, each of them native frames that no return may reach again: past
+// it the `jr $ra` returns as before (shown once). A jump walks every record
+// to the base, so UNWIND_MAX bounds the records; this bounds the native
+// frames among them.
+NATIVE_STALE_MAX :: 32
 
 // The most records a chain holds, each a run's host frames on its thread's
 // coroutine stack (core.CO_STACK, 8 MiB): past it the call is fatal. A call

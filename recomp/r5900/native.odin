@@ -189,6 +189,12 @@ trace :: proc(a: ^native.Asm, entry: u32) {
 	native.bind(a, skip)
 }
 
+// The byte native code tests after each guest call (native.call_leave):
+// cpu.unwinding, set while an interpreted `jr $ra` unwinds to an outer call
+// (ps2 interp_call), so each native function between returns at once.
+@(private = "file")
+UNWINDING :: "cpu.unwinding"
+
 @(private = "file")
 call_imm :: proc(a: ^native.Asm, name: string, v: u32) {
 	native.mov_imm(a, .A, v)
@@ -1639,11 +1645,12 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				exit(a, .Call, .T, s.n)
 				leaves = true
 			} else if mods && s.target == MOD_ORIGINAL {
-				native.call(a, "ps2.mod_call_original")
+				native.call_leave(a, UNWINDING, "ps2.mod_call_original")
 			} else if l, ok := funcs[s.target]; ok {
-				native.call_func(a, l)
+				native.call_func(a, l, UNWINDING)
 			} else {
-				call_imm(a, "cpu.call", s.target)
+				native.mov_imm(a, .A, s.target)
+				native.call_leave(a, UNWINDING, "cpu.call", .A)
 			}
 		case .Branch:
 			branch_cond(a, s.i)
@@ -1669,7 +1676,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				native.set_cond_imm(a, .Eq, .B, s.n)
 				native.br_zero(a, .B, skip, nonzero = true)
 				native.mov(a, .A, .T)
-				native.call(a, "cpu.call", .A)
+				native.call_leave(a, UNWINDING, "cpu.call", .A)
 				native.bind(a, skip)
 			}
 		case .Goto_Reg:

@@ -48,5 +48,6 @@ flat_print :: proc() {
 		if iop_flat_print != nil {iop_flat_print()}
 	} else {
 		fmt.eprintfln("ee interp: %d calls open at most, %d barrier records", interp_max_depth, interp_barriers)
+		fmt.eprintfln("ee interp: %d unwinds (%d across native code), %d jumps (%d across native code), %d jumps refused at NATIVE_STALE_MAX", interp_unwinds, interp_unwinds_native, interp_jumps, interp_jumps_native, interp_stale)
 	}
 }

@@ -554,16 +554,16 @@ a64_br_state64_below :: proc(a: ^Asm, off: u32, limit: int, l: Label) {
 	branch(a, 0x54000000 | CC[.Ltu], .A64_B19, l) // b.lo
 }
 
-a64_br_byte_clear :: proc(a: ^Asm, addr, mask: int, l: Label) {
+a64_br_byte_clear :: proc(a: ^Asm, addr, mask: int, l: Label, nonzero: bool) {
 	load_imp(a, T0, addr)
 	emit32(a, 0x39400000 | T0 << 5 | T0) // ldrb w12, [x12]
 	if mask < 0 {
-		branch(a, 0x34000000 | T0, .A64_B19, l) // cbz
+		branch(a, (nonzero ? 0x35000000 : 0x34000000) | T0, .A64_B19, l) // cbnz, cbz
 		return
 	}
 	load_imp(a, T1, mask)
 	rrr(a, 0x6a00001f, 0, T0, T1) // tst w12, w13
-	branch(a, 0x54000000 | CC[.Eq], .A64_B19, l)
+	branch(a, 0x54000000 | CC[nonzero ? .Ne : .Eq], .A64_B19, l)
 }
 
 // The immr and imms fields of a 32-bit logical immediate: one run of ones.

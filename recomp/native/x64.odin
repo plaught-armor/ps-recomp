@@ -716,7 +716,7 @@ x64_br_state64_below :: proc(a: ^Asm, off: u32, limit: int, l: Label) {
 	jump(a, 0x2, l) // jb
 }
 
-x64_br_byte_clear :: proc(a: ^Asm, addr, mask: int, l: Label) {
+x64_br_byte_clear :: proc(a: ^Asm, addr, mask: int, l: Label, nonzero: bool) {
 	op_imp(a, true, 0x8b, RCX, addr) // mov rcx, [slot]
 	emit8(a, 0x0f, 0xb6, 0x09) // movzx ecx, byte [rcx]
 	if mask >= 0 {
@@ -724,7 +724,7 @@ x64_br_byte_clear :: proc(a: ^Asm, addr, mask: int, l: Label) {
 	} else {
 		emit8(a, 0x85, 0xc9) // test ecx, ecx
 	}
-	jump(a, 0x4, l) // jz
+	jump(a, nonzero ? 0x5 : 0x4, l) // jnz, jz
 }
 
 // To far when the guest address in A is not RAM.

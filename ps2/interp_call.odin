@@ -11,13 +11,15 @@
 // an outer interpreted call with that call's sp, it is a longjmp there (a
 // throw that restored a catch frame's registers): the runs in between
 // return, and the one that made the call goes on there
-// (interp_unwind_find). Host code between them stops it: the `jr` returns
-// as before (shown once under PS_DEBUG). One that no call returns to with
-// that sp (a coroutine's resume, or a fiber switch one call down whose
-// return address is another fiber's call's) is a jump there, the calls it
-// is inside left open until a later `jr $ra` returns to one of them, when
-// only the thread's start is host code under the run: else it may return
-// to native code.
+// (interp_unwind_find). Native code between them returns at once too
+// (cpu.unwinding). Host code's call (cpu.host_call: a handler's, a
+// syscall's) stops it: the `jr` returns as before (shown once under
+// PS_DEBUG). One that no call returns to with that sp (a coroutine's
+// resume, or a fiber switch one call down whose return address is another
+// fiber's call's) is a jump there, the calls it is inside left open until a
+// later `jr $ra` returns to one of them, with no host code's call under the
+// run, and at most cpu.NATIVE_STALE_MAX gaps of native code left open
+// under it.
 //
 // A link branch or `jal` / `jalr` to its own return address (bal .+8, which
 // reads the pc into $ra) only links: no call, as on the console.
@@ -46,7 +48,7 @@ interp_unwind: ^cpu.Interp_Frame
 // The longjmps shown so far, each kind once under PS_DEBUG (a search past
 // cpu.UNWIND_MAX once always): not state.
 @(private = "file")
-unwind_shown: bit_set[enum {Done, Native, Max, Jump, Under}]
+unwind_shown: bit_set[enum {Done, Native, Max, Jump, Under, Stale}]
 
 @(private)
 branch_taken :: proc(i: r5900.Insn) -> bool {
@@ -156,12 +158,15 @@ interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame) -> (lf: ^core.Learn_Fr
 	lf = lf_in
 	c := &cpu.state
 	pc := entry
-	// Its return address, and whether the call into it is the top record
-	// (cpu.Interp_Frame), or with none, the thread's base: host code
-	// between, such as native code, or a mod's chain, could be.
+	// Its return address; whether no host code's call is under it (direct:
+	// mods' chains count as one); and the gaps of host code under it
+	// (cpu.Interp_Frame): one more than the top record's when the call into
+	// it is not that record's, or with none, not the thread's base.
 	ra, sp := u32(c.r[31].d[0]), u32(c.r[29].d[0])
 	top := cpu.interp_top
-	direct := !cpu.mod_on && (top == nil ? entry == cpu.interp_base : !top.barrier && top.target == entry && top.ret == ra && top.sp == sp)
+	direct := !cpu.mod_on && (top == nil || !top.barrier)
+	tight := top == nil ? entry == cpu.interp_base : !top.barrier && top.target == entry && top.ret == ra && top.sp == sp
+	gaps := (top == nil ? 0 : top.gaps) + (tight ? 0 : 1)
 	for {
 		i := r5900.decode(pc, mem.rd32(pc))
 		if lf != nil {learn_note(lf, i)}
@@ -184,7 +189,7 @@ interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame) -> (lf: ^core.Learn_Fr
 			if !taken {
 				pc = ret
 			} else if i.link {
-				if i.target != ret && interp_calls(ret, i.target, direct) {return}
+				if i.target != ret && interp_calls(ret, i.target, direct, gaps) {return}
 				pc = ret
 			} else {
 				if goto_pc(entry, pc, i.target) {return}
@@ -197,19 +202,19 @@ interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame) -> (lf: ^core.Learn_Fr
 		case .Call:
 			c.r[31].d[0] = u64(ret)
 			delay_slot(pc + 4, lf)
-			if i.target != ret && interp_calls(ret, i.target, direct) {return}
+			if i.target != ret && interp_calls(ret, i.target, direct, gaps) {return}
 			pc = ret
 		case .Jalr:
 			t := u32(c.r[i.rs].d[0])
 			if i.rd != 0 {c.r[i.rd].d[0] = u64(ret)}
 			delay_slot(pc + 4, lf)
-			if t != ret && interp_calls(ret, t, direct) {return}
+			if t != ret && interp_calls(ret, t, direct, gaps) {return}
 			pc = ret
 		case .Jr:
 			t := u32(c.r[i.rs].d[0])
 			delay_slot(pc + 4, lf)
 			if i.rs == 31 {
-				if t == ra && u32(c.r[29].d[0]) == sp || !interp_unwind_find(t, direct) {return}
+				if t == ra && u32(c.r[29].d[0]) == sp || !interp_unwind_find(t, direct, gaps) {return}
 				// A jump to another fiber's code: this run ends here
 				// for LEARN, so none of that code is noted in it.
 				if lf != nil {
@@ -227,11 +232,11 @@ interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame) -> (lf: ^core.Learn_Fr
 	}
 }
 
-// The call to t from a run, which returns to ret; direct is the run's own
-// (interp_body). True when an unwind goes on past it to an outer call: the
+// The call to t from a run, which returns to ret; direct and gaps are the
+// run's own (interp_body). True when an unwind goes on past it to an outer call: the
 // run returns at once.
 @(private = "file")
-interp_calls :: #force_inline proc(ret, t: u32, direct: bool) -> bool {
+interp_calls :: #force_inline proc(ret, t: u32, direct: bool, gaps: u32) -> bool {
 	depth := cpu.interp_top == nil ? 1 : cpu.interp_top.depth + 1
 	if depth > cpu.INTERP_DEPTH_MAX {
 		cpu.fatal("ee: the call of %08x from %08x is past the limit of %d interpreted calls open at once (INTERP_DEPTH_MAX, the host stack's): calls whose callee jumped away and never returned", t, ret - 8, cpu.INTERP_DEPTH_MAX)
@@ -242,6 +247,7 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool) -> bool {
 		sp     = u32(cpu.state.r[29].d[0]),
 		target = t,
 		depth  = depth,
+		gaps   = gaps,
 		direct = direct,
 		prev   = cpu.interp_top,
 	}
@@ -251,29 +257,30 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool) -> bool {
 	if interp_unwind == nil {return false}
 	if interp_unwind != &fr {return true}
 	interp_unwind = nil
+	cpu.unwinding = false
 	return false
 }
 
 // A `jr $ra` to t, not with the run's own return address and sp: the
 // innermost of the cpu.UNWIND_MAX records above returning to t with the
 // guest sp now is the call to unwind to (interp_unwind), when every run
-// above it was called directly (direct, then each record's). A record that
+// above it has no host code's call under it (direct, then each record's):
+// native code between returns at once (cpu.unwinding). A record that
 // returns to t with another sp is no match. Else the `jr` returns as
-// before, except when no record matches and every run down to the thread's
-// base was called directly: true, a jump. With host code under a run, t
-// may be a native caller's return address. A barrier record (host code's
-// call) is host code under every run above it, and not counted.
+// before, except when no record matches and no run down to the thread's
+// base has host code's call under it: true, a jump, the native code under
+// the run (gaps, the run's) left open, at most cpu.NATIVE_STALE_MAX gaps.
+// A barrier record (host code's call) is under every run above it, and not
+// counted.
 @(private = "file")
-interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
+interp_unwind_find :: proc(t: u32, direct: bool, gaps: u32) -> bool {
 	sp := u32(cpu.state.r[29].d[0])
 	ok := direct
 	n := 0
 	for f := cpu.interp_top; f != nil; f = f.prev {
-		// Host code's call (cpu.host_call): nothing past it is unwound to.
-		if f.barrier {
-			ok = false
-			continue
-		}
+		// Host code's call (cpu.host_call): not a call to match. The run
+		// above it is not direct, so ok is already false past it.
+		if f.barrier {continue}
 		if n == cpu.UNWIND_MAX {
 			if .Max not_in unwind_shown {
 				unwind_shown += {.Max}
@@ -286,7 +293,7 @@ interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 			if !ok {
 				if cpu.debug >= 1 && .Native not_in unwind_shown {
 					unwind_shown += {.Native}
-					fmt.eprintfln("ee: jr $ra to %08x: the call %d out returns there, past host code; returning as before", t, n)
+					fmt.eprintfln("ee: jr $ra to %08x: the call %d out returns there, past host code's call; returning as before", t, n)
 				}
 				return false
 			}
@@ -295,6 +302,9 @@ interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 				fmt.eprintfln("ee: jr $ra to %08x: unwound to the call %d out", t, n)
 			}
 			interp_unwind = f
+			cpu.unwinding = true
+			cpu.interp_unwinds += 1
+			if gaps > f.gaps {cpu.interp_unwinds_native += 1}
 			return false
 		}
 		ok = ok && f.direct
@@ -302,7 +312,15 @@ interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 	if !ok {
 		if cpu.debug >= 1 && .Under not_in unwind_shown {
 			unwind_shown += {.Under}
-			fmt.eprintfln("ee: jr $ra to %08x: no call returns there, host code under the run; returning as before", t)
+			fmt.eprintfln("ee: jr $ra to %08x: no call returns there, host code's call under the run; returning as before", t)
+		}
+		return false
+	}
+	if gaps > cpu.NATIVE_STALE_MAX {
+		cpu.interp_stale += 1
+		if .Stale not_in unwind_shown {
+			unwind_shown += {.Stale}
+			fmt.eprintfln("ee: jr $ra to %08x: no call returns there, and a jump would leave %d gaps of native code open under the run, past %d (NATIVE_STALE_MAX); returning as before", t, gaps, cpu.NATIVE_STALE_MAX)
 		}
 		return false
 	}
@@ -310,5 +328,7 @@ interp_unwind_find :: proc(t: u32, direct: bool) -> bool {
 		unwind_shown += {.Jump}
 		fmt.eprintfln("ee: jr $ra to %08x: no call returns there; a jump", t)
 	}
+	cpu.interp_jumps += 1
+	if gaps > 0 {cpu.interp_jumps_native += 1}
 	return true
 }

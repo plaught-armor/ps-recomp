@@ -4,8 +4,8 @@
 // Control flow inside it is a `for { switch pc { ... } }` state machine
 // whose cases are basic-block labels; straight-line code falls through.
 // `jal` to a function in the same package is a direct host call, otherwise
-// `cpu.call(addr)` dispatches through the runtime's table. `jr $ra` is a host
-// return. Instructions are inline, or call the runtime procedure that
+// `cpu.call(addr)` dispatches through the runtime's table; after either, a
+// set cpu.unwinding returns at once. `jr $ra` is a host return. Instructions are inline, or call the runtime procedure that
 // owns them: `kernel.syscall`, `cpu.brk`, the MMI multiplies (PMULTW,
 // PMULTUW, PMADDW, PMADDUW, PMSUBW, PMULTH, PMADDH, PMSUBH, PHMSBH),
 // `cpu.pdivbw`, `cpu.pmfhl`, and `cpu.fpu_slow` for FPU arithmetic on
@@ -619,6 +619,7 @@ emit_func :: proc(e: ^Emitter, f: ^Func) {
 			put(&body, tab, "continue")
 		case .Call:
 			put(&body, tab, call_stmt(e, s.target))
+			put(&body, tab, LEAVE)
 		case .Branch:
 			put(&body, tab, "{")
 			put(&body, tab, fmt.tprintf("t := %s", branch_cond(s.i)))
@@ -634,7 +635,10 @@ emit_func :: proc(e: ^Emitter, f: ^Func) {
 			put(&body, tab, fmt.tprintf("t := %s", R32(u8(s.n))))
 			append(&open, s.kind)
 		case .Call_Reg:
-			put(&body, tab, fmt.tprintf("if t != %s {{cpu.call(t)}}", hexu(s.n)))
+			put(&body, tab, fmt.tprintf("if t != %s {{", hexu(s.n)))
+			put(&body, tab, "\tcpu.call(t)")
+			put(&body, tab, fmt.tprintf("\t%s", LEAVE))
+			put(&body, tab, "}")
 		case .Goto_Reg:
 			put(&body, tab, "pc = t")
 			put(&body, tab, "if c.cycles >= cpu.next_event {kernel.run_events()}")
@@ -654,6 +658,11 @@ emit_func :: proc(e: ^Emitter, f: ^Func) {
 	fmt.sbprintln(sb, "}")
 	fmt.sbprintln(sb, "")
 }
+
+// After each guest call: an unwind past this function (cpu.unwinding, ps2
+// interp_call) returns from it at once.
+@(private = "file")
+LEAVE :: "if cpu.unwinding {return}"
 
 call_stmt :: proc(e: ^Emitter, t: u32) -> string {
 	hooked := e.hooked != nil && t in e.hooked^

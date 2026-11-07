@@ -192,6 +192,7 @@ Asm :: struct {
 	imports:   [dynamic]string,
 	imp_index: map[string]int,
 	epilogue:  Label, // of the function being emitted
+	leave:     Label, // its epilogue past the write-back of the cached fields
 	ram:       Ram,
 	cold:      [dynamic]Cold, // of the function being emitted
 	slow:      [dynamic]Slow,
@@ -423,6 +424,7 @@ func_begin :: proc(a: ^Asm, state: string) -> int {
 	align_code(a)
 	at := len(a.code)
 	a.epilogue = new_label(a)
+	a.leave = new_label(a)
 	a.state = state
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
@@ -487,6 +489,7 @@ func_end :: proc(a: ^Asm) {
 	}
 	bind(a, a.epilogue)
 	cache_sync(a, true)
+	bind(a, a.leave)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_epilogue(a)
@@ -1056,6 +1059,12 @@ divide :: proc(a: ^Asm, signed: bool, lo, hi: u32) {
 // comes back in A. The cached fields go to the state for it and come back
 // after.
 call :: proc(a: ^Asm, name: string, args: ..Reg) {
+	call_leave(a, "", name, ..args)
+}
+
+// call; then, with leave not "", when the byte at import `leave` is set,
+// leave the function at once (call_after).
+call_leave :: proc(a: ^Asm, leave, name: string, args: ..Reg) {
 	assert(len(args) <= 3, "native: too many arguments")
 	cache_sync(a, true)
 	switch a.arch {
@@ -1066,13 +1075,14 @@ call :: proc(a: ^Asm, name: string, args: ..Reg) {
 	case .Wasm32:
 		wasm_call(a, imp(a, name), args)
 	}
-	cache_sync(a, false)
+	call_after(a, leave)
 }
 
 // Call the function at label l (bound with bind_at), passing the context
 // as the runtime's call table does, so the callee's prologue is entered the
-// same way. As call, the cached fields go to the state and come back after.
-call_func :: proc(a: ^Asm, l: Label) {
+// same way. As call, the cached fields go to the state and come back after,
+// and leave is call_leave's.
+call_func :: proc(a: ^Asm, l: Label, leave := "") {
 	cache_sync(a, true)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
@@ -1081,6 +1091,19 @@ call_func :: proc(a: ^Asm, l: Label) {
 		a64_call_func(a, l)
 	case .Wasm32:
 		wasm_call_func(a, l)
+	}
+	call_after(a, leave)
+}
+
+// After a call: with leave not "", when the byte at import `leave` is set,
+// go to the epilogue past its write-back of the cached fields, which the
+// call already wrote and the callee may have changed since (an unwind
+// across native code, ps2 interp_call). Then the cached fields come back.
+@(private = "file")
+call_after :: proc(a: ^Asm, leave: string) {
+	if leave != "" {
+		assert(a.arch != .Wasm32, "native: call_leave on wasm32")
+		br_byte_clear(a, leave, "", a.leave, nonzero = true)
 	}
 	cache_sync(a, false)
 }
@@ -1411,15 +1434,17 @@ br_state64_below :: proc(a: ^Asm, off: u32, limit: string, l: Label) {
 }
 
 // Go to l when the byte at the address in import `addr`, masked with the
-// value of import `mask` (or with 0xff when mask is ""), is zero.
-br_byte_clear :: proc(a: ^Asm, addr, mask: string, l: Label) {
+// value of import `mask` (or with 0xff when mask is ""), is zero; with
+// nonzero (x64 and arm64), when it is not.
+br_byte_clear :: proc(a: ^Asm, addr, mask: string, l: Label, nonzero := false) {
 	m := mask == "" ? -1 : imp(a, mask)
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
-		x64_br_byte_clear(a, imp(a, addr), m, l)
+		x64_br_byte_clear(a, imp(a, addr), m, l, nonzero)
 	case .Arm64:
-		a64_br_byte_clear(a, imp(a, addr), m, l)
+		a64_br_byte_clear(a, imp(a, addr), m, l, nonzero)
 	case .Wasm32:
+		assert(!nonzero, "native: br_byte_clear nonzero on wasm32")
 		wasm_br_byte_clear(a, imp(a, addr), m, l)
 	}
 }

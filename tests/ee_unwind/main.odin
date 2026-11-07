@@ -40,6 +40,21 @@
 // open. With the argument cap, a function calls itself without end: the
 // chain's cap (cpu.INTERP_DEPTH_MAX, kernel.FLAT_DEPTH_MAX under FLAT) is a
 // fatal, not a host stack overflow.
+//
+// With the argument native (the coroutine model only), R is learned code
+// run native (ps2 load_learned), so native frames are between C's run and
+// main's: the unwinds return past them (cpu.unwinding), the jumps leave
+// them open, and the search, which counts records, finds main's call past
+// UNWIND_MAX native R calls. Then a handler called by the kernel
+// (kernel.call_handler) that `jr $ra`s to an address no call returns to
+// returns as before: host code's call is under it. With the argument
+// stale, L calls native N, which calls F, which jumps back to L: each jump
+// leaves N's frame open under the run, until the one that would leave more
+// than cpu.NATIVE_STALE_MAX returns as before. Last (x64 SysV), R is
+// registered as a thunk that puts known values in every callee-saved
+// register and calls R's native code, and a handler's call of R(2) is
+// unwound past both native R frames: each must give the thunk its values
+// back, as the epilogue that the unwind leaves through restores them.
 package main
 
 import "core:fmt"
@@ -50,6 +65,8 @@ import "ps:ps2"
 import cpu "ps:ps2/cpu"
 import kernel "ps:ps2/kernel"
 import "ps:ps2/mem"
+import "ps:recomp/native"
+import "ps:recomp/r5900"
 
 ENTRY :: u32(0x00100000) // thread 1: the cases
 FN_R :: u32(0x00100400)
@@ -70,6 +87,11 @@ RET :: DATA + 0xc0 // main's return address from its call
 DONE :: DATA + 0x100
 FRAMES :: DATA + 0x1000 // R's saved $ra, growing down (s1)
 STACK :: DATA + 0x2000 // frames: main's sp
+FN_HJ :: u32(0x00100b00) // native: the handler that jumps
+NOWHERE2 :: u32(0x00100b40) // its target: MARK = 1, then a return
+FN_HC :: u32(0x00100c00) // native: the handler whose R(2) is unwound
+MARK :: DATA + 0x104
+HC_RES :: DATA + 0x108 // its s2 after its call
 SYSCALL_N :: 0xa0
 // getpc: main's call of G the only one open (were the links calls, 4).
 GETPC_OPEN :: 1
@@ -118,6 +140,10 @@ CASES :: [?]Case {
 	{mode = 1, depth = 2, syscall = true, want = 102}, // past host code: W counts 100
 	{mode = 1, depth = 2, syscall = true, to = .Nowhere, want = 102}, // host code under: no jump
 }
+
+// native: CASES with R native. Its calls make no records, so the search
+// reaches main's call past UNWIND_MAX of them too.
+NATIVE_WANT :: [len(CASES)]u32{2, 0, 50, 1000, 0, 0, 0, 102, 102}
 
 i_type :: proc(op, rs, rt: u32, imm: i32) -> u32 {return op << 26 | rs << 21 | rt << 16 | (u32(imm) & 0xffff)}
 r_type :: proc(rs, rt, rd, fn: u32) -> u32 {return rs << 21 | rt << 16 | rd << 11 | fn}
@@ -443,18 +469,194 @@ vblank :: proc() {
 		fmt.eprintln("fail: the jump's target ran")
 		os.exit(1)
 	}
-	cases := CASES
+	cases, native_want := CASES, NATIVE_WANT
 	ok := true
 	for c, k in cases {
-		got := mem.rd32(RES + 4 * u32(k))
+		got, want := mem.rd32(RES + 4 * u32(k)), native_on ? native_want[k] : c.want
 		fmt.printfln("case %d: s2 %d", k, got)
-		if got != c.want {
-			fmt.eprintfln("fail: case %d: s2 %d, want %d", k, got, c.want)
+		if got != want {
+			fmt.eprintfln("fail: case %d: s2 %d, want %d", k, got, want)
 			ok = false
 		}
 	}
 	if !ok {os.exit(1)}
+	if native_on {
+		if cpu.learned_calls < cpu.UNWIND_MAX {
+			fmt.eprintfln("fail: %d native calls of R", cpu.learned_calls)
+			os.exit(1)
+		}
+		kernel.call_handler(FN_HJ, 0, 0, 0, 0)
+		if mem.rd32(MARK) != 0 {
+			fmt.eprintln("fail: a handler's jump past the kernel's call ran")
+			os.exit(1)
+		}
+		saved_ok()
+		if cpu.interp_unwinds_native == 0 || cpu.interp_jumps_native == 0 || cpu.interp_barriers == 0 || cpu.interp_stale != 0 {
+			fmt.eprintfln("fail: %d unwinds and %d jumps across native code, %d barriers, %d stale refusals", cpu.interp_unwinds_native, cpu.interp_jumps_native, cpu.interp_barriers, cpu.interp_stale)
+			os.exit(1)
+		}
+		fmt.printfln("ee_unwind native: ok (%d native calls)", cpu.learned_calls)
+		os.exit(0)
+	}
 	fmt.println("ee_unwind: ok")
+	os.exit(0)
+}
+
+// Whether R runs native (the argument native).
+native_on: bool
+
+// Compile the words lo..hi, entered at lo, to native code and load them
+// (ps2 learned.odin): run in place of the interpreter while RAM holds them.
+load_native :: proc(lo, hi: u32) {
+	words := make([]u32, (hi - lo) / 4)
+	for &w, k in words {w = mem.rd32(lo + 4 * u32(k))}
+	blob, skipped := r5900.learned_blob({{lo, lo, words}}, native.Arch(core.NATIVE_ARCH))
+	dir, err := os.make_directory_temp("", "ps_ee_unwind_*", context.allocator)
+	if skipped != 0 || err != nil {
+		fmt.eprintln("fail: no native code:", skipped, err)
+		os.exit(1)
+	}
+	path, _ := filepath.join({dir, "native.bin"}, context.allocator)
+	loaded := os.write_entire_file(path, blob) == nil && ps2.load_learned(path)
+	os.remove_all(dir)
+	if !loaded {
+		fmt.eprintln("fail: native code not loaded")
+		os.exit(1)
+	}
+}
+
+// native: HJ `jr $ra`s to NOWHERE2, which no call returns to; were it a
+// jump there, NOWHERE2 sets MARK, and its own `jr $ra` returns.
+program_handler :: proc() {
+	a := Asm{FN_HJ}
+	li(&a, RA, NOWHERE2)
+	put(&a, JR_RA, NOP)
+	a = {NOWHERE2}
+	li(&a, T7, DATA)
+	put(&a, addiu(T0, ZERO, 1), sw(T0, MARK - DATA, T7), addu(RA, ZERO, ZERO), JR_RA, NOP)
+
+	// HC: R(2), whose C jumps back to HC's call with its sp (CASES' second
+	// case), then s2 to HC_RES and a return.
+	a = {FN_HC}
+	li(&a, S1, FRAMES)
+	push_ra(&a)
+	li(&a, T7, DATA)
+	put(&a, addiu(T0, ZERO, 1), sw(T0, MODE - DATA, T7), sw(ZERO, DELTA - DATA, T7), sw(SP, SP0 - DATA, T7))
+	tgt := a.pc
+	li(&a, T0, 0) // patched below
+	put(&a, sw(T0, TGT - DATA, T7), addiu(S2, ZERO, 0), addiu(A0, ZERO, 2), jal(FN_R), NOP)
+	patch := Asm{tgt}
+	li(&patch, T0, a.pc)
+	li(&a, T7, DATA)
+	put(&a, sw(S2, HC_RES - DATA, T7))
+	pop_ra(&a)
+	put(&a, JR_RA, NOP)
+	assert(a.pc <= ENTRY + 0x1000)
+}
+
+// The values the thunk puts in rbx, rbp and r12-r15 (bit 31 clear: each is
+// checked by an xor with a sign-extended imm32).
+SAVED_MAGIC :: [6]u32{0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666}
+
+// Each register's xor with its magic after a call, or'd (saved_thunk).
+saved_bad: u64
+
+// x64 SysV, as a Func_Proc (rdi, the context, passed on): push rbx, rbp,
+// r12-r15, set each to its SAVED_MAGIC, call fn, then or each register xor
+// its magic into saved_bad (0 when all came back), the registers restored.
+saved_thunk :: proc(fn: cpu.Func_Proc) -> []u8 {
+	m := SAVED_MAGIC
+	b: [dynamic]u8
+	imm :: proc(b: ^[dynamic]u8, v: u64, n: int) {for k in 0 ..< n {append(b, u8(v >> (8 * uint(k))))}}
+	append(&b, 0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57) // push rbx rbp r12-r15
+	append(&b, 0x48, 0x83, 0xec, 0x08) // sub rsp, 8: aligned for the call
+	append(&b, 0xbb);imm(&b, u64(m[0]), 4) // mov ebx, m0
+	append(&b, 0xbd);imm(&b, u64(m[1]), 4) // mov ebp, m1
+	for k in 0 ..< 4 {
+		append(&b, 0x41, 0xbc + u8(k));imm(&b, u64(m[2 + k]), 4) // mov r12d+k, m
+	}
+	append(&b, 0x48, 0xb8);imm(&b, u64(uintptr(rawptr(fn))), 8) // mov rax, fn
+	append(&b, 0xff, 0xd0) // call rax
+	append(&b, 0x48, 0x89, 0xd8, 0x48, 0x35);imm(&b, u64(m[0]), 4) // mov rax, rbx; xor rax, m0
+	append(&b, 0x48, 0x89, 0xe9, 0x48, 0x81, 0xf1);imm(&b, u64(m[1]), 4) // mov rcx, rbp; xor rcx, m1
+	append(&b, 0x48, 0x09, 0xc8) // or rax, rcx
+	for k in 0 ..< 4 {
+		append(&b, 0x4c, 0x89, 0xe1 + 8 * u8(k), 0x48, 0x81, 0xf1);imm(&b, u64(m[2 + k]), 4) // mov rcx, r12+k; xor rcx, m
+		append(&b, 0x48, 0x09, 0xc8) // or rax, rcx
+	}
+	append(&b, 0x48, 0xb9);imm(&b, u64(uintptr(&saved_bad)), 8) // mov rcx, &saved_bad
+	append(&b, 0x48, 0x09, 0x01) // or [rcx], rax
+	append(&b, 0x48, 0x83, 0xc4, 0x08) // add rsp, 8
+	append(&b, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5d, 0x5b, 0xc3) // pop r15-r12 rbp rbx; ret
+	return b[:]
+}
+
+// native, last: R registered as the thunk around its native code, so each
+// native R frame returns to the thunk, then the kernel calls HC: its R(2)
+// is unwound past both native R frames (s2 0, one more unwind across
+// native code), and each frame's leave gave the thunk's values back.
+saved_ok :: proc() {
+	when ODIN_ARCH == .amd64 && ODIN_OS != .Windows {
+		fn := ps2.learned_find(FN_R)
+		if fn == nil {
+			fmt.eprintln("fail: R's native code not found")
+			os.exit(1)
+		}
+		code := saved_thunk(fn)
+		thunk := cast(cpu.Func_Proc)core.map_code(code)
+		unwinds := cpu.interp_unwinds_native
+		mem.wr32(HC_RES, 0xffffffff)
+		cpu.register(FN_R, thunk)
+		kernel.call_handler(FN_HC, 0, 0, 0, 0)
+		cpu.register(FN_R, nil)
+		core.unmap_code(rawptr(thunk), len(code))
+		if saved_bad != 0 || mem.rd32(HC_RES) != 0 || cpu.interp_unwinds_native != unwinds + 1 {
+			fmt.eprintfln("fail: callee-saved xor %x, HC's s2 %d, %d unwinds across native code (want 0, 0, %d)", saved_bad, mem.rd32(HC_RES), cpu.interp_unwinds_native, unwinds + 1)
+			os.exit(1)
+		}
+		fmt.println("ee_unwind native: callee-saved registers kept")
+	}
+}
+
+// stale: L sets sp and calls N, then DONE = 1 and a hang. N (native): sp -= 16 and its
+// $ra saved there, F, then its $ra back and a return. F: `jr $ra` to L.
+FN_N :: ENTRY + 0x100
+FN_F2 :: ENTRY + 0x200
+program_stale :: proc() {
+	a := Asm{ENTRY}
+	li(&a, SP, STACK)
+	put(&a, jal(FN_N), NOP)
+	li(&a, T7, DATA)
+	put(&a, addiu(T0, ZERO, 1), sw(T0, DONE - DATA, T7))
+	put(&a, i_type(4, ZERO, ZERO, -1), NOP) // hang
+	a = {FN_N}
+	put(&a, addiu(SP, SP, -16), sw(RA, 0, SP), jal(FN_F2), NOP, lw(RA, 0, SP), addiu(SP, SP, 16), JR_RA, NOP)
+	assert(a.pc <= FN_F2)
+	a = {FN_F2}
+	li(&a, RA, ENTRY)
+	put(&a, JR_RA, NOP)
+}
+
+// stale: the run that would leave NATIVE_STALE_MAX + 1 gaps open returned
+// to its N, whose return took L to the hang, with one call of N fewer open.
+vblank_stale :: proc() {
+	if mem.rd32(DONE) == 0 {
+		if kernel.k.frame > 60 {
+			fmt.eprintln("fail: not done after 60 frames")
+			os.exit(1)
+		}
+		return
+	}
+	open, most, calls := open_now(), cpu.interp_max_depth, cpu.learned_calls
+	if open != cpu.NATIVE_STALE_MAX || most != cpu.NATIVE_STALE_MAX + 1 || calls != cpu.NATIVE_STALE_MAX + 1 {
+		fmt.eprintfln("fail: %d calls open at the hang, %d at most, %d native calls of N; want %d, %d, %d", open, most, calls, cpu.NATIVE_STALE_MAX, cpu.NATIVE_STALE_MAX + 1, cpu.NATIVE_STALE_MAX + 1)
+		os.exit(1)
+	}
+	if cpu.interp_stale != 1 {
+		fmt.eprintfln("fail: %d jumps refused at NATIVE_STALE_MAX, want 1", cpu.interp_stale)
+		os.exit(1)
+	}
+	fmt.printfln("ee_unwind stale: ok (%d calls open at the hang)", open)
 	os.exit(0)
 }
 
@@ -491,6 +693,22 @@ main :: proc() {
 	} else if mode == "frames" {
 		kernel.vblank_hook = vblank_frames
 		program_frames()
+	} else if mode == "native" || mode == "stale" {
+		when core.FLAT {
+			fmt.eprintln("fail: native code: the coroutine model only")
+			os.exit(1)
+		}
+		if mode == "native" {
+			native_on = true
+			kernel.vblank_hook = vblank
+			program()
+			program_handler()
+			load_native(FN_R, FN_C)
+		} else {
+			kernel.vblank_hook = vblank_stale
+			program_stale()
+			load_native(FN_N, FN_F2)
+		}
 	} else if mode == "away" {
 		kernel.vblank_hook = vblank_away
 		program_away()

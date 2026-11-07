@@ -82,7 +82,9 @@ main :: proc() {
 	put(&pc, NOP) // a fall through to here would hang on garbage
 
 	cpu.state.r[RA].d[0] = 0xdead0000
-	cpu.call(FN_A)
+	// Host code that goes on after the guest's code, as the kernel's calls:
+	// A's `jr ra` (ra now the jalr's) returns here, never a jump.
+	cpu.host_call(FN_A)
 	want := u64(10 + 100 + 1000 + 20000 + 100)
 	if got := cpu.state.r[V0].d[0]; got != want {fail("fail: v0 %d, want %d", got, want)}
 	if b_calls != 2 {fail("fail: B called %d times, want 2", b_calls)}
