@@ -3454,7 +3454,10 @@ test_start_block_cross :: proc() {
 }
 
 // thmsgbx in a start: CreateMbx gives an id; SendMbx queues first come, or by
-// priority in an MBA_MSPRI box; PollMbx takes the first, then NOMSG once empty.
+// priority in an MBA_MSPRI box; PollMbx takes the first, then NOMSG once
+// empty, and a send after that is taken again. Emptiness is the box's count:
+// a message whose next word the guest wrote over before the poll is taken
+// once, and the box is empty after it.
 test_msgbx :: proc() {
 	fresh()
 	a: Asm
@@ -3462,39 +3465,78 @@ test_msgbx :: proc() {
 	create, send, poll := mb, mb + 8, mb + 16
 	param := at(&a)
 	put(&a, 0, 0, 4, 0, 2, 0) // attr, option: first come, MBA_MSPRI, then a bit retail lacks
-	msg: [3]u32
-	prio := [3]u32{5, 1, 3}
+	msg: [4]u32
+	prio := [4]u32{5, 1, 3, 0}
 	for &m, i in msg {
 		m = at(&a)
 		put(&a, 0xffffffff, prio[i]) // next (a send sets it), priority
 	}
+	// A ring the guest breaks: two of priority 0, then one that ranks below both.
+	brk: [3]u32
+	brk_prio := [3]u32{0, 0, 0xff}
+	for &m, i in brk {
+		m = at(&a)
+		put(&a, 0xffffffff, brk_prio[i])
+	}
 	ids := at(&a)
-	put(&a, 0, 0, 0)
-	out := at(&a) // per box, per poll: v0, the message it took
-	for _ in 0 ..< 16 {put(&a, 0)}
+	put(&a, 0, 0, 0, 0, 0)
+	out := at(&a) // per box, per poll: v0, the message it took; then a send's v0
+	for _ in 0 ..< 25 {put(&a, 0)}
 	entry := at(&a)
 	prologue(&a)
+	poll_to :: proc(a: ^Asm, poll, box, o: u32) {
+		la(a, A0, o + 4)
+		lw_at(a, A1, box)
+		jal(a, poll)
+		store_v0(a, o)
+	}
 	for b in 0 ..< u32(2) {
 		la(&a, A0, param + 8 * b)
 		jal(&a, create)
 		store_v0(&a, ids + 4 * b)
-		// The first message sent again while still queued: refused.
-		for m in ([4]u32{msg[0], msg[1], msg[2], msg[0]}) {
+		for m in msg[:3] {
 			lw_at(&a, A0, ids + 4 * b)
 			la(&a, A1, m)
 			jal(&a, send)
 		}
-		for p in 0 ..< u32(4) {
-			o := out + 32 * b + 8 * p
-			la(&a, A0, o + 4)
-			lw_at(&a, A1, ids + 4 * b)
-			jal(&a, poll)
-			store_v0(&a, o)
-		}
+		for p in 0 ..< u32(4) {poll_to(&a, poll, ids + 4 * b, out + 32 * b + 8 * p)}
 	}
+	// The first come box drained: a send there is taken again.
+	lw_at(&a, A0, ids)
+	la(&a, A1, msg[0])
+	jal(&a, send)
+	poll_to(&a, poll, ids, out + 64)
+	poll_to(&a, poll, ids, out + 72)
 	la(&a, A0, param + 16)
 	jal(&a, create)
 	store_v0(&a, ids + 8)
+	// A third box, first come: one message, its next word then written over
+	// by its sender, as a stack message's is once the frame is reused.
+	la(&a, A0, param)
+	jal(&a, create)
+	store_v0(&a, ids + 12)
+	lw_at(&a, A0, ids + 12)
+	la(&a, A1, msg[3])
+	jal(&a, send)
+	li(&a, V0, 2)
+	store_v0(&a, msg[3])
+	poll_to(&a, poll, ids + 12, out + 80)
+	poll_to(&a, poll, ids + 12, out + 88)
+	// A fourth box, MBA_MSPRI: one message, then the ring broken so it leads to
+	// a second message that links to itself, never back to the last.
+	la(&a, A0, param + 8)
+	jal(&a, create)
+	store_v0(&a, ids + 16)
+	lw_at(&a, A0, ids + 16)
+	la(&a, A1, brk[0])
+	jal(&a, send)
+	la(&a, V0, brk[1])
+	store_v0(&a, brk[0])
+	store_v0(&a, brk[1])
+	lw_at(&a, A0, ids + 16)
+	la(&a, A1, brk[2])
+	jal(&a, send)
+	store_v0(&a, out + 96)
 	li(&a, V0, 0)
 	epilogue(&a)
 	id, _ := iop.iop_load(build_mod("mbx", &a, entry), "mbx", nil)
@@ -3513,8 +3555,16 @@ test_msgbx :: proc() {
 			got &&= w(base, o) == 0 && w(base, o + 4) == base + order[p]
 		}
 		got &&= w(base, out + 32 * b + 24) == nomsg && w(base, out + 32 * b + 28) == 0
-		check(id > 0 && got, "msgbx: PollMbx takes first come, by priority under MBA_MSPRI, then NOMSG, a resend refused" if b == 1 else "msgbx: PollMbx takes the messages first come, then NOMSG, a resend refused")
+		check(id > 0 && got, "msgbx: PollMbx takes by priority under MBA_MSPRI, then NOMSG" if b == 1 else "msgbx: PollMbx takes the messages first come, then NOMSG")
 	}
+	check(w(base, out + 64) == 0 && w(base, out + 68) == base + msg[0] && w(base, out + 72) == nomsg, "msgbx: a send after the box drained is taken, then NOMSG")
+	check(w(base, ids + 12) == 3 && w(base, out + 80) == 0 && w(base, out + 88) == nomsg, "msgbx: a message whose next word was written over is taken once, then NOMSG")
+	cap_ok := w(base, ids + 16) == 4 && w(base, out + 96) == 0
+	for m in iop.iop_sched.mbxs {
+		if m.id == 4 {cap_ok &&= m.count == 2 && m.last == base + brk[2]}
+	}
+	cap_ok &&= w(base, brk[0]) == base + brk[2] && w(base, brk[2]) == base + brk[1]
+	check(cap_ok, "msgbx: a send into a ring with no way back to the last goes in as the newest, counted once")
 }
 
 // The calls an audio service's module needs at load and in play: CpuEnableIntr

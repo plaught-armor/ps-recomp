@@ -165,11 +165,15 @@ Iop_Evf :: struct {
 	initial, bits:    u32,
 }
 
-// A message box: its queue is the messages' own next words in IOP memory,
-// first to last; 0 when empty.
+// A message box, by retail's layout: a ring through the messages' own next
+// words in IOP memory, `last` the newest, its next word the oldest; 0 when
+// none was ever left. Only `count` says how many are queued: a message's
+// next word the guest wrote over after the send changes what a poll takes,
+// never whether one is there.
 Iop_Mbx :: struct {
 	id, attr, option: u32,
-	head, tail:       u32,
+	count:            i32,
+	last:             u32,
 }
 
 // Emulated state, in the emu heap: snapshotted (sif_snap).
@@ -1197,10 +1201,14 @@ sema_waiter :: proc(m: Iop_Sema) -> ^Iop_Thread {
 
 MBA_THPRI :: 1 // waiters by priority, else first come: no waiter here
 MBA_MSPRI :: 4 // a box's messages queue by priority, else first come
-// The most messages a box's list is walked over: as many as IOP RAM holds,
-// so a list the guest looped by hand ends.
+// The most messages an MBA_MSPRI send walks over: as many as IOP RAM holds,
+// so a ring the guest broke by hand ends.
 @(private = "file")
 MBX_WALK_MAX :: IOP_RAM_SIZE / 8
+
+// Whether a broken ring was shown yet, once under PS_DEBUG; not state.
+@(private = "file")
+mbx_ring_broken: bool
 
 // Function fno of thmsgbx, as th_base: CreateMbx, SendMbx and PollMbx. No
 // ReceiveMbx here, so no thread ever waits on a box and a send only queues.
@@ -1220,14 +1228,16 @@ th_msgbx :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		mbx_put(m, a1)
 		return KE_OK, true
 	// recvmsg is written unchecked, null too, as retail's PollMbx does.
+	// The oldest is `last`'s next word, read now: what retail takes.
 	case 9: // PollMbx(void **recvmsg, mbxid): the first message, or NOMSG
 		m := mbx_find(a1)
 		if m == nil {return ke(KE_UNKNOWN_MBXID), true}
-		if m.head == 0 {return ke(KE_MBOX_NOMSG), true}
-		msg := m.head
-		m.head = r32(msg)
-		if m.head == 0 {m.tail = 0}
-		w32(a0, msg)
+		if m.count <= 0 {return ke(KE_MBOX_NOMSG), true}
+		m.count -= 1
+		first := r32(m.last)
+		after := r32(first)
+		if after == first {m.last = 0} else {w32(m.last, after)}
+		w32(a0, first)
 		return KE_OK, true
 	}
 	return 0, false
@@ -1241,34 +1251,49 @@ mbx_find :: proc(id: u32) -> ^Iop_Mbx {
 	return nil
 }
 
-// Queues message `msg` in box `m`: last, or under MBA_MSPRI after every
-// message of the same or a better (lower) priority. A message already in
-// the box stays where it is: queued again its next word would loop the
-// list, so the host would walk it forever; refused, the guest only waits.
+// Queues message `msg` in box `m` as retail does: newest, or under
+// MBA_MSPRI after every message of the same or a better (lower) priority,
+// walking the ring from the oldest. A message sent again while still queued
+// is linked again, as on retail, which leaves the ring as retail leaves it:
+// the same message sent twice to an empty box counts 2 on a one-message
+// ring, and the second poll reads through a last of 0. Retail's PollMbx
+// does the same, so this is on purpose; no refusal of a resend belongs here.
+// A ring the guest broke so the walk never comes back to the last message
+// stops at MBX_WALK_MAX, and the message then goes in as the newest.
 @(private = "file")
 mbx_put :: proc(m: ^Iop_Mbx, msg: u32) {
-	at := m.head
-	for _ in 0 ..< MBX_WALK_MAX {
-		if at == 0 {break}
-		if at == msg {
-			fmt.eprintfln("iop: message %x sent again to box %d, still queued: refused", msg, m.id)
-			return
-		}
-		at = r32(at)
+	m.count += 1
+	if m.last == 0 {
+		m.last = msg
+		w32(msg, msg)
+		return
 	}
-	prio := u8(r32(msg + 4))
-	prev, next := u32(0), m.head
+	// After `at`: the newest when no message ranks below it.
+	at, newest := m.last, true
 	if m.attr & MBA_MSPRI != 0 {
-		for _ in 0 ..< MBX_WALK_MAX {
-			if next == 0 || u8(r32(next + 4)) > prio {break}
-			prev, next = next, r32(next)
+		prio := u8(r32(msg + 4))
+		newest = false
+		walked := 0
+		for ; walked < MBX_WALK_MAX; walked += 1 {
+			next := r32(at)
+			if prio < u8(r32(next + 4)) {break}
+			at = next
+			if at == m.last {
+				newest = true
+				break
+			}
 		}
-	} else {
-		prev, next = m.tail, 0
+		if walked == MBX_WALK_MAX {
+			if cpu.debug >= 1 && !mbx_ring_broken {
+				mbx_ring_broken = true
+				fmt.eprintfln("iop: mbx %d ring has no way back to its last message %08x; message %08x goes in as the newest", m.id, m.last, msg)
+			}
+			at, newest = m.last, true
+		}
 	}
-	w32(msg, next)
-	if prev == 0 {m.head = msg} else {w32(prev, msg)}
-	if next == 0 {m.tail = msg}
+	w32(msg, r32(at))
+	w32(at, msg)
+	if newest {m.last = msg}
 }
 
 // ------------------------------------------------------------- thevent
