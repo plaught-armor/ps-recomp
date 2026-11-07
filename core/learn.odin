@@ -45,6 +45,7 @@ LEARN_SPAN_MAX :: learnfile.LEARN_SPAN_MAX
 LEARN_HEADER :: learnfile.LEARN_HEADER
 LEARN_TAG :: learnfile.LEARN_TAG
 learn_read :: learnfile.learn_read
+learn_header :: learnfile.learn_header
 learn_compact :: learnfile.learn_compact
 learn_compilable :: learnfile.learn_compilable
 
@@ -243,6 +244,12 @@ learn_open_path :: proc(path: string, cpus := ~Learn_Cpus{}) -> bool {
 	learn.on = true
 	learn.cpus = cpus
 	return true
+}
+
+// The records written for cpu's runs so far, which grows as its runs
+// reach code not noted before (mid-run loading watches it).
+learn_count :: proc(cpu: Learn_Cpu) -> u64 {
+	return learn.space[cpu].records
 }
 
 // Whether cpu's interpreter notes its runs: LEARN is open, for cpu.

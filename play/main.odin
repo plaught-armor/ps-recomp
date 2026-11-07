@@ -64,6 +64,7 @@ import "ps:core"
 import "ps:core/disc"
 import "ps:ps2"
 import "ps:psx"
+import "ps:recomp/native"
 
 main :: proc() {
 	os.exit(run(os.args))
@@ -82,8 +83,8 @@ run :: proc(args: []string) -> int {
 	case len(args) == 7 && args[1] == "--convert-vu":
 		if !midload_child(args[6]) {return 1}
 		return convert(args[2], args[3], args[4], args[5], vu_only = true)
-	case len(args) == 5 && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
-		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4])
+	case (len(args) == 5 || len(args) == 6) && args[1] == "--learned" && (args[2] == "psx" || args[2] == "iop" || args[2] == "ee"):
+		return compile_learned(.Psx if args[2] == "psx" else .Iop if args[2] == "iop" else .Ee, args[3], args[4], args[5] if len(args) == 6 else "")
 	case len(args) == 5 && args[1] == "--mods" && (args[2] == "psx" || args[2] == "ee"):
 		return compile_mods(args[2] == "ee", args[3], args[4])
 	case (len(args) == 3 || len(args) == 4) && args[1] == "--compat":
@@ -147,6 +148,7 @@ learned_key: string
 learned_failed :: proc() {
 	os.remove(learned_key)
 	fmt.eprintln("play: the stored learned code would not load; it is compiled again next run")
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {midlearn_uncover()}
 }
 
 // The same for a PS2 game's EE learned blob.
@@ -197,6 +199,29 @@ learned_files :: proc(cpu: core.Learn_Cpu) -> Learned_Files {
 	unreachable()
 }
 
+// The key of a learned blob of cpu's records in recs, compiled leaving
+// interp to the interpreter: each record by its code's hash, in recs' order
+// (compacted, they are in one), then interp. False when recs has none of
+// cpu's.
+@(private)
+learned_set :: proc(recs: []core.Learn_Record, cpu: core.Learn_Cpu, interp: []native.Blob_Interp) -> (string, bool) {
+	Key :: struct #packed {
+		flags:        core.Learn_Flags,
+		entry, lo, n: u32,
+		hash:         u64,
+	}
+	keys := make([dynamic]Key, context.temp_allocator)
+	for r in recs {
+		if r.cpu == cpu {append(&keys, Key{r.flags, r.entry, r.lo, u32(len(r.words)), r.hash})}
+	}
+	if len(keys) == 0 {
+		return "", false
+	}
+	key := slice.clone_to_dynamic(([^]u8)(raw_data(keys))[:len(keys) * size_of(Key)], context.temp_allocator)
+	append(&key, ..learned_interp_bytes(interp))
+	return fmt.tprintf("%016x", xxhash.XXH3_64_default(key[:])), true
+}
+
 // The learned blob for cpu's records in the disc directory dir's learn
 // directory, after the file is compacted (core.learn_compact); compiled when
 // the stored one is not for them. Its key names those records alone, so
@@ -229,28 +254,16 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile: bool, deadline: 
 	if n == 0 {
 		return ""
 	}
-	// Each record by its code's hash; compacted, they are in one order.
-	Key :: struct #packed {
-		flags:        core.Learn_Flags,
-		entry, lo, n: u32,
-		hash:         u64,
-	}
 	recs, _ := core.learn_read(compact, context.temp_allocator)
-	keys := make([dynamic]Key, context.temp_allocator)
-	for r in recs {
-		if r.cpu == cpu {append(&keys, Key{r.flags, r.entry, r.lo, u32(len(r.words)), r.hash})}
-	}
-	if len(keys) == 0 {
-		return ""
-	}
-	key := slice.clone_to_dynamic(([^]u8)(raw_data(keys))[:len(keys) * size_of(Key)], context.temp_allocator)
 	// A wasm32 build's PS1 runs leave out what interp holds, so the blob
 	// is for it too: a convert with other patches or overlays, or a known
 	// switch added, compiles again.
 	interp, iok := learned_interp(dir, cpu)
 	if !iok {return ""}
-	append(&key, ..slice.to_bytes(interp))
-	set := fmt.tprintf("%016x", xxhash.XXH3_64_default(key[:]))
+	set, any := learned_set(recs[:], cpu, interp)
+	if !any {
+		return ""
+	}
 	if !core.blob_cached(dir, core.COMMIT, l.kind, set) {
 		if !compile {
 			fmt.eprintln("play: no learned code (not compiled in the compat run)")
@@ -454,6 +467,7 @@ play :: proc(image: string) -> int {
 	// PS2 game's IOP, whose modules no recompiled code covers, and its EE
 	// (loaded at run time, or missed). A default that cannot open its
 	// records runs without them.
+	learning := false // the runs are recorded
 	if learn_env == "1" || learn_env == "" {
 		cpus := ~core.Learn_Cpus{} if learn_env == "1" else {.Iop, .Ee} if cnf.ps2 else {.Psx}
 		learn := core.disc_path(dir, .Learn)
@@ -463,6 +477,7 @@ play :: proc(image: string) -> int {
 		} else {
 			opened = core.learn_open_path(learn_records(dir, learned_files(learn_cpu).records), cpus)
 		}
+		learning = opened
 		if !opened && learn_env == "1" {
 			return 1
 		}
@@ -519,6 +534,12 @@ play :: proc(image: string) -> int {
 		switches_dir = dir
 		b.native_skip = slice.clone(core.known_switches(dir))
 		b.native_switched = native_switched
+		// The PS1 code it records is loaded as it is compiled
+		// (midload_learned.odin).
+		if learned_on && learning && midlearn_init(dir, learn_records(dir, learned_files(.Psx).records), learned != "") {
+			b.vblank = midload_vblank
+			b.quit = midload_quit
+		}
 	}
 	for &c, i in b.cards {
 		c, _ = filepath.join({cards, fmt.tprintf("slot%d.mcd", i + 1)})

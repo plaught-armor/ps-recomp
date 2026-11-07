@@ -67,6 +67,25 @@ Boot :: struct {
 	// (cpu.hook, cpu.hook_overlay) and host hooks.
 	setup:         proc() -> bool,
 	hooks:         proc() -> bool,
+	// Called at each vblank after the port's host hook (host.vblank_hook),
+	// and when the host quits (host.quit_hook); nil none. A preload machine
+	// (host/preload.odin) runs vblank_hook too, so a native build's
+	// forked child would call it as well: play sets these only in a
+	// wasm32 build, which has no fork.
+	vblank:        proc(),
+	quit:          proc(),
+}
+
+// Boot.vblank, and the port's vblank_hook it follows: taken once, after
+// the hooks step sets it, so nothing may assign host.vblank_hook after the
+// boot, or Boot.vblank is dropped.
+@(private = "file")
+boot_vblank, port_vblank: proc()
+
+@(private = "file")
+vblank_chain :: proc() {
+	if port_vblank != nil {port_vblank()}
+	boot_vblank()
 }
 
 // Whether the boot loads native and learned code: not in a native FLAT
@@ -137,6 +156,11 @@ run :: proc(b: Boot) -> bool {
 		}
 	}
 	if b.hooks != nil {b.hooks() or_return}
+	if b.vblank != nil {
+		port_vblank, boot_vblank = host.vblank_hook, b.vblank
+		host.vblank_hook = vblank_chain
+	}
+	host.quit_hook = b.quit
 	cpu.watch_code()
 	// After every other hook, so a mod wraps the port's.
 	mods_load(mods, b.mods_native, b.mods_native_failed) or_return

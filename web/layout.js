@@ -111,6 +111,19 @@ export const NET = {
 NET.IN = NET.OUT + NET.SLOTS * NET.SLOT_SIZE;
 NET.SIZE = NET.IN + NET.SLOTS * NET.SLOT_SIZE;
 
+// Learn: a mid-run learned compile's blob, from the page (or Node's
+// learnlink.mjs) to the play Worker (web/learn.js). STATE_WORD guards the
+// blob: only the deliverer writes it, from EMPTY, and the Worker reads it
+// only once READY.
+export const LEARN = {
+	STATE_WORD: 0, // EMPTY, WRITING, READY or TAKEN (web/learn.js)
+	LEN_WORD: 1, // the blob's size, or FAILED or OVERSIZED
+	WARNED_WORD: 2, // 1 once an oversized blob was said
+	DATA: 32,
+	DATA_MAX: 16 * 1024 * 1024,
+};
+LEARN.SIZE = LEARN.DATA + LEARN.DATA_MAX;
+
 // Commands: CLEAR r g b a; FILL r g b a blend x y w h; COPY texture alpha
 // blend sx sy sw sh dx dy dw dh.
 export const CMD = { CLEAR: 1, FILL: 2, COPY: 3 };

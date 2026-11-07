@@ -29,11 +29,16 @@
 // (netlink.mjs), so the peer can be another play.mjs or a native play.
 // The build id is the module's (web/net.js buildId), so against a native
 // peer both need PS_NET_ANY_BUILD=1.
+//
+// A mid-run learned compile (play/midload_learned.odin) runs on a
+// worker_thread (learnlink.mjs), as the play page runs it in a Worker of
+// its own (web/learn.js).
 import { mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { argv, env, exit, stderr, stdout } from "node:process";
 import { Worker } from "node:worker_threads";
-import { AUDIO, CONTROL, NET, PRESENT } from "../../web/layout.js";
+import { LearnImports } from "../../web/learn.js";
+import { AUDIO, CONTROL, LEARN, NET, PRESENT } from "../../web/layout.js";
 import { Native } from "../../web/native.js";
 import { buildId, NetImports, NO_NET } from "../../web/net.js";
 import { Sdl } from "../../web/sdl.js";
@@ -131,15 +136,25 @@ if (settings.PS_NET_PEER !== undefined) {
 	link.on("error", (e) => console.error(`net: the link failed: ${e.message}`));
 	net = new NetImports(buffer, await buildId(bytes));
 }
+// The worker is made inside the start import, while the module blocks this
+// thread: its 'error' and 'message' events are never seen here, so
+// learnlink.mjs catches everything and delivers a failure itself.
+const learnBuffer = new SharedArrayBuffer(LEARN.SIZE);
+const learn = new LearnImports(learnBuffer, (records, interp) => {
+	new Worker(new URL("learnlink.mjs", import.meta.url), { workerData: { buffer: learnBuffer, module, records, interp } }).unref();
+	return true;
+});
 const instance = await WebAssembly.instantiate(module, {
 	...wasi.imports,
 	"system:SDL2": sdl.imports,
 	"system:ps_native": native.imports,
 	"system:ps_net": net?.imports ?? NO_NET,
+	"system:ps_learn": learn.imports,
 });
 sdl.attach(instance);
 native.attach(instance);
 net?.attach(instance);
+learn.attach(instance);
 const code = wasi.run(instance);
 const ms = Math.round(performance.now() - start);
 const written = [...wasi.files()];

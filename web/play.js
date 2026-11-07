@@ -31,7 +31,8 @@
 // In test mode the files go to `file/p<N>/<name>` and the state to
 // `result?player=<N>`.
 import { SCANCODE_OF_CODE } from "./keys.js";
-import { AUDIO, CONTROL, EV, NET, PAD, PRESENT } from "./layout.js";
+import { LEARN_ARGS, LEARN_OUT, learnDeliver, learnSeed } from "./learn.js";
+import { AUDIO, CONTROL, EV, LEARN, NET, PAD, PRESENT } from "./layout.js";
 import { serveLink } from "./net.js";
 import { Present } from "./present.js";
 import { forget, storedNames } from "./readers.js";
@@ -104,6 +105,7 @@ function makeShared() {
 		control: new SharedArrayBuffer(CONTROL.SIZE),
 		audio: new SharedArrayBuffer(AUDIO.SIZE),
 		present: new SharedArrayBuffer(PRESENT.SIZE),
+		learn: new SharedArrayBuffer(LEARN.SIZE),
 	};
 	ctl = new Int32Array(shared.control);
 	ctlView = new DataView(shared.control);
@@ -506,6 +508,7 @@ function onMessage({ data }) {
 	}
 	if (data.audio !== undefined) return startAudio(data.audio);
 	if (data.store !== undefined) return onStore(data.store);
+	if (data.learn !== undefined) return learnCompile(data.learn);
 	if (data.fullscreen !== undefined) {
 		if (data.fullscreen && !document.fullscreenElement) $("screen").requestFullscreen?.().catch(() => {});
 		else if (!data.fullscreen && document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -526,6 +529,39 @@ function onMessage({ data }) {
 	log("Reload the page to play again.\n");
 	audioContext?.close();
 	audioContext = null;
+}
+
+// A mid-run learned compile the play Worker asked for (web/learn.js): run
+// `play --learned psx` in a Worker of its own (an `out` run) and hand its
+// blob to the play Worker. Its log goes to the page's; the instantiate's
+// time is said, for the cost of a mid-run compile on this browser.
+function learnCompile({ records, interp }) {
+	const t0 = performance.now();
+	const conv = new Worker("play-worker.js", { type: "module" });
+	let over = false;
+	const finish = (blob) => {
+		if (over) return;
+		over = true;
+		conv.terminate();
+		learnDeliver(shared.learn, blob, log);
+	};
+	conv.onmessage = ({ data }) => {
+		if (data.log !== undefined) {
+			log(data.log);
+		} else if (data.done !== undefined) {
+			const files = new Map(data.files ?? []);
+			log(`play: mid-run learned compile: exit ${data.done.code}, ${Math.round(performance.now() - t0)} ms (worker start, fetch and compile ${data.done.compileMs} ms, run ${data.done.runMs} ms)\n`);
+			finish(data.done.code === 0 ? (files.get(LEARN_OUT) ?? null) : null);
+		} else if (data.error !== undefined) {
+			log(`play: mid-run learned compile failed: ${data.error.split("\n")[0]}\n`);
+			finish(null);
+		}
+	};
+	conv.onerror = (e) => {
+		log(`play: mid-run learned compile failed: ${e.message || "worker failed to load"}\n`);
+		finish(null);
+	};
+	conv.postMessage({ wasm: "play.wasm", args: LEARN_ARGS.slice(1), out: true, seed: learnSeed(records, interp) }, [records.buffer, interp.buffer]);
 }
 
 function tick() {

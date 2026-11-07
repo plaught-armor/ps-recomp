@@ -835,6 +835,10 @@ HOLD_FADE :: 36
 // uses it to follow the game's state (e.g. to change speed).
 vblank_hook: proc()
 
+// Run when the host quits, before the learn and compat reports (psx.Boot's
+// quit); nil none.
+quit_hook: proc()
+
 // Run at every emulated vblank just before present, e.g. to draw the extra
 // picture present is about to show (the game's smooth motion). Not run in a
 // background machine (preload.odin), which shows nothing.
@@ -995,6 +999,7 @@ platform_frame :: proc() {
 		platform_shutdown()
 		when cpu.FALLBACK_COUNT {cpu.fallback_dump()}
 		when core.FLAT {cpu.flat_print()}
+		if quit_hook != nil {quit_hook()}
 		core.learn_report()
 		core.compat_report()
 		os.exit(failed ? 1 : 0)
