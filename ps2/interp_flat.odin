@@ -159,7 +159,7 @@ flat_resume :: proc() -> (x: ^kernel.Flat_Ctx, pc: u32, ok: bool) {
 	x, pc = flat_reload()
 	when ODIN_ARCH == .wasm32 {
 		for flat_native_on {
-			f := cpu.lookup(pc)
+			f := flat_lookup(pc)
 			if f == nil {break}
 			e := &cpu.native_exit
 			(cast(Wasm_Func)rawptr(f))(pc)
@@ -198,10 +198,18 @@ flat_resume :: proc() -> (x: ^kernel.Flat_Ctx, pc: u32, ok: bool) {
 @(private = "file")
 flat_native_at :: #force_inline proc(t: u32) -> bool {
 	when ODIN_ARCH == .wasm32 {
-		return flat_native_on && cpu.lookup(t) != nil
+		return flat_native_on && flat_lookup(t) != nil
 	} else {
 		return false
 	}
+}
+
+// wasm32: the native code at pc, the game's (the call table) or a mod's
+// (load_mods), else nil.
+@(private = "file")
+flat_lookup :: #force_inline proc(pc: u32) -> cpu.Func_Proc {
+	if f := cpu.lookup(pc); f != nil {return f}
+	return mem.mod_func_at(pc)
 }
 
 // A SYSCALL, with the run's pc past it (x.pc): it may switch threads.
@@ -222,7 +230,14 @@ flat_reload :: proc() -> (^kernel.Flat_Ctx, u32) {
 		check := false
 		if x.enter {
 			x.enter = false
-			if cpu.mod_on {mod_flat_enter(x)}
+			if cpu.mod_on {
+				mod_flat_enter(x)
+				// A call into the mod region, counted as the recursive
+				// model's hook does (mod_interp_hook).
+				if mem.mod_ram_has(x.pc) {
+					if flat_native_at(x.pc) {mem.mod_native_calls += 1} else {mem.mod_interp_calls += 1}
+				}
+			}
 			// Native code at the entry is not interpreted, and traces its
 			// own entry (flat_resume runs it next).
 			if !flat_native_at(x.pc) {interp_enter(x.pc)}

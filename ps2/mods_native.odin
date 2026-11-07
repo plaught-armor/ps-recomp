@@ -5,6 +5,12 @@
 // misses the call table (the region is outside the recompiled range) and
 // reaches mod_interp_hook, which runs it; a call from one mod function to
 // another is a direct call in the blob.
+//
+// On wasm32 each function's code is a step of the FLAT runner
+// (interp_flat.odin), which looks it up at the pc it goes on at
+// (flat_lookup): every word of the function stands for it, and a pc no
+// block starts at leaves at once to be interpreted. Hooks reach it through
+// the runner, never as a direct call.
 package ps2
 
 import "core:fmt"
@@ -21,6 +27,10 @@ import mem "mem"
 // cannot be used, says why (temp allocator), and is not printed: the
 // caller removes the blob's key first. None of it is then loaded, and the
 // mods are interpreted. Its code is never freed.
+// Whether mods' native code can run: not under FLAT, but for its wasm32
+// steps.
+MODS_NATIVE :: !core.FLAT || ODIN_ARCH == .wasm32
+
 load_mods :: proc(path: string) -> (why: string) {
 	if mem.mod_ram == nil {
 		return fmt.tprintf("mods: %s: no mods in the region (load_mods comes after mods_load)", path)
@@ -53,9 +63,19 @@ load_mods :: proc(path: string) -> (why: string) {
 		return fmt.tprintf("mods: %s: %s", path, msg)
 	}
 	for s in code.spans {
-		mem.mod_native_set(s.entry, cast(cpu.Func_Proc)rawptr(code.base + uintptr(s.off)))
+		fn := cast(cpu.Func_Proc)rawptr(code.base + uintptr(s.off))
+		when core.FLAT {
+			r := code.ranges[s.range_first]
+			for k in 0 ..< r.n_words {mem.mod_native_set(r.pc + 4 * k, fn)}
+		} else {
+			mem.mod_native_set(s.entry, fn)
+		}
 	}
-	mod_native_resolve()
+	when core.FLAT {
+		flat_native_on = true
+	} else {
+		mod_native_resolve()
+	}
 	fmt.eprintfln("mods: %d functions from %s", len(code.spans), path)
 	delete(code.funcs)
 	delete(code.ovls)

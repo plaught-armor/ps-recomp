@@ -116,16 +116,17 @@ boot :: proc(b: Boot) -> bool {
 	}
 	host.quit_hook = b.quit
 	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
-	// native code would leave its host frames running on. A wasm32 blob is
-	// the exception: its functions are steps of the FLAT runner, which
-	// leave to it for every call, return and thread switch.
+	// native code would leave its host frames running on. A wasm32 blob,
+	// the game's or the mods' (MODS_NATIVE), is the exception: its
+	// functions are steps of the FLAT runner, which leave to it for every
+	// call, return and thread switch.
 	when core.FLAT {
 		what := ""
 		switch {
 		case b.native != "" && core.NATIVE_ARCH != core.NATIVE_ARCH_WASM32: what = "native code (Boot.native)"
 		case b.learned != "": what = "the IOP's learned code (Boot.learned)"
 		case b.learned_ee != "": what = "the EE's learned code (Boot.learned_ee)"
-		case b.mods_native != "": what = "the mods' native code (Boot.mods_native)"
+		case b.mods_native != "" && !MODS_NATIVE: what = "the mods' native code (Boot.mods_native)"
 		}
 		if what != "" {cpu.fatal("FLAT runs interpreted only: %s not installed", what)}
 	}
@@ -181,7 +182,7 @@ boot :: proc(b: Boot) -> bool {
 		fmt.eprintln(merr)
 		return false
 	}
-	when !core.FLAT {
+	when MODS_NATIVE {
 		if why := load_mods(b.mods_native) if b.mods_native != "" else ""; why != "" {
 			if b.mods_native_failed != nil {
 				b.mods_native_failed(why)

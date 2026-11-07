@@ -108,15 +108,29 @@ mods_read :: proc(ee: bool, dir: string) -> (core.Mod_Set, string) {
 // functions for this host at out (psx/native/mods.odin,
 // ps2/mods_native.odin). A failure exits with status 1 after a message.
 compile_mods :: proc(ee: bool, dir, out: string) -> int {
+	blob, ok := mods_compile(ee, dir)
+	if !ok {return 1}
+	defer delete(blob)
+	if werr := os.write_entire_file(out, blob); werr != nil {
+		fmt.eprintln("mods: cannot write", out, werr)
+		return 1
+	}
+	return 0
+}
+
+// The blob of the functions of the mods in dir for this host, in
+// context.allocator (compile_mods); false after a message.
+@(private = "file")
+mods_compile :: proc(ee: bool, dir: string) -> ([]u8, bool) {
 	set, err := mods_read(ee, dir)
 	if err != "" {
 		fmt.eprintln(err)
-		return 1
+		return nil, false
 	}
 	defer core.mod_set_delete(set)
 	arch, ok := native.arch_of("mods", mips.HOST_ARCH)
 	if !ok {
-		return 1
+		return nil, false
 	}
 	funcs := make([dynamic]r3000.Learned)
 	for img in set.images {
@@ -138,16 +152,12 @@ compile_mods :: proc(ee: bool, dir, out: string) -> int {
 	} else {
 		blob = r3000.learned_blob(funcs[:], arch)
 	}
-	if werr := os.write_entire_file(out, blob); werr != nil {
-		fmt.eprintln("mods: cannot write", out, werr)
-		return 1
-	}
 	if ee {
 		fmt.eprintfln("mods: %d functions from %d mods (%d not lowered, interpreted)", len(funcs) - skipped, len(set.mods), skipped)
 	} else {
 		fmt.eprintfln("mods: %d functions from %d mods", len(funcs), len(set.mods))
 	}
-	return 0
+	return blob, true
 }
 
 // Convert the disc image in a child of this executable (in this process in
@@ -321,12 +331,17 @@ learned_store :: proc(cpu: core.Learn_Cpu, records, dir, set: string, deadline: 
 }
 
 // Compile the functions of the mods in the mods directory mods in a child
-// of this executable (as convert_store) and store the blob in the disc
-// directory dir, its key naming the mod set by set. False, after a
-// message, when there is no blob.
+// of this executable (as convert_store; in this process in a wasm32 build,
+// which cannot start one, and whose compile of a few functions needs no
+// memory of its own) and store the blob in the disc directory dir, its key
+// naming the mod set by set. False, after a message, when there is no blob.
 mods_store :: proc(ee: bool, mods, dir, set: string, deadline: time.Duration) -> bool {
-	tmp := strings.concatenate({core.disc_path(dir, .Mods_Native, context.temp_allocator), ".compile"}, context.temp_allocator)
-	blob := child_blob({"--mods", "ee" if ee else "psx", mods, tmp}, tmp, "native code for the mods", "mods compile", deadline) or_return
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		blob := mods_compile(ee, mods) or_return
+	} else {
+		tmp := strings.concatenate({core.disc_path(dir, .Mods_Native, context.temp_allocator), ".compile"}, context.temp_allocator)
+		blob := child_blob({"--mods", "ee" if ee else "psx", mods, tmp}, tmp, "native code for the mods", "mods compile", deadline) or_return
+	}
 	defer delete(blob)
 	return core.blob_store(dir, blob, core.COMMIT, .Mods, set)
 }

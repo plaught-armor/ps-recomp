@@ -341,6 +341,9 @@ mod_enter :: proc(site: int) {
 // Run the mod function at fn: its native code p, else through cpu.call.
 @(private = "file")
 mod_run :: #force_inline proc(fn: u32, p: cpu.Func_Proc) {
+	// A FLAT build's mod code is a step of its runner (load_mods), never a
+	// procedure to call.
+	when core.FLAT {assert(p == nil, "a native mod procedure under FLAT")}
 	if p != nil {
 		mem.mod_native_calls += 1
 		p()

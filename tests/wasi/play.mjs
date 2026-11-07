@@ -19,10 +19,11 @@
 // play page's /data holds what earlier runs stored (web/readers.js).
 // PLAY_CONVERT=1 runs `play --convert-store` on the disc instead (the play
 // page's step before a run): the blob and key it stores are written under
-// <out dir>/data. Prints the frame of the first present, the presents, the
-// time, the memory's size at the end (its high-water: wasm memory only
-// grows) and the shim's call counts to stderr, and exits with play's exit
-// code.
+// <out dir>/data, as PLAY_DATA_OUT=1 does for a run (the mods' native
+// code a run compiles and stores, for one). Prints the frame of the first
+// present, the presents, the time, the memory's size at the end (its
+// high-water: wasm memory only grows) and the shim's call counts to
+// stderr, and exits with play's exit code.
 //
 // With PS_NET_PEER set, netplay runs over UDP from a worker_thread
 // (netlink.mjs), so the peer can be another play.mjs or a native play.
@@ -142,7 +143,7 @@ net?.attach(instance);
 const code = wasi.run(instance);
 const ms = Math.round(performance.now() - start);
 const written = [...wasi.files()];
-if (env.PLAY_CONVERT === "1") for (const [path, bytes] of wasi.files(wasi.data)) written.push(["data/" + path, bytes]);
+if (env.PLAY_CONVERT === "1" || env.PLAY_DATA_OUT === "1") for (const [path, bytes] of wasi.files(wasi.data)) written.push(["data/" + path, bytes]);
 for (const [path, bytes] of written) {
 	const to = join(resolve(out), path);
 	mkdirSync(dirname(to), { recursive: true });

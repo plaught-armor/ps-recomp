@@ -248,6 +248,15 @@ learned_blob :: proc(dir: string, cpu: core.Learn_Cpu, compile: bool, deadline: 
 // stopped. "" when there are no mod functions, or no blob. A mods directory
 // that does not read is left to the boot, which reports why.
 @(private)
+// Whether a game's mods run native: unless NATIVE=0 or MOD_NATIVE=0, and
+// under FLAT only a PS2 game's EE in a wasm32 build, whose FLAT runner
+// takes wasm32 code as its steps (ps2/interp_flat.odin); FLAT runs no
+// other native code.
+mods_native_on :: proc(ee: bool) -> bool {
+	if core.env("NATIVE") == "0" || core.env("MOD_NATIVE") == "0" {return false}
+	return !core.FLAT || (ee && core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32)
+}
+
 mods_blob :: proc(dir: string, ee, compile: bool, deadline: time.Duration) -> string {
 	mods := core.disc_path(dir, .Mods, context.temp_allocator)
 	set, err := mods_read(ee, mods)
@@ -395,9 +404,10 @@ play :: proc(image: string) -> int {
 	learned_key = core.disc_path(dir, learned_files(learn_cpu).key)
 	learned_ee_key = core.disc_path(dir, learned_files(.Ee).key)
 	// A game's mods run native unless NATIVE=0 or MOD_NATIVE=0, which
-	// interprets them; a compat child's parent compiled them (compat_disc).
+	// interprets them (mods_native_on); a compat child's parent compiled
+	// them (compat_disc).
 	mods_native: string
-	if !native_off && core.env("MOD_NATIVE") != "0" {
+	if mods_native_on(cnf.ps2) {
 		mods_native = mods_blob(dir, cnf.ps2, !compat_child(), 0)
 	}
 	mods_native_key = core.disc_path(dir, .Mods_Native_Key)
