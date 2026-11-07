@@ -703,8 +703,10 @@ disc_open :: proc(path: string) -> (f: ^os.File, err: os.Error) {
 // (directory, executable) for a directory, its size, and its record's
 // date {0, second, minute, hour, day, month, year (u16)} as ctime, atime and
 // mtime; attr, hisize and the private words 0. The device's unit is the
-// layer. 1 when found; -ENOENT when not, -ENODEV on a device other than
-// cdrom, as ioman answers a name no device has; stat is left alone then.
+// layer. 0 when found: the device answers 1, but ioman's getstat turns any
+// result that is not negative into 0. -ENOENT when not found, -ENODEV on a
+// device other than cdrom, as ioman answers a name no device has; stat is
+// left alone then.
 FIO_STAT :: 0x40
 @(private)
 fileio_getstat :: proc(name: string, stat: []u8) -> i32 {
@@ -729,7 +731,7 @@ fileio_getstat :: proc(name: string, stat: []u8) -> i32 {
 		time := [8]u8{0, d[5], d[4], d[3], d[2], d[1], u8(year), u8(year >> 8)}
 		for at in ([3]int{0x0c, 0x14, 0x1c}) {copy(stat[at:], time[:])}
 	}
-	return 1
+	return 0
 }
 
 // The disc file or directory by its IOP name in a layer's volume. Under

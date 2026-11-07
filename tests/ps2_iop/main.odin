@@ -4401,18 +4401,18 @@ test_fileio_getstat :: proc() {
 
 	res, at, st := stat(fio, "cdrom0:\\BIG.BIN;1")
 	time := []u8{0, 58, 59, 23, 31, 12, 1999 & 0xff, 1999 >> 8}
-	check(res == 1 && at == STAT, "getstat: a file is found, 1, the reply names the EE buffer")
+	check(res == 0 && at == STAT, "getstat: a file is found, 0, the reply names the EE buffer")
 	check(u32_at(st, 0) == 0x2124 && u32_at(st, 4) == 0 && u32_at(st, 8) == discimg.BIG, "getstat: a file's mode, attr and size")
 	check(slice.equal(st[0x0c:0x14], time) && slice.equal(st[0x14:0x1c], time) && slice.equal(st[0x1c:0x24], time), "getstat: ctime, atime and mtime are the record's date")
 	check(slice.all_of(st[0x24:0x40], 0), "getstat: hisize and the private words are 0")
 	res, _, st = stat(fio, "cdrom0:\\DATA")
-	check(res == 1 && u32_at(st, 0) == 0x116d && u32_at(st, 8) == disc.DATA, "getstat: a directory's mode and size")
+	check(res == 0 && u32_at(st, 0) == 0x116d && u32_at(st, 8) == disc.DATA, "getstat: a directory's mode and size")
 	check(slice.equal(st[0x0c:0x14], []u8{0, 0, 0, 0, 0, 0, 1900 & 0xff, 1900 >> 8}), "getstat: a zero date is 1900")
 	res, _, st = stat(fio, "cdrom:\\DATA\\SUB.TXT")
-	check(res == 1 && u32_at(st, 0) == 0x2124 && u32_at(st, 8) == u32(len(discimg.SUB)), "getstat: no version and no unit find the file")
+	check(res == 0 && u32_at(st, 0) == 0x2124 && u32_at(st, 8) == u32(len(discimg.SUB)), "getstat: no version and no unit find the file")
 	for name in ([]string{"cdrom0:", "cdrom0:.", "cdrom0:\\.", "cdrom0:\\"}) {
 		res, _, st = stat(fio, name)
-		check(res == 1 && u32_at(st, 0) == 0x116d, fmt.tprintf("getstat: %q is the root", name))
+		check(res == 0 && u32_at(st, 0) == 0x116d, fmt.tprintf("getstat: %q is the root", name))
 	}
 	res, _, st = stat(fio, "cdrom0:\\NOPE.BIN;1")
 	check(res == -2 && u32_at(st, 0) == 0, "getstat: a missing file is -ENOENT, no stat")
