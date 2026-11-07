@@ -1,34 +1,39 @@
-#+build wasi
-// The mid-run load of a wasm32 build's PS1 learned functions (midload.odin
-// has the policy).
+// The mid-run load of a PS1 game's learned functions (midload.odin has the
+// policy).
 //
 // A PS1 run records the code it interprets (core/learn.odin); the next run
 // compiles the records to a learned blob and runs them native
 // (learned_blob). Until then that code runs in the interpreter. So while the
-// game runs, once its records have stopped growing, the host compiles the
-// records no loaded blob was compiled from (a new body at an entry one
-// covers among them) in a worker of its own (`play --learned psx <records>
-// <out> <interp>`, through the "system:ps_learn" imports: web/learn.js), and
-// the run loads the blob it returns (midload_learned_wasi.odin has the
-// host's half). Nothing is stored: the next run
-// compiles its own set, by its own key (learned_blob), as it would have.
+// game runs, once its records have stopped growing, the records no loaded
+// blob was compiled from (a new body at an entry one covers among them) are
+// compiled away from the play thread, and the run loads the blob that comes
+// back. Where the compile runs is the host's half: a wasm32 build's host
+// compiles in a worker of its own (`play --learned psx <records> <out>
+// <interp>`, through the "system:ps_learn" imports: web/learn.js,
+// midload_learned_wasi.odin); a native build in a child of this executable
+// (`play --learned-midload <records> <out> <parent pid>`,
+// midload_learned_native.odin). Nothing is stored: the next run compiles its
+// own set, by its own key (learned_blob), as it would have.
 //
 // A compile takes at most MIDLEARN_RECORDS records, so a load costs this
 // thread no more than the largest measured; the rest go in another, after
 // MIDLOAD_FRAMES more vblanks. A blob over the host's size is not compiled
-// again until the records grow. Each load's code stays loaded, with the
-// wasm instance and table range it was linked into (psx/native): one per
-// load, which never repeats a record, so they are bounded by the records.
+// again until the records grow. Each load's code stays loaded (in a wasm32
+// build with the wasm instance and table range it was linked into:
+// psx/native): one per load, which never repeats a record, so they are
+// bounded by the records.
 //
-// The blob is for the code the snapshot's interp list (psx_interp) left to
-// the interpreter. A thread switch this run makes known (native_switched)
-// changes that list, and a blob compiled before it would run the switch's
-// code native: one whose key (learned_set), from the snapshot's records and
-// the list as it is now, is not the one it started with is dropped as stale.
+// A wasm32 build's blob is for the code the snapshot's interp list
+// (psx_interp) left to the interpreter. A thread switch this run makes known
+// (native_switched) changes that list, and a blob compiled before it would
+// run the switch's code native: one whose key (learned_set), from the
+// snapshot's records and the list as it is now, is not the one it started
+// with is dropped as stale. A native build leaves nothing to the interpreter
+// (learned_interp), so its loads are never stale.
 //
-// On only in a wasm32 build that runs a PS1 game's learned code and records
-// its runs (play), unless MIDLOAD=0; the host has the say on whether it can
-// compile (a host without a worker says so once, and none starts).
+// On only in a build that runs a PS1 game's learned code and records its
+// runs (play), unless MIDLOAD=0; the host has the say on whether it can
+// compile (one that cannot says so once, and none starts).
 package play
 
 import "core:fmt"
@@ -83,14 +88,18 @@ midlearn_init :: proc(dir, records: string, startup: bool) -> bool {
 		cleanup = midlearn_cleanup,
 		report  = midlearn_report,
 	}
-	// The stored blob's interp list, read once (psx_stored_interp): no
-	// compile can start without it.
-	stored, ok := psx_stored_interp(dir, context.allocator)
-	if !ok {
-		fmt.eprintln("play: mid-run learned loading off: no interp list")
-		return false
+	// A wasm32 build's stored blob's interp list, read once
+	// (psx_stored_interp): no compile can start without it.
+	stored: []native.Blob_Interp
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		ok: bool
+		stored, ok = psx_stored_interp(dir, context.allocator)
+		if !ok {
+			fmt.eprintln("play: mid-run learned loading off: no interp list")
+			return false
+		}
 	}
-	if !midload_begin(job) {
+	if !midlearn_host_init() || !midload_begin(job) {
 		delete(stored)
 		return false
 	}
@@ -117,11 +126,16 @@ midlearn_uncover :: proc() {
 	clear(&mlrn.covered)
 }
 
-// psx_interp, from the list read at init: the known thread switches as
-// they are now on it.
+// What the compile leaves to the interpreter (learned_interp): in a wasm32
+// build psx_interp, from the list read at init, with the known thread
+// switches as they are now on it; none in a native build.
 @(private = "file")
 midlearn_interp :: proc() -> []native.Blob_Interp {
-	return psx_interp_with(mlrn.dir, mlrn.stored)
+	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
+		return psx_interp_with(mlrn.dir, mlrn.stored)
+	} else {
+		return nil
+	}
 }
 
 @(private = "file")

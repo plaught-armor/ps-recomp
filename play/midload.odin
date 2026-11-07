@@ -1,6 +1,6 @@
 // Loading code a run makes while it runs: one job per run, the PS2's VU
-// microprograms on a native build (midload_vu.odin) or a wasm32 build's PS1
-// learned functions (midload_learned.odin). This file is the policy both
+// microprograms on a native build (midload_vu.odin) or a PS1 game's learned
+// functions (midload_learned.odin). This file is the policy both
 // share; each job has only its own start and done steps.
 //
 // Once what the job loads from (the VU captures, the LEARN records) has
@@ -234,4 +234,26 @@ midload_tmp_sweep :: proc(prefix: string) {
 		if !ok || n == self || time.diff(fi.modification_time, start) <= 0 || !midload_pid_gone(n) {continue}
 		_ = os.remove(fi.fullpath)
 	}
+}
+
+// The start of a job's child (mode, such as "--convert-vu"), given its
+// run's pid: on Linux it dies with the run, and false when the run has
+// already ended. With COMMIT=test, MIDLOAD_FAIL=1 makes it fail (tests/play).
+midload_child :: proc(mode, parent: string) -> bool {
+	when core.COMMIT == "test" {
+		if core.env("MIDLOAD_FAIL") == "1" {
+			fmt.eprintfln("play: %s: failing for %sMIDLOAD_FAIL=1", mode, core.ENV_PREFIX)
+			return false
+		}
+	}
+	pid, ok := strconv.parse_int(parent, 10)
+	if !ok {
+		fmt.eprintfln("play: %s: bad parent pid %s", mode, parent)
+		return false
+	}
+	if !midload_die_with(pid) {
+		fmt.eprintfln("play: %s: its run has ended", mode)
+		return false
+	}
+	return true
 }
