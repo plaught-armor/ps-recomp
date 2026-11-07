@@ -40,6 +40,7 @@ init :: proc() {
 	vu.vu_snap()
 	iop.sif_snap()
 	iop.mcserv_snap()
+	iop.mcraw_snap()
 	iop.pad_snap()
 	iop.spu_snap()
 	core.snap_add(&cpu.unmapped_seen)
@@ -67,6 +68,7 @@ init :: proc() {
 	vu.vu_init()
 	iop.sif_init()
 	iop.mcserv_init()
+	iop.mcraw_init()
 	kernel.kernel_init()
 }
 

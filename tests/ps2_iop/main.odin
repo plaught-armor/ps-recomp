@@ -111,6 +111,19 @@
 // while host writes are off a commit counts nothing and a rewind returns
 // none. String keys are the store's own copies.
 //
+// mc2: the raw card behind mc2_d, its image in a temp dir. Port 0 a blank
+// card, port 1 none (its socket unbound). Each command: the status at A,
+// then B, seq counting, 0x2080 at +8; a read's pages at A+0x80 and its
+// status at A, no flip; ECC computed on write, one flipped bit corrected
+// in what the EE gets and never written back, two refused; past the card,
+// 0. A write through the backup blocks, an interrupted one found and
+// restored, the markers' other cases; copy, erase, fill; an unknown
+// command, one row. The image made at the first write, each changed block
+// in place; nothing with host writes off. A save state restores the card,
+// not the image; a rollback rewind writes the image back. Not ready: a
+// stale push, no 0x2080, seq not counted. Images read in at init, one of
+// the wrong size refused and kept.
+//
 // sdrdrv: a user command handler's slot, range and previous handler; an
 // EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
 //
@@ -264,6 +277,7 @@ game :: proc(_: rawptr) {
 	test_usbd()
 	test_boot_gaps()
 	test_card_dirty()
+	test_mc2()
 
 	if failed {os.exit(1)}
 	fmt.println("ok ps2_iop")
@@ -271,9 +285,10 @@ game :: proc(_: rawptr) {
 }
 
 main :: proc() {
-	core.snap_init(1 << 20)
+	core.snap_init(1 << 22) // room for the card tests' blocks
 	iop.sif_snap()
 	iop.spu_snap()
+	iop.mcraw_snap()
 	mem.mem_init()
 	iop.sif_init()
 	context.allocator = core.emu_allocator()
@@ -6782,4 +6797,245 @@ test_card_dirty :: proc() {
 	check(len(keys2) == 2 && keys2[0] == "a/b" && keys2[1] == "c", "card dirty: a string key is the store's own copy")
 	iop.card_dirty_rewound(&s, 0)
 	check(len(s.at) == 0, "card dirty: a save-state load frees the string keys")
+}
+
+mc2_snap: core.Snapshot
+mc2_loaded, mc2_rb_loaded: bool // not emulated state
+
+Mc2_P :: struct {
+	start, count, size, ppb, total, bk1, bk2, src, dst, ecc: i32,
+}
+
+// mc2_d's parameters for `count` pages from `start` on the 8 MiB card, ECC on.
+mc2_pages :: proc(start, count: i32, bk1: i32 = 0, bk2: i32 = 0) -> Mc2_P {
+	return {start = start, count = count, size = 512, ppb = 16, total = 16384, bk1 = bk1, bk2 = bk2, ecc = 1}
+}
+
+// A card command on socket `s` through the large server: the result.
+mc2_cmd :: proc(buf: []u8, s, cmd: u32, p: Mc2_P = {}, data: []u8 = nil) -> i32 {
+	for &b in buf {b = 0}
+	w := ([^]u32)(raw_data(buf))
+	w[0], w[1] = s, cmd
+	pp := p
+	copy(buf[0xc:], ([^]u8)(&pp)[:size_of(pp)])
+	copy(buf[0x34:], data)
+	iop.sif.servers[iop.DBC_SID_BIG](0, buf, 0x2090)
+	return ([^]i32)(raw_data(buf))[0x208c / 4]
+}
+
+mc2_socket :: proc(buf: []u8, port, a, b: u32) -> i32 {
+	for &x in buf {x = 0}
+	w := ([^]u32)(raw_data(buf))
+	w[0], w[1], w[2], w[10], w[11] = 3, 2, port, a, b
+	copy(buf[0x14:], "MC2S")
+	iop.sif.servers[iop.DBC_SID](0x80001301, buf, 0x90)
+	return ([^]i32)(raw_data(buf))[9]
+}
+
+// A status block in EE RAM: seq, driver, result.
+mc2_status :: proc(at: u32) -> (seq: i32, drv: u32, res: i32) {
+	s := mem.ram_slice(at, 12)
+	return i32(endian.unchecked_get_u32le(s)), endian.unchecked_get_u32le(s[4:]), i32(endian.unchecked_get_u32le(s[8:]))
+}
+
+// Block `b` of port `port`'s card: nil when erased.
+mc2_block :: proc(port, b: int) -> []u8 {
+	blk := iop.mcraw[port].blocks[b]
+	return blk[:] if blk != nil else nil
+}
+
+// Block `b` of an image on the host (temp allocator).
+mc2_image :: proc(path: string, b: int) -> []u8 {
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil || len(data) != iop.MCRAW_SIZE {return nil}
+	return data[b * iop.MCRAW_BLOCK:][:iop.MCRAW_BLOCK]
+}
+
+mc2_all :: proc(b: []u8, x: u8) -> bool {return b != nil && slice.all_of(b, x)}
+
+// mc2_d on a raw card image in a temp dir: each command; the image made at
+// the first write and changed blocks written in place; ECC corrected on
+// read only; the backup blocks; not ready; snapshots and rollback; host
+// writes off; images read in, one of the wrong size refused.
+test_mc2 :: proc() {
+	A :: 0x00110000
+	B :: 0x00118000
+	BLK :: iop.MCRAW_BLOCK
+	PG :: iop.MCRAW_PAGE
+	dir, derr := os.make_directory_temp("", "ps_iop_mc2_test_*", context.allocator)
+	if derr != nil {
+		check(false, "mc2: a temp dir")
+		return
+	}
+	defer os.remove_all(dir)
+	root := iop.mc_root
+	defer iop.mc_root = root
+	iop.mc_root = dir
+	fresh()
+	iop.pad_init()
+	defer iop.pad_init()
+	iop.mcraw_init()
+	path0, path1 := strings.clone(iop.mcraw_path(0)), strings.clone(iop.mcraw_path(1))
+	buf: [0x2090]u8
+	check(iop.mcraw_present(0) && !iop.mcraw_present(1) && !os.exists(path0), "mc2: port 0 a blank card, no image yet; port 1 no card")
+	check(mc2_socket(buf[:], 2, A, B) == 0 && mc2_socket(buf[:], 3, 0, 0) == 1, "mc2: card sockets 0 and 1")
+	check(mc2_cmd(buf[:], 1, 4) == -0x17, "mc2: port 1, no card: unbound, -0x17")
+
+	// The status: A, then B, seq counting.
+	check(mc2_cmd(buf[:], 0, 4) == 2 && endian.unchecked_get_u32le(buf[8:]) == 0x2080, "mc2 4: 2, ready; 0x2080 at +8")
+	seq, drv, res := mc2_status(A)
+	check(seq == 1 && drv == 2 && res == 2, "mc2 4: the status at A, seq 1, driver 2")
+	check(mc2_cmd(buf[:], 0, 12) == 2, "mc2 12: 2")
+	seq, drv, res = mc2_status(B)
+	check(seq == 2 && res == 2, "mc2 12: the status at B, seq 2")
+	check(mc2_cmd(buf[:], 0, 3) == 1, "mc2 3: 1")
+	seq, _, _ = mc2_status(A)
+	check(seq == 3 && slice.equal(mem.ram_slice(A + 0xc, 8), []u8{0, 2, 0x10, 0, 0, 0x40, 0, 0}), "mc2 3: the card's size in the extra bytes, at A")
+
+	// A page written: its ECC, the image made.
+	pat: [512]u8
+	pat[5] = 1
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(32, 1), pat[:]) == 1, "mc2 2: one page, 1")
+	b2 := mc2_block(0, 2)
+	ecc := [12]u8{0x70, 0x05, 0x7a, 0x77, 0x7f, 0x7f, 0x77, 0x7f, 0x7f, 0x77, 0x7f, 0x7f}
+	check(b2 != nil && slice.equal(b2[:512], pat[:]) && slice.equal(b2[512:][:12], ecc[:]) && mc2_all(b2[524:], 0xff), "mc2 2: the page, its ECC, the rest of the block erased")
+	fi, _ := os.stat(path0, context.temp_allocator)
+	img := mc2_image(path0, 2)
+	check(fi.size == iop.MCRAW_SIZE && slice.equal(img, b2) && mc2_all(mc2_image(path0, 1), 0xff) && iop.mcraw[0].blocks[1] == nil, "mc2 2: the image made, block 2 as on the card, the rest erased")
+
+	// Read: data at A+0x80, the status at A, no flip.
+	check(mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 1 && slice.equal(mem.ram_slice(A + 0x80, 512), pat[:]), "mc2 1: the page at A+0x80")
+	seq, _, res = mc2_status(A)
+	check(seq == 5 && res == 1, "mc2 1: the status at A")
+	mc2_cmd(buf[:], 0, 4)
+	seq, _, _ = mc2_status(A)
+	check(seq == 6, "mc2 1: the toggle not flipped, the next status at A too")
+	b2[5] ~= 0x10
+	check(mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 1 && mem.ram_slice(A + 0x80, 512)[5] == 1, "mc2 1: a flipped bit corrected in what the EE gets")
+	check(b2[5] == 0x11 && mc2_image(path0, 2)[5] == 1, "mc2 1: the correction not written back, to the card or the image")
+	b2[6] ~= 1
+	check(mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 0 && mem.ram_slice(A + 0x80, 512)[6] == 1, "mc2 1: two flipped bits in 128 bytes, 0; the page still sent")
+	b2[5] ~= 0x10
+	b2[6] ~= 1
+	p8 := mc2_pages(32, 1)
+	p8.ecc = 0
+	for &x in mem.ram_slice(A + 0x80, 641) {x = 0xee}
+	check(mc2_cmd(buf[:], 0, 8, p8) == 1 && slice.equal(mem.ram_slice(A + 0x80, 524), b2[:524]) && mem.ram_slice(A + 0x80, 641)[640] == 0xee, "mc2 8: the page and its ECC, 640 bytes")
+	check(mc2_cmd(buf[:], 0, 1, mc2_pages(16380, 8)) == 0, "mc2 1: past the card, 0")
+	bad := mc2_pages(0, 1, 0, 1024)
+	check(mc2_cmd(buf[:], 0, 5, bad) == 0, "mc2 5: a backup block past the card, 0")
+
+	// Block 3 whole, then page 1 again through the backup blocks.
+	old: [16 * 512]u8
+	for &x, i in old {x = u8(i * 7 + i >> 9)}
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(48, 16), old[:]) == 1, "mc2 2: a whole block, 1")
+	b3 := slice.clone(mc2_block(0, 3), context.temp_allocator)
+	whole := true
+	for j in 0 ..< 16 {whole &&= slice.equal(b3[j * PG:][:512], old[j * 512:][:512])}
+	check(whole, "mc2 2: each page of the block")
+	ab: [512]u8
+	for &x in ab {x = 0xab}
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(49, 1, 1022, 1023), ab[:]) == 1, "mc2 2 with backup: 1")
+	n3 := mc2_block(0, 3)
+	check(slice.equal(n3[PG:][:512], ab[:]) && slice.equal(n3[:PG], b3[:PG]) && slice.equal(n3[2 * PG:], b3[2 * PG:]), "mc2 2 with backup: the page new, the others restored")
+	check(slice.equal(mc2_block(0, 1022), b3) && iop.mcraw[0].blocks[1023] == nil, "mc2 2 with backup: the old block in backup block 1, backup block 2 erased")
+	check(slice.equal(mc2_image(path0, 3), n3) && slice.equal(mc2_image(path0, 1022), b3) && mc2_all(mc2_image(path0, 1023), 0xff), "mc2 2 with backup: the image as the card")
+
+	// An interrupted write: both markers name block 3, which differs from
+	// backup block 1.
+	mark: [2 * 512]u8
+	mark[0], mark[512] = 3, 3
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(1023 * 16, 2), mark[:]) == 1 && mc2_cmd(buf[:], 0, 2, mc2_pages(50, 1), ab[:]) == 1, "mc2: markers in backup block 2, block 3 changed")
+	bk := mc2_pages(0, 0, 1022, 1023)
+	check(mc2_cmd(buf[:], 0, 5, bk) == 2, "mc2 5: 2")
+	seq, _, res = mc2_status(A)
+	sa, _, _ := mc2_status(B)
+	at := u32(A) if seq > sa else u32(B)
+	check(endian.unchecked_get_u32le(mem.ram_slice(at + 0xc, 4)) == 3, "mc2 5: the block in the extra bytes")
+	check(mc2_cmd(buf[:], 0, 6, bk) == 2 && slice.equal(mc2_block(0, 3), b3) && iop.mcraw[0].blocks[1023] == nil, "mc2 6: 2, block 3 back from backup block 1, backup block 2 erased")
+	check(mc2_cmd(buf[:], 0, 5, bk) == 1, "mc2 5: nothing interrupted, 1")
+	check(mc2_cmd(buf[:], 0, 6, bk) == 1, "mc2 6: nothing to restore, 1")
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(1023 * 16, 1), mark[:512]) == 1 && mc2_cmd(buf[:], 0, 5, bk) == 1 && iop.mcraw[0].blocks[1023] == nil, "mc2 5: page 0's marker alone, 1, backup block 2 erased")
+	mark[0], mark[1] = 0xd0, 7
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(1023 * 16, 1), mark[:512]) == 1 && mc2_cmd(buf[:], 0, 5, bk) == 0 && iop.mcraw[0].blocks[1023] != nil, "mc2 5: a marker past the card, 0, kept")
+	cp: Mc2_P = {size = 512, ppb = 16, total = 16384, ecc = 1, dst = 1023}
+	check(mc2_cmd(buf[:], 0, 9, cp) == 1 && iop.mcraw[0].blocks[1023] == nil && mc2_all(mc2_image(path0, 1023), 0xff), "mc2 9: the block erased, on the image too")
+
+	// Copy, and the fill over two blocks.
+	cp.src, cp.dst = 3, 10
+	check(mc2_cmd(buf[:], 0, 7, cp) == 1 && slice.equal(mc2_block(0, 10), b3), "mc2 7: block 3 copied to 10")
+	cp.dst = 1024
+	check(mc2_cmd(buf[:], 0, 7, cp) == 0, "mc2 7: past the card, 0")
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(177, 1), ab[:]) == 1 && mc2_cmd(buf[:], 0, 11, mc2_pages(160, 17), pat[:]) == 1, "mc2 11: 17 pages, 1")
+	b10, b11 := mc2_block(0, 10), mc2_block(0, 11)
+	fill := true
+	for j in 0 ..< 16 {fill &&= slice.equal(b10[j * PG:][:524], b2[:524])}
+	check(fill && slice.equal(b11[:524], b2[:524]) && mc2_all(b11[PG:], 0xff), "mc2 11: each page the same, block 11 erased past its first")
+
+	check(mc2_cmd(buf[:], 0, 10) == 1, "mc2 10: 1")
+	clear(&core.compat.calls)
+	check(mc2_cmd(buf[:], 0, 99) == 1 && mc2_cmd(buf[:], 0, 99) == 1 && core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 99}].n == 2, "mc2: an unknown command, 1, one row")
+
+	// Host writes off: the card changes, the image does not.
+	core.host_writes_off = true
+	check(mc2_cmd(buf[:], 0, 2, mc2_pages(96, 1), ab[:]) == 1, "mc2: host writes off, 1")
+	core.host_writes_off = false
+	check(slice.equal(mc2_block(0, 6)[:512], ab[:]) && mc2_all(mc2_image(path0, 6), 0xff), "mc2: host writes off, the card written, not the image")
+	cp.dst = 6
+	mc2_cmd(buf[:], 0, 9, cp)
+
+	// A save state: the card restored, the image left alone; a rollback
+	// rewind: the image written back from the restored card.
+	mc2_cmd(buf[:], 0, 2, mc2_pages(80, 1), pat[:])
+	mc2_snap.id = 0
+	core.snap_op, core.snap_target = .Save, &mc2_snap
+	core.snap_yield()
+	if !mc2_loaded {
+		check(mc2_cmd(buf[:], 0, 2, mc2_pages(80, 1), ab[:]) == 1 && slice.equal(mc2_image(path0, 5)[:512], ab[:]), "mc2 snapshot: block 5 written after the save")
+		mc2_loaded = true
+		core.snap_op, core.snap_target = .Load, &mc2_snap
+		core.snap_yield()
+	}
+	check(slice.equal(mc2_block(0, 5)[:512], pat[:]) && slice.equal(mc2_image(path0, 5)[:512], ab[:]), "mc2 snapshot: block 5 the old bytes; a save state leaves the image")
+	mc2_snap.id = core.RB_HOOK_ID
+	core.snap_op, core.snap_target = .Save, &mc2_snap
+	core.snap_yield()
+	if !mc2_rb_loaded {
+		zero: [512]u8
+		check(mc2_cmd(buf[:], 0, 2, mc2_pages(80, 1), zero[:]) == 1 && mc2_all(mc2_image(path0, 5)[:512], 0), "mc2 rollback: block 5 written after the commit")
+		mc2_rb_loaded = true
+		core.snap_op, core.snap_target = .Load, &mc2_snap
+		core.snap_yield()
+	}
+	check(slice.equal(mc2_block(0, 5)[:512], pat[:]) && slice.equal(mc2_image(path0, 5), mc2_block(0, 5)), "mc2 rollback: block 5 back on the card and the image")
+
+	// Not ready: no 0x2080, a stale push. The EE's status blocks came back
+	// with the snapshot, the driver's count did not (dbcman_snap is not in
+	// this test's snapshot): one command first.
+	mc2_cmd(buf[:], 0, 4)
+	seq, _, _ = mc2_status(A)
+	sb, _, _ := mc2_status(B)
+	check(mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 4) == 1, "mc2 13: 1; then 4: 1, not ready")
+	check(mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 0 && endian.unchecked_get_u32le(buf[8:]) == 0, "mc2 not ready: 1 refused, 0, no 0x2080")
+	s1, _, r1 := mc2_status(A)
+	s2, _, r2 := mc2_status(B)
+	check(max(s1, s2) == max(seq, sb) + 2 && (r1 == 0 || r2 == 0), "mc2 not ready: the status pushed, seq not counted")
+
+	// Images read in: port 1's; port 0's of the wrong size refused.
+	img1 := make([]u8, iop.MCRAW_SIZE, context.temp_allocator)
+	for &x in img1 {x = 0xff}
+	for &x in img1[7 * BLK:][:BLK] {x = 0x5a}
+	small := [100]u8{}
+	check(os.write_entire_file(path1, img1) == nil && os.remove(path0) == nil && os.write_entire_file(path0, small[:]) == nil, "mc2: images seeded")
+	iop.mcraw_init()
+	iop.pad_init()
+	fi, _ = os.stat(path0, context.temp_allocator)
+	check(!iop.mcraw_present(0) && fi.size == 100, "mc2: an image of another size refused, no card, the file kept")
+	check(iop.mcraw_present(1) && iop.mcraw[1].blocks[7] != nil && mc2_all(mc2_block(1, 7), 0x5a) && iop.mcraw[1].blocks[6] == nil, "mc2: port 1's image read in, only blocks not erased held")
+	check(mc2_socket(buf[:], 2, A, B) == 0 && mc2_socket(buf[:], 3, A, B) == 1, "mc2: sockets again")
+	check(mc2_cmd(buf[:], 0, 4) == -0x17 && mc2_cmd(buf[:], 1, 4) == 2, "mc2: port 0 no card, unbound; port 1 ready")
+
+	check(os.remove(path0) == nil && os.remove(path1) == nil, "mc2: images removed")
+	iop.mcraw_init()
+	iop.mcraw[0].present = false
 }

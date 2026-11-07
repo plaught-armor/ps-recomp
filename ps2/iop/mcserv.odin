@@ -148,11 +148,17 @@ mc_guest_path :: proc(port: u32, name: string) -> string {
 // before the game first uses a card.
 mc_root := "."
 
+// The host directory holding the cards: MC, else mc_root. mc2's raw card
+// images sit there too (mcraw.odin).
+mc_host_root :: proc() -> string {
+	root := core.env("MC")
+	return root if root != "" else mc_root
+}
+
 // The host path of a normalized guest path.
 @(private = "file")
 mc_card_path :: proc(port: u32, guest: string) -> string {
-	root := core.env("MC")
-	return fmt.tprintf("%s/memcard%d%s", root if root != "" else mc_root, port, guest)
+	return fmt.tprintf("%s/memcard%d%s", mc_host_root(), port, guest)
 }
 
 // The port's card, read from the host on first use.
