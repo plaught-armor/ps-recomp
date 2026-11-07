@@ -160,6 +160,12 @@ snapshot_request :: proc() {
 	debug.snap_due = true
 }
 
+// Whether the next draw takes a snapshot.
+@(private)
+snapshot_due :: proc() -> bool {
+	return debug.snap_due
+}
+
 // Called by draw before the picture is shown.
 @(private)
 snapshot_take :: proc() {

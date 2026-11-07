@@ -204,9 +204,14 @@ pause_wait :: proc() {
 // Draw the current texture (or a held picture, and after the hold that
 // picture fading out over it) with the window options, the pause dimming
 // and the on-screen display. With vsync on a 120 or 240 Hz display the
-// picture is presented once for each of the vblank's refreshes.
+// picture is presented once for each of the vblank's refreshes. Headless,
+// the window is drawn only for a present that reads it back (a snapshot,
+// DUMP_WINDOW, CAPTURE): nothing else sees it.
 @(private)
 draw :: proc() {
+	if core.headless && !window_read_due() {
+		return
+	}
 	compose()
 	osd_draw()
 	if host.dump_window && !window.paused && core.dump_due(cpu.presents) {
@@ -225,6 +230,16 @@ draw :: proc() {
 		osd_draw()
 		sdl.RenderPresent(host.renderer)
 	}
+}
+
+// Whether this present reads the window's back buffer back (draw).
+@(private)
+window_read_due :: proc() -> bool {
+	return(
+		snapshot_due() ||
+		(host.dump_window && !window.paused && core.dump_due(cpu.presents)) ||
+		(!io.preload_child && core.capture_wanted(cpu.presents)) \
+	)
 }
 
 // The window's picture under the on-screen display.
