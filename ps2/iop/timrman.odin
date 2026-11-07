@@ -261,6 +261,11 @@ tim_next_ee :: proc() -> u64 {
 	return t
 }
 
+// Whether a full table's refusal has been printed this run: a log flag,
+// no guest state, so snapshots leave it.
+@(private = "file")
+alarm_full_said: bool
+
 // SetAlarm(clock, handler, arg): an alarm `clock`'s 64-bit count of IOP
 // cycles from now, raised to ALARM_MIN in the guest's clock as retail
 // does. KE_FOUND_HANDLER when handler and arg already have one.
@@ -269,7 +274,14 @@ alarm_set :: proc(clock, handler, arg: u32) -> u32 {
 	for a in x.alarms[:x.nalarm] {
 		if a.handler == handler && a.arg == arg {return ke(KE_FOUND_HANDLER)}
 	}
-	if x.nalarm == ALARM_N {return ke(KE_NO_MEMORY)}
+	if x.nalarm == ALARM_N {
+		// Retail's heap would take it; ALARM_N is this HLE's bound. A row,
+		// and a line at the first refusal of the run.
+		core.compat_unknown(.Iop_Timer_Intr, handler, pc = handler)
+		if !alarm_full_said {fmt.eprintfln("iop: SetAlarm of handler %x refused, KE_NO_MEMORY: all %d alarms set", handler, ALARM_N)}
+		alarm_full_said = true
+		return ke(KE_NO_MEMORY)
+	}
 	lo, hi := r32(clock), r32(clock + 4)
 	if hi == 0 && lo < ALARM_MIN {
 		lo = ALARM_MIN

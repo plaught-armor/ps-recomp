@@ -6241,6 +6241,12 @@ test_alarm :: proc() {
 	check(tb_call(35, clock, b + h, 0x55) == neg(104) && x.nalarm == 1, "alarm: the same handler and argument again is -104")
 	iop.iop_u32(clock)^, iop.iop_u32(clock + 4)^ = 5, 1
 	check(tb_call(35, clock, b + h, 0x66) == 0 && word(clock) == 5 && x.alarms[1].due == C + 1 << 32 + 5, "alarm: another argument; a clock with a high word kept")
+	// A full table: KE_NO_MEMORY and a row; the table as it was after.
+	for i in u32(2) ..< iop.ALARM_N {tb_call(35, clock, b + h, 0x100 + i)}
+	fk := core.Compat_Key{.Iop_Timer_Intr, b + h, 0}
+	check(x.nalarm == iop.ALARM_N && core.compat.calls[fk].n == 0, "alarm: the table filled")
+	check(tb_call(35, clock, b + h, 0x77) == neg(-iop.KE_NO_MEMORY) && x.nalarm == iop.ALARM_N && core.compat.calls[fk].n == 1, "alarm: one more on a full table is KE_NO_MEMORY, a row")
+	x.nalarm = 2
 
 	iop.iop_u32(b + d + 8)^ = 10
 	iop.iop_tick((C + MIN - 1) * 8)
