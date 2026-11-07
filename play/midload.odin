@@ -239,6 +239,15 @@ midload_tmp_sweep :: proc(prefix: string) {
 	}
 }
 
+// How a job's child that failed ended, for its message: "exit N", or
+// "killed" when it did not exit. On Linux core:os reports a child killed by
+// a signal as exited, with the signal's number as N.
+@(private)
+midload_ended :: proc(state: os.Process_State) -> string {
+	if !state.exited {return "killed"}
+	return fmt.tprintf("exit %d", state.exit_code)
+}
+
 // The start of a job's child (mode, such as "--convert-vu"), given its
 // run's pid: on Linux it dies with the run, and false when the run has
 // already ended. With COMMIT=test, MIDLOAD_FAIL=1 makes it fail (tests/play).
