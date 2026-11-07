@@ -1025,20 +1025,20 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		t.status = .Dormant
 		th_stop(t)
 		return KE_OK, true
-	case 14: // ChangeThreadPriority(thid, prio): prio 0 the caller's own
+	case 14: // ChangeThreadPriority(thid, prio): thid 0 the caller, prio 0 the caller's own
+		// Retail checks the thread, then that it is not dormant, then the
+		// priority.
 		t := th_find(s.cur if a0 == 0 else a0)
 		c := th_find(s.cur)
-		if t == nil {
-			// The loader's priority is IOP_START_PRIO for good: a start's
-			// change of its own is taken and changes nothing.
-			if a0 == 0 {return KE_OK, true}
-			return ke(KE_UNKNOWN_THID), true
-		}
+		if t == nil && a0 != 0 {return ke(KE_UNKNOWN_THID), true}
+		if t != nil && t.status == .Dormant {return ke(KE_DORMANT), true}
 		prio := a1
-		if prio == 0 {prio = c.prio if c != nil else t.prio}
+		if prio == 0 {prio = c.prio if c != nil else IOP_START_PRIO}
 		if prio < PRIO_HIGHEST || prio > PRIO_LOWEST {return ke(KE_ILLEGAL_PRIORITY), true}
+		// The loader's priority is IOP_START_PRIO for good: a start's
+		// change of its own is taken and changes nothing.
+		if t == nil {return KE_OK, true}
 		#partial switch t.status {
-		case .Dormant: return ke(KE_DORMANT), true
 		case .Run:
 			// The caller keeps the CPU while it stays better than every
 			// ready thread, else goes to the tail of its new priority's.
@@ -1051,7 +1051,16 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			t.prio = prio
 			th_ready(t)
 			if c != nil && prio < c.prio {s.resched = true}
-		case: t.prio = prio // a waiter: its wait's queue is by priority at the signal (sema_waiter)
+		case .Wait:
+			// A waiter: retail moves one in a queue by priority to the
+			// tail of its new equals; first come keeps its place. The
+			// queue is by priority at the signal (sema_waiter).
+			t.prio = prio
+			if m := sema_find(t.sema); m != nil && m.attr & SA_THPRI != 0 {
+				t.seq = s.tail
+				s.tail += 1
+			}
+		case: t.prio = prio // the other waits are first come
 		}
 		return KE_OK, true
 	case 16: // RotateThreadReadyQueue(prio): the caller yields to its equals

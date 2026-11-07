@@ -782,6 +782,7 @@ disc_find :: proc(name: string, layer: u8 = 0) -> (file: Disc_File, path: string
 // Read len(buf) bytes from byte pos of a disc file; the count read.
 @(private)
 disc_file_read :: proc(file: Disc_File, pos: i64, buf: []u8) -> int {
+	cd_spin()
 	if image.volume != 0 {
 		return disc.read_at(&image, file.lba, pos, buf)
 	}
@@ -969,6 +970,7 @@ disc_read :: proc(lsn, sectors, dest: u32) {
 @(private)
 disc_sectors :: proc(lsn: u32, buf: []u8) {
 	sectors := len(buf) / DISC_SECTOR
+	cd_spin()
 	slice.zero(buf)
 	if image.volume != 0 {
 		if disc.read_at(&image, lsn, 0, buf) != len(buf) { // the rest stays zero
@@ -1008,7 +1010,9 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 			a[0], a[1] = 0, 0
 		}
 		w[0] = 1
-	case 0x05: w[0] = 1 // Seek {lsn}
+	case 0x05: // Seek {lsn}
+		cd_spin()
+		w[0] = 1
 	case 0x0e: w[0] = 2 // DiskReady (non-blocking): 2 is ready, 6 not ready
 	case: return false
 	}

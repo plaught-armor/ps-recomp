@@ -325,7 +325,9 @@ sd_fine_ratio :: proc(fine: i32) -> u32 {return u32(math.floor(0x8000 * math.pow
 // the lower its fine. The fine plus 1 adds to center_fine, whole semitones
 // carrying into the note, which adds to center_note, the octave counted from
 // 12 (0x1000's top bit) as 12 semitones each. The sums wrap, as retail's 32
-// bits do, and only the low 16 are given.
+// bits do, and only the low 16 are given. Pitch 0 has no top bit and falls
+// below every ratio: octave, semitone and fine are 0, as retail's searches
+// leave them, so the note is center_note - 144 plus the fine's carry.
 @(private = "file")
 sd_pitch_note :: proc(center_note, center_fine, pitch: u32) -> u32 {
 	p := min(pitch & 0xffff, 0x3fff)

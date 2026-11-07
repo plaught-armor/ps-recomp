@@ -3255,6 +3255,10 @@ test_boot_gaps :: proc() {
 	check(iop.iop_cd.n_pending == 3 && iop.iop_cd.pending[0] == iop.CD_FUNC_PAUSE && iop.iop_cd.pending[1] == iop.CD_FUNC_STOP, "boot: Pause and Stop owe their callbacks")
 	check(cd(39) == 1 && iop.iop_cd.n_pending == 3, "boot: sceCdBreak, nothing to break")
 	iop.iop_cd = {}
+	cd(15)
+	r3000.state.r[5], r3000.state.r[6], r3000.state.r[7] = 1, P, 0
+	check(cd(6, 0) == 1 && cd(28) == iop.CD_STAT_PAUSE, "boot: a read spins a stopped disc up")
+	iop.iop_cd = {}
 	for i in u32(0) ..< 3 {iop.iop_u32(P + 4 * i)^ = 0xffffffff}
 	check(cd(24, P) == 1 && iop.iop_u32(P)^ == 0 && iop.iop_u32(P + 4)^ == 0 && iop.iop_u32(P + 8)^ == 0xffffffff, "boot: sceCdReadClock, eight zero bytes")
 
@@ -3271,10 +3275,12 @@ test_boot_gaps :: proc() {
 	tid, uid := t.id, u.id
 	check(base(14, tid, 40) == neg(-iop.KE_DORMANT), "boot: a dormant thread's priority stays")
 	check(base(14, tid + 100, 40) == neg(-iop.KE_UNKNOWN_THID), "boot: an unknown thread")
-	check(base(14, tid, 127) == neg(-iop.KE_ILLEGAL_PRIORITY), "boot: a priority past the lowest")
-	check(base(14, 0, 40) == 0, "boot: the loader's own is taken")
+	check(base(14, tid + 100, 127) == neg(-iop.KE_UNKNOWN_THID) && base(14, tid, 127) == neg(-iop.KE_DORMANT), "boot: the thread is checked before the priority")
+	check(base(14, 0, 40) == 0 && base(14, 0, 0) == 0, "boot: the loader's own is taken")
+	check(base(14, 0, 127) == neg(-iop.KE_ILLEGAL_PRIORITY), "boot: but not past the lowest")
 	check(base(6, tid, 0) == 0 && base(6, uid, 0) == 0, "boot: StartThread")
 	t, u = iop.th_find(tid), iop.th_find(uid)
+	check(base(14, uid, 127) == neg(-iop.KE_ILLEGAL_PRIORITY) && base(14, uid, 0) == 0 && u.prio == iop.IOP_START_PRIO, "boot: a priority past the lowest; 0 on the loader its IOP_START_PRIO")
 	s.resched = false
 	check(base(14, uid, 40) == 0 && u.prio == 40 && !s.resched, "boot: a ready thread's priority on the loader")
 	s.cur = tid
@@ -3285,6 +3291,16 @@ test_boot_gaps :: proc() {
 	u.status, u.sema = .Wait, 7
 	check(base(14, uid, 50) == 0 && u.prio == 50 && u.status == .Wait, "boot: a waiter keeps waiting")
 	check(base(14, 0, 25) == 0 && t.prio == 25 && t.status == .Run, "boot: the caller keeps the CPU when no ready thread is as good")
+	for w, i in ([4]u32{1, 0, 0, 1}) {iop.iop_u32(P + 4 * u32(i))^ = w} // SA_THPRI, a count of 0 to 1
+	r3000.state.r[4] = P
+	semid, sok := iop.th_semap(4)
+	check(sok && i32(semid) > 0, "boot: CreateSema by priority")
+	seq := u.seq
+	u.sema = semid
+	check(base(14, uid, 50) == 0 && u.seq > seq, "boot: a waiter by priority goes to the tail of its new equals")
+	seq = u.seq
+	u.sema = 7
+	check(base(14, uid, 50) == 0 && u.seq == seq, "boot: a first-come waiter keeps its place")
 	s.intr = true
 	check(base(14, uid, 40) == neg(-iop.KE_ILLEGAL_CONTEXT) && u.prio == 50, "boot: ChangeThreadPriority in a handler is illegal")
 	check(base(22, uid, P) == neg(-iop.KE_ILLEGAL_CONTEXT), "boot: so is ReferThreadStatus")
@@ -3331,6 +3347,9 @@ test_boot_gaps :: proc() {
 	sd(11, C_SPDIF, 0x102)
 	sd(11, C_SPDIF, 0x5)
 	check(sd(12, C_SPDIF) == 0x102, "boot: SPDIF keeps a known out mode only")
+	sd(4, 0)
+	check(sd(12, C_EFFECT_ENABLE) == 0 && sd(12, C_SPDIF) == 0x102, "boot: sceSdInit turns the effect off and keeps SPDIF")
+	check(sd(14, 60, 0, 0) == 0xac00, "boot: sceSdPitch2Note of pitch 0, retail's center - 144 (-84) in the high byte")
 	check(sd(14, 60, 0, 0x1000) == 60 << 8 && sd(14, 60, 0, 0x2000) == 72 << 8 && sd(14, 60, 0, 0x4000) == sd(14, 60, 0, 0x3fff), "boot: sceSdPitch2Note, pitch 0x1000 the center, its octave above, 0x3fff the most")
 	p := sd(13, 60, 0, 67)
 	n := sd(14, 60, 0, p)

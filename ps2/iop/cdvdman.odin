@@ -73,7 +73,7 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 4: // sceCdInit(mode): 1 for every mode. 0 waits for the drive, always ready here; 5 shuts down, nothing held
 		return 1, true
 	case 5: // sceCdStandby: spins the disc up, done here; 1, the command accepted
-		iop_cd.stopped = false
+		cd_spin()
 		cd_done(CD_FUNC_STANDBY)
 		return 1, true
 	case 6: // sceCdRead(lsn, sectors, buffer, sceCdRMode *{trycount, spindlctrl, datapattern})
@@ -92,7 +92,6 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			disc_sectors(a0 + k, sector[:])
 			copy(iop_ram_at(a2 + k * DISC_SECTOR, DISC_SECTOR), sector[:])
 		}
-		iop_cd.stopped = false
 		cd_done(CD_FUNC_READ)
 		return 1, true
 	case 8: // sceCdGetError: none
@@ -115,10 +114,10 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 28: // sceCdStatus
 		return cd_status(), true
 	case 38: // sceCdPause: spins the disc up and holds it there, done here; 1, the command accepted
-		iop_cd.stopped = false
+		cd_spin()
 		cd_done(CD_FUNC_PAUSE)
 		return 1, true
-	case 39: // sceCdBreak: 1. No command runs here for it to break, so no callback comes of it
+	case 39: // sceCdBreak: 1, retail's whether or not a command is busy. No command runs here for it to break, so no callback comes of it
 		return 1, true
 	case 37: // sceCdCallback(func): the previous func. Retail returns 0 and sets nothing while a command is busy; none is here
 		old := iop_cd.callback
@@ -186,6 +185,13 @@ cd_done :: proc(code: u32) {
 	iop_cd.pending[iop_cd.n_pending] = code
 	iop_cd.n_pending += 1
 	iop_wake_set()
+}
+
+// The disc spins up, as every read and seek of it does, whoever makes it
+// (disc_sectors, disc_file_read, cdvdfsv's Seek), and sceCdStandby and
+// sceCdPause: a sceCdStop is over (cd_status).
+cd_spin :: proc() {
+	iop_cd.stopped = false
 }
 
 // The drive's status, as CD_STAT_STOP and CD_STAT_PAUSE say.

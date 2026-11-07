@@ -1095,7 +1095,7 @@ sd_clear_effect :: proc(core: u32) {
 // kept 0, the zero state, as their value at power on is not known.
 sd_lib_init :: proc() {
 	spu.irqa, spu.irq_watch, spu.in_irq, spu.bvol = {}, 0, {max(u64), max(u64)}, {}
-	spu.mute, spu.noise_clk = 0, {} // retail's init sets ATTR to the core's enable alone; SPDIF it keeps
+	spu.mute, spu.noise_clk, spu.effect = 0, {}, {} // retail's init sets ATTR to the core's enable alone; SPDIF it keeps
 	spu.block = {}
 	for &c in spu.switches {c = {.PMON = 0, .NON = 0, .VMIXL = 0xffffff, .VMIXEL = 0xffffff, .VMIXR = 0xffffff, .VMIXER = 0xffffff}}
 }
