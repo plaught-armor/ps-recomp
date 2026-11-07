@@ -454,13 +454,19 @@ mc2: struct {
 MC2_SPEC := [8]u8{0x00, 0x02, 0x10, 0x00, 0x00, 0x40, 0x00, 0x00}
 
 // SignalData: `data` to the EE at the bound socket's A or B, plus `off`.
+// False, nothing sent, when it would end past EE RAM or names the EE
+// scratchpad, which the SIF's DMA does not reach.
 @(private = "file")
-mc2_signal :: proc(d: int, which, off: u32, data: []u8) {
+mc2_signal :: proc(d: int, which, off: u32, data: []u8) -> bool {
 	for s in dbc.sockets {
 		if !s.used || s.driver != i32(d) {continue}
-		if a := s.addr[which]; a != 0 {copy(mem.ram_slice(a + off, u32(len(data))), data)}
-		return
+		a := s.addr[which]
+		if a == 0 {return true}
+		if a >> 28 == 7 || u64(a & 0x0fffffff) + u64(off) + u64(len(data)) > mem.RAM_SIZE {return false}
+		copy(mem.ram_slice(a + off, u32(len(data))), data)
+		return true
 	}
+	return true
 }
 
 @(private = "file")
@@ -507,23 +513,19 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 	mc2.port = port
 	mc2.eccsize = p.size / 128 * 3 if p.ecc != 0 || cmd == 8 else 0
 	mc2.xfer = p.size + mc2.eccsize
-	defer mcraw_flush(port)
-	switch cmd {
-	case 1, 2, 5, 6, 8, 11:
-		if p.start + p.count > p.total || (p.bk1 + 1) * p.ppb > p.total || (p.bk2 + 1) * p.ppb > p.total {
-			st.result = 0
-			mc2_push(d)
-			return 0
-		}
+	if !mc2_params_ok(cmd) {
+		st.result = 0
+		mc2_push(d)
+		return 0
 	}
-	n := int(clamp(p.size, 0, MC2_BUF))
+	n := int(p.size)
 	switch cmd {
 	case 1:
 		for i in 0 ..< p.count {
 			ok := mc2_read(p.start + i, mc2.page[:])
 			if ok {ok = mc2_ecc_check(mc2.page[:])}
-			if !ok {st.result = 0}
-			mc2_signal(d, 0, 0x80 + u32(i * p.size), mc2.page[:n])
+			// Sent even when it fails its check, as mc2_d does.
+			if !mc2_signal(d, 0, 0x80 + u32(i) * u32(n), mc2.page[:n]) || !ok {st.result = 0}
 		}
 		mc2_signal(d, 0, 0, mc2_status_bytes())
 		return st.result
@@ -541,7 +543,7 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 		endian.unchecked_put_u32le(st.extra[:], u32(blk))
 	case 6: st.result = mc2_backup_restore()
 	case 7: st.result = i32(mc2_copy(p.dst, p.src))
-	case 9: st.result = i32(mc2_erase(p.dst))
+	case 9: st.result = i32(mc2_block_ok(p.dst) && mc2_erase(p.dst))
 	case 10: // the clock, all 0: the extra bytes as cleared
 	case 11:
 		for i in 0 ..< p.count {
@@ -563,6 +565,30 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 	}
 	mc2_push(d)
 	return st.result
+}
+
+// Whether command `cmd`'s parameters fit the card, so no command reads,
+// writes or erases past it. mc2_d's own check (cmds 1, 2, 5, 6, 8 and 11):
+// start + count pages and both backup blocks on the card. Here also, as
+// mc2_d trusts its caller: none of them negative, the sums taken in i64 so
+// none wraps; for every command on the card, the card's own block of 16
+// pages (as command 3 reports it, so ppb 0 never makes every block block 0)
+// and at most its pages; a page and its ECC within the page buffer. Failing,
+// the command gives 0 as mc2_d's check does.
+@(private = "file")
+mc2_params_ok :: proc(cmd: u32) -> bool {
+	p := &mc2.p
+	switch cmd {
+	case 1, 2, 5, 6, 7, 8, 9, 11:
+	case: return true
+	}
+	if p.ppb != MCRAW_PPB || p.total < 0 || p.total > MCRAW_PAGES || p.size < 0 || mc2.xfer > MC2_BUF {return false}
+	switch cmd {
+	case 1, 2, 5, 6, 8, 11:
+		start, count := i64(p.start), i64(p.count)
+		return start >= 0 && count >= 0 && start + count <= i64(p.total) && mc2_block_ok(p.bk1) && mc2_block_ok(p.bk2)
+	}
+	return true
 }
 
 // Read xfer bytes of a page into buf.
@@ -595,7 +621,7 @@ mc2_fill :: proc(data: []u8, off: int) -> bool {
 
 // Whether a block lies on the card the parameters describe.
 @(private = "file")
-mc2_block_ok :: proc(blk: i32) -> bool {return blk >= 0 && (blk + 1) * mc2.p.ppb <= mc2.p.total}
+mc2_block_ok :: proc(blk: i32) -> bool {return blk >= 0 && (i64(blk) + 1) * i64(mc2.p.ppb) <= i64(mc2.p.total)}
 
 // Copy block src over block dst raw, each page read back and compared.
 @(private = "file")
@@ -617,7 +643,7 @@ mc2_backup_check :: proc() -> (r: i32, blk: i32) {
 	if !mc2_read(p.bk2 * p.ppb, mc2.page[:]) {return 0, -1}
 	w0 := first()
 	if w0 == -1 {return 1, -1}
-	if (w0 + 1) * p.ppb > p.total {return 0, -1}
+	if (i64(w0) + 1) * i64(p.ppb) > i64(p.total) {return 0, -1}
 	if !mc2_read(p.bk2 * p.ppb + 1, mc2.page[:]) {return 0, -1}
 	if w1 := first(); w1 == -1 || w1 != w0 {
 		mc2_erase(p.bk2)
@@ -647,7 +673,6 @@ mc2_marker :: proc(page, blk: i32) -> bool {
 @(private = "file")
 mc2_write_blocks :: proc(data: []u8) -> (result: i32) {
 	p := &mc2.p
-	if p.ppb <= 0 {return 0}
 	result = 1
 	cur, off := p.start, 0
 	for cur < p.start + p.count {
@@ -718,8 +743,10 @@ mc2_ecc_set :: proc(buf: []u8) {
 }
 
 // Check a page read into buf against its ECC, correcting one flipped data
-// bit per 128 bytes in buf; buf's ECC bytes end up recomputed. True with
-// ECC off, and for an erased page.
+// bit per 128 bytes in buf; buf's ECC bytes end up those computed before the
+// correction, not the stored ones. True with ECC off, and for an erased page.
+// As mc2_d's check (0x2bb8): a flipped bit in the stored ECC itself is
+// uncorrectable, false.
 @(private = "file")
 mc2_ecc_check :: proc(buf: []u8) -> bool {
 	size, n := int(mc2.p.size), int(mc2.eccsize)

@@ -1035,6 +1035,9 @@ run_events :: proc() {
 		mem.gs_csr ~= 0x2000 // FIELD
 		mem.intc_raise(mem.INTC_VBLANK_START)
 		if mem.gs_imr & 0x800 == 0 {mem.intc_raise(mem.INTC_GS)}
+		// The card's changed blocks reach its image once a frame, here, so
+		// none is pending when a snapshot is taken or restored.
+		iop.mcraw_flush_all()
 		// Snapshots hold the state as of here, before the host's input for
 		// the frame, so a loaded one replays with whatever input the host
 		// gives it next.
