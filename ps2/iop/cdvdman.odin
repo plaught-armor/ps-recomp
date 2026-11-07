@@ -52,7 +52,7 @@ CD_CLOCK :: 8
 // The clock both write (cd_clock_write): 2004-01-01 12:00:00, fixed so every
 // run, replay and netplay peer reads the same, and a date a real drive
 // gives. All 0, day 0 of month 0, drives games' date arithmetic negative:
-// Metal Gear Solid 3 turns it into a time before its epoch, indexes a table
+// a game turns it into a time before its epoch, indexes a table
 // with the negative remainder and corrupts its heap.
 CD_CLOCK_TIME :: [CD_CLOCK]u8{0, 0x00, 0x00, 0x12, 0, 0x01, 0x01, 0x04}
 
