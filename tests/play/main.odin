@@ -234,6 +234,7 @@ main :: proc() {
 	test_midload()
 	test_midload_status()
 	test_midload_child()
+	test_midlearn()
 	test_press()
 	test_press_watch()
 	test_ramdiff()
@@ -1023,6 +1024,33 @@ test_midload_child :: proc() {
 		check(c.name, strings.contains(errs, c.line), fmt.tprintf("no %q:\n%s", c.line, errs))
 		check(c.name, strings.contains(errs, c.quit), fmt.tprintf("quit line:\n%s", errs))
 		check(c.name, clean, "the temporary blob is left")
+	}
+}
+
+// A PS1 run with no learn records at its start records the function SECOND
+// (load_exec_disc) it interprets, compiles it mid-run in a child and loads
+// it, leaving no temporary file; a child that fails leaves the run
+// interpreted, counted, and no temporary file.
+@(private = "file")
+test_midlearn :: proc() {
+	Case :: struct {
+		name:  string,
+		label: string, // a disc directory of its own, with no records
+		fail:  bool,
+		line:  string,
+		quit:  string,
+	}
+	cases := [?]Case {
+		{"midlearn", "MIDLEARN", false, "play: mid-run learned load: 1 records", "play: mid-run learned loads: 1 (1 records), 0 stale, 0 failed"},
+		{"midlearn_fail", "MIDLEARN FAIL", true, "play: mid-run learned compile failed (exit 1)", "play: mid-run learned loads: 0 (0 records), 0 stale, 1 failed"},
+	}
+	for c in cases {
+		path := write(c.name, labeled(load_exec_disc(), c.label))
+		errs, clean := run_midload(c.name, path, fail = c.fail)
+		check(c.name, strings.contains(errs, "play: mid-run learned loading on, each compile waited for"), fmt.tprintf("mode line:\n%s", errs))
+		check(c.name, strings.contains(errs, c.line), fmt.tprintf("no %q:\n%s", c.line, errs))
+		check(c.name, strings.contains(errs, c.quit), fmt.tprintf("quit line:\n%s", errs))
+		check(c.name, clean, "a temporary file is left")
 	}
 }
 
