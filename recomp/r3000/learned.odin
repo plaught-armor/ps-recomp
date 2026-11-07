@@ -59,6 +59,16 @@ learned_blob :: proc(runs: []Learned, arch: native.Arch, exact := true, interp: 
 			}
 		}
 	}
+	// Room for the code of the runs compiled, from their words: wasm32
+	// function bodies take up to about 82 bytes a word, and no arch more
+	// than about 0.8 labels a word (lod, bof4, ff7), so each grows at most
+	// once or not at all.
+	words := 0
+	for r, k in runs {
+		if !left[k] {words += len(r.words)}
+	}
+	if arch == .Wasm32 {reserve(&a.wa.out, 88 * words)}
+	reserve(&a.labels, words)
 	spans := make([dynamic]native.Blob_Span, 0, len(runs))
 	defer delete(spans)
 	for r, k in runs {

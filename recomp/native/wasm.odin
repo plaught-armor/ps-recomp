@@ -385,6 +385,14 @@ VOP_SIMPLE := [Vop]u32 {
 
 // ---------------------------------------------------------------- encoding
 
+// The bytes wa_uleb writes for v.
+@(private = "file")
+wa_uleb_len :: proc(v: u64) -> int {
+	n := 1
+	for rest := v >> 7; rest != 0; rest >>= 7 {n += 1}
+	return n
+}
+
 @(private = "file")
 wa_uleb :: proc(buf: ^[dynamic]u8, v: u64) {
 	v := v
@@ -1898,13 +1906,17 @@ wasm_finish :: proc(a: ^Asm) -> []u8 {
 	wa_uleb(&sec, u64(n_gen))
 	for k in 0 ..< n_gen {wa_uleb(&sec, u64(k))}
 	wa_section(&m, 9, sec[:])
-	// Code.
-	clear(&sec)
-	wa_uleb(&sec, u64(len(w.bodies)))
+	// Code, straight into m: its size first, then the bodies, so the
+	// largest section is copied once.
+	size := wa_uleb_len(u64(len(w.bodies)))
+	for b in w.bodies {size += wa_uleb_len(u64(b.hi - b.lo)) + b.hi - b.lo}
+	reserve(&m, len(m) + 1 + wa_uleb_len(u64(size)) + size)
+	append(&m, 10)
+	wa_uleb(&m, u64(size))
+	wa_uleb(&m, u64(len(w.bodies)))
 	for b in w.bodies {
-		wa_uleb(&sec, u64(b.hi - b.lo))
-		append(&sec, ..w.out[b.lo:b.hi])
+		wa_uleb(&m, u64(b.hi - b.lo))
+		append(&m, ..w.out[b.lo:b.hi])
 	}
-	wa_section(&m, 10, sec[:])
 	return m[:]
 }
