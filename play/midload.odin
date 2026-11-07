@@ -80,6 +80,7 @@ Midload :: struct {
 	pending: bool, // grown since the last job started
 	quiet:   int, // vblanks since it last grew
 	fails:   int, // jobs that failed or were stopped
+	vblanks: u64, // vblanks since boot, for the log
 }
 
 @(private = "file")
@@ -122,6 +123,7 @@ midload_begin :: proc(job: Midload_Job) -> bool {
 // Boot.vblank: take a finished job's code, then start a job once what it
 // loads from has been quiet MIDLOAD_FRAMES vblanks.
 midload_vblank :: proc() {
+	ml.vblanks += 1
 	if ml.stuck {return}
 	if ml.running {midload_poll(0)}
 	if n := ml.job.grown(); n != ml.count {
@@ -174,6 +176,7 @@ midload_poll :: proc(timeout: time.Duration) {
 		fmt.eprintfln("play: mid-run %s %s took over %.0f s, stopped", ml.job.what, ml.job.noun, time.duration_seconds(MIDLOAD_DEADLINE))
 	case .Done:
 		ml.running = false
+		fmt.eprintfln("play: mid-run %s %s done at vblank %d", ml.job.what, ml.job.noun, ml.vblanks)
 		return
 	case .Failed:
 		ml.running = false
