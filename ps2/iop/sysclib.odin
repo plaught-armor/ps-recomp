@@ -263,6 +263,23 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		v, end := iop_strtol(a0, a2)
 		if a1 != 0 {w32(a1, end)}
 		return v, true
+	case 40: // wmemcopy(dst, src, n): dst; n/4 words copied forward, n's low 2 bits dropped
+		// The kernel copies the first (n/4)%4 words one at a time, then four
+		// at a time, reading all four before writing any: an overlapping copy
+		// follows that order. An unaligned dst or src faults there; here it is
+		// copied as given with a row.
+		if (a0 | a1) & 3 != 0 {core.compat_unknown(.Iop_Call, core.compat_name("sysclib"), fno, pc = r[31])}
+		dst := ram_w(a0, a2 & ~u32(3))
+		src := ram(a1, a2 & ~u32(3))
+		words := min(len(dst), len(src)) / 4
+		i := 0
+		for ; i < words % 4; i += 1 {copy(dst[i * 4:][:4], src[i * 4:][:4])}
+		for ; i < words; i += 4 {
+			g: [16]u8
+			copy(g[:], src[i * 4:][:16])
+			copy(dst[i * 4:][:16], g[:])
+		}
+		return a0, true
 	case 41: // wmemset(dst, word, n): dst; n/4 words of `word`, n's low 2 bits dropped
 		// The kernel stores words: an unaligned dst faults there, here it is
 		// written as given with a row.

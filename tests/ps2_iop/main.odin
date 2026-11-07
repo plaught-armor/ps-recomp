@@ -1598,6 +1598,28 @@ test_sysclib :: proc() {
 	ram[TOP - 1] = 9
 	call(41, TOP - 4, 0x01020304, 100)
 	check(ram[TOP - 4] == 4 && ram[TOP - 1] == 1, "sysclib: wmemset stops at RAM's end")
+
+	// wmemcopy: n/4 words forward, n's low 2 bits dropped, dst returned; the
+	// kernel's order on an overlap (the first (n/4)%4 words singly, then four
+	// read before four written); an unaligned address a row.
+	for i in 0 ..< 12 {ram[B + u32(i)] = u8(0x40 + i)}
+	for &c in ram[A:][:12] {c = 7}
+	check(call(40, A, B, 11) == A, "sysclib: wmemcopy returns dst")
+	check(slice.equal(ram[A:][:8], ram[B:][:8]) && ram[A + 8] == 7, "sysclib: wmemcopy copies n/4 words, n%4 dropped")
+	call(40, A + 8, B, 3)
+	check(ram[A + 8] == 7, "sysclib: wmemcopy of n < 4 copies none")
+	wc :: proc(ram: []u8, at: u32, n: int) -> (w: [9]u32) {
+		for i in 0 ..< n {w[i] = endian.unchecked_get_u32le(ram[at + u32(i) * 4:])}
+		return
+	}
+	for i in 0 ..< 9 {endian.unchecked_put_u32le(ram[A + u32(i) * 4:], u32(i))}
+	call(40, A + 4, A, 32)
+	check(wc(ram, A, 9) == [9]u32{0, 0, 1, 2, 3, 3, 5, 6, 7}, "sysclib: wmemcopy over itself, 4 words read before 4 written")
+	for i in 0 ..< 9 {endian.unchecked_put_u32le(ram[A + u32(i) * 4:], u32(i))}
+	call(40, A + 4, A, 20)
+	check(wc(ram, A, 9) == [9]u32{0, 0, 0, 2, 3, 4, 6, 7, 8}, "sysclib: wmemcopy over itself, (n/4)%4 words singly first")
+	ck := core.Compat_Key{.Iop_Call, core.compat_name("sysclib"), 40}
+	check(core.compat.calls[ck].n == 0 && call(40, A, B + 2, 4) == A && core.compat.calls[ck].n == 1, "sysclib: an unaligned wmemcopy is a row")
 }
 
 // A Sony import of another major version is not served; another minor is.
