@@ -179,11 +179,12 @@ platform_init :: proc(title: cstring) -> bool {
 // Called by quit before the counters are printed; nil none.
 quit_hook: proc()
 
-// Exit, after printing the fallback counters when built with them, the
-// VU1 program counters when VU1_STATS is set, and the unmapped access
-// counts when some went unlogged.
+// Exit, after writing the memory card's pending blocks and printing the
+// fallback counters when built with them, the VU1 program counters when
+// VU1_STATS is set, and the unmapped access counts when some went unlogged.
 @(private)
 quit :: proc(code: int) -> ! {
+	iop.mcraw_flush_all() // the card's last changes, before anything else can fail
 	if quit_hook != nil {quit_hook()}
 	if code == 0 {thumb_save()}
 	when cpu.FALLBACK_COUNT {cpu.fallback_print()}

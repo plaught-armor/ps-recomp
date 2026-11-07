@@ -14,9 +14,12 @@
 // The card is emulated state: a table of blocks per port, each allocated on
 // the emulated heap at its first write and freed when erased, so a snapshot
 // copies only the blocks in use and a rewind restores them. The image is
-// read in at init. Each command's changed blocks are written
-// in place into the image when it ends (one write per block, then a sync),
-// and kept in Card_Dirty for rollback. Under FLAT and on wasi the image goes
+// read in at init. Changed blocks wait in a pending set and are written in
+// place into the image at most once a frame, at vblank before any snapshot,
+// and at exit (one write per block, then one sync), so no fsync lands on a
+// command. A write that fails keeps its blocks pending for the next flush,
+// logged once until one succeeds. Changes are also kept in Card_Dirty for
+// rollback. Under FLAT and on wasi the image goes
 // through the same core:os calls; web/wasi.js keeps it in the page's memory,
 // lost when the page goes, as mcserv's directories are.
 package ps2_iop
@@ -42,11 +45,14 @@ Mcraw_Card :: struct {
 
 mcraw: [MCRAW_PORTS]Mcraw_Card
 
-// Host state: the blocks this command changed, and what rollback keeps.
+// Host state: the blocks not yet written to the image, whether its last
+// write failed, and what rollback keeps.
 @(private = "file")
 mcraw_pending: [MCRAW_PORTS][MCRAW_BLOCKS]bool
 @(private = "file")
 mcraw_any_pending: [MCRAW_PORTS]bool
+@(private = "file")
+mcraw_failed: [MCRAW_PORTS]bool
 @(private = "file")
 mcraw_dirty: [MCRAW_PORTS]Card_Dirty(u32)
 
@@ -61,6 +67,7 @@ mcraw_init :: proc() {
 		c^ = {}
 		mcraw_pending[port] = {}
 		mcraw_any_pending[port] = false
+		mcraw_failed[port] = false
 		mcraw_load(port)
 	}
 	if !mcraw_hooked {
@@ -130,9 +137,9 @@ mcraw_read :: proc(port: int, page: u32, dst: []u8) -> bool {
 }
 
 // Write src over the start of page `page`; the rest of the page keeps what
-// it held.
+// it held. False past the card or the page, or with no card.
 mcraw_write :: proc(port: int, page: u32, src: []u8) -> bool {
-	if page >= MCRAW_PAGES || len(src) > MCRAW_PAGE {return false}
+	if !mcraw[port].present || page >= MCRAW_PAGES || len(src) > MCRAW_PAGE {return false}
 	c := &mcraw[port]
 	b := page / MCRAW_PPB
 	if c.blocks[b] == nil {
@@ -144,9 +151,9 @@ mcraw_write :: proc(port: int, page: u32, src: []u8) -> bool {
 	return true
 }
 
-// Erase the block holding page `page`.
+// Erase the block holding page `page`. False past the card, or with no card.
 mcraw_erase :: proc(port: int, page: u32) -> bool {
-	if page >= MCRAW_PAGES {return false}
+	if !mcraw[port].present || page >= MCRAW_PAGES {return false}
 	c := &mcraw[port]
 	b := page / MCRAW_PPB
 	if c.blocks[b] != nil {
@@ -157,6 +164,8 @@ mcraw_erase :: proc(port: int, page: u32) -> bool {
 	return true
 }
 
+// A block changed: to be written to the image. While host writes are off
+// the change is not noted at all, and never reaches the image.
 @(private = "file")
 mcraw_touch :: proc(port: int, b: u32) {
 	if core.host_writes_off {return}
@@ -165,23 +174,34 @@ mcraw_touch :: proc(port: int, b: u32) {
 	mcraw_any_pending[port] = true
 }
 
-// After a driver command: write the blocks it changed to the image.
+// Write each port's pending blocks to its image: at vblank, before any
+// snapshot is taken or restored, and at exit.
+mcraw_flush_all :: proc() {
+	for port in 0 ..< MCRAW_PORTS {mcraw_flush(port)}
+}
+
+// Write port `port`'s pending blocks to the image. On a failure they all
+// stay pending, to be written again at the next flush; the first failure
+// after a success is logged.
+@(private = "file")
 mcraw_flush :: proc(port: int) {
-	if !mcraw_any_pending[port] {return}
-	mcraw_any_pending[port] = false
+	if !mcraw_any_pending[port] || core.host_writes_off {return}
 	blocks := make([dynamic]u32, context.temp_allocator)
-	for &p, b in mcraw_pending[port] {
-		if p {append(&blocks, u32(b))}
-		p = false
+	for p, b in mcraw_pending[port] {if p {append(&blocks, u32(b))}}
+	if msg := mcraw_write_host(port, blocks[:]); msg != "" {
+		if !mcraw_failed[port] {fmt.eprintln(msg)}
+		mcraw_failed[port] = true
+		return
 	}
-	mcraw_write_host(port, blocks[:])
+	mcraw_failed[port] = false
+	mcraw_pending[port] = {}
+	mcraw_any_pending[port] = false
 }
 
 // Make blocks of the image match the card; the whole image when there is
-// none yet.
+// none yet. "" on success, else what failed (temp allocator).
 @(private = "file")
-mcraw_write_host :: proc(port: int, blocks: []u32) {
-	if core.host_writes_off || len(blocks) == 0 {return}
+mcraw_write_host :: proc(port: int, blocks: []u32) -> string {
 	path := mcraw_path(port)
 	c := &mcraw[port]
 	bytes :: proc(c: ^Mcraw_Card, b: u32, dst: []u8) {
@@ -196,28 +216,25 @@ mcraw_write_host :: proc(port: int, blocks: []u32) {
 		defer delete(img, core.host_allocator)
 		for b in 0 ..< u32(MCRAW_BLOCKS) {bytes(c, b, img[b * MCRAW_BLOCK:][:MCRAW_BLOCK])}
 		if err := os.make_directory_all(mc_host_root()); err != nil && err != .Exist {
-			fmt.eprintfln("mc2: cannot make %s: %v", mc_host_root(), err)
+			return fmt.tprintf("mc2: cannot make %s: %v", mc_host_root(), err)
 		}
 		if err := core.write_file_atomic(path, img); err != nil {
-			fmt.eprintfln("mc2: cannot write %s: %v", path, err)
+			return fmt.tprintf("mc2: cannot write %s: %v", path, err)
 		}
-		return
+		return ""
 	}
 	f, err := os.open(path, {.Write})
-	if err != nil {
-		fmt.eprintfln("mc2: cannot open %s: %v", path, err)
-		return
-	}
+	if err != nil {return fmt.tprintf("mc2: cannot open %s: %v", path, err)}
 	defer os.close(f)
 	buf: Mcraw_Block
 	for b in blocks {
 		bytes(c, b, buf[:])
 		if _, err = os.write_at(f, buf[:], i64(b) * MCRAW_BLOCK); err != nil {
-			fmt.eprintfln("mc2: cannot write %s: %v", path, err)
-			return
+			return fmt.tprintf("mc2: cannot write %s: %v", path, err)
 		}
 	}
-	if err = os.sync(f); err != nil {fmt.eprintfln("mc2: cannot sync %s: %v", path, err)}
+	if err = os.sync(f); err != nil {return fmt.tprintf("mc2: cannot sync %s: %v", path, err)}
+	return ""
 }
 
 @(private = "file")
@@ -225,14 +242,17 @@ mcraw_committed :: proc(id: int) {
 	for port in 0 ..< MCRAW_PORTS {card_dirty_committed(&mcraw_dirty[port], id)}
 }
 
-// After a snapshot is restored. A rollback: rewrite each block changed
-// within reach of a rewind from the restored card. A save state: leave the
-// image alone, as mcserv does.
+// After a snapshot is restored. A rollback: each block changed within reach
+// of a rewind is pending, to be rewritten from the restored card at the next
+// flush. A save state: leave the image alone, as mcserv does.
 @(private = "file")
 mcraw_rewound :: proc(id: int) {
 	for port in 0 ..< MCRAW_PORTS {
 		mcraw_pending[port] = {}
 		mcraw_any_pending[port] = false
-		mcraw_write_host(port, card_dirty_rewound(&mcraw_dirty[port], id))
+		for b in card_dirty_rewound(&mcraw_dirty[port], id) {
+			mcraw_pending[port][b] = true
+			mcraw_any_pending[port] = true
+		}
 	}
 }

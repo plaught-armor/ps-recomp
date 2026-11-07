@@ -34,8 +34,10 @@ card_dirty_note :: proc(d: ^Card_Dirty($K), key: K) {
 }
 
 // After a snapshot is saved. A rollback commit: forget keys last changed
-// before any frame a rewind can still reach. While host writes are off,
-// rewinds skip their repair, so the keys are kept for when they come on.
+// before any frame a rewind can still reach. While host writes are off no
+// commit counts and rewinds skip their repair, so keys noted before writes
+// went off are kept for when they come on. The stores note no key while
+// writes are off: those changes never reach the host.
 card_dirty_committed :: proc(d: ^Card_Dirty($K), id: int) {
 	if id < core.RB_HOOK_ID || core.host_writes_off {return}
 	d.commits += 1
