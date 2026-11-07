@@ -77,6 +77,7 @@ KE_ILLEGAL_THID :: -406
 KE_UNKNOWN_THID :: -407
 KE_UNKNOWN_SEMID :: -408
 KE_UNKNOWN_EVFID :: -409
+KE_UNKNOWN_MBXID :: -410
 KE_DORMANT :: -413
 KE_NOT_DORMANT :: -414
 KE_CAN_NOT_WAIT :: -417
@@ -85,6 +86,7 @@ KE_SEMA_OVF :: -420
 KE_EVF_COND :: -421
 KE_EVF_MULTI :: -422
 KE_EVF_ILPAT :: -423
+KE_MBOX_NOMSG :: -424
 KE_WAIT_DELETE :: -425
 
 @(private = "file")
@@ -163,13 +165,22 @@ Iop_Evf :: struct {
 	initial, bits:    u32,
 }
 
+// A message box: its queue is the messages' own next words in IOP memory,
+// first to last; 0 when empty.
+Iop_Mbx :: struct {
+	id, attr, option: u32,
+	head, tail:       u32,
+}
+
 // Emulated state, in the emu heap: snapshotted (sif_snap).
 iop_sched: struct {
 	threads:              [dynamic]Iop_Thread,
 	semas:                [dynamic]Iop_Sema,
 	evfs:                 [dynamic]Iop_Evf,
+	mbxs:                 [dynamic]Iop_Mbx,
 	next_thid, next_semid: u32,
 	next_evfid:           u32,
+	next_mbxid:           u32,
 	lock:                 i32, // sio2man's transfer lock, a semaphore's count
 	lock_holder:          u32, // the thread that last took it, 0 when given back
 	head, tail:           i64, // the next seq at a queue's head, at its tail
@@ -232,13 +243,16 @@ th_init :: proc() {
 	clear(&s.threads)
 	clear(&s.semas)
 	clear(&s.evfs)
+	clear(&s.mbxs)
 	s^ = {
 		threads    = s.threads,
 		semas      = s.semas,
 		evfs       = s.evfs,
+		mbxs       = s.mbxs,
 		next_thid  = 1,
 		next_semid = 1,
 		next_evfid = 1,
+		next_mbxid = 1,
 		lock       = 1,
 		head       = -1,
 	}
@@ -798,12 +812,12 @@ th_intr_stop :: proc(why: Intr_Stop) {
 
 // The ids a load's threads, semaphores and event flags start from.
 Th_Mark :: struct {
-	thid, semid, evfid: u32,
+	thid, semid, evfid, mbxid: u32,
 }
 
 th_mark :: proc() -> Th_Mark {
 	s := &iop_sched
-	return {s.next_thid, s.next_semid, s.next_evfid}
+	return {s.next_thid, s.next_semid, s.next_evfid, s.next_mbxid}
 }
 
 // Undoes a failed load: deletes the semaphores, event flags and threads
@@ -817,6 +831,9 @@ th_undo :: proc(m: Th_Mark) {
 	}
 	for i := len(s.evfs) - 1; i >= 0; i -= 1 {
 		if s.evfs[i].id >= m.evfid {evf_delete(i)}
+	}
+	for i := len(s.mbxs) - 1; i >= 0; i -= 1 {
+		if s.mbxs[i].id >= m.mbxid {ordered_remove(&s.mbxs, i)}
 	}
 	for i := len(s.threads) - 1; i >= 0; i -= 1 {
 		t := &s.threads[i]
@@ -882,7 +899,7 @@ sema_delete :: proc(i: int) {
 // ------------------------------------------------------------- call context
 
 Fno_Set :: bit_set[0 ..< 64; u64]
-Th_Lib :: enum u8 {Base, Semap, Event}
+Th_Lib :: enum u8 {Base, Semap, Event, Msgbx}
 
 // ReferThreadStatus's iop_thread_info_t at `info` for thread id: attr,
 // option, status, entry, stack, stacksize, gp, initPriority,
@@ -946,12 +963,14 @@ TH_CHECKED := [Th_Lib]Fno_Set {
 	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 20, 22, 24, 25, 26, 33},
 	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
 	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
+	.Msgbx = {4, 6, 9},
 }
 @(rodata)
 TH_IVAR := [Th_Lib]Fno_Set {
 	.Base  = {11, 26},
 	.Semap = {7, 12},
 	.Event = {7, 9, 14},
+	.Msgbx = {},
 }
 
 // The calls refused so far, each shown once under PS_DEBUG; not state.
@@ -1172,6 +1191,63 @@ sema_waiter :: proc(m: Iop_Sema) -> ^Iop_Thread {
 		if better {best = &t}
 	}
 	return best
+}
+
+// ------------------------------------------------------------- thmsgbx
+
+MBA_MSPRI :: 4 // a box's messages queue by priority, else first come
+
+// Function fno of thmsgbx, as th_base: CreateMbx, SendMbx and PollMbx. No
+// ReceiveMbx here, so no thread ever waits on a box and a send only queues.
+th_msgbx :: proc(fno: u32) -> (v0: u32, ok: bool) {
+	s := &iop_sched
+	a0, a1 := r3000.state.r[4], r3000.state.r[5]
+	if th_wrong_context(.Msgbx, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
+	switch fno {
+	case 4: // CreateMbx(iop_mbx_t *): attr, option
+		append(&s.mbxs, Iop_Mbx{id = s.next_mbxid, attr = r32(a0), option = r32(a0 + 4)})
+		s.next_mbxid += 1
+		return s.next_mbxid - 1, true
+	case 6: // SendMbx(mbxid, iop_message_t *): next word, then a priority byte
+		m := mbx_find(a0)
+		if m == nil {return ke(KE_UNKNOWN_MBXID), true}
+		mbx_put(m, a1)
+		return KE_OK, true
+	case 9: // PollMbx(void **recvmsg, mbxid): the first message, or NOMSG
+		m := mbx_find(a1)
+		if m == nil {return ke(KE_UNKNOWN_MBXID), true}
+		if m.head == 0 {return ke(KE_MBOX_NOMSG), true}
+		msg := m.head
+		m.head = r32(msg)
+		if m.head == 0 {m.tail = 0}
+		w32(a0, msg)
+		return KE_OK, true
+	}
+	return 0, false
+}
+
+@(private = "file")
+mbx_find :: proc(id: u32) -> ^Iop_Mbx {
+	for &m in iop_sched.mbxs {
+		if m.id == id {return &m}
+	}
+	return nil
+}
+
+// Queues message `msg` in box `m`: last, or under MBA_MSPRI after every
+// message of the same or a better (lower) priority.
+@(private = "file")
+mbx_put :: proc(m: ^Iop_Mbx, msg: u32) {
+	prio := u8(r32(msg + 4))
+	prev, next := u32(0), m.head
+	if m.attr & MBA_MSPRI != 0 {
+		for next != 0 && u8(r32(next + 4)) <= prio {prev, next = next, r32(next)}
+	} else {
+		prev, next = m.tail, 0
+	}
+	w32(msg, next)
+	if prev == 0 {m.head = msg} else {w32(prev, msg)}
+	if next == 0 {m.tail = msg}
 }
 
 // ------------------------------------------------------------- thevent

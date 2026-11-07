@@ -243,6 +243,8 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		fmt.eprintfln("iop: \"%s\" is no IRX", path)
 		return KE_ERROR, 0
 	}
+	// A module info can hold an empty name; its lines and rows go by the path
+	if x.name == "" {x.name = path}
 	core.compat_code_load()
 	l := &iop_loader
 	key := failed_key(path, data)
@@ -617,6 +619,12 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 			// state (17 and 18 neither), so neither is ever already done; retail's
 			// KE_CPUDI for a second disable never comes back
 			return KE_OK, true
+		case 6: // EnableIntr(irq): every line counts as enabled, as above
+			return KE_OK, true
+		case 7: // DisableIntr(irq, int *res): the old state, which is always
+			// enabled, so res gets irq as retail gives an enabled line's
+			if a1 != 0 {w32(a1, a0)}
+			return KE_OK, true
 		case 17: // CpuSuspendIntr(int *state): no interrupts to hold off
 			if a0 != 0 {w32(a0, 0)}
 			return KE_OK, true
@@ -646,6 +654,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return th_base(fno)
 	case "thsemap":
 		return th_semap(fno)
+	case "thmsgbx":
+		return th_msgbx(fno)
 	case "sio2man":
 		return sio2man_fn(fno)
 	case "thevent":

@@ -222,6 +222,7 @@ game :: proc(_: rawptr) {
 	test_rpc_client()
 	test_rpc_pool_kept()
 	test_c1_gaps()
+	test_msgbx()
 	test_call_context()
 	test_sifman()
 	test_sif_dma_intr()
@@ -3375,6 +3376,65 @@ test_boot_gaps :: proc() {
 	check(sys(P, P + 4, 0xffffffff) == P && sys(0, P, 4) == 0 && bytes() == [8]u8{0, 1, 2, 3, 4, 3, 4, 7}, "boot: memmove copies none for n <= 0 or a null dst")
 }
 
+// thmsgbx in a start: CreateMbx gives an id; SendMbx queues first come, or by
+// priority in an MBA_MSPRI box; PollMbx takes the first, then NOMSG once empty.
+test_msgbx :: proc() {
+	fresh()
+	a: Asm
+	mb := imports(&a, "thmsgbx", 4, 6, 9)
+	create, send, poll := mb, mb + 8, mb + 16
+	param := at(&a)
+	put(&a, 0, 0, 4, 0) // attr, option: first come, then MBA_MSPRI
+	msg: [3]u32
+	prio := [3]u32{5, 1, 3}
+	for &m, i in msg {
+		m = at(&a)
+		put(&a, 0xffffffff, prio[i]) // next (a send sets it), priority
+	}
+	ids := at(&a)
+	put(&a, 0, 0)
+	out := at(&a) // per box, per poll: v0, the message it took
+	for _ in 0 ..< 16 {put(&a, 0)}
+	entry := at(&a)
+	prologue(&a)
+	for b in 0 ..< u32(2) {
+		la(&a, A0, param + 8 * b)
+		jal(&a, create)
+		store_v0(&a, ids + 4 * b)
+		for m in msg {
+			lw_at(&a, A0, ids + 4 * b)
+			la(&a, A1, m)
+			jal(&a, send)
+		}
+		for p in 0 ..< u32(4) {
+			o := out + 32 * b + 8 * p
+			la(&a, A0, o + 4)
+			lw_at(&a, A1, ids + 4 * b)
+			jal(&a, poll)
+			store_v0(&a, o)
+		}
+	}
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("mbx", &a, entry), "mbx", nil)
+	base := module_base(id)
+	check(id > 0, "msgbx: a start that creates, sends and polls loads")
+	w :: proc(base, off: u32) -> u32 {return iop.iop_u32(base + off)^}
+	check(w(base, ids) == 1 && w(base, ids + 4) == 2, "msgbx: CreateMbx gives ids 1 and 2")
+	nomsg := transmute(u32)i32(-424)
+	for b in 0 ..< u32(2) {
+		orders := [2][3]u32{{msg[0], msg[1], msg[2]}, {msg[1], msg[2], msg[0]}}
+		order := orders[b]
+		got := true
+		for p in 0 ..< u32(3) {
+			o := out + 32 * b + 8 * p
+			got &&= w(base, o) == 0 && w(base, o + 4) == base + order[p]
+		}
+		got &&= w(base, out + 32 * b + 24) == nomsg && w(base, out + 32 * b + 28) == 0
+		check(id > 0 && got, "msgbx: PollMbx takes first come, by priority under MBA_MSPRI, then NOMSG" if b == 1 else "msgbx: PollMbx takes the messages first come, then NOMSG")
+	}
+}
+
 // The calls an audio service's module needs at load and in play: CpuEnableIntr
 // in a start; ReferSemaStatus and iReferSemaStatus by retail's layout, each only
 // in its context; sceSdGetEffectAttr gives back what Set left, delay and
@@ -3408,6 +3468,24 @@ test_c1_gaps :: proc() {
 	epilogue(&b)
 	id, _ = iop.iop_load(build_mod("modh", &b, entry), "modh", nil)
 	check(id > 0, "c1: CpuDisableIntr, CpuEnableIntr, CpuDisableIntr each give KE_OK")
+	c: Asm
+	en := imports(&c, "intrman", 6, 7)
+	res := at(&c)
+	put(&c, 0xffffffff)
+	entry = at(&c)
+	prologue(&c)
+	li(&c, A0, 40)
+	jal(&c, en)
+	li(&c, A0, 40)
+	la(&c, A1, res)
+	jal(&c, en + 8)
+	li(&c, A0, 41)
+	li(&c, A1, 0)
+	jal(&c, en + 8)
+	epilogue(&c)
+	id, _ = iop.iop_load(build_mod("modi", &c, entry), "modi", nil)
+	check(id > 0, "c1: EnableIntr, DisableIntr with and without res each give KE_OK")
+	check(id > 0 && iop.iop_u32(module_base(id) + res)^ == 40, "c1: DisableIntr writes the line's old state, enabled, to res")
 
 	P :: 0x00040000
 	r := &r3000.state.r
