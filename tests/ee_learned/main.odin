@@ -129,8 +129,8 @@ test_wasm_skip :: proc() {
 	blob, skipped := r5900.learned_blob({{LOOP, LOOP, loop[:]}, {LOOP + 0x100, LOOP + 0x100, slot[:]}}, .Wasm32)
 	defer delete(blob)
 	check(skipped == 1, fmt.tprintf("wasm32 skipped %d runs, want 1", skipped))
-	// The header's n_spans, its seventh field (recomp/native/blob.odin).
-	n_spans := len(blob) < 28 ? -1 : int(u32(blob[24]) | u32(blob[25]) << 8 | u32(blob[26]) << 16 | u32(blob[27]) << 24)
+	// The header's n_spans, its eighth field (recomp/native/blob.odin).
+	n_spans := len(blob) < 32 ? -1 : int(u32(blob[28]) | u32(blob[29]) << 8 | u32(blob[30]) << 16 | u32(blob[31]) << 24)
 	check(n_spans == 1, fmt.tprintf("wasm32 blob has %d spans, want 1", n_spans))
 }
 

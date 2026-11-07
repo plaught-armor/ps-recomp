@@ -1253,7 +1253,7 @@ bad_blobs :: proc(blob: []u8, imports: map[string]u64) {
 	set :: proc(b: []u8, at: int, v: u32) {
 		for k in 0 ..< 4 {b[at + k] = u8(v >> (8 * uint(k)))}
 	}
-	n_spans, n_ranges, n_pool, size := get(blob, 24), get(blob, 28), get(blob, 32), get(blob, 36)
+	n_spans, n_ranges, n_pool, size := get(blob, 28), get(blob, 32), get(blob, 36), get(blob, 40)
 	ranges_at := len(blob) - int(size) - 4 * int(n_pool) - 12 * int(n_ranges)
 	spans_at := ranges_at - 20 * int(n_spans)
 	Damage :: struct {
@@ -1263,10 +1263,11 @@ bad_blobs :: proc(blob: []u8, imports: map[string]u64) {
 	}
 	damages := [?]Damage {
 		{-1, 0, "short blob"},
-		{32, n_pool + 1, "pool count past the file"},
-		{24, 0xffffffff, "huge span count"},
+		{36, n_pool + 1, "pool count past the file"},
+		{24, 0xffffffff, "huge interp count"},
+		{28, 0xffffffff, "huge span count"},
 		{spans_at, u32(max(core.Native_Kind)) + 1, "unknown span kind"},
-		{spans_at + 8, get(blob, 40), "span function at the import slots"},
+		{spans_at + 8, get(blob, 44), "span function at the import slots"},
 		{spans_at + 12, 0xffffffff, "range_first past the ranges"},
 		{spans_at + 16, n_ranges + 1, "n_ranges past the ranges"},
 		{ranges_at + 8, n_pool - 1, "range past the pool"},

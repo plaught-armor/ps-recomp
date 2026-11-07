@@ -11,7 +11,7 @@ import bios "bios"
 import cpu "cpu"
 import host "host"
 import io "io"
-@(require) import native "native" // used only without FLAT
+@(require) import native "native" // used only with LOADERS
 import spu "spu"
 
 // What run needs from the port.
@@ -63,6 +63,11 @@ Boot :: struct {
 	hooks:         proc() -> bool,
 }
 
+// Whether the boot loads native and learned code: not in a native FLAT
+// build (run).
+@(private = "file")
+LOADERS :: !core.FLAT || core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32
+
 // Set up the runtime for the game b describes and call the executable's
 // entry. False when a step fails, with the reason printed; true when the
 // entry returns.
@@ -85,9 +90,11 @@ run :: proc(b: Boot) -> bool {
 	mods := mods_identify(b.mods, b.disc_id) or_return
 	host.platform_init(b.title) or_return
 
-	// FLAT runs interpreted only (core/flat.odin): a thread switch inside
-	// native code would leave its host frames running on.
-	when core.FLAT {
+	// A native FLAT build runs interpreted only (core/flat.odin): a thread
+	// switch inside native code would leave its host frames running on. A
+	// wasm32 build runs a stored blob's native and learned code under FLAT,
+	// where such a switch is fatal (cpu.flat_block).
+	when core.FLAT && core.NATIVE_ARCH != core.NATIVE_ARCH_WASM32 {
 		what := ""
 		switch {
 		case len(b.funcs) > 0: what = "recompiled functions (Boot.funcs)"
@@ -104,10 +111,10 @@ run :: proc(b: Boot) -> bool {
 	// On failure load_native prints why and the Odin functions stay; a
 	// standalone blob has none behind it. With neither, every function is
 	// interpreted: a disc nobody has converted still runs, slowly.
-	// Under FLAT the loaders are not compiled in (the check above refuses
-	// what they load), so a FLAT build refers to no map_code.
+	// Under a native FLAT build the loaders are not compiled in (the check
+	// above refuses what they load), so it refers to no map_code.
 	standalone := len(b.funcs) == 0
-	when !core.FLAT {
+	when LOADERS {
 		if b.native != "" && !load_native(b.native, standalone) && standalone {
 			if b.native_failed != nil {b.native_failed()}
 			return false
@@ -116,7 +123,7 @@ run :: proc(b: Boot) -> bool {
 	if standalone && b.native == "" {
 		fmt.eprintln("psx: no native code, interpreting everything")
 	}
-	when !core.FLAT {
+	when LOADERS {
 		if b.learned_funcs != nil {b.learned_funcs()}
 		if b.learned != "" && !native.load_learned(b.learned) && b.learned_failed != nil {
 			b.learned_failed()
