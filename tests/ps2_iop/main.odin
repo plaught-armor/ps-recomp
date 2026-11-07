@@ -271,6 +271,7 @@ game :: proc(_: rawptr) {
 	test_alarm()
 	test_wakeup_cancel()
 	test_release_wait()
+	test_error_rows()
 	test_create_thread()
 	test_vblank()
 	test_vblank_handlers()
@@ -1381,7 +1382,7 @@ test_libc :: proc() {
 	b := module_base(id)
 	u := proc(b, o: u32) -> u32 {return iop.iop_u32(b + o)^}
 	check(id > 0, "libc: modl loads")
-	check(u(b, state) == 0 && u(b, out) == 0, "libc: CpuSuspendIntr writes its state and returns 0")
+	check(u(b, state) == iop.INTR_ON_STATE && u(b, out) == 0, "libc: CpuSuspendIntr writes the on state and returns 0")
 	check(u(b, out + 4) == 6, "libc: printf returns what it wrote")
 	check(u(b, out + 8) == 0xffffffe1 && u(b, endp) == b + num + 7, "libc: strtol base 0 reads -0x1f, ends before Z")
 	check(u(b, buf) == 0x115a5a5a && u(b, buf + 4) == 0x11116261, "libc: memset and memcpy")
@@ -5936,8 +5937,8 @@ test_timrman :: proc() {
 	check(tm(t, 4, 1, 32, 1) == neg(150) && tm(t, 4, 1, 32, 256) == neg(150), "timrman: none free")
 	check(tm(t, 4, 1, 16, 8) == TIMER2 && tm(t, 4, 1, 16, 2) == neg(150), "timrman: timer 2 for prescale 8, none for a 16-bit prescale 2 left")
 	check(tm(t, 4, 2, 16, 1) == TIMER0 && tm(t, 4, 4, 16, 1) == TIMER1, "timrman: the pixel and hline sources")
-	check(tm(t, 6, 0) == neg(151) && tm(t, 6, 0x7bf80000) == neg(151), "timrman: FreeHardTimer of no timer")
-	check(tm(t, 6, TIMER4) == 0 && tm(t, 6, TIMER3) == 0 && tm(t, 6, TIMER0) == 0 && tm(t, 6, TIMER1) == 0 && tm(t, 6, TIMER4) == neg(151), "timrman: FreeHardTimer, once")
+	check(tm(t, 6, 0) == neg(150) && tm(t, 6, 0x7bf80000) == neg(150) && tm(t, 6, TIMER4 + 1) == neg(150), "timrman: FreeHardTimer of no timer, or of an id that is not one")
+	check(tm(t, 6, TIMER4) == 0 && tm(t, 6, TIMER3) == 0 && tm(t, 6, TIMER0) == 0 && tm(t, 6, TIMER1) == 0 && tm(t, 6, TIMER4) == neg(150), "timrman: FreeHardTimer, once")
 	check(tm(t, 22, TIMER5, 1, 2, 1) == neg(405) && tm(t, 22, TIMER5, 1, 0, 3) == neg(153) && tm(t, 22, TIMER2, 1, 0, 16) == neg(153), "timrman: a bad mode, prescale")
 	check(tm(t, 22, TIMER5, 2, 0, 1) == neg(152) && tm(t, 22, TIMER5, 3, 0, 1) == neg(152), "timrman: a source the timer lacks")
 	check(tm(t, 23, TIMER5) == neg(155) && tm(t, 24, TIMER5) == neg(156), "timrman: start before setup, stop before start")
@@ -6260,6 +6261,68 @@ test_create_thread :: proc() {
 	fresh()
 }
 
+// The error codes of intrman, loadcore, cdvdman and vblank where retail has
+// one: CpuSuspendIntr and CpuDisableIntr -102 when interrupts were off, the
+// old state stored either way, and a handler's off; RegisterLibraryEntries -1
+// for no table, a bad magic and a name and major already there, and
+// ReleaseLibraryEntries -1 for a table not registered; sceCdGetError none
+// and sceCdDiskReady mode 8 the ready register; WaitVblank* from a handler
+// -100; AddVblankHandler's no-room before its duplicate.
+test_error_rows :: proc() {
+	fresh()
+	P :: 0x00040000
+	call :: proc(lib: string, fno: u32, a0: u32 = 0, a1: u32 = 0, a2: u32 = 0, a3: u32 = 0) -> u32 {
+		r := &r3000.state.r
+		r[4], r[5], r[6], r[7] = a0, a1, a2, a3
+		v, ok := iop.hle_fn(lib, fno)
+		check(ok, fmt.tprintf("error rows: %s %d served", lib, fno))
+		return v
+	}
+	cpudi := neg(-iop.KE_CPUDI)
+	st := iop.iop_u32(P)
+	st^ = 0xdead
+	check(call("intrman", 17, P) == 0 && st^ == iop.INTR_ON_STATE, "intr: a suspend from on gives 0 and the on state")
+	st^ = 0xdead
+	check(call("intrman", 17, P) == cpudi && st^ == 0, "intr: a second suspend -102, the off state stored")
+	check(call("intrman", 17, 0) == cpudi, "intr: a null state pointer is not written")
+	check(call("intrman", 8) == cpudi, "intr: a disable while off -102")
+	check(call("intrman", 18, iop.INTR_ON_STATE) == 0 && call("intrman", 8) == 0, "intr: resumed on, a disable gives 0")
+	check(call("intrman", 9) == 0 && call("intrman", 18, 0) == 0 && call("intrman", 8) == cpudi, "intr: enable, then a resume to off")
+	call("intrman", 9)
+	iop.iop_sched.intr = true
+	check(call("intrman", 17, P) == cpudi && st^ == 0, "intr: a handler's interrupts are off")
+	iop.iop_sched.intr = false
+	check(call("intrman", 8) == 0, "intr: and a handler's calls leave the thread's state")
+	call("intrman", 9)
+
+	err := neg(-iop.KE_ERROR)
+	T :: P + 0x100
+	words := [8]u32{0xdead, 0, 0x0102, 0, 0x74736574, 0x0000006c, 0x1000, 0} // "testl", version 1.2
+	for w, i in words {iop.iop_u32(T + 4 * u32(i))^ = w}
+	check(call("loadcore", 6, 0) == err && call("loadcore", 6, T) == err, "loadcore: no table, a bad magic -1")
+	iop.iop_u32(T)^ = iop.IRX_EXPORT_MAGIC
+	check(call("loadcore", 6, T) == 0, "loadcore: a table registered")
+	check(call("loadcore", 6, T) == err, "loadcore: the same name and major again -1")
+	check(call("loadcore", 7, T + 0x40) == err, "loadcore: releasing a table not registered -1")
+	check(call("loadcore", 7, T) == 0 && call("loadcore", 7, T) == err, "loadcore: released once")
+
+	check(call("cdvdman", 8) == 0, "cdvdman: sceCdGetError, none")
+	check(call("cdvdman", 13, 0) == 2 && call("cdvdman", 13, 1) == 2, "cdvdman: sceCdDiskReady, ready")
+	check(call("cdvdman", 13, 8) == iop.CD_READY_REG, "cdvdman: sceCdDiskReady mode 8, the ready register")
+
+	vs, ve := iop.ee_vblank_start, iop.ee_vblank_end
+	defer iop.ee_vblank_start, iop.ee_vblank_end = vs, ve
+	iop.ee_vblank_start, iop.ee_vblank_end = &vbl_start, &vbl_end
+	iop.iop_sched.intr = true
+	for fno in u32(4) ..= 7 {check(call("vblank", fno) == neg(-iop.KE_ILLEGAL_CONTEXT), "vblank: a wait from a handler -100")}
+	iop.iop_sched.intr = false
+	check(call("vblank", 8, 0, 0, 0x1000, 0) == 0, "vblank: a handler added")
+	check(call("vblank", 8, 0, 0, 0x1000, 0) == neg(-iop.KE_FOUND_HANDLER), "vblank: the same again -104")
+	for k in u32(1) ..< iop.VBL_HANDLERS {check(call("vblank", 8, 0, 0, 0x1000 + 4 * k, 0) == 0, "vblank: room for 14")}
+	check(call("vblank", 8, 0, 0, 0x1000, 0) == neg(-iop.KE_NO_MEMORY), "vblank: full is told before a duplicate")
+	fresh()
+}
+
 // thbase 19 iReleaseWaitThread: a handler's call only; thread 0 -406, an
 // unknown thread -407, one not waiting -416; a waiting thread, of any wait,
 // ready with its wait returning KE_RELEASE_WAIT.
@@ -6296,7 +6359,7 @@ snap10_loaded: bool // not emulated state
 // vblank; 5 and 7 the same for the end, out of it; none at once before the
 // first start. A waiter is a delayed thread, woken at its edge with every
 // other on it; it survives a snapshot, a failed load's undo leaves none, a
-// handler that calls one is stopped.
+// handler that calls one gets KE_ILLEGAL_CONTEXT and goes on.
 test_vblank :: proc() {
 	fresh()
 	iop.iop_irx = true
@@ -6410,10 +6473,10 @@ test_vblank :: proc() {
 	iop.iop_tick(F)
 	check(log_equal(b, logp, {3, 1, 2}), "vblank: the restored waiters wake at the end")
 
-	// Out of vblank, a handler is stopped, whether its call would wait (4)
-	// or pass (7).
-	check(iop.th_intr(b + h4, 0, 0) == .Blocked, "vblank: a handler waiting for the start is stopped")
-	check(iop.th_intr(b + h7, 0, 0) == .Blocked, "vblank: a handler whose call would pass is stopped too")
+	// Out of vblank, a handler's call is KE_ILLEGAL_CONTEXT and it goes on,
+	// whether the call would wait (4) or pass (7).
+	check(iop.th_intr(b + h4, 0, 0) == .None, "vblank: a handler waiting for the start goes on")
+	check(iop.th_intr(b + h7, 0, 0) == .None, "vblank: so does one whose call would pass")
 
 	// "modz": its thread (priority 5) waits for the end, then its start
 	// fails: the thread and its wait are gone.
@@ -6504,7 +6567,8 @@ test_vblank_handlers :: proc() {
 	// "modv": thread T (priority 20) sleeps, then logs 9. Handlers h1 and h3
 	// log 1 and 3 and return 1, h2 logs 2 and returns 0; hw wakes T and
 	// logs 4; ha and hd log 5 and 6 after calling Add and Del, keeping what
-	// they return; hb waits for the start.
+	// they return; hb waits for the start, which a handler is refused, and
+	// logs 7.
 	a: Asm
 	VFN :: [3]u32{4, 8, 9}
 	vfn := VFN
@@ -6559,6 +6623,7 @@ test_vblank_handlers :: proc() {
 	hb := at(&a)
 	prologue(&a)
 	jal(&a, vb)
+	log_v(&a, logp, 7)
 	li(&a, V0, 1)
 	epilogue(&a)
 	tp := thread_param(&a, et, 20)
@@ -6618,9 +6683,9 @@ test_vblank_handlers :: proc() {
 	rows := core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + hb, 0}].n
 	check(del(b, vb, 0, b + hw) == 0 && add(b, vb, 0, 0, b + ha) == 0 && add(b, vb, 0, 1, b + hd) == 0 && add(b, vb, 0, 2, b + hb) == 0, "vblank handlers: ha, hd and hb added")
 	iop.iop_tick(up8(9 * F - 22 * L))
-	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6}) && iop.iop_u32(b + out)^ == neg(-iop.KE_ILLEGAL_CONTEXT) && iop.iop_u32(b + out + 4)^ == neg(-iop.KE_ILLEGAL_CONTEXT), "vblank handlers: a handler's Add and Del are KE_ILLEGAL_CONTEXT")
-	check(core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + hb, 0}].n == rows + 1 && v.n == 4 && order(v) == {0 = b + h3, 1 = b + h1, 2 = b + ha, 3 = b + hd}, "vblank handlers: a handler that waits is stopped, a row, dropped")
-	check(del(b, vb, 0, b + ha) == 0 && del(b, vb, 0, b + hd) == 0 && v.n == 2, "vblank handlers: ha and hd removed")
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 7}) && iop.iop_u32(b + out)^ == neg(-iop.KE_ILLEGAL_CONTEXT) && iop.iop_u32(b + out + 4)^ == neg(-iop.KE_ILLEGAL_CONTEXT), "vblank handlers: a handler's Add and Del are KE_ILLEGAL_CONTEXT")
+	check(core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + hb, 0}].n == rows && v.n == 5 && order(v) == {0 = b + h3, 1 = b + h1, 2 = b + ha, 3 = b + hd, 4 = b + hb}, "vblank handlers: a handler whose wait is refused goes on, no row, kept")
+	check(del(b, vb, 0, b + ha) == 0 && del(b, vb, 0, b + hd) == 0 && del(b, vb, 0, b + hb) == 0 && v.n == 2, "vblank handlers: ha, hd and hb removed")
 
 	full := b + 0x10000
 	for i in 0 ..< u32(iop.VBL_HANDLERS - 2) {check(add(b, vb, 0, 0, full + 4 * i) == 0, "vblank handlers: the table fills")}
@@ -6683,10 +6748,10 @@ test_vblank_handlers :: proc() {
 	check(fails("modd", 1, b + h3, 0, 0) <= 0 && v^ == before, "vblank handlers: a failed load that deleted an edge's only handler puts it back, its next edge unchanged")
 	iop.iop_tick(up8(9 * F))
 	iop.iop_tick(up8(9 * F))
-	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 3}) && v.next[1] == 10 * F, "vblank handlers: and it runs at that edge once")
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 7, 3}) && v.next[1] == 10 * F, "vblank handlers: and it runs at that edge once")
 	check(fails("moda", 0, 0, 0, b + h2) <= 0 && v.n == 2 && v.h[1] == {0, 0, b + h2, 0} && v.next[0] == 10 * F - 22 * L, "vblank handlers: a failed load's handler outside its memory stays, its new list from the kernel's next edge")
 	iop.iop_tick(up8(10 * F - 22 * L))
-	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 3, 2}) && v.n == 1, "vblank handlers: and runs at that edge")
+	check(log_equal(b, logp, {4, 9, 3, 2, 1, 4, 3, 1, 3, 1, 4, 3, 1, 5, 6, 7, 3, 2}) && v.n == 1, "vblank handlers: and runs at that edge")
 	for i in 0 ..< u32(iop.VBL_HANDLERS - 1) {check(add(b, vb, 0, 0, full + 4 * i) == 0, "vblank handlers: the table fills again")}
 	before = v^
 	rows = core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + h1, 1}].n

@@ -21,16 +21,17 @@
 // delayed to its edge, so the scheduler wakes it with DelayThread's, every
 // waiter on one edge in the order they began to wait, and snapshots and a
 // failed load's undo carry or drop it with the thread. A handler that
-// calls one is stopped (th_wait_until).
+// calls one gets KE_ILLEGAL_CONTEXT, which is what retail's event flag wait
+// returns there, and goes on.
 //
 // 8 AddVblankHandler(edge, priority, handler, arg) and 9
 // DelVblankHandler(edge, handler) keep a list per edge, the start for edge 0
 // and the end for any other, in one table of VBL_HANDLERS entries. Retail's
 // table has 16, and its start takes two for the handlers that drive the
 // flag, which are not kept here. Each list runs lowest priority first, equal
-// ones in the order added. Add refuses a handler already on the edge's list
-// (KE_FOUND_HANDLER) and, with no entry free, KE_NO_MEMORY, a compat row
-// here; Del one not on it, KE_NOTFOUND_HANDLER. Both refuse a handler's call
+// ones in the order added. Add refuses, in retail's order, with no entry
+// free, KE_NO_MEMORY, a compat row here, then a handler already on the
+// edge's list (KE_FOUND_HANDLER); Del one not on it, KE_NOTFOUND_HANDLER. Both refuse a handler's call
 // (KE_ILLEGAL_CONTEXT), so a list changes during its run only by a
 // handler's own return: retail calls each with its arg and drops it on 0.
 //
@@ -91,12 +92,13 @@ vblank_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 8: // AddVblankHandler(edge, priority, handler, arg)
 		if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT), true}
 		h := Vbl_Handler{u32(r[4] != 0), i32(r[5]), r[6], r[7]}
-		if vbl_find(h.end, h.handler) >= 0 {return ke(KE_FOUND_HANDLER), true}
-		if !vbl_insert(h) {
+		if iop_vbl.n == VBL_HANDLERS {
 			core.compat_unknown(.Iop_Vblank_Intr, h.handler, sub = 1, pc = r[31])
 			fmt.eprintfln("iop: vblank handler at %x: no room", h.handler)
 			return ke(KE_NO_MEMORY), true
 		}
+		if vbl_find(h.end, h.handler) >= 0 {return ke(KE_FOUND_HANDLER), true}
+		_ = vbl_insert(h)
 		return KE_OK, true
 	case 9: // DelVblankHandler(edge, handler)
 		if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT), true}
@@ -105,6 +107,7 @@ vblank_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		vbl_remove(i)
 		return KE_OK, true
 	case 4, 5, 6, 7: // WaitVblankStart, WaitVblankEnd, WaitVblank, WaitNonVblank
+		if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT), true}
 		edge, set := vblank_wait_for(fno, r3000.state.cycles * IOP_EE_RATIO)
 		if set {return th_wait_until(0), true}
 		return th_wait_until((edge + IOP_EE_RATIO - 1) / IOP_EE_RATIO), true

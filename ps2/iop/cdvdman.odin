@@ -94,7 +94,7 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		}
 		cd_done(CD_FUNC_READ)
 		return 1, true
-	case 8: // sceCdGetError: none
+	case 8: // sceCdGetError: the error byte the last command stored; no command fails here, so 0, none
 		return 0, true
 	case 10: // sceCdSearchFile(sceCdlFILE *, name): sceCdLayerSearchFile on layer 0
 		return cd_search(a0, a1, 0), true
@@ -102,8 +102,8 @@ cdvdman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 0, true
 	case 12: // sceCdGetDiskType
 		return cd_disk_type(), true
-	case 13: // sceCdDiskReady(mode): 2, ready
-		return 2, true
+	case 13: // sceCdDiskReady(mode): mode 8, the drive's ready register as read; any other, 2, ready
+		return CD_READY_REG if a0 == 8 else 2, true
 	case 15: // sceCdStop: stops the disc, done here; 1, the command accepted
 		iop_cd.stopped = true
 		cd_done(CD_FUNC_STOP)
@@ -193,6 +193,11 @@ cd_done :: proc(code: u32) {
 cd_spin :: proc() {
 	iop_cd.stopped = false
 }
+
+// The drive's ready register as sceCdDiskReady mode 8 reads it: the ready
+// bit (0x40) set and the busy bit (0x80) clear, the two the other modes test.
+// The low bits are not modelled.
+CD_READY_REG :: 0x40
 
 // The drive's status, as CD_STAT_STOP and CD_STAT_PAUSE say.
 cd_status :: proc() -> u32 {

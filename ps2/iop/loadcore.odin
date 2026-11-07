@@ -49,8 +49,6 @@ IOP_START_STACK :: 0x2000
 
 KE_OK :: 0
 KE_ERROR :: -1
-KE_LIBRARY_FOUND :: -212
-KE_LIBRARY_NOTFOUND :: -213
 
 // What a start returns in its low 2 bits.
 RESIDENT_END :: 0
@@ -1010,7 +1008,6 @@ ke :: proc(e: i32) -> u32 {
 
 // Function fno of Sony library `name`, reading a0..a3; v0, or false when the
 // HLE lacks it. Numbers as the PS2SDK's export tables order them.
-@(private = "file")
 hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
 	a0, a1, a2 := r[4], r[5], r[6]
@@ -1049,7 +1046,7 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 					return KE_OK, true
 				}
 			}
-			return ke(KE_LIBRARY_NOTFOUND), true
+			return ke(KE_ERROR), true // retail's -1 for a table not registered
 		case 12: // QueryBootMode(mode): no boot-mode records
 			return 0, true
 		case 27: // SetRebootTimeLibraryHandlingMode
@@ -1057,9 +1054,12 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		}
 	case "intrman":
 		switch fno {
-		case 8, 9: // CpuDisableIntr, CpuEnableIntr: the HLE keeps no interrupt
-			// state (17 and 18 neither), so neither is ever already done; retail's
-			// KE_CPUDI for a second disable never comes back
+		case 8: // CpuDisableIntr: KE_CPUDI when they were off already
+			off := th_intr_off()
+			th_intr_set(true)
+			return off ? ke(KE_CPUDI) : KE_OK, true
+		case 9: // CpuEnableIntr
+			th_intr_set(false)
 			return KE_OK, true
 		case 6: // EnableIntr(irq): every line counts as enabled, as above
 			return KE_OK, true
@@ -1067,10 +1067,14 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 			// enabled, so res gets irq as retail gives an enabled line's
 			if a1 != 0 {w32(a1, a0)}
 			return KE_OK, true
-		case 17: // CpuSuspendIntr(int *state): no interrupts to hold off
-			if a0 != 0 {w32(a0, 0)}
-			return KE_OK, true
-		case 18: // CpuResumeIntr(state)
+		case 17: // CpuSuspendIntr(int *state): the old state stored whether
+			// or not they were on; KE_CPUDI when they were off already
+			off := th_intr_off()
+			if a0 != 0 {w32(a0, off ? 0 : INTR_ON_STATE)}
+			th_intr_set(true)
+			return off ? ke(KE_CPUDI) : KE_OK, true
+		case 18: // CpuResumeIntr(state): back to what state says
+			th_intr_set(a0 & INTR_ON_STATE != INTR_ON_STATE)
 			return KE_OK, true
 		case 23: // QueryIntrContext
 			return iop_query_intr_context(), true
@@ -1127,11 +1131,14 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 }
 
 // Registers the export table at `a` and patches the pending stubs it
-// satisfies; KE_LIBRARY_FOUND when a library of that name and major version
-// is registered.
+// satisfies. As retail, -1 for a null table or one without the export
+// magic, and -1 when a library of that name and major version is
+// registered. Retail lets a newer minor take the older one's importers
+// over; that is not done here, and it is -1 too.
 @(private = "file")
 lib_register :: proc(a: u32) -> u32 {
 	l := &iop_loader
+	if a == 0 || r32(a) != IRX_EXPORT_MAGIC {return ke(KE_ERROR)}
 	b := Iop_Lib {
 		version = u16(r32(a + 8)),
 		table   = a,
@@ -1139,7 +1146,7 @@ lib_register :: proc(a: u32) -> u32 {
 	}
 	(^[2]u32)(&b.name)^ = {r32(a + 12), r32(a + 16)}
 	name := lib_name(&b.name)
-	if _, dup := lib_find(name, b.version); dup {return ke(KE_LIBRARY_FOUND)}
+	if _, dup := lib_find(name, b.version); dup {return ke(KE_ERROR)}
 	for b.count < 256 && r32(a + 20 + 4 * b.count) != 0 {b.count += 1}
 	append(&l.libs, b)
 	failed_paths_retry()
