@@ -226,6 +226,7 @@ main :: proc() {
 	got, native_ran = run(LOOP, 3, 5)
 	check(same(got, want_loop) && native_ran, "loop put back whole not run native")
 
+	test_tail_call(tmp)
 	test_first_wins()
 	test_recomp(tmp)
 	test_switches(tmp)
@@ -236,7 +237,182 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads to the interpreter")
+	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; a callee's jr $ra to a label the caller or the callee put in $ra goes on there, and one past the caller returns; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads to the interpreter")
+}
+
+// A `j` out of a function (a tail call) when $ra holds a label of the
+// function itself: on the R3000 a `jr` is a plain jump, so the callee's
+// `jr $ra` goes on at that label (cpu.tail_call); with $ra the function's
+// own return address, the callee returns for it. v0 + 1 in the callee.
+@(private = "file")
+TAIL :: 0x80016000
+@(private = "file")
+TAIL_CALLEE :: TAIL + 0x100
+@(rodata, private = "file")
+CODE_TAIL := [?]u32 {
+	0x3c1f8001, // lui ra, 0x8001
+	0x37ff6010, // ori ra, ra, 0x6010 (LABEL)
+	0x08000000 | (TAIL_CALLEE >> 2) & 0x3ffffff, // j TAIL_CALLEE
+	0x00000000,
+	0x24420009, // LABEL: addiu v0, v0, 9
+	0x3c1f8000, // lui ra, 0x8000
+	0x37ff0ff0, // ori ra, ra, 0x0ff0 (RA)
+	0x03e00008, // jr ra
+	0x00000000,
+}
+// v0 = 2, then the callee: it returns for this function.
+@(private = "file")
+TAIL_RET :: TAIL + 0x80
+@(rodata, private = "file")
+CODE_TAIL_RET := [?]u32 {
+	0x24020002, // addiu v0, zero, 2
+	0x08000000 | (TAIL_CALLEE >> 2) & 0x3ffffff, // j TAIL_CALLEE
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_TAIL_CALLEE := [?]u32 {
+	0x24420001, // addiu v0, v0, 1
+	0x03e00008, // jr ra
+	0x00000000,
+}
+// CODE_TAIL with its `j` to TAIL_UNWIND, which returns for it: v0 + 1,
+// then $ra = RA and `jr ra`, compiled too (recompiled code returns on it).
+@(private = "file")
+TAIL_FOR :: TAIL + 0x40
+@(private = "file")
+TAIL_UNWIND :: TAIL_CALLEE + 0x40
+@(rodata, private = "file")
+CODE_TAIL_UNWIND := [?]u32 {
+	0x24420001, // addiu v0, v0, 1
+	0x3c1f8000, // lui ra, 0x8000
+	0x37ff0ff0, // ori ra, ra, 0x0ff0 (RA)
+	0x03e00008, // jr ra
+	0x00000000,
+}
+
+// $ra = 4 (not a return address), then a `j` to TAIL_JMP, which loads $ra
+// with LABEL itself (a longjmp) and `jr ra`, v0 = 1 in its delay slot: the
+// caller goes on at LABEL, where the callee's `jr` went, with v0 + 7.
+@(private = "file")
+TAIL_SET :: TAIL + 0xc0
+@(private = "file")
+TAIL_JMP :: TAIL_CALLEE + 0x80
+@(rodata, private = "file")
+CODE_TAIL_SET := [?]u32 {
+	0x241f0004, // addiu ra, zero, 4
+	0x08000000 | (TAIL_JMP >> 2) & 0x3ffffff, // j TAIL_JMP
+	0x00000000,
+	0x24420007, // LABEL: addiu v0, v0, 7
+	0x3c1f8000, // lui ra, 0x8000
+	0x37ff0ff0, // ori ra, ra, 0x0ff0 (RA)
+	0x03e00008, // jr ra
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_TAIL_JMP := [?]u32 {
+	0x3c1f8001, // lui ra, 0x8001
+	0x37ff0000 | (TAIL_SET + 0xc) & 0xffff, // ori ra, ra, LABEL
+	0x03e00008, // jr ra
+	0x24020001, // addiu v0, zero, 1
+}
+
+// Hand-written code that keeps $ra in memory and uses the register for
+// data: TAIL_OUTER calls TAIL_MID, which saves $ra at TAIL_SAVE, sets
+// $ra = 8 and jumps to TAIL_HOP; that sets $ra = 4 and jumps to TAIL_LOAD,
+// which loads $ra back and `jr ra`, v0 + 1 in its delay slot. That `jr`
+// goes to TAIL_OUTER past its call, not into TAIL_HOP or TAIL_MID: both
+// return, and TAIL_OUTER adds 100 once. v0 = 101. TAIL_HOP's frame_ret is
+// 8, the $ra TAIL_MID jumped with.
+@(private = "file")
+TAIL_OUTER :: TAIL + 0x200
+@(private = "file")
+TAIL_MID :: TAIL + 0x240
+@(private = "file")
+TAIL_HOP :: TAIL + 0x260
+@(private = "file")
+TAIL_LOAD :: TAIL + 0x280
+@(private = "file")
+TAIL_SAVE :: TAIL + 0x2c0
+@(rodata, private = "file")
+CODE_TAIL_OUTER := [?]u32 {
+	0x03e04021, // addu t0, ra, zero
+	0x0c000000 | (TAIL_MID >> 2) & 0x3ffffff, // jal TAIL_MID
+	0x00000000,
+	0x24420064, // addiu v0, v0, 100
+	0x01000008, // jr t0
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_TAIL_MID := [?]u32 {
+	0x3c018001, // lui at, 0x8001
+	0xac3f0000 | TAIL_SAVE & 0xffff, // sw ra, TAIL_SAVE(at)
+	0x241f0008, // addiu ra, zero, 8
+	0x08000000 | (TAIL_HOP >> 2) & 0x3ffffff, // j TAIL_HOP
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_TAIL_HOP := [?]u32 {
+	0x241f0004, // addiu ra, zero, 4
+	0x08000000 | (TAIL_LOAD >> 2) & 0x3ffffff, // j TAIL_LOAD
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_TAIL_LOAD := [?]u32 {
+	0x3c018001, // lui at, 0x8001
+	0x8c3f0000 | TAIL_SAVE & 0xffff, // lw ra, TAIL_SAVE(at)
+	0x00000000,
+	0x03e00008, // jr ra
+	0x24420001, // addiu v0, v0, 1
+}
+
+@(private = "file")
+test_tail_call :: proc(tmp: string) {
+	tail, tail_ret, callee := CODE_TAIL, CODE_TAIL_RET, CODE_TAIL_CALLEE
+	put(TAIL, tail[:])
+	put(TAIL_RET, tail_ret[:])
+	put(TAIL_CALLEE, callee[:])
+	want, native_ran := run(TAIL, 0, 0)
+	check(want.r[2] == 10 && !native_ran, fmt.tprintf("interpreted jump to a callee that goes on at a label: v0 %d, want 10", want.r[2]))
+	want_ret, _ := run(TAIL_RET, 0, 0)
+	check(want_ret.r[2] == 3, fmt.tprintf("interpreted tail call: v0 %d, want 3", want_ret.r[2]))
+	check(psx_native.load_learned(write(tmp, "tail.bin", blob({{TAIL, TAIL, tail[:]}, {TAIL_RET, TAIL_RET, tail_ret[:]}}))), "load the tail calls")
+	got: Regs
+	got, native_ran = run(TAIL, 0, 0)
+	check(native_ran, "learned jump to a callee not run")
+	check(same(got, want), fmt.tprintf("learned jump to a callee that goes on at a label: v0 %d, want %d", got.r[2], want.r[2]))
+	got, native_ran = run(TAIL_RET, 0, 0)
+	check(native_ran && same(got, want_ret), fmt.tprintf("learned tail call: v0 %d, want %d", got.r[2], want_ret.r[2]))
+
+	tail_for, unwind := CODE_TAIL, CODE_TAIL_UNWIND
+	tail_for[1] = 0x37ff0000 | (TAIL_FOR + 0x10) & 0xffff
+	tail_for[2] = 0x08000000 | (TAIL_UNWIND >> 2) & 0x3ffffff
+	put(TAIL_FOR, tail_for[:])
+	put(TAIL_UNWIND, unwind[:])
+	want_for, _ := run(TAIL_FOR, 0, 0)
+	check(want_for.r[2] == 1, fmt.tprintf("interpreted callee that returns for its caller: v0 %d, want 1", want_for.r[2]))
+	check(psx_native.load_learned(write(tmp, "tail_for.bin", blob({{TAIL_FOR, TAIL_FOR, tail_for[:]}, {TAIL_UNWIND, TAIL_UNWIND, unwind[:]}}))), "load the callee that returns for its caller")
+	got, native_ran = run(TAIL_FOR, 0, 0)
+	check(native_ran && same(got, want_for), fmt.tprintf("learned callee that returns for its caller: v0 %d, want %d", got.r[2], want_for.r[2]))
+
+	set, jmp := CODE_TAIL_SET, CODE_TAIL_JMP
+	put(TAIL_SET, set[:])
+	put(TAIL_JMP, jmp[:])
+	want_set, _ := run(TAIL_SET, 0, 0)
+	check(want_set.r[2] == 8, fmt.tprintf("interpreted callee that loads its own $ra: v0 %d, want 8", want_set.r[2]))
+	check(psx_native.load_learned(write(tmp, "tail_set.bin", blob({{TAIL_SET, TAIL_SET, set[:]}, {TAIL_JMP, TAIL_JMP, jmp[:]}}))), "load the callee that loads its own $ra")
+	got, native_ran = run(TAIL_SET, 0, 0)
+	check(native_ran && same(got, want_set), fmt.tprintf("learned callee that loads its own $ra: v0 %d, want %d", got.r[2], want_set.r[2]))
+
+	outer, mid, hop, load := CODE_TAIL_OUTER, CODE_TAIL_MID, CODE_TAIL_HOP, CODE_TAIL_LOAD
+	put(TAIL_OUTER, outer[:])
+	put(TAIL_MID, mid[:])
+	put(TAIL_HOP, hop[:])
+	put(TAIL_LOAD, load[:])
+	want_out, _ := run(TAIL_OUTER, 0, 0)
+	check(want_out.r[2] == 101, fmt.tprintf("interpreted callee that loads its caller's $ra: v0 %d, want 101", want_out.r[2]))
+	check(psx_native.load_learned(write(tmp, "tail_out.bin", blob({{TAIL_OUTER, TAIL_OUTER, outer[:]}, {TAIL_MID, TAIL_MID, mid[:]}, {TAIL_HOP, TAIL_HOP, hop[:]}, {TAIL_LOAD, TAIL_LOAD, load[:]}}))), "load the callee that loads its caller's $ra")
+	got, native_ran = run(TAIL_OUTER, 0, 0)
+	check(native_ran && same(got, want_out), fmt.tprintf("learned callee that loads its caller's $ra: v0 %d, want %d", got.r[2], want_out.r[2]))
 }
 
 // words at LOOP as one recompiled function.

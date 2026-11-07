@@ -209,6 +209,28 @@ call :: proc(addr: u32) {
 	call_slow(addr)
 }
 
+// A `j` (or a fall) from recompiled code in [start, end) to addr, which is
+// not one of its blocks. On the R3000 a `jr` is a plain jump: the callee's
+// `jr $ra` goes to the $ra it holds then, the $ra this code left in it or
+// one the callee loaded itself (a longjmp, or hand-written code that keeps
+// $ra in memory and uses the register for data). When that is a pc in this
+// code (code that set $ra to one of its own labels, then jumped: a loop
+// through a routine) the caller goes on there, and this returns that pc.
+// Else it returns 1 (never an aligned pc): the Return that follows runs.
+// frame_ret alone cannot tell a return: code that holds data in $ra and
+// jumps on sets the callee's frame_ret to that data, so a later `jr $ra`
+// back to the true caller matches no frame_ret on the way. A pc outside
+// this code goes on in a host frame under this one, so it returns. It
+// returns too when $ra is frame_ret (a true tail call; it may be a pc in
+// this code when the function called itself).
+tail_call :: proc(addr, start, end: u32) -> u32 {
+	e := state.r[31]
+	call(addr)
+	ra := state.r[31]
+	if e == frame_ret || ra == frame_ret || ra - start >= end - start {return 1}
+	return ra
+}
+
 @(private)
 resolve_overlay :: proc(addr: u32) -> ^Ovl_Entry {
 	list, ok := dispatch.overlay[addr]

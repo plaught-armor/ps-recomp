@@ -87,6 +87,8 @@ odin run tests/read_dir -collection:ps=.
 odin build tests/read_dir -collection:ps=. -target:wasi_wasm32 -out:read_dir.wasm
 node tests/read_dir/run.mjs read_dir.wasm
 odin run tests/psx_interp -collection:ps=.
+odin run tests/psx_jr -collection:ps=.
+odin run tests/psx_jr -collection:ps=. -define:PS_FLAT=true
 odin run tests/compat -collection:ps=.
 odin run tests/learn -collection:ps=.
 odin run tests/play -collection:ps=. -define:COMMIT=test
@@ -125,7 +127,7 @@ here.
 | `psx_cover` | Which R3000 encodings each PS1 backend does inline |
 | `psx_fallback` | The PS1 ways out of recompiled code and their counts |
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |
-| `psx_learned` | Learned PS1 runs compiled, run native only while RAM holds their code |
+| `psx_learned` | Learned PS1 runs compiled, run native only while RAM holds their code; a `j` out of one goes on at the label its callee's `jr $ra` jumps to when that lies in its own code, and returns when it does not |
 | `psx_flat_learn` | LEARN under FLAT (FLAT builds only): a run on the shadow stack when its flat run stops stays open across the stop and is written once when it returns, covering the words fetched on both sides, a store another thread made into it meanwhile marking it `.Smc`; a run from code a standalone blob left to the interpreter (an entry, or inside a range) not written; a run that never returns is written `.Open` at the report |
 | `iop_learned` | Learned IOP runs native only while IOP RAM holds their code, through host writes and snapshot loads |
 | `ee_learned` | Learned EE runs native, where no function is registered, only while RAM holds their code, through host and DMA writes and snapshot loads, one version per code at an entry; runs stored into or too large are not compiled |
@@ -137,6 +139,7 @@ here.
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |
 | `psx_interp` | The PS1 interpreter's jumps into the BIOS |
+| `psx_jr` | The PS1 `jr`, interpreted and under FLAT: a plain jump, only one to the run's return address returns; a `jr $ra` to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps |
 | `disc` | Disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image |
 | `host_frames` | Each host, headless, exits at FRAMES |
 | `data` | The user data directory and its cached native code |

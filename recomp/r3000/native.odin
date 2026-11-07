@@ -77,6 +77,7 @@ R3000_SIGS := [?]native.Sig {
 	{"cpu.rfe", 0, false},
 	{"cpu.bad_insn", 2, false},
 	{"cpu.call", 1, false},
+	{"cpu.tail_call", 3, true},
 	{"cpu.jump_unknown", 2, false},
 	{"cpu.trace_block", 1, false},
 	{"gte.gte_read", 1, true},
@@ -1028,6 +1029,20 @@ native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exa
 			leaves = true
 		case .Call:
 			call_imm(a, "cpu.call", s.target)
+		case .Tail_Call:
+			// 1: back at this function's return address, the Return
+			// that follows; else on at the pc in A, as a Goto_Reg
+			skip := native.new_label(a)
+			native.mov_imm(a, .A, s.target)
+			native.mov_imm(a, .B, f.start)
+			native.mov_imm(a, .C, f.end)
+			native.call(a, "cpu.tail_call", .A, .B, .C)
+			native.br_cmp_imm(a, .Eq, .A, 1, skip)
+			native.mov(a, .T, .A)
+			events(a)
+			if lookup < 0 {lookup = native.new_label(a)}
+			native.jmp(a, lookup)
+			native.bind(a, skip)
 		case .Branch:
 			branch_cond(a, s.i)
 			append(&ifs, -1)

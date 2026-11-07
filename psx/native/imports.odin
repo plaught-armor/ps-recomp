@@ -81,6 +81,7 @@ imports :: proc(types: ^map[string]typeid = nil) -> map[string]u64 {
 	f(&m, types, "cpu.rfe", cpu.rfe)
 	f(&m, types, "cpu.bad_insn", cpu.bad_insn)
 	f(&m, types, "cpu.call", cpu.call)
+	f(&m, types, "cpu.tail_call", cpu.tail_call)
 	f(&m, types, "cpu.jump_unknown", cpu.jump_unknown)
 	f(&m, types, "cpu.trace_block", cpu.trace_block)
 	m["gte.state"] = p(&gte.state)

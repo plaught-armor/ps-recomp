@@ -331,6 +331,12 @@ emit_func :: proc(f: ^Func, out: ^strings.Builder, name: string, patches: []Patc
 			put(out, depth, "continue")
 		case .Call:
 			put(out, depth, fmt.aprintf("cpu.call(%s)", hexu(s.target)))
+		case .Tail_Call:
+			put(out, depth, fmt.aprintf("if back := cpu.tail_call(%s, %s, %s); back != 1 {{", hexu(s.target), hexu(f.start), hexu(f.end)))
+			put(out, depth + 1, "pc = back")
+			put(out, depth + 1, "if c.cycles >= cpu.next_event {io.run_events()}")
+			put(out, depth + 1, "continue")
+			put(out, depth, "}")
 		case .Branch:
 			put(out, depth, "{")
 			put(out, depth, concat("t := ", branch_cond(s.i)))
