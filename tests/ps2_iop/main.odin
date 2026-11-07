@@ -120,8 +120,9 @@
 // restored, the markers' other cases; copy, erase, fill; an unknown
 // command, one row. The image made at the first write, each changed block
 // in place; nothing with host writes off. A save state restores the card,
-// not the image; a rollback rewind writes the image back. Not ready: a
-// stale push, no 0x2080, seq not counted. Images read in at init, one of
+// not the image; a rollback rewind writes the image back. A new card:
+// until 13 acknowledges it, 2, a stale push, no 0x2080, seq not counted;
+// then commands taken. Images read in at init, one of
 // the wrong size refused and kept.
 //
 // sdrdrv: a user command handler's slot, range and previous handler; an
@@ -7087,7 +7088,7 @@ mc2_all :: proc(b: []u8, x: u8) -> bool {return b != nil && slice.all_of(b, x)}
 
 // mc2_d on a raw card image in a temp dir: each command; the image made at
 // the first write and changed blocks written in place; ECC corrected on
-// read only; the backup blocks; not ready; snapshots and rollback; host
+// read only; the backup blocks; a new card until 13; snapshots and rollback; host
 // writes off; images read in, one of the wrong size refused.
 test_mc2 :: proc() {
 	A :: 0x00110000
@@ -7114,12 +7115,12 @@ test_mc2 :: proc() {
 	check(mc2_cmd(buf[:], 1, 4) == -0x17, "mc2: port 1, no card: unbound, -0x17")
 
 	// The status: A, then B, seq counting.
-	check(mc2_cmd(buf[:], 0, 4) == 2 && endian.unchecked_get_u32le(buf[8:]) == 0x2080, "mc2 4: 2, ready; 0x2080 at +8")
+	check(mc2_cmd(buf[:], 0, 4) == 2 && endian.unchecked_get_u32le(buf[8:]) == 0x2080, "mc2 4: 2, a new card; 0x2080 at +8")
 	seq, drv, res := mc2_status(A)
 	check(seq == 1 && drv == 2 && res == 2, "mc2 4: the status at A, seq 1, driver 2")
-	check(mc2_cmd(buf[:], 0, 12) == 2, "mc2 12: 2")
+	check(mc2_cmd(buf[:], 0, 13) == 1, "mc2 13: 1, the card acknowledged")
 	seq, drv, res = mc2_status(B)
-	check(seq == 2 && res == 2, "mc2 12: the status at B, seq 2")
+	check(seq == 2 && res == 1, "mc2 13: the status at B, seq 2")
 	check(mc2_cmd(buf[:], 0, 3) == 1, "mc2 3: 1")
 	seq, _, _ = mc2_status(A)
 	check(seq == 3 && slice.equal(mem.ram_slice(A + 0xc, 8), []u8{0, 2, 0x10, 0, 0, 0x40, 0, 0}), "mc2 3: the card's size in the extra bytes, at A")
@@ -7247,21 +7248,24 @@ test_mc2 :: proc() {
 	iop.mcraw_flush_all()
 	check(slice.equal(mc2_image(path0, 5), mc2_block(0, 5)), "mc2 rollback: block 5 back on the image")
 
-	// Not ready: no 0x2080, a stale push. The EE's status blocks came back
-	// with the snapshot, the driver's count did not (dbcman_snap is not in
-	// this test's snapshot): one command first.
-	mc2_cmd(buf[:], 0, 4)
-	seq, _, _ = mc2_status(A)
-	sb, _, _ := mc2_status(B)
-	check(mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 4) == 1, "mc2 13: 1; then 4: 1, not ready")
-	check(mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 0 && endian.unchecked_get_u32le(buf[8:]) == 0, "mc2 not ready: 1 refused, 0, no 0x2080")
+	// 13 again on an acknowledged card: 1, and 4 still 1.
+	check(mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 4) == 1, "mc2 13: 1; then 4: 1, acknowledged")
+
+	// A new card again (the driver as at boot): 4 answers 2, any command
+	// but 4 and 13 gets 2 with no 0x2080 and a stale push, until 13; then
+	// 4 answers 1 and the port takes commands.
+	iop.pad_init()
+	check(mc2_socket(buf[:], 2, A, B) == 0, "mc2 new card: socket 0 again")
+	check(mc2_cmd(buf[:], 0, 4) == 2, "mc2 new card: 4, 2")
+	check(mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 2 && endian.unchecked_get_u32le(buf[8:]) == 0, "mc2 new card: 1 refused, 2, no 0x2080")
+	check(mc2_cmd(buf[:], 0, 12) == 2 && endian.unchecked_get_u32le(buf[8:]) == 0, "mc2 new card: 12 refused too")
 	s1, _, r1 := mc2_status(A)
 	s2, _, r2 := mc2_status(B)
-	check(max(s1, s2) == max(seq, sb) + 2 && (r1 == 0 || r2 == 0), "mc2 not ready: the status pushed, seq not counted")
+	check(s1 == 1 && s2 == 1 && r1 == 2 && r2 == 2, "mc2 new card: the status pushed, seq not counted")
+	check(mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 4) == 1, "mc2 new card: 13, 1; then 4, 1")
+	check(mc2_cmd(buf[:], 0, 12) == 2 && mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 1 && endian.unchecked_get_u32le(buf[8:]) == 0x2080, "mc2 new card: after 13 the port re-armed, 12 2 and 1 taken")
 
 	// Parameters no command may act on: each gives 0 and changes nothing.
-	iop.pad_init()
-	check(mc2_socket(buf[:], 2, A, B) == 0, "mc2 edges: socket 0 again, ready")
 	check(mc2_cmd(buf[:], 0, 2, mc2_pages(0, 1), pat[:]) == 1 && iop.mcraw[0].blocks[0] != nil, "mc2 edges: block 0 written")
 	b0 := slice.clone(mc2_block(0, 0), context.temp_allocator)
 	edge :: proc(buf: []u8, cmd: u32, p: Mc2_P, data: []u8, b0: []u8) -> bool {
@@ -7360,10 +7364,10 @@ test_mc2 :: proc() {
 
 	// A destination past EE RAM: 0, nothing sent, no host fatal.
 	iop.pad_init()
-	check(mc2_socket(buf[:], 2, mem.RAM_SIZE - 0x1000, B) == 0, "mc2 edges: socket 0 at the end of EE RAM")
+	check(mc2_socket(buf[:], 2, mem.RAM_SIZE - 0x1000, B) == 0 && mc2_cmd(buf[:], 0, 13) == 1, "mc2 edges: socket 0 at the end of EE RAM, the card acknowledged")
 	check(mc2_cmd(buf[:], 0, 1, mc2_pages(0, 64)) == 0, "mc2 1: a count past EE RAM, 0")
 	iop.pad_init()
-	check(mc2_socket(buf[:], 2, 0x70000000, B) == 0 && mc2_cmd(buf[:], 0, 1, mc2_pages(0, 1)) == 0, "mc2 1: to the scratchpad, 0")
+	check(mc2_socket(buf[:], 2, 0x70000000, B) == 0 && mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 1, mc2_pages(0, 1)) == 0, "mc2 1: to the scratchpad, 0")
 
 	// Images read in: port 1's; port 0's of the wrong size refused.
 	img1 := make([]u8, iop.MCRAW_SIZE, context.temp_allocator)
@@ -7377,7 +7381,7 @@ test_mc2 :: proc() {
 	check(!iop.mcraw_present(0) && fi.size == 100, "mc2: an image of another size refused, no card, the file kept")
 	check(iop.mcraw_present(1) && iop.mcraw[1].blocks[7] != nil && mc2_all(mc2_block(1, 7), 0x5a) && iop.mcraw[1].blocks[6] == nil, "mc2: port 1's image read in, only blocks not erased held")
 	check(mc2_socket(buf[:], 2, A, B) == 0 && mc2_socket(buf[:], 3, A, B) == 1, "mc2: sockets again")
-	check(mc2_cmd(buf[:], 0, 4) == -0x17 && mc2_cmd(buf[:], 1, 4) == 2, "mc2: port 0 no card, unbound; port 1 ready")
+	check(mc2_cmd(buf[:], 0, 4) == -0x17 && mc2_cmd(buf[:], 1, 4) == 2, "mc2: port 0 no card, unbound; port 1 a new card")
 
 	check(os.remove(path0) == nil && os.remove(path1) == nil, "mc2: images removed")
 	iop.mcraw_init()
