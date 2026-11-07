@@ -87,6 +87,12 @@ compile_learned :: proc(cpu: core.Learn_Cpu, records, out: string) -> int {
 		funcs := make([]r3000.Learned, len(runs))
 		for r, k in runs {funcs[k] = {r.entry, r.lo, r.words}}
 		// The IOP's accesses see the block's start (psx/cpu/interp.odin).
+		// The IOP keeps k=0 on two switches that must agree: exact here and
+		// learn_cpu == .Iop in psx/cpu access_cycles. Its exact charging
+		// would also need ps2/iop/thread.odin:346, which sets
+		// r3000.state.cycles = w on an idle wait from inside a run, to stop
+		// doing so: a set, not a sum or a max, breaks adding the block's
+		// cycles for an access and taking them off after it.
 		blob = r3000.learned_blob(funcs, arch, exact = cpu != .Iop)
 	}
 	if werr := os.write_entire_file(out, blob); werr != nil {

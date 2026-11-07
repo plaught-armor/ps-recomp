@@ -36,6 +36,8 @@ odin run tests/psx_cover -collection:ps=.
 odin run tests/psx_timer -collection:ps=.
 odin run tests/psx_access_cycles -collection:ps=.
 odin run tests/psx_access_cycles -collection:ps=. -define:PS_FLAT=true
+odin build tests/psx_access_cycles -collection:ps=. -target:wasi_wasm32 -extra-linker-flags:"--export-table --growable-table" -out:psx_access_cycles.wasm
+node tests/psx_access_cycles/run.mjs psx_access_cycles.wasm
 odin run tests/psx_gpu_upload -collection:ps=.
 odin run tests/ps2_kernel -collection:ps=.
 odin run tests/ps2_iop -collection:ps=.
@@ -114,7 +116,7 @@ here.
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
-| `psx_access_cycles` | The cycles a PS1 load or store off RAM sees, interpreted and learned alike, in the coroutine model and under FLAT: every instruction before it and its own, right after a label the block before falls into, in a delay slot, and as a load and the instruction after it |
+| `psx_access_cycles` | The cycles a PS1 load or store off RAM, an mtc0 to SR and a syscall see, interpreted and learned alike, in the coroutine model, under FLAT and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer, interpreted only: the r3000 has no wasm32 import signatures, so no PS1 wasm32 blob yet): every instruction before it and its own, right after a label the block before falls into, in a delay slot, and as a load and the instruction after it |
 | `psx_gpu_upload` | VRAM uploads a run at a time, as a pixel at a time: row wrap, a dropped half word, mask bits |
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |
@@ -176,7 +178,10 @@ them natively. A cold run spends its time in the interpreter on code the
 next run will not interpret, so a speed compared from cold runs measures
 how much each side interprets, not its code. Learned code and the
 interpreter see the same cycles at every access (psx/cpu/interp.odin), so
-a warm run and a cold one of a PS1 disc play the same.
+a warm run and a cold one of a PS1 disc play the same. The one exception
+is a fused lwl/lwr or swl/swr pair, which learned code charges at its
+first word for both halves: it shows only off RAM, on ROM (constant) or
+I/O (no game reads a timer unaligned).
 
 ### Press scripts with conditions
 

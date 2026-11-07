@@ -22,6 +22,11 @@
 //     a later event (the BIOS's wait), so taking them off leaves what a
 //     charge at the block's end adds back. The IOP's accesses see the
 //     cycles of the block's start, as the PS2's learned IOP code does.
+//     One known difference: learned, static and Odin-source code fuse an
+//     lwl/lwr or swl/swr pair and charge both halves at the first word's
+//     count, where this charges the first then the second's. Only an
+//     access off RAM could tell, which is I/O or ROM: ROM is constant, and
+//     an unaligned read of an I/O timer is not something a game does.
 //   - due events run on entry, on a taken branch or jump back (its target
 //     at or before it) and on a jump through a register other than $ra.
 //     Every loop has such a jump or a call, and a call's callee checks on
@@ -171,18 +176,13 @@ interp_exec :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 			core.learn_store(st.learn, addr)
 		}
 	}
-	ahead: u64 // the cycles this access sees beyond state.cycles
-	switch w >> 26 {
-	case 0x10, 0x20 ..= 0x2e, 0x32, 0x3a:
-		ahead = access_cycles(pending)
-	case 0x00:
-		if w & 0x3f == 0x0c {ahead = access_cycles(pending)} // syscall
-	}
-	state.cycles += ahead
-	defer state.cycles -= ahead
+	// What a load or a store off RAM sees beyond state.cycles goes to the
+	// bus as k, which only its slow path adds (bus.odin load_slow): the
+	// interpreters run every instruction through here, and RAM hits are most
+	// of the accesses.
 	switch w >> 26 {
 	case 0x00:
-		interp_special(st, pc, w)
+		interp_special(st, pc, w, pending)
 	case 0x01:
 		interp_regimm(st, pc, w)
 	case 0x02:
@@ -214,46 +214,49 @@ interp_exec :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	case 0x0f:
 		r[rt] = w << 16
 	case 0x10:
+		ahead := access_cycles(pending)
+		state.cycles += ahead
 		interp_cop0(pc, w)
+		state.cycles -= ahead
 	case 0x12:
 		interp_cop2(pc, w)
 	case 0x20:
-		r[rt] = lb(addr)
+		r[rt] = lb(addr, access_cycles(pending))
 	case 0x21:
-		r[rt] = lh(addr)
+		r[rt] = lh(addr, access_cycles(pending))
 	case 0x22:
-		r[rt] = lwl(addr, r[rt])
+		r[rt] = lwl(addr, r[rt], access_cycles(pending))
 	case 0x23:
-		r[rt] = lw(addr)
+		r[rt] = lw(addr, access_cycles(pending))
 	case 0x24:
-		r[rt] = lbu(addr)
+		r[rt] = lbu(addr, access_cycles(pending))
 	case 0x25:
-		r[rt] = lhu(addr)
+		r[rt] = lhu(addr, access_cycles(pending))
 	case 0x26:
-		r[rt] = lwr(addr, r[rt])
+		r[rt] = lwr(addr, r[rt], access_cycles(pending))
 	case 0x28:
-		sb(addr, r[rt])
+		sb(addr, r[rt], access_cycles(pending))
 	case 0x29:
-		sh(addr, r[rt])
+		sh(addr, r[rt], access_cycles(pending))
 	case 0x2a:
-		swl(addr, r[rt])
+		swl(addr, r[rt], access_cycles(pending))
 	case 0x2b:
-		sw(addr, r[rt])
+		sw(addr, r[rt], access_cycles(pending))
 	case 0x2e:
-		swr(addr, r[rt])
+		swr(addr, r[rt], access_cycles(pending))
 	case 0x32:
 		if gte_write == nil {bad_insn(pc, w); return}
-		gte_write(rt, lw(addr))
+		gte_write(rt, lw(addr, access_cycles(pending)))
 	case 0x3a:
 		if gte_read == nil {bad_insn(pc, w); return}
-		sw(addr, gte_read(rt))
+		sw(addr, gte_read(rt), access_cycles(pending))
 	case:
 		bad_insn(pc, w)
 	}
 }
 
 @(private)
-interp_special :: proc(st: ^Interp, pc, w: u32) {
+interp_special :: proc(st: ^Interp, pc, w: u32, pending: u64) {
 	r := &state.r
 	rs := (w >> 21) & 31
 	rt := (w >> 16) & 31
@@ -287,7 +290,10 @@ interp_special :: proc(st: ^Interp, pc, w: u32) {
 		branch(st, false, 0)
 		call(t)
 	case 0x0c:
+		ahead := access_cycles(pending)
+		state.cycles += ahead
 		syscall(pc)
+		state.cycles -= ahead
 	case 0x0d:
 		brk(pc, (w >> 6) & 0xfffff)
 	case 0x10:
