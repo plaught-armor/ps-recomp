@@ -256,6 +256,15 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		v, end := iop_strtol(a0, a2)
 		if a1 != 0 {w32(a1, end)}
 		return u32(v), true
+	case 41: // wmemset(dst, word, n): dst; n/4 words of `word`, n's low 2 bits dropped
+		// The kernel stores words: an unaligned dst faults there, here it is
+		// written as given with a row.
+		if a0 & 3 != 0 {core.compat_unknown(.Iop_Call, core.compat_name("sysclib"), fno, pc = r[31])}
+		dst := ram_w(a0, a2)
+		for i := 0; i + 4 <= len(dst); i += 4 {
+			dst[i], dst[i + 1], dst[i + 2], dst[i + 3] = u8(a1), u8(a1 >> 8), u8(a1 >> 16), u8(a1 >> 24)
+		}
+		return a0, true
 	}
 	return 0, false
 }

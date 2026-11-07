@@ -609,8 +609,8 @@ start_drop :: proc(i: int, why: string) {
 		mine := b.owner == f.thid || b.addr == m.base || m.argv != 0 && b.addr == m.argv
 		if mine && !(cur != nil && cur.id != f.thid && sys_in({b}, cur.stack)) {append(&freed, b)}
 	}
-	if h, st := drop_dangling(freed[:], m); h + st > 0 {
-		fmt.eprintfln("iop: \"%s\" dropped with %d handlers and %d stubs of other modules into its memory, kept as on retail", name, h, st)
+	if h, st, nl := drop_dangling(freed[:], m); h + st + nl > 0 {
+		fmt.eprintfln("iop: \"%s\" dropped with %d handlers and %d stubs of other modules into its memory, kept as on retail, and %d libraries of its own, removed", name, h, st, nl)
 	}
 	th_kill_in(freed[:], f.thid)
 	rpc_drop_in(freed[:])
@@ -627,8 +627,9 @@ start_drop :: proc(i: int, why: string) {
 // libsd, sdrdrv, vblank and cdvdman by their address, and stubs of modules
 // other than `m` patched to jump there. Retail modload unlinks only the
 // module's own imports (UnLinkLibraryEntries) and releases neither, so both
-// stay; a later crash through one points here.
-drop_dangling :: proc(freed: []Sys_Block, m: Iop_Module) -> (handlers, stubs: int) {
+// stay; a later crash through one points here. `libs` counts the libraries
+// `m` registered, which module_drop removes.
+drop_dangling :: proc(freed: []Sys_Block, m: Iop_Module) -> (handlers, stubs, libs: int) {
 	in_f :: proc(freed: []Sys_Block, a: u32) -> int {return 1 if a != 0 && sys_in(freed, a) else 0}
 	for t in iop_timr.t {handlers += in_f(freed, t.handler)}
 	for a in iop_timr.alarms[:iop_timr.nalarm] {handlers += in_f(freed, a.handler)}
@@ -641,6 +642,7 @@ drop_dangling :: proc(freed: []Sys_Block, m: Iop_Module) -> (handlers, stubs: in
 	for h in iop_sdr.user {handlers += in_f(freed, h)}
 	for x in iop_vbl.h[:iop_vbl.n] {handlers += in_f(freed, x.handler)}
 	handlers += in_f(freed, iop_cd.callback)
+	for x in iop_loader.libs {libs += 1 if x.owner == m.id else 0}
 	// A linked stub is `j export; nop` (link_stub); no module's own code
 	// jumps into another's image.
 	for o in iop_loader.modules {

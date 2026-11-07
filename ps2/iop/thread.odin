@@ -1018,14 +1018,14 @@ th_refer :: proc(id, info: u32) -> u32 {
 // those served here, and which of them are its i-variants.
 @(rodata)
 TH_CHECKED := [Th_Lib]Fno_Set {
-	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 19, 20, 22, 24, 25, 26, 27, 33, 35},
+	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 19, 20, 22, 24, 25, 26, 27, 33, 35, 36, 37, 38},
 	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
 	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
 	.Msgbx = {4, 6, 9},
 }
 @(rodata)
 TH_IVAR := [Th_Lib]Fno_Set {
-	.Base  = {11, 19, 26},
+	.Base  = {11, 19, 26, 36, 38},
 	.Semap = {7, 12},
 	.Event = {7, 9, 14},
 	.Msgbx = {},
@@ -1180,8 +1180,10 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		w32(a1, u32(c / IOP_CLOCK))
 		w32(a2, u32(c % IOP_CLOCK * 1_000_000 / IOP_CLOCK))
 		return KE_OK, true
-	case 35: // SetAlarm(iop_sys_clock_t *, handler, arg)
+	case 35, 36: // SetAlarm, iSetAlarm(iop_sys_clock_t *, handler, arg)
 		return alarm_set(a0, a1, a2), true
+	case 37, 38: // CancelAlarm, iCancelAlarm(handler, arg)
+		return alarm_cancel(a0, a1), true
 	case 43: // GetSystemTimeLow: the system clock's low 32 bits, as 34 gives them
 		return u32(r3000.state.cycles), true
 	}

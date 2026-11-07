@@ -971,12 +971,15 @@ test_modload :: proc() {
 	// timer handler and pldt's words 3 and 4 made a linked stub, `j; nop`.
 	gone := iop.sys_alloc(.High, 0x100)
 	freed := []iop.Sys_Block{{addr = gone, size = 0x100}}
-	h0, s0 := iop.drop_dangling(freed, {})
+	GONE_ID :: 0x7777
+	h0, s0, n0 := iop.drop_dangling(freed, {id = GONE_ID})
 	iop.iop_timr.t[0].handler = gone + 8
 	iop.iop_u32(d + 12)^ = 0x08000000 | (gone + 16) >> 2 & 0x3ffffff
 	iop.iop_u32(d + 16)^ = 0
-	h1, s1 := iop.drop_dangling(freed, {})
-	check(h0 == 0 && s0 == 0 && h1 == 1 && s1 == 1, fmt.tprintf("modload: a drop counts the handler and the stub into its memory (%d %d, %d %d)", h0, s0, h1, s1))
+	append(&l.libs, iop.Iop_Lib{owner = GONE_ID})
+	h1, s1, n1 := iop.drop_dangling(freed, {id = GONE_ID})
+	pop(&l.libs)
+	check(h0 == 0 && s0 == 0 && n0 == 0 && h1 == 1 && s1 == 1 && n1 == 1, fmt.tprintf("modload: a drop counts the handler and the stub into its memory and its own library (%d %d %d, %d %d %d)", h0, s0, n0, h1, s1, n1))
 	iop.iop_timr.t[0].handler = 0
 	iop.sys_free(gone)
 }
@@ -1496,6 +1499,19 @@ test_sysclib :: proc() {
 	put_str(A, "%*d")
 	check(call(19, TOP - 0x10000, A, 0x7fffffff, 5) == 0x7fffffff, "sysclib: sprintf with width 0x7fffffff returns the count")
 	check(ram[TOP - 1] == ' ' && ram[TOP - 0x10000] == ' ', "sysclib: sprintf with width 0x7fffffff stops at RAM's end")
+
+	// wmemset: n/4 words of the word, n's low 2 bits dropped, dst returned;
+	// an unaligned dst a row; a run to RAM's end.
+	for &c in ram[A:][:12] {c = 7}
+	check(call(41, A, 0x11223344, 11) == A, "sysclib: wmemset returns dst")
+	check(ram[A] == 0x44 && ram[A + 3] == 0x11 && ram[A + 4] == 0x44 && ram[A + 7] == 0x11 && ram[A + 8] == 7, "sysclib: wmemset writes n/4 words, little-endian")
+	call(41, A + 8, 0, 3)
+	check(ram[A + 8] == 7, "sysclib: wmemset of n < 4 writes none")
+	wk := core.Compat_Key{.Iop_Call, core.compat_name("sysclib"), 41}
+	check(core.compat.calls[wk].n == 0 && call(41, A + 2, 0, 4) == A + 2 && core.compat.calls[wk].n == 1, "sysclib: an unaligned wmemset is a row")
+	ram[TOP - 1] = 9
+	call(41, TOP - 4, 0x01020304, 100)
+	check(ram[TOP - 4] == 4 && ram[TOP - 1] == 1, "sysclib: wmemset stops at RAM's end")
 }
 
 // A Sony import of another major version is not served; another minor is.
@@ -5775,7 +5791,7 @@ snap8_loaded: bool // not emulated state
 snap7: core.Snapshot
 snap7_loaded: bool // not emulated state
 
-TIMR_FNOS := [?]u32{4, 6, 20, 22, 23, 24}
+TIMR_FNOS := [?]u32{4, 6, 10, 20, 22, 23, 24}
 
 // timrman's ids: the timer's number from 1 in the top 4 bits, its base.
 TIMER0 :: 0x1bf80110
@@ -5896,6 +5912,28 @@ test_timrman :: proc() {
 	tm(t, 23, TIMER2)
 	check(iop.tim_next_ee() == (cur + 0x10000 * 8) * 8, "timrman: compare 0 counts the full 16 bits")
 	tm(t, 24, TIMER2)
+
+	// GetTimerCounter: counts of the prescale since the start, restarting at
+	// the compare with a handler, wrapping at the width without; held when
+	// stopped; an id past the six is 0 with a row.
+	tm(t, 20, TIMER5, 1000, b + h, 0)
+	cur = r3000.state.cycles
+	tm(t, 23, TIMER5)
+	r3000.state.cycles = cur + 250
+	check(tm(t, 10, TIMER5) == 250, "timrman: the counter since the start")
+	r3000.state.cycles = cur + 1250
+	check(tm(t, 10, TIMER5) == 250, "timrman: the counter restarts at the compare")
+	tm(t, 24, TIMER5)
+	r3000.state.cycles = cur + 1600
+	check(tm(t, 10, TIMER5) == 250, "timrman: a stopped counter holds")
+	tm(t, 20, TIMER2, 0, 0, 0)
+	cur = r3000.state.cycles
+	tm(t, 23, TIMER2)
+	r3000.state.cycles = cur + 8 * 0x10005 + 7
+	check(tm(t, 10, TIMER2) == 5, "timrman: a counter without a handler wraps at 16 bits, by the prescale")
+	tm(t, 24, TIMER2)
+	ck := core.Compat_Key{.Iop_Call, core.compat_name("timrman"), 10}
+	check(tm(t, 10, 0x0bf80000) == 0 && core.compat.calls[ck].n == 1, "timrman: GetTimerCounter of no timer is 0, a row")
 
 	// Another source: set up and started, never fires, a row.
 	t0 := tm(t, 4, 2, 16, 1)
@@ -6038,6 +6076,21 @@ test_alarm :: proc() {
 	saved := x^
 	iop.tim_undo(saved, {{b, at(&a), 0}})
 	check(x.nalarm == 1 && x.alarms[0].handler == 0x1000, "alarm: a failed load's undo ends the alarms of the memory it frees")
+
+	// iSetAlarm and iCancelAlarm in a handler only, CancelAlarm on a thread
+	// only; a cancel finds handler and argument both, else -105.
+	iop.iop_u32(clock)^ = 1000
+	check(tb_call(36, clock, b + h, 0x77) == neg(-iop.KE_ILLEGAL_CONTEXT) && x.nalarm == 1, "alarm: iSetAlarm on a thread is illegal")
+	iop.iop_sched.intr = true
+	check(tb_call(36, clock, b + h, 0x77) == 0 && x.nalarm == 2 && x.alarms[1].arg == 0x77, "alarm: iSetAlarm in a handler")
+	check(tb_call(37, b + h, 0x77) == neg(-iop.KE_ILLEGAL_CONTEXT) && x.nalarm == 2, "alarm: CancelAlarm in a handler is illegal")
+	check(tb_call(38, b + h, 0x78) == neg(105) && tb_call(38, 0x1000, 0x77) == neg(105) && x.nalarm == 2, "alarm: iCancelAlarm needs handler and argument both")
+	check(tb_call(38, 0x1000, 0x2000) == 0 && x.nalarm == 1 && x.alarms[0].arg == 0x77, "alarm: iCancelAlarm ends it")
+	check(tb_call(38, 0x1000, 0x2000) == neg(105), "alarm: a second cancel is -105")
+	iop.iop_sched.intr = false
+	check(tb_call(38, b + h, 0x77) == neg(-iop.KE_ILLEGAL_CONTEXT) && x.nalarm == 1, "alarm: iCancelAlarm on a thread is illegal")
+	check(tb_call(37, b + h, 0x77) == 0 && x.nalarm == 0 && iop.tim_next_ee() == max(u64), "alarm: CancelAlarm ends it, none due")
+	check(tb_call(37, b + h, 0x77) == neg(105), "alarm: CancelAlarm of none is -105")
 
 	fresh()
 	check(iop.iop_timr.nalarm == 0 && iop.tim_next_ee() == max(u64), "alarm: the loader's reset clears the alarms")

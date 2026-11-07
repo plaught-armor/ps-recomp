@@ -83,6 +83,8 @@ Iop_Timer :: struct {
 	arg:     u32,
 	scale:   u32, // IOP cycles per count: the prescale, 0 a source not timed
 	due:     u64, // the IOP cycle of the next compare, while armed
+	start:   u64, // the IOP cycle its counter was last 0, while running
+	count:   u32, // its counter when it stopped
 }
 
 // A thbase alarm: SetAlarm's handler and argument, due at an IOP cycle.
@@ -129,6 +131,13 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			tim_arm()
 		}
 		return KE_OK, true
+	case 10: // GetTimerCounter(id): the counter's register, read as the id's base names it, no check
+		i := (a0 >> 28) - 1
+		if i >= TIMR_N {
+			core.compat_unknown(.Iop_Call, core.compat_name("timrman"), fno, pc = r[31])
+			return 0, true
+		}
+		return tim_count(i), true
 	case 20: // SetTimerHandler(id, compare, handler, arg)
 		t := tim_find(a0)
 		if t == nil {return ke(KE_ILLEGAL_TIMERID), true}
@@ -175,7 +184,8 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if t.mode != 0 {return ke(KE_TIMER_BUSY), true}
 		if t.setup == 0 {return ke(KE_TIMER_NOT_SETUP), true}
 		t.mode = t.setup | u32(t.cmp)
-		t.due = r3000.state.cycles + tim_period(a0, t.compare)
+		t.start = r3000.state.cycles
+		t.due = t.start + tim_period(a0, t.compare)
 		tim_arm()
 		iop_wake_set()
 		return KE_OK, true
@@ -183,6 +193,7 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		t := tim_find(a0)
 		if t == nil {return ke(KE_ILLEGAL_TIMERID), true}
 		if t.mode == 0 {return ke(KE_TIMER_NOT_INUSE), true}
+		t.count = tim_count(u32(a0 >> 28) - 1)
 		t.mode = 0
 		tim_arm()
 		return KE_OK, true
@@ -215,6 +226,21 @@ tim_period :: proc(id, compare: u32) -> u64 {
 	if TIMR_HW[i].bits == 16 {c &= 0xffff}
 	if c == 0 {c = 1 << TIMR_HW[i].bits}
 	return c * u64(t.scale)
+}
+
+// Timer i's counter now: while it runs timed, its counts of `scale` cycles
+// since its start, restarting at each compare when its mode says so, else
+// wrapping at its width; stopped, or counting a source not timed here, the
+// count it stopped at.
+@(private = "file")
+tim_count :: proc(i: u32) -> u32 {
+	TIMR_RESET :: 0x08 // the counter restarts at its compare
+	t := &iop_timr.t[i]
+	if t.mode == 0 || t.scale == 0 {return t.count}
+	n := (r3000.state.cycles - t.start) / u64(t.scale)
+	wrap := u64(1) << TIMR_HW[i].bits
+	if t.mode & TIMR_RESET != 0 {wrap = tim_period(tim_id(i), t.compare) / u64(t.scale)}
+	return u32(n % wrap)
 }
 
 // Sets armed from the timers: running, timed, with a compare handler.
@@ -255,6 +281,20 @@ alarm_set :: proc(clock, handler, arg: u32) -> u32 {
 	alarm_add({handler = handler, arg = arg, due = r3000.state.cycles + (u64(hi) << 32 | u64(lo))})
 	iop_wake_set()
 	return KE_OK
+}
+
+// CancelAlarm(handler, arg): the alarm of handler and arg ended before it
+// comes; KE_NOTFOUND_HANDLER when none is set. An alarm whose handler is
+// running is off its list, so its handler cannot cancel it: its v0 decides.
+alarm_cancel :: proc(handler, arg: u32) -> u32 {
+	x := &iop_timr
+	for a, i in x.alarms[:x.nalarm] {
+		if a.handler != handler || a.arg != arg {continue}
+		alarm_remove(u32(i))
+		iop_wake_set()
+		return KE_OK
+	}
+	return ke(KE_NOTFOUND_HANDLER)
 }
 
 @(private = "file")
@@ -302,7 +342,12 @@ alarm_run :: proc() {
 		case .Call:
 			fmt.eprintfln("iop: alarm handler at %x stopped", a.handler)
 		}
-		if next == 0 || x.nalarm == ALARM_N {continue}
+		if next == 0 {continue}
+		if x.nalarm == ALARM_N {
+			// Retail's heap would take it; ALARM_N is this HLE's bound.
+			fmt.eprintfln("iop: alarm handler at %x ended, its re-add finding all %d alarms set", a.handler, ALARM_N)
+			continue
+		}
 		a.due += u64(max(next, ALARM_MIN))
 		alarm_add(a)
 	}
@@ -355,12 +400,18 @@ tim_intr :: proc(i: u32) {
 	case .Call:
 		fmt.eprintfln("iop: timer handler at %x stopped", handler)
 	}
-	if next == 0 || t.mode == 0 { // or the handler stopped it
+	if t.mode == 0 { // the handler stopped it
+		tim_arm()
+		return
+	}
+	if next == 0 {
+		t.count = tim_count(i)
 		t.mode = 0
 		tim_arm()
 		return
 	}
 	t.compare = next
+	t.start = t.due
 	t.due += tim_period(tim_id(i), next)
 }
 
