@@ -10,7 +10,8 @@
 // slot's global, the context last, as the Odin calling convention on
 // wasm32 passes it.
 //
-// A generated function has type (pc, ctx: i32) -> (). The Regs, the cached
+// A generated function has type (pc, ctx: i32) -> (), or (ctx: i32) -> ()
+// under Asm.ctx_only, where the pc is a plain local. The Regs, the cached
 // fields and the Vregs are locals. Wasm has no goto, so the operations
 // record items (code, label binds, branches) and the function is laid out
 // when it is done (wasm_finalize): a forward branch's label becomes the end
@@ -93,7 +94,11 @@ Wasm_Type :: struct {
 @(private = "file")
 L_PC :: 0
 @(private = "file")
-L_CTX :: 1
+L_CTX :: 1 // 0 under Asm.ctx_only, where L_PC is the first i32 local
+
+// The context's local.
+@(private = "file")
+wa_ctx :: #force_inline proc(a: ^Asm) -> int {return 0 if a.ctx_only else L_CTX}
 @(private = "file")
 L_REG :: 2 // A, B, C, T, LD
 @(private = "file")
@@ -684,6 +689,7 @@ wasm_state_add64 :: proc(a: ^Asm, off, v: u32, sub: bool) {
 }
 
 wasm_entry_pc :: proc(a: ^Asm, dst: Reg) {
+	assert(!a.ctx_only, "native: entry_pc in a ctx_only function")
 	wa_get(a, L_PC)
 	wa_set(a, wa_reg(dst))
 }
@@ -1200,7 +1206,7 @@ wasm_call :: proc(a: ^Asm, k: int, args: []Reg) {
 	params := [5]u8{I32, I32, I32, I32, I32}
 	t := wa_type(a, params[:sig.args + 1], I32 if sig.result else 0)
 	for r in args {wa_get(a, wa_reg(r))}
-	wa_get(a, L_CTX)
+	wa_get(a, wa_ctx(a))
 	wa_global(a, k)
 	emit8(a, OP_CALL_INDIRECT)
 	wa_uleb(&a.code, u64(t))
@@ -1209,8 +1215,8 @@ wasm_call :: proc(a: ^Asm, k: int, args: []Reg) {
 }
 
 wasm_call_func :: proc(a: ^Asm, l: Label) {
-	wa_i32(a, 0)
-	wa_get(a, L_CTX)
+	if !a.ctx_only {wa_i32(a, 0)}
+	wa_get(a, wa_ctx(a))
 	wa_call_label(a, l)
 }
 
@@ -1706,7 +1712,7 @@ wasm_finalize :: proc(a: ^Asm) {
 	body := &w.out
 	lo := len(body)
 	wa_uleb(body, 3)
-	append(body, 12, I32, 3, I64, 6, V128)
+	append(body, 13 if a.ctx_only else 12, I32, 3, I64, 6, V128)
 	if n_regions > 1 {
 		append(body, OP_LOOP, VOID)
 		for _ in 0 ..< n_regions {append(body, OP_BLOCK, VOID)}
@@ -1791,7 +1797,8 @@ wasm_finalize :: proc(a: ^Asm) {
 	assert(len(stack) == 0 && ci == len(w.calls), "native: wasm32 layout")
 	if n_regions > 1 {append(body, OP_END)} // the dispatch loop
 	append(body, OP_END)
-	append(&w.bodies, Wasm_Body{lo, len(body), wa_type(a, {I32, I32}, 0)})
+	params := [2]u8{I32, I32}
+	append(&w.bodies, Wasm_Body{lo, len(body), wa_type(a, params[:1 if a.ctx_only else 2], 0)})
 	st := &w.stats
 	fi := len(w.bodies) - 1
 	st.bodies += 1

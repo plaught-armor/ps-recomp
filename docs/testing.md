@@ -88,7 +88,7 @@ here.
 | `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading, the mod set in input records and replays, netplay HELLO checks, a full emulated heap ending the process (a child run) |
 | `native` | The machine-code emitter |
 | `ee_native` | EE instructions through the native backend against the interpreter |
-| `wasm_sigs` | Every runtime procedure native code imports (`ps2.native_imports`) has a signature in `r5900.EE_SIGS`, the signatures wasm32 code calls them with, each agrees with its procedure (Odin convention, argument count, a result or none, every argument and result fits one i32), and no signature lacks an import |
+| `wasm_sigs` | Every runtime procedure native code imports (`ps2.native_imports`, `psx_native.imports`) has a signature in `r5900.EE_SIGS` or `r3000.R3000_SIGS`, the signatures wasm32 code calls them with, each agrees with its procedure (Odin convention, argument count, a result or none, every argument and result fits one i32), and no signature lacks an import |
 | `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store, an INTC_STAT poll and two threads at one priority handing the EE back and forth with RotateThreadReadyQueue are skipped, and end the same when the other thread rotates at two sites in turn; a counter, a GIF_STAT poll and a timer poll are not |
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |
@@ -116,7 +116,7 @@ here.
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
-| `psx_access_cycles` | The cycles a PS1 load or store off RAM, an mtc0 to SR and a syscall see, interpreted and learned alike, in the coroutine model, under FLAT and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer, interpreted only: the r3000 has no wasm32 import signatures, so no PS1 wasm32 blob yet): every instruction before it and its own, right after a label the block before falls into, in a delay slot, and as a load and the instruction after it |
+| `psx_access_cycles` | The cycles a PS1 load or store off RAM, an mtc0 to SR and a syscall see, interpreted and learned alike, in the coroutine model, under FLAT and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer, the learned function as wasm32 code): every instruction before it and its own, right after a label the block before falls into, in a delay slot, and as a load and the instruction after it |
 | `psx_gpu_upload` | VRAM uploads a run at a time, as a pixel at a time: row wrap, a dropped half word, mask bits |
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |
