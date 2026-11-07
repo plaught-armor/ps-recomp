@@ -111,7 +111,7 @@ PORT_SETUP :: `#!/bin/sh
 # build/recomp.tsv is tools/recomp.tsv with the disc image local.tsv names,
 # the VU capture files it names that are still there and, for a PS1 disc,
 # the code the player learned (learn/psx.bin in the player's directory for
-# the disc, recorded with PS_LEARN=1) when there is any; recomp writes the
+# the disc, recorded as the game plays) when there is any; recomp writes the
 # game's code to port/src/rec from it, then port/build.sh builds
 # port/game. Both stay out of git. PS_RECOMP overrides the ps-recomp
 # checkout (default: the ps-recomp submodule).
@@ -630,8 +630,8 @@ export_readme :: proc(id: string, info: [Info]string, files: bit_set[Export_File
 			"The recompiler sees the disc's executable; code the game loads from\n" +
 			"other files as it runs stays interpreted. Play that code with the player\n" +
 			"recording what it interprets, then recompile:\n\n```sh\n" +
-			"PS_LEARN=1 play <your disc image>\nsh setup.sh\n```\n\n" +
-			"`PS_LEARN=1` records each run of code the player interprets in its\n" +
+			"play <your disc image>\nsh setup.sh\n```\n\n" +
+			"The player records each run of code it interprets in its\n" +
 			"directory for the disc, as `learn/psx.bin`; `setup.sh` gives that file to\n" +
 			"the recompiler, which adds it to `port/src/rec`. Only what was played is\n" +
 			"recorded: play through the parts of the game to cover. The file holds\n" +

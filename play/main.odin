@@ -23,9 +23,9 @@
 //
 // LEARN=1 records the code a game interprets in the disc's directory, a PS1
 // game's in learn/psx.bin and a PS2 game's in learn/ps2.bin (core/learn.odin;
-// a path records there instead). Without LEARN a PS2 game's IOP code is
-// recorded there all the same; LEARN=0 records nothing and runs no learned
-// code. While that file has records of the PS1, or
+// a path records there instead). Without LEARN a PS1 game's code and a PS2
+// game's IOP and EE code are recorded there all the same; LEARN=0 records
+// nothing and runs no learned code. While that file has records of the PS1, or
 // of the PS2's IOP, each run compacts it and runs native code for them:
 // compiled in a child (`play --learned <psx | iop> <records> <out>`) when the
 // stored learned blob is not for these records, this build and blob
@@ -411,12 +411,13 @@ play :: proc(image: string) -> int {
 		mods_native = mods_blob(dir, cnf.ps2, !compat_child(), 0)
 	}
 	mods_native_key = core.disc_path(dir, .Mods_Native_Key)
-	// LEARN=1 records every processor's runs; unset, a PS2 game's IOP,
-	// whose modules no recompiled code covers, and its EE, whose code the
-	// recompiler never saw (loaded at run time, or missed). A default that
-	// cannot open its records runs without them.
-	if learn_env == "1" || (learn_env == "" && cnf.ps2) {
-		cpus := ~core.Learn_Cpus{} if learn_env == "1" else {.Iop, .Ee}
+	// LEARN=1 records every processor's runs; unset, the code the
+	// recompiler never saw: a PS1 game's (overlays, loaded at run time), a
+	// PS2 game's IOP, whose modules no recompiled code covers, and its EE
+	// (loaded at run time, or missed). A default that cannot open its
+	// records runs without them.
+	if learn_env == "1" || learn_env == "" {
+		cpus := ~core.Learn_Cpus{} if learn_env == "1" else {.Iop, .Ee} if cnf.ps2 else {.Psx}
 		learn := core.disc_path(dir, .Learn)
 		opened := false
 		if err := os.make_directory_all(learn); err != nil && !(err == .Exist && os.is_dir(learn)) {

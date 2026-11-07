@@ -131,11 +131,12 @@ here.
 
 ## Compatibility runs
 
-`play --compat` runs each disc once. A PS2 disc's run records its I/O
-processor code and the EE code it interpreted (`learn/ps2.bin` in the
-disc's folder), as every PS2 run does by default; a later run, compat or
-not, compiles those records and runs that code natively, the EE's only
-while memory holds the code it was compiled from. The `learned` column
+`play --compat` runs each disc once. A run records the code it
+interpreted (`learn/psx.bin` in the disc's folder for a PS1 disc; for a
+PS2 disc its I/O processor code and its EE code, `learn/ps2.bin`), as
+every run does by default; a later run, compat or not, compiles those
+records and runs that code natively, a PS1 game's and the EE's only while
+memory holds the code it was compiled from. The `learned` column
 says whether a run had learned code, so a cold run (no records yet) and a
 warm one are told apart. Set `PS_LEARN=0` for a run with no learned code that records
 nothing.

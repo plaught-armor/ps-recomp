@@ -1230,7 +1230,7 @@ test_export :: proc() {
 	check(name, strings.contains(ps1_readme, "git -C ps-recomp checkout test\ngit add .\ngit commit -m "), "README does not pin ps-recomp to the player's commit and commit")
 	check(name, strings.contains(ps1_readme, "it needs the network"), "README does not say the submodule add needs the network")
 	check(name, strings.contains(ps1_readme, "as the player does: with `settings.tsv`, the player's"), "PS1 README does not name its settings.tsv")
-	check(name, strings.contains(ps1_readme, "PS_LEARN=1 play <your disc image>\nsh setup.sh\n"), "PS1 README has no LEARN step")
+	check(name, strings.contains(ps1_readme, "```sh\nplay <your disc image>\nsh setup.sh\n"), "PS1 README has no LEARN step")
 	clean(name, out1, files, forbidden)
 
 	out2, _ := filepath.join({tmp, "export_ps2_repo"}, context.temp_allocator)

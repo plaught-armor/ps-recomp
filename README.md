@@ -205,7 +205,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 | `PS_SCALE` | PS2 only. The window size, as a multiple of the console's resolution. 1 to 8. The default is 3. |
 | `PS_IRX` | PS2 only. By default, a game's own sound and input/output modules run on an emulated copy of the console's I/O processor. `0` turns that off: each module is answered as loaded, without running it. |
 | `PS_NATIVE` | `0` runs the game through the interpreter instead of as native code. Slower; for checking a bug. |
-| `PS_LEARN` | By default, a PS2 game's I/O processor code (its own modules, loaded from the disc) is recorded in the disc's folder as it runs, and later runs use native code compiled from it. `1` records the code every processor interprets. `0` records nothing and uses no learned code. |
+| `PS_LEARN` | By default, the code a game loads as it runs and the converter never saw (a PS1 game's interpreted code, such as its overlays; a PS2 game's I/O processor modules and interpreted EE code) is recorded in the disc's folder as it runs, and later runs use native code compiled from it. `1` records the code every processor interprets. `0` records nothing and uses no learned code. |
 | `PS_VU_CAPTURE` | PS2 only. By default, the game's vector unit microcode that has no native code yet is recorded in the disc's folder as it runs; it runs as native code later in the same run (once the recording has been quiet for a while) and in later runs, and a [port](docs/porting.md#vu-microcode) compiles it too. Each run adds to the record. `1` records all of it, with the vector units run through the interpreter, so the game is slower. `0` records nothing. |
 
 `PS_GPU`, `PS_SW`, `PS_SCALE`, `PS_IRX` and `PS_NATIVE` can also be set

@@ -362,14 +362,15 @@ while its overlay's first word (its id) is at its slot and its first words
 match. In `funcs`, an overlay's space is its file name less `.bin`.
 
 `learned` names a LEARN file: the code the player interpreted, recorded
-with `PS_LEARN=1` in the disc's directory as `learn/psx.bin`
+as it plays (by default, or with `PS_LEARN=1`) in the disc's directory as
+`learn/psx.bin`
 (core/learn.odin). Each run in it that never stored into its own code is
 recompiled into `lrn_NN` packages that `rec.register_learned` registers.
 A learned function runs only while RAM holds the words it was recompiled
 from, so it needs no knowledge of how the game loads its code, and code
 the player never ran stays interpreted. Recording covers what the run
-played: run the player with `PS_LEARN=1` through the parts of the game to
-cover, then recompile. The file holds the game's code, so keep it out of
+played: run the player through the parts of the game to cover, then
+recompile. The file holds the game's code, so keep it out of
 git. `learned.odin` is written with or without the option, registering
 nothing without it. When the player's learned blob is also loaded (psx.Boot
 `learned`), a function for the same code that the port recompiled wins.
