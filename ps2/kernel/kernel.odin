@@ -1048,6 +1048,7 @@ run_events :: proc() {
 		}
 		vblank_hook_host()
 		iop.pad_update()
+		iop.dbcman_vblank()
 		iop.fmod_vblank()
 		if cpu.debug != 0 && k.frame % 120 == 0 {dump_threads()}
 	}

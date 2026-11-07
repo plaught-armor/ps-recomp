@@ -91,6 +91,7 @@ pad_init :: proc() {
 	for &a in act_align {a = 0xff}
 	for &m in btn_mask {m = DS2_RESPONSE_ANALOG}
 	ds2_reset()
+	dbcman_init()
 }
 
 // The multitap is plugged in while more than one player is.
@@ -101,7 +102,7 @@ tap_present :: proc() -> bool {
 }
 
 // Player on a port and slot, or -1 for an empty socket.
-@(private = "file")
+@(private)
 pad_player :: proc(port, slot: u32) -> int {
 	if port != 0 {return -1}
 	if slot == 0 {return 0}
@@ -138,6 +139,32 @@ pad_update :: proc() {
 	}
 }
 
+// A player's poll bytes, as a DualShock 2 in its fullest mode sends them
+// after its ID: the buttons active low (byte 2 of the wire frame in the low
+// half), the sticks rx, ry, lx, ly, then the pressures in PRESSURE's order,
+// 0xff for a button held. Every pad interface reads the host input here.
+PAD_POLL_BYTES :: 6 + len(PRESSURE)
+
+@(private)
+pad_poll_bytes :: proc(player: int) -> (b: [PAD_POLL_BYTES]u8) {
+	for &x, k in b {x = pad_poll_byte(player, k)}
+	return
+}
+
+// Poll byte k alone, 0 past the last, for the wire pad, which sends one
+// byte at a time.
+@(private)
+pad_poll_byte :: proc(player, k: int) -> u8 {
+	p := &pads[player]
+	switch {
+	case k < 0: return 0
+	case k < 2: return u8(~transmute(u16)p.buttons >> (8 * uint(k)))
+	case k < 6: return p.axes[k - 2]
+	case k < PAD_POLL_BYTES: return 0xff if PRESSURE[k - 6] in p.buttons else 0
+	}
+	return 0
+}
+
 // An empty socket keeps its frame counter running with state 0
 // (disconnected), so a pad pulled out mid-game reads as gone. The mode the
 // mask sets decides the data: the buttons, then the sticks unless digital,
@@ -152,15 +179,15 @@ pad_fill :: proc(p: []u8, frame: u32, player: int, mask: u32) {
 		w32(p, PD_FRAME, frame)
 		return
 	}
-	pad := &pads[player]
 	mode := ds2_mask_mode(mask)
 	analog := mode != DS2_DIGITAL
+	poll := pad_poll_bytes(player)
 	d := p[PD_DATA:][:32]
 	d[0] = 0
 	d[1] = mode
-	w16(d, 2, ~transmute(u16)pad.buttons)
-	copy(d[4:8], pad.axes[:] if analog else []u8{0, 0, 0, 0})
-	for b, i in PRESSURE {d[8 + i] = 0xff if mode == DS2_DUALSHOCK2 && b in pad.buttons else 0}
+	copy(d[2:4], poll[0:2])
+	copy(d[4:8], poll[2:6] if analog else []u8{0, 0, 0, 0})
+	copy(d[8:20], poll[6:18] if mode == DS2_DUALSHOCK2 else []u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
 	// DualShock 2 motors: small (on/off) and large (8-bit speed).
 	copy(p[PD_ACT_DATA:][:8], []u8{1, 0, 0, 1, 1, 1, 1, 10})
 	w16(p, PD_MODE_TABLE + 0, 4)
@@ -281,4 +308,5 @@ pad_snap :: proc() {
 	core.snap_add(&mtap)
 	core.snap_add(&pad_frame)
 	core.snap_add(&ds2)
+	dbcman_snap()
 }

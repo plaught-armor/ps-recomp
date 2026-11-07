@@ -66,7 +66,8 @@ IOP_SONY := [?]string {
 	"thvpool", "thrdman", "vblank", "stdio", "sifman", "sifcmd", "secrman",
 	"loadfile", "modload", "ioman", "iomanx", "cdvdman", "cdvdfsv", "sio2man",
 	"padman", "mtapman", "mcman", "mcserv", "libsd", "sdrdrv", "usbd", "dev9",
-	"rmman", "siftool", "reboot", "eesync", "cdvdstm",
+	"rmman", "siftool", "reboot", "eesync", "cdvdstm", "dbcman", "sio2d",
+	"ds1o_d", "ds2u", "ds2u_d", "mc2_d",
 }
 
 Iop_Lib :: struct {
@@ -271,10 +272,10 @@ iop_sony :: proc(name: string) -> bool {
 }
 
 // Whether LOADFILE runs IRX file `data`: not when it is no IRX, nor a Sony
-// module by its name or by a library it exports.
+// module by its name (spaces around it ignored) or by a library it exports.
 iop_runs :: proc(data: []u8) -> bool {
 	x := irx_parse(data) or_return
-	if iop_sony(x.name) {return false}
+	if iop_sony(strings.trim_space(x.name)) {return false}
 	text := data[x.file_off:][:min(x.text_size, x.file_size)]
 	for &t in irx_tables(text, 0, context.temp_allocator) {
 		if !t.imports && iop_sony(lib_name(&t.name)) {return false}
@@ -691,7 +692,8 @@ modload_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 
 // LoadModuleBuffer: links the IRX image at `buf`, which the caller may free
 // once it returns, as a module not yet started; its id. A Sony module is not
-// run (iop_runs): IOP_SONY_ID. An image that failed before is refused
+// run (iop_runs): IOP_SONY_ID. A pad driver's name picks the one dbcman
+// serves (dbcman_module). An image that failed before is refused
 // (failed_refused); one whose link fails is a failed path.
 @(private = "file")
 module_buffer_load :: proc(buf: u32) -> u32 {
@@ -702,6 +704,7 @@ module_buffer_load :: proc(buf: u32) -> u32 {
 	x, ok := irx_parse(data)
 	if !ok {return ke(KE_ILLEGAL_OBJECT)}
 	data = data[:irx_extent(data, x)]
+	dbcman_module(strings.trim_space(x.name))
 	if !iop_runs(data) {return IOP_SONY_ID}
 	if x.name == "" {x.name = fmt.tprintf("irx@%x", buf)}
 	core.compat_code_load()

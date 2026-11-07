@@ -259,12 +259,5 @@ ds2_poll :: proc(i: int, tx: u8, motors := true) -> u8 {
 		case DS2_MOTOR_LARGE: p.large = tx
 		}
 	}
-	b := ~transmute(u16)p.buttons
-	switch i {
-	case 3: return u8(b)
-	case 4: return u8(b >> 8)
-	case 5 ..= 8: return p.axes[i - 5]
-	case 9 ..< 9 + len(PRESSURE): return 0xff if PRESSURE[i - 9] in p.buttons else 0
-	}
-	return 0
+	return pad_poll_byte(0, i - 3)
 }

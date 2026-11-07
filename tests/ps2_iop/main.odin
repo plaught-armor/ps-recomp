@@ -96,6 +96,15 @@
 // one, back to analog on Open. GetSlotMax is 4 once the multitap is open.
 // An unknown command is a row answered 0.
 //
+// dbcman: a pad socket on port 0 binds, its link flag 1 in the flag buffer
+// and its block at A and B by turns with the host input, a DualShock in
+// analog mode; pad port 1 and both card ports stay unbound, flag 0, so the
+// game sees no memory card. Each control function and each pad command
+// answers in its result word, with the errors for a bad or unbound socket, a
+// full table and a bad command word; the fast and large servers run a driver
+// call and skip one larger than their buffer; delete unbinds. The disc's
+// device modules are Sony ones, a trailing space in a name included.
+//
 // sdrdrv: a user command handler's slot, range and previous handler; an
 // EE RPC to a set slot is a row answered 0; snapshot, reset and undo.
 //
@@ -212,6 +221,7 @@ game :: proc(_: rawptr) {
 	test_sio2_stat()
 	test_ds2()
 	test_padman()
+	test_dbcman()
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
@@ -6581,4 +6591,152 @@ test_cdvd_poff :: proc() {
 	check(len(iop.sif.replies) == 0 && core.compat.calls[{.Sif_Rpc, POFF_SID, 1}].n == 0, "poff: fn 1 stays open, no RPC_END, no row")
 	send_pkt(iop.SIF_CMD_RPC_CALL, 3, 0, 0, 0, 2, 0, 0, 0, 0, sd)
 	check(call_ends(sd, 3) && core.compat.calls[{.Sif_Rpc, POFF_SID, 2}].n == 1, "poff: fn 2 is refused with a row and ends")
+}
+
+test_dbcman :: proc() {
+	fresh()
+	iop.pad_init()
+	defer iop.pad_init()
+	FLAGS :: 0x00100000
+	PAD_A :: 0x00100100
+	PAD_B :: 0x00100180
+	CARD_A :: 0x00100200
+	buf: [0x2090]u8
+	w := ([^]u32)(&buf)
+	r := ([^]i32)(&buf)
+	call :: proc(buf: []u8, fno: u32, words: ..u32) {
+		for &b in buf {b = 0}
+		w := ([^]u32)(raw_data(buf))
+		for x, i in words {w[i] = x}
+		iop.sif.servers[iop.DBC_SID](0x80000000 | fno, buf, 0x90)
+	}
+	create :: proc(buf: []u8, type, port, a, b: u32) -> i32 {
+		for &x in buf {x = 0}
+		w := ([^]u32)(raw_data(buf))
+		w[0], w[1], w[2], w[10], w[11] = 3, type, port, a, b
+		copy(buf[0x14:], "MC2S")
+		iop.sif.servers[iop.DBC_SID](0x80001301, buf, 0x90)
+		return ([^]i32)(raw_data(buf))[9]
+	}
+	// A pad command on socket `s`: cmd, the size word, then param words.
+	pad_cmd :: proc(buf: []u8, fno, s, cmd: u32, param: ..u32) -> i32 {
+		for &b in buf {b = 0}
+		w := ([^]u32)(raw_data(buf))
+		w[0], w[1] = s, cmd
+		for x, i in param {w[3 + i] = x}
+		iop.sif.servers[iop.DBC_SID if fno == 0 else fno](0x80001319 if fno == 0 else 0, buf, 0x90)
+		return ([^]i32)(raw_data(buf))[0x8c / 4]
+	}
+	flags := ([^]u32)(raw_data(mem.ram_slice(FLAGS, 64)))
+	for i in 0 ..< 16 {flags[i] = 0xee}
+
+	call(buf[:], 0x1363)
+	check(w[0] == 0x310, "dbcman 0x1363: version 0x310")
+	call(buf[:], 0x1304, 0x310, FLAGS)
+	check(w[0] == 1 && flags[0] == 0 && flags[15] == 0, "dbcman 0x1304: 1, the flags written at once, none bound")
+
+	// The game's sockets: pads on ports 0 and 1, cards on 2 and 3.
+	check(create(buf[:], 1, 0, PAD_A, PAD_B) == 0, "dbcman 0x1301: pad port 0, socket 0")
+	check(flags[0] == 1 && flags[1] == 0, "dbcman 0x1301: the flags written, socket 0 bound")
+	check(create(buf[:], 1, 1, 0, 0) == 1, "dbcman 0x1301: pad port 1, socket 1")
+	check(create(buf[:], 2, 2, CARD_A, CARD_A + 0x80) == 2 && create(buf[:], 2, 3, 0, 0) == 3, "dbcman 0x1301: card ports, sockets 2 and 3")
+	check(flags[0] == 1 && flags[1] == 0 && flags[2] == 0 && flags[3] == 0 && flags[4] == 0, "dbcman: only the port 0 pad bound; no card")
+	for _ in 4 ..< 16 {create(buf[:], 2, 9, 0, 0)}
+	check(create(buf[:], 1, 0, 0, 0) == -0x15, "dbcman 0x1301: a full table, -0x15")
+	for i in u32(4) ..< 16 {call(buf[:], 0x1302, i)}
+
+	call(buf[:], 0x1303, 0)
+	check(r[1] == 0, "dbcman 0x1303: socket 0 on driver 0")
+	call(buf[:], 0x1303, 2)
+	check(r[1] == -0xc, "dbcman 0x1303: a card socket unbound, -0xc")
+	call(buf[:], 0x1303, 9)
+	check(r[1] == -0x16, "dbcman 0x1303: a free socket, -0x16")
+	call(buf[:], 0x1317)
+	check(w[1] == 0, "dbcman 0x1317: 0")
+	call(buf[:], 0x131d, 0, 0, 2, 0, 0, 0)
+	check(r[1] == 0, "dbcman 0x131d: port 0's socket")
+	call(buf[:], 0x131d, 0, 0, 2, 0, 2, 0)
+	check(r[1] == -0xc, "dbcman 0x131d: no card driver connected, -0xc")
+
+	// Pad commands, on the control server's 0x1319 and 0x131a.
+	check(pad_cmd(buf[:], 0, 0, 0x0101800c) == 1 && w[2] == 1 && buf[0xc] == 1, "dbcman pad 0x0101800c: size 1, stable")
+	buf[0] = 0
+	check(pad_cmd(buf[:], 0, 0, 0x01020002) == 1 && w[2] == 4 && slice.equal(buf[0xc:][:4], []u8{0xff, 0xff, 0x0f, 0}), "dbcman pad 0x01020002: the 4 bytes after the poll bytes")
+	check(pad_cmd(buf[:], 0, 0, 0x01010002) == 1 && w[2] == 4 && w[3] == 0x73, "dbcman pad 0x01010002: the pad's id")
+	check(pad_cmd(buf[:], 0, 0, 0x01030002) == 1 && w[2] == 1 && buf[0xc] == 3, "dbcman pad 0x01030002: motors")
+	check(pad_cmd(buf[:], 0, 0, 0x0103400b, 1, 2, 0x00030180) == 1 && iop.pads[0].small == 0 && iop.pads[0].large == 0xc0, "dbcman pad 0x0103400b: both motors")
+	check(pad_cmd(buf[:], 0, 0, 0x0103400b, 1, 0, 0x01) == 1 && iop.pads[0].small == 1 && iop.pads[0].large == 0xc0, "dbcman pad 0x0103400b: the small motor")
+	check(pad_cmd(buf[:], 0, 0, 0x0103400b, 1, 1, 0x0240) == 1 && iop.pads[0].large == 0x40, "dbcman pad 0x0103400b: the large motor")
+	check(pad_cmd(buf[:], 0, 0, 0x0103400b, 1, 1, 0x0740) == -1, "dbcman pad 0x0103400b: a bad selector, -1")
+	check(pad_cmd(buf[:], 0, 0, 0x0103400b, 1, 0x10000) == -1, "dbcman pad 0x0103400b: an offset past the buffer, -1")
+	check(pad_cmd(buf[:], 0, 0, 0x0201800c) == -1, "dbcman pad: top byte not 1, -1")
+	check(pad_cmd(buf[:], 0, 0, 0x0104000c) == -2, "dbcman pad: a bad group, -2")
+	key := core.Compat_Key{.Sif_Rpc, iop.DBC_SID, 0x01010003}
+	clear(&core.compat.calls)
+	check(pad_cmd(buf[:], 0, 0, 0x01010003) == -3 && core.compat.calls[key].n == 1, "dbcman pad: an unknown sub command, a row, -3")
+	check(pad_cmd(buf[:], 0, 1, 0x0101800c) == -0x17, "dbcman pad: port 1 unbound, -0x17")
+	check(pad_cmd(buf[:], 0, 2, 0x0101800c) == -0x17, "dbcman: the card socket unbound, -0x17")
+	check(pad_cmd(buf[:], 0, 9, 0x0101800c) == -0x16, "dbcman: a free socket, -0x16")
+	for &b in buf {b = 0}
+	w[0], w[1] = 0, 0x0101800c
+	iop.sif.servers[iop.DBC_SID](0x8000131a, buf[:], 0x90)
+	check(r[0x8c / 4] == 1 && buf[0xc] == 1, "dbcman 0x131a: the same pad command")
+
+	// The fast servers and the large one; larger requests are not served.
+	check(pad_cmd(buf[:], iop.DBC_SID_FAST0, 0, 0x0101800c) == 1 && pad_cmd(buf[:], iop.DBC_SID_FAST1, 0, 0x0101800c) == 1, "dbcman 0x8000131e/f: a driver call")
+	for &b in buf {b = 0}
+	w[0], w[1] = 0, 0x0101800c
+	iop.sif.servers[iop.DBC_SID_FAST0](0, buf[:], 0x94)
+	check(w[0x8c / 4] == 0 && buf[0xc] == 0, "dbcman 0x8000131e: over 0x90 bytes, not served")
+	iop.sif.servers[iop.DBC_SID_BIG](0, buf[:], 0x2090)
+	check(r[0x208c / 4] == 1 && buf[0xc] == 1, "dbcman 0x8000131c: a driver call")
+	for &b in buf {b = 0}
+	w[0], w[1] = 0, 0x0101800c
+	iop.sif.servers[iop.DBC_SID_BIG](0, buf[:], 0x2094)
+	check(w[0x208c / 4] == 0, "dbcman 0x8000131c: over 0x2090 bytes, not served")
+
+	// Pad blocks: A, then B, with the host input; nothing at the card's A.
+	iop.pads[0].buttons = {.Cross}
+	iop.pads[0].axes = {1, 2, 3, 4}
+	a, b := mem.ram_slice(PAD_A, 0x80), mem.ram_slice(PAD_B, 0x80)
+	for &x in a {x = 0xee}
+	for &x in b {x = 0xee}
+	iop.dbcman_vblank()
+	poll := [6]u8{0xff, 0xbf, 1, 2, 3, 4}
+	check(slice.equal(a[:4], []u8{1, 10, 6, 4}) && endian.unchecked_get_u32le(a[4:]) == 1 && slice.equal(a[0x1c:][:10], []u8{0xff, 0xbf, 1, 2, 3, 4, 0xff, 0xff, 0x0f, 0}) && a[0x26] == 0 && endian.unchecked_get_u32le(a[0x7c:]) == 0 && b[0] == 0xee, "dbcman: frame 0's block at A")
+	iop.dbcman_vblank()
+	check(slice.equal(b[0x1c:][:6], poll[:]) && endian.unchecked_get_u32le(b[0x7c:]) == 1, "dbcman: frame 1's block at B")
+	check(mem.ram_slice(CARD_A, 1)[0] == 0, "dbcman: no card block")
+
+	// ds2u: DualShock 2 mode, the pressures after the 6 bytes, its own 4
+	// bytes; the counter starts over with the driver.
+	iop.dbcman_module("host0:modules/ds2u_x.irx")
+	check(pad_cmd(buf[:], 0, 0, 0x01010002) == 1 && w[3] == 0x73, "dbcman: another module's name, still ds1o_d")
+	iop.dbcman_module(`cdrom0:\MODULES\DS2U.IRX;1`)
+	check(pad_cmd(buf[:], 0, 0, 0x01010002) == 1 && w[3] == 0x79, "dbcman ds2u 0x01010002: id 0x79")
+	check(pad_cmd(buf[:], 0, 0, 0x01020002) == 1 && slice.equal(buf[0xc:][:4], []u8{0xff, 0xff, 0xff, 0xff}), "dbcman ds2u 0x01020002: its 4 bytes")
+	iop.dbcman_vblank()
+	press := [12]u8{6 = 0xff}
+	check(slice.equal(a[:4], []u8{1, 22, 18, 4}) && endian.unchecked_get_u32le(a[4:]) == 1 && slice.equal(a[0x1c:][:6], poll[:]) && slice.equal(a[0x22:][:12], press[:]) && slice.equal(a[0x2e:][:4], []u8{0xff, 0xff, 0xff, 0xff}) && a[0x32] == 0 && endian.unchecked_get_u32le(a[0x7c:]) == 0, "dbcman ds2u: frame 0's block at A, 18 poll bytes")
+	iop.dbcman_module("ds1o_d")
+	check(pad_cmd(buf[:], 0, 0, 0x01010002) == 1 && w[3] == 0x73, "dbcman: the module name ds1o_d")
+	// ds2u_d loaded on the IOP, as a loader module loads it: not run (id 2),
+	// and the pad served as ds2u.
+	fresh()
+	_, _, pw := run_pldm(mod_inner("ds2u_d", false, 0))
+	check(iop.iop_u32(pw)^ == 2 && pad_cmd(buf[:], 0, 0, 0x01010002) == 1 && w[3] == 0x79, "dbcman: ds2u_d from LoadModuleBuffer, not run, served as ds2u")
+	iop.dbcman_module("ds1o_d")
+
+	// Delete unbinds and writes the flags; the socket is free again.
+	call(buf[:], 0x1302, 0)
+	check(w[1] == 1 && flags[0] == 0, "dbcman 0x1302: 1, flag 0")
+	call(buf[:], 0x1302, 0)
+	check(r[1] == -0x16, "dbcman 0x1302: a free socket, -0x16")
+	check(create(buf[:], 1, 0, PAD_A, PAD_B) == 0 && flags[0] == 1, "dbcman: socket 0 again, bound")
+
+	clear(&core.compat.calls)
+	call(buf[:], 0x1315, 0)
+	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001315}].n == 1, "dbcman 0x1315: a row")
+
+	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
 }

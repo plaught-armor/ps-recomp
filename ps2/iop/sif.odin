@@ -110,6 +110,10 @@ sif_init :: proc() {
 	sif.servers[PADMAN_SID] = padman_server
 	sif.servers[PADMAN_SID_101] = padman_server_101
 	sif.servers[0x80000900] = mtap_server
+	sif.servers[DBC_SID] = dbcman_server
+	sif.servers[DBC_SID_BIG] = dbcman_big_server
+	sif.servers[DBC_SID_FAST0] = dbcman_fast_server
+	sif.servers[DBC_SID_FAST1] = dbcman_fast_server
 	sif.servers[SDR_SID] = proc(fno: u32, buf: []u8, size: u32) -> bool {return sdr_server(fno, buf, size, sif.call_client)}
 	sif.servers[0x90000200] = adx_server
 }
@@ -452,6 +456,7 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		fmt.eprintfln("sif: load module \"%s\"", cstring(&buf[8]))
 		path := strings.truncate_to_byte(string(buf[8:][:252]), 0)
 		args := buf[0x104:][:min(w[0], 252)]
+		dbcman_module(path)
 		w[0] = 2
 		w[1] = 0
 		if iop_irx && !strings.has_prefix(path, "rom0:") {
@@ -477,6 +482,7 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		if cpu.debug >= 1 {fmt.eprintfln("sif: load module buffer %x \"%s\"", w[0], name)}
 		data := iop_mem(w[0], IOP_RAM_SIZE)
 		args := buf[0x104:][:min(w[1], 252)]
+		dbcman_module(name)
 		w[0] = 2
 		w[1] = 0
 		if iop_irx && iop_runs(data) {
