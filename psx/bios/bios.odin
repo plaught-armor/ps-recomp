@@ -223,12 +223,32 @@ bios_a :: proc(fn: u32) {
 		cpu.w32(arg(2), bios.conf[2])
 		cpu.w32(arg(0), bios.conf[0])
 		cpu.w32(arg(1), bios.conf[1])
+	case 0x9f:
+		set_mem_size(arg(0))
 	case 0xab, 0xac:
 		// _card_info / _card_load: complete at once.
 		card_info(arg(0))
 		ret(1)
 	case:
 		bios_unknown("A", fn)
+	}
+}
+
+// SetMemSize(megabytes), as the retail kernel's (PSone v4.5): 2 or 8 sets
+// the memory controller's RAM window (1F801060h bits 8-10: 2 MB with the
+// rest locked, or 8 MB, which is 2 MB mirrored) and the size word at
+// 00000060h, and prints the change; any other size only prints that it must
+// be 2 or 8. v0 is what printf leaves, as A(3Fh) here sets none.
+set_mem_size :: proc(mb: u32) {
+	RAM_SIZE :: 0x1f801060
+	switch mb {
+	case 2, 8:
+		v := cpu.io_read(RAM_SIZE, 4) &~ 0x700
+		cpu.io_write(RAM_SIZE, v | (0x300 if mb == 8 else 0), 4)
+		cpu.w32(0x60, mb)
+		fmt.eprintf("[printf] Change effective memory : %d MBytes\n", mb)
+	case:
+		fmt.eprint("[printf] Effective memory must be 2/8 MBytes\n")
 	}
 }
 

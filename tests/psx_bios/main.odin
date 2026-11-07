@@ -32,6 +32,8 @@
 //   head; SysDeqIntRP returns the element it unlinks, or 0. CloseEvent,
 //   EnableEvent and DisableEvent return 1 for any handle, InitPAD 1.
 //   GetConf reads back the table sizes, or what SetConf set.
+//   SetMemSize(2 or 8) sets RAM_SIZE's window bits and the size word at
+//   00000060h as retail does; any other size touches neither.
 //   The memory card calls: card status, firstfile/nextfile patterns and the
 //   DIRENTRY, and lseek and read on whole frames. The card images live in
 //   memory only: their paths name a directory that does not exist.
@@ -116,6 +118,10 @@ ELEM_NOP :: 0x2030
 PAD_WORD :: 0x2100
 @(private = "file")
 PAD_BUF :: 0x2110
+
+// The memory controller's RAM_SIZE register, for SetMemSize.
+@(private = "file")
+ram_size_reg: u32
 
 // GetConf's three words.
 @(private = "file")
@@ -596,6 +602,27 @@ main :: proc() {
 	check("GetConf events after SetConf", cpu.r32(CONF_BUF), 16)
 	check("GetConf threads after SetConf", cpu.r32(CONF_BUF + 4), 4)
 	check("GetConf stack after SetConf", cpu.r32(CONF_BUF + 8), 0x801ff000)
+
+	// SetMemSize: 2 clears RAM_SIZE bits 8-10 and 8 sets bits 8-9, keeping
+	// the rest, each storing the size at 00000060h; any other size changes
+	// neither.
+	cpu.io_read = proc(p: u32, size: u32) -> u32 {return ram_size_reg if p == 0x1f801060 else 0}
+	cpu.io_write = proc(p, v: u32, size: u32) {if p == 0x1f801060 {ram_size_reg = v}}
+	ram_size_reg = 0xfffff7ff
+	cpu.w32(0x60, 0)
+	a(0x9f, 2)
+	check("SetMemSize(2) RAM_SIZE", ram_size_reg, 0xfffff0ff)
+	check("SetMemSize(2) size word", cpu.r32(0x60), 2)
+	a(0x9f, 8)
+	check("SetMemSize(8) RAM_SIZE", ram_size_reg, 0xfffff3ff)
+	check("SetMemSize(8) size word", cpu.r32(0x60), 8)
+	ram_size_reg = 0x00000b88
+	a(0x9f, 4)
+	check("SetMemSize(4) RAM_SIZE", ram_size_reg, 0x00000b88)
+	check("SetMemSize(4) size word", cpu.r32(0x60), 8)
+	a(0x9f, 2)
+	check("SetMemSize(2) from boot", ram_size_reg, 0x00000888)
+	cpu.io_read, cpu.io_write = nil, nil
 
 	// The thread tables: the PCB's one word is the running TCB.
 	check("PCB pointer", cpu.r32(0x108), 0xa000e000)

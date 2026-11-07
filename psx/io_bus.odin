@@ -17,6 +17,10 @@ import io "io"
 
 @(private)
 memctrl: [16]u32
+// RAM_SIZE (1F801060h), as the kernel leaves it at boot. Only stored: its
+// window (mirrors, locked ranges) is not applied to the memory map.
+@(private)
+ram_size: u32 = 0x00000b88
 
 io_read :: proc(p: u32, size: u32) -> u32 {
 	v := io_read_reg(p, size)
@@ -36,7 +40,7 @@ io_read_reg :: proc(p: u32, size: u32) -> u32 {
 	case 0x1f801050 ..< 0x1f801060:
 		return 0
 	case 0x1f801060:
-		return 0x00000b88
+		return ram_size
 	case 0x1f801070:
 		return io.irq_regs.stat
 	case 0x1f801074:
@@ -75,7 +79,10 @@ io_write :: proc(p, v: u32, size: u32) {
 		memctrl[(p - 0x1f801000) >> 2] = v
 	case 0x1f801040 ..< 0x1f801050:
 		bios.sio0_write(p - 0x1f801040, v, size)
-	case 0x1f801050 ..< 0x1f801064:
+	case 0x1f801050 ..< 0x1f801060:
+	case 0x1f801060:
+		ram_size = v
+	case 0x1f801061 ..< 0x1f801064:
 	case 0x1f801070:
 		if .Irq in core.trace.active {
 			core.tracef(.Irq, "ack stat=%x & %x ra=%x", io.irq_regs.stat, v, cpu.state.r[31])
