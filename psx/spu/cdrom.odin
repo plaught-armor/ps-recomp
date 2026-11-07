@@ -322,7 +322,21 @@ cdrom_command :: proc(c: u8) {
 		queue_int(3, ACK_DELAY, stat_byte())
 		queue_int(2, SEEK_DELAY, stat_byte())
 	case 0x19:
-		queue_int(3, ACK_DELAY, 0x94, 0x09, 0x19, 0xc0)
+		sub := p[0] if len(p) > 0 else 0x20
+		switch sub {
+		case 0x04: // read the SCEx string, which restarts its counters
+			cd.motor = true
+			queue_int(3, ACK_DELAY, stat_byte())
+		case 0x05: // the SCEx counters: total reads, then those that matched
+			// A drive reads the SCEx string off the lead-in's wobble only;
+			// the emulated head is always in the program area, so no read
+			// matches. Anti-modchip checks (Legend of Dragoon's loader) ask
+			// for this there and take a match for a modchip's injected one.
+			// The attempts' rate is not modelled, so total stays 0 too.
+			queue_int(3, ACK_DELAY, 0, 0)
+		case: // 20h and the rest: the controller's version date
+			queue_int(3, ACK_DELAY, 0x94, 0x09, 0x19, 0xc0)
+		}
 	case 0x1a:
 		queue_int(3, ACK_DELAY, stat_byte())
 		queue_int(2, DONE_DELAY, 0x02, 0x00, 0x20, 0x00, 'S', 'C', 'E', 'A')
