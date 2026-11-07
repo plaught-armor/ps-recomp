@@ -234,7 +234,8 @@ dbcman_init :: proc() {
 // the IOP, or the cdrom file a path names (loadfile_server). A Dbc_Manager
 // image picks the server set from then on by its module version: the 131b
 // set for 0x301, the fast set for 0x310, and the fast set, logged once, for
-// any other. A dbcman load with no image to read (a rom0 or host path, or a
+// any other. Each such pick is logged, naming the version and the set.
+// A dbcman load with no image to read (a rom0 or host path, or a
 // disc file that cannot be read) takes the fast set, logged once. Any other
 // load leaves the set as it is.
 //
@@ -246,6 +247,7 @@ dbcman_module :: proc(path: string, image: []u8 = nil) {
 	name := dbc_module_name(path)
 	if v, ok := dbc_module_version(image); ok {
 		dbc.servers = .Sid_131b if v == 0x301 else .Fast
+		fmt.eprintfln("dbcman: Dbc_Manager module version %#x: the %v set", v, dbc.servers)
 		if v != 0x301 && v != 0x310 && !dbc_logged.version {
 			dbc_logged.version = true
 			fmt.eprintfln("dbcman: Dbc_Manager module version %#x not known; serving the fast set", v)
