@@ -38,6 +38,12 @@ mlw: struct {
 	gen: i32,
 }
 
+// Nothing to set up: the host says at the first start whether it compiles.
+@(private)
+midlearn_host_init :: proc() -> bool {
+	return true
+}
+
 // Start the host compiling mlrn's stream; .Off for a host with no worker.
 @(private)
 midlearn_host_start :: proc() -> Midload_Start {

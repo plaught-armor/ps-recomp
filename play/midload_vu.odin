@@ -27,7 +27,6 @@ package play
 
 import "core:fmt"
 import "core:os"
-import "core:strconv"
 import "core:time"
 import "ps:core"
 @(require) import "ps:ps2" // used only without FLAT
@@ -170,26 +169,4 @@ midload_vu_take :: proc(state: os.Process_State) -> Midload_Poll {
 @(private = "file")
 midload_vu_remove :: proc() {
 	midload_tmp_remove(&mv.tmp)
-}
-
-// The --convert-vu child's start, given its run's pid: on Linux it dies
-// with the run, and false when the run has already ended. With COMMIT=test,
-// MIDLOAD_FAIL=1 makes it fail (tests/play).
-midload_child :: proc(parent: string) -> bool {
-	when core.COMMIT == "test" {
-		if core.env("MIDLOAD_FAIL") == "1" {
-			fmt.eprintln("play: --convert-vu: failing for " + core.ENV_PREFIX + "MIDLOAD_FAIL=1")
-			return false
-		}
-	}
-	pid, ok := strconv.parse_int(parent, 10)
-	if !ok {
-		fmt.eprintln("play: --convert-vu: bad parent pid", parent)
-		return false
-	}
-	if !midload_die_with(pid) {
-		fmt.eprintln("play: --convert-vu: its run has ended")
-		return false
-	}
-	return true
 }
