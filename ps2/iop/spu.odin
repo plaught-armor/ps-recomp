@@ -82,6 +82,7 @@ spu: struct {
 	// unity (x * 0x4000 >> 14 == x) that spu_volume never returns, where its
 	// 0x3fff loses a step on loud samples.
 	master: [2][2]i32,
+	master_reg: [2][2]u16, // MVOLL, MVOLR as last written, 0 until then, for sceSdGetParam
 	block:  [2]Sdr_Block, // the block transfers, per channel
 	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
 	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
@@ -696,6 +697,7 @@ spu_effect :: proc(core: int, mode: u32, depth_l, depth_r: i16) -> bool {
 spu_master :: proc(core: int, l, r: u32) {
 	assert(core >= 0 && core < 2, "spu: no such core")
 	spu.master[core] = {spu_volume(l), spu_volume(r)}
+	spu.master_reg[core] = {u16(l), u16(r)}
 }
 
 // Turn a core's effects on or off, as SD_C_EFFECT_ENABLE (ATTR bit 7).
@@ -941,8 +943,8 @@ sd_get_param :: proc(id: u32) -> (u32, bool) {
 sd_core_param :: proc(id, value: u32) -> bool {
 	c := id & 1
 	switch id & 0xff00 {
-	case SD_P_MVOLL: spu.master[c][0] = spu_volume(value)
-	case SD_P_MVOLR: spu.master[c][1] = spu_volume(value)
+	case SD_P_MVOLL: spu.master[c][0], spu.master_reg[c][0] = spu_volume(value), u16(value)
+	case SD_P_MVOLR: spu.master[c][1], spu.master_reg[c][1] = spu_volume(value), u16(value)
 	case SD_P_EVOLL: spu.reverb[c].evol[0] = i32(i16(u16(value)))
 	case SD_P_EVOLR: spu.reverb[c].evol[1] = i32(i16(u16(value)))
 	case SD_P_BVOLL: spu.bvol[c][0] = i32(i16(u16(value)))
@@ -953,10 +955,15 @@ sd_core_param :: proc(id, value: u32) -> bool {
 	return true
 }
 
-// sceSdGetParam(id) for a core's EVOLL, EVOLR.
+// sceSdGetParam(id) for a core's MVOLL, MVOLR and EVOLL, EVOLR. A master
+// volume reads back the register exactly as written, bit 15 (sweep) kept, as
+// PCSX2 keeps it (V_VolumeSlide::RegSet stores the raw value, and its
+// register table reads MVOLL and MVOLR from that copy).
 sd_core_get :: proc(id: u32) -> (u32, bool) {
 	c := id & 1
 	switch id & 0xff00 {
+	case SD_P_MVOLL: return u32(spu.master_reg[c][0]), true
+	case SD_P_MVOLR: return u32(spu.master_reg[c][1]), true
 	case SD_P_EVOLL: return u32(u16(spu.reverb[c].evol[0])), true
 	case SD_P_EVOLR: return u32(u16(spu.reverb[c].evol[1])), true
 	}
