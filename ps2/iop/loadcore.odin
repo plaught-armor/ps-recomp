@@ -609,6 +609,9 @@ start_drop :: proc(i: int, why: string) {
 		mine := b.owner == f.thid || b.addr == m.base || m.argv != 0 && b.addr == m.argv
 		if mine && !(cur != nil && cur.id != f.thid && sys_in({b}, cur.stack)) {append(&freed, b)}
 	}
+	if h, st := drop_dangling(freed[:], m); h + st > 0 {
+		fmt.eprintfln("iop: \"%s\" dropped with %d handlers and %d stubs of other modules into its memory, kept as on retail", name, h, st)
+	}
 	th_kill_in(freed[:], f.thid)
 	rpc_drop_in(freed[:])
 	module_drop(m)
@@ -617,6 +620,38 @@ start_drop :: proc(i: int, why: string) {
 	}
 	failed_add(failed_key(name, m.hash), name)
 	th_start_wake(f.waiter, ke(KE_ERROR))
+}
+
+// What a failed StartModule leaves pointing into `freed`, the blocks it
+// drops, for start_drop's log: handlers of timrman, thbase's alarms, sifcmd,
+// libsd, sdrdrv, vblank and cdvdman by their address, and stubs of modules
+// other than `m` patched to jump there. Retail modload unlinks only the
+// module's own imports (UnLinkLibraryEntries) and releases neither, so both
+// stay; a later crash through one points here.
+drop_dangling :: proc(freed: []Sys_Block, m: Iop_Module) -> (handlers, stubs: int) {
+	in_f :: proc(freed: []Sys_Block, a: u32) -> int {return 1 if a != 0 && sys_in(freed, a) else 0}
+	for t in iop_timr.t {handlers += in_f(freed, t.handler)}
+	for a in iop_timr.alarms[:iop_timr.nalarm] {handlers += in_f(freed, a.handler)}
+	s := &iop_sifcmd
+	for h in s.sys {handlers += in_f(freed, h.handler)}
+	for c in s.dma_cb[:s.n_dma_cb] {handlers += in_f(freed, c.func)}
+	for i in 0 ..< min(s.user_size, IOP_RAM_SIZE / 8) {handlers += in_f(freed, r32(s.user_tab + 8 * i))}
+	for h in iop_sd.trans {handlers += in_f(freed, h.func)}
+	handlers += in_f(freed, iop_sd.spu2.func)
+	for h in iop_sdr.user {handlers += in_f(freed, h)}
+	for x in iop_vbl.h[:iop_vbl.n] {handlers += in_f(freed, x.handler)}
+	handlers += in_f(freed, iop_cd.callback)
+	// A linked stub is `j export; nop` (link_stub); no module's own code
+	// jumps into another's image.
+	for o in iop_loader.modules {
+		if o.id == m.id {continue}
+		for a := o.base; a + 8 <= o.base + o.size; a += 4 {
+			w := r32(a)
+			if w >> 26 != 2 || r32(a + 4) != 0 {continue}
+			stubs += in_f(freed, (a + 4) & 0xf0000000 | (w & 0x3ffffff) << 2)
+		}
+	}
+	return
 }
 
 @(private = "file")

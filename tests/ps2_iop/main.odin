@@ -966,6 +966,19 @@ test_modload :: proc() {
 	waiting := false
 	for t in iop.iop_sched.threads {waiting ||= t.status == .Start}
 	check(!waiting, "modload: no thread left in StartModule")
+
+	// What a drop leaves pointing into its blocks, for start_drop's log: a
+	// timer handler and pldt's words 3 and 4 made a linked stub, `j; nop`.
+	gone := iop.sys_alloc(.High, 0x100)
+	freed := []iop.Sys_Block{{addr = gone, size = 0x100}}
+	h0, s0 := iop.drop_dangling(freed, {})
+	iop.iop_timr.t[0].handler = gone + 8
+	iop.iop_u32(d + 12)^ = 0x08000000 | (gone + 16) >> 2 & 0x3ffffff
+	iop.iop_u32(d + 16)^ = 0
+	h1, s1 := iop.drop_dangling(freed, {})
+	check(h0 == 0 && s0 == 0 && h1 == 1 && s1 == 1, fmt.tprintf("modload: a drop counts the handler and the stub into its memory (%d %d, %d %d)", h0, s0, h1, s1))
+	iop.iop_timr.t[0].handler = 0
+	iop.sys_free(gone)
 }
 
 // "sleeper": registers libi, then sleeps in its start.
