@@ -368,7 +368,8 @@ scan_file :: proc(di: int, d: ^disc.Disc, e: disc.Entry, path: string) {
 
 // -bios: the export count of each library in the ROM's modules. A table is
 // an export magic, no link, a major of 1..15 and a printable name, then
-// function offsets up to a zero one.
+// function offsets up to a zero one that is not followed by another offset
+// (some tables have null slots past the first four: DMACMAN 4, SIO2MAN 4).
 bios_read :: proc(path: string) -> bool {
 	b, err := os.read_entire_file(path, context.allocator)
 	if err != nil {return false}
@@ -384,11 +385,21 @@ bios_read :: proc(path: string) -> bool {
 			if lib == "" || !printable(lib) {continue}
 			// The first four entries are the module's own and may be zero
 			// (unrelocated, its start can be at offset 0; the fourth is
-			// often unused): a zero ends the table only after them.
+			// often unused): a zero ends the table only after them, and
+			// only when the word after it is not a nonzero offset into the
+			// image, which says the zero is a null slot in the table.
+			offset :: proc(f: []u8, p: int) -> (w: u32, ok: bool) {
+				if p + 4 > len(f) {return 0, false}
+				w = le32(f, p)
+				return w, w & 3 == 0 && w < u32(len(f))
+			}
 			count: u32
-			for p := o + 20; p + 4 <= len(f) && count < 512; p += 4 {
-				w := le32(f, p)
-				if w == 0 && count >= 4 || w & 3 != 0 || w >= u32(len(f)) {break}
+			for p := o + 20; count < 512; p += 4 {
+				w, ok := offset(f, p)
+				if !ok {break}
+				if w == 0 && count >= 4 {
+					if n, next := offset(f, p + 4); !next || n == 0 {break}
+				}
 				count += 1
 			}
 			k := key(lib_id(lib), u16(major), 0)
