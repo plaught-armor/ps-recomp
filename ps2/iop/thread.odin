@@ -95,6 +95,10 @@ KE_RELEASE_WAIT :: -418
 PRIO_HIGHEST :: 1
 @(private = "file")
 PRIO_LOWEST :: 126
+// The top part of a new thread's stack that CreateThread leaves out of its
+// 0xff fill.
+@(private = "file")
+TH_STACK_TOP :: 0x30
 @(private = "file")
 SA_THPRI :: 1 // a semaphore's waiters by priority, else first come
 @(private = "file")
@@ -1068,7 +1072,11 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if prio < PRIO_HIGHEST || prio > PRIO_LOWEST {return ke(KE_ILLEGAL_PRIORITY), true}
 		stack := sys_alloc(.High, size)
 		if stack == 0 || size == 0 {return ke(KE_NO_MEMORY), true}
-		t := th_new(entry, stack, (size + SYS_ALIGN - 1) &~ (SYS_ALIGN - 1), r[28], prio)
+		// Retail fills a new stack with 0xff but for its top 0x30 bytes, so
+		// what a thread reads from stack it never wrote is 0xff, not 0.
+		size = (size + SYS_ALIGN - 1) &~ (SYS_ALIGN - 1)
+		if size > TH_STACK_TOP {for &b in ram_w(stack, size - TH_STACK_TOP) {b = 0xff}}
+		t := th_new(entry, stack, size, r[28], prio)
 		t.attr, t.option = r32(a0), r32(a0 + 4)
 		if cpu.debug >= 1 {fmt.eprintfln("iop: thread %d entry %x prio %d stack %x", t.id, entry, prio, size)}
 		return t.id, true

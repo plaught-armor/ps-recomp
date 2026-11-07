@@ -252,6 +252,7 @@ game :: proc(_: rawptr) {
 	test_alarm()
 	test_wakeup_cancel()
 	test_release_wait()
+	test_stack_fill()
 	test_vblank()
 	test_vblank_handlers()
 	test_fallback()
@@ -6136,6 +6137,24 @@ test_wakeup_cancel :: proc() {
 	s.cur, t.wakeups = id, 2
 	check(tb_call(27, 0) == 2 && t.wakeups == 0, "cancel wakeup: thread 0 is the caller")
 	s.cur = cur
+	fresh()
+}
+
+// thbase 4 CreateThread fills the new stack with 0xff but for its top 0x30
+// bytes, as retail does.
+test_stack_fill :: proc() {
+	fresh()
+	P :: 0x00040000
+	at := iop.sys_alloc(.High, 0x200)
+	check(at != 0 && iop.sys_free(at), "CreateThread: a stack's place")
+	for i in u32(0) ..< 0x200 / 4 {iop.iop_u32(at + 4 * i)^ = 0}
+	for w, i in ([5]u32{0, 0, 0x1000, 0x1f0, 20}) {iop.iop_u32(P + 4 * u32(i))^ = w}
+	tid := tb_call(4, P)
+	t := iop.th_find(tid)
+	check(i32(tid) > 0 && t != nil && t.stack == at && t.stacksize == 0x200, "CreateThread: the stack, rounded up to 256")
+	top := at + 0x200 - 0x30
+	check(iop.iop_u32(at)^ == 0xffffffff && iop.iop_u32(top - 4)^ == 0xffffffff, "CreateThread: the stack is filled with 0xff")
+	check(iop.iop_u32(top)^ == 0 && iop.iop_u32(top + 0x2c)^ == 0, "CreateThread: but for its top 0x30")
 	fresh()
 }
 
