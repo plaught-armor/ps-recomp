@@ -318,15 +318,20 @@ th_reset :: proc(t: ^Iop_Thread) {
 	t.intr_off = false
 }
 
-// The interrupt state CpuSuspendIntr stores when interrupts were on: the
-// status bits retail tests for that. Off, it stores 0.
-INTR_ON_STATE :: 0x404
+// The interrupt state CpuSuspendIntr stores when interrupts were on, as
+// INTRMANI (the IOP-mode intrman a PS2 boot loads; INTRMANP is the PS1
+// mode's) stores it: the old value of the global interrupt-enable register,
+// 1 on and 0 off. CpuResumeIntr writes the state back to that register, so
+// only its bit 0 counts.
+INTR_ON_STATE :: 1
 
 // Whether the running context has turned interrupts off with
-// CpuDisableIntr or CpuSuspendIntr. Retail keeps this in each thread's saved
-// status, so it is per thread here and the loader's own; a handler always
-// runs with them off. Nothing in the HLE is held off by it: it only shapes
-// what those calls return.
+// CpuDisableIntr or CpuSuspendIntr. Retail has one global register for
+// this; here it is per thread and the loader's own, which differs from that
+// only when a thread switches away with interrupts off, which retail does
+// not let it do: nothing preempts it then, and WaitSema, SleepThread and
+// DelayThread return -102. A handler always runs with them off. Nothing in the HLE is held
+// off by it: it only shapes what those calls return.
 th_intr_off :: proc() -> bool {
 	s := &iop_sched
 	if s.intr {return true}
@@ -1119,6 +1124,9 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if prio < PRIO_HIGHEST || prio > PRIO_LOWEST {return ke(KE_ILLEGAL_PRIORITY), true}
 		if entry & 3 != 0 {return ke(KE_ILLEGAL_ENTRY), true}
 		if size < TH_STACK_MIN {return ke(KE_ILLEGAL_STACK_SIZE), true}
+		// A size past all of sysmem is no memory, as retail's allocation
+		// fails; rounding it would wrap to 0 here.
+		if size > SYS_END - SYS_BASE {return ke(KE_NO_MEMORY), true}
 		size = (size + SYS_ALIGN - 1) &~ (SYS_ALIGN - 1)
 		w32(a0 + 12, size)
 		stack := sys_alloc(.High, size)

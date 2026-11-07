@@ -272,6 +272,7 @@ game :: proc(_: rawptr) {
 	test_wakeup_cancel()
 	test_release_wait()
 	test_error_rows()
+	test_intr_undo()
 	test_create_thread()
 	test_vblank()
 	test_vblank_handlers()
@@ -1908,6 +1909,31 @@ test_event_undo :: proc() {
 	id, _ := iop.iop_load(build_mod("modu", &a, entry), "modu", nil)
 	check(id == -1 && len(s.evfs) == 1 && s.evfs[0].id == kept, "event undo: the failed load's flag is deleted, the earlier one kept")
 	check(s.next_evfid == kept + 2, "event undo: ids go on past the deleted flag")
+}
+
+// A start that turns interrupts off and fails before turning them on leaves
+// nothing off: the start runs on its own thread, deleted with the failed
+// load, so the loader's state is untouched and its next suspend gives 0.
+test_intr_undo :: proc() {
+	fresh()
+	a: Asm
+	im := imports(&a, "intrman", 17)
+	te := imports(&a, "thevent", 12)
+	stp := at(&a)
+	put(&a, 0)
+	entry := at(&a)
+	prologue(&a)
+	la(&a, A0, stp)
+	jal(&a, im)
+	jal(&a, te)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, _ := iop.iop_load(build_mod("modi", &a, entry), "modi", nil)
+	check(id == -1 && !iop.iop_sched.loader_intr_off, "intr undo: the failed start's suspend leaves the loader on")
+	r3000.state.r[4] = 0
+	v, ok := iop.hle_fn("intrman", 17)
+	check(ok && v == 0, "intr undo: the loader's next suspend gives 0")
+	fresh()
 }
 
 // sio2man fno with a0 from the loader; v0.
@@ -6260,6 +6286,9 @@ test_create_thread :: proc() {
 	check(create(0, 0x1002, 0x10, 20) == ill(iop.KE_ILLEGAL_ENTRY), "CreateThread: then the entry's alignment")
 	check(create(0, 0x1000, 0x12f, 20) == ill(iop.KE_ILLEGAL_STACK_SIZE), "CreateThread: then a stack under 0x130")
 	check(iop.iop_u32(P + 12)^ == 0x12f, "CreateThread: a refused size is not written back")
+	for size in ([3]u32{0xffffff01, 0xffffffff, iop.SYS_END - iop.SYS_BASE + 1}) {
+		check(create(0, 0x1000, size, 20) == ill(iop.KE_NO_MEMORY) && iop.iop_u32(P + 12)^ == size, "CreateThread: a size past sysmem is no memory, not wrapped")
+	}
 	// Where the stack will go, cleared so the unfilled top shows.
 	at := iop.sys_alloc(.High, 0x200)
 	check(at != 0 && iop.sys_free(at), "CreateThread: a stack's place")
@@ -6314,6 +6343,9 @@ test_error_rows :: proc() {
 	check(call("intrman", 8) == cpudi, "intr: a disable while off -102")
 	check(call("intrman", 18, iop.INTR_ON_STATE) == 0 && call("intrman", 8) == 0, "intr: resumed on, a disable gives 0")
 	check(call("intrman", 9) == 0 && call("intrman", 18, 0) == 0 && call("intrman", 8) == cpudi, "intr: enable, then a resume to off")
+	check(call("intrman", 18, 1) == 0 && call("intrman", 8) == 0, "intr: a resume to a literal 1 is on")
+	check(call("intrman", 18, 3) == 0 && call("intrman", 17, P) == 0 && st^ == 1, "intr: any state with bit 0 is on")
+	check(call("intrman", 18, 0x404) == 0 && call("intrman", 8) == cpudi, "intr: a status-like 0x404 is off, bit 0 clear")
 	call("intrman", 9)
 	iop.iop_sched.intr = true
 	check(call("intrman", 17, P) == cpudi && st^ == 0, "intr: a handler's interrupts are off")
