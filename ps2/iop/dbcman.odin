@@ -101,7 +101,8 @@
 // - 7 copies block +0x1c over block +0x20 raw (ECC bytes as they are),
 //   each page read back and compared; 9 erases block +0x20; neither checks
 //   the range beyond the copy's own block check.
-// - 10 reads the clock (cdvdman's, all 0) into the extra bytes, 1.
+// - 10 reads the clock into the first 8 extra bytes, as cdvdman's
+//   sceCdReadClock writes it (cd_clock_write), and answers its result, 1.
 // - 11 writes the first data page with its ECC to count pages from the
 //   first, erasing first at each page whose low 4 bits are 0; no read back.
 // - Any other command: result 1.
@@ -666,7 +667,7 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 	case 6: st.result = mc2_backup_restore()
 	case 7: st.result = i32(mc2_copy(p.dst, p.src))
 	case 9: st.result = i32(mc2_block_ok(p.dst) && mc2_erase(p.dst))
-	case 10: // the clock, all 0: the extra bytes as cleared
+	case 10: cd_clock_write(st.extra[:CD_CLOCK]) // cdvdman's ReadClock, 1 as it returns
 	case 11:
 		for i in 0 ..< p.count {
 			page := p.start + i

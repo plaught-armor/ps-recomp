@@ -7319,6 +7319,12 @@ test_mc2 :: proc() {
 	check(fill && slice.equal(b11[:524], b2[:524]) && mc2_all(b11[PG:], 0xff), "mc2 11: each page the same, block 11 erased past its first")
 
 	check(mc2_cmd(buf[:], 0, 10) == 1, "mc2 10: 1")
+	{
+		seq10, _, _ := mc2_status(A)
+		seq10b, _, _ := mc2_status(B)
+		clk := iop.CD_CLOCK_TIME
+		check(slice.equal(mem.ram_slice(A + 0xc if seq10 > seq10b else B + 0xc, iop.CD_CLOCK), clk[:]), "mc2 10: the CD clock in the extra bytes")
+	}
 	clear(&core.compat.calls)
 	check(mc2_cmd(buf[:], 0, 99) == 1 && mc2_cmd(buf[:], 0, 99) == 1 && core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 99}].n == 2, "mc2: an unknown command, 1, one row")
 
