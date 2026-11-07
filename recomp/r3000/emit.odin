@@ -263,7 +263,10 @@ trace_stmt :: proc(pc: u32) -> string {
 }
 
 // Odin source for a lowered function: one switch case per block.
+// out must not grow on the temp allocator: the guard below frees what it
+// grows into.
 emit_func :: proc(f: ^Func, out: ^strings.Builder, name: string, patches: []Patch, cycles: int) {
+	assert(out.buf.allocator.data != context.temp_allocator.data, "emit_func: out is on the temp allocator")
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD() // lower's steps
 	line(out, "%s :: proc() {{", name)
 	line(out, "\tc := &cpu.state")
