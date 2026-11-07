@@ -205,8 +205,12 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			if x[i] != y[i] {return x[i] < y[i] ? ke(-1) : 1, true}
 		}
 		return 0, true
-	case 12: // memcpy(dst, src, n)
-		src := ram(a1, a2)
+	case 12: // memcpy(dst, src, n): dst; a null dst copies none and gives 0, n <= 0 copies none
+		// The kernel's word path, taken when dst, src and n are all
+		// multiples of 4, counts n/4 unsigned, so a negative n there runs
+		// over RAM; its byte path copies none. Here neither copies.
+		if a0 == 0 {return 0, true}
+		src := ram(a1, u32(max(i32(a2), 0)))
 		copy(ram_w(a0, u32(len(src))), src)
 		return a0, true
 	case 13: // memmove(dst, src, n): an overlapping copy as if through a buffer; n <= 0 copies none. A null dst copies none and gives 0
@@ -214,8 +218,10 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		src := ram(a1, u32(max(i32(a2), 0)))
 		copy(ram_w(a0, u32(len(src))), src)
 		return a0, true
-	case 14: // memset(dst, c, n)
-		for &b in ram_w(a0, a2) {b = u8(a1)}
+	case 14: // memset(dst, c, n): dst; a null dst or n <= 0 sets none
+		// As memcpy, the kernel's word path (c 0, dst and n multiples of 4)
+		// would run over RAM for a negative n; here it sets none.
+		for &b in ram_w(a0, a0 == 0 ? 0 : u32(max(i32(a2), 0))) {b = u8(a1)}
 		return a0, true
 	case 17: // bzero(p, n)
 		for &b in ram_w(a0, u32(max(i32(a1), 0))) {b = 0}
@@ -252,10 +258,11 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return a0, true
 	case 34: // strstr(hay, needle)
 		return iop_strstr(a0, a1), true
-	case 36: // strtol(s, char **end, base)
+	case 36: // strtol(s, char **end, base): see iop_strtol; a null s gives 0 and leaves *end
+		if a0 == 0 {return 0, true}
 		v, end := iop_strtol(a0, a2)
 		if a1 != 0 {w32(a1, end)}
-		return u32(v), true
+		return v, true
 	case 41: // wmemset(dst, word, n): dst; n/4 words of `word`, n's low 2 bits dropped
 		// The kernel stores words: an unaligned dst faults there, here it is
 		// written as given with a row.
@@ -289,37 +296,41 @@ iop_strstr :: proc(hay, needle: u32) -> u32 {
 	return 0
 }
 
-// C's strtol over the string at `a`: the value, clamped to an i32, and the
-// address of the first character it did not use (`a` when it used none).
-iop_strtol :: proc(a, base: u32) -> (v: i32, end: u32) {
-	end = a
-	p := a
+// strtol as the kernel's sysclib runs it, which is not C's. White space is
+// skipped, then each '-' flips the sign; '+' is no sign, so it ends the
+// number at once. A base outside 2..36, 0 among them, is 10: there is no
+// octal guess. Then, whatever the base: a leading '0' is taken, and an x or
+// X after it makes the base 16, a b or B makes it 2, the letter taken too;
+// a first character o or O (with no '0' before it) makes the base 8 and is
+// taken. Digits build the value in 32 bits, wrapping, with no clamp. `end`
+// is the first character not taken, even when no digit was: white space,
+// signs and a prefix stay taken.
+iop_strtol :: proc(a, base: u32) -> (v: u32, end: u32) {
 	ch :: proc(p: u32) -> u8 {return ram(p, 1)[0]}
-	for ch(p) == ' ' || ch(p) >= '\t' && ch(p) <= '\r' {p += 1}
-	neg := false
-	if ch(p) == '-' || ch(p) == '+' {
-		neg = ch(p) == '-'
+	p := a
+	for ctype(i32(i8(ch(p)))) & CT_SPACE != 0 {p += 1}
+	sign: u32 = 1
+	for ; ch(p) == '-'; p += 1 {sign = ~sign + 1}
+	base := base if base >= 2 && base <= 36 else 10
+	if ch(p) == '0' {
+		p += 1
+		switch ch(p) {
+		case 'x', 'X':
+			base = 16
+			p += 1
+		case 'b', 'B':
+			base = 2
+			p += 1
+		}
+	} else if ch(p) | 0x20 == 'o' {
+		base = 8
 		p += 1
 	}
-	base := base
-	hex := ch(p) == '0' && ch(p + 1) | 0x20 == 'x'
-	if (base == 0 || base == 16) && hex && digit(ch(p + 2)) < 16 {
-		p += 2
-		base = 16
-	} else if base == 0 {
-		base = 8 if ch(p) == '0' else 10
-	}
-	if base < 2 || base > 36 {return 0, a}
-	n: i64
-	any := false
 	for d := digit(ch(p)); d < base; d = digit(ch(p)) {
-		n = min(n * i64(base) + i64(d), i64(max(i32)) + 1)
-		any = true
+		v = v * base + d
 		p += 1
 	}
-	if !any {return 0, a}
-	if neg {n = -n}
-	return i32(clamp(n, i64(min(i32)), i64(max(i32)))), p
+	return v * sign, p
 }
 
 @(private = "file")
