@@ -6989,7 +6989,36 @@ test_dbcman :: proc() {
 	call(buf[:], 0x1315, 0)
 	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001315}].n == 1, "dbcman 0x1315: a row")
 
-	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
+	// The contract, by the dbcman export library of the image loaded: 1.02
+	// serves the 1.x calls; a name alone changes nothing.
+	dbc_image :: proc(version: u32) -> []u8 {
+		return build_file("Dbc_Manager", {EXPORT, 0, version, 0x6d636264, 0x00006e61, 0}, {}, 0) // "dbcman"
+	}
+	iop.dbcman_module("dbc.irx", dbc_image(0x0102))
+	call(buf[:], 0x1363)
+	check(w[0] == 0x310, "dbcman 1.x 0x1363: version 0x310")
+	for &b in buf {b = 0}
+	w[0], w[1] = 0, 0x0101800c
+	iop.sif.servers[iop.DBC_SID](0x8000131a, buf[:], 0x280)
+	check(r[0x20c / 4] == 1 && w[2] == 1 && buf[0xc] == 1 && w[0x8c / 4] == 0, "dbcman 1.x 0x131a: the result at +0x20c, the size at +8, the data at +0xc")
+	clear(&core.compat.calls)
+	for &b in buf {b = 0xee}
+	iop.sif.servers[iop.DBC_SID](0x80001319, buf[:], 0x90)
+	iop.sif.servers[iop.DBC_SID](0x80001319, buf[:], 0x90)
+	check(core.compat.calls[{.Sif_Rpc, iop.DBC_SID, 0x80001319}].n == 2 && w[0x8c / 4] == 0xeeeeeeee && w[1] == 0xeeeeeeee, "dbcman 1.x 0x1319: not served, a row, the buffer left")
+	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x0101800c) == 0 && r[0x108c / 4] == 1 && buf[0xc] == 1, "dbcman 1.x 0x8000131b: a driver call, the result at +0x108c")
+	for &b in buf {b = 0}
+	w[0], w[1] = 0, 0x0101800c
+	check(iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x1094) && w[0x108c / 4] == 0, "dbcman 1.x 0x8000131b: over 0x1090 bytes, not served")
+	check(!iop.sif.servers[iop.DBC_SID_FAST0](0, buf[:], 0x90), "dbcman 1.x: no fast server")
+	iop.sif.servers[iop.DBC_SID_BIG](0, buf[:], 0x2090)
+	check(r[0x208c / 4] == 1, "dbcman 1.x 0x8000131c: a driver call")
+	iop.dbcman_module("ds2o_d")
+	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 1.x: no image, still 1.x; ds2o_d served as ds1o_d")
+	iop.dbcman_module("dbc.irx", dbc_image(0x0201))
+	check(!iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x90) && pad_cmd(buf[:], 0, 0, 0x0101800c) == 1, "dbcman: an unknown major, the 2.x calls")
+
+	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
 }
 
 test_card_dirty :: proc() {
