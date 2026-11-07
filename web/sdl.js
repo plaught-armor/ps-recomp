@@ -398,6 +398,13 @@ export class Sdl {
 				const [x, y, w, h] = this.rect(rect, [0, 0, tex.w, tex.h]);
 				if (x < 0 || y < 0 || w < 0 || h < 0 || x + w > tex.w || y + h > tex.h) return this.fail("rect outside the texture");
 				const m = this.u8();
+				// Whole rows packed as the texture's are (the screen each
+				// frame): one copy instead of one per row.
+				if (x === 0 && w === tex.w && pitch === w * 4) {
+					tex.pixels.set(m.subarray(pixels, pixels + h * pitch), y * pitch);
+					tex.version++;
+					return 0;
+				}
 				for (let row = 0; row < h; row++) {
 					const src = pixels + row * pitch;
 					tex.pixels.set(m.subarray(src, src + w * 4), ((y + row) * tex.w + x) * 4);

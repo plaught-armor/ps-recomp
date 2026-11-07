@@ -219,17 +219,44 @@ scanout :: proc() -> (w, h: int) {
 		return
 	}
 	if skip_readout {return} // headless, no picture due: the size is enough
-	for y in 0 ..< h {
-		row := screen[y * DISP_W:]
-		for x in 0 ..< w {
-			c := read_raw(psm, fbp, fbw, dbx + u32(x), dby + u32(y))
-			if psm == PSMCT16 || psm == PSMCT16S {
-				c = (c & 0x1f) << 3 | (c & 0x3e0) << 6 | (c & 0x7c00) << 9
+	r := row_init(psm)
+	switch {
+	case r.ok && r.wide: scanout_rows(&r, fbp, fbw, dbx, dby, w, h, true)
+	case psm == PSMCT16 || psm == PSMCT16S: scanout_rows(&r, fbp, fbw, dbx, dby, w, h, false)
+	case:
+		for y in 0 ..< h {
+			row := screen[y * DISP_W:]
+			for x in 0 ..< w {
+				c := read_raw(psm, fbp, fbw, dbx + u32(x), dby + u32(y))
+				row[x] = scanout_rgba(c, psm == PSMCT16 || psm == PSMCT16S)
 			}
-			row[x] = c | 0xff000000
 		}
 	}
 	return
+}
+
+// A displayed pixel as RGBA8888: 16-bit colours widened (5 bits to the top
+// of each byte), alpha forced opaque.
+@(private)
+scanout_rgba :: #force_inline proc(c: u32, narrow: bool) -> u32 {
+	c := c
+	if narrow {c = (c & 0x1f) << 3 | (c & 0x3e0) << 6 | (c & 0x7c00) << 9}
+	return c | 0xff000000
+}
+
+// scanout for a 32- or 24-bit buffer, or a 16-bit colour one: each row's
+// address math once (row_seek), then two table reads per pixel, as draw
+// does. Reads the same words read_raw would.
+@(private)
+scanout_rows :: proc(r: ^Row, fbp, fbw, dbx, dby: u32, w, h: int, $WIDE: bool) #no_bounds_check {
+	for y in 0 ..< h {
+		row := screen[y * DISP_W:]
+		row_seek(r, fbp, fbw, dby + u32(y))
+		for x in 0 ..< w {
+			a := row_addr_w(r, dbx + u32(x), WIDE)
+			row[x] = scanout_rgba(row_read_w(r, a, WIDE), !WIDE)
+		}
+	}
 }
 
 // Debug: write the texture TEX0_1 currently names, as raw indices (8/4-bit)
