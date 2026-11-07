@@ -219,6 +219,7 @@ game :: proc(_: rawptr) {
 	test_rpc()
 	test_rpc_remove()
 	test_rpc_self_remove()
+	test_cdvd_poff()
 	test_rpc_client()
 	test_rpc_pool_kept()
 	test_c1_gaps()
@@ -6067,4 +6068,24 @@ test_vblank_handlers :: proc() {
 	rows = core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + h1, 1}].n
 	check(fails("modf", 0, full, 0, b + h1) <= 0 && v^ == before, "vblank handlers: with no entry left, the deleted one comes back")
 	check(core.compat.calls[core.Compat_Key{.Iop_Vblank_Intr, b + h1, 1}].n == rows + 1, "vblank handlers: the one added is dropped with Add's row")
+}
+
+// cdvdfsv's power-off server with PS_IRX=1: a bind gets its descriptor at
+// once, no row; fn 1 stays open, no RPC_END and no row; any other fno is
+// refused with a row and ends.
+test_cdvd_poff :: proc() {
+	POFF_SID :: 0x80000596
+	drop_replies()
+	defer drop_replies()
+	irx := iop.iop_irx
+	defer iop.iop_irx = irx
+	iop.iop_irx = true
+	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, POFF_SID)
+	sd := reply_word(0, 9)
+	check(len(iop.sif.replies) == 1 && sd != 0 && iop.iop_u32(sd)^ == POFF_SID && core.compat.calls[{.Sif_Bind, POFF_SID, 0}].n == 0, "poff: a bind gets its descriptor, no row")
+	drop_replies()
+	send_pkt(iop.SIF_CMD_RPC_CALL, 2, 0, 0, 0, 1, 0, 0, 0, 0, sd)
+	check(len(iop.sif.replies) == 0 && core.compat.calls[{.Sif_Rpc, POFF_SID, 1}].n == 0, "poff: fn 1 stays open, no RPC_END, no row")
+	send_pkt(iop.SIF_CMD_RPC_CALL, 3, 0, 0, 0, 2, 0, 0, 0, 0, sd)
+	check(call_ends(sd, 3) && core.compat.calls[{.Sif_Rpc, POFF_SID, 2}].n == 1, "poff: fn 2 is refused with a row and ends")
 }

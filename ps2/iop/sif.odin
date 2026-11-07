@@ -102,6 +102,7 @@ sif_init :: proc() {
 	sif.servers[0x80000593] = cdvd_scmd_server
 	sif.servers[0x80000595] = cdvd_ncmd_server
 	sif.servers[0x80000597] = cdvd_search_server
+	sif.servers[CDVD_POFF_SID] = cdvd_poff_server
 	sif.servers[0x8000059a] = cdvd_ready_server
 	sif.servers[0x8000059c] = cdvd_ready_server
 	sif.servers[0x80000003] = iop_heap_server
@@ -405,6 +406,7 @@ sif_command :: proc(a, pc: u32) {
 			if iop_rpc_call(a, sid) {return}
 			if cpu.debug >= 1 {fmt.eprintfln("iop: rpc %08x fno %d left to the host", sid, fno)}
 		}
+		if cdvd_poff_held(sid, fno) {return}
 		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
 		sif.call_client = client
@@ -1003,6 +1005,24 @@ cdvd_scmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case: return false
 	}
 	return true
+}
+
+// cdvdfsv power-off: fn 1 answers once cdvdman's power-off event comes,
+// which nothing sends here. The call stays open, no RPC_END and no row:
+// served, as retail's still waiting. libcdvd calls it no-wait from its
+// power-off callback setup, so the EE goes on.
+@(private)
+CDVD_POFF_SID :: 0x80000596
+
+@(private)
+cdvd_poff_held :: proc(sid, fno: u32) -> bool {
+	return sid == CDVD_POFF_SID && fno == 1
+}
+
+// Every other fno of the power-off server, which fn 1 never reaches: refused.
+@(private)
+cdvd_poff_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
+	return false
 }
 
 // cdvdfsv DiskReady: 2 is ready.
