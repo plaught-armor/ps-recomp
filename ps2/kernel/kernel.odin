@@ -174,8 +174,6 @@ ROM_ONLY_SYSCALLS := [0x83]string {
 	0x52 = "SetEventFlag",
 	0x53 = "iSetEventFlag",
 	0x60 = "KSeg0",
-	0x61 = "EnableCache",
-	0x62 = "DisableCache",
 	0x65 = "?",
 	0x66 = "CpuConfig",
 	0x69 = "RFU105",
@@ -288,6 +286,16 @@ syscall :: proc(pc: u32) {
 		list := abs(n) <= 0x5d ? &k.intc : &k.dmac
 		for &h in list {if h.id == i32(a0) || h.id == i32(a1) {h.enabled = abs(n) & 1 == 0}}
 	case 0x5b: ret = i64(mem.rd32(SYSCALL_TABLE + (a0 & 0xff) * 4)) // GetEntryAddress
+	case 0x61, 0x62: // EnableCache(mask), DisableCache(mask)
+		// Retail sets or clears Config's ICE and DCE (bits 16, 17) by the
+		// mask's bits 0 and 1, after invalidating a cache it turns on or
+		// flushing one it turns off. There is no cache
+		// here, only the bits a GetCop0 or mfc0 reads back. Config is the
+		// machine's, so every thread's saved copy takes them too.
+		bits := (a0 & 3) << 16
+		config := abs(n) == 0x61 ? c.cop0[16] | bits : c.cop0[16] &~ bits
+		c.cop0[16] = config
+		for t in k.threads {if t != nil {t.regs.cop0[16] = config}}
 	case 0x63, 0x67: ret = i64(cpu.state.cop0[a0 & 31]) // GetCop0, iGetCop0
 	case 0x64, 0x68: // FlushCache
 	case 0x6b: // SifStopDma: transfers complete instantly

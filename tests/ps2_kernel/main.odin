@@ -20,7 +20,8 @@
 // SetVCommonHandler store a handler only for their own causes and return it,
 // or 0 for a cause out of range. SetVSyncFlag's flag and CSR pointers are
 // stored through once, by the next vblank start interrupt taken, and the CSR
-// only with a flag pointer.
+// only with a flag pointer. EnableCache and DisableCache set and clear Config's
+// bits 16 and 17 by their mask's low two bits, in every thread's copy.
 package main
 
 import "core:fmt"
@@ -467,6 +468,33 @@ exc_handler_test :: proc() {
 	fmt.println("ok exception handlers")
 }
 
+// EnableCache (0x61) sets Config's bits 16 and 17 by the mask's bits 0 and 1,
+// DisableCache (0x62) clears them; the rest of Config and of the mask is left
+// alone, and a thread not running reads the same Config when it next runs.
+cache_test :: proc() {
+	CONFIG :: 16
+	ICE_DCE :: 3 << 16
+	c := &cpu.state.cop0[CONFIG]
+	c^ = 0x0440 // some other bits, which stay
+	mem.wr32(PARAM + 4, ENTRY)
+	mem.wr32(PARAM + 20, 100) // below the main thread: it does not run here
+	parked := kernel.k.threads[sys(0x20, PARAM)]
+	sys(0x22, u32(parked.id))
+	sys(0x61, 0xfffffffe)
+	if c^ != 0x0440 | 2 << 16 {fail("fail: EnableCache(2) left Config %x", c^)}
+	sys(0x61, 1)
+	if c^ != 0x0440 | ICE_DCE || sys(0x63, CONFIG) != i64(c^) {fail("fail: EnableCache(1) left Config %x", c^)}
+	if parked.regs.cop0[CONFIG] != c^ {fail("fail: a parked thread's Config is %x, want %x", parked.regs.cop0[CONFIG], c^)}
+	sys(0x62, 0xfffffffd)
+	if c^ != 0x0440 | 2 << 16 {fail("fail: DisableCache(1) left Config %x", c^)}
+	sys(0x62, 3)
+	if c^ != 0x0440 || parked.regs.cop0[CONFIG] != c^ {fail("fail: DisableCache(3) left Config %x", c^)}
+	sys(0x25, u32(parked.id))
+	sys(0x21, u32(parked.id))
+	c^ = 0
+	fmt.println("ok EnableCache, DisableCache")
+}
+
 // An IOP reset to `path`, a packet SifSetDma (0x77) sends to the IOP's
 // command buffer, then LOADFILE's version handshake (fno 255).
 reset_version :: proc(path: string) -> string {
@@ -611,6 +639,7 @@ main :: proc() {
 	boot_args_test()
 	dma_stat_test()
 	exc_handler_test()
+	cache_test()
 	vsync_flag_test()
 	loadfile_version_test()
 
