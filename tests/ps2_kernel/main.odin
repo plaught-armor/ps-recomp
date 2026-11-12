@@ -22,6 +22,9 @@
 // stored through once, by the next vblank start interrupt taken, and the CSR
 // only with a flag pointer. EnableCache and DisableCache set and clear Config's
 // bits 16 and 17 by their mask's low two bits, in every thread's copy.
+// FlushCache of the instruction cache leaves the function table on while each
+// recompiled function's first word is the boot program's and turns it off,
+// until an exec, once one changed; a data-cache flush checks nothing.
 package main
 
 import "core:fmt"
@@ -497,6 +500,49 @@ cache_test :: proc() {
 
 // An IOP reset to `path`, a packet SifSetDma (0x77) sends to the IOP's
 // command buffer, then LOADFILE's version handshake (fno 255).
+// An instruction-cache FlushCache (modes 2 and 3) with the functions' first
+// words as booted keeps the table, whatever else in the range changed: a
+// word past a function's first, a word no function holds. With a first
+// word changed (code loaded over the program, no exec) it turns the table
+// off, and a later flush with the word back does not turn it on. A
+// data-cache flush (modes 0 and 1) checks nothing. The state is the
+// kernel's, so a copy of it brings the table back as it was.
+flush_text_test :: proc() {
+	e := &kernel.k.exec
+	saved := kernel.k
+	sys(0x64, 2)
+	sys(0x68, 3)
+	if e.text_off || cpu.lookup(EXEC) == nil {fail("fail: FlushCache turned the table off with the text unchanged")}
+	mem.wr32(PATCH, 1)
+	mem.wr32(ENTRY + 0xfc, 1)
+	sys(0x64, 2)
+	sys(0x68, 3)
+	if e.text_off || cpu.lookup(EXEC) == nil {fail("fail: FlushCache turned the table off for a word that starts no function")}
+	mem.wr32(PATCH, 0)
+	mem.wr32(ENTRY + 0xfc, 0)
+	was := mem.rd32(EXEC)
+	mem.wr32(EXEC, was + 1)
+	sys(0x64, 0)
+	sys(0x68, 1)
+	if e.text_off || cpu.lookup(EXEC) == nil {fail("fail: a data-cache FlushCache turned the table off")}
+	sys(0x64, 2)
+	if !e.text_off {fail("fail: FlushCache did not mark the text changed")}
+	if cpu.lookup(EXEC) != nil {fail("fail: FlushCache left the table on with the text changed")}
+	off := kernel.k
+	mem.wr32(EXEC, was)
+	sys(0x68, 3)
+	if !e.text_off || cpu.lookup(EXEC) != nil {fail("fail: a later FlushCache turned the table back on")}
+	// As a snapshot's load does (kernel_snap): the table follows text_off.
+	kernel.k = saved
+	cpu.dispatch_set(!e.text_off)
+	if e.text_off || cpu.lookup(EXEC) == nil {fail("fail: the state from before the flush left the table off")}
+	kernel.k = off
+	cpu.dispatch_set(!e.text_off)
+	if !e.text_off || cpu.lookup(EXEC) != nil {fail("fail: the state from after the flush left the table on")}
+	kernel.k = saved
+	cpu.dispatch_set(!e.text_off)
+	fmt.println("ok FlushCache text check")
+}
 reset_version :: proc(path: string) -> string {
 	LIST :: PARAM + 0x300
 	PKT :: PARAM + 0x400
@@ -640,6 +686,7 @@ main :: proc() {
 	dma_stat_test()
 	exc_handler_test()
 	cache_test()
+	flush_text_test()
 	vsync_flag_test()
 	loadfile_version_test()
 

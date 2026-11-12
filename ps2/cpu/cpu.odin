@@ -5,6 +5,7 @@
 // through a table indexed by word offset into .text.
 package ps2_cpu
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:os"
 import "ps:core"
@@ -126,6 +127,37 @@ dispatch_set :: proc(on: bool) {
 	} else if !on && fn_held == nil {
 		fn_table, fn_held = nil, fn_table
 	}
+}
+
+// The address of each function in the table, and the word ram held there
+// at entries_keep. Host state, as the table is.
+@(private)
+entry_addr, entry_word: []u32
+
+// Keep the first word of every function in the table, on or off, as ram
+// holds it now. The range has to be in ram.
+entries_keep :: proc(ram: []u8) {
+	t := fn_held != nil ? fn_held : fn_table
+	n := 0
+	for fn in t {n += int(fn != nil)}
+	delete(entry_addr)
+	delete(entry_word)
+	entry_addr, entry_word = make([]u32, n), make([]u32, n)
+	n = 0
+	for fn, i in t {
+		if fn == nil {continue}
+		a := text_lo + u32(i) << 2
+		entry_addr[n], entry_word[n] = a, intrinsics.unaligned_load((^u32)(&ram[a]))
+		n += 1
+	}
+}
+
+// How many of the kept words ram no longer holds, of how many.
+entries_changed :: proc(ram: []u8) -> (changed, of: int) {
+	for a, i in entry_addr {
+		changed += int(intrinsics.unaligned_load((^u32)(&ram[a])) != entry_word[i])
+	}
+	return changed, len(entry_addr)
 }
 
 // Unchecked: the slot is tested against len(fn_table) first.

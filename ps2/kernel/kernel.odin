@@ -297,7 +297,12 @@ syscall :: proc(pc: u32) {
 		c.cop0[16] = config
 		for t in k.threads {if t != nil {t.regs.cop0[16] = config}}
 	case 0x63, 0x67: ret = i64(cpu.state.cop0[a0 & 31]) // GetCop0, iGetCop0
-	case 0x64, 0x68: // FlushCache
+	case 0x64, 0x68:
+		// FlushCache, iFlushCache: there is no cache, only code loaded over the
+		// recompiled functions to see, and only a flush that invalidates the
+		// instruction cache (modes 2 and 3) comes ahead of running it. The
+		// data-cache modes are called by the million.
+		if a0 & 2 != 0 {flush_text_check()}
 	case 0x6b: // SifStopDma: transfers complete instantly
 	case 0x70: ret = i64(mem.gs_imr) // GsGetIMR
 	case 0x71: // GsPutIMR

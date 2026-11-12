@@ -6,7 +6,9 @@
 // LoadExecPS2 also clears user memory and loads the ELF from the disc, which
 // retail leaves to the ROM's loader; the program gets the arguments that
 // loader passes on. A new program over the recompiled code turns the function
-// table off (text_check).
+// table off (text_check), and so does code a program loads over its own text
+// with no exec, seen at its functions' first words when it flushes the
+// instruction cache (flush_text_check).
 package ps2_kernel
 
 import "base:intrinsics"
@@ -51,7 +53,7 @@ Exec_State :: struct {
 }
 
 // Once the boot program is in RAM, before it runs (ps2 run): what text_check
-// compares against. A range it cannot hash is said here, since every exec
+// and flush_text_check compare against. A range it cannot hash is said here, since every exec
 // then interprets. A standalone blob's range ends at the first word of its
 // last function (ps2 load_native), so a change past that is not seen.
 exec_boot :: proc() {
@@ -63,6 +65,7 @@ exec_boot :: proc() {
 		return
 	}
 	e.text_hash = text_hash()
+	cpu.entries_keep(mem.ram)
 }
 
 @(private = "file")
@@ -107,6 +110,26 @@ text_check :: proc(entry: u32) -> (same: bool) {
 		fmt.eprintfln("ee: exec %08x: text %08x-%08x differs from the recompiled program; interpreting", entry, cpu.text_lo, cpu.text_hi)
 	}
 	return
+}
+
+// FlushCache of the instruction cache: a program that loads code over its
+// own text (a level's, over the boot program's) invalidates the instruction
+// cache before it runs it. While the table is on, the first word of any of
+// its functions no longer being the boot program's turns it off, said once;
+// it stays off until an exec finds the boot program back (text_check). Only
+// those words are compared: the range holds data too, which a program
+// writes, and each function's first word is code. So a change inside a
+// function that leaves every first word alone is not seen, nor is a load
+// with no flush or with only a data-cache flush, and a native function on
+// the host stack when its words change runs the old code until it returns.
+flush_text_check :: proc() {
+	e := &k.exec
+	if e.text_off || !e.text_ok {return}
+	changed, of := cpu.entries_changed(mem.ram)
+	if changed == 0 {return}
+	e.text_off = true
+	cpu.dispatch_set(false)
+	fmt.eprintfln("ee: FlushCache at frame %d: text %08x-%08x differs from the recompiled program (%d of %d function entry words); interpreting", k.frame, cpu.text_lo, cpu.text_hi, changed, of)
 }
 
 // Start the argument list over.
