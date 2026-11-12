@@ -60,6 +60,20 @@
 // run native: its own `jr $ra` (a host return in native code) must unwind
 // and jump as the interpreted C's does (ps2 learned_jr), so every case
 // ends as in the default run.
+//
+// With the argument catch (the coroutine model only), the call a throw
+// returns to is one learned code made, which leaves no record but the
+// callee's own run (cpu.Learned_Run). K calls M, M calls N, N calls T, and
+// T `jr $ra`s to K's call of M with K's sp there (plus DELTA): M's and N's
+// counts are skipped, K goes on. Each case has its own copy of the four,
+// some of them learned code run native, and must end as the copy with none
+// learned does, with as many unwinds and jumps: an interpreted T and a
+// learned one to a learned K and M; the same through a native N; to an
+// interpreted K past learned M, N and T, and past a learned N and T alone;
+// and with another sp than K's (DELTA 16), which no call has: a jump, then
+// K's own return unwinds to the call of K. Last, a learned X that jumps
+// out of its words to Y with another sp: Y's return is one to X's own
+// call, which X's jump out must end.
 package main
 
 import "core:fmt"
@@ -673,11 +687,165 @@ vblank_stale :: proc() {
 	os.exit(0)
 }
 
+// catch: the functions of a case, its learned ones native.
+Catch_Fn :: enum {
+	K,
+	M,
+	N,
+	T,
+	X,
+}
+
+Catch_Case :: struct {
+	name:    string,
+	learned: bit_set[Catch_Fn],
+	delta:   u32,
+	tail:    bool, // main calls X, not K
+	ref:     int, // the case with none learned it must end as
+	counted: bool, // with as many unwinds and jumps too
+}
+
+CATCH_CASES :: [?]Catch_Case {
+	{name = "none learned", ref = 0, counted = true},
+	{name = "none learned, another sp", delta = 16, ref = 1, counted = true},
+	{name = "none learned, a jump out", tail = true, ref = 2, counted = true},
+	{name = "interpreted T to learned K and M", learned = {.K, .M}, ref = 0, counted = true},
+	{name = "learned T to learned K and M", learned = {.K, .M, .N, .T}, ref = 0, counted = true},
+	{name = "interpreted T past native N to learned K and M", learned = {.K, .M, .N}, ref = 0, counted = true},
+	{name = "learned T past learned M and N to interpreted K", learned = {.M, .N, .T}, ref = 0, counted = true},
+	{name = "learned T past learned N to interpreted K and M", learned = {.N, .T}, ref = 0, counted = true},
+	{name = "learned T, another sp", learned = {.K, .M, .N, .T}, delta = 16, ref = 1, counted = true},
+	{name = "interpreted T, another sp, learned K and M", learned = {.K, .M}, delta = 16, ref = 1, counted = true},
+	// The interpreted X goes on in its own run; the learned one's jump
+	// out is a run of its own, whose return unwinds to X's call.
+	{name = "learned X jumps out", learned = {.X}, tail = true, ref = 2},
+}
+
+CATCH_BASE :: u32(0x00110000) // case k's code at CATCH_BASE + k * 0x1000
+CATCH_FN :: 0x100 // each function's room; X's Y is past X's
+STEP :: DATA + 0x200 // the cases done
+GO :: DATA + 0x204 // the cases the host has seen done
+CATCH_RES :: DATA + 0x300
+
+catch_fn :: proc(k: int, f: Catch_Fn) -> u32 {
+	return CATCH_BASE + u32(k) * 0x1000 + (u32(f) + 1) * CATCH_FN
+}
+
+program_catch :: proc() {
+	cases := CATCH_CASES
+	a := Asm{ENTRY}
+	for c, k in cases {
+		li(&a, SP, STACK)
+		li(&a, T7, DATA)
+		li(&a, T0, c.delta)
+		put(&a, sw(T0, DELTA - DATA, T7), addiu(S2, ZERO, 0))
+		put(&a, jal(catch_fn(k, c.tail ? .X : .K)), NOP)
+		li(&a, T7, DATA)
+		put(&a, sw(S2, CATCH_RES - DATA + 4 * u32(k), T7))
+		put(&a, addiu(T0, ZERO, i32(k + 1)), sw(T0, STEP - DATA, T7))
+		// Until the host has counted this case's unwinds and jumps.
+		put(&a, lw(T1, GO - DATA, T7), i_type(5, T1, T0, -2), NOP)
+
+		// K: its sp to SP0, M, then (K_RET) the sp back, its count and a return.
+		f := Asm{catch_fn(k, .K)}
+		put(&f, addiu(SP, SP, -16), sw(RA, 0, SP), sw(S0, 4, SP), addu(S0, SP, ZERO))
+		li(&f, T7, DATA)
+		put(&f, sw(SP, SP0 - DATA, T7), jal(catch_fn(k, .M)), NOP)
+		k_ret := f.pc
+		put(&f, addu(SP, S0, ZERO), addiu(S2, S2, 1), lw(RA, 0, SP), lw(S0, 4, SP), addiu(SP, SP, 16), JR_RA, NOP)
+		catch_load(c, .K, f)
+		// M and N: the next one, then a count the throw skips.
+		for m in ([?]Catch_Fn{.M, .N}) {
+			f = {catch_fn(k, m)}
+			put(&f, addiu(SP, SP, -16), sw(RA, 0, SP), jal(catch_fn(k, m == .M ? .N : .T)), NOP)
+			put(&f, addiu(S2, S2, m == .M ? 100 : 1000), lw(RA, 0, SP), addiu(SP, SP, 16), JR_RA, NOP)
+			catch_load(c, m, f)
+		}
+		// T: `jr $ra` to K_RET with K's sp at its call of M, plus DELTA.
+		f = {catch_fn(k, .T)}
+		li(&f, T7, DATA)
+		put(&f, lw(T0, SP0 - DATA, T7), lw(T1, DELTA - DATA, T7), addu(SP, T0, T1))
+		li(&f, RA, k_ret)
+		put(&f, JR_RA, NOP)
+		catch_load(c, .T, f)
+		// X: a frame, then a jump out of its words to Y, which drops the
+		// frame, counts and returns to X's caller.
+		f = {catch_fn(k, .X)}
+		y := f.pc + CATCH_FN
+		put(&f, addiu(SP, SP, -16), j_type(2, y), NOP)
+		catch_load(c, .X, f)
+		f = {y}
+		put(&f, addiu(SP, SP, 16), addiu(S2, S2, 7), JR_RA, NOP)
+	}
+	put(&a, i_type(4, ZERO, ZERO, -1), NOP) // hang
+	assert(a.pc <= FN_R)
+}
+
+// The function f of case c ends at a.pc: learned, when the case has it so.
+catch_load :: proc(c: Catch_Case, f: Catch_Fn, a: Asm) {
+	lo := a.pc &~ (CATCH_FN - 1)
+	assert(a.pc - lo <= CATCH_FN)
+	if f in c.learned {load_native(lo, a.pc)}
+}
+
+catch_seen: u32
+catch_last: [2]u64 // unwinds and jumps when the case before was done
+catch_got: [len(CATCH_CASES)][2]u64
+
+vblank_catch :: proc() {
+	cases := CATCH_CASES
+	if kernel.k.frame > 120 {
+		fmt.eprintfln("fail: catch: %d of %d cases done after 120 frames", catch_seen, len(cases))
+		os.exit(1)
+	}
+	step := mem.rd32(STEP)
+	if step == catch_seen {return}
+	now := [2]u64{cpu.interp_unwinds, cpu.interp_jumps}
+	catch_got[catch_seen] = now - catch_last
+	catch_last = now
+	catch_seen = step
+	mem.wr32(GO, step)
+	if int(step) != len(cases) {return}
+	ok := true
+	for c, k in cases {
+		r, got := mem.rd32(CATCH_RES + 4 * u32(k)), catch_got[k]
+		want, want_got := mem.rd32(CATCH_RES + 4 * u32(c.ref)), catch_got[c.ref]
+		if r != want || (c.counted && got != want_got) {
+			ok = false
+			fmt.eprintfln("fail: catch: %s: s2 %d with %d unwinds and %d jumps; none learned: s2 %d, %d, %d", c.name, r, got[0], got[1], want, want_got[0], want_got[1])
+		}
+	}
+	// What the cases with none learned must be: K's count alone, with one
+	// unwind; the same after one jump; Y's count, a plain return.
+	refs := [3][3]u64{{1, 1, 0}, {1, 1, 1}, {7, 0, 0}}
+	for w, k in refs {
+		if u64(mem.rd32(CATCH_RES + 4 * u32(k))) != w[0] || catch_got[k] != {w[1], w[2]} {
+			ok = false
+			fmt.eprintfln("fail: catch: %s: s2 %d with %d unwinds and %d jumps, want %d, %d, %d", cases[k].name, mem.rd32(CATCH_RES + 4 * u32(k)), catch_got[k][0], catch_got[k][1], w[0], w[1], w[2])
+		}
+	}
+	if cpu.learned_calls == 0 || cpu.unwinding {
+		ok = false
+		fmt.eprintfln("fail: catch: %d native calls, cpu.unwinding %v at the end", cpu.learned_calls, cpu.unwinding)
+	}
+	if !ok {os.exit(1)}
+	fmt.printfln("ee_unwind catch: ok (%d cases, %d native calls)", len(cases), cpu.learned_calls)
+	os.exit(0)
+}
+
 main :: proc() {
 	ps2.init()
 	cpu.text_range(ENTRY, ENTRY + 0x1000)
 	mode := len(os.args) > 1 ? os.args[1] : ""
-	if mode == "cap" {
+	if mode == "catch" {
+		when core.FLAT {
+			fmt.eprintln("fail: catch: the coroutine model only")
+			os.exit(1)
+		}
+		cpu.text_range(ENTRY, CATCH_BASE + len(CATCH_CASES) * 0x1000)
+		kernel.vblank_hook = vblank_catch
+		program_catch()
+	} else if mode == "cap" {
 		core.fatal_cleanup = cap_fatal
 		kernel.vblank_hook = vblank_cap
 		program_cap()

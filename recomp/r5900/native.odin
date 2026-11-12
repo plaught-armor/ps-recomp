@@ -76,6 +76,7 @@ EE_SIGS := [?]native.Sig {
 	{"kernel.run_events", 0, false},
 	{"ps2.mod_call_original", 0, false}, // mods blobs only
 	{"ps2.learned_jr", 1, false}, // learned blobs only, not wasm32's
+	{"ps2.learned_left", 0, false}, // the same
 	{"ps2.spin_probe", 1, false},
 	{"ps2.exec_op", 3, false},
 	{"ps2.ld", 2, false},
@@ -1509,9 +1510,10 @@ events_exit :: proc(a: ^native.Asm, t: native.Reg) {
 	native.bind(a, skip)
 }
 
-// pc = t: the block at t, or outside the function's blocks.
+// pc = t: the block at t, or outside the function's blocks (learned: in
+// a learned function, jump_out).
 @(private = "file")
-go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
+go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32, learned: bool) {
 	if l, ok := labels[t]; ok {
 		native.jmp(a, l)
 		return
@@ -1523,7 +1525,20 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 	}
 	native.mov_imm(a, .A, f.entry)
 	native.mov_imm(a, .B, t)
-	native.call(a, "cpu.jump_unknown", .A, .B)
+	jump_out(a, learned)
+}
+
+// The tail call of cpu.jump_unknown with the function's entry in A and the
+// address in B, then the return. A learned function tests cpu.unwinding
+// after it as after a call: the code it ran may unwind to the function's
+// own call (ps2 learned_left), which the plain return would not end.
+@(private = "file")
+jump_out :: proc(a: ^native.Asm, learned: bool) {
+	if learned {
+		native.call_leave(a, UNWINDING, "cpu.jump_unknown", .A, .B)
+	} else {
+		native.call(a, "cpu.jump_unknown", .A, .B)
+	}
 	native.ret(a)
 }
 
@@ -1540,6 +1555,10 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32) {
 // (learned_blob's code), each `jr $ra` calls ps2.learned_jr first, so one
 // to another address than the function's own return address unwinds or
 // jumps as the interpreter's does: static native code's never needs to.
+// And a learned function that leaves with cpu.unwinding set, after a call
+// or a jump out of its words, calls ps2.learned_left before it returns: an
+// unwind to its own call ends there. That call is past the epilogue, so a
+// call that returns runs what it ran without it.
 //
 // On wasm32 the code is a step of the FLAT runner: one function, entered
 // at the block of its pc parameter, that runs until the interpreter has
@@ -1584,7 +1603,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		// again: every pc entered at is a block.
 		for b in fs {assert(b.addr in labels, "wasm32 entry without a block")}
 		if len(fs) == 1 {
-			go(a, f, labels, f.entry)
+			go(a, f, labels, f.entry, learned)
 		} else {
 			// t = the pc entered at, found among the blocks.
 			native.entry_pc(a, .T)
@@ -1595,7 +1614,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		if l, ok := funcs[f.entry]; ok {native.bind_at(a, l, int(at))}
 		trace(a, f.entry)
 		events(a)
-		go(a, f, labels, f.entry)
+		go(a, f, labels, f.entry, learned)
 	}
 	// Open ifs: the label each one ends at, or -1 for a group (Branch,
 	// Jump_Reg) that only scopes t.
@@ -1642,7 +1661,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				}
 				if s.n - s.target < SPIN_SPAN * 4 {spin(a, s.n)}
 			}
-			go(a, f, labels, s.target)
+			go(a, f, labels, s.target, learned)
 			leaves = true
 		case .Call:
 			if wasm {
@@ -1705,7 +1724,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		}
 	}
 	again(a, leaves, block)
-	native.func_end(a)
+	native.func_end(a, "ps2.learned_left" if learned && a.arch != .Wasm32 else "")
 	// One lookup of t among the case pcs, shared by every Goto_Reg (and on
 	// wasm32 the entry).
 	if lookup >= 0 {
@@ -1718,8 +1737,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		} else {
 			native.mov_imm(a, .A, f.entry)
 			native.mov(a, .B, .T)
-			native.call(a, "cpu.jump_unknown", .A, .B)
-			native.ret(a)
+			jump_out(a, learned)
 		}
 	}
 	// Interior entries share the body and its epilogue.

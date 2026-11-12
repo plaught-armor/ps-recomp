@@ -63,6 +63,7 @@ odin run tests/ee_unwind -collection:ps=. -define:PS_FLAT=true -- cap
 odin run tests/ee_unwind -collection:ps=. -- native
 odin run tests/ee_unwind -collection:ps=. -- stale
 odin run tests/ee_unwind -collection:ps=. -- learned
+odin run tests/ee_unwind -collection:ps=. -- catch
 odin run tests/psx_bios -collection:ps=.
 odin run tests/psx_bios_libc -collection:ps=.
 odin run tests/disc -collection:ps=.

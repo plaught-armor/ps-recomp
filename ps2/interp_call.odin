@@ -12,7 +12,10 @@
 // throw that restored a catch frame's registers): the runs in between
 // return, and the one that made the call goes on there
 // (interp_unwind_find). Native code between them returns at once too
-// (cpu.unwinding). Host code's call (cpu.host_call: a handler's, a
+// (cpu.unwinding). A learned function called to return there with that sp
+// is such a call too, whoever made it (learned code's calls leave no
+// record): the runs in between return, and it returns to its caller
+// (learned_unwind). Host code's call (cpu.host_call: a handler's, a
 // syscall's) stops it: the `jr` returns as before (shown once under
 // PS_DEBUG). One that no call returns to with that sp (a coroutine's
 // resume, or a fiber switch one call down whose return address is another
@@ -45,10 +48,17 @@ interp_seen: map[u32]bool
 @(private = "file")
 interp_unwind: ^cpu.Interp_Frame
 
+// The learned function's run an unwind returns to (interp_unwind_find),
+// when it is no interpreted call: the runs above it return, and it returns
+// to its caller, which goes on (learned_left). Never set with
+// interp_unwind, nor across a thread switch or an events check: not state.
+@(private = "file")
+learned_unwind: ^cpu.Learned_Run
+
 // The longjmps shown so far, each kind once under PS_DEBUG (a search past
 // cpu.UNWIND_MAX once always): not state.
 @(private = "file")
-unwind_shown: bit_set[enum {Done, Native, Max, Jump, Under, Stale}]
+unwind_shown: bit_set[enum {Done, Learned, Native, Max, Jump, Under, Stale}]
 
 @(private)
 branch_taken :: proc(i: r5900.Insn) -> bool {
@@ -169,15 +179,28 @@ interp_run :: proc(entry: u32) -> cpu.Interp_Run {
 // another sp is an interpreted run's (interp_body), with the function's run.
 // An unwind to an outer call returns from it at once (cpu.unwinding); a
 // jump interprets on from there, in the learned function's place, and
-// returns when that run does. Under FLAT, which never runs learned code,
-// and from code no interp_call entered, nothing.
+// returns when that run does: an unwind to this function's own call that
+// comes back through that run ends here, as the function returns. Under
+// FLAT, which never runs learned code, and from code no interp_call
+// entered, nothing.
 learned_jr :: proc(pc: u32) {
 	lr := cpu.learned_top
 	if lr == nil {return}
 	t := u32(cpu.state.r[31].d[0])
 	if t == lr.ra && u32(cpu.state.r[29].d[0]) == lr.sp || !interp_unwind_find(t, lr.direct, lr.gaps) {return}
-	if goto_pc(lr.entry, pc, t) {return}
-	interp_body(lr.entry, nil, lr.run, t)
+	if !goto_pc(lr.entry, pc, t) {interp_body(lr.entry, nil, lr.run, t)}
+	learned_left()
+}
+
+// A learned function leaves, an unwind under way (cpu.unwinding: its code
+// calls this on that path alone, recomp/r5900 native_func, so a call that
+// returns runs nothing more): when the unwind is to this function's own
+// call, it ends here, and the function returns to its caller as from any
+// call. From code no interp_call entered, nothing.
+learned_left :: proc() {
+	if learned_unwind == nil || learned_unwind != cpu.learned_top {return}
+	learned_unwind = nil
+	cpu.unwinding = false
 }
 
 // The run of the function at entry (run, from interp_run), from pc; lf is
@@ -276,7 +299,7 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool, gaps: u32) -> bool
 	cpu.interp_top = &fr
 	cpu.call(t)
 	cpu.interp_top = fr.prev
-	if interp_unwind == nil {return false}
+	if !cpu.unwinding {return false}
 	if interp_unwind != &fr {return true}
 	interp_unwind = nil
 	cpu.unwinding = false
@@ -294,15 +317,40 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool, gaps: u32) -> bool
 // the run (gaps, the run's) left open, at most cpu.NATIVE_STALE_MAX gaps.
 // A barrier record (host code's call) is under every run above it, and not
 // counted.
+//
+// A learned function's run (cpu.learned_top's chain) whose own return
+// address and sp at its call are t and that sp is a call returning there
+// too, the only record of one learned or native code made: the innermost
+// of the cpu.UNWIND_MAX runs above. It is the call to unwind to
+// (learned_unwind) when it is inside every record that matches, with no
+// barrier record inside it and no mods. The order of the two chains is the
+// host stack's: every record and run of a thread is a local on that
+// thread's stack, which grows down, so in each chain prev is at a higher
+// address (asserted here), and of a record and a run the one at the lower
+// address is the inner.
 @(private = "file")
 interp_unwind_find :: proc(t: u32, direct: bool, gaps: u32) -> bool {
 	sp := u32(cpu.state.r[29].d[0])
+	lm: ^cpu.Learned_Run
+	for l, k := cpu.learned_top, 0; l != nil && k < cpu.UNWIND_MAX; l, k = l.prev, k + 1 {
+		assert(l.prev == nil || uintptr(l.prev) > uintptr(l), "ee: a learned run under an older one on the host stack")
+		if l.ra == t && l.sp == sp {
+			lm = l
+			break
+		}
+	}
 	ok := direct
+	barred := cpu.mod_on
 	n := 0
 	for f := cpu.interp_top; f != nil; f = f.prev {
+		assert(f.prev == nil || uintptr(f.prev) > uintptr(f), "ee: a call record under an older one on the host stack")
+		if lm != nil && uintptr(f) > uintptr(lm) {break}
 		// Host code's call (cpu.host_call): not a call to match. The run
 		// above it is not direct, so ok is already false past it.
-		if f.barrier {continue}
+		if f.barrier {
+			barred = true
+			continue
+		}
 		if n == cpu.UNWIND_MAX {
 			if .Max not_in unwind_shown {
 				unwind_shown += {.Max}
@@ -330,6 +378,24 @@ interp_unwind_find :: proc(t: u32, direct: bool, gaps: u32) -> bool {
 			return false
 		}
 		ok = ok && f.direct
+	}
+	if lm != nil {
+		if barred {
+			if cpu.debug >= 1 && .Native not_in unwind_shown {
+				unwind_shown += {.Native}
+				fmt.eprintfln("ee: jr $ra to %08x: the learned function %08x was called to return there, past host code's call; returning as before", t, lm.entry)
+			}
+			return false
+		}
+		if cpu.debug >= 1 && .Learned not_in unwind_shown {
+			unwind_shown += {.Learned}
+			fmt.eprintfln("ee: jr $ra to %08x: unwound to the call of the learned function %08x", t, lm.entry)
+		}
+		learned_unwind = lm
+		cpu.unwinding = true
+		cpu.interp_unwinds += 1
+		cpu.interp_unwinds_native += 1
+		return false
 	}
 	if !ok {
 		if cpu.debug >= 1 && .Under not_in unwind_shown {

@@ -482,14 +482,18 @@ align_code :: proc(a: ^Asm) {
 	}
 }
 
-func_end :: proc(a: ^Asm) {
+// The end of the function: its epilogue. With left (not wasm32), the path
+// a call_leave takes out of the function calls import left first, with no
+// argument, in a second copy of the epilogue after the first: the return
+// that is no leave runs none of it.
+func_end :: proc(a: ^Asm, left := "") {
 	if a.arch == .Wasm32 {
 		wasm_func_end(a)
 		return
 	}
 	bind(a, a.epilogue)
 	cache_sync(a, true)
-	bind(a, a.leave)
+	if left == "" {bind(a, a.leave)}
 	switch a.arch {
 	case .X64_SysV, .X64_Win:
 		x64_epilogue(a)
@@ -497,6 +501,19 @@ func_end :: proc(a: ^Asm) {
 		a64_epilogue(a)
 	case .Wasm32:
 		panic("native: wasm32")
+	}
+	if left != "" {
+		bind(a, a.leave)
+		switch a.arch {
+		case .X64_SysV, .X64_Win:
+			x64_call(a, imp(a, left), nil)
+			x64_epilogue(a)
+		case .Arm64:
+			a64_call(a, imp(a, left), nil)
+			a64_epilogue(a)
+		case .Wasm32:
+			panic("native: wasm32")
+		}
 	}
 	for c in a.cold {
 		bind(a, c.far)

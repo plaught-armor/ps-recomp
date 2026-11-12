@@ -283,8 +283,12 @@ Interp_Run :: struct {
 // address than run.ra with another sp than run.sp unwinds or jumps as an
 // interpreted run's does (ps2 learned_jr): learned code makes its calls as
 // native code does, with no Interp_Frame, so its own return is the only
-// one to check. Each thread has its own (learned_tops by thread id,
-// swapped with interp_top); like those records, on the coroutines' stacks.
+// one to check. It is also the record of the call that entered it: a
+// `jr $ra` above it to run.ra with run.sp unwinds to it (ps2
+// interp_unwind_find), which is how a call learned code made is found.
+// Each thread has its own (learned_tops by thread id, swapped with
+// interp_top); like those records, on the coroutines' stacks, so of any
+// two of a thread's records and runs the inner is at the lower address.
 Learned_Run :: struct {
 	using run: Interp_Run,
 	entry:     u32,
