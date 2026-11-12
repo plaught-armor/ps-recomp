@@ -284,6 +284,7 @@ game :: proc(_: rawptr) {
 	test_boot_gaps()
 	test_card_dirty()
 	test_mc2()
+	test_sd_mmix()
 	test_sd_mvol() // last: it leaves the master volumes off unity
 
 	if failed {os.exit(1)}
@@ -3961,6 +3962,24 @@ test_msgbx :: proc() {
 	}
 	cap_ok &&= w(base, brk[0]) == base + brk[2] && w(base, brk[2]) == base + brk[1]
 	check(cap_ok, "msgbx: a send into a ring with no way back to the last goes in as the newest, counted once")
+}
+
+test_sd_mmix :: proc() {
+	// MMIX reads what sceSdInit leaves, then exactly what was set, per core:
+	// all 16 bits, core 0's low four too, which gate nothing there.
+	mmix_get :: proc(core: u32) -> u32 {
+		r3000.state.r[4] = 0x0800 | core
+		v, _ := iop.libsd_fn(6)
+		return v
+	}
+	r3000.state.r[4] = 0
+	iop.libsd_fn(4)
+	check(mmix_get(0) == 0xff0 && mmix_get(1) == 0xffc, "libsd: sceSdGetParam reads MMIX 0xff0 and 0xffc after sceSdInit")
+	for v, core in ([2]u32{0xffff, 0x0123}) {
+		r3000.state.r[4], r3000.state.r[5] = 0x0800 | u32(core), v
+		iop.libsd_fn(5)
+	}
+	check(mmix_get(0) == 0xffff && mmix_get(1) == 0x0123, "libsd: sceSdGetParam reads MMIX as set, per core")
 }
 
 test_sd_mvol :: proc() {

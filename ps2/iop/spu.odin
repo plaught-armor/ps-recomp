@@ -83,6 +83,7 @@ spu: struct {
 	// 0x3fff loses a step on loud samples.
 	master: [2][2]i32,
 	master_reg: [2][2]u16, // MVOLL, MVOLR as last written, 0 until then, for sceSdGetParam
+	mmix:   [2]u16, // MMIX as last written, for sceSdGetParam; no gate of it is modelled
 	block:  [2]Sdr_Block, // the block transfers, per channel
 	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
 	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
@@ -938,8 +939,9 @@ sd_get_param :: proc(id: u32) -> (u32, bool) {
 
 // sceSdSetParam(id, value) for a core's: MVOLL, MVOLR, EVOLL, EVOLR and the
 // input area's volume BVOLL, BVOLR (a signed 16-bit level, 0x7fff about
-// unity, as PCSX2 takes it) set; MMIX, the external input's AVOL and the
-// read-only MVOLX are taken and change nothing.
+// unity, as PCSX2 takes it) set; MMIX is kept for sceSdGetParam and gates
+// nothing; the external input's AVOL and the read-only MVOLX are taken and
+// change nothing.
 sd_core_param :: proc(id, value: u32) -> bool {
 	c := id & 1
 	switch id & 0xff00 {
@@ -949,19 +951,24 @@ sd_core_param :: proc(id, value: u32) -> bool {
 	case SD_P_EVOLR: spu.reverb[c].evol[1] = i32(i16(u16(value)))
 	case SD_P_BVOLL: spu.bvol[c][0] = i32(i16(u16(value)))
 	case SD_P_BVOLR: spu.bvol[c][1] = i32(i16(u16(value)))
-	case SD_P_MMIX, SD_P_AVOLL, SD_P_AVOLR, SD_P_MVOLXL, SD_P_MVOLXR:
+	case SD_P_MMIX: spu.mmix[c] = u16(value)
+	case SD_P_AVOLL, SD_P_AVOLR, SD_P_MVOLXL, SD_P_MVOLXR:
 	case: return false
 	}
 	return true
 }
 
-// sceSdGetParam(id) for a core's MVOLL, MVOLR and EVOLL, EVOLR. A master
+// sceSdGetParam(id) for a core's MMIX, MVOLL, MVOLR and EVOLL, EVOLR. A master
 // volume reads back the register exactly as written, bit 15 (sweep) kept, as
 // PCSX2 keeps it (V_VolumeSlide::RegSet stores the raw value, and its
 // register table reads MVOLL and MVOLR from that copy).
+// MMIX reads back all 16 bits written, core 0's too, though its low four
+// gate nothing: PCSX2's RegWrite_Core masks only the copy it gates with and
+// stores the value whole in Regs.MMIX, which its register table reads.
 sd_core_get :: proc(id: u32) -> (u32, bool) {
 	c := id & 1
 	switch id & 0xff00 {
+	case SD_P_MMIX: return u32(spu.mmix[c]), true
 	case SD_P_MVOLL: return u32(spu.master_reg[c][0]), true
 	case SD_P_MVOLR: return u32(spu.master_reg[c][1]), true
 	case SD_P_EVOLL: return u32(u16(spu.reverb[c].evol[0])), true
@@ -1104,6 +1111,7 @@ sd_lib_init :: proc() {
 	spu.irqa, spu.irq_watch, spu.in_irq, spu.bvol = {}, 0, {max(u64), max(u64)}, {}
 	spu.mute, spu.noise_clk, spu.effect = 0, {}, {} // retail's init sets ATTR to the core's enable alone; SPDIF it keeps
 	spu.block = {}
+	spu.mmix = {0xff0, 0xffc} // as PCSX2's V_Core::Init leaves it, the value it notes a PS2 reads after sceSdInit
 	for &c in spu.switches {c = {.PMON = 0, .NON = 0, .VMIXL = 0xffffff, .VMIXEL = 0xffffff, .VMIXR = 0xffffff, .VMIXER = 0xffffff}}
 }
 
