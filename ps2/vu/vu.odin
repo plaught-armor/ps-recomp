@@ -866,6 +866,15 @@ vu1_start :: proc(addr: u32) {
 
 @(private)
 vu1_exec :: proc(addr: u32, compiled: bool) {
+	#force_no_inline vu1_run(addr, compiled)
+	vu1_kick_flush() // the program stopped: at the E bit's end, or at the step limit
+}
+
+// vu1_exec without the XGKICK flush. Kept a procedure of its own, not
+// inlined: with the flush call in the same body as micro_exec's inlined
+// loop the interpreter ran more instructions per pair.
+@(private)
+vu1_run :: proc(addr: u32, compiled: bool) {
 	pc, ended, _ := micro_exec(&vu1, &vu1_table, &vu1_micro_gen, vu1_pairs[:], addr, compiled, false)
 	vu_drain(&vu1)
 	if !ended && !vu1_overrun {
@@ -1563,23 +1572,56 @@ vu_lower :: proc(v: ^Vu, w, pc: u32) -> (taken: bool, target: u32) #no_bounds_ch
 	return
 }
 
-// XGKICK: send the GIF packet at quadword `addr` of VU1 memory down PATH1,
-// following tags to the one with EOP.
 @(private)
 vu1_kick_hash: u64
 @(private)
 vu1_kick_mute: bool
 
-// The packet is fed to the GIF straight out of VU1 memory, split where it
-// wraps past the end. gif_feed keeps no pointer into the data past the call
-// and raises interrupts only as pending, so nothing writes VU1 memory while
-// the packet is read.
+// An XGKICK whose packet has not been read yet, and its address. Empty
+// whenever no VU1 program runs: vu1_exec sends it when the program stops.
+vu1_kick_latched: bool
+vu1_kick_addr: u16
+// A packet was dropped (vu1_kick_send); reported once.
+vu1_kick_dropped: bool
+
+// XGKICK: send the GIF packet at quadword `addr` of VU1 memory down PATH1.
+// The GIF does not read the packet at the instruction: it starts a cycle on
+// and reads while the program runs, so a program may kick first and store
+// the tag (its EOP, say) in the pairs that follow. The kick is latched here
+// and the packet read when the program stops (vu1_exec) or kicks again,
+// whichever comes first. The interpreter, emitted and native code all call
+// this.
 vu1_xgkick :: proc(addr: u16) {
+	vu1_kick_flush()
+	vu1_kick_addr, vu1_kick_latched = addr, true
+}
+
+// Send the latched XGKICK, if any.
+vu1_kick_flush :: proc() {
+	if !vu1_kick_latched {return}
+	vu1_kick_latched = false
+	vu1_kick_send(vu1_kick_addr)
+}
+
+// Send the packet at quadword `addr` down PATH1, following tags to the one
+// with EOP. The packet is fed to the GIF straight out of VU1 memory, split
+// where it wraps past the end. gif_feed keeps no pointer into the data past
+// the call and raises interrupts only as pending, so nothing writes VU1
+// memory while the packet is read.
+//
+// A walk that passes the size of VU1 memory without meeting EOP is not a
+// packet: nothing is fed, so PATH1 does not keep the GIF waiting for an end
+// that never comes. PCSX2 does the same: Gif_Unit::GetGSPacketSize
+// (Gif_Unit.h) gives size 0 for a PATH1 packet as large as VU memory, and
+// _vuXGKICKTransfer (VUops.cpp) ends the transfer on size 0.
+@(private)
+vu1_kick_send :: proc(addr: u16) {
 	qwords := u32(len(vu1_mem) / 16)
 	start := u32(addr) % qwords
 	a := start
 	total: u32 = 0
-	for total < qwords {
+	eop := false
+	for total < qwords && !eop {
 		lo := (^u64)(&vu1_mem[a * 16])^
 		nloop, nreg := u32(lo & 0x7fff), u32(lo >> 60)
 		if nreg == 0 {nreg = 16}
@@ -1591,7 +1633,15 @@ vu1_xgkick :: proc(addr: u16) {
 		}
 		a = (a + n) % qwords
 		total += n
-		if lo & 0x8000 != 0 {break}
+		eop = lo & 0x8000 != 0
+	}
+	if !eop {
+		if vu_check {vu1_kick_hash = (vu1_kick_hash ~ 0xd809) * 0x100000001b3}
+		if !vu1_kick_dropped {
+			vu1_kick_dropped = true
+			fmt.eprintfln("vu1: XGKICK at %03x has no EOP within VU1 memory, dropped", start)
+		}
+		return
 	}
 	if vu_check {
 		a = start
@@ -1698,4 +1748,7 @@ vu_snap :: proc() {
 	core.snap_add(&vu1_pairs)
 	core.snap_add(&vu1_kick_hash)
 	core.snap_add(&vu1_kick_mute)
+	core.snap_add(&vu1_kick_latched)
+	core.snap_add(&vu1_kick_addr)
+	core.snap_add(&vu1_kick_dropped)
 }

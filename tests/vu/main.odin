@@ -50,6 +50,10 @@
 //
 // Then VU0's window onto VU1's registers, read and written by LQ and SQ.
 //
+// Then the XGKICK latch: the packet is read when the program stops or kicks
+// again, not at the instruction, so a tag stored in the pair after the kick
+// is the tag sent; a walk with no EOP inside VU1 memory sends nothing.
+//
 // Last, the branch VI delay: a conditional branch right after a pair that
 // writes its VI reads it from before that write (tests/vu_programs DELAY).
 //
@@ -627,6 +631,7 @@ gif_paths :: proc() {
 	kick := [2][4]u32{gif_tag(1), ad41}
 	copy(vu.vu1_mem[:32], ([^]u8)(&kick)[:32])
 	vu.vu1_xgkick(0)
+	vu.vu1_kick_flush()
 	if gs.state.regs[0x41] != 0 {fail("XGKICK inside a split DIRECT packet went in before the packet's end")}
 	feed(&vu.vifs[1], 0x50000001, ad42[0], ad42[1], ad42[2], ad42[3])
 	r := gs.state.regs
@@ -672,6 +677,7 @@ gif_kick :: proc() {
 	kick := [2][4]u32{gif_tag(1), gif_ad(0x41, 0x2222)}
 	copy(vu.vu1_mem[:32], ([^]u8)(&kick)[:32])
 	vu.vu1_xgkick(0)
+	vu.vu1_kick_flush()
 }
 
 @(private = "file")
@@ -1246,6 +1252,165 @@ park :: proc() {
 	if v.vi[7] != ((1 << 24) + 2) / 3 & 0xffff {fail("park: the loop that writes vi7 did not run to the limit: vi7 %d", v.vi[7])}
 }
 
+// VU1 data memory as 32-bit words.
+@(private = "file")
+vu1_words :: proc() -> [^]u32 {return ([^]u32)(raw_data(vu.vu1_mem[:]))}
+
+// Each case of kick_latch as the interpreter runs it and as registered
+// compiled code that makes the same calls and stores.
+@(private = "file")
+Kick_Case :: struct {
+	name:     string,
+	setup:    proc(),
+	pairs:    [][2]u32,
+	compiled: vu.Vu_Run,
+	check:    proc(how: string),
+}
+
+@(private = "file")
+KICK_NOP :: 0x8000033c
+@(private = "file")
+KICK_UNOP :: 0x000002ff
+@(private = "file")
+KICK_E :: 1 << 30 | KICK_UNOP
+
+@(private = "file")
+kick_xg :: proc(is: u32) -> u32 {return 0x800006fc | is << 11}
+// ISW.x vi<it>, imm(vi<is>)
+@(private = "file")
+kick_isw :: proc(it, is, imm: u32) -> u32 {return 0x05 << 25 | 8 << 21 | it << 16 | is << 11 | imm}
+
+// PATH1 is idle when a DIRECT goes straight in.
+@(private = "file")
+kick_path1_idle :: proc(name, how: string) {
+	tag, ad := gif_tag(1), gif_ad(0x43, 0x4343)
+	gs.state.regs[0x43] = 0
+	feed(&vu.vifs[1], 0x50000002, tag[0], tag[1], tag[2], tag[3], ad[0], ad[1], ad[2], ad[3])
+	if gs.state.regs[0x43] != 0x4343 || vu.vifs[1].gif_wait {fail("%s (%s): PATH1 kept the GIF, a DIRECT after it waits", name, how)}
+	if vu.vu1_kick_latched {fail("%s (%s): a kick is still latched after the program", name, how)}
+}
+
+@(private = "file")
+kick_latch :: proc() {
+	cases := []Kick_Case {
+		{
+			name = "XGKICK in the E-bit pair, EOP stored in the next pair",
+			setup = proc() {
+				w := vu1_words()
+				// A tag of one A+D qword, no EOP; what follows is no tag.
+				w[0], w[1], w[2], w[3] = 1, 1 << 28, 0xe, 0
+				w[4], w[5], w[6], w[7] = 0x2222, 0, 0x41, 0
+				w[8], w[9], w[10], w[11] = 0x40, 0x40, 0x40, 0x80
+				vu.vu1.vi[1], vu.vu1.vi[2] = 0, 0x8001
+			},
+			pairs = {{kick_xg(1), KICK_E}, {kick_isw(2, 1, 0), KICK_UNOP}},
+			compiled = proc(_: u32, _: ^int) -> (u32, vu.Vu_Exit) {
+				compiled_ran = true
+				vu.vu1_xgkick(vu.vu1.vi[1])
+				vu1_words()[0] = u32(vu.vu1.vi[2])
+				return 0x10, .End
+			},
+			check = proc(how: string) {
+				if gs.state.regs[0x41] != 0x2222 {fail("XGKICK with its EOP stored in the next pair (%s): GS 41 %x, want 2222 (read at the instruction, or never sent)", how, gs.state.regs[0x41])}
+				kick_path1_idle("XGKICK with its EOP stored in the next pair", how)
+			},
+		},
+		{
+			name = "two XGKICKs in one program",
+			setup = proc() {
+				w := vu1_words()
+				t := gif_tag(2)
+				w[0], w[1], w[2], w[3] = t[0], t[1], t[2], t[3]
+				w[4], w[5], w[6], w[7] = 0x1111, 0, 0x40, 0
+				w[8], w[9], w[10], w[11] = 0x2222, 0, 0x41, 0
+				w[16], w[17], w[18], w[19] = t[0], t[1], t[2], t[3]
+				w[20], w[21], w[22], w[23] = 0x3333, 0, 0x41, 0
+				w[24], w[25], w[26], w[27] = 0x4444, 0, 0x42, 0
+				vu.vu1.vi[1], vu.vu1.vi[2], vu.vu1.vi[3], vu.vu1.vi[4], vu.vu1.vi[5] = 0, 4, 0x5555, 0x7777, 0x6666
+			},
+			pairs = {
+				{kick_xg(1), KICK_UNOP},
+				{kick_isw(3, 1, 1), KICK_UNOP}, // the first packet's 40: 5555
+				{kick_xg(2), KICK_UNOP},
+				{kick_isw(4, 1, 1), KICK_E}, // too late for the first packet
+				{kick_isw(5, 2, 2), KICK_UNOP}, // the second packet's 42: 6666
+			},
+			compiled = proc(_: u32, _: ^int) -> (u32, vu.Vu_Exit) {
+				w, vi := vu1_words(), &vu.vu1.vi
+				compiled_ran = true
+				vu.vu1_xgkick(vi[1])
+				w[4] = u32(vi[3])
+				vu.vu1_xgkick(vi[2])
+				w[4] = u32(vi[4])
+				w[24] = u32(vi[5])
+				return 0x28, .End
+			},
+			check = proc(how: string) {
+				r := gs.state.regs
+				// 41 is written by both: the second packet's value shows the order.
+				if r[0x40] != 0x5555 || r[0x41] != 0x3333 || r[0x42] != 0x6666 {
+					fail("two XGKICKs in one program (%s): GS 40 %x 41 %x 42 %x, want 5555 3333 6666", how, r[0x40], r[0x41], r[0x42])
+				}
+				kick_path1_idle("two XGKICKs in one program", how)
+			},
+		},
+		{
+			name = "XGKICK walk with no EOP inside VU1 memory",
+			setup = proc() {
+				w := vu1_words()
+				w[0], w[1], w[2], w[3] = 1, 1 << 28, 0xe, 0
+				w[4], w[5], w[6], w[7] = 0x2222, 0, 0x41, 0
+				w[8], w[9], w[10], w[11] = 0x40, 0x40, 0x40, 0x80 // 1025 qwords, no EOP
+				vu.vu1.vi[1] = 0
+			},
+			pairs = {{kick_xg(1), KICK_E}, {KICK_NOP, KICK_UNOP}},
+			compiled = proc(_: u32, _: ^int) -> (u32, vu.Vu_Exit) {
+				compiled_ran = true
+				vu.vu1_xgkick(vu.vu1.vi[1])
+				return 0x10, .End
+			},
+			check = proc(how: string) {
+				if gs.state.regs[0x41] != 0 {fail("XGKICK walk with no EOP (%s): GS 41 %x, the walk was fed", how, gs.state.regs[0x41])}
+				kick_path1_idle("XGKICK walk with no EOP", how)
+			},
+		},
+	}
+	for c in cases {
+		code := make([]u32, 2 * len(c.pairs), context.temp_allocator)
+		for p, k in c.pairs {code[2 * k], code[2 * k + 1] = p[0], p[1]}
+		for how in ([]string{"interpreted", "compiled"}) {
+			gif.gif_reset()
+			gif_clear()
+			for &b in vu.vu1_mem {b = 0}
+			// Other code first, so what a compiled case registered is gone.
+			mpg(&vu.vifs[1], END_CODE[:])
+			if how == "compiled" {vu.vu1_register(code, c.compiled)}
+			mpg(&vu.vifs[1], code)
+			c.setup()
+			compiled_ran = false
+			vu.vu1_start(0)
+			if compiled_ran != (how == "compiled") {fail("%s (%s): compiled code ran %v", c.name, how, compiled_ran)}
+			c.check(how)
+		}
+	}
+
+	// A program that kicks and never ends stops at the step limit: the kick
+	// is sent there.
+	gif.gif_reset()
+	gif_clear()
+	for &b in vu.vu1_mem {b = 0}
+	w := vu1_words()
+	t := gif_tag(1)
+	w[0], w[1], w[2], w[3] = t[0], t[1], t[2], t[3]
+	w[4], w[5], w[6], w[7] = 0x2222, 0, 0x41, 0
+	vu.vu1.vi[1] = 0
+	loop := [?]u32{kick_xg(1), KICK_UNOP, 0x08 << 25 | 7 << 16 | 7 << 11 | 1, KICK_UNOP, 0x20 << 25 | u32(-2 & 0x7ff), KICK_UNOP, KICK_NOP, KICK_UNOP}
+	mpg(&vu.vifs[1], loop[:])
+	vu.vu1_start(0)
+	if gs.state.regs[0x41] != 0x2222 {fail("XGKICK in a program stopped at the step limit: GS 41 %x, want 2222", gs.state.regs[0x41])}
+	kick_path1_idle("XGKICK in a program stopped at the step limit", "interpreted")
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -1275,6 +1440,7 @@ main :: proc() {
 	mfifo()
 	mfifo_hold()
 	window()
+	kick_latch()
 	branch_delay()
 	park()
 	fmt.println("vu: ok")
