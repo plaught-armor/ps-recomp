@@ -42,7 +42,7 @@ hw_read :: proc(addr: u32, size: int) -> u64 {
 	case a >= 0x12000000 && a < 0x12002000:
 		o := a & 0x1fff
 		switch o &~ 7 {
-		case 0x1000: return u64(mem.gs_csr) | 0x551b0000 // revision/id bits
+		case 0x1000: return u64(mem.gs_csr) | mem.GS_CSR_ID
 		case 0x1010: return u64(mem.gs_imr)
 		}
 		return (^u64)(&mem.gsregs[o &~ 7])^

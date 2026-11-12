@@ -18,7 +18,9 @@
 // when the flag was clear; a flag clears where T_MODE is written 1, and
 // T_ZRET resets the count at compare. SetVTLBRefillHandler and
 // SetVCommonHandler store a handler only for their own causes and return it,
-// or 0 for a cause out of range.
+// or 0 for a cause out of range. SetVSyncFlag's flag and CSR pointers are
+// stored through once, by the next vblank start interrupt taken, and the CSR
+// only with a flag pointer.
 package main
 
 import "core:fmt"
@@ -374,6 +376,75 @@ dma_stat_test :: proc() {
 	fmt.println("ok SifDmaStat")
 }
 
+// SetVSyncFlag (0x73): the next vblank start interrupt taken stores 1 through
+// the flag pointer and the GS CSR through the other, once.
+vsync_flag_test :: proc() {
+	FLAG :: PARAM + 0x400
+	CSR :: PARAM + 0x408
+	MARK :: 0x1122334455667788
+	vblank :: proc() {
+		mem.intc_raise(mem.INTC_VBLANK_START)
+		kernel.deliver_interrupts()
+	}
+	mark :: proc() {
+		mem.wr64(FLAG, MARK)
+		mem.wr64(CSR, MARK)
+	}
+	status, mask, csr := cpu.state.cop0[12], mem.intc_mask, mem.gs_csr
+	mem.intc_pending = 0
+	mem.gs_csr = 0x2008
+	want := u64(0x551b2008)
+	mark()
+	sys(0x73, FLAG, CSR)
+	if kernel.k.vsync_flag != FLAG || kernel.k.vsync_csr != CSR {fail("fail: SetVSyncFlag kept %x, %x", kernel.k.vsync_flag, kernel.k.vsync_csr)}
+
+	// Not taken: masked in INTC_MASK, then interrupts off.
+	cpu.state.cop0[12] |= 0x10001
+	mem.intc_mask = 0
+	vblank()
+	mem.intc_mask = 1 << mem.INTC_VBLANK_START
+	cpu.state.cop0[12] &~= 1
+	vblank()
+	if mem.rd64(FLAG) != MARK || mem.rd64(CSR) != MARK {fail("fail: a vblank not taken stored %x, %x", mem.rd64(FLAG), mem.rd64(CSR))}
+	if kernel.k.vsync_flag != FLAG || kernel.k.vsync_csr != CSR {fail("fail: a vblank not taken cleared the pointers")}
+
+	// The pointers are kernel state a snapshot holds: they come back with it.
+	saved := kernel.k
+	sys(0x73, 0, 0)
+	kernel.k = saved
+
+	// Taken: 32 bits of 1, 64 bits of CSR, both pointers cleared.
+	cpu.state.cop0[12] |= 1
+	mem.intc_pending = 0
+	vblank()
+	if got := mem.rd64(FLAG); got != MARK &~ 0xffffffff | 1 {fail("fail: the flag reads %x, want 32 bits of 1", got)}
+	if got := mem.rd64(CSR); got != want {fail("fail: CSR stored as %x, want %x", got, want)}
+	if kernel.k.vsync_flag != 0 || kernel.k.vsync_csr != 0 {fail("fail: pointers %x, %x after the vblank, want 0", kernel.k.vsync_flag, kernel.k.vsync_csr)}
+
+	// A second vblank stores nothing.
+	mark()
+	vblank()
+	if mem.rd64(FLAG) != MARK || mem.rd64(CSR) != MARK {fail("fail: the second vblank stored %x, %x", mem.rd64(FLAG), mem.rd64(CSR))}
+
+	// No flag pointer: CSR is not stored.
+	sys(0x73, 0, CSR)
+	low := mem.rd64(0)
+	vblank()
+	if mem.rd64(CSR) != MARK {fail("fail: CSR stored with no flag pointer: %x", mem.rd64(CSR))}
+	if mem.rd64(0) != low {fail("fail: a store through a null flag pointer")}
+
+	// No CSR pointer: only the flag.
+	sys(0x73, FLAG, 0)
+	vblank()
+	if mem.rd32(FLAG) != 1 || mem.rd64(CSR) != MARK || mem.rd64(0) != low {fail("fail: flag %x, CSR %x with no CSR pointer", mem.rd32(FLAG), mem.rd64(CSR))}
+	if kernel.k.vsync_flag != 0 {fail("fail: flag pointer kept with no CSR pointer")}
+
+	sys(0x73, 0, 0)
+	mem.intc_pending = 0
+	cpu.state.cop0[12], mem.intc_mask, mem.gs_csr = status, mask, csr
+	fmt.println("ok SetVSyncFlag")
+}
+
 // SetVTLBRefillHandler (0x0d) takes causes 1-3, SetVCommonHandler (0x0e)
 // causes 4-13; each returns the handler it stored, or 0 and stores nothing.
 exc_handler_test :: proc() {
@@ -540,6 +611,7 @@ main :: proc() {
 	boot_args_test()
 	dma_stat_test()
 	exc_handler_test()
+	vsync_flag_test()
 	loadfile_version_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.

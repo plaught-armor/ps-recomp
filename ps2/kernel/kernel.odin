@@ -104,6 +104,10 @@ k: struct {
 	// Exception handlers a program installed with SetVTLBRefillHandler and
 	// SetVCommonHandler, by ExcCode (set_exception_handler).
 	exc_handlers: [EXC_LAST + 1]u32,
+	// SetVSyncFlag's two pointers, 0 when not set. The next vblank start
+	// interrupt taken uses them once (vsync_flag_fire).
+	vsync_flag:   u32,
+	vsync_csr:    u32,
 }
 
 KE_OK :: 0
@@ -291,7 +295,9 @@ syscall :: proc(pc: u32) {
 	case 0x71: // GsPutIMR
 		ret = i64(mem.gs_imr)
 		mem.gs_imr = a0
-	case 0x73: // SetVSyncFlag
+	case 0x73: // SetVSyncFlag(*flag, *csr)
+		k.vsync_flag = a0
+		k.vsync_csr = a1
 	case 0x74: // SetSyscall(index, fn)
 		mem.wr32(SYSCALL_TABLE + (a0 & 0xff) * 4, a1)
 	case 0x76: ret = iop.sif_dma_stat(i32(a0))
@@ -1109,6 +1115,7 @@ deliver_interrupts :: proc() {
 		for cause in u32(0) ..< 15 {
 			if pending & (1 << cause) == 0 {continue}
 			mem.intc_pending &~= 1 << cause
+			if cause == mem.INTC_VBLANK_START && k.vsync_flag != 0 {vsync_flag_fire()}
 	for h in k.intc {
 				if h.cause == cause && h.enabled {
 					if i32(call_handler(h.fn, h.gp, cause, h.arg, 0)) < 0 {break} // a negative return ends the chain
@@ -1125,6 +1132,20 @@ deliver_interrupts :: proc() {
 			}
 		}
 	}
+}
+
+// A vblank start interrupt is taken with SetVSyncFlag's flag pointer set:
+// store 1 through it and, with a CSR pointer, the GS CSR as a read of the
+// register gives it, 64 bits wide. Both pointers are cleared, so the next
+// vblank stores nothing until the program sets them again. With no flag
+// pointer the CSR pointer is left alone and nothing is stored.
+@(private = "file")
+vsync_flag_fire :: proc() {
+	mem.wr32(k.vsync_flag, 1)
+	k.vsync_flag = 0
+	if k.vsync_csr == 0 {return}
+	mem.wr64(k.vsync_csr, u64(mem.gs_csr) | mem.GS_CSR_ID)
+	k.vsync_csr = 0
 }
 
 // Called on every vblank start, for the host side (present, input, pacing).

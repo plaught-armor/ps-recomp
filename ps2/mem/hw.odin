@@ -39,6 +39,7 @@ intc_stat, intc_mask: u32
 intc_pending: u32
 dmac_stat: u32 // D_STAT: low half status, high half mask
 gs_csr: u32
+GS_CSR_ID :: 0x551b0000 // the revision and id bits a read of CSR adds
 gs_imr: u32 = 0x7f00
 
 // Unchecked: the mask keeps the word inside hwregs whatever o is.
