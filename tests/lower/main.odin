@@ -83,7 +83,8 @@ main :: proc() {
 	likely_cycles()
 	imports()
 	exact_steps()
-	fmt.println("ok lower:", len(r5900_firsts), "r5900 and", len(r3000_firsts), "r3000 branches with a branch in a jump-target delay slot; beql cycles; import placeholders; exact steps")
+	learned_steps()
+	fmt.println("ok lower:", len(r5900_firsts), "r5900 and", len(r3000_firsts), "r3000 branches with a branch in a jump-target delay slot; beql cycles; import placeholders; exact steps; learned jr $ra steps")
 }
 
 // The function of `words` at `base`, discovered with the r5900 rules.
@@ -258,4 +259,54 @@ exact_steps :: proc() {
 		os.exit(1)
 	}
 	free_all(context.temp_allocator)
+}
+
+// r5900.lower for learned code (each): a `jr $ra` whose delay slot may write
+// $ra reads it before the slot (a Jump_Reg, the Return's check); any other
+// `jr $ra` has the steps it had, and so has every one outside learned code.
+@(private = "file")
+learned_steps :: proc() {
+	Case :: struct {
+		name:  string,
+		slot:  u32,
+		each:  bool,
+		latch: bool,
+	}
+	cases := [?]Case {
+		{"lui ra in the slot, learned", 0x3c1f7000, true, true},
+		{"lw ra in the slot, learned", 0x8fbf0000, true, true},
+		{"addu ra in the slot, learned", 0x0080f821, true, true},
+		{"nop in the slot, learned", 0, true, false},
+		{"addiu sp in the slot, learned", 0x27bd0010, true, false},
+		{"lui ra in the slot, not learned", 0x3c1f7000, false, false},
+	}
+	for c in cases {
+		f := func_of(0x1000, {0x24020007, 0x03e00008, c.slot}) // addiu v0,zero,7; jr ra; the slot
+		steps := r5900.lower(f, 1, true, each = c.each)
+		got := make([dynamic]Want, context.temp_allocator)
+		for s in steps {
+			if s.kind == .Cycles {continue}
+			w := Want{kind = s.kind, check = s.check, n = s.n, target = s.target}
+			if s.kind == .Op {w.pc = s.i.pc}
+			append(&got, w)
+		}
+		plain := [?]Want{{kind = .Case, target = 0x1000}, {kind = .Op, pc = 0x1000}, {kind = .Op, pc = 0x1008}, {kind = .Return, n = 0x1004}}
+		latched := [?]Want {
+			{kind = .Case, target = 0x1000},
+			{kind = .Op, pc = 0x1000},
+			{kind = .Jump_Reg, n = 31},
+			{kind = .Op, pc = 0x1008},
+			{kind = .Return, n = 0x1004, check = true},
+			{kind = .End},
+		}
+		want := c.latch ? latched[:] : plain[:]
+		same := len(got) == len(want)
+		for k := 0; same && k < len(want); k += 1 {same = got[k] == want[k]}
+		if !same {
+			fmt.eprintfln("FAIL r5900 learned lower (%s): %d steps, want %d", c.name, len(got), len(want))
+			for g, j in got {fmt.eprintfln("  %d %v", j, g)}
+			os.exit(1)
+		}
+		free_all(context.temp_allocator)
+	}
 }

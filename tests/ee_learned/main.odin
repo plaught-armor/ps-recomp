@@ -14,6 +14,8 @@
 //   - A blob of no functions loads, with no code to map.
 //   - A run wasm32 cannot lower (a SYSCALL in a delay slot) gets no span and
 //     is counted.
+//   - A `jr $ra` whose delay slot writes $ra returns to $ra as it was before
+//     the slot, compiled as interpreted.
 package main
 
 import "core:fmt"
@@ -53,6 +55,28 @@ CODE_LOOP := [?]u32 {
 	0x00000000,
 }
 
+// A return whose delay slot loads $ra with LANDING: the caller goes on with
+// that $ra, and nothing runs at LANDING.
+@(private = "file")
+SLOT_RA :: 0x00101000
+@(rodata, private = "file")
+CODE_SLOT_RA := [?]u32 {
+	0x24020007, // addiu v0, zero, 7
+	0x03e00008, // jr ra
+	0x3c1f0011, // lui ra, 0x11
+}
+
+// Run only by a return that read $ra after the slot: v1 = 1, then back to RA.
+@(private = "file")
+LANDING :: 0x00110000
+@(rodata, private = "file")
+CODE_LANDING := [?]u32 {
+	0x24030001, // addiu v1, zero, 1
+	0x341f0ff0, // ori ra, zero, RA
+	0x03e00008, // jr ra
+	0x00000000,
+}
+
 // The loop's first word changed: v0 starts at 1.
 @(private = "file")
 CHANGED :: 0x24020001
@@ -83,6 +107,16 @@ run :: proc() -> (u32, bool) {
 	calls := cpu.learned_calls
 	cpu.call(LOOP)
 	return u32(cpu.state.r[2].d[0]), cpu.learned_calls != calls
+}
+
+// Call SLOT_RA: the registers it leaves, and whether a learned function ran it.
+@(private = "file")
+run_slot_ra :: proc() -> (type_of(cpu.state.r), bool) {
+	cpu.state.r = {}
+	cpu.state.r[29].d[0], cpu.state.r[31].d[0] = 0x001ff000, RA
+	calls := cpu.learned_calls
+	cpu.call(SLOT_RA)
+	return cpu.state.r, cpu.learned_calls != calls
 }
 
 // fromSPR: the quadword at the scratchpad's start to LOOP, its first word w.
@@ -221,13 +255,24 @@ game :: proc(_: rawptr) {
 	v0, native_ran = run()
 	check(v0 == 17 && !native_ran, "code neither version holds ran native")
 
+	// A return whose delay slot writes $ra, interpreted and then learned.
+	for w, k in CODE_SLOT_RA {put(SLOT_RA + 4 * u32(k), w)}
+	for w, k in CODE_LANDING {put(LANDING + 4 * u32(k), w)}
+	want, slot_native := run_slot_ra()
+	check(!slot_native && want[2].d[0] == 7 && want[3].d[0] == 0 && want[31].d[0] == LANDING, "interpreted jr ra with ra written in its delay slot")
+	slot_ra := CODE_SLOT_RA
+	check(ps2.load_learned(write_blob(tmp, "c.bin", {{SLOT_RA, SLOT_RA, slot_ra[:]}})), "load the return with ra written in its delay slot")
+	got, slot_ran := run_slot_ra()
+	check(slot_ran, "return with ra written in its delay slot not run native")
+	check(got == want, fmt.tprintf("learned jr ra with ra written in its delay slot: v0 %x v1 %x ra %x, interpreted v0 %x v1 %x ra %x", got[2].d[0], got[3].d[0], got[31].d[0], want[2].d[0], want[3].d[0], want[31].d[0]))
+
 	if os.remove_all(tmp) != nil {
 		check(false, fmt.tprintf("cannot remove %s", tmp))
 	}
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok ee_learned: learned EE code runs native only while RAM holds its words, through host and DMA writes and snapshot loads, one version per code at an entry")
+	fmt.println("ok ee_learned: learned EE code runs native only while RAM holds its words, through host and DMA writes and snapshot loads, one version per code at an entry; a return whose delay slot writes $ra goes where the interpreter's does")
 	os.exit(0)
 }
 

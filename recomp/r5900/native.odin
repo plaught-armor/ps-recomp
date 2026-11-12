@@ -76,6 +76,7 @@ EE_SIGS := [?]native.Sig {
 	{"kernel.run_events", 0, false},
 	{"ps2.mod_call_original", 0, false}, // mods blobs only
 	{"ps2.learned_jr", 1, false}, // learned blobs only, not wasm32's
+	{"ps2.learned_jr_to", 2, false}, // the same
 	{"ps2.learned_left", 0, false}, // the same
 	{"ps2.learned_goto", 2, false},
 	{"ps2.spin_probe", 1, false},
@@ -1557,6 +1558,8 @@ jump_out :: proc(a: ^native.Asm, learned: bool) {
 // (learned_blob's code), each `jr $ra` calls ps2.learned_jr first, so one
 // to another address than the function's own return address unwinds or
 // jumps as the interpreter's does: static native code's never needs to.
+// Where the delay slot may write $ra, the address is $ra as it was before
+// the slot (ps2.learned_jr_to), as the interpreter reads it.
 // And a learned function that leaves with cpu.unwinding set, after a call
 // or a jump out of its words, calls ps2.learned_left before it returns: an
 // unwind to its own call ends there. That call is past the epilogue, so a
@@ -1648,7 +1651,13 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			if wasm {
 				exit(a, .Eret if s.check else .Return)
 			} else {
-				if learned && s.n != 0 {call_imm(a, "ps2.learned_jr", s.n)}
+				if learned && s.n != 0 && s.check {
+					native.mov(a, .B, .T)
+					native.mov_imm(a, .A, s.n)
+					native.call(a, "ps2.learned_jr_to", .A, .B)
+				} else if learned && s.n != 0 {
+					call_imm(a, "ps2.learned_jr", s.n)
+				}
 				native.ret(a)
 			}
 			leaves = true

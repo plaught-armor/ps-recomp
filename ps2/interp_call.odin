@@ -184,9 +184,20 @@ interp_run :: proc(entry: u32) -> cpu.Interp_Run {
 // FLAT, which never runs learned code, and from code no interp_call
 // entered, nothing.
 learned_jr :: proc(pc: u32) {
+	learned_return(pc, u32(cpu.state.r[31].d[0]))
+}
+
+// learned_jr where the delay slot may have written $ra: t is $ra as it was
+// before the slot, the address interp_body's `jr` jumps to. sp is read
+// after the slot by both.
+learned_jr_to :: proc(pc, t: u32) {
+	learned_return(pc, t)
+}
+
+@(private = "file")
+learned_return :: #force_inline proc(pc, t: u32) {
 	lr := cpu.learned_top
 	if lr == nil {return}
-	t := u32(cpu.state.r[31].d[0])
 	if t == lr.ra && u32(cpu.state.r[29].d[0]) == lr.sp || !interp_unwind_find(t, lr.direct, lr.gaps) {return}
 	if !goto_pc(lr.entry, pc, t) {interp_body(lr.entry, nil, lr.run, t)}
 	learned_left()

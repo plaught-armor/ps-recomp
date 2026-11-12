@@ -133,7 +133,7 @@ here.
 | `psx_learned` | Learned PS1 runs compiled, run native only while RAM holds their code; a `j` out of one goes on at the label its callee's `jr $ra` jumps to when that lies in its own code, and returns when it does not |
 | `psx_flat_learn` | LEARN under FLAT (FLAT builds only): a run on the shadow stack when its flat run stops stays open across the stop and is written once when it returns, covering the words fetched on both sides, a store another thread made into it meanwhile marking it `.Smc`; a run from code a standalone blob left to the interpreter (an entry, or inside a range) not written; a run that never returns is written `.Open` at the report |
 | `iop_learned` | Learned IOP runs native only while IOP RAM holds their code, through host writes and snapshot loads |
-| `ee_learned` | Learned EE runs native, where no function is registered, only while RAM holds their code, through host and DMA writes and snapshot loads, one version per code at an entry; runs stored into or too large are not compiled |
+| `ee_learned` | Learned EE runs native, where no function is registered, only while RAM holds their code, through host and DMA writes and snapshot loads, one version per code at an entry; runs stored into or too large are not compiled; a `jr $ra` whose delay slot writes `$ra` returns where the interpreter's does |
 | `psx_unaligned` | Fused PS1 unaligned words |
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |

@@ -9,7 +9,7 @@ Step_Kind :: enum u8 {
 	Case,     // block at `target`; `check`: the previous block falls into it; `n`: 1 where the runner goes on (exact: every block)
 	Op,       // instruction `i` (no control transfer)
 	Cycles,   // charge `n` cycles
-	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead; else `n`: the `jr $ra`'s pc (0: no `jr`)
+	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead; else `n`: the `jr $ra`'s pc (0: no `jr`), `check`: t = the address it jumps to
 	Goto,     // pc = `target` within the function (exact: or outside it); `check`: run due events first; `n`: the jump's pc
 	Call,     // call the function at `target`, returning to `n`
 	Branch,   // t := the condition of branch `i`, up to the matching End
@@ -246,6 +246,13 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false, each := false)
 				delay(&l, d, slot_op)
 				put(&l, {kind = .Return})
 				put(&l, {kind = .End})
+			} else if i.rs == 31 && each && slot_op && may_write(d, 31) {
+				// Learned code's return goes where the interpreter's does
+				// (ps2 learned_jr_to): to $ra as it was before the slot.
+				put(&l, {kind = .Jump_Reg, n = 31})
+				delay(&l, d, slot_op)
+				put(&l, {kind = .Return, n = pc, check = true})
+				put(&l, {kind = .End})
 			} else if i.rs == 31 {
 				delay(&l, d, slot_op)
 				put(&l, {kind = .Return, n = pc})
@@ -290,6 +297,14 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false, each := false)
 }
 
 // The branch is always taken: beq r, r or bgez $zero (and their forms).
+// i, no control transfer, may write general register r: every instruction
+// that writes one names it in its rt or rd field, and a SYSCALL's handler
+// writes what it likes. True of more instructions than write it (a store's
+// rt, a shift amount's bits), which costs a register read and no more.
+may_write :: proc(i: Insn, r: u8) -> bool {
+	return i.rt == r || i.rd == r || i.kind == .Sys
+}
+
 branch_always :: proc(i: Insn) -> bool {
 	#partial switch i.op {
 	case .BEQ, .BEQL:
