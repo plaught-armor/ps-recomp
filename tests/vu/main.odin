@@ -1158,6 +1158,94 @@ branch_delay :: proc() {
 	if v.vi[5] != 10 || v.vi[6] != 1 {fail("branch VI delay from 0x60: vi5 %d vi6 %d, want 10 1", v.vi[5], v.vi[6])}
 }
 
+// A microprogram that waits for the EE parks (vu.vu0_call_micro): two
+// loops of idle pairs, each ended by a CTC2 of 0 to the register it tests,
+// then the E bit. A loop that writes state is no such wait.
+@(private = "file")
+park :: proc() {
+	v := &vu.vu0
+	NOP :: 0x8000033c
+	UNOP :: 0x000002ff
+	iaddiu :: proc(it, is, imm: u32) -> u32 {return 0x08 << 25 | it << 16 | is << 11 | imm}
+	ibeq :: proc(it, is: u32, off: i32) -> u32 {return 0x28 << 25 | it << 16 | is << 11 | u32(off) & 0x7ff}
+	b :: proc(off: i32) -> u32 {return 0x20 << 25 | u32(off) & 0x7ff}
+	put_pairs(0x200,
+		{iaddiu(1, 0, 1), UNOP},
+		{iaddiu(2, 0, 1), UNOP},
+		{ibeq(1, 0, 3), UNOP}, // 0x210: vi1 == 0 leaves for 0x230
+		{NOP, UNOP},
+		{b(-3), UNOP}, // back to 0x210
+		{NOP, UNOP},
+		{iaddiu(3, 0, 7), UNOP}, // 0x230
+		{ibeq(2, 0, 3), UNOP}, // 0x238: vi2 == 0 leaves for 0x258
+		{NOP, UNOP},
+		{b(-3), UNOP}, // back to 0x238
+		{NOP, UNOP},
+		{iaddiu(4, 3, 2), 1 << 30 | UNOP}, // 0x258, E
+		{NOP, UNOP},
+	)
+	stat :: proc() -> u32 {return vu.vu0_ctrl_read(29)}
+	v.vi = {}
+	vu.vu_op(v, 0x4a000038 | (0x200 / 8) << 6)
+	if !vu.vu0_parked || stat() != 1 || v.tpc != 0x210 {fail("park: parked %v, VPU-STAT %d, tpc %04x; want true, 1, 0210", vu.vu0_parked, stat(), v.tpc)}
+	if v.vi[1] != 1 || v.vi[2] != 1 || v.vi[3] != 0 {fail("park: vi1-3 %d %d %d at the first loop, want 1 1 0", v.vi[1], v.vi[2], v.vi[3])}
+
+	// A write that does not end the loop: parked there again.
+	vu.vu0_ctrl_write(5, 9)
+	if !vu.vu0_parked || v.tpc != 0x210 || v.vi[3] != 0 {fail("park: after a CTC2 to vi5 parked %v, tpc %04x, vi3 %d", vu.vu0_parked, v.tpc, v.vi[3])}
+	// Nothing but a CTC2 to vi1-vi15 lets it go on.
+	vu.vu0_ctrl_write(16, v.status)
+	_ = vu.vu0_ctrl_read(1)
+	if !vu.vu0_parked || v.tpc != 0x210 || v.vi[3] != 0 {fail("park: went on with no CTC2 to an integer register: parked %v, tpc %04x, vi3 %d", vu.vu0_parked, v.tpc, v.vi[3])}
+
+	// The parked program is state: it comes back with a copy of it, as a
+	// snapshot's does, after another program ran to its end.
+	saved, saved_parked := v^, vu.vu0_parked
+	put_pairs(0x3c0, {NOP, 1 << 30 | UNOP}, {NOP, UNOP})
+	vu.vu_op(v, 0x4a000038 | (0x3c0 / 8) << 6)
+	if vu.vu0_parked || stat() != 0 || v.tpc != 0x3d0 {fail("park: a new program over a parked one: parked %v, VPU-STAT %d, tpc %04x", vu.vu0_parked, stat(), v.tpc)}
+	v^, vu.vu0_parked = saved, saved_parked
+
+	// vi1 = 0: on to the second loop.
+	vu.vu0_ctrl_write(1, 0)
+	if !vu.vu0_parked || stat() != 1 || v.tpc != 0x238 {fail("park: second loop: parked %v, VPU-STAT %d, tpc %04x; want true, 1, 0238", vu.vu0_parked, stat(), v.tpc)}
+	if v.vi[3] != 7 || v.vi[4] != 0 {fail("park: vi3 %d vi4 %d at the second loop, want 7 0", v.vi[3], v.vi[4])}
+	// vi2 = 0: on to the E bit.
+	vu.vu0_ctrl_write(2, 0)
+	if vu.vu0_parked || stat() != 0 || v.tpc != 0x268 {fail("park: end: parked %v, VPU-STAT %d, tpc %04x; want false, 0, 0268", vu.vu0_parked, stat(), v.tpc)}
+	if v.vi[1] != 0 || v.vi[2] != 0 || v.vi[3] != 7 || v.vi[4] != 9 || v.vi[5] != 9 {fail("park: vi1-5 %d %d %d %d %d at the end, want 0 0 7 9 9", v.vi[1], v.vi[2], v.vi[3], v.vi[4], v.vi[5])}
+	// Not parked: a CTC2 runs nothing.
+	vu.vu0_ctrl_write(3, 1)
+	if v.vi[4] != 9 || v.tpc != 0x268 {fail("park: a CTC2 with nothing parked ran code: vi4 %d, tpc %04x", v.vi[4], v.tpc)}
+
+	// A loop that counts down writes state: it runs to its own end.
+	put_pairs(0x300,
+		{iaddiu(6, 0, 1000), UNOP},
+		{0x09 << 25 | 6 << 16 | 6 << 11 | 1, UNOP}, // 0x308: ISUBIU vi6, vi6, 1
+		{NOP, UNOP}, // the branch reads vi6 as written
+		{NOP, UNOP},
+		{0x29 << 25 | 0 << 16 | 6 << 11 | u32(-4 & 0x7ff), UNOP}, // 0x320: IBNE vi0, vi6, 0x308
+		{NOP, UNOP},
+		{NOP, 1 << 30 | UNOP},
+		{NOP, UNOP},
+	)
+	vu.vu_op(v, 0x4a000038 | (0x300 / 8) << 6)
+	if vu.vu0_parked || v.vi[6] != 0 || v.tpc != 0x340 {fail("park: counting loop: parked %v, vi6 %d, tpc %04x; want false, 0, 0340", vu.vu0_parked, v.vi[6], v.tpc)}
+
+	// An endless loop that writes state is not a wait: it runs to the step
+	// limit, as before.
+	put_pairs(0x380,
+		{iaddiu(7, 7, 1), UNOP}, // 0x380
+		{b(-2), UNOP}, // back to 0x380
+		{NOP, UNOP},
+	)
+	v.vi[7] = 0
+	vu.vu_op(v, 0x4a000038 | (0x380 / 8) << 6)
+	if vu.vu0_parked || stat() != 0 {fail("park: a loop that writes vi7 parked at %04x", v.tpc)}
+	// 1 << 24 steps of three pairs a turn.
+	if v.vi[7] != ((1 << 24) + 2) / 3 & 0xffff {fail("park: the loop that writes vi7 did not run to the limit: vi7 %d", v.vi[7])}
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -1188,5 +1276,6 @@ main :: proc() {
 	mfifo_hold()
 	window()
 	branch_delay()
+	park()
 	fmt.println("vu: ok")
 }

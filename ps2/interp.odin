@@ -211,8 +211,14 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 	// COP2
 	case .QMFC2: if i.rt != 0 {c.r[i.rt].q = vu.vu0.vf[i.rd].q}; return
 	case .QMTC2: vu.vu0_set_vf(i.rd, t.q); return
-	case .CFC2:  if i.rt != 0 {c.r[i.rt].d[0] = cpu.sx32(vu.vu0_ctrl_read(i.rd))}; return
-	case .CTC2:  vu.vu0_ctrl_write(i.rd, u32(t.d[0])); return
+	case .CFC2:
+		if vu.vu0_parked && w & 1 != 0 {vu.vu0_park_note(.Interlock)}
+		if i.rt != 0 {c.r[i.rt].d[0] = cpu.sx32(vu.vu0_ctrl_read(i.rd))}
+		return
+	case .CTC2:
+		if vu.vu0_parked && w & 1 != 0 {vu.vu0_park_note(.Interlock)}
+		vu.vu0_ctrl_write(i.rd, u32(t.d[0]))
+		return
 	case .VU0:   vu.vu0_macro(w); return
 	case .SLL, .SRL, .SRA, .SLLV, .SRLV, .SRAV, .MOVZ, .MOVN, .SYSCALL, .BREAK, .SYNC,
 	     .MFHI, .MTHI, .MFLO, .MTLO, .DSLLV, .DSRLV, .DSRAV, .MULT, .MULTU, .DIV, .DIVU,

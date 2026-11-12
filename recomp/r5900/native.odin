@@ -642,6 +642,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		if rt == 0 {return true}
 		if rd < 16 {
 			vu.vi_get(a, .VU0, .A, u32(rd))
+		} else if rd == 29 {
+			// VPU-STAT: whether VU0 is parked
+			native.mov_imm(a, .A, u32(rd))
+			native.call(a, "vu.ctrl_read", .A)
 		} else if f, ok := vu0_ctrl(rd, true); ok {
 			native.imp_load(a, .A, f)
 		} else {
@@ -650,14 +654,11 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		put_sx(a, rt, .A)
 	case .CTC2:
 		// As vu.vu0_ctrl_write, by register; a write to CMSAR1 starts VU1
-		// and stays a call.
-		if rd == 31 {
+		// and one to vi1-vi15 lets a parked VU0 go on: they stay calls.
+		if rd == 31 || rd != 0 && rd < 16 {
 			get(a, .B, rt)
 			native.mov_imm(a, .A, u32(rd))
 			native.call(a, "vu.ctrl_write", .A, .B)
-		} else if rd != 0 && rd < 16 {
-			get(a, .A, rt)
-			vu.vi_put(a, .VU0, u32(rd))
 		} else if f, ok := vu0_ctrl(rd, false); ok {
 			get(a, .A, rt)
 			if rd == 20 {native.alu_imm(a, .And, .A, 0x7fffff)}

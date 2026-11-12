@@ -63,7 +63,8 @@ vu0_ctrl :: proc(n: u8, read: bool) -> string {
 	switch n {
 	case 0:      return read ? "u32(vu.vu0.vi[0])" : ""
 	case 1 ..< 16:
-		return read ? fmt.tprintf("u32(vu.vu0.vi[%d])", n) : fmt.tprintf("vu.vu0.vi[%d] = u16(%%s)", n)
+		// a write lets a parked VU0 go on
+		return read ? fmt.tprintf("u32(vu.vu0.vi[%d])", n) : fmt.tprintf("vu.vu0_ctrl_write(%d, %%s)", n)
 	case 16:     return read ? "vu.vu0.status" : "vu.vu0.status = %s"
 	case 17:     return read ? "vu.vu0.mac" : ""
 	case 18:     return read ? "vu.vu0.clip" : "vu.vu0.clip = %s"
@@ -73,9 +74,10 @@ vu0_ctrl :: proc(n: u8, read: bool) -> string {
 	case 26:     return read ? "vu.vu0.tpc" : ""
 	case 27:     return read ? "vu.vu0.cmsar" : "vu.vu0.cmsar = %s"
 	case 28:     return read ? "vu.vu0.fbrst" : "vu.vu0.fbrst = %s"
+	case 29:     return read ? "u32(vu.vu0_parked)" : "" // VPU-STAT
 	case 31:     return read ? "vu.vu1.cmsar" : ""
 	}
-	// VPU-STAT (29, both VUs idle) and the unused ones
+	// the unused ones
 	return read ? "u32(0)" : ""
 }
 

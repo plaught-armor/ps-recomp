@@ -145,7 +145,7 @@ vu0_ctrl_read :: proc(n: u8) -> u32 {
 	case 26: return vu0.tpc
 	case 27: return vu0.cmsar
 	case 28: return vu0.fbrst
-	case 29: return 0 // VPU-STAT: both VUs idle
+	case 29: return u32(vu0_parked) // VPU-STAT: VU0 runs while parked, VU1 is idle
 	case 31: return vu1.cmsar
 	}
 	return 0
@@ -154,7 +154,10 @@ vu0_ctrl_read :: proc(n: u8) -> u32 {
 vu0_ctrl_write :: proc(n: u8, v: u32) {
 	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	switch n {
-	case 1 ..< 16: vu0.vi[n] = u16(v)
+	case 1 ..< 16:
+		vu0.vi[n] = u16(v)
+		// What a parked microprogram waits for: it goes on from its loop.
+		if vu0_parked {vu0_exec(vu0.tpc, true)}
 	case 16: vu0.status = v
 	case 18: vu0.clip = v
 	case 20: vu0.r = v & 0x7fffff
@@ -175,6 +178,7 @@ vclamp4 :: #force_inline proc(r: [4]f32) -> [4]f32 {return {vclamp(r.x), vclamp(
 vu0_macro :: proc(w: u32) {
 	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	when cpu.FALLBACK_COUNT {cpu.fallback_vu0[cpu.cop2_key(w)] += 1}
+	if vu0_parked {vu0_park_note(.Macro)}
 	vu_op(&vu0, w)
 	vu_drain(&vu0) // macro mode waits for Q, and sets I and D at once
 }
@@ -862,7 +866,7 @@ vu1_start :: proc(addr: u32) {
 
 @(private)
 vu1_exec :: proc(addr: u32, compiled: bool) {
-	pc, ended := micro_exec(&vu1, &vu1_table, &vu1_micro_gen, vu1_pairs[:], addr, compiled)
+	pc, ended, _ := micro_exec(&vu1, &vu1_table, &vu1_micro_gen, vu1_pairs[:], addr, compiled, false)
 	vu_drain(&vu1)
 	if !ended && !vu1_overrun {
 		vu1_overrun = true
@@ -876,9 +880,10 @@ vu1_exec :: proc(addr: u32, compiled: bool) {
 // them, unless !compiled, and the interpreter elsewhere. Inlined into each
 // VU's wrapper, so the VU, its table and its pair cache are constants there.
 // No bounds checks: pc stays masked to a pair address in micro memory,
-// including what compiled code hands back.
+// including what compiled code hands back. With park, a constant, the
+// interpreter may stop at a loop that can never end by itself (parked).
 @(private)
-micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: []Vu_Pair_Info, addr: u32, compiled: bool) -> (pc: u32, ended: bool) #no_bounds_check {
+micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: []Vu_Pair_Info, addr: u32, compiled: bool, park: bool) -> (pc: u32, ended: bool, parked: bool) #no_bounds_check {
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc = addr & mask
 	vu_flags_seed(v)
@@ -924,12 +929,12 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 				}
 			}
 			if v == &vu1 && !t.status {vu1_status_stale = true}
-			if exit == .End {return pc, true}
+			if exit == .End {return pc, true, false}
 			if budget <= 0 {break}
 		}
 		if budget <= 0 {break}
 		when cpu.FALLBACK_COUNT {left, from := budget, pc}
-		pc, ended = vu_interp(v, pairs, pc, stop, &budget)
+		pc, ended, parked = vu_interp(v, pairs, pc, stop, &budget, park)
 		// VUCHECK's interpreter-only run is not counted.
 		when cpu.FALLBACK_COUNT {
 			if compiled {
@@ -943,9 +948,9 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 				}
 			}
 		}
-		if ended {return}
+		if ended || parked {return}
 	}
-	return pc, false
+	return pc, false, false
 }
 
 // Interpret from pc for at least one pair, until the program ends or
@@ -953,12 +958,22 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 // with no branch, end, Q or P pending. Inlined into micro_exec.
 // No bounds checks: callers pass a masked pc, every later pc is masked, and
 // pairs holds one entry per pair of v.micro; stop is checked against len.
+//
+// With park, the loop a microprogram waits in for the EE stops the run
+// (parked, at the loop's first pair) instead of using up the budget. The
+// test is exact: a jump lands where the jump before it landed, and every
+// pair run in between was idle (Vu_Pair_Info.idle), so the registers the
+// branches read are what they were and the same pairs would run for ever.
+// Q, P and the flags are left as that endless run leaves them: nothing
+// pending, the pipeline drained.
 @(private)
-vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []bool, budget: ^int) -> (u32, bool) #no_bounds_check {
+vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []bool, budget: ^int, park: bool) -> (u32, bool, bool) #no_bounds_check {
 	mask := u32(len(v.micro) - 1) &~ 7
 	pc := pc
 	jumping, ending := false, false
 	target: u32
+	land := ~u32(0) // where the last jump landed
+	idle := false // every pair since then was idle
 	for budget^ > 0 {
 		budget^ -= 1
 		lw := (^u32)(&v.micro[pc])^
@@ -985,21 +1000,29 @@ vu_interp :: #force_inline proc(v: ^Vu, pairs: []Vu_Pair_Info, pc: u32, stop: []
 		vu_flags_shift(v, pre)
 		vu_tick(v)
 		v.vih = {e, v.vih[0], v.vih[1], v.vih[2]}
+		if park && !info.idle {idle = false}
 		if jumping { // that was the delay slot
 			next = target & mask
 			jumping = false
 			v.vih = {}
+			if park && !taken {
+				if next == land && idle && v.q_wait | v.p_wait | v.q_due == 0 {
+					vu_flags_seed(v)
+					return next, false, true
+				}
+				land, idle = next, true
+			}
 		}
 		if taken {
 			jumping = true
 			target = dst
 		}
-		if ending {return next, true}
+		if ending {return next, true, false}
 		if uw & (1 << 30) != 0 {ending = true}
 		pc = next
 		if !jumping && !ending && v.q_wait | v.p_wait == 0 && int(pc / 8) < len(stop) && stop[pc / 8] {break}
 	}
-	return pc, false
+	return pc, false, false
 }
 
 // A microprogram starts with the pipeline drained: every older flag is the
@@ -1373,7 +1396,21 @@ Vu_Pair_Info :: struct {
 	uw, lw: u32,
 	valid:  bool,
 	serial: bool, // running upper then lower gives the same result as vu_pair
+	idle:   bool, // writes no state: vu_pair_idle
 	vih:    u32, // vih_entry
+}
+
+// Whether a pair writes no state at all, so a loop of such pairs never
+// ends by itself (vu_interp's park): a NOP upper with no I, E, M, D or T
+// bit over a branch that links nothing (B, IBEQ, IBNE, IBLTZ, IBGTZ,
+// IBLEZ, IBGEZ) or a MOVE with no field to write, the lower NOP.
+@(private)
+vu_pair_idle :: proc(uw, lw: u32) -> bool {
+	if uw != 0x000002ff {return false}
+	switch lw >> 25 {
+	case 0x20, 0x28, 0x29, 0x2c ..= 0x2f: return true
+	}
+	return lw & 0xffe007ff == 0x8000033c
 }
 
 @(private)
@@ -1386,7 +1423,7 @@ vu1_pairs: [len(vu1_micro) / 8]Vu_Pair_Info
 // nothing else the lower reads (VI, Q, P and R belong to the lower side).
 @(private)
 vu_pair_info :: proc(uw, lw: u32) -> Vu_Pair_Info {
-	info := Vu_Pair_Info{uw = uw, lw = lw, valid = true, vih = vih_entry(uw, lw)}
+	info := Vu_Pair_Info{uw = uw, lw = lw, valid = true, idle = vu_pair_idle(uw, lw), vih = vih_entry(uw, lw)}
 	if uw & (1 << 31) != 0 {return info} // I bit: vu_pair's own path
 	ud := vu_upper_dest(uw)
 	ft, fs := (lw >> 16) & 31, (lw >> 11) & 31
@@ -1577,12 +1614,25 @@ vu1_xgkick :: proc(addr: u16) {
 
 // Run a VU0 microprogram (VCALLMS, VCALLMSR, VIF0 MSCAL) to its E bit, as
 // vu1_start: compiled programs (rec/vu0) where they hold, the interpreter
-// elsewhere. Like VU1 it runs synchronously, so VU0 is never busy when the
+// elsewhere. Like VU1 it runs synchronously, so VU0 is not busy when the
 // EE next looks: the EE is charged no cycles, where hardware would stall it
 // only for a VCALLMS while VU0 still runs or a QMFC2.I/CFC2.I that waits
 // for the end. No state outlives the call but tpc and the registers.
+//
+// The exception is a program that waits for the EE: one in a loop of idle
+// pairs that only a CTC2 to an integer register can end. The interpreter
+// parks it there (vu_interp): tpc is the loop, vu0_parked is set and
+// VPU-STAT reads VU0 as running, until a CTC2 to vi1-vi15 lets it go on
+// (vu0_ctrl_write) to its E bit or to its next such loop. A VCALLMS,
+// VCALLMSR or MSCAL meanwhile starts the new program and drops the parked
+// one, where hardware would first let it end. A macro operation or an
+// interlocked CFC2 or CTC2 meanwhile runs at once against the parked
+// registers, where hardware would wait for the program's end or M bit.
+// Compiled code never parks: such a loop inside a compiled program still
+// runs to the step limit.
 vu0_call_micro :: proc(addr: u32) {
 	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
+	if vu0_parked {vu0_park_note(.Call)}
 	t := cpu.prof_start()
 	defer cpu.prof_end(.VU0, t)
 	if vu0_cap.on {vu_capture(&vu0, addr)}
@@ -1595,13 +1645,39 @@ vu0_call_micro :: proc(addr: u32) {
 
 @(private)
 vu0_exec :: proc(addr: u32, compiled: bool) {
-	pc, ended := micro_exec(&vu0, &vu0_table, &vu0_micro_gen, vu0_pairs[:], addr, compiled)
+	pc, ended, parked := micro_exec(&vu0, &vu0_table, &vu0_micro_gen, vu0_pairs[:], addr, compiled, true)
 	vu_drain(&vu0)
-	if !ended && !vu0_overrun {
+	vu0_parked = parked
+	if !ended && !parked && !vu0_overrun {
 		vu0_overrun = true
 		fmt.eprintfln("vu0: microprogram at %04x ran %d steps without ending", addr, VU_STEP_LIMIT)
 	}
 	vu0.tpc = pc
+}
+
+// Whether VU0's microprogram is parked in a loop that waits for the EE
+// (vu0_call_micro); vu0.tpc is the loop then.
+vu0_parked: bool
+
+// What ran over a parked VU0 without waiting for it, each kind shown once
+// under PS_DEBUG; not state.
+Vu_Park_Note :: enum {
+	Call, // VCALLMS, VCALLMSR, MSCAL: the parked program is dropped
+	Macro, // a COP2 macro operation
+	Interlock, // CFC2 or CTC2 with the interlock bit
+}
+@(private)
+vu0_park_noted: bit_set[Vu_Park_Note]
+
+vu0_park_note :: proc(what: Vu_Park_Note) {
+	if cpu.debug < 1 || what in vu0_park_noted {return}
+	vu0_park_noted += {what}
+	@(static, rodata) text := [Vu_Park_Note]string {
+		.Call      = "a new microprogram starts: the parked one is dropped",
+		.Macro     = "a macro operation runs without waiting for it",
+		.Interlock = "an interlocked CFC2 or CTC2 runs without waiting for it",
+	}
+	fmt.eprintfln("vu0: parked at %04x, %s", vu0.tpc, text[what])
 }
 
 // Emulated state, saved and restored by snapshots (snap.odin).
@@ -1613,6 +1689,7 @@ vu_snap :: proc() {
 	core.snap_add(&vu1_mem)
 	core.snap_add(&vu1_micro)
 	core.snap_add(&vu0_overrun)
+	core.snap_add(&vu0_parked)
 	core.snap_add(&vu1_overrun)
 	core.snap_add(&vu1_status_stale)
 	core.snap_add(&vu0_micro_gen)
