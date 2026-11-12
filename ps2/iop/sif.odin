@@ -109,7 +109,8 @@ sif_init :: proc() {
 	sif.servers[0x80000400] = mcserv_server
 	sif.servers[PADMAN_SID] = padman_server
 	sif.servers[PADMAN_SID_101] = padman_server_101
-	sif.servers[0x80000900] = mtap_server
+	sif.servers[DBC_SID_900] = dbcman_900_server
+	sif.servers[DBC_SID_900_CALL] = dbcman_900_call_server
 	sif.servers[DBC_SID] = dbcman_server
 	sif.servers[DBC_SID_MID] = dbcman_mid_server
 	sif.servers[DBC_SID_BIG] = dbcman_big_server

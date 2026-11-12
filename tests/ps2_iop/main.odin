@@ -242,6 +242,7 @@ game :: proc(_: rawptr) {
 	test_ds2()
 	test_padman()
 	test_dbcman()
+	test_dbcman_900()
 	test_sifcmd()
 	test_other_data()
 	test_cmd_deliver()
@@ -7128,6 +7129,111 @@ test_dbcman :: proc() {
 	iop.dbcman_module("dbc.irx", dbc_image(0x310))
 
 	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
+}
+
+// The 900 server set: a Dbc_Manager image of module version 0x202 serves
+// dbcman on 0x80000900, the sid mtapman has in every other set, and driver
+// calls on 0x8000091b.
+test_dbcman_900 :: proc() {
+	fresh()
+	iop.pad_init()
+	defer iop.pad_init()
+	FLAGS :: 0x00100000
+	PAD_A :: 0x00100100
+	PAD_B :: 0x00100180
+	buf: [0x400]u8
+	w := ([^]u32)(&buf)
+	r := ([^]i32)(&buf)
+	call :: proc(buf: []u8, sid, fno: u32, words: ..u32) -> bool {
+		for &b in buf {b = 0}
+		w := ([^]u32)(raw_data(buf))
+		for x, i in words {w[i] = x}
+		return iop.sif.servers[sid](fno, buf, 0x400)
+	}
+	create :: proc(buf: []u8, type, port, a, b: u32) -> i32 {
+		for &x in buf {x = 0}
+		w := ([^]u32)(raw_data(buf))
+		w[0], w[1], w[2], w[10], w[11] = 3, type, port, a, b
+		copy(buf[0x14:], "MC2S")
+		iop.sif.servers[iop.DBC_SID_900](0x80000901, buf, 0x400)
+		return ([^]i32)(raw_data(buf))[9]
+	}
+	dbc_image :: proc(version: u16) -> []u8 {
+		f := build_file("Dbc_Manager", {EXPORT, 0, 0x0101, 0x6d636264, 0x00006e61, 0}, {}, 0) // "dbcman"
+		endian.put_u16(f[0x74 + 24:], .Little, version)
+		return f
+	}
+	S :: iop.DBC_SID_900
+	C :: iop.DBC_SID_900_CALL
+
+	// No dbcman image yet, then the two 13xx ones: 0x80000900 is mtapman.
+	mtap :: proc(buf: []u8) -> bool {
+		w := ([^]u32)(raw_data(buf))
+		ok := call(buf, S, 5) && w[0] == 0x310
+		ok &&= call(buf, S, 1, 2) && w[1] == 1 && call(buf, S, 2, 2) && w[1] == 1
+		return ok && !call(buf, C, C, 0, 0x0101800c)
+	}
+	check(mtap(buf[:]), "dbcman 900: no image, 0x80000900 is mtapman, version 0x310, a port opens; no 0x8000091b")
+	iop.dbcman_module("dbc.irx", dbc_image(0x301))
+	check(mtap(buf[:]) && call(buf[:], iop.DBC_SID, 0x80001363) && w[0] == 0x310 && iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x90), "dbcman 900: a 0x301 image, the 131b set as before, mtapman on 0x80000900")
+	iop.dbcman_module("dbc.irx", dbc_image(0x310))
+	check(mtap(buf[:]) && call(buf[:], iop.DBC_SID, 0x80001363) && w[0] == 0x310 && iop.sif.servers[iop.DBC_SID_FAST0](0, buf[:], 0x90), "dbcman 900: a 0x310 image, the fast set as before, mtapman on 0x80000900")
+
+	// A 0x202 image: the control calls, numbered from 0x80000901.
+	iop.dbcman_module("dbc.irx", dbc_image(0x202))
+	check(call(buf[:], S, 0x80000963) && w[0] == 0x202, "dbcman 900 0x963: version 0x202")
+	flags := ([^]u32)(raw_data(mem.ram_slice(FLAGS, 64)))
+	for i in 0 ..< 16 {flags[i] = 0xee}
+	call(buf[:], S, 0x80000904, 0x202, FLAGS)
+	check(w[0] == 1 && flags[0] == 0 && flags[15] == 0, "dbcman 900 0x904: 1, the 16 flags written at once")
+	check(create(buf[:], 1, 0, PAD_A, PAD_B) == 0 && flags[0] == 1, "dbcman 900 0x901: socket 0 at +0x24, its flag set")
+	check(create(buf[:], 2, 2, 0, 0) == 1 && flags[1] == 0, "dbcman 900 0x901: a card socket, unbound")
+	call(buf[:], S, 0x80000903, 0)
+	check(r[1] == 0, "dbcman 900 0x903: socket 0 on driver 0")
+	call(buf[:], S, 0x80000903, 1)
+	check(r[1] == -0xc, "dbcman 900 0x903: the card socket unbound, -0xc")
+	call(buf[:], S, 0x80000917)
+	check(w[1] == 0, "dbcman 900 0x917: 0")
+	call(buf[:], S, 0x8000091a, 0, 0x0101800c)
+	check(r[0x8c / 4] == 1 && w[2] == 1 && buf[0xc] == 1 && w[0x20c / 4] == 0, "dbcman 900 0x91a: the result at +0x8c")
+	check(call(buf[:], C, C, 0, 0x0101800c) && r[0x8c / 4] == 1 && buf[0xc] == 1 && w[0x3fc / 4] == 0, "dbcman 900 0x8000091b: a driver call of 0x400 bytes, the result at +0x8c")
+	for &b in buf {b = 0}
+	w[0], w[1] = 0, 0x0101800c
+	check(iop.sif.servers[C](C, buf[:], 0x404) && w[0x8c / 4] == 0, "dbcman 900 0x8000091b: over 0x400 bytes, not served")
+	check(!iop.sif.servers[iop.DBC_SID_MID](0, buf[:], 0x90) && !iop.sif.servers[iop.DBC_SID_BIG](0, buf[:], 0x90) && !iop.sif.servers[iop.DBC_SID_FAST0](0, buf[:], 0x90), "dbcman 900: no 13xx driver-call server")
+
+	// A call the set has not: a row each time, the buffer left as sent.
+	// mtapman's fnos are such calls now.
+	clear(&core.compat.calls)
+	for fno in ([2]u32{0x80000915, 5}) {
+		for &b in buf {b = 0xee}
+		iop.sif.servers[S](fno, buf[:], 0x400)
+		iop.sif.servers[S](fno, buf[:], 0x400)
+		check(core.compat.calls[{.Sif_Rpc, S, fno}].n == 2 && w[0] == 0xeeeeeeee && w[1] == 0xeeeeeeee, "dbcman 900: a call not in the set, a row, the buffer left")
+	}
+
+	// ds2u under the set: its mode bytes, and the pad block at vblank.
+	iop.dbcman_module(`cdrom0:\MODULES\DS2U.IRX;1`)
+	check(call(buf[:], C, C, 0, 0x01010002) && r[0x8c / 4] == 1 && w[3] == 0x79, "dbcman 900 ds2u 0x01010002: id 0x79")
+	check(call(buf[:], C, C, 0, 0x01020002) && r[0x8c / 4] == 1 && slice.equal(buf[0xc:][:4], []u8{0xff, 0xff, 0xff, 0xff}), "dbcman 900 ds2u 0x01020002: its 4 bytes")
+	iop.pads[0].buttons = {.Cross}
+	iop.pads[0].axes = {1, 2, 3, 4}
+	a := mem.ram_slice(PAD_A, 0x80)
+	for &x in a {x = 0xee}
+	iop.dbcman_vblank()
+	poll := [18]u8{0 = 0xff, 1 = 0xbf, 2 = 1, 3 = 2, 4 = 3, 5 = 4, 12 = 0xff}
+	check(slice.equal(a[:4], []u8{1, 22, 18, 4}) && slice.equal(a[0x1c:][:18], poll[:]) && slice.equal(a[0x2e:][:4], []u8{0xff, 0xff, 0xff, 0xff}), "dbcman 900 ds2u: the block at A, 18 poll bytes at +0x1c, then ff ff ff ff")
+	call(buf[:], S, 0x80000902, 0)
+	check(w[1] == 1 && flags[0] == 0, "dbcman 900 0x902: 1, flag 0")
+
+	// Init (an IOP reset) gives 0x80000900 back to mtapman; a 13xx image
+	// after the 0x202 one does too.
+	iop.dbcman_init()
+	check(mtap(buf[:]), "dbcman 900: init, mtapman again")
+	iop.dbcman_module("dbc.irx", dbc_image(0x202))
+	check(load_buffer(dbc_image(0x310)) == {2, 0} && mtap(buf[:]) && call(buf[:], iop.DBC_SID, 0x80001363) && w[0] == 0x310, "dbcman 900: a 0x310 image after, the fast set and mtapman")
+	check(load_buffer(dbc_image(0x202)) == {2, 0} && call(buf[:], S, 0x80000963) && w[0] == 0x202, "dbcman 900: a buffer load's 0x202 image picks the set")
+	iop.dbcman_init()
 }
 
 test_card_dirty :: proc() {

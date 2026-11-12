@@ -2,10 +2,11 @@
 // driver (ds1o_d, ds2o_d or ds2u) and the memory card driver mc2_d, so none
 // of these modules, nor sio2d under them, runs on the IOP.
 //
-// Two server sets, keyed on the Dbc_Manager module version (its .iopmod
+// Three server sets, keyed on the Dbc_Manager module version (its .iopmod
 // header) of the image the game loads (dbcman_module); each is a row of
-// DBC_SERVERS. Every retail dbcman seen exports dbcman 1.02, whichever set it
-// registers, so the export library's version cannot tell them apart.
+// DBC_SERVERS. Every retail dbcman seen with a 13xx set exports dbcman 1.02,
+// whichever of the two it registers, so the export library's version cannot
+// tell them apart.
 // - Fast (module 0x310, and the default): control server 0x80001300 with
 //   every call below, the large driver-call server 0x8000131c and the fast
 //   ones 0x8000131e/f.
@@ -14,7 +15,13 @@
 //   DriverFn3's result at +0x20c of its 0x280-byte buffer; the driver-call
 //   servers 0x8000131b (requests of up to 0x1090 bytes) and 0x8000131c. No
 //   fast servers.
-// The calls the two share take the same layouts. A control call a set does
+// - 900 (module 0x202): control server 0x80000900, the sid mtapman registers
+//   in games that load that instead, with the same calls numbered from
+//   0x80000901: CreateSocket, DeleteSocket, GetBoundDriver, SetFlagBuffer,
+//   Status, DriverFn3 (0x8000091a, result at +0x8c) and the version, 0x202.
+//   One driver-call server, 0x8000091b, its result at +0x8c of a 0x400-byte
+//   request. None of the 13xx servers.
+// The calls the sets share take the same layouts. A control call a set does
 // not serve is logged once and its buffer left as sent; a driver-call server
 // it has not is unserved, as without a handler.
 //
@@ -123,15 +130,16 @@ DBC_SID_MID :: 0x8000131b // the 131b set: driver calls of up to 0x1090 bytes
 DBC_SID_BIG :: 0x8000131c // driver calls of up to 0x2090 bytes
 DBC_SID_FAST0 :: 0x8000131e // driver calls of up to 0x90 bytes
 DBC_SID_FAST1 :: 0x8000131f
-// Both sets answer 0x1363 with this: the EE library of either checks only
-// the major version, 3. Retail's 0x301 module answers 0x301.
-DBC_VERSION :: 0x310
+DBC_SID_900 :: 0x80000900 // the 900 set's control server; mtapman's sid in any other set
+DBC_SID_900_CALL :: 0x8000091b // the 900 set: driver calls of up to 0x400 bytes
 
 // What one server set serves (see the header).
 Dbc_Rows :: struct {
-	fnos:      Dbc_Fnos, // control calls served, by fno - 0x1300
-	fn3_at:    u32, // where DriverFn3's result goes
-	mid, fast: bool, // 0x8000131b; 0x8000131e/f
+	fnos:           Dbc_Fnos, // control calls served, by fno - base
+	base:           u32, // low 16 bits of the control server's sid
+	version:        u32, // the answer to the version call, base + 0x63
+	fn3_at:         u32, // where DriverFn3's result goes
+	mid, big, fast: bool, // 0x8000131b; 0x8000131c; 0x8000131e/f
 }
 
 // A full set serves every fno, even one past it.
@@ -140,12 +148,22 @@ Dbc_Fnos :: bit_set[0 ..< 128;u128]
 Dbc_Servers :: enum u8 {
 	Fast,
 	Sid_131b,
+	Sid_900,
 }
 
+// The two 13xx sets answer 0x310: the EE library of either checks only the
+// major version, 3. Retail's 0x301 module answers 0x301. The 900 set's EE
+// library wants major version 2, and its module answers 0x202.
+//
+// The 900 row's fnos are matched on their low 16 bits like the others'; its
+// image compares the full fno, 0x80000901 up. Its table has DriverFn0,
+// DriverFn1, DriverFn4 and DriverFn5 too (0x15, 0x16, 0x18, 0x19), which its
+// EE library never sends: not served.
 @(rodata)
 DBC_SERVERS := [Dbc_Servers]Dbc_Rows {
-	.Fast     = {fnos = ~Dbc_Fnos{}, fn3_at = 0x8c, fast = true},
-	.Sid_131b = {fnos = {0x01, 0x02, 0x03, 0x04, 0x1a, 0x63}, fn3_at = 0x20c, mid = true},
+	.Fast     = {fnos = ~Dbc_Fnos{}, base = 0x1300, version = 0x310, fn3_at = 0x8c, big = true, fast = true},
+	.Sid_131b = {fnos = {0x01, 0x02, 0x03, 0x04, 0x1a, 0x63}, base = 0x1300, version = 0x310, fn3_at = 0x20c, mid = true, big = true},
+	.Sid_900  = {fnos = {0x01, 0x02, 0x03, 0x04, 0x17, 0x1a, 0x63}, base = 0x0900, version = 0x202, fn3_at = 0x8c},
 }
 
 DBC_SOCKETS :: 16
@@ -219,7 +237,7 @@ dbc: struct {
 }
 
 // Host diagnostics, not emulated state: the unserved control fnos logged
-// (fno - 0x1300; any other fno is 127's), and whether an unknown export
+// (fno - the set's base; any other fno is 127's), and whether an unknown export
 // version was.
 @(private = "file")
 dbc_logged: struct {
@@ -236,9 +254,9 @@ dbcman_init :: proc() {
 
 // A module load, its IRX `image` when one was read: the copy the EE made to
 // the IOP, or the cdrom file a path names (loadfile_server). A Dbc_Manager
-// image picks the server set from then on by its module version: the 131b
-// set for 0x301, the fast set for 0x310, and the fast set, logged once, for
-// any other. Each such pick is logged, naming the version and the set.
+// image picks the server set from then on by its module version: the 900
+// set for 0x202, the 131b set for 0x301, the fast set for 0x310, and the
+// fast set, logged once, for any other. Each such pick is logged, naming the version and the set.
 // A dbcman load with no image to read (a rom0 or host path, or a
 // disc file that cannot be read) takes the fast set, logged once. Any other
 // load leaves the set as it is.
@@ -250,9 +268,13 @@ dbcman_init :: proc() {
 dbcman_module :: proc(path: string, image: []u8 = nil) {
 	name := dbc_module_name(path)
 	if v, ok := dbc_module_version(image); ok {
-		dbc.servers = .Sid_131b if v == 0x301 else .Fast
+		switch v {
+		case 0x202: dbc.servers = .Sid_900
+		case 0x301: dbc.servers = .Sid_131b
+		case: dbc.servers = .Fast
+		}
 		fmt.eprintfln("dbcman: Dbc_Manager module version %#x: the %v set", v, dbc.servers)
-		if v != 0x301 && v != 0x310 && !dbc_logged.version {
+		if v != 0x202 && v != 0x301 && v != 0x310 && !dbc_logged.version {
 			dbc_logged.version = true
 			fmt.eprintfln("dbcman: Dbc_Manager module version %#x not known; serving the fast set", v)
 		}
@@ -388,17 +410,18 @@ dbcman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
 	r := ([^]i32)(raw_data(buf)) // result words
 	rows := &DBC_SERVERS[dbc.servers]
-	if k := int(fno & 0xffff) - 0x1300; !dbc_serves(rows.fnos, k) {
+	k := int(fno & 0xffff) - int(rows.base) // the call's number in the set
+	if !dbc_serves(rows.fnos, k) {
 		bit := k if 0 <= k && k < 128 else 127
 		if bit not_in dbc_logged.fnos {
 			dbc_logged.fnos += {bit}
 			fmt.eprintfln("dbcman: fno %08x not served by the %v set; the buffer left as sent", fno, dbc.servers)
 		}
-		core.compat_unknown(.Sif_Rpc, DBC_SID, sub = fno)
+		core.compat_unknown(.Sif_Rpc, 0x80000000 | rows.base, sub = fno)
 		return true
 	}
-	switch fno & 0xffff {
-	case 0x1301: // CreateSocket {flags, type, port, slot, sub, name[16], _, A, B} -> +0x24
+	switch k {
+	case 0x01: // CreateSocket {flags, type, port, slot, sub, name[16], _, A, B} -> +0x24
 		i := 0
 		for i < DBC_SOCKETS && dbc.sockets[i].used {i += 1}
 		if i == DBC_SOCKETS {
@@ -420,7 +443,7 @@ dbcman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		dbc_bind()
 		dbc_flags_push()
 		w[9] = u32(i)
-	case 0x1302: // DeleteSocket {socket} -> +4
+	case 0x02: // DeleteSocket {socket} -> +4
 		s := dbc_socket(w[0])
 		if s == nil {
 			r[1] = DBC_BAD_SOCKET
@@ -430,66 +453,81 @@ dbcman_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		dbc_bind()
 		dbc_flags_push()
 		w[1] = 1
-	case 0x1303: // GetBoundDriver {socket} -> +4
+	case 0x03: // GetBoundDriver {socket} -> +4
 		s := dbc_socket(w[0])
 		r[1] = DBC_BAD_SOCKET if s == nil else DBC_NO_DRIVER if s.driver < 0 else s.driver
-	case 0x1304: // SetFlagBuffer {version, EE address} -> +0: the flags go there at once
+	case 0x04: // SetFlagBuffer {version, EE address} -> +0: the flags go there at once
 		dbc.flag_buf = w[1]
 		dbc_flags_push()
 		w[0] = 1
-	case 0x1317: w[1] = 0 // Status: unsupported, always 0
-	case 0x1319: // DriverFn5 {socket, cmd, size, param...} -> +0x8c
+	case 0x17: w[1] = 0 // Status: unsupported, always 0
+	case 0x19: // DriverFn5 {socket, cmd, size, param...} -> +0x8c
 		r[0x8c / 4] = dbc_call(w[0], w[1], buf)
-	case 0x131a: // DriverFn3 {socket, cmd, size, param...} -> the set's place
+	case 0x1a: // DriverFn3 {socket, cmd, size, param...} -> the set's place
 		r[rows.fn3_at / 4] = dbc_call(w[0], w[1], buf, ping = true)
-	case 0x131d: // FindSocketByDevice {_, _, _, _, port, slot} -> +4
+	case 0x1d: // FindSocketByDevice {_, _, _, _, port, slot} -> +4
 		r[1] = DBC_NO_DRIVER
 		for drv, d in DBC_DRIVERS {
 			if drv.port != w[4] || w[5] != 0 || !dbc_connected(d) {continue}
 			r[1] = DBC_BAD_SOCKET
 			for s, i in dbc.sockets {if s.driver == i32(d) {r[1] = i32(i)}}
 		}
-	case 0x1363: w[0] = DBC_VERSION
+	case 0x63: w[0] = rows.version
 	case:
-		// DriverFn0, DriverFn1, DriverFn4 (0x1315, 0x1316, 0x1318): what the
+		// DriverFn0, DriverFn1, DriverFn4 (0x15, 0x16, 0x18): what the
 		// pad driver does for them is not known.
-		if !core.compat_unknown(.Sif_Rpc, DBC_SID, sub = fno) {fmt.eprintfln("dbcman: unhandled fno %08x", fno)}
+		if !core.compat_unknown(.Sif_Rpc, 0x80000000 | rows.base, sub = fno) {fmt.eprintfln("dbcman: unhandled fno %08x", fno)}
 		w[1] = 0
 	}
 	return true
 }
 
-// Whether `fnos` serves control fno 0x1300 + k.
+// Whether `fnos` serves control call k of its set.
 @(private = "file")
 dbc_serves :: proc(fnos: Dbc_Fnos, k: int) -> bool {
 	if 0 <= k && k < 128 {return k in fnos}
 	return fnos == ~Dbc_Fnos{}
 }
 
+// 0x80000900: the 900 set's control server while that set is picked, and
+// mtapman's server otherwise. No game seen loads both modules.
+@(private)
+dbcman_900_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
+	if dbc.servers == .Sid_900 {return dbcman_server(fno, buf, send_size)}
+	return mtap_server(fno, buf, send_size)
+}
+
 // The driver-call servers: a DriverFn5 request, its result at the end of the
-// buffer. A request larger than the buffer is not served. A server the
-// set has not is unserved, as without a handler.
+// buffer, or at +0x8c of the 900 set's, whose server takes any fno. A
+// request larger than the buffer is not served. A server the set has not is
+// unserved, as without a handler.
 @(private)
 dbcman_fast_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
-	return DBC_SERVERS[dbc.servers].fast && dbc_driver_call(buf, send_size, 0x90)
+	return DBC_SERVERS[dbc.servers].fast && dbc_driver_call(buf, send_size, 0x90, 0x8c)
 }
 
 @(private)
 dbcman_mid_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
-	return DBC_SERVERS[dbc.servers].mid && dbc_driver_call(buf, send_size, 0x1090)
+	return DBC_SERVERS[dbc.servers].mid && dbc_driver_call(buf, send_size, 0x1090, 0x108c)
 }
 
 @(private)
 dbcman_big_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
-	return dbc_driver_call(buf, send_size, 0x2090)
+	return DBC_SERVERS[dbc.servers].big && dbc_driver_call(buf, send_size, 0x2090, 0x208c)
 }
 
+@(private)
+dbcman_900_call_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
+	return dbc.servers == .Sid_900 && dbc_driver_call(buf, send_size, 0x400, 0x8c)
+}
+
+// A driver call of up to `size` bytes, its result at `at`.
 @(private = "file")
-dbc_driver_call :: proc(buf: []u8, send_size, size: u32) -> bool {
+dbc_driver_call :: proc(buf: []u8, send_size, size, at: u32) -> bool {
 	if send_size <= size {
 		w := ([^]u32)(raw_data(buf))
 		r := ([^]i32)(raw_data(buf))
-		r[(size - 4) / 4] = dbc_call(w[0], w[1], buf)
+		r[at / 4] = dbc_call(w[0], w[1], buf)
 	}
 	return true
 }
