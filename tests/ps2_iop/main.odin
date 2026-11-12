@@ -260,6 +260,7 @@ game :: proc(_: rawptr) {
 	test_call_context()
 	test_sifman()
 	test_sif_dma_intr()
+	test_sif_dma_stat()
 	test_libsd()
 	test_vblank_samples()
 	test_cdvdman()
@@ -4267,7 +4268,7 @@ test_sif_dma_intr :: proc() {
 		core.snap_op, core.snap_target = .Load, &snap15
 		core.snap_yield()
 	}
-	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && s.dma_cb[0] == {b + h, 0x55, due}, "sifman 32: the load puts the owed callback back")
+	check(word(b, d, 0) == 0 && s.n_dma_cb == 1 && s.dma_cb[0] == {b + h, 0x55, due, id32}, "sifman 32: the load puts the owed callback back")
 	iop.iop_tick(iop.iop_wake_ee)
 	check(word(b, d, 0) == 1 && word(b, d, 1) == 0x55 && word(b, d, 2) == 1, "sifman 32: the callback gets its arg, the thread it signals runs after")
 	check(s.n_dma_cb == 0 && iop.sif_dma_next_ee() == max(u64), "sifman 32: none owed, no wake")
@@ -4328,6 +4329,116 @@ test_sif_dma_intr :: proc() {
 	check(word(b, rd, 0) == 2 && iop.iop_wake_ee > w2, "sifman 32: it runs again at its next due")
 	fresh()
 	check(iop.iop_sifcmd.n_dma_cb == 0, "sifman 32: the loader's reset clears the callbacks owed")
+}
+
+// sceSifDmaStat: 0 for the first transfer owed its callback, 1 for one owed
+// behind it, -1 once the callback has run, and -1 for a plain sceSifSetDma
+// id or one never handed out. A thread that polls it without blocking sees
+// the transfer end: its slice is bounded, and the next tick runs the
+// callback due before the thread goes on.
+test_sif_dma_stat :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	// "modk": a callback that counts its calls and iSignalSemas sem; a
+	// thread that waits on sem, then polls DmaStat of the id in its data
+	// until it is done, counting the polls that found it not done.
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6)
+	ts := imports(&a, "thsemap", 4, 7, 8)
+	sm := imports(&a, "sifman", 8)
+	d := at(&a) // callback calls, polls not done, polls done, sem, th, id
+	put(&a, 0, 0, 0, 0, 0, 0)
+	src := at(&a)
+	put(&a, 0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00)
+	dmat := at(&a) // {src, dest, size, attr}, filled in below
+	put(&a, 0, 0, 0, 0)
+	semp := at(&a)
+	put(&a, 0, 0, 0, 64) // attr, option, initial, max
+	h := at(&a)
+	prologue(&a)
+	la(&a, T0, d)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0x8d04000c, 0) // lw a0, 12(t0); nop
+	jal(&a, ts + 8)
+	epilogue(&a)
+	w := at(&a)
+	call_word(&a, ts + 16, d + 12)
+	poll := at(&a)
+	lw_at(&a, A0, d + 20)
+	jal(&a, sm)
+	put(&a, 0x04400000, 0) // bltz v0, done; nop
+	done := len(a.w) - 2
+	la(&a, T0, d)
+	put(&a, 0x8d090004, 0, 0x25290001, 0xad090004) // lw t1, 4(t0); nop; addiu t1, t1, 1; sw t1, 4(t0)
+	put_rel(&a, 0x08000000 | poll >> 2, 4) // j poll
+	put(&a, 0)
+	branch_to(&a, done)
+	la(&a, T0, d)
+	put(&a, 0x8d090008, 0, 0x25290001, 0xad090008) // lw t1, 8(t0); nop; addiu t1, t1, 1; sw t1, 8(t0)
+	put_rel(&a, 0x08000000 | w >> 2, 4) // j w
+	put(&a, 0)
+	tp := thread_param(&a, w, 20)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, ts, semp, d + 12)
+	call_addr(&a, tb, tp, d + 16)
+	call_word(&a, tb + 8, d + 16)
+	li(&a, V0, 0)
+	epilogue(&a)
+	id, res := iop.iop_load(build_mod("modk", &a, entry), "modk", nil)
+	b := module_base(id)
+	word :: proc(b, d, i: u32) -> u32 {return iop.iop_u32(b + d + 4 * i)^}
+	check(id > 0 && res == 0 && word(b, d, 2) == 0, "sifman 8: the module loads, its thread waits")
+	EE_DEST :: 0x100000
+	t := iop.iop_mem(b + dmat, 16)
+	endian.put_u32(t[0:], .Little, b + src)
+	endian.put_u32(t[4:], .Little, EE_DEST)
+	// sifman's functions called as the IOP's code would, the registers
+	// the call uses put back for the thread that owns them.
+	fn :: proc(fno: u32, args: ..u32) -> u32 {
+		saved := r3000.state.r
+		defer r3000.state.r = saved
+		for v, i in args {r3000.state.r[4 + i] = v}
+		v, ok := iop.sifman_fn(fno)
+		check(ok, "sifman 8: served")
+		return v
+	}
+	DONE :: 0xffffffff
+	s := &iop.iop_sifcmd
+
+	r3000.state.cycles = 1000
+	endian.put_u32(t[8:], .Little, 16)
+	plain := fn(7, b + dmat, 1)
+	none := fn(32, b + dmat, 1, 0, 0)
+	first := fn(32, b + dmat, 1, b + h, 0)
+	endian.put_u32(t[8:], .Little, 64)
+	second := fn(32, b + dmat, 1, b + h, 0)
+	check(s.n_dma_cb == 2 && first != second, "sifman 8: two transfers owed their callbacks, an id each")
+	check(fn(8, first) == 0, "sifman 8: the first transfer owed its callback runs, 0")
+	check(fn(8, second) == 1, "sifman 8: one owed behind it is queued, 1")
+	check(fn(8, plain) == DONE && fn(8, none) == DONE, "sifman 8: a transfer with no callback is done when set, -1")
+	check(fn(8, 0) == DONE && fn(8, second + 1) == DONE, "sifman 8: an id never handed out, -1")
+
+	// The thread polls the second id from the first's callback on: it
+	// finds it running, and done once the second's callback has run.
+	iop.iop_u32(b + d + 20)^ = second
+	d1, d2 := s.dma_cb[0].due, s.dma_cb[1].due
+	iop.iop_tick(d1)
+	check(word(b, d, 0) == 1 && fn(8, first) == DONE && fn(8, second) == 0, "sifman 8: its callback run, the first is done and the second runs")
+	check(word(b, d, 1) > 0 && word(b, d, 2) == 0, "sifman 8: the thread polls the second and finds it running")
+	for _ in 0 ..< 4 {
+		if word(b, d, 2) != 0 {break}
+		iop.iop_tick(max(iop.iop_wake_ee, d2))
+	}
+	check(word(b, d, 0) == 2 && word(b, d, 2) != 0 && fn(8, second) == DONE && s.n_dma_cb == 0, "sifman 8: the poll ends, the second's callback run while the thread never blocked")
+
+	// The loader's reset drops the callbacks owed, so their ids are done.
+	first = fn(32, b + dmat, 1, b + h, 0)
+	second = fn(32, b + dmat, 1, b + h, 0)
+	check(fn(8, first) == 0 && fn(8, second) == 1, "sifman 8: two owed again")
+	fresh()
+	check(fn(8, first) == DONE && fn(8, second) == DONE, "sifman 8: after the loader's reset no id reads as running")
 }
 
 // libsd's functions, in the order "modl" imports them.

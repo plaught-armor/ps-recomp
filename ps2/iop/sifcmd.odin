@@ -36,10 +36,12 @@ Iop_Sifcmd :: struct {
 }
 
 // A completion callback owed: func(arg) once its transfer is done, at EE
-// cycle `due`.
+// cycle `due`; `id` is the transfer's, which sceSifDmaStat reads as not
+// done until then.
 Sif_Dma_Cb :: struct {
 	func, arg: u32,
 	due:       u64,
+	id:        u32,
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -96,8 +98,9 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	return 0, false
 }
 
-// Function fno of sifman, as stdio_fn. A DMA is done when it is set; a
-// completion callback runs at the next tick (sif_dma_intr_run).
+// Function fno of sifman, as stdio_fn. A DMA is copied when it is set; a
+// completion callback runs at the tick its transfer's time is up
+// (sif_dma_intr_run), and sceSifDmaStat reads the transfer as done from then.
 sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
 	switch fno {
@@ -112,11 +115,20 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if n > SIF_DMA_TAGS {return 0, true}
 		id, _, _ := sifman_dma(r[4], u32(max(n, 0)))
 		return id, true
-	case 8: // sceSifDmaStat(id): -1, done
-		// Retail: 1 while the id's batch is queued behind a running one, 0
-		// while it runs, -1 once done, and -1 for any id while the channel
-		// is idle. A transfer here is done when it is set, so the channel is
-		// always idle.
+	case 8: // sceSifDmaStat(id): 0 running, 1 queued behind one running, -1 done
+		// Retail reads any id as running while the SIF0 channel is busy
+		// and makes no difference by the export that set it. Ours keeps a
+		// completion time only for sceSifSetDmaIntr transfers with a
+		// callback, so a plain transfer is done when it is set: the first
+		// transfer owed its callback runs, those owed behind it are
+		// queued, any other id is done. Retail also queues by buffer
+		// generation, so all the ids queued read 1 and then 0 together;
+		// ours is per transfer, the same to a caller that waits for each
+		// transfer in turn.
+		s := &iop_sifcmd
+		for c, i in s.dma_cb[:s.n_dma_cb] {
+			if c.id == r[4] {return 0 if i == 0 else 1, true}
+		}
 		return ke(-1), true
 	case 29: // sceSifCheckInit: the flag sceSifInit sets, set at boot
 		return 1, true
@@ -137,7 +149,7 @@ sifman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			start := max(cpu.state.cycles, r3000.state.cycles * IOP_EE_RATIO)
 			if s.n_dma_cb > 0 {start = max(start, s.dma_cb[s.n_dma_cb - 1].due)}
 			due := max(start + max(bytes * SIF_DMA_CYCLES_PER_BYTE, IOP_EE_RATIO), pkt_due)
-			s.dma_cb[s.n_dma_cb] = {cb, arg, due}
+			s.dma_cb[s.n_dma_cb] = {cb, arg, due, id}
 			s.n_dma_cb += 1
 			iop_wake_set()
 		}
