@@ -192,6 +192,34 @@ learned_jr :: proc(pc: u32) {
 	learned_left()
 }
 
+// Learned code goes on at t from the instruction at pc, where its function's
+// words hold no code it can jump to: past the last word, or at one no path
+// through them reached (recomp/r5900 native_func). The code there goes on
+// in the function's own run, as the interpreter would have from the entry:
+// no call is made, so the run's `jr $ra` is the function's, and no events
+// are checked but a backward jump's. Code learned at t runs it, entered
+// with the function's run still the top one; it checks events as it is
+// entered, so with one due the interpreter runs it instead, which also
+// notes it under LEARN as a run from t, for the next blob. From code no
+// interp_call entered, a call, as before.
+learned_goto :: proc(pc, t: u32) {
+	lr := cpu.learned_top
+	if lr == nil {
+		cpu.call(t)
+		return
+	}
+	if !goto_pc(lr.entry, pc, t) {
+		if fn := cpu.state.cycles < cpu.next_event ? learned_find(t) : nil; fn != nil {
+			fn()
+		} else {
+			f := core.learn_on(.Ee) ? core.learn_begin(.Ee, t) : nil
+			f = interp_body(lr.entry, f, lr.run, t)
+			if f != nil {core.learn_end(f)}
+		}
+	}
+	learned_left()
+}
+
 // A learned function leaves, an unwind under way (cpu.unwinding: its code
 // calls this on that path alone, recomp/r5900 native_func, so a call that
 // returns runs nothing more): when the unwind is to this function's own

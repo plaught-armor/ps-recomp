@@ -40,6 +40,11 @@ Lowering :: struct {
 	// runs, and each place the code can be left and gone on at a block
 	// (lower's exact).
 	exact:     bool,
+	// Learned code: the cycles so far, the instruction's own included, are
+	// charged before each instruction that can see or publish the count
+	// (!batches), as the interpreter has charged them by then. The ones
+	// between still wait for the next flush.
+	each:      bool,
 	resume:    map[u32]bool, // exact: a block after each call and SYSCALL, also where no branch targets
 }
 
@@ -73,6 +78,28 @@ flush :: proc(l: ^Lowering) {
 	}
 }
 
+// Whether i's cycles can wait for a later flush: it works on registers
+// only, so it neither reads the cycle count nor reaches anything that does
+// (a timer or COP0 Count, an event, an exception, a call out to code that
+// charges on its own). Loads and stores are not here: one to a hardware
+// register runs a handler that works from the count. Neither are the
+// multimedia ops, which are left charged one by one.
+@(private = "file")
+batches :: proc(i: Insn) -> bool {
+	#partial switch i.op {
+	case .SLL, .SRL, .SRA, .SLLV, .SRLV, .SRAV, .ADD, .ADDU, .SUB, .SUBU, .ADDI, .ADDIU, .LUI, .AND, .OR,
+	     .XOR, .NOR, .ANDI, .ORI, .XORI, .DADD, .DADDU, .DSUB, .DSUBU, .DADDI, .DADDIU, .SLT, .SLTU, .SLTI,
+	     .SLTIU, .DSLL, .DSRL, .DSRA, .DSLL32, .DSRL32, .DSRA32, .DSLLV, .DSRLV, .DSRAV, .MOVZ, .MOVN,
+	     .MFHI, .MFLO, .MFHI1, .MFLO1, .MTHI, .MTLO, .MTHI1, .MTLO1, .MULT, .MULTU, .MULT1, .MULTU1,
+	     .MADD, .MADDU, .MADD1, .MADDU1, .DIV, .DIVU, .DIV1, .DIVU1, .PLZCW, .MFSA, .MTSA, .MTSAB, .MTSAH,
+	     .MFC1, .MTC1, .MOV_S, .NEG_S, .ABS_S, .CVT_S_W, .CVT_W_S, .ADD_S, .SUB_S, .MUL_S, .DIV_S,
+	     .SQRT_S, .RSQRT_S, .ADDA_S, .SUBA_S, .MULA_S, .MADD_S, .MSUB_S, .MADDA_S, .MSUBA_S, .MAX_S,
+	     .MIN_S, .C_F_S, .C_EQ_S, .C_LT_S, .C_LE_S:
+		return true
+	}
+	return false
+}
+
 // Transfer control to t from instruction src.
 @(private = "file")
 goto_ :: proc(l: ^Lowering, src, t: u32) {
@@ -80,7 +107,7 @@ goto_ :: proc(l: ^Lowering, src, t: u32) {
 		put(l, {kind = .Goto, target = t, check = t <= src, n = src})
 		return
 	}
-	put(l, {kind = .Call, target = t, n = src + 8})
+	put(l, {kind = .Call, target = t, n = src + 8, check = true})
 	put(l, {kind = .Return})
 }
 
@@ -94,7 +121,7 @@ goto_ :: proc(l: ^Lowering, src, t: u32) {
 // out of the function as a Goto, and the address `jr $ra` jumps to read
 // before its delay slot. nil when exact cannot lower f: a SYSCALL, BREAK or
 // ERET in a delay slot.
-lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
+lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false, each := false) -> []Step {
 	pcs := make([dynamic]u32, 0, len(f.insns), context.temp_allocator)
 	for a in f.insns {append(&pcs, a)}
 	sort_u32(pcs[:])
@@ -103,6 +130,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 		cycles = cycles,
 		steps  = make([dynamic]Step, 0, 2 * len(f.insns), context.temp_allocator),
 		exact  = exact,
+		each   = each,
 	}
 	l.resume.allocator = context.temp_allocator
 	if exact {
@@ -130,6 +158,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 			continue // unreachable except as a delay slot
 		}
 		charge(&l)
+		if each && !has_delay(i) && !batches(i) {flush(&l)}
 
 		if !has_delay(i) {
 			put(&l, {kind = .Op, i = i})
@@ -158,7 +187,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 		ret := pc + 8
 		delay :: proc(l: ^Lowering, d: Insn, slot_op: bool) {
 			if slot_op {
-				if l.exact {put(l, {kind = .Cycles, n = u32(l.cycles)})}
+				if l.exact {put(l, {kind = .Cycles, n = u32(l.cycles)})} else if l.each && !batches(d) {flush(l)}
 				put(l, {kind = .Op, i = d})
 			}
 			flush(l)
@@ -243,9 +272,9 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 				l.open_case = false
 			} else {
 				put(&l, {kind = .Case, target = pc + 4})
-				if exact {put(&l, {kind = .Cycles, n = u32(l.cycles)})}
+				charge(&l)
+				if each && !batches(d) {flush(&l)}
 				put(&l, {kind = .Op, i = d})
-				if !exact {l.pending += 1}
 				l.open_case = true
 			}
 		}
@@ -254,7 +283,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false) -> []Step {
 		put(&l, {kind = .Goto, target = f.end})
 	} else if l.open_case {
 		flush(&l)
-		put(&l, {kind = .Call, target = f.end})
+		put(&l, {kind = .Call, target = f.end, n = f.end + 4, check = true})
 		put(&l, {kind = .Return})
 	}
 	return l.steps[:]

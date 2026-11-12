@@ -255,6 +255,7 @@ native_imports :: proc(types: ^map[string]typeid = nil) -> map[string]u64 {
 	f(&m, types, "ps2.mod_call_original", mod_call_original)
 	f(&m, types, "ps2.learned_jr", learned_jr)
 	f(&m, types, "ps2.learned_left", learned_left)
+	f(&m, types, "ps2.learned_goto", learned_goto)
 	f(&m, types, "cpu.jump_unknown", cpu.jump_unknown)
 	f(&m, types, "cpu.bad_insn", cpu.bad_insn)
 	f(&m, types, "cpu.brk", cpu.brk)

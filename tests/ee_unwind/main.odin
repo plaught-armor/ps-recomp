@@ -74,6 +74,17 @@
 // K's own return unwinds to the call of K. Last, a learned X that jumps
 // out of its words to Y with another sp: Y's return is one to X's own
 // call, which X's jump out must end.
+//
+// With the argument goto (the coroutine model only), G saves $ra, reads
+// Count after three register instructions, calls H, then counts down a
+// loop a frame and a half long, reads Count again and returns. It runs
+// three times from one snapshot: interpreted; with its words up to the
+// call learned, so the rest is past them (ps2 learned_goto); and with the
+// rest learned too, as code of its own. Each must read the Counts the
+// interpreted one reads, take the vblank inside the loop at its cycle and
+// count, end at its cycle, and return with no unwind: the rest runs in G's
+// own run, whose `jr $ra` is G's. Under LEARN the second notes the rest
+// as a run from its first word.
 package main
 
 import "core:fmt"
@@ -111,6 +122,10 @@ NOWHERE2 :: u32(0x00100b40) // its target: MARK = 1, then a return
 FN_HC :: u32(0x00100c00) // native: the handler whose R(2) is unwound
 MARK :: DATA + 0x104
 HC_RES :: DATA + 0x108 // its s2 after its call
+FN_GT :: u32(0x00100d00) // goto: G
+FN_GH :: u32(0x00100e00) // goto: H, which returns
+GT_GO :: DATA + 0x110 // goto: set at a vblank, main then calls G
+GT_C :: DATA + 0x120 // goto: Count before the call, twice in G, after it
 SYSCALL_N :: 0xa0
 // getpc: main's call of G the only one open (were the links calls, 4).
 GETPC_OPEN :: 1
@@ -441,6 +456,119 @@ vblank_cap :: proc() {
 		fmt.eprintln("fail: no fatal after 60 frames")
 		os.exit(1)
 	}
+}
+
+// goto: main waits for GT_GO, then Count, G, Count, DONE = 1 and a hang.
+// goto_rest is G's first word after its call of H, goto_end its end.
+goto_rest, goto_end: u32
+mfc0_count :: proc(rt: u32) -> u32 {return 0x40000000 | rt << 16 | 9 << 11}
+program_goto :: proc() {
+	a := Asm{ENTRY}
+	li(&a, SP, STACK)
+	li(&a, T7, DATA)
+	put(&a, lw(T0, GT_GO - DATA, T7), i_type(4, T0, ZERO, -2), NOP) // until GT_GO
+	put(&a, mfc0_count(T0), sw(T0, GT_C - DATA, T7))
+	put(&a, jal(FN_GT), NOP)
+	put(&a, mfc0_count(T0), sw(T0, GT_C + 12 - DATA, T7))
+	put(&a, addiu(T0, ZERO, 1), sw(T0, DONE - DATA, T7))
+	put(&a, i_type(4, ZERO, ZERO, -1), NOP) // hang
+	a = {FN_GT}
+	put(&a, addiu(SP, SP, -16), sw(RA, 0, SP))
+	put(&a, addiu(T1, ZERO, 1), addu(T1, T1, T1), addu(T1, T1, T1))
+	put(&a, mfc0_count(T0), sw(T0, GT_C + 4 - DATA, T7))
+	put(&a, jal(FN_GH), NOP)
+	goto_rest = a.pc
+	li(&a, T2, cpu.CYCLES_PER_FRAME / (2 * cpu.CYCLES_PER_INSN))
+	put(&a, addiu(T2, T2, -1), i_type(5, T2, ZERO, -2), NOP) // 3 a turn
+	put(&a, mfc0_count(T0), sw(T0, GT_C + 8 - DATA, T7))
+	put(&a, lw(RA, 0, SP), addiu(SP, SP, 16), JR_RA, NOP)
+	goto_end = a.pc
+	a = {FN_GH}
+	put(&a, JR_RA, NOP)
+}
+
+// goto: what a run of G gave.
+Goto_Got :: struct {
+	count:      [4]u32, // GT_C
+	vb_cycles:  u64, // the vblank inside the loop
+	vb_t2:      u32, // the loop's count then
+	end_cycles: u64, // the first vblank with DONE set
+	end_frame:  u32,
+	unwinds:    u64,
+}
+goto_round: int
+goto_got: [3]Goto_Got
+goto_snap: core.Snapshot
+goto_unwinds: u64
+
+// goto: the snapshot is made at frame 3, GT_GO set there (again after each
+// load); the loop holds frame 4's vblank; a later one sees DONE, then
+// loads the snapshot for the next round.
+vblank_goto :: proc() {
+	frame := kernel.k.frame
+	g := &goto_got[goto_round]
+	switch {
+	case frame == 2 && goto_round == 0:
+		core.snap_op, core.snap_target = .Save, &goto_snap
+	case frame == 3:
+		mem.wr32(GT_GO, 1)
+		goto_unwinds = cpu.interp_unwinds
+	case frame == 4:
+		g.vb_cycles, g.vb_t2 = cpu.state.cycles, u32(cpu.state.r[T2].d[0])
+	}
+	if frame < 5 || mem.rd32(DONE) == 0 {
+		if frame > 60 {
+			fmt.eprintln("fail: not done after 60 frames")
+			os.exit(1)
+		}
+		return
+	}
+	for &c, k in g.count {c = mem.rd32(GT_C + 4 * u32(k))}
+	g.end_cycles, g.end_frame, g.unwinds = cpu.state.cycles, u32(frame), cpu.interp_unwinds - goto_unwinds
+	fmt.printfln("goto round %d: Count +%d +%d +%d, vblank at +%d with %d turns left, done at +%d, %d unwinds", goto_round, g.count[1] - g.count[0], g.count[2] - g.count[0], g.count[3] - g.count[0], u32(g.vb_cycles) - g.count[0], g.vb_t2, u32(g.end_cycles) - g.count[0], g.unwinds)
+	if g.vb_t2 == 0 || g.unwinds != 0 || g^ != goto_got[0] {
+		fmt.eprintfln("fail: round %d: %v, want %v with the vblank inside the loop and no unwind", goto_round, g^, goto_got[0])
+		os.exit(1)
+	}
+	switch goto_round {
+	case 0:
+		dir, err := os.make_directory_temp("", "ps_ee_unwind_*", context.allocator)
+		if err != nil {
+			fmt.eprintln("fail: no temp directory:", err)
+			os.exit(1)
+		}
+		learn_dir = dir
+		learn_path, _ = filepath.join({dir, "learn.bin"}, context.allocator)
+		if !core.learn_open_path(learn_path, {.Ee}) {
+			os.remove_all(learn_dir)
+			os.exit(1)
+		}
+		core.learn_cpu(.Ee, &cpu.state.cycles, cpu.CYCLES_PER_INSN, proc(a: u32) -> u32 {return mem.rd32(a)}, mem.RAM_SIZE, false)
+		load_native(FN_GT, goto_rest)
+	case 1:
+		core.learn_report()
+		data, err := os.read_entire_file(learn_path, context.allocator)
+		os.remove_all(learn_dir)
+		recs, bad := core.learn_read(data)
+		noted := false
+		for r in recs {
+			noted ||= r.entry == goto_rest && r.lo == goto_rest && len(r.words) == int(goto_end - goto_rest) / 4 && r.flags == {}
+		}
+		if err != nil || bad != 0 || !noted || cpu.learned_calls != 1 {
+			fmt.eprintfln("fail: LEARN file %v, %d bad records, the rest of G noted %v, %d native calls (want 1)", err, bad, noted, cpu.learned_calls)
+			os.exit(1)
+		}
+		load_native(goto_rest, goto_end)
+	case 2:
+		if cpu.learned_calls != 3 {
+			fmt.eprintfln("fail: %d native calls, want 3: G, then G and its rest", cpu.learned_calls)
+			os.exit(1)
+		}
+		fmt.println("ee_unwind goto: ok")
+		os.exit(0)
+	}
+	goto_round += 1
+	core.snap_op, core.snap_target = .Load, &goto_snap
 }
 
 // learn: C's records, each within C, one of them .Open.
@@ -899,6 +1027,13 @@ main :: proc() {
 			program_stale()
 			load_native(FN_N, FN_F2)
 		}
+	} else if mode == "goto" {
+		when core.FLAT {
+			fmt.eprintln("fail: goto: the coroutine model only")
+			os.exit(1)
+		}
+		kernel.vblank_hook = vblank_goto
+		program_goto()
 	} else if mode == "away" {
 		kernel.vblank_hook = vblank_away
 		program_away()

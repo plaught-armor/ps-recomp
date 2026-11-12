@@ -77,6 +77,7 @@ EE_SIGS := [?]native.Sig {
 	{"ps2.mod_call_original", 0, false}, // mods blobs only
 	{"ps2.learned_jr", 1, false}, // learned blobs only, not wasm32's
 	{"ps2.learned_left", 0, false}, // the same
+	{"ps2.learned_goto", 2, false},
 	{"ps2.spin_probe", 1, false},
 	{"ps2.exec_op", 3, false},
 	{"ps2.ld", 2, false},
@@ -1570,7 +1571,7 @@ jump_out :: proc(a: ^native.Asm, learned: bool) {
 // lower f for it: f is interpreted.
 native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow: ^map[string]int, funcs: map[u32]native.Label = nil, mods := false, learned := false) -> []native.Blob_Func {
 	wasm := a.arch == .Wasm32
-	steps := lower(f, cycles, quiet = true, exact = wasm) // emit_func warned
+	steps := lower(f, cycles, quiet = true, exact = wasm, each = learned) // emit_func warned
 	if steps == nil {return nil}
 	labels := make(map[u32]native.Label, context.temp_allocator)
 	pcs := make([dynamic]u32, context.temp_allocator)
@@ -1670,6 +1671,10 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				leaves = true
 			} else if mods && s.target == MOD_ORIGINAL {
 				native.call_leave(a, UNWINDING, "ps2.mod_call_original")
+			} else if learned && s.check {
+				native.mov_imm(a, .A, s.n - 8)
+				native.mov_imm(a, .B, s.target)
+				native.call_leave(a, UNWINDING, "ps2.learned_goto", .A, .B)
 			} else if l, ok := funcs[s.target]; ok {
 				native.call_func(a, l, UNWINDING)
 			} else {
