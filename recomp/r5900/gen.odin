@@ -447,7 +447,7 @@ generate :: proc(o: mips.Options) {
 		vus: [dynamic]native.Blob_Span
 		if mips.option_or(o, "native_vu", "") == "true" {
 			if code.arch == .Wasm32 {mips.fail("%s: no wasm32 VU backend yet", img.name)}
-			native_vus(o, img, code, &vus)
+			native_vus(o, img, code, &vus, true)
 		}
 		code_size, ok := native.write_blob(path, code, n_funcs[:], nil, vus[:])
 		if !ok {
@@ -514,7 +514,7 @@ vu_only :: proc(o: mips.Options, img: mips.Image) {
 	if arch == .Wasm32 {mips.fail("%s: no wasm32 VU backend yet", img.name)}
 	code^ = native.make_asm(arch, native_ram())
 	vus: [dynamic]native.Blob_Span
-	native_vus(o, img, code, &vus)
+	native_vus(o, img, code, &vus, false)
 	path := mips.option(o, "native_out")
 	code_size, written := native.write_blob(path, code, nil, nil, vus[:])
 	if !written {
@@ -525,13 +525,22 @@ vu_only :: proc(o: mips.Options, img: mips.Image) {
 
 // Both VUs' programs (.vutext and the captures) compiled into code, their
 // spans appended to vus; vu_status "all" has VU1 code compute status.
+// A unit whose programs cannot be read (a bad .vutext, a bad capture) fails
+// before any of its code is emitted (vu.native_programs), so code is as it
+// was. soft, the conversion of a whole executable: that unit gets no
+// programs, with one line saying so, and the blob keeps its EE functions
+// and the other unit's programs; its microcode runs in the interpreter.
+// Not soft, the VU programs alone: nothing else is in the blob, so the
+// conversion fails.
 @(private = "file")
-native_vus :: proc(o: mips.Options, img: mips.Image, code: ^native.Asm, vus: ^[dynamic]native.Blob_Span) {
+native_vus :: proc(o: mips.Options, img: mips.Image, code: ^native.Asm, vus: ^[dynamic]native.Blob_Span, soft: bool) {
 	status_all := mips.option_or(o, "vu_status", "") == "all"
 	for unit in vu.Unit {
-		if !vu.native_programs(code, img, vu_capture(o, unit), unit, vus, status_all) {
+		if vu.native_programs(code, img, vu_capture(o, unit), unit, vus, status_all) {continue}
+		if !soft {
 			mips.fail("%s: bad .vutext or %v capture", img.name, unit)
 		}
+		fmt.eprintfln("%s: bad .vutext or %v capture: no %v microprograms compiled, the interpreter runs them", img.name, unit, unit)
 	}
 }
 

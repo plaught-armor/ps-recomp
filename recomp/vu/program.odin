@@ -170,13 +170,22 @@ Prog :: struct {
 @(private)
 VUTEXT_ENTRIES := [1]u32{0}
 
+// .vutext's programs: each run of MPGs that loads micro memory from address
+// 0 on without a gap, one program per MPG at address 0. A bundle that
+// cannot be placed so (its first MPG loads elsewhere than the pair after
+// the program before it: an overlay loaded over part of another program)
+// is left out with one line naming it, counted in dropped, and the scan
+// goes on at the next MPG at address 0. False only for an MPG that runs
+// past the section.
 @(private)
-find_programs :: proc(img: mips.Image) -> (progs: [dynamic]Prog, ok: bool) {
+find_programs :: proc(img: mips.Image) -> (progs: [dynamic]Prog, dropped: int, ok: bool) {
 	sec := mips.find_section(img, ".vutext")
-	if sec == nil {return progs, true}
+	if sec == nil {return progs, 0, true}
 	n := sec.size / 4
 	w := ([^]u32)(raw_data(sec.data))[:n]
 	end: u32 = 0
+	// Inside a bundle left out: its later MPGs go with it.
+	skip := false
 	for i: u32 = 0; i < n; {
 		code := w[i]
 		if (code >> 24) & 0x7f != 0x4a {
@@ -188,21 +197,25 @@ find_programs :: proc(img: mips.Image) -> (progs: [dynamic]Prog, ok: bool) {
 		addr := (code & 0xffff) * 8
 		if i + 1 + num * 2 > n {
 			fmt.eprintfln("vu: MPG at %08x runs past .vutext", sec.addr + i * 4)
-			return progs, false
+			return progs, dropped, false
 		}
 		if addr == 0 {
 			append(&progs, Prog{entries = VUTEXT_ENTRIES[:]})
 			end = 0
+			skip = false
 		}
-		if len(progs) == 0 || addr != end {
-			fmt.eprintfln("vu: MPG at %08x loads %04x, expected %04x", sec.addr + i * 4, addr, end)
-			return progs, false
+		if !skip && (len(progs) == 0 || addr != end) {
+			fmt.eprintfln("vu: MPG at %08x loads %04x, expected %04x: its bundle is left out, and runs in the interpreter unless a capture has it", sec.addr + i * 4, addr, end)
+			dropped += 1
+			skip = true
 		}
-		append(&progs[len(progs) - 1].words, ..w[i + 1:][:num * 2])
-		end = addr + num * 8
+		if !skip {
+			append(&progs[len(progs) - 1].words, ..w[i + 1:][:num * 2])
+			end = addr + num * 8
+		}
 		i += 1 + num * 2
 	}
-	return progs, true
+	return progs, dropped, true
 }
 
 @(private)
@@ -737,11 +750,19 @@ extent :: proc(words: []u32, entry, mask: u32) -> []bool {
 	return ext
 }
 
+// How many programs .vutext gives and how many bundles the scan left out
+// (find_programs).
+vutext_scan :: proc(img: mips.Image) -> (programs, dropped: int, ok: bool) {
+	progs: [dynamic]Prog
+	progs, dropped, ok = find_programs(img)
+	return len(progs), dropped, ok
+}
+
 // A unit's programs: on VU1 those of .vutext, then on either unit those of
 // its capture file ("" for none).
 @(private)
 load_programs :: proc(img: mips.Image, capture: string, unit: Unit) -> (progs: [dynamic]Prog, ok: bool) {
-	if unit == .VU1 {progs = find_programs(img) or_return}
+	if unit == .VU1 {progs, _ = find_programs(img) or_return}
 	if capture != "" {load_capture(&progs, capture, unit) or_return}
 	return progs, true
 }
