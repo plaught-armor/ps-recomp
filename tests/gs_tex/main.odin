@@ -195,6 +195,51 @@ main :: proc() {
 		if at(F, 3, 1) != want {fail("CLUT %x: %x, want %x", base, at(F, 3, 1), want)}
 	}
 
+	// The same CLUT loaded again changes no entry, so the texture's cache
+	// entry is known good without a compare; one colour the texture uses
+	// changed, it is not, and the texture resolves to another entry; a
+	// change outside the texture's 16 colours makes it compare, and match.
+	// The cached texel is what local memory and the CLUT give every time.
+	{
+		t := tex0(T4, 1, PSMT4, 6)
+		X, Y :: 23, 31
+		i := idx_a(X, Y)
+		resolve :: proc(what: string, want: u32) -> i32 {
+			gs.probe_ctx(6)
+			got, mem := gs.probe_texel(0, X, Y), gs.probe_fetch(0, X, Y)
+			if got != mem || got != want {fail("%s: cached texel %x, local memory's %x, want %x", what, got, mem, want)}
+			if gs.probe_bypass(0) {fail("%s: the level is not cached", what)}
+			return gs.probe_entry(0)
+		}
+		set_clut(0x400000)
+		gs.gs_write(0x06, t)
+		e := resolve("a new CLUT", 0x400000 + i * 0x010101)
+
+		gen := gs.probe_clut_gen()
+		set_clut(0x400000)
+		gs.gs_write(0x06, t)
+		if gs.probe_clut_gen() != gen {fail("the same CLUT loaded again: the generation moved")}
+		if !gs.probe_clut_known(e) {fail("the same CLUT loaded again: the entry would compare its CLUT")}
+		if resolve("the same CLUT loaded again", 0x400000 + i * 0x010101) != e {fail("the same CLUT loaded again: another entry")}
+
+		one := [1]u32{0x123456}
+		upload(P, 1, PSMCT32, u64(i & 7), u64(i >> 3), 1, 1, slice.to_bytes(one[:]))
+		gs.gs_write(0x06, t)
+		if gs.probe_clut_gen() != gen + 1 {fail("one colour changed: the generation moved by %d", gs.probe_clut_gen() - gen)}
+		if gs.probe_clut_known(e) {fail("one colour changed: the entry would not compare its CLUT")}
+		e2 := resolve("one colour changed", 0x123456)
+		if e2 == e {fail("one colour changed: the same entry")}
+
+		// Entry 255 of a 256-colour load from the same blocks: pixel (15, 15).
+		one[0] = 0x654321
+		upload(P, 1, PSMCT32, 15, 15, 1, 1, slice.to_bytes(one[:]))
+		gs.gs_write(0x07, (P * 32) << 37 | 1 << 61 | 0x13 << 20) // TEX0_2: PSMT8, CLD 1
+		if gs.probe_clut_gen() != gen + 2 {fail("a colour outside the texture's changed: the generation moved by %d", gs.probe_clut_gen() - gen - 1)}
+		if gs.probe_clut_known(e2) {fail("a colour outside the texture's changed: the entry would not compare its CLUT")}
+		if resolve("a colour outside the texture's changed", 0x123456) != e2 {fail("a colour outside the texture's changed: another entry")}
+		if !gs.probe_clut_known(e2) {fail("a colour outside the texture's changed: the entry did not keep the compare's verdict")}
+	}
+
 	// A and B, every tile sampled once each: 8192 tiles through a 4096-tile
 	// pool. Then tiles A decoded first, long reused.
 	set_clut(0x300000)

@@ -4,7 +4,7 @@ import "core:math"
 
 // Test hooks: the texture sampler outside a draw, for tests/gs_tex, the
 // pixel proc choice, for tests/gs_pixel, a triangle's pixel calls, for
-// tests/gs_span, and the CLUT buffer, for tests/gs_clut.
+// tests/gs_span, and the CLUT buffer, for tests/gs_clut and tests/gs_tex.
 
 // Decodes the context PRIM's CTXT selects, texture mapping on, as a draw
 // would, and resolves its levels again on their first sample. The next
@@ -221,6 +221,29 @@ draw_tri_ref :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) -> (cls: Tri_Classes) {
 // The CLUT buffer and the block pointers CLD 4 and 5 compare with.
 probe_clut :: proc() -> (buf: ^[512]u32, c0, c1: ^u32) {
 	return &clut, &cbp0, &cbp1
+}
+
+// The CLUT generation: it moves when a load changes the buffer.
+probe_clut_gen :: proc() -> u64 {
+	return clut_gen
+}
+
+// The cache entry of level n of the probed context's texture, once a
+// sample has resolved it.
+probe_entry :: proc(n: u32) -> i32 {
+	return tc_lvl[n]
+}
+
+// Whether cache entry e's CLUT entries are known to be the buffer's, so
+// that validating it compares none.
+probe_clut_known :: proc(e: i32) -> bool {
+	return tc_e[e].clut_gen == clut_gen
+}
+
+// Level n's texel (x, y) of the probed context's texture, from local memory
+// and the CLUT buffer.
+probe_fetch :: proc(n, x, y: u32) -> u32 {
+	return fetch(&ctx_cur.tex, n, x, y)
 }
 
 // clut_load as it was before CSM1 read through clut_off32 and clut_off16:

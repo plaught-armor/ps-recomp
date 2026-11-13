@@ -94,7 +94,7 @@ tc_gen: u64 = 1
 tc_pending: Page_Set
 @(private)
 tc_use: u64
-// Bumped by every software CLUT load.
+// Bumped by a software CLUT load that changes a word of the buffer.
 @(private)
 clut_gen: u64 = 1
 

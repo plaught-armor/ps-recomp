@@ -620,7 +620,8 @@ clut_off16 := [256]u8 {
 
 // TEX0/TEX2 write: load the CLUT when CLD asks for it. Unchecked: every
 // clut index is masked to 511 and every local memory index to its size.
-// CSM2 inlines read_raw so each entry skips the call.
+// CSM2 inlines read_raw so each entry skips the call. Each word is
+// compared with the one it replaces as it is stored.
 @(private)
 clut_load :: proc(tex0: u64) #no_bounds_check {
 	cbp := u32(tex0 >> 37) & 0x3fff
@@ -650,25 +651,52 @@ clut_load :: proc(tex0: u64) #no_bounds_check {
 		hw_clut(cpsm, cbp, cbw, cou, cov, csm2, n, base)
 		return
 	}
-	clut_gen += 1
+	// clut_gen tells a cache entry only that the buffer may differ from what
+	// the entry last compared, so it moves only when a stored word differs
+	// from the one it replaces: a load of what is there already leaves every
+	// entry's last verdict standing.
+	diff: u32
 	if csm2 {
 		for i in 0 ..< n {
-			clut[(base + i) & 511] = #force_inline read_raw(cpsm, cbp, cbw, cou * 16 + i, cov)
+			e := &clut[(base + i) & 511]
+			v := #force_inline read_raw(cpsm, cbp, cbw, cou * 16 + i, cov)
+			diff |= e^ ~ v
+			e^ = v
 		}
-		return
+	} else {
+		// CSM1: the entries sit in the blocks at CBP, at constant offsets.
+		switch cpsm {
+		case PSMCT32:
+			w := cbp << 6
+			for i in 0 ..< n {
+				e := &clut[(base + i) & 511]
+				v := vram[(w + u32(clut_off32[i])) & (VRAM_WORDS - 1)]
+				diff |= e^ ~ v
+				e^ = v
+			}
+		case PSMCT24:
+			w := cbp << 6
+			for i in 0 ..< n {
+				e := &clut[(base + i) & 511]
+				v := vram[(w + u32(clut_off32[i])) & (VRAM_WORDS - 1)] & 0xffffff
+				diff |= e^ ~ v
+				e^ = v
+			}
+		case PSMCT16, PSMCT16S:
+			h := cbp << 7
+			for i in 0 ..< n {
+				e := &clut[(base + i) & 511]
+				v := u32(vram16()[(h + u32(clut_off16[i])) & (2 * VRAM_WORDS - 1)])
+				diff |= e^ ~ v
+				e^ = v
+			}
+		case:
+			for i in 0 ..< n {
+				e := &clut[(base + i) & 511]
+				diff |= e^
+				e^ = 0
+			}
+		}
 	}
-	// CSM1: the entries sit in the blocks at CBP, at constant offsets.
-	switch cpsm {
-	case PSMCT32:
-		w := cbp << 6
-		for i in 0 ..< n {clut[(base + i) & 511] = vram[(w + u32(clut_off32[i])) & (VRAM_WORDS - 1)]}
-	case PSMCT24:
-		w := cbp << 6
-		for i in 0 ..< n {clut[(base + i) & 511] = vram[(w + u32(clut_off32[i])) & (VRAM_WORDS - 1)] & 0xffffff}
-	case PSMCT16, PSMCT16S:
-		h := cbp << 7
-		for i in 0 ..< n {clut[(base + i) & 511] = u32(vram16()[(h + u32(clut_off16[i])) & (2 * VRAM_WORDS - 1)])}
-	case:
-		for i in 0 ..< n {clut[(base + i) & 511] = 0}
-	}
+	if diff != 0 {clut_gen += 1}
 }

@@ -6,7 +6,11 @@
 // the remembered pointer equal and different, every CSA, both storage
 // modes, 16 and 256 entries, every CPSM the field can hold, and block
 // pointers low, anywhere, and in the last blocks, where the address
-// wraps. Each class has a floor.
+// wraps. The CLUT generation, which tells the texture cache that the
+// buffer may have changed, moves by one on a load that changes a word of
+// the buffer and not at all otherwise: loads of what the buffer already
+// holds, and of that but for one word, the first, the last or any the load
+// stores, or one it does not. Each class has a floor.
 package main
 
 import "core:fmt"
@@ -63,6 +67,11 @@ Class :: enum {
 	Store_Wrap, // entries stored past the end of the buffer, from its start
 	TEX2, // loaded by a TEX2 write
 	Changed, // the load changed the buffer
+	Reload, // the buffer already held what the load stores
+	But_First, // but for the first entry stored
+	But_Last, // but for the last
+	But_One, // but for any one
+	Outside, // the buffer differed from the reference's only in a word no load stores
 }
 
 @(private = "file")
@@ -145,8 +154,39 @@ trial :: proc() {
 	before, b0, b1 := buf^, c0^, c1^
 	gs.clut_load_ref(tex0)
 	want, w0, w1 := buf^, c0^, c1^
+	// Half the loads start from what the reference left, less one bit of
+	// one word in most of them.
+	sc := rndn(8)
+	if sc >= 4 {
+		before = want
+		base := u32(csa) * 16
+		j: u32
+		switch sc {
+		case 4: j = 512
+		case 5: j = base & 511
+		case 6: j = (base + u32(n) - 1) & 511
+		case 7: j = u32(rndn(512))
+		}
+		if j < 512 {
+			before[j] ~= 1 << rndn(32)
+			stored := loaded && (j - base) & 511 < u32(n)
+			if !stored {want[j] = before[j]}
+			if loaded {
+				switch {
+				case !stored: cls += {.Outside}
+				case sc == 5: cls += {.But_First}
+				case sc == 6: cls += {.But_Last}
+				case: cls += {.But_One}
+				}
+			}
+		} else if loaded {
+			cls += {.Reload}
+		}
+	}
 	buf^, c0^, c1^ = before, b0, b1
+	gen := gs.probe_clut_gen()
 	gs.gs_write(reg, tex0)
+	moved := gs.probe_clut_gen() - gen
 
 	trials += 1
 	if loaded {loads += 1}
@@ -159,6 +199,11 @@ trial :: proc() {
 	if failed > 8 {return}
 	if c0^ != w0 || c1^ != w1 {
 		fmt.eprintfln("trial %d TEX0 %016x: remembered pointers %x %x, the reference's %x %x", trials, tex0, c0^, c1^, w0, w1)
+		failed += 1
+		return
+	}
+	if moved != u64(want != before) {
+		fmt.eprintfln("trial %d TEX0 %016x by register %02x: the generation moved by %d, the buffer %s", trials, tex0, reg, moved, want != before ? "changed" : "did not change")
 		failed += 1
 		return
 	}
@@ -212,7 +257,12 @@ main :: proc() {
 		.Wrap16     = 600,
 		.Store_Wrap = 23_000,
 		.TEX2       = 50_000,
-		.Changed    = 100_000,
+		.Changed    = 78_000,
+		.Reload     = 12_000,
+		.But_First  = 12_000,
+		.But_Last   = 12_000,
+		.But_One    = 3_300,
+		.Outside    = 9_200,
 	}
 	for c in Class {
 		fmt.printfln("%-10v loads %d", c, counts[c])
