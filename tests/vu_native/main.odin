@@ -16,7 +16,8 @@
 // direct call leaves; after a write into a program's micro memory, they
 // must interpret it instead. Before that, one VU1 program with no status
 // read, registered alone, must make each outside read of VU1 status a
-// compat row (vu_programs.stale_status).
+// compat row (vu_programs.stale_status). A VU0 program that waits for the
+// EE parks in native code where the interpreter parks it (test_park).
 // The seed is fixed, so a run is reproducible.
 //
 //   odin run tests/vu_native -collection:ps=.
@@ -315,6 +316,7 @@ main :: proc() {
 		dispatch_fails += 1
 	}
 	dispatch_fails += test_miss_capture(progs[:], arch)
+	dispatch_fails += test_park(arch)
 	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, %d failing dispatched, MAC changed in %d, VU0 I or D set in %d, VU1 in %d", arch, cases, TRIALS, fails, dispatch_fails, flagged, status_set, vu1_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
@@ -506,5 +508,251 @@ test_miss_capture :: proc(progs: []vu_programs.Prog, arch: native.Arch) -> (fail
 		break
 	}
 	if !elided && rvu.VU_CLAMP_ELIDE {fail(&fails, "no VU1 program with a leave")}
+	return
+}
+
+// A VU0 program that waits for the EE (vu_programs.park_image) parks in
+// native code where the interpreter parks it, with the same registers:
+//   - recomp/vu marks the loops it can park in (wait_loop_heads), and no
+//     loop with a pair that writes state, a forward branch or a branch that
+//     reads an integer register late; its test of an idle pair agrees with
+//     the runtime's on every lower opcode, every bit of the lower NOP and
+//     every upper bit.
+//   - Called directly, the native function stops at the loop's first pair
+//     with bit 30 after one turn; with a Q pending, only once it landed;
+//     compiled for VU1, never.
+//   - Registered, each step of a script (the two loops, a CTC2 that does
+//     not end one, a call over the parked program, the loops that end or
+//     write state) leaves what the interpreter leaves: registers, older
+//     flags, tpc, vu0_parked and VPU-STAT.
+// The failures.
+@(private = "file")
+test_park :: proc(arch: native.Arch) -> (fails: int) {
+	fail :: proc(fails: ^int, msg: string) {
+		fmt.eprintln("FAIL vu_native park:", msg)
+		fails^ += 1
+	}
+	NOP_L :: vu_programs.NOP_L
+	NOP_U :: vu_programs.NOP_U
+	PARK_BIT :: 1 << 30
+	words := vu_programs.park_image()
+
+	// The loops marked, and the one refused for its late read.
+	{
+		marked, refused := rvu.wait_loop_heads(words, nil)
+		want := []u32{vu_programs.PARK_LOOP_1, vu_programs.PARK_LOOP_2, vu_programs.PARK_DIV_LOOP}
+		if !slice.equal(marked, want) {fail(&fails, fmt.tprintf("loops marked: %04x, want %04x", marked, want))}
+		if !slice.equal(refused, []u32{vu_programs.PARK_LATE_LOOP}) {
+			fail(&fails, fmt.tprintf("loops refused for a late integer read: %04x, want [%04x]", refused, vu_programs.PARK_LATE_LOOP))
+		}
+		ibeq := vu_programs.lower_op(vu_programs.IBEQ, 0, 1, 0, 3)
+		back := vu_programs.lower_op(vu_programs.B, 0, 0, 0, 0x7fd)
+		shapes := []struct {name: string, words: []u32} {
+			{"an upper that is no NOP", {ibeq, NOP_U, NOP_L, vu_programs.upper(vu_programs.ADD, 1, 2, 3), back, NOP_U, NOP_L, NOP_U}},
+			{"a lower that writes an integer register", {ibeq, NOP_U, vu_programs.lower_op(vu_programs.IADDIU, 0, 5, 5, 1), NOP_U, back, NOP_U, NOP_L, NOP_U}},
+			{"a delay slot that writes an integer register", {ibeq, NOP_U, NOP_L, NOP_U, back, NOP_U, vu_programs.lower_op(vu_programs.IADDIU, 0, 5, 5, 1), NOP_U}},
+			{"a forward branch", {vu_programs.lower_op(vu_programs.B, 0, 0, 0, 1), NOP_U, NOP_L, NOP_U, NOP_L, NOP_U, NOP_L, NOP_U | vu_programs.E_BIT, NOP_L, NOP_U}},
+			{"an E bit", {ibeq, NOP_U, NOP_L, NOP_U | vu_programs.E_BIT, back, NOP_U, NOP_L, NOP_U}},
+		}
+		for s in shapes {
+			m, r := rvu.wait_loop_heads(s.words, nil)
+			if len(m) != 0 || len(r) != 0 {fail(&fails, fmt.tprintf("a loop with %s: marked %04x, refused %04x, want neither", s.name, m, r))}
+		}
+		m, _ := rvu.wait_loop_heads([]u32{ibeq, NOP_U, NOP_L, NOP_U, back, NOP_U, NOP_L, NOP_U}, nil)
+		if !slice.equal(m, []u32{0}) {fail(&fails, fmt.tprintf("the plain loop: marked %04x, want [0000]", m))}
+	}
+
+	// The two tests of an idle pair, the runtime's and the conversion's.
+	{
+		uppers, lowers: [dynamic]u32
+		append(&uppers, NOP_U, 0, NOP_U | 15 << 21)
+		for bit in u32(0) ..< 32 {append(&uppers, NOP_U ~ (1 << bit))}
+		for op in u32(0) ..< 128 {
+			append(&lowers, op << 25, op << 25 | 0x1ffffff, op << 25 | 0x033c, op << 25 | 1 << 16 | 2 << 11 | 3)
+		}
+		for bit in u32(0) ..< 32 {append(&lowers, NOP_L ~ (1 << bit))}
+		append(&lowers, NOP_L)
+		idle, differ := 0, 0
+		for uw in uppers {
+			for lw in lowers {
+				got, want := rvu.pair_idle(uw, lw), vu.vu_pair_idle(uw, lw)
+				if got != want {
+					differ += 1
+					if differ < 5 {fail(&fails, fmt.tprintf("idle pair %08x %08x: the conversion says %v, the runtime %v", uw, lw, got, want))}
+				}
+				if want {idle += 1}
+			}
+		}
+		// Under the one idle upper: seven branch opcodes of four words each,
+		// the NOP with any of its 10 free bits flipped, or none, and the
+		// NOP again as its opcode's word.
+		if idle != 7 * 4 + 11 + 1 {fail(&fails, fmt.tprintf("%d idle pairs in the sweep, want %d", idle, 7 * 4 + 11 + 1))}
+		if !vu.vu_pair_idle(NOP_U, NOP_L) || vu.vu_pair_idle(NOP_U | vu_programs.E_BIT, NOP_L) || vu.vu_pair_idle(NOP_U, vu_programs.lower_op(vu_programs.IADDIU, 0, 7, 7, 1)) {
+			fail(&fails, "the runtime's idle test: want a NOP pair idle, one with the E bit or an IADDIU not")
+		}
+	}
+
+	a := native.make_asm(arch, r5900.native_ram())
+	ranges := []native.Blob_Range{{0, words}}
+	slow: map[string]int
+	off0 := u32(rvu.native_program(&a, words, nil, nil, .VU0, false, &slow))
+	off1 := u32(rvu.native_program(&a, words, nil, nil, .VU1, false, &slow))
+	if len(slow) != 0 {fail(&fails, fmt.tprintf("the programs call the interpreter: %v", slow))}
+	code, err := core.native_load(native.make_blob(&a, nil, {}, []native.Blob_Span{{.Vu0, 0, off0, ranges}, {.Vu1, 0, off1, ranges}}), ps2.native_imports())
+	if err != "" {
+		fail(&fails, fmt.tprint("native_load:", err))
+		return
+	}
+	run0 := cast(proc())rawptr(code.base + uintptr(code.spans[0].off))
+	run1 := cast(proc())rawptr(code.base + uintptr(code.spans[1].off))
+
+	// The state every run starts from: vf2 + vf3 changes MAC, vf4.x / vf2.x
+	// is 2 over a Q of 5, and vi1-vi15 are 1.
+	start :: proc(v: ^vu.Vu) {
+		for r in 1 ..< 32 {v.vf[r].f = {f32(r), f32(r) + 1, -f32(r), 0}}
+		v.acc.f = {}
+		v.vi = 1
+		v.vi[0] = 0
+		v.q, v.q_next, v.q_wait, v.q_flags, v.q_due = 5, 0, 0, 0, 0
+		v.p, v.p_next, v.p_wait = 0, 0, 0
+		v.vih = {}
+		v.mac, v.clip, v.status = 0xffff, 0, 0
+		v.old_mac, v.old_status, v.old_clip = v.mac, v.status, v.clip
+	}
+	load :: proc(v: ^vu.Vu, words: []u32) {
+		for &b in v.micro {b = 0}
+		copy(([^]u32)(&v.micro[0])[:len(words)], words)
+	}
+	load(&vu.vu0, words)
+	load(&vu.vu1, words)
+	vu.vu0_micro_touch()
+	vu.vu1_micro_touch()
+
+	// Called directly.
+	{
+		v, nr := &vu.vu0, &vu.native_run[0]
+		start(v)
+		nr.pc, nr.budget = 0, BUDGET
+		run0()
+		if u32(nr.pc) != vu_programs.PARK_LOOP_1 | PARK_BIT || nr.budget != BUDGET - 1 {
+			fail(&fails, fmt.tprintf("a direct call into the first loop: pc %08x, budget %d; want %08x, %d", u32(nr.pc), nr.budget, u32(vu_programs.PARK_LOOP_1 | PARK_BIT), BUDGET - 1))
+		}
+		// From the loop's own first pair, as after a CTC2 that ends nothing.
+		nr.pc, nr.budget = vu_programs.PARK_LOOP_1, BUDGET
+		run0()
+		if u32(nr.pc) != vu_programs.PARK_LOOP_1 | PARK_BIT || nr.budget != BUDGET - 1 {
+			fail(&fails, fmt.tprintf("a direct call at the first loop: pc %08x, budget %d; want %08x, %d", u32(nr.pc), nr.budget, u32(vu_programs.PARK_LOOP_1 | PARK_BIT), BUDGET - 1))
+		}
+		start(v)
+		nr.pc, nr.budget = vu_programs.PARK_DIV, BUDGET
+		run0()
+		if u32(nr.pc) != vu_programs.PARK_DIV_LOOP | PARK_BIT || nr.budget >= BUDGET - 1 || v.q_wait | v.p_wait | v.q_due != 0 || v.q != 2 {
+			fail(&fails, fmt.tprintf("a direct call with a DIV before the loop: pc %08x, budget %d, Q wait %d due %d, Q %v; want %08x, under %d, 0 0, 2",
+				u32(nr.pc), nr.budget, v.q_wait, v.q_due, v.q, u32(vu_programs.PARK_DIV_LOOP | PARK_BIT), BUDGET - 1))
+		}
+		v, nr = &vu.vu1, &vu.native_run[1]
+		start(v)
+		nr.pc, nr.budget = 0, BUDGET
+		run1()
+		if nr.pc < 0 || u32(nr.pc) & PARK_BIT != 0 || nr.budget > 0 {
+			fail(&fails, fmt.tprintf("the first loop compiled for VU1: pc %08x, budget %d; want no bit 30 or 31 and no budget left", u32(nr.pc), nr.budget))
+		}
+	}
+
+	// The script, interpreted and then with the program registered.
+	Step :: struct {
+		v:      vu.Vu,
+		parked: bool,
+		stat:   u32,
+		native: bool,
+	}
+	STEPS :: 9
+	NAMES := [STEPS]string {
+		"a call into the first loop",
+		"a CTC2 that does not end the loop",
+		"a call over the parked program",
+		"a CTC2 that ends the first loop",
+		"a CTC2 that ends the second loop",
+		"a loop that counts down",
+		"a loop that writes vi7",
+		"a DIV before the loop",
+		"a loop entered behind an integer write",
+	}
+	script :: proc(out: ^[STEPS]Step) {
+		v, nr := &vu.vu0, &vu.native_run[0]
+		note :: proc(out: ^[STEPS]Step, k: int) {
+			out[k] = {vu.vu0, vu.vu0_parked, vu.vu0_ctrl_read(29), vu.native_run[0].pc != -1}
+			vu.native_run[0].pc = -1
+		}
+		start(v)
+		nr.pc = -1
+		vu.vu0_call_micro(0)
+		note(out, 0)
+		vu.vu0_ctrl_write(5, 9)
+		note(out, 1)
+		saved, saved_parked := v^, vu.vu0_parked
+		vu.vu0_call_micro(vu_programs.PARK_END)
+		note(out, 2)
+		v^, vu.vu0_parked = saved, saved_parked
+		vu.vu0_ctrl_write(1, 0)
+		note(out, 3)
+		vu.vu0_ctrl_write(2, 0)
+		note(out, 4)
+		start(v)
+		vu.vu0_call_micro(vu_programs.PARK_COUNT)
+		note(out, 5)
+		start(v)
+		vu.vu0_call_micro(vu_programs.PARK_BUSY)
+		note(out, 6)
+		start(v)
+		vu.vu0_call_micro(vu_programs.PARK_DIV)
+		note(out, 7)
+		start(v)
+		vu.vu0_call_micro(vu_programs.PARK_LATE)
+		note(out, 8)
+	}
+	want, got: [STEPS]Step
+	script(&want)
+	// What the interpreter leaves: parked, and where.
+	WANT := [STEPS]struct {parked: bool, tpc: u32} {
+		{true, vu_programs.PARK_LOOP_1},
+		{true, vu_programs.PARK_LOOP_1},
+		{false, vu_programs.PARK_END + 0x10},
+		{true, vu_programs.PARK_LOOP_2},
+		{false, vu_programs.PARK_END},
+		{false, vu_programs.PARK_COUNT_END},
+		{false, 0},
+		{true, vu_programs.PARK_DIV_LOOP},
+		{false, vu_programs.PARK_LATE_END},
+	}
+	for w, k in want {
+		if w.native {fail(&fails, fmt.tprintf("%s: native code ran before the program was registered", NAMES[k]))}
+		if w.parked != WANT[k].parked || u32(w.parked) != w.stat || (k != 6 && w.v.tpc != WANT[k].tpc) {
+			fail(&fails, fmt.tprintf("%s, interpreted: parked %v, VPU-STAT %d, tpc %04x; want %v at %04x", NAMES[k], w.parked, w.stat, w.v.tpc, WANT[k].parked, WANT[k].tpc))
+		}
+	}
+	if want[4].v.vi[4] != 9 || want[4].v.vi[5] != 9 {fail(&fails, fmt.tprintf("the script's end, interpreted: vi4 %d vi5 %d, want 9 9", want[4].v.vi[4], want[4].v.vi[5]))}
+	if want[0].v.old_mac == 0xffff {fail(&fails, "the first loop, interpreted: the ADD before it left the older MAC flags alone")}
+
+	vu.vu_register_native(0, {{0, words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.spans[0].off)))
+	vu.vu0_micro_touch()
+	script(&got)
+	for &g, k in got {
+		w := &want[k]
+		if !g.native {fail(&fails, fmt.tprintf("%s: no native code ran", NAMES[k]))}
+		// The loop that writes vi7 runs to the step limit, which compiled
+		// code counts in taken branches: only that it does not park.
+		same := g.parked == w.parked && g.stat == w.stat
+		if k != 6 {
+			same &&= g.v.tpc == w.v.tpc && same_regs(&g.v, &w.v, true)
+			same &&= g.v.old_mac == w.v.old_mac && g.v.old_status == w.v.old_status && g.v.old_clip == w.v.old_clip
+			// The integer history is state only while the program is parked.
+			same &&= !g.parked || g.v.vih == w.v.vih
+		}
+		if !same {
+			fail(&fails, fmt.tprintf("%s, native: parked %v, VPU-STAT %d, tpc %04x, older MAC %04x; interpreted: parked %v, VPU-STAT %d, tpc %04x, older MAC %04x; same registers %v",
+				NAMES[k], g.parked, g.stat, g.v.tpc, g.v.old_mac, w.parked, w.stat, w.v.tpc, w.v.old_mac, same_regs(&g.v, &w.v, true)))
+		}
+	}
 	return
 }

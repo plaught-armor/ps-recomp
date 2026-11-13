@@ -564,9 +564,11 @@ VU_STEP_LIMIT :: 1 << 24
 @(private)
 vu0_overrun, vu1_overrun: bool
 
-// How compiled microcode stopped: at the E bit's end, or by handing the
-// pair at the returned pc to the interpreter.
-Vu_Exit :: enum u8 {End, Leave}
+// How compiled microcode stopped: at the E bit's end, by handing the pair
+// at the returned pc to the interpreter, or (VU0) parked at the returned
+// pc, the first pair of a loop that waits for the EE, where the
+// interpreter would park (vu_interp).
+Vu_Exit :: enum u8 {End, Leave, Park}
 
 // A microprogram compiled ahead of time (rec/vu0, rec/vu1). `run` executes
 // from a pair address below len(code)*4; taken branches count against
@@ -575,7 +577,8 @@ Vu_Run :: #type proc(pc: u32, budget: ^int) -> (u32, Vu_Exit)
 
 // A microprogram compiled to native code (recomp/vu/native.odin): it
 // starts at native_run's pc with its budget and leaves the pc it stopped
-// at, bit 31 set when it ended, and the budget left there.
+// at, bit 31 set when it ended or bit 30 when it parked (Vu_Exit), and the
+// budget left there.
 Vu_Native :: #type proc()
 
 // Micro memory a compiled program was compiled from: code at pc.
@@ -890,7 +893,8 @@ vu1_run :: proc(addr: u32, compiled: bool) {
 // VU's wrapper, so the VU, its table and its pair cache are constants there.
 // No bounds checks: pc stays masked to a pair address in micro memory,
 // including what compiled code hands back. With park, a constant, the
-// interpreter may stop at a loop that can never end by itself (parked).
+// interpreter or compiled code may stop at a loop that can never end by
+// itself (parked).
 @(private)
 micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: []Vu_Pair_Info, addr: u32, compiled: bool, park: bool) -> (pc: u32, ended: bool, parked: bool) #no_bounds_check {
 	mask := u32(len(v.micro) - 1) &~ 7
@@ -920,7 +924,7 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 				nr.pc, nr.budget = i32(pc), i32(budget)
 				prog.native()
 				budget = int(nr.budget)
-				exit = nr.pc < 0 ? .End : .Leave // bit 31
+				exit = nr.pc < 0 ? .End : nr.pc & (1 << 30) != 0 ? .Park : .Leave // bits 31 and 30
 				pc = u32(nr.pc)
 			} else {
 				pc, exit = prog.run(pc, &budget)
@@ -939,6 +943,12 @@ micro_exec :: #force_inline proc(v: ^Vu, t: ^Micro_Table($N), gen: ^u32, pairs: 
 			}
 			if v == &vu1 && !t.status {vu1_status_stale = true}
 			if exit == .End {return pc, true, false}
+			// Parked as the interpreter parks: the pipeline drained.
+			if park && exit == .Park {
+				vu_flags_seed(v)
+				v.vih = {}
+				return pc, false, true
+			}
 			if budget <= 0 {break}
 		}
 		if budget <= 0 {break}
@@ -1219,7 +1229,8 @@ vu1_compare :: proc(addr: u32) {
 // memory, mem0 and mem1 scratch of its size, entry the program compiled at
 // addr. Status is compared when status is set: always on VU0, and on VU1
 // only once a program reads it (Micro_Table.status); compiled VU1 code
-// leaves it alone otherwise. The interpreter's results are kept.
+// leaves it alone otherwise. Where the run stopped is compared too: tpc,
+// and whether VU0 parked. The interpreter's results are kept.
 @(private)
 vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, status: bool, entry: ^Vu_Program, addr: u32, exec: proc(addr: u32, compiled: bool)) {
 	@(static) reported: int
@@ -1227,7 +1238,7 @@ vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, statu
 	copy(mem0, mem)
 	vu1_kick_hash = 0
 	exec(addr, false)
-	v1, kick1 := v^, vu1_kick_hash
+	v1, kick1, parked1 := v^, vu1_kick_hash, vu0_parked
 	copy(mem1, mem)
 	v^ = v0
 	copy(mem, mem0)
@@ -1245,13 +1256,13 @@ vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, statu
 	bad := kick1 != kick2 || mem_bad || vf_bad || v1.vi != v2.vi ||
 		v1.acc.q != v2.acc.q || v1.q != v2.q || v1.q_next != v2.q_next || v1.q_wait != v2.q_wait || v1.q_due != v2.q_due || v1.p != v2.p ||
 		v1.p_next != v2.p_next || v1.p_wait != v2.p_wait || v1.i != v2.i ||
-		v1.r != v2.r || v1.clip != v2.clip || v1.mac != v2.mac || status_bad || v1.tpc != v2.tpc
+		v1.r != v2.r || v1.clip != v2.clip || v1.mac != v2.mac || status_bad || v1.tpc != v2.tpc || parked1 != vu0_parked
 	if bad && reported < 20 {
 		reported += 1
-		fmt.eprintfln("vucheck: vu%d program %d entry %04x differs: kick %v vf %v vi %v acc %v q %v p %v i %v clip %v mac %v (%04x/%04x) status %v (%04x/%04x) tpc %v mem %v",
+		fmt.eprintfln("vucheck: vu%d program %d entry %04x differs: kick %v vf %v vi %v acc %v q %v p %v i %v clip %v mac %v (%04x/%04x) status %v (%04x/%04x) tpc %v parked %v mem %v",
 			unit, prog, addr, kick1 != kick2, vf_bad, v1.vi != v2.vi,
 			v1.acc.q != v2.acc.q, v1.q != v2.q, v1.p != v2.p, v1.i != v2.i, v1.clip != v2.clip,
-			v1.mac != v2.mac, v1.mac, v2.mac, status_bad, v1.status, v2.status, v1.tpc != v2.tpc, mem_bad)
+			v1.mac != v2.mac, v1.mac, v2.mac, status_bad, v1.status, v2.status, v1.tpc != v2.tpc, parked1 != vu0_parked, mem_bad)
 		for k in 0 ..< 32 {
 			if v1.vf[k].q != v2.vf[k].q {fmt.eprintfln("  vf%d %v / %v", k, v1.vf[k].f, v2.vf[k].f)}
 		}
@@ -1260,6 +1271,7 @@ vu_compare :: proc(v: ^Vu, mem, mem0, mem1: []u8, programs: []^Vu_Program, statu
 		}
 	}
 	v^ = v1
+	vu0_parked = parked1
 	copy(mem, mem1)
 }
 
@@ -1413,7 +1425,6 @@ Vu_Pair_Info :: struct {
 // ends by itself (vu_interp's park): a NOP upper with no I, E, M, D or T
 // bit over a branch that links nothing (B, IBEQ, IBNE, IBLTZ, IBGTZ,
 // IBLEZ, IBGEZ) or a MOVE with no field to write, the lower NOP.
-@(private)
 vu_pair_idle :: proc(uw, lw: u32) -> bool {
 	if uw != 0x000002ff {return false}
 	switch lw >> 25 {
@@ -1678,8 +1689,11 @@ vu1_kick_send :: proc(addr: u16) {
 // one, where hardware would first let it end. A macro operation or an
 // interlocked CFC2 or CTC2 meanwhile runs at once against the parked
 // registers, where hardware would wait for the program's end or M bit.
-// Compiled code never parks: such a loop inside a compiled program still
-// runs to the step limit.
+// Compiled code parks at the same pair with the same registers, where the
+// loop is one its conversion can see ahead of time (recomp/vu wait_loops):
+// idle pairs closed by a branch back to the first of them, all compiled,
+// no branch of it reading an integer register late. Any other such loop
+// inside a compiled program still runs to the step limit.
 vu0_call_micro :: proc(addr: u32) {
 	cpu.spin_dirty |= cpu.SPIN_SIDE // the spin skip's probe (ps2/spin.odin)
 	if vu0_parked {vu0_park_note(.Call)}

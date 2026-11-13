@@ -797,6 +797,11 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 
 	fmt.sbprintfln(sb, "run_%d :: proc(pc: u32, budget: ^int) -> (u32, vu.Vu_Exit) {{", n)
 	fmt.sbprintfln(sb, "\tv := &vu.vu%d", int(unit))
+	// Where the last taken jump landed, when that was the first pair of a
+	// loop that waits for the EE (wait_loops).
+	laps := false
+	for p in pairs {laps ||= p.lap != .None}
+	if laps {fmt.sbprintln(sb, "\tlap := ~u32(0)")}
 	fmt.sbprintln(sb, "\tvf, vi := &v.vf, &v.vi")
 	fmt.sbprintln(sb, "\t_, _ = vf, vi")
 	fmt.sbprintln(sb, "\tpc := pc")
@@ -827,10 +832,23 @@ emit_program :: proc(sb: ^strings.Builder, n: int, words: []u32, ext: []bool, en
 			if p.branch == .Reg || (t < len(pairs) && (delayed[t] || enter[t])) {
 				fmt.sbprintln(sb, "\t\t\t\tv.vih = {}")
 			}
+			// A loop that waits for the EE: park at its first pair when
+			// the jump before this one landed there too and no Q or P is
+			// pending (the interpreter's test, vu_interp); any other jump
+			// of the loop forgets the landing.
+			switch p.lap {
+			case .None:
+			case .Back:
+				fmt.sbprintfln(sb, "\t\t\t\tif lap == 0x%04x && v.q_wait | v.p_wait | v.q_due == 0 {{return 0x%04x, .Park}", p.head, p.head)
+				fmt.sbprintfln(sb, "\t\t\t\tlap = 0x%04x", p.head)
+			case .Exit:
+				fmt.sbprintln(sb, "\t\t\t\tlap = ~u32(0)")
+			}
 			fmt.sbprintln(sb, "\t\t\t\tbudget^ -= 1")
 			fmt.sbprintln(sb, "\t\t\t\tif budget^ <= 0 {return tg, .Leave}")
 			fmt.sbprintln(sb, "\t\t\t\tpc = tg")
 			fmt.sbprintln(sb, "\t\t\t} else {")
+			if p.lap == .Back {fmt.sbprintln(sb, "\t\t\t\tlap = ~u32(0)")}
 			fmt.sbprintfln(sb, "\t\t\t\tpc = 0x%04x", (pc + 16) & mask)
 			fmt.sbprintln(sb, "\t\t\t}")
 			fmt.sbprintln(sb, "\t\t\tcontinue")

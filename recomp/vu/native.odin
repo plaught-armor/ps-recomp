@@ -8,7 +8,10 @@
 // function with no arguments. It reads where to start from import
 // <unit>.run_pc and the taken-branch budget from <unit>.run_budget, and
 // leaves in run_pc the pc it stopped at, with bit 31 set when the program
-// ended (Vu_Exit .End, else .Leave), and the budget left in run_budget.
+// ended (Vu_Exit .End) or bit 30 when it parked in a loop that waits for
+// the EE (.Park, VU0 only: wait_loops), else .Leave, and the budget left
+// in run_budget. Between the two, a VU0 program with such a loop keeps in
+// run_pc where its last taken jump landed, when that was the loop.
 // Globals rather than arguments, as functions from the Asm take none, the
 // same as the EE's.
 //
@@ -1348,6 +1351,31 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 				native.mov_imm(a, .A, 0)
 				for off in u32(0) ..< 4 {native.imp_store(a, IMPORTS[u][.Vf], .A, VU_VIH + 4 * off)}
 			}
+			// A loop that waits for the EE (wait_loops), as emit_program:
+			// park at its first pair when the jump before this one landed
+			// there too and no Q or P is pending; any other jump of the
+			// loop forgets the landing.
+			switch p.lap {
+			case .None:
+			case .Back:
+				vf := IMPORTS[u][.Vf]
+				lap := native.new_label(a)
+				native.imp_load(a, .A, run_pc)
+				native.br_cmp_imm(a, .Ne, .A, p.head | PARK_BIT, lap)
+				native.imp_load(a, .A, vf, VU_Q_WAIT)
+				native.imp_load(a, .B, vf, VU_P_WAIT)
+				native.alu(a, .Or, .A, .B)
+				native.imp_load(a, .B, vf, VU_Q_DUE)
+				native.alu(a, .Or, .A, .B)
+				native.br_zero(a, .A, lap, nonzero = true)
+				leave(a, exit, p.head | PARK_BIT)
+				native.bind(a, lap)
+				native.mov_imm(a, .A, p.head | PARK_BIT)
+				native.imp_store(a, run_pc, .A)
+			case .Exit:
+				native.mov_imm(a, .A, 0)
+				native.imp_store(a, run_pc, .A)
+			}
 			// The budget counts taken branches; out of it, leave at the
 			// target.
 			budget := IMPORTS[u][.Run_Budget]
@@ -1367,6 +1395,10 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 				goto(a, labels, exit, branch_target(p.lw, pc, mask))
 			}
 			native.bind(a, not_taken)
+			if cond && p.lap == .Back { // out of the loop
+				native.mov_imm(a, .A, 0)
+				native.imp_store(a, run_pc, .A)
+			}
 			if cond {goto(a, labels, exit, (pc + 16) & mask)}
 		case p.ebit:
 			micro_wait_pair(a, u, p, pc, slow, k, p.waits)

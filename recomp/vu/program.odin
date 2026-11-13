@@ -50,6 +50,90 @@ Pair :: struct {
 	out:        [Flag]u8, // the depths of each flag after the pair that can be seen
 	waits:      Waits, // the Q and P waits the pair can start with, when not run as a delay slot (demand_waits)
 	stall:      bool, // the pair can stall before it runs (stall_waits)
+	lap:        Lap, // the branch's part in a loop that waits for the EE (wait_loops)
+	head:       u32, // that loop's first pair, as a pc
+}
+
+// A branch's part in a loop that waits for the EE (wait_loops): Back jumps
+// to the loop's first pair, Exit anywhere else.
+@(private)
+Lap :: enum u8 {None, Back, Exit}
+
+// In run_pc with a loop's first pair: compiled code stopped there, parked
+// (the runtime's Vu_Exit .Park). Inside a run, the same value in run_pc
+// says the last jump taken landed on that pair.
+@(private)
+PARK_BIT :: 1 << 30
+
+// Whether pair (uw, lw) changes nothing a branch reads and starts nothing:
+// a NOP upper over a NOP or a branch that links nothing. As the runtime's
+// vu_pair_idle; tests/vu_native holds the two to the same answer on every
+// lower word.
+pair_idle :: proc(uw, lw: u32) -> bool {
+	if uw != 0x000002ff {return false}
+	switch lw >> 25 {
+	case 0x20, 0x28, 0x29, 0x2c ..= 0x2f: return true
+	}
+	return lw & 0xffe007ff == 0x8000033c
+}
+
+// The loops of a VU0 program that wait for the EE, as the runtime's
+// interpreter finds them when it runs (vu_interp's park): a run of idle
+// pairs (pair_idle) closed by a branch back to its first pair, which only
+// a CTC2 to an integer register can end. Each branch in such a loop gets
+// its part (Pair.lap, Pair.head), and compiled code parks where the
+// interpreter does: at a Back branch taken when the jump taken before it
+// landed on the same first pair, with no Q or P pending. So a loop entered
+// part way, or one a write just before it lets out on its second lap, runs
+// its exits first.
+//
+// A loop is left as it was, to run to the step limit, when a pair of it is
+// not compiled or is left to the interpreter, when a branch inside it is
+// not conditional, when it shares a pair with a loop marked before it, or
+// (refused) when a conditional branch of it reads an integer register late
+// (delay_pairs): its first lap then reads another value than the laps
+// after it. Returns the first pairs of the loops marked and of those
+// refused, in the temp allocator.
+@(private)
+wait_loops :: proc(pairs: []Pair, ext: []bool, mask: u32) -> (marked, refused: [dynamic]u32) {
+	marked = make([dynamic]u32, context.temp_allocator)
+	refused = make([dynamic]u32, context.temp_allocator)
+	delayed, _ := delay_pairs(pairs, ext)
+	for p, j in pairs {
+		if p.ibit || (p.branch != .Uncond && p.branch != .Cond) {continue}
+		first := int(branch_target(p.lw, u32(j) * 8, mask) / 8)
+		if first > j || j + 1 >= len(pairs) {continue}
+		idle, late := true, false
+		for i in first ..= j + 1 {
+			q := pairs[i]
+			if (ext != nil && !ext[i]) || q.lap != .None || !pair_idle(q.uw, q.lw) || leave_pair(pairs, i) {idle = false}
+			if i < j && q.branch == .Uncond {idle = false}
+			if q.branch == .Cond && delayed[i] {late = true}
+		}
+		if !idle {continue}
+		if late {
+			append(&refused, u32(first) * 8)
+			continue
+		}
+		append(&marked, u32(first) * 8)
+		for i in first ..= j {
+			q := &pairs[i]
+			if q.branch == .None {continue}
+			q.head = u32(first) * 8
+			q.lap = int(branch_target(q.lw, u32(i) * 8, mask) / 8) == first ? .Back : .Exit
+		}
+	}
+	return
+}
+
+// The first pairs of the loops in a VU0 program's words that compiled code
+// parks at, and of those it does not for a late integer read (wait_loops),
+// over the pairs ext compiles (nil: all).
+wait_loop_heads :: proc(words: []u32, ext: []bool) -> (marked, refused: []u32) {
+	pairs := make([]Pair, len(words) / 2, context.temp_allocator)
+	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
+	m, r := wait_loops(pairs, ext, MASK[.VU0])
+	return m[:], r[:]
 }
 
 // The flags a micro-mode read sees late.
@@ -300,7 +384,8 @@ classify :: proc(lw, uw: u32) -> Pair {
 // that flag whole, and a stall before the pair shifts it more (stall).
 // Leaving for the interpreter needs every depth, which it
 // shifts and reads itself; an E bit only the newest, which the EE can read
-// and the next program starts from. Status counts only with status set
+// and the next program starts from, and so does a park (wait_loops), after
+// which the runtime takes every older value from the newest. Status counts only with status set
 // (reads_status): no upper op sets it whole, as its sticky bits keep every
 // earlier write, so a demand on it reaches every upper op before.
 @(private)
@@ -325,7 +410,7 @@ demand_flags :: proc(pairs: []Pair, ext: []bool, mask: u32, status: bool) {
 				case .Uncond, .Cond: out |= at(din, ext, int(branch_target(prev.lw, u32(i - 1) * 8, mask)))
 				}
 			}
-			if i > 0 && pairs[i - 1].ebit { // the E bit's delay slot
+			if i > 0 && (pairs[i - 1].ebit || pairs[i - 1].lap == .Back) { // the E bit's delay slot, or a park's
 				for &o in out {o |= DEPTH_NOW}
 			}
 			if !status {out[.Status] = 0}
@@ -799,6 +884,7 @@ analyze :: proc(words: []u32, ext: []bool, entries: []u32, unit: Unit, status: b
 	mask := MASK[unit]
 	pairs = make([]Pair, len(words) / 2, context.temp_allocator)
 	for &p, i in pairs {p = classify(words[2 * i], words[2 * i + 1])}
+	if unit == .VU0 {wait_loops(pairs, ext, mask)} // only VU0 parks
 	demand_waits(pairs, ext, mask)
 	demand_flags(pairs, ext, mask, status)
 	return pairs, dispatch_targets(pairs, mask, entries)

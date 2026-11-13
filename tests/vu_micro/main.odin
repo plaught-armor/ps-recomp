@@ -67,6 +67,10 @@
 // reached with Q pending and without both occur. Q, the pending Q and its
 // wait must match.
 //
+// Last of all, the programs that wait for the EE (vu_programs.park_image):
+// compiled for VU0 they park where the interpreter parks them, called
+// directly and registered; compiled for VU1 they do not (the harness's park).
+//
 //   odin run tests/vu_micro -collection:ps=.
 package main
 
@@ -128,6 +132,14 @@ main :: proc() {
 		if strings.count(e, "clamp4(vf[") >= strings.count(code, "clamp4(vf[") || strings.count(e, "case 0x") >= strings.count(code, "case 0x") {
 			fail("program %d (%v) elides no clamp or label", n, p.unit)
 		}
+	}
+	// The programs that wait for the EE (vu_programs.park_image), compiled
+	// for each unit: only VU0's parks (the harness's park).
+	for unit, k in ([]vu.Unit{.VU0, .VU1}) {
+		slow: map[string]int
+		fmt.sbprintln(&sb, vu.emit_micro(len(progs) + k, vu_programs.park_image(), unit, false, &slow))
+		if len(slow) != 0 {fail("the park programs (%v) call the interpreter: %v", unit, slow)}
+		fmt.sbprintfln(&sb, "PARK_VU%d :: run_%d\n", k, len(progs) + k)
 	}
 	fmt.sbprint(&sb, HARNESS)
 
@@ -301,10 +313,91 @@ main :: proc() {
 		vu.vu1_register_ranges({{0, c.words}}, c.run)
 		if !vu_programs.stale_status(c.words, c.pc) {fails += 1}
 	}
+	fails += park()
 	fmt.printfln("vu_micro: %d cases x %d trials, %d failing, MAC changed in %d, VU0 I or D set in %d, VU1 in %d", len(CASES), TRIALS, fails, flagged, status_set, vu1_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_micro: VU0 I or D set in only %d trials", status_set); os.exit(1)}
 	if vu1_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_micro: VU1 I or D set in only %d trials", vu1_set); os.exit(1)}
 	if fails > 0 {os.exit(1)}
+}
+
+// A VU0 program that waits for the EE (vu_programs.park_image) parks in
+// compiled code where the interpreter parks it: called directly it stops at
+// the loop's first pair after one turn, with a Q pending only once it
+// landed, and compiled for VU1 never; registered, the two loops park and a
+// CTC2 that ends each lets the program go on to its end. The failures.
+park :: proc() -> (fails: int) {
+	bad :: proc(fails: ^int, what: string, args: ..any) {
+		fmt.eprint("FAIL vu_micro park: ")
+		fmt.eprintfln(what, ..args)
+		fails^ += 1
+	}
+	start :: proc(v: ^vu.Vu) {
+		for r in 1 ..< 32 {v.vf[r].f = {f32(r), f32(r) + 1, -f32(r), 0}}
+		v.vi = 1
+		v.vi[0] = 0
+		v.q, v.q_next, v.q_wait, v.q_flags, v.q_due = 5, 0, 0, 0, 0
+		v.p, v.p_next, v.p_wait = 0, 0, 0
+		v.vih = {}
+		v.mac, v.clip, v.status = 0xffff, 0, 0
+		v.old_mac, v.old_status, v.old_clip = v.mac, v.status, v.clip
+	}
+	words := vu_programs.park_image()
+	for v in ([]^vu.Vu{&vu.vu0, &vu.vu1}) {
+		for &b in v.micro {b = 0}
+		copy(([^]u32)(&v.micro[0])[:len(words)], words)
+	}
+	vu.vu0_micro_touch()
+	vu.vu1_micro_touch()
+	v := &vu.vu0
+
+	start(v)
+	budget := 1000
+	pc, exit := PARK_VU0(0, &budget)
+	if exit != .Park || pc != vu_programs.PARK_LOOP_1 || budget != 999 {
+		bad(&fails, "a direct call into the first loop: exit %v, pc %04x, budget %d; want Park, %04x, 999", exit, pc, budget, vu_programs.PARK_LOOP_1)
+	}
+	budget = 1000
+	pc, exit = PARK_VU0(vu_programs.PARK_LOOP_1, &budget)
+	if exit != .Park || pc != vu_programs.PARK_LOOP_1 || budget != 999 {
+		bad(&fails, "a direct call at the first loop: exit %v, pc %04x, budget %d; want Park, %04x, 999", exit, pc, budget, vu_programs.PARK_LOOP_1)
+	}
+	start(v)
+	budget = 1000
+	pc, exit = PARK_VU0(vu_programs.PARK_DIV, &budget)
+	if exit != .Park || pc != vu_programs.PARK_DIV_LOOP || budget >= 999 || v.q_wait | v.p_wait | v.q_due != 0 || v.q != 2 {
+		bad(&fails, "a direct call with a DIV before the loop: exit %v, pc %04x, budget %d, Q wait %d due %d, Q %v; want Park, %04x, under 999, 0 0, 2",
+			exit, pc, budget, v.q_wait, v.q_due, v.q, vu_programs.PARK_DIV_LOOP)
+	}
+	start(v)
+	v.vi[8] = 1
+	budget = 1000
+	pc, exit = PARK_VU0(vu_programs.PARK_LATE, &budget)
+	if exit != .End || pc != vu_programs.PARK_LATE_END {
+		bad(&fails, "a loop entered behind an integer write: exit %v, pc %04x; want End, %04x", exit, pc, vu_programs.PARK_LATE_END)
+	}
+	start(&vu.vu1)
+	budget = 1000
+	pc, exit = PARK_VU1(0, &budget)
+	if exit != .Leave || budget > 0 {bad(&fails, "the first loop compiled for VU1: exit %v, pc %04x, budget %d; want Leave with no budget left", exit, pc, budget)}
+
+	vu.vu0_register_ranges({{0, words}}, PARK_VU0)
+	vu.vu0_micro_touch()
+	start(v)
+	vu.vu0_call_micro(0)
+	if !vu.vu0_parked || v.tpc != vu_programs.PARK_LOOP_1 || v.old_mac == 0xffff {
+		bad(&fails, "registered, the first loop: parked %v, tpc %04x, older MAC %04x; want true, %04x, the ADD's flags", vu.vu0_parked, v.tpc, v.old_mac, vu_programs.PARK_LOOP_1)
+	}
+	vu.vu0_ctrl_write(5, 9)
+	if !vu.vu0_parked || v.tpc != vu_programs.PARK_LOOP_1 {bad(&fails, "registered, a CTC2 that does not end the loop: parked %v, tpc %04x", vu.vu0_parked, v.tpc)}
+	vu.vu0_ctrl_write(1, 0)
+	if !vu.vu0_parked || v.tpc != vu_programs.PARK_LOOP_2 || v.vi[3] != 7 {
+		bad(&fails, "registered, the second loop: parked %v, tpc %04x, vi3 %d; want true, %04x, 7", vu.vu0_parked, v.tpc, v.vi[3], vu_programs.PARK_LOOP_2)
+	}
+	vu.vu0_ctrl_write(2, 0)
+	if vu.vu0_parked || v.tpc != vu_programs.PARK_END || v.vi[4] != 9 {
+		bad(&fails, "registered, the end: parked %v, tpc %04x, vi4 %d; want false, %04x, 9", vu.vu0_parked, v.tpc, v.vi[4], vu_programs.PARK_END)
+	}
+	return
 }
 `

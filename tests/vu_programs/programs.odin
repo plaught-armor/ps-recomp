@@ -599,3 +599,71 @@ stale_status :: proc(words: []u32, pc: u32) -> (ok: bool) {
 	ps2_vu.vu1_status_stale = false
 	return ok
 }
+
+// Programs that wait for the EE, and loops that do not, in one image from
+// address 0 (ps2/vu vu0_call_micro's park, recomp/vu wait_loops):
+//   0x000: vi1 = vi2 = 1 under an ADD that changes MAC, then a loop of idle
+//          pairs at 0x010 until vi1 == 0, vi3 = 7, a second at 0x038 until
+//          vi2 == 0, then vi4 = vi3 + 2 and the E bit.
+//   0x068: a program that ends at once.
+//   0x078: a loop that counts vi6 down from 1000, then the E bit.
+//   0x0b8: an endless loop that adds 1 to vi7.
+//   0x0d0: a DIV, then an endless loop of two idle pairs at 0x0d8: Q is
+//          still pending the second time round.
+//   0x0e8: vi8 = 0, then a loop of idle pairs at 0x0f0 until vi8 == 0: its
+//          IBEQ reads vi8 from before the write the first time round, so
+//          the loop turns once and leaves for the E bit.
+ISUBIU :: 0x09
+PARK_LOOP_1 :: 0x010
+PARK_LOOP_2 :: 0x038
+PARK_END :: 0x068 // where the first program stops, and the second starts
+PARK_COUNT :: 0x078
+PARK_COUNT_END :: 0x0b8
+PARK_BUSY :: 0x0b8
+PARK_DIV :: 0x0d0
+PARK_DIV_LOOP :: 0x0d8
+PARK_LATE :: 0x0e8
+PARK_LATE_LOOP :: 0x0f0
+PARK_LATE_END :: 0x120
+
+park_image :: proc() -> []u32 {
+	w := make([dynamic]u32)
+	back :: proc "contextless" (pairs: u32) -> u32 {return lower_op(B, 0, 0, 0, u32(-i32(pairs)) & 0x7ff)}
+	append(&w, lower_op(IADDIU, 0, 1, 0, 1), upper(ADD, 1, 2, 3))
+	append(&w, lower_op(IADDIU, 0, 2, 0, 1), NOP_U)
+	append(&w, lower_op(IBEQ, 0, 1, 0, 3), NOP_U) // 0x010
+	append(&w, NOP_L, NOP_U)
+	append(&w, back(3), NOP_U)
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_op(IADDIU, 0, 3, 0, 7), NOP_U)
+	append(&w, lower_op(IBEQ, 0, 2, 0, 3), NOP_U) // 0x038
+	append(&w, NOP_L, NOP_U)
+	append(&w, back(3), NOP_U)
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_op(IADDIU, 0, 4, 3, 2), NOP_U | E_BIT)
+	append(&w, NOP_L, NOP_U)
+	append(&w, NOP_L, NOP_U | E_BIT) // 0x068
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_op(IADDIU, 0, 6, 0, 1000), NOP_U) // 0x078
+	append(&w, lower_op(ISUBIU, 0, 6, 6, 1), NOP_U)
+	append(&w, NOP_L, NOP_U)
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_op(IBNE, 0, 0, 6, 0x7fc), NOP_U) // 0x098, to 0x080
+	append(&w, NOP_L, NOP_U)
+	append(&w, NOP_L, NOP_U | E_BIT)
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_op(IADDIU, 0, 7, 7, 1), NOP_U) // 0x0b8
+	append(&w, back(2), NOP_U)
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_sp(DIV, 0, 2, 4), NOP_U) // 0x0d0
+	append(&w, back(1), NOP_U) // 0x0d8
+	append(&w, NOP_L, NOP_U)
+	append(&w, lower_op(IADDIU, 0, 8, 0, 0), NOP_U) // 0x0e8
+	append(&w, lower_op(IBEQ, 0, 8, 0, 3), NOP_U) // 0x0f0
+	append(&w, NOP_L, NOP_U)
+	append(&w, back(3), NOP_U)
+	append(&w, NOP_L, NOP_U)
+	append(&w, NOP_L, NOP_U | E_BIT) // 0x110
+	append(&w, NOP_L, NOP_U)
+	return w[:]
+}
