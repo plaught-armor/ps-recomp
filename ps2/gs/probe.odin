@@ -3,8 +3,8 @@ package ps2_gs
 import "core:math"
 
 // Test hooks: the texture sampler outside a draw, for tests/gs_tex, the
-// pixel proc choice, for tests/gs_pixel, and a triangle's pixel calls, for
-// tests/gs_span.
+// pixel proc choice, for tests/gs_pixel, a triangle's pixel calls, for
+// tests/gs_span, and the CLUT buffer, for tests/gs_clut.
 
 // Decodes the context PRIM's CTXT selects, texture mapping on, as a draw
 // would, and resolves its levels again on their first sample. The next
@@ -216,4 +216,51 @@ draw_tri_ref :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) -> (cls: Tri_Classes) {
 		e2.w += e2.dx
 	}
 	return
+}
+
+// The CLUT buffer and the block pointers CLD 4 and 5 compare with.
+probe_clut :: proc() -> (buf: ^[512]u32, c0, c1: ^u32) {
+	return &clut, &cbp0, &cbp1
+}
+
+// clut_load as it was before CSM1 read through clut_off32 and clut_off16:
+// each entry's pixel through read_raw. The software path only.
+clut_load_ref :: proc(tex0: u64) {
+	cbp := u32(tex0 >> 37) & 0x3fff
+	switch (tex0 >> 61) & 7 {
+	case 0: return
+	case 2: cbp0 = cbp
+	case 3: cbp1 = cbp
+	case 4:
+		if cbp == cbp0 {return}
+		cbp0 = cbp
+	case 5:
+		if cbp == cbp1 {return}
+		cbp1 = cbp
+	case 6, 7: return
+	}
+	psm := u32(tex0 >> 20) & 0x3f
+	cpsm := u32(tex0 >> 51) & 0xf
+	csm2 := tex0 & (1 << 55) != 0
+	csa := u32(tex0 >> 56) & 0x1f
+	n: u32 = (psm == PSMT8 || psm == PSMT8H) ? 256 : 16
+	base := csa * 16
+	tc := state.regs[0x1c] // TEXCLUT: CBW, COU, COV
+	cbw, cou, cov := u32(tc) & 0x3f, u32(tc >> 6) & 0x3f, u32(tc >> 12) & 0x3ff
+	if csm2 {
+		for i in 0 ..< n {
+			clut[(base + i) & 511] = read_raw(cpsm, cbp, cbw, cou * 16 + i, cov)
+		}
+		return
+	}
+	for i in 0 ..< n {
+		x, y: u32
+		if n == 256 {
+			p := (i & 0xe7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1)
+			x, y = p & 15, p >> 4
+		} else {
+			x, y = i & 7, i >> 3
+		}
+		clut[(base + i) & 511] = read_raw(cpsm, cbp, 1, x, y)
+	}
 }
