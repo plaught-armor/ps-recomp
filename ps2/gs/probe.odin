@@ -287,3 +287,17 @@ clut_load_ref :: proc(tex0: u64) {
 		clut[(base + i) & 511] = read_raw(cpsm, cbp, 1, x, y)
 	}
 }
+
+// Drops every cache entry and fills every tile of the pool with v, so that
+// a tile decoded from now on holds v wherever its decode did not write
+// (tests/gs_decode).
+probe_tiles_fill :: proc(v: u32) {
+	tc_flush()
+	for &tile in tc_pool {tile = v}
+}
+
+// The cached tile holding level n's texel (x, y) of the probed context's
+// texture, decoded if it was not, or nil where the level is not cached.
+probe_tile :: proc(n, x, y: u32) -> ^[256]u32 {
+	return tile_at(&ctx_cur.tex, n, x, y, x, y)
+}

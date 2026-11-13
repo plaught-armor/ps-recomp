@@ -18,6 +18,7 @@ odin run tests/gs_tex -collection:ps=.
 odin run tests/gs_pixel -collection:ps=.
 odin run tests/gs_span -collection:ps=.
 odin run tests/gs_clut -collection:ps=.
+odin run tests/gs_decode -collection:ps=.
 odin run tests/gs_scanout -collection:ps=.
 odin run tests/gs_hw -collection:ps=.
 odin run tests/vu_macro -collection:ps=.

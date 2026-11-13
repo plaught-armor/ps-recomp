@@ -1,7 +1,7 @@
 // Decoded texture cache for the software GS: 16x16 tiles of texels as
 // `fetch` returns them (RGBA8888, after the CLUT and expand16), each tile
-// decoded on first use through fetch itself. A cached texel is the fetch it
-// stands for as long as nothing fetch read has changed since.
+// decoded on first use by a loop for its format (tc_fill). A cached texel is
+// the fetch it stands for as long as nothing fetch read has changed since.
 //
 // An entry is one mip level of one texture, keyed by what fetch reads: the
 // PSM, the level's base, width and size, the CLUT entries an indexed format
@@ -378,14 +378,147 @@ tc_decode :: proc(e: ^Tc_Entry, ei: u32, t: ^Tex, n, tx, ty: u32) -> u32 #no_bou
 	s := tc_alloc()
 	b := ty * e.tw + tx
 	x0, y0 := tx * 16, ty * 16
-	out := &tc_pool[s]
-	for y in 0 ..< min(16, e.key.ch - y0) {
-		for x in 0 ..< min(16, e.key.cw - x0) {
-			out[y << 4 | x] = fetch(t, n, x0 + x, y0 + y)
-		}
-	}
+	tc_fill(&tc_pool[s], t, n, x0, y0, min(16, e.key.cw - x0), min(16, e.key.ch - y0))
 	e.tile[b] = u16(s + 1)
 	e.live += 1
 	tc_owner[s] = {u16(ei), u16(b)}
 	return s + 1
+}
+
+// The w x h texels from (x0, y0) of level n of t into a tile, each as
+// `fetch` returns it; the rest of the tile is not written. x0 and y0 are
+// multiples of 16, so the tile lies in one page of every format, and in
+// that page covers one block of a 4- or 8-bit format, two of a 16-bit one,
+// one above the other, and four of a 32-bit one: what an address shares
+// across the tile or a row of it is computed once, and a texel costs a
+// column table read and a load. tests/gs_decode holds each loop to fetch.
+@(private = "file")
+tc_fill :: #force_no_inline proc(out: ^[256]u32, t: ^Tex, n, x0, y0, w, h: u32) #no_bounds_check {
+	c16 := t.cpsm != PSMCT32
+	ta := Tc_Texa{t.ta0 << 24, t.ta1 << 24, t.aem}
+	pal := t.csa * 16
+	switch t.psm {
+	case PSMCT32: tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.CT32, false)
+	case PSMCT24: tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.CT24, false)
+	case PSMCT16: tc_fill_h(out, t, n, x0, y0, w, h, ta, &block16)
+	case PSMCT16S: tc_fill_h(out, t, n, x0, y0, w, h, ta, &block16s)
+	case PSMT8:
+		if c16 {tc_fill_8(out, t, n, x0, y0, w, h, ta, pal, true)} else {tc_fill_8(out, t, n, x0, y0, w, h, ta, pal, false)}
+	case PSMT4:
+		if c16 {tc_fill_4(out, t, n, x0, y0, w, h, ta, pal, true)} else {tc_fill_4(out, t, n, x0, y0, w, h, ta, pal, false)}
+	case PSMT8H:
+		if c16 {tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.T8H, true)} else {tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.T8H, false)}
+	case PSMT4HL:
+		if c16 {tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.T4HL, true)} else {tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.T4HL, false)}
+	case PSMT4HH:
+		if c16 {tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.T4HH, true)} else {tc_fill_w(out, t, n, x0, y0, w, h, ta, pal, Tc_Wide.T4HH, false)}
+	case:
+		// No texture format: whatever fetch makes of it.
+		for y in 0 ..< h {
+			for x in 0 ..< w {out[y << 4 | x] = fetch(t, n, x0 + x, y0 + y)}
+		}
+	}
+}
+
+// TEXA as expand16 reads it, the alphas in place.
+@(private = "file")
+Tc_Texa :: struct {
+	a0, a1: u32,
+	aem:    bool,
+}
+
+// expand16 of c.
+@(private = "file")
+tc_x16 :: #force_inline proc(c: u32, ta: Tc_Texa) -> u32 {
+	rgb := (c & 0x1f) << 3 | (c & 0x3e0) << 6 | (c & 0x7c00) << 9
+	a := c & 0x8000 != 0 ? ta.a1 : !ta.aem || c & 0x7fff != 0 ? ta.a0 : 0
+	return rgb | a
+}
+
+// CLUT entry i from `base`, fetch's colour for an indexed texel: as it is
+// for a 32-bit CLUT, expanded for a 16-bit one.
+@(private = "file")
+tc_pal :: #force_inline proc(base, i: u32, ta: Tc_Texa, $C16: bool) -> u32 #no_bounds_check {
+	c := clut[(base + i) & 511]
+	when C16 {return tc_x16(c & 0xffff, ta)} else {return c}
+}
+
+// The formats stored a texel to a 32-bit word.
+@(private = "file")
+Tc_Wide :: enum {
+	CT32,
+	CT24,
+	T8H,
+	T4HL,
+	T4HH,
+}
+
+// Blocks are 8 x 8: a row of the tile lies in two, side by side.
+@(private = "file")
+tc_fill_w :: #force_inline proc(out: ^[256]u32, t: ^Tex, n, x0, y0, w, h: u32, ta: Tc_Texa, pal: u32, $K: Tc_Wide, $C16: bool) #no_bounds_check {
+	page := t.mtbp[n] + ((y0 >> 5) * t.mtbw[n] + (x0 >> 6)) * 32
+	bx := (x0 >> 3) & 7
+	for y in 0 ..< h {
+		blk := &block32[((y0 + y) >> 3) & 3]
+		col := &col32[y & 7]
+		base := [2]u32{(page + blk[bx]) << 6, (page + blk[bx + 1]) << 6}
+		o := ([^]u32)(out)[y << 4:]
+		for x in 0 ..< w {
+			v := vram[(base[x >> 3] + col[x & 7]) & (VRAM_WORDS - 1)]
+			when K == .CT32 {
+				o[x] = v
+			} else when K == .CT24 {
+				o[x] = v & 0xffffff | (ta.aem && v & 0xffffff == 0 ? 0 : ta.a0)
+			} else when K == .T8H {
+				o[x] = tc_pal(pal, v >> 24, ta, C16)
+			} else when K == .T4HL {
+				o[x] = tc_pal(pal, (v >> 24) & 15, ta, C16)
+			} else {
+				o[x] = tc_pal(pal, v >> 28, ta, C16)
+			}
+		}
+	}
+}
+
+// PSMCT16 and PSMCT16S, by their block table. Blocks are 16 x 8: a row of
+// the tile lies in one.
+@(private = "file")
+tc_fill_h :: proc(out: ^[256]u32, t: ^Tex, n, x0, y0, w, h: u32, ta: Tc_Texa, blocks: ^[8][4]u32) #no_bounds_check {
+	page := t.mtbp[n] + ((y0 >> 6) * t.mtbw[n] + (x0 >> 6)) * 32
+	bx := (x0 >> 4) & 3
+	for y in 0 ..< h {
+		base := (page + blocks[((y0 + y) >> 3) & 7][bx]) << 7
+		col := &col16[y & 7]
+		o := ([^]u32)(out)[y << 4:]
+		for x in 0 ..< w {
+			o[x] = tc_x16(u32(vram16()[(base + col[x]) & (2 * VRAM_WORDS - 1)]), ta)
+		}
+	}
+}
+
+// PSMT8. Blocks are 16 x 16: the tile is one.
+@(private = "file")
+tc_fill_8 :: #force_inline proc(out: ^[256]u32, t: ^Tex, n, x0, y0, w, h: u32, ta: Tc_Texa, pal: u32, $C16: bool) #no_bounds_check {
+	base := (t.mtbp[n] + ((y0 >> 6) * (t.mtbw[n] >> 1) + (x0 >> 7)) * 32 + block32[(y0 >> 4) & 3][(x0 >> 4) & 7]) << 8
+	for y in 0 ..< h {
+		col := &col8[y]
+		o := ([^]u32)(out)[y << 4:]
+		for x in 0 ..< w {
+			o[x] = tc_pal(pal, u32(vram8()[(base + col[x]) & (4 * VRAM_WORDS - 1)]), ta, C16)
+		}
+	}
+}
+
+// PSMT4. Blocks are 32 x 16: the tile is a half of one.
+@(private = "file")
+tc_fill_4 :: #force_inline proc(out: ^[256]u32, t: ^Tex, n, x0, y0, w, h: u32, ta: Tc_Texa, pal: u32, $C16: bool) #no_bounds_check {
+	base := (t.mtbp[n] + ((y0 >> 7) * (t.mtbw[n] >> 1) + (x0 >> 7)) * 32 + block16[(y0 >> 4) & 7][(x0 >> 5) & 3]) << 9
+	for y in 0 ..< h {
+		col := ([^]u32)(&col4[y])[x0 & 16:]
+		o := ([^]u32)(out)[y << 4:]
+		for x in 0 ..< w {
+			a := (base + col[x]) & (8 * VRAM_WORDS - 1)
+			o[x] = tc_pal(pal, u32(vram8()[a >> 1] >> ((a & 1) * 4)) & 15, ta, C16)
+		}
+	}
 }
