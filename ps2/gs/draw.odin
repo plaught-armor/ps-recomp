@@ -330,17 +330,41 @@ lerp_vertex :: proc(a, b: ^Vertex, f: f32) -> (v: Vertex) {
 @(private)
 tex_coord :: #force_inline proc(c: ^Ctx, stuv: #simd[4]f32, q: f32) -> (f32, f32, i32) {
 	if !c.tme {return 0, 0, 0}
-	d, sc := f32(1), #simd[4]f32{1, 1, 1, 1}
+	return tex_at(tex_map(c), stuv, q)
+}
+
+// What tex_coord takes from the context, the same for every pixel of a
+// primitive.
+@(private)
+Tex_Map :: struct {
+	sc:       #simd[4]f32, // S and T to texels; ones for U and V
+	fst, lcm: bool,
+	l:        u32,
+	k:        i32, // K as tex_lod adds it
+}
+
+@(private)
+tex_map :: #force_inline proc(c: ^Ctx) -> (m: Tex_Map) {
+	m.sc = {1, 1, 1, 1}
+	if !c.fst {m.sc = {f32(c.tex.w), f32(c.tex.h), 1, 1}}
+	m.fst, m.lcm, m.l, m.k = c.fst, c.tex.lcm, c.tex.l, c.tex.k << 19
+	return
+}
+
+// tex_coord of a texture-mapped context, its part of the context taken
+// beforehand. The four-lane divide tex_coord's comment speaks of is here.
+@(private)
+tex_at :: #force_inline proc(m: Tex_Map, stuv: #simd[4]f32, q: f32) -> (f32, f32, i32) {
+	d := f32(1)
 	lod: i32
-	if c.fst {
-		lod = tex_lod(&c.tex, 1)
+	if m.fst {
+		lod = tex_lod(m, 1)
 	} else {
-		lod = tex_lod(&c.tex, q)
+		lod = tex_lod(m, q)
 		if q != 0 {d = q}
-		sc = {f32(c.tex.w), f32(c.tex.h), 1, 1}
 	}
-	r := stuv / #simd[4]f32{d, d, 1, 1} * sc
-	if c.fst {return simd.extract(r, 2), simd.extract(r, 3), lod}
+	r := stuv / #simd[4]f32{d, d, 1, 1} * m.sc
+	if m.fst {return simd.extract(r, 2), simd.extract(r, 3), lod}
 	return simd.extract(r, 0), simd.extract(r, 1), lod
 }
 
@@ -349,12 +373,12 @@ tex_coord :: #force_inline proc(c: ^Ctx, stuv: #simd[4]f32, q: f32) -> (f32, f32
 // GPU's shaders/prim.frag `tex_lod` gets the same levels. UV primitives
 // take Q as 1.
 @(private)
-tex_lod :: #force_inline proc(t: ^Tex, q: f32) -> i32 {
+tex_lod :: #force_inline proc(m: Tex_Map, q: f32) -> i32 {
 	x: i32
-	if !t.lcm {
-		x = clamp(127 << 23 - i32(transmute(u32)abs(q)), -16 << 23, 16 << 23) << t.l
+	if !m.lcm {
+		x = clamp(127 << 23 - i32(transmute(u32)abs(q)), -16 << 23, 16 << 23) << m.l
 	}
-	return x + t.k << 19
+	return x + m.k
 }
 
 @(private)
@@ -420,6 +444,16 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 	sa := #simd[4]f32{a.s, a.t, a.u, a.v}
 	sb := #simd[4]f32{b.s, b.t, b.u, b.v}
 	sd := #simd[4]f32{d.s, d.t, d.u, d.v}
+	// What the pixels read of the vertices and the context, taken once: the
+	// pixel proc is called through a pointer, so nothing behind a pointer
+	// is known to outlive a call, and the swap of b and d would be made
+	// again for every field of every pixel.
+	az, bz, dz := a.z, b.z, d.z
+	ac, bc, dc := a.c, b.c, d.c
+	aq, bq, dq := a.q, b.q, d.q
+	af, bf, df := a.fog, b.fog, d.fog
+	iip, tme := c.iip, c.tme
+	tm := tex_map(c)
 	// Every step of an edge is exact. A vertex's x and y are sixteenths
 	// below 4096 in magnitude (vertex; lerp_vertex's output goes to draw_line
 	// only), so dx and dy are sixteenths below 8192, and the box lies in the
@@ -466,17 +500,17 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 			defer {w0 -= e0.dy; w1 -= e1.dy; w2 -= e2.dy}
 			l0, l1, l2 := w0 * inv, w1 * inv, w2 * inv
 			f0, f1, f2 := f32(l0), f32(l1), f32(l2)
-			z := a.z * l0 + b.z * l1 + d.z * l2
+			z := az * l0 + bz * l1 + dz * l2
 			col := flat
-			if c.iip {col = a.c * f0 + b.c * f1 + d.c * f2}
+			if iip {col = ac * f0 + bc * f1 + dc * f2}
 			u, v: f32
 			lod: i32
-			if c.tme {
-				u, v, lod = tex_coord(c,
+			if tme {
+				u, v, lod = tex_at(tm,
 					sa * f0 + sb * f1 + sd * f2,
-					a.q * f0 + b.q * f1 + d.q * f2)
+					aq * f0 + bq * f1 + dq * f2)
 			}
-			fog := a.fog * f0 + b.fog * f1 + d.fog * f2
+			fog := af * f0 + bf * f1 + df * f2
 			c.px(c, x, y, z, col, u, v, lod, fog)
 		}
 	}
