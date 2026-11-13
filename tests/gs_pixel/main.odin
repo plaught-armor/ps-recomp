@@ -1,11 +1,12 @@
 // The software GS's specialised pixel procs (gs.PX_FAST) against the
 // generic pixel, bit for bit on all of local memory (frame and Z): random
-// contexts of each PX_FAST kind, and fully random ones that take the
-// generic proc, each drawing random points, lines, triangles, strips, fans
-// and sprites over random memory. Frame and Z buffers sit at random pages
-// and widths, sometimes on the same pages, and spans cross page and block
-// rows, so the rows the rasteriser seeks once per span are checked against
-// the per-pixel seek too.
+// contexts of each PX_FAST kind (its fog, alpha test and destination alpha
+// test with it), and fully random ones that take the generic proc, each
+// drawing random points, lines, triangles, strips, fans and sprites over
+// random memory. Frame and Z buffers sit at random pages and widths,
+// sometimes on the same pages, and spans cross page and block rows, so the
+// rows the rasteriser seeks once per span are checked against the per-pixel
+// seek too.
 package main
 
 import "core:fmt"
@@ -98,11 +99,14 @@ build :: proc(fi: int) {
 	put(0x40 + u8(n), x0 | x1 << 16 | y0 << 32 | y1 << 48) // SCISSOR
 	test: u64
 	if fast {
-		if f.atst == 6 {
-			test = 1 | 6 << 1 | rndn(256) << 4 // ATE, ATST GREATER, AFAIL KEEP
+		if f.atst != 1 {
+			test = 1 | u64(f.atst) << 1 | rndn(256) << 4 | u64(f.afail) << 12 // ATE, the row's ATST and AFAIL
+		} else if rndn(2) == 0 {
+			test = 1 | 1 << 1 | rndn(256) << 4 | rndn(4) << 12 // ATE, ATST ALWAYS
 		} else {
-			test = rndn(2) | 1 << 1 | rndn(256) << 4 | rndn(4) << 12 // ATE maybe, ATST ALWAYS
+			test = rndn(8) << 1 | rndn(256) << 4 | rndn(4) << 12 // no ATE
 		}
+		test |= u64(f.date != 0) << 14 | u64(f.date == 2) << 15 // DATE, DATM
 		test |= 1 << 16 | u64(f.ztst) << 17
 	} else {
 		test = rnd() & 0x7ffff
@@ -137,7 +141,8 @@ build :: proc(fi: int) {
 
 	kind := rndn(7)
 	fst := rndn(2) == 0
-	prim := kind | rndn(2) << 3 | u64(tme) << 4 | u64(!fast && rndn(2) == 0) << 5 | u64(fst) << 8 | n << 9
+	fge := fast ? f.fge : rndn(2) == 0
+	prim := kind | rndn(2) << 3 | u64(tme) << 4 | u64(fge) << 5 | u64(fst) << 8 | n << 9
 	if fast ? f.bl != 0xff : rndn(2) == 0 {prim |= 1 << 6} // ABE
 	put(0x00, prim)
 
@@ -158,7 +163,7 @@ build :: proc(fi: int) {
 		}
 		x := (ox + cx) * 16 + rndn(size * 32) - size * 16
 		y := (oy + cy) * 16 + rndn(size * 32) - size * 16
-		if rndn(4) == 0 {
+		if (fast && fge) || rndn(4) == 0 { // a fog row: a fog value on every vertex
 			put(0x04, x | y << 16 | (rnd() & 0xffffff) << 32 | rndn(256) << 56) // XYZF2
 		} else {
 			put(0x05, x | y << 16 | (rnd() & 0xffffffff) << 32) // XYZ2
@@ -173,8 +178,10 @@ main :: proc() {
 	for &v in gs.vram {v = u32(rnd())}
 
 	FAST :: len(gs.PX_FAST)
-	TRIALS :: 1600
-	trials, pixels: [FAST + 1]int // per PX_FAST index, then random contexts
+	TRIALS :: 4800 // over 100 for each PX_FAST row
+	// Per PX_FAST index, then random contexts. A trial's pixels are the
+	// words its fast run changed; all of local memory is compared.
+	trials, pixels: [FAST + 1]int
 	random_fast := 0
 	for i in 0 ..< TRIALS {
 		fi := i % 4 == 3 ? -1 : (i / 4 * 3 + i % 4) % FAST // 3 in 4 fast
@@ -212,8 +219,9 @@ main :: proc() {
 	total := 0
 	for k in 0 ..= FAST {
 		name := k < FAST ? fmt.tprintf("PX_FAST[%d]", k) : "random"
-		fmt.printfln("%-11s trials %4d  words changed %8d", name, trials[k], pixels[k])
+		fmt.printfln("%-11s trials %4d  pixels compared %8d", name, trials[k], pixels[k])
 		total += pixels[k]
+		if k < FAST && trials[k] < 100 {fail("%s: only %d trials", name, trials[k])}
 		if trials[k] == 0 || pixels[k] == 0 {fail("%s: no pixels drawn", name)}
 	}
 	fmt.printfln("random contexts on a fast proc: %d; words changed: %d", random_fast, total)
