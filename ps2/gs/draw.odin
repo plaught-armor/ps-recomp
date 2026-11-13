@@ -420,21 +420,50 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 	sa := #simd[4]f32{a.s, a.t, a.u, a.v}
 	sb := #simd[4]f32{b.s, b.t, b.u, b.v}
 	sd := #simd[4]f32{d.s, d.t, d.u, d.v}
+	// Every step of an edge is exact. A vertex's x and y are sixteenths
+	// below 4096 in magnitude (vertex; lerp_vertex's output goes to draw_line
+	// only), so dx and dy are sixteenths below 8192, and the box lies in the
+	// scissor's 11 bits: w is a count of 1/256ths below 2^35, far inside a
+	// double's 53 bits, and no sum or difference of w with dx or dy rounds.
+	// So at minx + k an edge is exactly w - k * dy, its test passes on one
+	// run of k, and the three pass together on one run [ks, ke], found here
+	// from the 1/256ths as integers: w - k * dy >= 0, with w one lower for
+	// an edge that does not own its pixels.
+	Run :: struct {w, dx, dy: i64}
+	run :: proc(e: Edge) -> Run {
+		return {i64(e.w * 256) - i64(!e.bias), i64(e.dx * 256), i64(e.dy * 256)}
+	}
+	// a / b rounded down, for b > 0.
+	floor_div :: #force_inline proc(a, b: i64) -> i64 {
+		q := a / b
+		if a % b < 0 {q -= 1}
+		return q
+	}
+	runs := [3]Run{run(e0), run(e1), run(e2)}
+	last := i64(maxx - minx)
 	for y in miny ..= maxy {
-		w0, w1, w2 := e0.w, e1.w, e2.w
-		ctx_seek(c, y)
-		// Each w steps by one rounded subtraction of the same dy, so it moves
-		// one way only, and each edge's test passes on one run of x: the
-		// three pass together on one run, which ends at the first pixel
-		// that fails after one that passed.
-		inside := false
-		for x in minx ..= maxx {
-			defer {w0 -= e0.dy; w1 -= e1.dy; w2 -= e2.dy}
-			if w0 < 0 || w1 < 0 || w2 < 0 || (w0 == 0 && !e0.bias) || (w1 == 0 && !e1.bias) || (w2 == 0 && !e2.bias) {
-				if inside {break}
-				continue
+		defer {
+			e0.w += e0.dx
+			e1.w += e1.dx
+			e2.w += e2.dx
+		}
+		ks, ke := i64(0), last
+		for &r in runs {
+			switch {
+			case r.dy > 0: ke = min(ke, floor_div(r.w, r.dy))
+			case r.dy < 0: ks = max(ks, -floor_div(r.w, -r.dy))
+			case r.w < 0: ke = -1 // a level edge: the whole row, or none of it
 			}
-			inside = true
+			r.w += r.dx
+		}
+		if ks > ke {continue}
+		// The weights at ks, exact, then stepped pixel by pixel as a walk
+		// from minx would have stepped them.
+		k := f64(ks)
+		w0, w1, w2 := e0.w - k * e0.dy, e1.w - k * e1.dy, e2.w - k * e2.dy
+		ctx_seek(c, y)
+		for x in minx + i32(ks) ..= minx + i32(ke) {
+			defer {w0 -= e0.dy; w1 -= e1.dy; w2 -= e2.dy}
 			l0, l1, l2 := w0 * inv, w1 * inv, w2 * inv
 			f0, f1, f2 := f32(l0), f32(l1), f32(l2)
 			z := a.z * l0 + b.z * l1 + d.z * l2
@@ -450,9 +479,6 @@ draw_tri :: proc(c: ^Ctx, v0, v1, v2: ^Vertex) {
 			fog := a.fog * f0 + b.fog * f1 + d.fog * f2
 			c.px(c, x, y, z, col, u, v, lod, fog)
 		}
-		e0.w += e0.dx
-		e1.w += e1.dx
-		e2.w += e2.dx
 	}
 }
 
