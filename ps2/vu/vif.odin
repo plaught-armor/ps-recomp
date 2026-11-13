@@ -179,7 +179,7 @@ vif_mscal :: proc(v: ^Vif, addr: u32) {
 	if v.id == 1 {
 		v.top = v.tops
 		v.dbf = !v.dbf
-		v.tops = v.base + (v.dbf ? v.ofst : 0)
+		v.tops = (v.base + (v.dbf ? v.ofst : 0)) & 0x3ff // TOPS is 10 bits: the sum wraps
 		vu1_start(addr)
 	} else {
 		vu0_call_micro(addr)

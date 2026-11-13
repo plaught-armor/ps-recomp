@@ -1411,6 +1411,32 @@ kick_latch :: proc() {
 	kick_path1_idle("XGKICK in a program stopped at the step limit", "interpreted")
 }
 
+// VIF1's TOPS is 10 bits. An MSCAL copies TOPS to TOP, which XTOP reads,
+// then swaps TOPS between BASE and BASE + OFFSET; a sum past 0x3ff wraps.
+@(private = "file")
+tops_wrap :: proc() {
+	v := &vu.vifs[1]
+	code := [4]u32{0x40 << 25 | 1 << 16 | 0x6bc, 1 << 30 | 0x000002ff, 0x8000033c, 0x000002ff} // XTOP vi1 + E
+	mpg(v, code[:])
+	Case :: struct {
+		base, ofst: u32,
+		top:        [3]u32, // at each of three MSCALs
+	}
+	cases := [?]Case{{0x1ba, 0x246, {0x1ba, 0, 0x1ba}}, {0x300, 0x200, {0x300, 0x100, 0x300}}, {0x100, 0x080, {0x100, 0x180, 0x100}}}
+	for c in cases {
+		feed(v, 0x03000000 | c.base, 0x02000000 | c.ofst) // BASE, OFFSET
+		for want, k in c.top {
+			vu.vu1.vi[1] = 0xffff
+			feed(v, 0x14000000) // MSCAL 0
+			next := c.top[(k + 1) % 2]
+			if v.top != want || v.tops != next || vu.vu1.vi[1] != u16(want) {
+				fail("BASE %x OFFSET %x, MSCAL %d: TOP %x, TOPS %x, XTOP %x; want %x, %x, %x", c.base, c.ofst, k + 1, v.top, v.tops, vu.vu1.vi[1], want, next, want)
+			}
+		}
+	}
+	feed(v, 0x03000000, 0x02000000)
+}
+
 main :: proc() {
 	vu.vu_init()
 	put(0x40, 0x08 << 25 | 1 << 16 | 5) // IADDIU vi1, vi0, 5
@@ -1434,6 +1460,7 @@ main :: proc() {
 	q_latency()
 	stalls()
 	ibit()
+	tops_wrap()
 	gif_paths()
 	gif_tte()
 	spr_interleave()

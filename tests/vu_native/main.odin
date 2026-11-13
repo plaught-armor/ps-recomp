@@ -317,6 +317,7 @@ main :: proc() {
 	}
 	dispatch_fails += test_miss_capture(progs[:], arch)
 	dispatch_fails += test_park(arch)
+	dispatch_fails += test_xtop(arch)
 	fmt.printfln("vu_native %v: %d cases x %d trials, %d failing, %d failing dispatched, MAC changed in %d, VU0 I or D set in %d, VU1 in %d", arch, cases, TRIALS, fails, dispatch_fails, flagged, status_set, vu1_set)
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
@@ -754,5 +755,42 @@ test_park :: proc(arch: native.Arch) -> (fails: int) {
 				NAMES[k], g.parked, g.stat, g.v.tpc, g.v.old_mac, w.parked, w.stat, w.v.tpc, w.v.old_mac, same_regs(&g.v, &w.v, true)))
 		}
 	}
+	return
+}
+
+// XTOP in native code reads VIF1's TOP as the interpreter does: a VIF1
+// stream whose BASE + OFFSET passes 0x3ff, then three MSCALs of a
+// registered program, leaves the wrapped TOP in vi1 each time. The failures.
+@(private = "file")
+test_xtop :: proc(arch: native.Arch) -> (fails: int) {
+	words := []u32{vu_programs.lower_sp(0x68, 0, 1, 0), vu_programs.NOP_U | vu_programs.E_BIT, vu_programs.NOP_L, vu_programs.NOP_U}
+	a := native.make_asm(arch, r5900.native_ram())
+	slow: map[string]int
+	off := u32(rvu.native_program(&a, words, nil, nil, .VU1, false, &slow))
+	code, err := core.native_load(native.make_blob(&a, nil, {}, []native.Blob_Span{{.Vu1, 0, off, []native.Blob_Range{{0, words}}}}), ps2.native_imports())
+	if err != "" || len(slow) != 0 {
+		fmt.eprintfln("FAIL vu_native XTOP: native_load %q, interpreter calls %v", err, slow)
+		return 1
+	}
+	vu.vu_register_native(1, {{0, words}}, cast(vu.Vu_Native)rawptr(code.base + uintptr(code.spans[0].off)))
+	for &b in vu.vu1.micro {b = 0}
+	copy(([^]u32)(&vu.vu1.micro[0])[:len(words)], words)
+	vu.vu1_micro_touch()
+	feed :: proc(code: ..u32) {
+		w := code
+		vu.vif_feed(&vu.vifs[1], ([^]u8)(raw_data(w))[:len(w) * 4])
+	}
+	feed(0x030001ba, 0x02000246) // BASE 0x1ba, OFFSET 0x246
+	nr := &vu.native_run[1]
+	for want, k in ([3]u16{0x1ba, 0, 0x1ba}) {
+		vu.vu1.vi[1] = 0xffff
+		nr.pc = -1
+		feed(0x14000000) // MSCAL 0
+		if nr.pc == -1 || vu.vu1.vi[1] != want {
+			fmt.eprintfln("FAIL vu_native XTOP, MSCAL %d: ran native %v, vi1 %x, want %x", k + 1, nr.pc != -1, vu.vu1.vi[1], want)
+			fails += 1
+		}
+	}
+	feed(0x03000000, 0x02000000)
 	return
 }
