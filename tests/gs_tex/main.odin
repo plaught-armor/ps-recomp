@@ -295,6 +295,22 @@ ref_sample_level :: proc(t: ^Cfg, n: u32, tu, tv: f32, bilinear: bool) -> [4]i32
 	return top + ((bot - top) * av) / 256
 }
 
+// Whether a bilinear sample's four taps, wrapped, lie in one 16 x 16 tile
+// of level n.
+@(private = "file")
+ref_one_tile :: proc(t: ^Cfg, n: u32, tu, tv: f32) -> bool {
+	UV_EPS :: 1.0 / 512
+	u, v := tu / f32(u32(1) << n) - 0.5 + UV_EPS, tv / f32(u32(1) << n) - 0.5 + UV_EPS
+	w, h := max(t.w >> n, 1), max(t.h >> n, 1)
+	minu, maxu, minv, maxv := t.minu, t.maxu, t.minv, t.maxv
+	if t.wms == 2 {minu, maxu = minu >> n, maxu >> n}
+	if t.wmt == 2 {minv, maxv = minv >> n, maxv >> n}
+	iu, iv := i32(math.floor(u)), i32(math.floor(v))
+	x0, x1 := ref_wrap(iu, t.wms, w, minu, maxu), ref_wrap(iu + 1, t.wms, w, minu, maxu)
+	y0, y1 := ref_wrap(iv, t.wmt, h, minv, maxv), ref_wrap(iv + 1, t.wmt, h, minv, maxv)
+	return x0 >> 4 == x1 >> 4 && y0 >> 4 == y1 >> 4
+}
+
 // The sampler's TEX1 filters and level choice over ref_sample_level, and
 // the highest level it read.
 @(private = "file")
@@ -344,7 +360,12 @@ rnd_coord :: proc(size: u32) -> f32 {
 // CLUTs from it too), each sampled at random levels, coordinates, wrap
 // modes and filters against ref_sample_level, and at random LODs and TEX1
 // filters against ref_sample. Each wrap mode must be sampled at a level
-// above 0 on both paths.
+// above 0 on both paths. One texture in four is sampled by a context whose
+// frame lies on level 0's first pages, so that level is read from local
+// memory, not the cache (gs.probe_bypass); its samples must equal those
+// taken through the cache. Floors: LODs above 0 under each MMIN, and
+// bilinear samples with their four taps in one decoded tile, across tiles,
+// and in a bypassed level.
 @(private = "file")
 check_sampler :: proc() {
 	R :: 0x100 // first random page; 256 pages, 1024 x 512 PSMCT32 at width 16
@@ -357,6 +378,11 @@ check_sampler :: proc() {
 	bad := 0
 	// Samples per path (level, LOD) and wrap mode reading a level above 0.
 	up: [2][4]int
+	Tap :: enum {Nearest, One_Tile, Straddle, Bypass}
+	taps: [Tap]int
+	minified: [8]int // LOD > 0, by MMIN
+	want_level, want_lod: [SAMPLES][4]i32
+	tops: [SAMPLES]u32
 	for _ in 0 ..< CONFIGS {
 		psm := psms[rndn(len(psms))]
 		tw, th := rndn(11), rndn(11)
@@ -400,12 +426,37 @@ check_sampler :: proc() {
 			mmin = u32(mmin),
 			mmag = mmag != 0,
 		}
-		for _ in 0 ..< SAMPLES {
+		// The reference's samples first, through the cache; then the
+		// sampler's, of the same random stream, after the frame moves onto
+		// the texture when the context is to bypass it.
+		stream := rng
+		for i in 0 ..< SAMPLES {
+			n := u32(rndn(u64(c.mxl) + 1))
+			u, v := rnd_coord(c.w), rnd_coord(c.h)
+			bil := rndn(4) != 0
+			want_level[i] = ref_sample_level(&c, n, u, v, bil)
+			lod := i32(rndn(9 << 23)) - (1 << 23)
+			want_lod[i], tops[i] = ref_sample(&c, u, v, lod)
+		}
+		feedback := rndn(4) == 0
+		if feedback {
+			gs.gs_write(0x4c, tbp / 32 | 1 << 16) // FRAME_1 on level 0
+			gs.probe_ctx(6)
+		}
+		after := rng
+		rng = stream
+		for i in 0 ..< SAMPLES {
 			n := u32(rndn(u64(c.mxl) + 1))
 			u, v := rnd_coord(c.w), rnd_coord(c.h)
 			bil := rndn(4) != 0
 			got := gs.probe_sample(n, u, v, bil)
-			want := ref_sample_level(&c, n, u, v, bil)
+			want := want_level[i]
+			switch {
+			case !bil: taps[.Nearest] += 1
+			case gs.probe_bypass(n): taps[.Bypass] += 1
+			case ref_one_tile(&c, n, u, v): taps[.One_Tile] += 1
+			case: taps[.Straddle] += 1
+			}
 			if got != want {
 				if bad < 8 {
 					fail("sampler psm %x %dx%d wrap %d/%d level %d (%v, %v) bilinear %v: %v, want %v",
@@ -417,8 +468,9 @@ check_sampler :: proc() {
 			// LODs from below 0 to past level 6, fraction bits and all.
 			lod := i32(rndn(9 << 23)) - (1 << 23)
 			got = gs.probe_sample_lod(u, v, lod)
-			top: u32
-			want, top = ref_sample(&c, u, v, lod)
+			want = want_lod[i]
+			top := tops[i]
+			if lod > 0 {minified[c.mmin] += 1}
 			if got != want {
 				if bad < 8 {
 					fail("sample psm %x %dx%d wrap %d/%d mmag %v mmin %d mxl %d lod %x (%v, %v): %v, want %v",
@@ -428,6 +480,15 @@ check_sampler :: proc() {
 			}
 			if top > 0 {up[1][c.wms] += 1; up[1][c.wmt] += 1}
 		}
+		rng = after
+		if feedback {gs.gs_write(0x4c, F | 1 << 16)}
+	}
+	fmt.printfln("sampler taps %v, LOD > 0 by MMIN %v", taps, minified)
+	for k, t in taps {
+		if k < 20000 {fail("sampler: %v taps %d times", t, k)}
+	}
+	for k, m in minified {
+		if k < 50000 {fail("sampler: MMIN %d with LOD > 0 %d times", m, k)}
 	}
 	if bad > 0 {fail("sampler: %d of %d samples differ", bad, 2 * CONFIGS * SAMPLES)}
 	for p, i in up {

@@ -39,6 +39,9 @@ Tex :: struct {
 	tfx:                u32,
 	cpsm, csa:          u32,
 	bilinear:           bool,
+	// LOD cannot change the sample (decode_ctx): every pixel takes level 0
+	// with MMAG's filter.
+	flat:               bool,
 	wms, wmt:           u32,
 	minu, maxu:         u32,
 	minv, maxv:         u32,
@@ -230,6 +233,11 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 			l        = u32(t1 >> 19) & 3,
 			k        = i32(u32(t1 >> 32) << 20) >> 20,
 		}
+		// MMIN 0, 1, 6 and 7 sample level 0 at any LOD, and so does a
+		// mipmap filter with MXL 0 (sample_min). When MMIN's filter there is
+		// MMAG's too, the sample is the same at every LOD.
+		level0 := c.tex.mmin < 2 || c.tex.mmin > 5 || c.tex.mxl == 0
+		c.tex.flat = level0 && (c.tex.mmin == 1 || c.tex.mmin >= 4) == c.tex.bilinear && !tex_fold_off
 		c.tex.mtbp[0], c.tex.mtbw[0] = c.tex.tbp, c.tex.tbw
 		for i in u32(1) ..= 6 {
 			m := mip[(i - 1) / 3] >> (((i - 1) % 3) * 20)
@@ -243,6 +251,10 @@ decode_ctx :: proc(prim: u64) -> (c: Ctx) #no_bounds_check {
 	c.px = px_pick(&c)
 	return
 }
+
+// No texture is flat in a context decoded from now on (probe_fold).
+@(private)
+tex_fold_off: bool
 
 // PRIM's bits decode_ctx reads: IIP, TME, FGE, ABE, FST, CTXT.
 @(private)
@@ -343,11 +355,15 @@ Tex_Map :: struct {
 	k:        i32, // K as tex_lod adds it
 }
 
+// A flat texture's LOD is 0, as under LCM with K 0: its pixels compute no
+// LOD and `sample` takes level 0 inline, with no call of sample_min.
+
 @(private)
 tex_map :: #force_inline proc(c: ^Ctx) -> (m: Tex_Map) {
 	m.sc = {1, 1, 1, 1}
 	if !c.fst {m.sc = {f32(c.tex.w), f32(c.tex.h), 1, 1}}
 	m.fst, m.lcm, m.l, m.k = c.fst, c.tex.lcm, c.tex.l, c.tex.k << 19
+	if c.tex.flat {m.lcm, m.k = true, 0}
 	return
 }
 
@@ -601,7 +617,8 @@ expand16 :: #force_inline proc(t: ^Tex, c: u32) -> u32 {
 // detail `lod`: LOD <= 0 magnifies level 0 with MMAG, otherwise MMIN picks
 // the filter and how levels 0..MXL are used. RGBA in lanes 0..3. Level 0
 // is inlined into the pixel loop, which then saves no registers per pixel;
-// the mipmap filters stay a call.
+// the mipmap filters stay a call. A flat texture's pixels come with LOD 0
+// (tex_map).
 @(private)
 sample :: #force_inline proc(t: ^Tex, u, v: f32, lod: i32) -> #simd[4]i32 {
 	if lod <= 0 {return sample_level(t, 0, u, v, t.bilinear)}

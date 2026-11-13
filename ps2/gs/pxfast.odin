@@ -155,16 +155,17 @@ px_inst :: #force_inline proc(c: ^Ctx, x: i32, zf: f64, col: [4]f32, u, v: f32, 
 		F[N].tfx, F[N].tcc, F[N].ztst, F[N].zmsk, F[N].zpsm, F[N].bl, F[N].fpsm, F[N].fbmsk, F[N].atst, F[N].afail, F[N].fge, F[N].date)
 }
 
-// Forces the generic `pixel` for every context decoded from now on
-// (tests/gs_pixel).
+// The pixel proc of every context decoded from now on, when not nil: the
+// generic `pixel`, or one that tallies (probe_generic, probe_tally).
 @(private)
-px_generic: bool
+px_force: Pixel_Proc
 
 // The pixel proc for a decoded context: a fast one when the context is one
 // of PX_FAST's, else `pixel`.
 @(private)
 px_pick :: proc(c: ^Ctx) -> Pixel_Proc {
-	if px_generic || !c.zte || c.pabe || c.fba || !c.colclamp {return pixel}
+	if px_force != nil {return px_force}
+	if !c.zte || c.pabe || c.fba || !c.colclamp {return pixel}
 	if !c.frow.ok || !c.zrow.ok {return pixel}
 	atst, afail: u32 = 1, 0
 	if c.ate && c.atst != 1 {

@@ -7,6 +7,12 @@
 // sometimes on the same pages, and spans cross page and block rows, so the
 // rows the rasteriser seeks once per span are checked against the per-pixel
 // seek too.
+//
+// Then the fold of a flat texture's LOD (gs.probe_fold): contexts of five
+// TEX1 classes, three flat and two not, drawn with the fold on and off, the
+// same memory after both. Each class counts its pixels by LOD, those the
+// fold took, and its LCM, FST, primitive kinds and texture formats, with
+// floors.
 package main
 
 import "core:fmt"
@@ -69,10 +75,68 @@ replay :: proc() {
 @(private = "file")
 before, after_fast: [1 << 20]u32
 
-// Registers of context n for PX_FAST[fi], or a random context for fi -1,
-// and one primitive kind with its vertices.
+// TEX1 classes of the fold's trials. Flat: every LOD samples level 0 with
+// MMAG's filter.
 @(private = "file")
-build :: proc(fi: int) {
+Fold_Class :: enum {
+	Flat_Level0, // MMIN 0 or 1, MMAG the same filter
+	Flat_Reserved, // MMIN 6 or 7 (bilinear at level 0), MMAG LINEAR
+	Flat_Mxl0, // MMIN 2..5 with MXL 0, MMAG the same filter
+	Filters_Differ, // level 0 at every LOD, but MMAG is the other filter
+	Levels, // MMIN 2..5 with MXL 1..6
+}
+
+// What a fold trial's context and primitive were.
+@(private = "file")
+Fold_Trial :: struct {
+	lcm, fst: bool,
+	kind:     int, // 0 point, 1 line, 2 triangle, 3 sprite
+	psm:      int, // index in TEX_PSM
+}
+@(private = "file")
+fold_trial: Fold_Trial
+
+@(private = "file")
+TEX_PSM := [?]u64{PSMCT32, PSMCT24, PSMCT16, PSMCT16S, 0x13, 0x14, 0x1b, 0x24, 0x2c}
+
+// TEX1 of a fold class: LCM and L at random, K small half the time so that
+// LODs fall on both sides of 0.
+@(private = "file")
+fold_tex1 :: proc(cls: Fold_Class) -> u64 {
+	mmin, mmag, mxl: u64
+	bil :: proc(mmin: u64) -> u64 {return u64(mmin == 1 || mmin >= 4)}
+	switch cls {
+	case .Flat_Level0:
+		mmin, mxl = rndn(2), rndn(7)
+		mmag = bil(mmin)
+	case .Flat_Reserved:
+		mmin, mxl = 6 + rndn(2), rndn(7)
+		mmag = 1
+	case .Flat_Mxl0:
+		mmin = 2 + rndn(4)
+		mmag = bil(mmin)
+	case .Filters_Differ:
+		@(static, rodata) level0 := [?]u64{0, 1, 6, 7}
+		if rndn(2) == 0 {
+			mmin, mxl = level0[rndn(4)], rndn(7)
+		} else {
+			mmin = 2 + rndn(4)
+		}
+		mmag = 1 - bil(mmin)
+	case .Levels:
+		mmin, mxl, mmag = 2 + rndn(4), 1 + rndn(6), rndn(2)
+	}
+	k := rndn(2) == 0 ? rndn(49) - 24 : rnd()
+	lcm := rndn(2)
+	fold_trial.lcm = lcm != 0
+	return lcm | mxl << 2 | mmag << 5 | mmin << 6 | rndn(4) << 19 | (k & 0xfff) << 32
+}
+
+// Registers of context n for PX_FAST[fi], or a random context for fi -1,
+// and one primitive kind with its vertices. With fold, a texture-mapped
+// context of that class, its texture of any format.
+@(private = "file")
+build :: proc(fi: int, fold: Maybe(Fold_Class) = nil) {
 	clear(&writes)
 	n := rndn(2)
 	fast := fi >= 0
@@ -125,23 +189,34 @@ build :: proc(fi: int) {
 	put(0x1a, 1) // PRMODECONT
 	put(0x0a, rndn(256) << 56) // FOG: the vertex fog an XYZ2 keeps
 
-	tme := fast ? f.tfx >= 0 : rndn(2) == 0
+	cls, folds := fold.?
+	tme := fast ? f.tfx >= 0 : folds || rndn(2) == 0
 	tw, th := 1 + rndn(8), 1 + rndn(8)
 	if tme {
 		@(static, rodata) tpsm := [?]u64{PSMCT32, PSMCT24, PSMCT16}
 		tfx := fast ? u64(f.tfx) : rndn(4)
 		tcc := fast ? f.tcc : rndn(2) == 0
-		t0 := rndn(0x4000) | (1 + rndn(8)) << 14 | tpsm[rndn(len(tpsm))] << 20 | tw << 26 | th << 30
-		put(0x06 + u8(n), t0 | u64(tcc) << 34 | tfx << 35) // TEX0
-		put(0x14 + u8(n), rnd() &~ u64(0x1c) | rndn(3) << 2) // TEX1: MXL 0..2
+		t0 := rndn(0x4000) | (1 + rndn(8)) << 14 | tw << 26 | th << 30
+		if folds {
+			// Any format, its CLUT loaded from random memory.
+			fold_trial.psm = int(rndn(len(TEX_PSM)))
+			t0 |= TEX_PSM[fold_trial.psm] << 20 | rndn(0x4000) << 37 | rndn(2) << 52 | rndn(32) << 56 | 1 << 61
+			put(0x14 + u8(n), fold_tex1(cls)) // TEX1
+		} else {
+			t0 |= tpsm[rndn(len(tpsm))] << 20
+			put(0x14 + u8(n), rnd() &~ u64(0x1c) | rndn(3) << 2) // TEX1: MXL 0..2
+		}
 		put(0x34 + u8(n), rnd()) // MIPTBP1
 		put(0x36 + u8(n), rnd()) // MIPTBP2
 		put(0x08 + u8(n), rnd() & 0xfff_ffff_ffff) // CLAMP
+		put(0x06 + u8(n), t0 | u64(tcc) << 34 | tfx << 35) // TEX0
 	}
 
 	kind := rndn(7)
 	fst := rndn(2) == 0
 	fge := fast ? f.fge : rndn(2) == 0
+	@(static, rodata) kinds := [7]int{0, 1, 1, 2, 2, 2, 3}
+	fold_trial.fst, fold_trial.kind = fst, kinds[kind]
 	prim := kind | rndn(2) << 3 | u64(tme) << 4 | u64(fge) << 5 | u64(fst) << 8 | n << 9
 	if fast ? f.bl != 0xff : rndn(2) == 0 {prim |= 1 << 6} // ABE
 	put(0x00, prim)
@@ -168,6 +243,93 @@ build :: proc(fi: int) {
 		} else {
 			put(0x05, x | y << 16 | (rnd() & 0xffffffff) << 32) // XYZ2
 		}
+	}
+}
+
+// What a fold class's trials held.
+@(private = "file")
+Fold_Count :: struct {
+	trials, fast: int,
+	lod:          [2]int, // pixels with LOD <= 0, > 0
+	folded:       int, // pixels with LOD > 0 of a flat texture
+	lcm, fst:     [2]int, // trials
+	kind:         [4]int,
+	psm:          [len(TEX_PSM)]int,
+}
+
+// Each class's contexts drawn with the fold on and off: the same local
+// memory, word for word, and a flat texture exactly in the flat classes.
+// Three trials in four take a textured PX_FAST row's context.
+@(private = "file")
+fold_trials :: proc() {
+	TRIALS :: 240 // per class
+	fs := gs.PX_FAST
+	textured: [dynamic]int
+	defer delete(textured)
+	for f, i in fs {
+		if f.tfx >= 0 {append(&textured, i)}
+	}
+	counts: [Fold_Class]Fold_Count
+	for i in 0 ..< TRIALS * len(Fold_Class) {
+		cls := Fold_Class(i % len(Fold_Class))
+		fi := i % 4 == 3 ? -1 : textured[i / 4 * 3 % len(textured)]
+		build(fi, cls)
+		before = gs.vram
+
+		gs.probe_fold(true)
+		replay()
+		after_fast = gs.vram
+		flat := gs.probe_flat()
+		if flat != (cls <= .Flat_Mxl0) {fail("fold trial %d (%v): flat %v", i, cls, flat)}
+
+		gs.vram = before
+		gs.probe_fold(false)
+		replay()
+		if gs.probe_flat() {fail("fold trial %d (%v): flat with the fold off", i, cls)}
+		if after_fast != gs.vram {
+			for v, j in after_fast {
+				if v != gs.vram[j] {
+					fail("fold trial %d (%v, PX_FAST %d): word %x folded %08x, not folded %08x", i, cls, fi, j, v, gs.vram[j])
+					break
+				}
+			}
+		}
+
+		// The LODs the pixels have with the fold off, then with it on: a
+		// folded pixel's LOD was above 0 and is not.
+		gs.vram = before
+		gs.probe_tally(true)
+		replay()
+		off := gs.probe_lods
+		gs.probe_fold(true)
+		gs.probe_tally(true)
+		replay()
+		on := gs.probe_lods
+		gs.probe_tally(false)
+		if on[0] + on[1] != off[0] + off[1] {fail("fold trial %d (%v): %v pixels folded, %v not", i, cls, on, off)}
+
+		c := &counts[cls]
+		c.trials += 1
+		c.fast += int(fi >= 0)
+		c.lod += off
+		c.folded += off[1] - on[1]
+		c.lcm[int(fold_trial.lcm)] += 1
+		c.fst[int(fold_trial.fst)] += 1
+		c.kind[fold_trial.kind] += 1
+		c.psm[fold_trial.psm] += 1
+		if failed > 8 {break}
+	}
+	for c, cls in counts {
+		fmt.printfln("fold %-14v trials %d (fast %d)  pixels LOD <= 0 %d, > 0 %d, folded %d  LCM %v FST %v kinds %v formats %v",
+			cls, c.trials, c.fast, c.lod[0], c.lod[1], c.folded, c.lcm, c.fst, c.kind, c.psm)
+		if c.trials < 200 {fail("fold %v: only %d trials", cls, c.trials)}
+		if c.lod[0] < 100_000 || c.lod[1] < 100_000 {fail("fold %v: pixels by LOD %v", cls, c.lod)}
+		// A flat class folds every pixel with LOD > 0; the others none.
+		if c.folded != (cls <= .Flat_Mxl0 ? c.lod[1] : 0) {fail("fold %v: %d of %d pixels folded", cls, c.folded, c.lod[1])}
+		for n in c.lcm {if n < 60 {fail("fold %v: LCM %v", cls, c.lcm)}}
+		for n in c.fst {if n < 60 {fail("fold %v: FST %v", cls, c.fst)}}
+		for n in c.kind {if n < 15 {fail("fold %v: kinds %v", cls, c.kind)}}
+		for n in c.psm {if n < 8 {fail("fold %v: formats %v", cls, c.psm)}}
 	}
 }
 
@@ -215,6 +377,7 @@ main :: proc() {
 		if failed > 8 {break}
 	}
 	gs.probe_generic(false)
+	fold_trials()
 
 	total := 0
 	for k in 0 ..= FAST {

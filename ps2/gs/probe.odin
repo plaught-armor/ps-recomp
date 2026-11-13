@@ -34,7 +34,43 @@ probe_texel :: proc(n, x, y: u32) -> u32 {
 // Whether contexts decoded from now on take the generic pixel proc rather
 // than a fast one (tests/gs_pixel). The next draw decodes its context again.
 probe_generic :: proc(on: bool) {
-	px_generic = on
+	px_force = on ? pixel : nil
+	ctx_key = {~u64(0), ~u64(0)}
+}
+
+// Whether contexts decoded from now on fold a flat texture's LOD to 0, as
+// they do unless switched off (tests/gs_pixel). The next draw decodes its
+// context again.
+probe_fold :: proc(on: bool) {
+	tex_fold_off = !on
+	ctx_key = {~u64(0), ~u64(0)}
+}
+
+// Whether the last context decoded has a flat texture.
+probe_flat :: proc() -> bool {
+	return ctx_cur.tme && ctx_cur.tex.flat
+}
+
+// Whether level n of the current context's texture is read from local
+// memory, not the texture cache: the context writes a page of it.
+probe_bypass :: proc(n: u32) -> bool {
+	return tc_lvl[n] == TC_BYPASS
+}
+
+// Pixel calls since probe_tally(true), by their LOD: <= 0, > 0.
+probe_lods: [2]int
+
+@(private = "file")
+px_tally :: proc(_: ^Ctx, _, _: i32, _: f64, _: [4]f32, _, _: f32, lod: i32, _: f32) {
+	probe_lods[int(lod > 0)] += 1
+}
+
+// Whether contexts decoded from now on count their pixel calls in
+// probe_lods in place of drawing them; on clears the counts. The next draw
+// decodes its context again.
+probe_tally :: proc(on: bool) {
+	px_force = on ? px_tally : nil
+	if on {probe_lods = {}}
 	ctx_key = {~u64(0), ~u64(0)}
 }
 
