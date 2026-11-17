@@ -30,7 +30,18 @@
 // both pages on one machine.
 // In test mode the files go to `file/p<N>/<name>` and the state to
 // `result?player=<N>`.
+//
+// Save a report, for a player's bug: once a run starts the button opens a
+// new GitHub issue in another tab, its body a short summary (commit,
+// browser, disc, median fps, seconds with audio dropouts, error count), and
+// downloads ps-recomp-report-<title>-<time>.json, testState() plus the
+// game's title, the commit and the machine's cores and memory, for the
+// player to attach. testState()'s history is one entry a second of the run
+// (the last REPORT_SECONDS): frames presented, the page's animation frames
+// (tick) and the frames the audio worklet played as silence for an empty
+// ring. No backend exists (the site is static), so the player files it.
 import { SCANCODE_OF_CODE } from "./keys.js";
+import { LEARN_ARGS, LEARN_OUT, learnDeliver, learnSeed } from "./learn.js";
 import { AUDIO, CONTROL, EV, NET, PAD, PRESENT } from "./layout.js";
 import { serveLink } from "./net.js";
 import { Present } from "./present.js";
@@ -463,7 +474,7 @@ function pollPads() {
 // ---- audio ----
 
 let audioContext = null;
-const audioStats = { frames: 0, rms: 0, reports: 0 };
+const audioStats = { frames: 0, rms: 0, reports: 0, silent: 0 };
 
 async function startAudio(rate) {
 	try {
@@ -473,12 +484,13 @@ async function startAudio(rate) {
 		const node = new AudioWorkletNode(audioContext, "ring", {
 			numberOfInputs: 0,
 			outputChannelCount: [2],
-			processorOptions: { audio: shared.audio, report: test },
+			processorOptions: { audio: shared.audio },
 		});
 		node.port.onmessage = ({ data }) => {
 			audioStats.frames += data.frames;
 			audioStats.rms = Math.max(audioStats.rms, data.rms);
 			audioStats.reports++;
+			audioStats.silent += data.silent;
 		};
 		node.connect(audioContext.destination);
 		await audioContext.resume();
@@ -495,7 +507,9 @@ let present = null;
 let done = null;
 let startedAt = 0; // performance.now() at start()
 let firstPresentMs = null; // from start() to the first frame seen
+let endedAt = null; // performance.now() when done was set
 let written = []; // test mode: [name, bytes] of the module's files
+let disc = null; // the running disc's name
 
 function onMessage({ data }) {
 	if (data.log !== undefined) return log(data.log);
@@ -506,6 +520,7 @@ function onMessage({ data }) {
 	}
 	if (data.audio !== undefined) return startAudio(data.audio);
 	if (data.store !== undefined) return onStore(data.store);
+	if (data.learn !== undefined) return learnCompile(data.learn);
 	if (data.fullscreen !== undefined) {
 		if (data.fullscreen && !document.fullscreenElement) $("screen").requestFullscreen?.().catch(() => {});
 		else if (!data.fullscreen && document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -515,9 +530,11 @@ function onMessage({ data }) {
 		errors.push(data.error);
 		log(`\n${data.error}\n`);
 		done = { code: -1, ...data.times };
+		endedAt = performance.now();
 		written = data.files ?? [];
 	} else if (data.done !== undefined) {
 		done = data.done;
+		endedAt = performance.now();
 		written = data.files ?? [];
 		log(`\nExited with code ${done.code}.\n`);
 	} else {
@@ -528,9 +545,75 @@ function onMessage({ data }) {
 	audioContext = null;
 }
 
+// A mid-run learned compile the play Worker asked for (web/learn.js): run
+// `play --learned psx` in a Worker of its own (an `out` run) and hand its
+// blob to the play Worker. Its log goes to the page's; the instantiate's
+// time is said, for the cost of a mid-run compile on this browser. One
+// compile Worker runs at a time: a new compile, or a new run (start),
+// ends the one before, whose blob would be dropped anyway (its generation
+// is not the one in flight).
+let learnConv = null;
+function learnStop() {
+	learnConv?.terminate();
+	learnConv = null;
+}
+function learnCompile({ records, interp, buffer, gen }) {
+	learnStop();
+	const t0 = performance.now();
+	const conv = new Worker("play-worker.js", { type: "module" });
+	learnConv = conv;
+	let over = false;
+	const finish = (blob) => {
+		if (over) return;
+		over = true;
+		conv.terminate();
+		if (learnConv === conv) learnConv = null;
+		learnDeliver(buffer, blob, log, gen);
+	};
+	conv.onmessage = ({ data }) => {
+		if (data.log !== undefined) {
+			log(data.log);
+		} else if (data.done !== undefined) {
+			const files = new Map(data.files ?? []);
+			log(`play: mid-run learned compile: exit ${data.done.code}, ${Math.round(performance.now() - t0)} ms (worker start, fetch and compile ${data.done.compileMs} ms, run ${data.done.runMs} ms)\n`);
+			finish(data.done.code === 0 ? (files.get(LEARN_OUT) ?? null) : null);
+		} else if (data.error !== undefined) {
+			log(`play: mid-run learned compile failed: ${data.error.split("\n")[0]}\n`);
+			finish(null);
+		}
+	};
+	conv.onerror = (e) => {
+		log(`play: mid-run learned compile failed: ${e.message || "worker failed to load"}\n`);
+		finish(null);
+	};
+	conv.onmessageerror = () => {
+		log("play: mid-run learned compile failed: a message from its worker could not be read\n");
+		finish(null);
+	};
+	conv.postMessage({ wasm: "play.wasm", args: LEARN_ARGS.slice(1), out: true, seed: learnSeed(records, interp) }, [records.buffer, interp.buffer]);
+}
+
+// The run's history, a second an entry while it runs: {t: seconds since
+// start, fps: frames presented, ticks: tick calls, silent: audio frames
+// played as silence}. The last REPORT_SECONDS only.
+const REPORT_SECONDS = 600;
+const history = [];
+const sample = { at: 0, frames: 0, ticks: 0, silent: 0 }; // the second so far
+
+function record(now) {
+	const frames = Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD);
+	sample.ticks++;
+	if (now - sample.at < 1000) return;
+	if (history.length === REPORT_SECONDS) history.shift();
+	history.push({ t: Math.round((now - startedAt) / 1000), fps: frames - sample.frames, ticks: sample.ticks, silent: audioStats.silent - sample.silent });
+	Object.assign(sample, { at: now, frames, ticks: 0, silent: audioStats.silent });
+}
+
 function tick() {
+	const now = performance.now();
 	if (worker && firstPresentMs === null && Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD) > 0)
-		firstPresentMs = Math.round(performance.now() - startedAt);
+		firstPresentMs = Math.round(now - startedAt);
+	if (worker && done === null) record(now);
 	if (present) {
 		try {
 			present.frame();
@@ -550,6 +633,7 @@ function start(msg) {
 		msg = { ...msg, env: { ...msg.env } };
 		msg.net = startNet(msg.env);
 	}
+	learnStop();
 	$("start").disabled = true;
 	$("log").textContent = "";
 	const canvas = $("screen");
@@ -559,6 +643,9 @@ function start(msg) {
 	worker.onmessage = onMessage;
 	worker.onerror = (e) => onMessage({ data: { error: e.message || "worker failed to load" } });
 	startedAt = performance.now();
+	Object.assign(sample, { at: startedAt, frames: 0, ticks: 0, silent: audioStats.silent });
+	disc = msg.args.find((a) => a.startsWith("/disc/"))?.slice("/disc/".length) ?? null;
+	$("report").disabled = false;
 	worker.postMessage({ ...msg, ...shared });
 	for (const b of $("stored").querySelectorAll("button")) b.disabled = true;
 }
@@ -583,10 +670,48 @@ async function testState() {
 		firstPresentMs,
 		files: written.map(([name, bytes]) => ({ name, size: bytes.length })),
 		net: netLink && { player: netPlayer, ...netLink.stats },
+		history: [...history],
 		log: $("log").textContent,
 		errors: [...errors],
 		userAgent: navigator.userAgent,
 	};
+}
+
+const ISSUES = "https://github.com/plaught-armor/ps-recomp/issues/new";
+
+// Save a report's click (the comment at the top). The issue tab opens
+// first, before any await, or the browser blocks it as a popup.
+async function saveReport() {
+	const sha = $("sha").textContent;
+	const title = document.title.slice(0, 100); // the URL stays short
+	const now = performance.now();
+	const fps = history.map((h) => h.fps).sort((a, b) => a - b);
+	const name = `ps-recomp-report-${title.replace(/[^\w.-]+/g, "_")}-${new Date().toISOString().replace(/:/g, "-")}.json`;
+	const body = [
+		`Commit: ${sha}`,
+		`Browser: ${navigator.userAgent.slice(0, 300)}`,
+		`Cores: ${navigator.hardwareConcurrency ?? "?"}`,
+		`Disc: ${(disc ?? "?").slice(0, 200)}`,
+		`Run: ${Math.round(((endedAt ?? now) - startedAt) / 1000)} s${done ? `, exited with code ${done.code}` : ""}`,
+		`Median fps: ${fps.length ? fps[fps.length >> 1] : "?"} (over ${fps.length} s)`,
+		`Seconds with audio dropouts: ${history.filter((h) => h.silent > 0).length}`,
+		`Errors: ${errors.length}`,
+		"",
+		`Attach the downloaded ${name} (drag it into this box), and say what went wrong.`,
+	].join("\n");
+	const q = new URLSearchParams({ title: `Web player: ${title} ${sha.slice(0, 7)}`, body });
+	window.open(`${ISSUES}?${q}`, "_blank", "noopener");
+	try {
+		const report = await testState();
+		Object.assign(report, { disc, title: document.title, commit: sha, cores: navigator.hardwareConcurrency ?? null, deviceMemory: navigator.deviceMemory ?? null });
+		const a = document.createElement("a");
+		a.href = URL.createObjectURL(new Blob([JSON.stringify(report, null, 1)], { type: "application/json" }));
+		a.download = name;
+		a.click();
+		setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+	} catch (e) {
+		log(`Save a report: ${e.message}\n`);
+	}
 }
 
 async function main() {
@@ -617,6 +742,7 @@ async function main() {
 		if (canStore) navigator.storage.persist?.().catch(() => {});
 		start({ wasm: "play.wasm", args: [`/disc/${img.name}`], files, store: canStore ? img.name : undefined });
 	});
+	$("report").addEventListener("click", saveReport);
 	requestAnimationFrame(tick);
 	showStored();
 	if (!test) return;

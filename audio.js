@@ -2,21 +2,23 @@
 // AUDIO). The page makes the AudioContext at the ring's rate, so frames go
 // out one for one. An empty ring or a paused device plays silence.
 //
-// processorOptions: {audio: the SharedArrayBuffer, report: true to post
-// {frames, rms} to the port about once a second (the gate's check)}.
+// processorOptions: {audio: the SharedArrayBuffer}. About once a second it
+// posts {frames, rms, silent} to the port: the frames taken from the ring,
+// their RMS, and the frames it played as silence while the device was not
+// paused, an empty ring (an underrun: the stutter a report counts).
 import { AUDIO } from "./layout.js";
 
 const N = AUDIO.RING_FRAMES;
 
 class Ring extends AudioWorkletProcessor {
-	constructor({ processorOptions: { audio, report } }) {
+	constructor({ processorOptions: { audio } }) {
 		super();
 		this.words = new Int32Array(audio, 0, AUDIO.RING / 4);
 		this.ring = new Int16Array(audio, AUDIO.RING, N * 2);
-		this.report = report === true;
 		this.frames = 0; // frames taken from the ring since the last report
 		this.squares = 0; // their sum of squared samples
 		this.elapsed = 0; // frames played since the last report
+		this.silent = 0; // frames played as silence while not paused
 	}
 
 	process(_inputs, [out]) {
@@ -24,7 +26,8 @@ class Ring extends AudioWorkletProcessor {
 		const want = left.length;
 		const A = this.words;
 		let n = 0;
-		if (Atomics.load(A, AUDIO.PAUSED_WORD) === 0) {
+		const paused = Atomics.load(A, AUDIO.PAUSED_WORD) !== 0;
+		if (!paused) {
 			const r = Atomics.load(A, AUDIO.READ_WORD), w = Atomics.load(A, AUDIO.WRITE_WORD);
 			n = Math.max(0, Math.min(want, (w - r) | 0));
 			for (let i = 0; i < n; i++) {
@@ -38,7 +41,8 @@ class Ring extends AudioWorkletProcessor {
 		}
 		left.fill(0, n);
 		if (right !== left) right.fill(0, n);
-		if (this.report) this.measure(left, right, n, want);
+		if (!paused) this.silent += want - n;
+		this.measure(left, right, n, want);
 		return true;
 	}
 
@@ -47,8 +51,8 @@ class Ring extends AudioWorkletProcessor {
 		this.frames += n;
 		this.elapsed += want;
 		if (this.elapsed < sampleRate) return;
-		this.port.postMessage({ frames: this.frames, rms: this.frames ? Math.sqrt(this.squares / (2 * this.frames)) : 0 });
-		this.frames = this.squares = this.elapsed = 0;
+		this.port.postMessage({ frames: this.frames, rms: this.frames ? Math.sqrt(this.squares / (2 * this.frames)) : 0, silent: this.silent });
+		this.frames = this.squares = this.elapsed = this.silent = 0;
 	}
 }
 
