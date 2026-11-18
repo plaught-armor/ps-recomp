@@ -2160,8 +2160,8 @@ all_ff :: proc(b: []u8) -> bool {
 	return true
 }
 
-// padman's commands 0x09..0x0d on a pad area in EE RAM, and the mode a mask
-// sets against the wire pad's 0x4f.
+// padman's commands on a pad area in EE RAM, including its button capability
+// bytes, and the mode a mask sets against the wire pad's 0x4f.
 test_padman :: proc() {
 	fresh()
 	iop.pad_init()
@@ -2198,6 +2198,7 @@ test_padman :: proc() {
 	d := mem.ram_slice(AREA, 256)
 	length :: proc(d: []u8) -> u32 {return endian.unchecked_get_u32le(d[0x60:])}
 	check(d[1] == iop.DS2_ANALOG && length(d) == 8 && d[8 + 6] == 0 && d[0x65] == iop.DS2_ANALOG && d[0x69] == 1, "padman: open, analog, length 8, no pressures")
+	check(endian.unchecked_get_u32le(d[0x79:]) == iop.DS2_RESPONSE_DUALSHOCK2, "padman: the pad area advertises every DualShock 2 button")
 	cmd(buf[:], 0x09, 0, 0)
 	check(w[3] == iop.DS2_RESPONSE_DUALSHOCK2, "padman 0x09: an open DualShock 2, 0x3ffff")
 	cmd(buf[:], 0x0a, 0, 0, 0xfff)
@@ -2210,6 +2211,7 @@ test_padman :: proc() {
 	cmd(buf[:], 0x0a, 0, 0, 1)
 	iop.pad_update()
 	check(w[4] == 1 && d[1] == iop.DS2_DIGITAL && length(d) == 4 && d[4] == 0 && d[0x69] == 0, "padman 0x0a: a partial mask, digital, no sticks")
+	check(endian.unchecked_get_u32le(d[0x79:]) == iop.DS2_RESPONSE_DUALSHOCK2, "padman: digital mode keeps the full button capability")
 	cmd(buf[:], 0x01, 0, 0, 0, AREA)
 	check(d[1] == iop.DS2_ANALOG && length(d) == 8, "padman: open sets the analog mask again")
 	cmd(buf[:], 0x0b, 0, 0, 0x02020202, 0x02020202, 0x02020202)
@@ -2229,6 +2231,8 @@ test_padman :: proc() {
 	check(w[3] == 4, "padman 0x0d: 4 slots once the tap is open")
 	cmd(buf[:], 0x0d, 1)
 	check(w[3] == 1, "padman 0x0d: port 1, 1 slot")
+	cmd(buf[:], 0x14, 2)
+	check(w[2] == 1, "padman 0x14: SetWarningLevel, 1")
 	iop.pads[1].connected = false
 	for &b in buf {b = 0}
 	mw[0] = 2

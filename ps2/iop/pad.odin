@@ -76,6 +76,11 @@ PAD_STATE_STABLE :: 6
 @(private = "file") PD_STATE :: 0x70 // u8
 @(private = "file") PD_REQ_STATE :: 0x71 // u8, 2 = busy
 @(private = "file") PD_OK :: 0x72 // u8, 1 once mode info is valid
+// u8[4]: the poll bytes the pad can send (its 0x41 answer), which libpad's
+// scePadGetButtonMask reads here rather than over the RPC, and
+// scePadInfoPressMode tests for the DualShock 2 set before a game enters
+// pressure mode (seen in SLPM-65405's libpad).
+@(private = "file") PD_BUTTON_MASK :: 0x79
 
 // Pressure bytes 8..19 in order: right, left, up, down, triangle, circle,
 // cross, square, L1, R1, L2, R2.
@@ -205,6 +210,10 @@ pad_fill :: proc(p: []u8, frame: u32, player: int, mask: u32) {
 	p[PD_STATE] = PAD_STATE_STABLE
 	p[PD_REQ_STATE] = 0
 	p[PD_OK] = 1
+	// What the pad can send, not the current mask: a DualShock 2 answers
+	// the full set in any mode.
+	cap := u32(DS2_RESPONSE_DUALSHOCK2)
+	for k in 0 ..< 4 {p[PD_BUTTON_MASK + k] = u8(cap >> (8 * uint(k)))}
 }
 
 // padman: the command is the first word of the request; the result word
@@ -272,6 +281,9 @@ padman :: proc(sid: u32, buf: []u8) -> bool {
 	case 0x0d: // GetSlotMax {cmd, port}: the multitap's 4 once libmtap opened it
 		w[3] = 4 if w[1] == 0 && tap_present() && mtap.open[2] else 1
 	case 0x12: w[3] = 0x400 // GetModuleVersion
+	// SetWarningLevel {cmd, level}: how much padman prints on the IOP's
+	// console, which this HLE padman never prints; done, result word 2.
+	case 0x14: w[2] = 1
 	case:
 		// The command word is padman's function: the row's function number.
 		if !core.compat_unknown(.Sif_Rpc, sid, sub = cmd) {fmt.eprintfln("pad: unhandled command %08x", cmd)}
