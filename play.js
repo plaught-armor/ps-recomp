@@ -32,13 +32,15 @@
 // `result?player=<N>`.
 //
 // Save a report, for a player's bug: once a run starts the button opens a
-// new GitHub issue in another tab, its body a short summary (commit,
-// browser, disc, median fps, seconds with audio dropouts, error count), a
+// new GitHub issue in another tab, its body a short summary (commit, cores
+// rounded as coresBucket does, the disc's title: its serial, never the
+// file's name, median fps, seconds with audio dropouts, error count), a
 // place for what went wrong, and the report itself (issueReport: fps and
 // silent audio a second, errors, the log's tail cut to fit the URL); and it
-// downloads ps-recomp-report-<title>-<time>.json, testState() plus the
-// game's title, the commit and the machine's cores and memory, kept in case
-// more is asked for. testState()'s history is one entry a second of the run
+// downloads ps-recomp-report-<title>-<date>.json, testState() without the
+// browser's user agent or the player's file names, plus the game's title,
+// the commit and the machine's rounded cores and memory, kept in case more
+// is asked for. testState()'s history is one entry a second of the run
 // (the last REPORT_SECONDS): frames presented, the page's animation frames
 // (tick) and the frames the audio worklet played as silence for an empty
 // ring. No backend exists (the site is static), so the player files it.
@@ -511,7 +513,6 @@ let startedAt = 0; // performance.now() at start()
 let firstPresentMs = null; // from start() to the first frame seen
 let endedAt = null; // performance.now() when done was set
 let written = []; // test mode: [name, bytes] of the module's files
-let disc = null; // the running disc's name
 
 function onMessage({ data }) {
 	if (data.log !== undefined) return log(data.log);
@@ -646,7 +647,6 @@ function start(msg) {
 	worker.onerror = (e) => onMessage({ data: { error: e.message || "worker failed to load" } });
 	startedAt = performance.now();
 	Object.assign(sample, { at: startedAt, frames: 0, ticks: 0, silent: audioStats.silent });
-	disc = msg.args.find((a) => a.startsWith("/disc/"))?.slice("/disc/".length) ?? null;
 	$("report").disabled = false;
 	worker.postMessage({ ...msg, ...shared });
 	for (const b of $("stored").querySelectorAll("button")) b.disabled = true;
@@ -708,7 +708,7 @@ function issueReport(fit) {
 			"",
 			`Isolated: ${crossOriginIsolated}, memory: ${navigator.deviceMemory ?? "?"} GiB, first frame: ${firstPresentMs ?? "?"} ms, frames: ${Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD)}`,
 			`Audio: ${audioContext?.state ?? "none"}, ${audioStats.silent} silent frames`,
-			`Disc read: ${storeInfo ? JSON.stringify(storeInfo).slice(0, 200) : "?"}`,
+			`Disc read: ${storeInfo ? JSON.stringify({ ...storeInfo, name: undefined }).slice(0, 200) : "?"}`,
 			`Exit: ${done ? JSON.stringify(done).slice(0, 200) : "running"}`,
 			"",
 			`Fps a second, fps x seconds (from t ${kept[0]?.t ?? 0} s): ${kept.map((r) => (r.n > 1 ? `${r.fps}x${r.n}` : r.fps)).join(" ")}`,
@@ -742,17 +742,23 @@ function issueReport(fit) {
 
 // Save a report's click (the comment at the top). The issue tab opens
 // first, before any await, or the browser blocks it as a popup.
+// The host's cores rounded down to 1, 2, 4, 8 or 16, as game data's host row
+// (core/gamedata.odin): the count, never the exact machine.
+function coresBucket() {
+	const n = navigator.hardwareConcurrency ?? 0;
+	return [16, 8, 4, 2, 1].find((c) => n >= c) ?? null;
+}
+
 async function saveReport() {
 	const sha = $("sha").textContent;
 	const title = document.title.slice(0, 100); // the URL stays short
 	const now = performance.now();
 	const fps = history.map((h) => h.fps).sort((a, b) => a - b);
-	const name = `ps-recomp-report-${title.replace(/[^\w.-]+/g, "_")}-${new Date().toISOString().replace(/:/g, "-")}.json`;
+	const name = `ps-recomp-report-${title.replace(/[^\w.-]+/g, "_")}-${new Date().toISOString().slice(0, 10)}.json`;
 	const summary = [
 		`Commit: ${sha}`,
-		`Browser: ${navigator.userAgent.slice(0, 300)}`,
-		`Cores: ${navigator.hardwareConcurrency ?? "?"}`,
-		`Disc: ${(disc ?? "?").slice(0, 200)}`,
+		`Cores: ${coresBucket() ?? "?"}`,
+		`Disc: ${title || "?"}`,
 		`Run: ${Math.round(((endedAt ?? now) - startedAt) / 1000)} s${done ? `, exited with code ${done.code}` : ""}`,
 		`Median fps: ${fps.length ? fps[fps.length >> 1] : "?"} (over ${fps.length} s)`,
 		`Seconds with audio dropouts: ${history.filter((h) => h.silent > 0).length}`,
@@ -769,7 +775,12 @@ async function saveReport() {
 	window.open(url(body), "_blank", "noopener");
 	try {
 		const report = await testState();
-		Object.assign(report, { disc, title: document.title, commit: sha, cores: navigator.hardwareConcurrency ?? null, deviceMemory: navigator.deviceMemory ?? null });
+		// Nothing that names the player's files or browser: the file may be
+		// attached to the public issue.
+		delete report.userAgent;
+		delete report.files;
+		if (report.store) report.store = { ...report.store, name: undefined };
+		Object.assign(report, { title: document.title, commit: sha, cores: coresBucket(), deviceMemory: navigator.deviceMemory ?? null });
 		const a = document.createElement("a");
 		a.href = URL.createObjectURL(new Blob([JSON.stringify(report, null, 1)], { type: "application/json" }));
 		a.download = name;
