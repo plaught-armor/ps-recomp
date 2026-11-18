@@ -83,7 +83,7 @@ export class NetImports {
 			// fails or is not up within NET.OPEN_MS.
 			open: (bind, bindLen, peer, peerLen) => {
 				const config = utf8.encode(
-					`${text.decode(this.mem(bind, bindLen))}\n${text.decode(this.mem(peer, peerLen))}`);
+					`${text.decode(this.mem(bind, bindLen).slice())}\n${text.decode(this.mem(peer, peerLen).slice())}`);
 				if (config.length > NET.CONFIG_MAX) return -1;
 				this.config.fill(0);
 				this.config.set(config);

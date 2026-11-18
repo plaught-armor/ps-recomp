@@ -33,10 +33,12 @@
 //
 // Save a report, for a player's bug: once a run starts the button opens a
 // new GitHub issue in another tab, its body a short summary (commit,
-// browser, disc, median fps, seconds with audio dropouts, error count), and
+// browser, disc, median fps, seconds with audio dropouts, error count), a
+// place for what went wrong, and the report itself (issueReport: fps and
+// silent audio a second, errors, the log's tail cut to fit the URL); and it
 // downloads ps-recomp-report-<title>-<time>.json, testState() plus the
-// game's title, the commit and the machine's cores and memory, for the
-// player to attach. testState()'s history is one entry a second of the run
+// game's title, the commit and the machine's cores and memory, kept in case
+// more is asked for. testState()'s history is one entry a second of the run
 // (the last REPORT_SECONDS): frames presented, the page's animation frames
 // (tick) and the frames the audio worklet played as silence for an empty
 // ring. No backend exists (the site is static), so the player files it.
@@ -678,6 +680,65 @@ async function testState() {
 }
 
 const ISSUES = "https://github.com/plaught-armor/ps-recomp/issues/new";
+// The longest new-issue URL sent: GitHub refuses or cuts longer ones (about
+// 8 KiB), so the log's tail in the report is cut to fit.
+const ISSUE_URL_MAX = 7500;
+const REPORT_ERRORS = 10; // errors put in the issue, the first ones
+const REPORT_ERROR_CHARS = 160;
+
+// The issue's report section: the run's state as text, cut to what `fit`
+// accepts, in this order: the fps seconds (newest kept), then errors (first
+// kept), then the log's tail. Built without an await, as the issue tab must
+// open within the click.
+function issueReport(fit) {
+	const lines = $("log").textContent.replace(/```/g, "'''").split("\n");
+	// Fps a second, run-length: "60x120" is 120 seconds at 60.
+	const runs = [];
+	for (const h of history) {
+		const last = runs[runs.length - 1];
+		if (last && last.fps === h.fps) last.n++;
+		else runs.push({ t: h.t, fps: h.fps, n: 1 });
+	}
+	const at = (nRuns, nErr, nLog) => {
+		const kept = runs.slice(runs.length - nRuns);
+		const from = kept[0]?.t ?? Infinity;
+		const silent = history.filter((h) => h.silent > 0 && h.t >= from).map((h) => `${h.t}:${h.silent}`);
+		return [
+			"<details><summary>Report</summary>",
+			"",
+			`Isolated: ${crossOriginIsolated}, memory: ${navigator.deviceMemory ?? "?"} GiB, first frame: ${firstPresentMs ?? "?"} ms, frames: ${Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD)}`,
+			`Audio: ${audioContext?.state ?? "none"}, ${audioStats.silent} silent frames`,
+			`Disc read: ${storeInfo ? JSON.stringify(storeInfo).slice(0, 200) : "?"}`,
+			`Exit: ${done ? JSON.stringify(done).slice(0, 200) : "running"}`,
+			"",
+			`Fps a second, fps x seconds (from t ${kept[0]?.t ?? 0} s): ${kept.map((r) => (r.n > 1 ? `${r.fps}x${r.n}` : r.fps)).join(" ")}`,
+			`Silent audio over those seconds (second:frames): ${silent.join(" ") || "none"}`,
+			"",
+			`Errors (${errors.length}):`,
+			...errors.slice(0, nErr).map((e) => `- ${e.slice(0, REPORT_ERROR_CHARS)}`),
+			"",
+			"Log, last lines:",
+			"```",
+			...lines.slice(lines.length - nLog),
+			"```",
+			"</details>",
+		].join("\n");
+	};
+	// The largest n in [0, hi] with ok(n), by halving; ok is monotone.
+	const most = (hi, ok) => {
+		let lo = 0;
+		for (let i = 0; i < 32 && lo < hi; i++) {
+			const mid = (lo + hi + 1) >> 1;
+			if (ok(mid)) lo = mid;
+			else hi = mid - 1;
+		}
+		return lo;
+	};
+	const nRuns = most(runs.length, (n) => fit(at(n, 0, 0)));
+	const nErr = most(Math.min(errors.length, REPORT_ERRORS), (n) => fit(at(nRuns, n, 0)));
+	const nLog = most(lines.length, (n) => fit(at(nRuns, nErr, n)));
+	return at(nRuns, nErr, nLog);
+}
 
 // Save a report's click (the comment at the top). The issue tab opens
 // first, before any await, or the browser blocks it as a popup.
@@ -687,7 +748,7 @@ async function saveReport() {
 	const now = performance.now();
 	const fps = history.map((h) => h.fps).sort((a, b) => a - b);
 	const name = `ps-recomp-report-${title.replace(/[^\w.-]+/g, "_")}-${new Date().toISOString().replace(/:/g, "-")}.json`;
-	const body = [
+	const summary = [
 		`Commit: ${sha}`,
 		`Browser: ${navigator.userAgent.slice(0, 300)}`,
 		`Cores: ${navigator.hardwareConcurrency ?? "?"}`,
@@ -697,10 +758,15 @@ async function saveReport() {
 		`Seconds with audio dropouts: ${history.filter((h) => h.silent > 0).length}`,
 		`Errors: ${errors.length}`,
 		"",
-		`Attach the downloaded ${name} (drag it into this box), and say what went wrong.`,
+		"**What went wrong** (what you saw, and where in the game):",
+		"",
+		"",
+		"",
 	].join("\n");
-	const q = new URLSearchParams({ title: `Web player: ${title} ${sha.slice(0, 7)}`, body });
-	window.open(`${ISSUES}?${q}`, "_blank", "noopener");
+	const note = `\n\nThe full report was saved as ${name}; attach it only if asked.`;
+	const url = (body) => `${ISSUES}?${new URLSearchParams({ title: `Web player: ${title} ${sha.slice(0, 7)}`, body })}`;
+	const body = summary + issueReport((r) => url(summary + r + note).length <= ISSUE_URL_MAX) + note;
+	window.open(url(body), "_blank", "noopener");
 	try {
 		const report = await testState();
 		Object.assign(report, { disc, title: document.title, commit: sha, cores: navigator.hardwareConcurrency ?? null, deviceMemory: navigator.deviceMemory ?? null });

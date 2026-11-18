@@ -1,12 +1,13 @@
 // The play Worker: runs play.wasm (or, for the gate, another module with the
 // same imports) on web/wasi.js and web/sdl.js. It never yields while the
 // module runs; the page reaches it only through the SharedArrayBuffers.
+import { Bands, NO_BAND } from "./band.js";
 import { buildId, NetImports, NO_NET } from "./net.js";
 import { LearnImports, NO_LEARN, NO_SDL } from "./learn.js";
 import { dataLoad, dataSave, discOf, openStored, store } from "./readers.js";
 import { Native } from "./native.js";
 import { Sdl } from "./sdl.js";
-import { Wasi } from "./wasi.js";
+import { memoryImport, Wasi } from "./wasi.js";
 
 addEventListener("securitypolicyviolation", (e) =>
 	postMessage({ csp: `csp (worker): ${e.effectiveDirective} blocked ${e.blockedURI || "inline"}` }));
@@ -76,6 +77,15 @@ async function discFor({ files, urls, store: name, stored }) {
 // (web/learn.js) goes to the page as {learn: {records, interp, buffer,
 // gen}}: the LEARN buffer, made at the first, and the compile's generation.
 //
+// The software GS's band workers (PS_BANDS, ps2/gs/band_wasm.odin) run on
+// a pool of Workers (web/band.js) made before the run: as many as
+// PS_BANDS says, or by default one fewer than the CPUs, at most 8. A page
+// that is not cross-origin isolated cannot share memory with them, and
+// draws on this Worker.
+//
+// The run's game data (core/gamedata.odin) counts the CPUs (PS_CORES),
+// which it writes only rounded down to 1, 2, 4, 8 or 16.
+//
 // out: a tool run, as a mid-run learned compile's (web/learn.js): no disc,
 // no store and no window; /data holds only seed (path -> bytes), and done
 // carries what the module wrote there as files.
@@ -110,6 +120,28 @@ onmessage = async ({ data }) => {
 		if (!response.ok) throw new Error(`${wasm}: ${response.status}`);
 		const bytes = await response.arrayBuffer();
 		const module = await WebAssembly.compile(bytes);
+		// play.wasm imports its memory, shared with the band Workers.
+		const limits = memoryImport(bytes);
+		const memory = limits && new WebAssembly.Memory(limits);
+		if (!out && env.PS_BANDS === undefined) {
+			env.PS_BANDS = self.crossOriginIsolated ? String(Math.max(1, Math.min(navigator.hardwareConcurrency - 1, 8))) : "1";
+		}
+		if (!out && env.PS_CORES === undefined && navigator.hardwareConcurrency) {
+			env.PS_CORES = String(navigator.hardwareConcurrency);
+		}
+		const nBands = out ? 1 : Number(env.PS_BANDS);
+		const bands = memory && nBands > 1 && self.crossOriginIsolated
+			? await Bands.make(module, memory, nBands, (id, data) => new Promise((resolve, reject) => {
+					const w = new Worker(new URL("band-worker.js", import.meta.url), { type: "module" });
+					w.onmessage = ({ data: m }) => {
+						if (m.ready) resolve();
+						else if (m.error !== undefined) reject(new Error(`band worker ${id}: ${m.error}`));
+						else if (m.log !== undefined) postMessage({ log: m.log });
+					};
+					w.onerror = (e) => reject(new Error(`band worker ${id}: ${e.message}`));
+					w.postMessage(data);
+				}))
+			: null;
 		const net = netBuffer ? new NetImports(netBuffer, await buildId(bytes)) : null;
 		const learn = out
 			? null
@@ -143,10 +175,12 @@ onmessage = async ({ data }) => {
 		const native = new Native({ log: (text) => postMessage({ log: text }) });
 		const instance = await WebAssembly.instantiate(module, {
 			...wasi.imports,
+			...(memory && { env: { memory } }),
 			"system:SDL2": sdl?.imports ?? NO_SDL,
 			"system:ps_native": native.imports,
 			"system:ps_net": net?.imports ?? NO_NET,
 			"system:ps_learn": learn?.imports ?? NO_LEARN,
+			"system:ps_band": bands?.imports ?? NO_BAND,
 		});
 		sdl?.attach(instance);
 		native.attach(instance);

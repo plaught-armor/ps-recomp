@@ -116,7 +116,7 @@ export class Sdl {
 		const m = this.u8();
 		let end = ptr;
 		while (m[end] !== 0) end++;
-		return text.decode(m.subarray(ptr, end));
+		return text.decode(m.slice(ptr, end));
 	}
 
 	// The C string for s, in the SDL page; the same pointer each time.
