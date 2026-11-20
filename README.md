@@ -204,6 +204,7 @@ PS_GPU=sw ./play-bin path/to/game.cue
 | `PS_SW` | PS2 only. `1` draws in software. Otherwise PS2 games draw with Vulkan, except in the wasm build, which always draws in software. |
 | `PS_BANDS` | PS2 only, software drawing. The number of threads that draw, each a band of rows (1 to 16). The default, 1, draws on the emulator's own thread. The play page's default is one fewer than the CPUs, at most 8, each a Worker. |
 | `PS_SCALE` | PS2 only. The window size, as a multiple of the console's resolution. 1 to 8. The default is 3. |
+| `PS_UPSCALER` | PS2 Vulkan only. `fsr1` uses AMD FidelityFX Super Resolution 1 EASU and RCAS when the window is larger than the internal picture. Otherwise output uses linear scaling. |
 | `PS_IRX` | PS2 only. By default, a game's own sound and input/output modules run on an emulated copy of the console's I/O processor. `0` turns that off: each module is answered as loaded, without running it. |
 | `PS_NATIVE` | `0` runs the game through the interpreter instead of as native code. Slower; for checking a bug. |
 | `PS_LEARN` | By default, the code a game loads as it runs and the converter never saw (a PS1 game's interpreted code, such as its overlays; a PS2 game's I/O processor modules and interpreted EE code) is recorded in the disc's folder as it runs, and later runs use native code compiled from it. `1` records the code every processor interprets. `0` records nothing and uses no learned code. |

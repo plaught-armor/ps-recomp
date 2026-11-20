@@ -1,0 +1,90 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_GOOGLE_include_directive : require
+
+// FidelityFX Super Resolution 1.0 presentation pass. The bundled AMD headers
+// and their license are kept beside this shader.
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+	uint w[];
+};
+
+layout(push_constant) uniform PC {
+	Words input_data;
+	Words output_data;
+	uvec2 input_size;
+	uvec2 output_size;
+	uint pass;
+	float sharpness;
+} pc;
+
+vec4 load_color(ivec2 p) {
+	p = clamp(p, ivec2(0), ivec2(pc.input_size) - 1);
+	uint c = pc.input_data.w[uint(p.y) * pc.input_size.x + uint(p.x)];
+	return vec4(
+		float(c & 0xffu),
+		float((c >> 8u) & 0xffu),
+		float((c >> 16u) & 0xffu),
+		float(c >> 24u)
+	) / 255.0;
+}
+
+vec4 gather_channel(vec2 p, int channel) {
+	ivec2 i = ivec2(floor(p * vec2(pc.input_size) - 0.5));
+	return vec4(
+		load_color(i + ivec2(0, 1))[channel],
+		load_color(i + ivec2(1, 1))[channel],
+		load_color(i + ivec2(1, 0))[channel],
+		load_color(i)[channel]
+	);
+}
+
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return gather_channel(p, 0); }
+AF4 FsrEasuGF(AF2 p) { return gather_channel(p, 1); }
+AF4 FsrEasuBF(AF2 p) { return gather_channel(p, 2); }
+
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return load_color(ivec2(p)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+
+#include "ffx_fsr1.h"
+
+uint pack_color(vec3 c) {
+	uvec3 q = uvec3(round(clamp(c, 0.0, 1.0) * 255.0));
+	return q.r | (q.g << 8u) | (q.b << 16u) | 0xff000000u;
+}
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+	uvec2 p = gl_GlobalInvocationID.xy;
+	if (any(greaterThanEqual(p, pc.output_size))) return;
+
+	AF3 color;
+	if (pc.pass == 0u) {
+		AU4 con0, con1, con2, con3;
+		FsrEasuCon(
+			con0,
+			con1,
+			con2,
+			con3,
+			AF1(pc.input_size.x),
+			AF1(pc.input_size.y),
+			AF1(pc.input_size.x),
+			AF1(pc.input_size.y),
+			AF1(pc.output_size.x),
+			AF1(pc.output_size.y)
+		);
+		FsrEasuF(color, p, con0, con1, con2, con3);
+	} else {
+		AU4 con;
+		FsrRcasCon(con, AF1(pc.sharpness));
+		FsrRcasF(color.r, color.g, color.b, p, con);
+	}
+	pc.output_data.w[p.y * pc.output_size.x + p.x] = pack_color(color);
+}

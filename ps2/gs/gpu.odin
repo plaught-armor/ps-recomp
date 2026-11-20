@@ -102,6 +102,13 @@ Scan_PC :: struct {
 	vram, outp:                         vk.DeviceAddress,
 	psm, fbp, fbw, dbx, dby, w, h, scale: u32,
 }
+@(private)
+Fsr_PC :: struct {
+	input_data, output_data: vk.DeviceAddress,
+	input_size, output_size: [2]u32,
+	pass:                    u32,
+	sharpness:               f32,
+}
 
 @(private)
 Slot :: struct {
@@ -109,6 +116,7 @@ Slot :: struct {
 	fence:                         vk.Fence,
 	acquire:                       vk.Semaphore,
 	verts, states, cluts, up, scan: core.Vk_Buf,
+	fsr_a, fsr_b:                  core.Vk_Buf,
 	nverts, nstates, ncluts, nup:  int,
 	scan_w, scan_h:                int,
 }
@@ -138,7 +146,8 @@ hw: struct {
 	draw_layout:         vk.PipelineLayout,
 	comp_layout:         vk.PipelineLayout,
 	prim, upload, copy:  vk.Pipeline,
-	scan, clut, decode:  vk.Pipeline,
+	scan, clut, decode, fsr: vk.Pipeline,
+	fsr_on:              bool,
 	clut_cur:            core.Vk_Buf, // the CLUT as the last load left it
 	out_img:             vk.Image,
 	out_mem:             vk.DeviceMemory,
@@ -243,11 +252,14 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
 	hw.scan = core.vk_compute_pipeline(#load("shaders/scanout.comp.spv"), hw.comp_layout)
 	hw.clut = core.vk_compute_pipeline(#load("shaders/clut.comp.spv"), hw.comp_layout)
 	hw.decode = core.vk_compute_pipeline(#load("shaders/decode.comp.spv"), hw.comp_layout)
+	hw.fsr = core.vk_compute_pipeline(#load("shaders/fsr.comp.spv"), hw.comp_layout)
+	hw.fsr_on = core.env("UPSCALER") == "fsr1"
 
 	hw_begin_slot()
 	vk.CmdFillBuffer(hw.slots[0].cmd, hw.vram.buf, 0, vk.DeviceSize(vk.WHOLE_SIZE), 0)
 	vk.CmdFillBuffer(hw.slots[0].cmd, hw.clut_cur.buf, 0, vk.DeviceSize(vk.WHOLE_SIZE), 0)
 	fmt.eprintfln("gs: GPU renderer, scale %d", scale)
+	if hw.fsr_on {fmt.eprintln("gs: FSR 1 EASU + RCAS output scaling")}
 	return true
 }
 
@@ -1083,19 +1095,60 @@ image_barrier :: proc(cmd: vk.CommandBuffer, img: vk.Image, from, to: vk.ImageLa
 	vk.CmdPipelineBarrier(cmd, {.ALL_COMMANDS}, {.ALL_COMMANDS}, {}, 0, nil, 0, nil, 1, &b)
 }
 
+@(private)
+hw_buf_free :: proc(b: ^core.Vk_Buf) {
+	vk.DestroyBuffer(core.vkc.device, b.buf, nil)
+	vk.FreeMemory(core.vkc.device, b.mem, nil)
+	b^ = {}
+}
+
+@(private)
+hw_fsr_buffers :: proc(s: ^Slot, size: int) {
+	if s.fsr_a.size >= size {return}
+	if s.fsr_a.buf != 0 {
+		vk.DeviceWaitIdle(core.vkc.device)
+		hw_buf_free(&s.fsr_a)
+		hw_buf_free(&s.fsr_b)
+	}
+	s.fsr_a = core.vk_buf_create(size, {.STORAGE_BUFFER}, {.DEVICE_LOCAL})
+	s.fsr_b = core.vk_buf_create(size, {.STORAGE_BUFFER, .TRANSFER_SRC}, {.DEVICE_LOCAL})
+}
+
+@(private)
+hw_fsr_record :: proc(s: ^Slot, dst: vk.Image, ox, oy, dw, dh: i32) {
+	cmd := s.cmd
+	size := int(dw * dh * 4)
+	hw_fsr_buffers(s, size)
+	pc := Fsr_PC {
+		input_data = s.scan.addr,
+		output_data = s.fsr_a.addr,
+		input_size = {u32(s.scan_w), u32(s.scan_h)},
+		output_size = {u32(dw), u32(dh)},
+		pass = 0,
+		sharpness = 0.2,
+	}
+	vk.CmdBindPipeline(cmd, .COMPUTE, hw.fsr)
+	vk.CmdPushConstants(cmd, hw.comp_layout, {.COMPUTE}, 0, size_of(pc), &pc)
+	vk.CmdDispatch(cmd, (u32(dw) + 7) / 8, (u32(dh) + 7) / 8, 1)
+	core.vk_barrier(cmd)
+	pc.input_data, pc.output_data = s.fsr_a.addr, s.fsr_b.addr
+	pc.input_size, pc.pass = pc.output_size, 1
+	vk.CmdPushConstants(cmd, hw.comp_layout, {.COMPUTE}, 0, size_of(pc), &pc)
+	vk.CmdDispatch(cmd, (u32(dw) + 7) / 8, (u32(dh) + 7) / 8, 1)
+	core.vk_barrier(cmd)
+	region := vk.BufferImageCopy {
+		imageSubresource = {aspectMask = {.COLOR}, layerCount = 1},
+		imageOffset      = {ox, oy, 0},
+		imageExtent      = {u32(dw), u32(dh), 1},
+	}
+	vk.CmdCopyBufferToImage(cmd, s.fsr_b.buf, dst, .TRANSFER_DST_OPTIMAL, 1, &region)
+}
+
 // Scaled output to the swapchain image, 4:3 and centred.
 @(private)
 hw_present_record :: proc(s: ^Slot, dst: vk.Image) {
 	cmd := s.cmd
 	sw, sh := u32(s.scan_w), u32(s.scan_h)
-	image_barrier(cmd, hw.out_img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
-	region := vk.BufferImageCopy {
-		imageSubresource = {aspectMask = {.COLOR}, layerCount = 1},
-		imageExtent      = {sw, sh, 1},
-	}
-	vk.CmdCopyBufferToImage(cmd, s.scan.buf, hw.out_img, .TRANSFER_DST_OPTIMAL, 1, &region)
-	image_barrier(cmd, hw.out_img, .TRANSFER_DST_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
-
 	image_barrier(cmd, dst, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
 	black: vk.ClearColorValue
 	rng := vk.ImageSubresourceRange{aspectMask = {.COLOR}, levelCount = 1, layerCount = 1}
@@ -1104,13 +1157,24 @@ hw_present_record :: proc(s: ^Slot, dst: vk.Image) {
 	dw, dh := W, H
 	if W * 3 > H * 4 {dw = H * 4 / 3} else {dh = W * 3 / 4}
 	ox, oy := (W - dw) / 2, (H - dh) / 2
-	blit := vk.ImageBlit {
-		srcSubresource = {aspectMask = {.COLOR}, layerCount = 1},
-		srcOffsets     = {{0, 0, 0}, {i32(sw), i32(sh), 1}},
-		dstSubresource = {aspectMask = {.COLOR}, layerCount = 1},
-		dstOffsets     = {{ox, oy, 0}, {ox + dw, oy + dh, 1}},
+	if hw.fsr_on && sw <= u32(dw) && sh <= u32(dh) {
+		hw_fsr_record(s, dst, ox, oy, dw, dh)
+	} else {
+		image_barrier(cmd, hw.out_img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
+		region := vk.BufferImageCopy {
+			imageSubresource = {aspectMask = {.COLOR}, layerCount = 1},
+			imageExtent      = {sw, sh, 1},
+		}
+		vk.CmdCopyBufferToImage(cmd, s.scan.buf, hw.out_img, .TRANSFER_DST_OPTIMAL, 1, &region)
+		image_barrier(cmd, hw.out_img, .TRANSFER_DST_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
+		blit := vk.ImageBlit {
+			srcSubresource = {aspectMask = {.COLOR}, layerCount = 1},
+			srcOffsets     = {{0, 0, 0}, {i32(sw), i32(sh), 1}},
+			dstSubresource = {aspectMask = {.COLOR}, layerCount = 1},
+			dstOffsets     = {{ox, oy, 0}, {ox + dw, oy + dh, 1}},
+		}
+		vk.CmdBlitImage(cmd, hw.out_img, .TRANSFER_SRC_OPTIMAL, dst, .TRANSFER_DST_OPTIMAL, 1, &blit, .LINEAR)
 	}
-	vk.CmdBlitImage(cmd, hw.out_img, .TRANSFER_SRC_OPTIMAL, dst, .TRANSFER_DST_OPTIMAL, 1, &blit, .LINEAR)
 	image_barrier(cmd, dst, .TRANSFER_DST_OPTIMAL, .PRESENT_SRC_KHR)
 }
 
