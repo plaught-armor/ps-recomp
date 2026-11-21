@@ -152,6 +152,11 @@ void main() {
 		// phase is not reliable with the interlocked descriptor VRAM path.
 		S = pc.states.s[key];
 #else
+	// A wave can hold pixels of several primitives. Each pass of this loop
+	// runs the phase before the interlock for the lanes of one State index,
+	// so S is wave-uniform there and its fields load into scalar registers.
+	// The interlock cannot sit inside control flow, so it follows the loop
+	// and reloads S per lane.
 	for (;;) {
 		uint first = subgroupBroadcastFirst(key);
 		if (first != key) continue;

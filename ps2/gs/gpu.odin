@@ -1346,6 +1346,8 @@ hw_present_record :: proc(s: ^Slot, dst: vk.Image) {
 	black: vk.ClearColorValue
 	rng := vk.ImageSubresourceRange{aspectMask = {.COLOR}, levelCount = 1, layerCount = 1}
 	vk.CmdClearColorImage(cmd, dst, .TRANSFER_DST_OPTIMAL, &black, 1, &rng)
+	// The copy or blit below writes over part of the clear: order the two.
+	image_barrier(cmd, dst, .TRANSFER_DST_OPTIMAL, .TRANSFER_DST_OPTIMAL)
 	W, H := i32(core.vkc.swap_ext.width), i32(core.vkc.swap_ext.height)
 	dw, dh := W, H
 	if W * 3 > H * 4 {dw = H * 4 / 3} else {dh = W * 3 / 4}
