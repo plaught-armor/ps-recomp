@@ -136,6 +136,9 @@ hw: struct {
 	read_cmd:            vk.CommandBuffer,
 	read_fence:          vk.Fence,
 	draw_layout:         vk.PipelineLayout,
+	draw_set_layout:     vk.DescriptorSetLayout,
+	draw_pool:           vk.DescriptorPool,
+	draw_set:            vk.DescriptorSet,
 	comp_layout:         vk.PipelineLayout,
 	prim, upload, copy:  vk.Pipeline,
 	scan, clut, decode:  vk.Pipeline,
@@ -238,7 +241,45 @@ hw_init :: proc(win: ^sdl.Window, scale: u32) -> bool {
 		hw.out_img, hw.out_mem = core.vk_image_create(DISP_W * scale, DISP_H * scale, .R8G8B8A8_UNORM, {.TRANSFER_SRC, .TRANSFER_DST})
 	}
 
-	hw.draw_layout = core.vk_layout_create({.VERTEX, .FRAGMENT}, size_of(Draw_PC))
+	binding := vk.DescriptorSetLayoutBinding {
+		binding         = 0,
+		descriptorType  = .STORAGE_BUFFER,
+		descriptorCount = 1,
+		stageFlags      = {.FRAGMENT},
+	}
+	linfo := vk.DescriptorSetLayoutCreateInfo {
+		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		bindingCount = 1,
+		pBindings    = &binding,
+	}
+	core.vk_check(vk.CreateDescriptorSetLayout(core.vkc.device, &linfo, nil, &hw.draw_set_layout), "vkCreateDescriptorSetLayout")
+	psize := vk.DescriptorPoolSize{type = .STORAGE_BUFFER, descriptorCount = 1}
+	pinfo := vk.DescriptorPoolCreateInfo {
+		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
+		maxSets       = 1,
+		poolSizeCount = 1,
+		pPoolSizes    = &psize,
+	}
+	core.vk_check(vk.CreateDescriptorPool(core.vkc.device, &pinfo, nil, &hw.draw_pool), "vkCreateDescriptorPool")
+	ainfo := vk.DescriptorSetAllocateInfo {
+		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
+		descriptorPool     = hw.draw_pool,
+		descriptorSetCount = 1,
+		pSetLayouts        = &hw.draw_set_layout,
+	}
+	core.vk_check(vk.AllocateDescriptorSets(core.vkc.device, &ainfo, &hw.draw_set), "vkAllocateDescriptorSets")
+	binfo := vk.DescriptorBufferInfo{buffer = hw.vram.buf, offset = 0, range = vk.DeviceSize(vk.WHOLE_SIZE)}
+	write := vk.WriteDescriptorSet {
+		sType           = .WRITE_DESCRIPTOR_SET,
+		dstSet          = hw.draw_set,
+		dstBinding      = 0,
+		descriptorCount = 1,
+		descriptorType  = .STORAGE_BUFFER,
+		pBufferInfo     = &binfo,
+	}
+	vk.UpdateDescriptorSets(core.vkc.device, 1, &write, 0, nil)
+	sets := [1]vk.DescriptorSetLayout{hw.draw_set_layout}
+	hw.draw_layout = core.vk_layout_create({.VERTEX, .FRAGMENT}, size_of(Draw_PC), sets[:])
 	hw.comp_layout = core.vk_layout_create({.COMPUTE}, 128)
 	hw.prim = core.vk_draw_pipeline(#load("shaders/prim.vert.spv"), #load("shaders/prim.frag.spv"), hw.draw_layout)
 	hw.upload = core.vk_compute_pipeline(#load("shaders/upload.comp.spv"), hw.comp_layout)
@@ -302,6 +343,7 @@ hw_flush_draws :: proc() {
 		}
 		vk.CmdBeginRendering(s.cmd, &info)
 		vk.CmdBindPipeline(s.cmd, .GRAPHICS, hw.prim)
+		vk.CmdBindDescriptorSets(s.cmd, .GRAPHICS, hw.draw_layout, 0, 1, &hw.draw_set, 0, nil)
 		vp := vk.Viewport{0, 0, f32(size), f32(size), 0, 1}
 		vk.CmdSetViewport(s.cmd, 0, 1, &vp)
 		pc := Draw_PC{hw.vram.addr, s.states.addr, s.cluts.addr, s.verts.addr, hw.dec.addr, hw.snap.addr, hw.scale}

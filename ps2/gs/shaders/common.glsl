@@ -10,6 +10,11 @@
 layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Words {
 	uint w[];
 };
+#ifdef VRAM_DESCRIPTOR
+layout(set = 0, binding = 0, std430) coherent buffer VramWords {
+	uint vram_w[];
+};
+#endif
 
 #include "tables.glsl"
 
@@ -59,7 +64,13 @@ uint addr4(uint bp, uint bw, uint x, uint y) {
 	return ((blk << 9) + col4[(y & 15u) * 32u + (x & 31u)]) & (8u * VRAM_WORDS - 1u);
 }
 
-uint word(uint i) { return VR.w[LB + i]; }
+uint word(uint i) {
+#ifdef VRAM_DESCRIPTOR
+	return vram_w[LB + i];
+#else
+	return VR.w[LB + i];
+#endif
+}
 
 // Where a pixel lives: bits (w >> sh) & m of word i in each layer. Layers share
 // the layout, so a caller touching every layer computes this once. m is 0 for a
@@ -95,12 +106,23 @@ uint load(Pixel p) { return (word(p.i) >> p.sh) & p.m; }
 // format share words, and different fragments run concurrently, so partial
 // stores are atomic.
 void store_bits(uint i, uint m, uint v) {
+#ifdef VRAM_DESCRIPTOR
+	atomicAnd(vram_w[LB + i], ~m);
+	atomicOr(vram_w[LB + i], v & m);
+#else
 	atomicAnd(VR.w[LB + i], ~m);
 	atomicOr(VR.w[LB + i], v & m);
+#endif
 }
 
 void store(Pixel p, uint v) {
-	if (p.m == 0xffffffffu) VR.w[LB + p.i] = v;
+	if (p.m == 0xffffffffu) {
+#ifdef VRAM_DESCRIPTOR
+		vram_w[LB + p.i] = v;
+#else
+		VR.w[LB + p.i] = v;
+#endif
+	}
 	else if (p.m != 0u) store_bits(p.i, p.m << p.sh, v << p.sh);
 }
 
