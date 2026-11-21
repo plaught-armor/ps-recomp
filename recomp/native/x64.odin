@@ -155,7 +155,27 @@ x64_prologue :: proc(a: ^Asm, state: int) {
 		op_imp(a, true, 0x8b, R15, imp(a, a.ram.base))
 		op_imp(a, true, 0x8b, RBP, imp(a, a.ram.pages))
 	}
-	if a.round_zero {x64_mxcsr(a, MXCSR_RZ)}
+	if a.round_zero {
+		// MXCSR_RN put back at each exit is a constant: a debug build traps
+		// (ud2) at an entry that finds the host's MXCSR is not it.
+		when ODIN_DEBUG {x64_mxcsr_check(a)}
+		x64_mxcsr(a, MXCSR_RZ)
+	}
+}
+
+// Trap unless MXCSR is MXCSR_RN but for its sticky exception flags (bits
+// 0-5, which host code sets and nothing reads): sub rsp, 8; stmxcsr
+// [rsp]; and dword [rsp], ~0x3f; cmp dword [rsp], MXCSR_RN; lea rsp,
+// [rsp + 8] (keeps the flags); je over; ud2.
+x64_mxcsr_check :: proc(a: ^Asm) {
+	emit8(a, 0x48, 0x83, 0xec, 0x08)
+	emit8(a, 0x0f, 0xae, 0x1c, 0x24)
+	emit8(a, 0x81, 0x24, 0x24)
+	emit32(a, 0xffff_ffc0)
+	emit8(a, 0x81, 0x3c, 0x24)
+	emit32(a, MXCSR_RN)
+	emit8(a, 0x48, 0x8d, 0x64, 0x24, 0x08)
+	emit8(a, 0x74, 0x02, 0x0f, 0x0b)
 }
 
 x64_epilogue :: proc(a: ^Asm, ret := true) {
