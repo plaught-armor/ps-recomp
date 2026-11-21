@@ -9,7 +9,9 @@
 // no FILE, a missing file, overlapping tracks and a bad time. Disc ids hash
 // the volume descriptor, SYSTEM.CNF and the boot file, the same for each
 // image format. A post-read hook changes a good read, fills past the image,
-// propagates failure, and changes nothing while nil. The IOP finds files on
+// propagates failure, and changes nothing while nil; on raw reads it sees a
+// Mode 1 or Form 1 sector's data, never an audio or Form 2 sector's, and a
+// sector it fills past the image reads as Form 1. The IOP finds files on
 // an opened image by the paths games pass it (cdrom0:\DIR\FILE.EXT;1), a
 // second lookup from its cache.
 // The images are written to a directory under the OS temp directory,
@@ -218,6 +220,76 @@ test_read_hook :: proc(iso: []u8) {
 		"read hook: failed read arguments",
 	)
 	check(all_byte(buf[:disc.DATA], 0xcc), "read hook: failed read buffer unchanged")
+}
+
+// What a raw read past the image fills: every byte of the data.
+@(private = "file")
+hook_fill_all :: proc(d: ^disc.Disc, lba: u32, buf: []u8, ok: bool) -> bool {
+	hook_record(d, lba, buf, ok)
+	if !ok {
+		for &b in buf {
+			b = 0x5a
+		}
+	}
+	return true
+}
+
+// read_raw passes the hook one Mode 1 or Form 1 sector's user data.
+@(private = "file")
+test_raw_hook :: proc(iso, mode1, mode2, audio: []u8) {
+	defer disc.read_hook = nil
+	raw: [disc.RAW]u8
+	images := []struct {
+		name: string,
+		img:  []u8,
+		from: int,
+	}{{"rh.iso", iso, 24}, {"rh1.bin", mode1, 16}, {"rh2.bin", mode2, 24}}
+	for c in images {
+		d, ok := open(write(c.name, c.img), c.name)
+		if !ok {
+			continue
+		}
+		disc.read_hook = nil
+		check(disc.read_raw(&d, 22, raw[:]) && raw[c.from] != 0xa5, fmt.tprintf("raw hook: %s nil leaves the data", c.name))
+		hook_seen = {}
+		disc.read_hook = hook_modify
+		check(disc.read_raw(&d, 22, raw[:]) && raw[c.from] == 0xa5, fmt.tprintf("raw hook: %s modifies the data", c.name))
+		check(
+			hook_seen.d == &d && hook_seen.lba == 22 && hook_seen.size == disc.DATA && hook_seen.ok && hook_seen.calls == 1,
+			fmt.tprintf("raw hook: %s arguments", c.name),
+		)
+		disc.close(&d)
+	}
+
+	// An audio sector whose samples happen to read as a Form 1 header.
+	aud := make([]u8, len(audio), context.temp_allocator)
+	copy(aud, audio)
+	aud[15], aud[18] = 2, 0x08
+	write("rha.bin", aud)
+	cue := "FILE \"rh2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\nFILE \"rha.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n"
+	d, ok := open(write_text("rh.cue", cue), "raw hook cue")
+	if !ok {
+		return
+	}
+	defer disc.close(&d)
+	hook_seen = {}
+	disc.read_hook = hook_modify
+	check(disc.read_raw(&d, discimg.FORM2, raw[:]) && raw[18] == 0x28 && hook_seen.calls == 0, "raw hook: passes a Form 2 sector by")
+	start := discimg.VOLUME + 150
+	check(disc.read_raw(&d, u32(start), raw[:]) && raw[0] == aud[0] && hook_seen.calls == 0, "raw hook: passes an audio sector by")
+
+	past := u32(start + discimg.AUDIO)
+	disc.read_hook = hook_pass
+	check(!disc.read_raw(&d, past, raw[:]) && hook_seen.calls == 1 && !hook_seen.ok, "raw hook: propagates failure past the image")
+	hook_seen = {}
+	disc.read_hook = hook_fill_all
+	m, sec, f := disc.msf(past)
+	check(
+		disc.read_raw(&d, past, raw[:]) && raw[12] == m && raw[13] == sec && raw[14] == f && raw[15] == 2 &&
+		raw[18] == 0x08 && all_byte(raw[24:24 + disc.DATA], 0x5a) && all_byte(raw[24 + disc.DATA:], 0),
+		"raw hook: a sector filled past the image reads as Form 1",
+	)
+	check(hook_seen.lba == past && hook_seen.size == disc.DATA && !hook_seen.ok && hook_seen.calls == 1, "raw hook: fill arguments")
 }
 
 @(private = "file")
@@ -519,6 +591,7 @@ main :: proc() {
 	iso := discimg.make_iso(discimg.CNF_PS2)
 	test_formats(iso, discimg.make_raw(discimg.make_iso(discimg.CNF_PS1), 1), discimg.make_raw(iso, 2), discimg.make_audio(discimg.AUDIO))
 	test_read_hook(iso)
+	test_raw_hook(iso, discimg.make_raw(discimg.make_iso(discimg.CNF_PS1), 1), discimg.make_raw(iso, 2), discimg.make_audio(discimg.AUDIO))
 	test_dual_layer(iso)
 	test_corrupt(iso)
 	test_id()

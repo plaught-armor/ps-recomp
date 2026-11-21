@@ -298,11 +298,45 @@ msf :: proc(lba: u32) -> (m, s, f: u8) {
 	return bcd(a / (75 * 60)), bcd(a / 75 % 60), bcd(a % 75)
 }
 
+// A port's view over disc images (nil: none): called after every read of
+// user data, with the first LBA, the data and whether the image held all of
+// it. read passes it whole sectors, read_raw one Mode 1 or Form 1 sector's
+// 2048 bytes. It may change the bytes, fill sectors past the image and return
+// whether the data is now valid. The sector's EDC and ECC are left as the
+// image had them. Host state; a port installs and clears it.
+read_hook: proc(d: ^Disc, lba: u32, buf: []u8, ok: bool) -> bool
+
 // Read the raw sector at lba into buf (RAW bytes). A 2048-byte sector comes
-// back as the Mode 2 Form 1 sector holding it.
+// back as the Mode 2 Form 1 sector holding it. read_hook sees the user data
+// of a Mode 1 or Form 1 sector, not of an audio, Mode 0 or Form 2 one, and a
+// sector it fills past the image comes back as a Form 1 sector.
 read_raw :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
 	assert(len(buf) >= RAW, "disc: raw read under a sector")
 	t := track_of(d, lba)
+	ok := read_raw_image(t, lba, buf)
+	if read_hook == nil {
+		return ok
+	}
+	from := 24
+	if ok {
+		switch {
+		case t.audio: return true
+		case buf[15] == 1: from = 16
+		case buf[15] == 2 && buf[18] & 0x20 == 0:
+		case: return true
+		}
+	}
+	if !read_hook(d, lba, buf[from:from + DATA], ok) {
+		return false
+	}
+	if !ok {
+		form1_header(lba, buf)
+	}
+	return true
+}
+
+@(private = "file")
+read_raw_image :: proc(t: ^Track, lba: u32, buf: []u8) -> bool {
 	if t == nil {
 		return false
 	}
@@ -310,6 +344,15 @@ read_raw :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
 		n, err := os.read_at(t.file, buf[:RAW], t.at + i64(lba - t.start) * RAW)
 		return err == nil && n == RAW
 	}
+	form1_header(lba, buf)
+	n, err := os.read_at(t.file, buf[24:24 + DATA], t.at + i64(lba - t.start) * DATA)
+	return err == nil && n == DATA
+}
+
+// The sync, header and subheader of the Mode 2 Form 1 sector at lba, and a
+// zero EDC and ECC around its data.
+@(private = "file")
+form1_header :: proc(lba: u32, buf: []u8) {
 	for &b in buf[1:11] {
 		b = 0xff
 	}
@@ -317,18 +360,10 @@ read_raw :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
 	buf[12], buf[13], buf[14] = msf(lba)
 	buf[15] = 2
 	copy(buf[16:24], []u8{0, 0, 0x08, 0, 0, 0, 0x08, 0})
-	n, err := os.read_at(t.file, buf[24:24 + DATA], t.at + i64(lba - t.start) * DATA)
 	for &b in buf[24 + DATA:RAW] {
 		b = 0
 	}
-	return err == nil && n == DATA
 }
-
-// A port's view over disc images (nil: none): called after every read of
-// whole sectors, with the first LBA, the buffer and whether the image held
-// all of it. It may change the bytes, fill sectors past the image and return
-// whether the buffer is now valid. Host state; a port installs and clears it.
-read_hook: proc(d: ^Disc, lba: u32, buf: []u8, ok: bool) -> bool
 
 // Read the user data of whole sectors from lba on into buf, a multiple of
 // DATA long: a Mode 2 Form 1 sector's from byte 24, a Mode 1 one's from
@@ -359,7 +394,7 @@ read_image :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
 			i += k
 			continue
 		}
-		if !read_raw(d, at, raw[:]) {
+		if !read_raw_image(t, at, raw[:]) {
 			return false
 		}
 		from: int
