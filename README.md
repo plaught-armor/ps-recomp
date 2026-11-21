@@ -40,7 +40,7 @@ have bugs.
 | System | Status |
 |---|---|
 | Linux | Games have been played here. The automated tests run here. |
-| Windows | A port runs here natively with Vulkan: [SDF_Macross](https://github.com/Tzeentchnet/SDF_Macross). |
+| Windows | A PS2 game-specific port has built and run natively with Vulkan on Windows x86-64: [Chou Jikuu Yousai Macross](https://github.com/Tzeentchnet/SDF_Macross). This is evidence for one title and NVIDIA system, not broad compatibility. |
 | macOS | Untested. The code is type-checked for macOS, but neither games nor the automated tests run there. |
 
 ## Guides
