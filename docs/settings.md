@@ -20,6 +20,7 @@ variable always wins over both.
 | `PS_SW` **L** | PS2 | `1` draws in software. Otherwise Vulkan, except the wasm build, which always draws in software. |
 | `PS_BANDS` | PS2 | Software drawing only. The number of threads that draw, each a band of rows, 1 to 16. The default, 1, draws on the emulator's own thread. The play page's default is one fewer than the CPUs, at most 8. |
 | `PS_SCALE` **L** | PS2 | Window size as a multiple of the console's resolution, 1 to 8. Default 3. |
+| `PS_UPSCALER` | PS2 | Vulkan only. `fsr1` uses AMD FidelityFX Super Resolution 1 EASU and RCAS when the window is larger than the internal picture. Otherwise output uses linear scaling. |
 
 ## How the game runs
 
