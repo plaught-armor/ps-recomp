@@ -29,6 +29,7 @@ odin run tests/gs_hw -collection:ps=.
 odin run tests/vu_macro -collection:ps=.
 odin run tests/vu_micro -collection:ps=.
 odin run tests/vu_native -collection:ps=.
+odin run tests/vu_rz -collection:ps=.   # x86-64 only
 odin run tests/vu_text -collection:ps=.
 odin run tests/ee_emit -collection:ps=.
 odin run tests/spu -collection:ps=.
@@ -138,6 +139,7 @@ here.
 | `ee_emit` | The EE recompiler's inline MMI, multiply-add and FPU code against the interpreter |
 | `vu_micro` | Whole VU microprograms through the VU recompiler against the interpreter |
 | `vu_native` | VU microprograms through the native backend against the interpreter |
+| `vu_rz` | x86-64 only: SSE addps, mulps and the MADD/MSUB guard under MXCSR round toward zero, as recomp/vu's round_zero spans emit them, against ps2_add and ps2_mul |
 | `vu_text` | `.vutext`'s programs as the conversion finds them: a bundle of MPGs that cannot be placed from micro address 0 is left out and the scan goes on; a conversion whose VU half fails (a bad capture, a bad `.vutext`) still writes the EE blob, and the VU programs alone fail |
 | `spu` | SPU2 voices through the port API, sound RAM in snapshots |
 | `ps2_kernel` | EE kernel threads, ExecPS2, SetVSyncFlag, EnableCache and DisableCache, FlushCache's text check |

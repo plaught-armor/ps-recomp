@@ -155,9 +155,11 @@ x64_prologue :: proc(a: ^Asm, state: int) {
 		op_imp(a, true, 0x8b, R15, imp(a, a.ram.base))
 		op_imp(a, true, 0x8b, RBP, imp(a, a.ram.pages))
 	}
+	if a.round_zero {x64_mxcsr(a, MXCSR_RZ)}
 }
 
 x64_epilogue :: proc(a: ^Asm, ret := true) {
+	if a.round_zero && a.near == 0 {x64_mxcsr(a, MXCSR_RN)}
 	emit8(a, 0x48, 0x83, 0xc4, frame(a)) // add rsp, frame
 	if win_cache(a) {
 		emit8(a, 0x5f, 0x5e) // pop rdi rsi
@@ -723,7 +725,20 @@ x64_call :: proc(a: ^Asm, k: int, args: []Reg) {
 		op_rr(a, false, 0x89, X64_REG[r], regs[n])
 	}
 	op_rr(a, true, 0x89, R12, regs[len(args)]) // the context, last
+	rz := a.round_zero && a.near == 0
+	if rz {x64_mxcsr(a, MXCSR_RN)} // the callee runs as the host does
 	op_imp(a, false, 0xff, 2, k) // call [slot]
+	if rz {x64_mxcsr(a, MXCSR_RZ)}
+}
+
+// MXCSR = v, with no register free: push imm32; ldmxcsr [rsp]; lea rsp,
+// [rsp + 8], which keeps the flags.
+x64_mxcsr :: proc(a: ^Asm, v: u32) {
+	assert(v < 0x8000_0000, "native: mxcsr push sign-extends")
+	emit8(a, 0x68)
+	emit32(a, v)
+	emit8(a, 0x0f, 0xae, 0x14, 0x24)
+	emit8(a, 0x48, 0x8d, 0x64, 0x24, 0x08)
 }
 
 // x64_call's sequence with no arguments, to a label in the code.
@@ -971,10 +986,15 @@ x64_window :: proc(a: ^Asm, s: Slow) {
 	}
 }
 
+// A call to label l: a function of its own (call_func) or a shared slow
+// routine, either of which runs with MXCSR as the host's.
 x64_call_label :: proc(a: ^Asm, l: Label) {
+	rz := a.round_zero && a.near == 0
+	if rz {x64_mxcsr(a, MXCSR_RN)}
 	emit8(a, 0xe8)
 	append(&a.jumps, Fixup{at = len(a.code), target = int(l), kind = .Rel32})
 	emit32(a, 0)
+	if rz {x64_mxcsr(a, MXCSR_RZ)}
 }
 
 x64_return :: proc(a: ^Asm) {

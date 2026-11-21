@@ -474,6 +474,8 @@ window_call :: proc(a: ^native.Asm, lw, pc: u32) {
 // those take them. Uses C and LD.
 @(private = "file")
 quotient :: proc(a: ^native.Asm, key: u32) {
+	native.near_begin(a) // rounded to nearest, as the host's
+	defer native.near_end(a)
 	if key != 0x39 {fclamp_gpr(a, .A, .C)}
 	fclamp_gpr(a, .B, .C)
 	store, fmax := native.new_label(a), native.new_label(a)
@@ -524,6 +526,8 @@ EFU :: "vu.efu"
 // A, B, C and LD, and keeps T.
 @(private = "file")
 efu :: proc(a: ^native.Asm, u: Unit, lw, key: u32) {
+	native.near_begin(a) // rounded to nearest, as the host's
+	defer native.near_end(a)
 	fs, fsf := (lw >> 11) & 31, (lw >> 21) & 3
 	lane :: proc(a: ^native.Asm, u: Unit, r: native.Reg, fs, k: u32) {
 		native.imp_load(a, r, IMPORTS[u][.Vf], 16 * fs + 4 * k)
@@ -708,11 +712,13 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil, 
 		// NaN or denormal.
 		if ft == 0 {return true}
 		native.vec_load(a, .V1, 16 * fs, vf)
+		native.near_begin(a) // the conversion rounds to nearest
 		native.vec_op(a, .Itof, .V0, .V1)
 		if bc != 0 {
 			native.vec_load(a, .V1, VU_ITOF + 16 * (bc - 1), K)
 			native.vec_op(a, .Fmul, .V0, .V1)
 		}
+		native.near_end(a)
 		put(a, 16 * ft, vf, dest)
 		wrote(known, ft, dest, true)
 		return true
@@ -821,7 +827,7 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil, 
 		native.vec_shuf32(a, .V1, .V2, {2, 0, 1, 3})
 		if !sure(known, fs, 0xe) {clamp(a, .V0, .V2, .V3, .V4)}
 		if !sure(known, ft, 0xe) {clamp(a, .V1, .V2, .V3, .V4)}
-		ps2_mul(a)
+		if kind == .Opmsub {product(a, dest)} else {ps2_mul(a)}
 	case .Add, .Sub, .Mul, .Madd, .Msub:
 		native.vec_load(a, .V0, 16 * fs, vf)
 		switch src {
@@ -846,8 +852,10 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil, 
 			native.vec_load(a, .V2, VU_SIGN, K)
 			native.vec_op(a, .Xor, .V1, .V2)
 			ps2_add(a)
-		case:
+		case .Mul:
 			ps2_mul(a)
+		case:
+			product(a, dest)
 		}
 	}
 	if kind == .Madd || kind == .Msub || kind == .Opmsub {
@@ -913,8 +921,15 @@ op :: proc(a: ^native.Asm, u: Unit, w: u32, flags: Flags, known: ^[32]u8 = nil, 
 // zero to 24 bits; below 2^-126 a zero of its sign; past the largest
 // finite value infinite, which the caller's clamp makes the largest.
 // Operands not infinite, NaN or denormal. Uses V0-V4.
+// In a round_zero function (Asm.round_zero) outside a near region, mulps
+// is all of that (tests/vu_rz): rounded toward zero, with FTZ, and past the
+// largest finite value the largest.
 @(private = "file")
 ps2_mul :: proc(a: ^native.Asm) {
+	if round_zero(a) {
+		native.vec_op(a, .Fmul, .V0, .V1)
+		return
+	}
 	native.vec_op(a, .Widen_Lo, .V2, .V0)
 	native.vec_op(a, .Widen_Lo, .V3, .V1)
 	native.vec_op(a, .Fmul64, .V2, .V3)
@@ -940,6 +955,47 @@ ps2_mul :: proc(a: ^native.Asm) {
 	native.vec_op(a, .Andn, .V1, .V3)
 	native.vec_op(a, .Narrow, .V0, .V1)
 }
+
+// V0 = V0 * V1 as ps2_mul, as the product an add takes next (MADD, MSUB,
+// OPMSUB): where ps2_mul's is infinite the sum stays infinite, so the
+// largest after the clamp. In a round_zero function mulps rounds a product
+// from past the largest finite value and one from [FMAX, 2^128) both to
+// FMAX, where ps2_mul gives infinity and FMAX: a vector with a dest lane
+// of magnitude FMAX takes ps2_mul's product, rounded to nearest, instead.
+// Uses C and V0-V4.
+@(private = "file")
+product :: proc(a: ^native.Asm, dest: u32) {
+	if !round_zero(a) {
+		ps2_mul(a)
+		return
+	}
+	native.vec_copy(a, .V2, .V0)
+	native.vec_op(a, .Fmul, .V0, .V1)
+	native.vec_load(a, .V3, VU_ABS, K)
+	native.vec_op(a, .And, .V3, .V0)
+	native.vec_load(a, .V4, VU_MAX, K)
+	native.vec_op(a, .Eq32, .V3, .V4)
+	native.vec_signs(a, .C, .V3) // in dest's bit order, as MAC's
+	native.alu_imm(a, .And, .C, dest)
+	far, done := native.out_of_line(a, product_near)
+	native.br_zero(a, .C, far, nonzero = true)
+	native.bind(a, done)
+}
+
+// product's rare path: V0 = V2 * V1 again, as ps2_mul in round to nearest.
+@(private = "file")
+product_near :: proc(a: ^native.Asm) {
+	native.vec_copy(a, .V0, .V2)
+	native.near_begin(a)
+	ps2_mul(a)
+	native.near_end(a)
+}
+
+// Whether float code emitted here runs with MXCSR in round toward zero,
+// FTZ (native.Asm.round_zero), as native_program's spans that
+// take it do.
+@(private = "file")
+round_zero :: proc(a: ^native.Asm) -> bool {return a.round_zero && a.near == 0}
 
 // V0 = V0 + V1 as the PS2 adds, as ps2/vu ps2_add: the smaller operand
 // (by magnitude) cut to the larger's last mantissa bit, then the sum
@@ -987,6 +1043,11 @@ ps2_add :: proc(a: ^native.Asm) {
 	native.vec_load(a, .V2, VU_ABS, K)
 	native.vec_op(a, .And, .V4, .V2)
 	native.vec_op(a, .Andn, .V4, .V1)
+	if round_zero(a) {
+		// addps rounds the cut sum toward zero (tests/vu_rz)
+		native.vec_op(a, .Fadd, .V0, .V4)
+		return
+	}
 	// r = big + small in V1, e = small - (r - big) in V4
 	native.vec_copy(a, .V1, .V0)
 	native.vec_op(a, .Fadd, .V1, .V4)
@@ -1434,6 +1495,34 @@ micro_branch :: proc(a: ^native.Asm, u: Unit, lw, pc, mask: u32, delayed: bool) 
 	}
 }
 
+// Whether a span of pairs (those ext marks) runs in round toward zero
+// (native.func_begin's round_zero): on x86-64 only, where its adds and
+// multiplies are then addps and mulps of the cut operands (ps2_add,
+// ps2_mul), when they outnumber the ops that need the host's rounding
+// back, each an MXCSR load either side (near_begin: DIV, SQRT, RSQRT, the
+// EFU, ITOF; XGKICK's call), 8 to 1.
+@(private = "file")
+round_zero_span :: proc(arch: native.Arch, pairs: []Pair, ext: []bool) -> bool {
+	if arch != .X64_SysV && arch != .X64_Win {return false}
+	add_mul, near := 0, 0
+	for p, i in pairs {
+		if ext != nil && !ext[i] {continue}
+		fn := p.uw & 63
+		key := fn < 0x3c ? fn : ((p.uw >> 4) & 0x7c) | (p.uw & 3)
+		if fn < 0x30 || (fn >= 0x3c && key < 0x30) {
+			switch key {
+			case 0x00 ..= 0x0f, 0x18 ..= 0x1c, 0x1e, 0x20 ..= 0x2a, 0x2c ..= 0x2e: add_mul += 1 // ADD SUB MADD MSUB MUL OPMULA OPMSUB, all forms
+			case 0x10 ..= 0x13: if fn >= 0x3c {near += 1} // ITOF
+			}
+		}
+		if p.ibit || p.lw >> 25 != 0x40 || p.lw & 63 < 0x3c {continue}
+		switch ((p.lw >> 4) & 0x7c) | (p.lw & 3) {
+		case 0x38 ..= 0x3a, 0x6c, 0x70 ..= 0x7a, 0x7c ..= 0x7e: near += 1
+		}
+	}
+	return add_mul > 0 && add_mul >= 8 * near
+}
+
 // The keys outlive the temp allocator, which each program frees.
 @(private = "file")
 count_slow :: proc(slow: ^map[string]int, key: string) {
@@ -1482,7 +1571,7 @@ native_program :: proc(a: ^native.Asm, words: []u32, ext: []bool, entries: []u32
 	known := KNOWN_NONE
 	k := VU_CLAMP_ELIDE && entries != nil ? &known : nil
 	fell := false // the previous pair falls through
-	at := native.func_begin(a, K)
+	at := native.func_begin(a, K, round_zero_span(a.arch, pairs, ext))
 	labels := make(map[u32]native.Label, context.temp_allocator)
 	pcs := make([dynamic]u32, context.temp_allocator)
 	for i in 0 ..< len(pairs) {

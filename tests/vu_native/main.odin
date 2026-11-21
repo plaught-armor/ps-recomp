@@ -23,6 +23,7 @@
 //   odin run tests/vu_native -collection:ps=.
 package main
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:math/rand"
 import "core:os"
@@ -131,6 +132,8 @@ main :: proc() {
 		os.exit(1)
 	}
 
+	rz_fails := round_zero_spans(code, progs[:])
+
 	rand.reset(SEED)
 	vu.vu_init()
 	cases, fails, flagged, status_set, vu1_set := 0, 0, 0, 0, 0
@@ -168,6 +171,10 @@ main :: proc() {
 				copy(mem, mem_init)
 				nr.pc, nr.budget = i32(pc), BUDGET
 				run()
+				if !host_round_nearest() {
+					rz_fails += 1
+					if rz_fails < 10 {fmt.eprintfln("FAIL vu_native program %d (vu%d, from %04x): the host rounds toward zero after the run", k, vu0 ? 0 : 1, pc)}
+				}
 				drain(v, u32(nr.pc))
 				got := v^
 				got_pc := u32(nr.pc)
@@ -349,7 +356,7 @@ main :: proc() {
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
 	if vu1_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU1 I or D set in only %d trials", vu1_set); os.exit(1)}
-	if fails > 0 || slow_fails > 0 || dispatch_fails > 0 {os.exit(1)}
+	if fails > 0 || slow_fails > 0 || dispatch_fails > 0 || rz_fails > 0 {os.exit(1)}
 }
 
 // A miss capture (VU_CAPTURE=miss, ps2/vu/capture.odin) of VU1 into a file
@@ -826,4 +833,42 @@ test_xtop :: proc(arch: native.Arch) -> (fails: int) {
 	}
 	feed(0x03000000, 0x02000000)
 	return
+}
+
+// ldmxcsr of round toward zero (recomp/native x64_mxcsr MXCSR_RZ): push
+// 0xff80, ldmxcsr [rsp].
+RZ_SET :: [?]u8{0x68, 0x80, 0xff, 0x00, 0x00, 0x0f, 0xae, 0x14, 0x24}
+
+// On x64 the RZ_MIX program's function on each unit must set round toward
+// zero (recomp/vu round_zero_span); says how many functions do. Returns
+// the failures.
+round_zero_spans :: proc(code: core.Native_Code, progs: []vu_programs.Prog) -> (fails: int) {
+	when ODIN_ARCH != .amd64 {return}
+	bytes := ([^]u8)(rawptr(code.base))[:code.size]
+	set := RZ_SET
+	n := 0
+	for p, k in progs {
+		start, end := int(code.spans[k].off), code.size
+		for s in code.spans {if int(s.off) > start && int(s.off) < end {end = int(s.off)}}
+		has := false
+		for i in start ..= end - len(set) {
+			if slice.equal(bytes[i:][:len(set)], set[:]) {has = true; break}
+		}
+		if has {n += 1}
+		if raw_data(p.words) == raw_data(vu_programs.RZ_MIX) && !has {
+			fmt.eprintfln("FAIL vu_native: program %d (vu%d), RZ_MIX, does not set round toward zero", k, p.unit == .VU0 ? 0 : 1)
+			fails += 1
+		}
+	}
+	fmt.printfln("vu_native: %d of %d functions set round toward zero", n, len(progs))
+	return
+}
+
+// The host's rounding after a native run: 1 + 0.75 ulp is 1 + 1 ulp to
+// nearest, 1 toward zero.
+rn_one: f32 = 1
+rn_part := transmute(f32)u32(0x33c00000) // 1.5 * 2^-24
+host_round_nearest :: proc() -> bool {
+	sum := intrinsics.volatile_load(&rn_one) + intrinsics.volatile_load(&rn_part)
+	return transmute(u32)sum == 0x3f800001
 }

@@ -188,7 +188,6 @@ vclamp4 :: #force_inline proc(r: [4]f32) -> [4]f32 {return {vclamp(r.x), vclamp(
 // exact (a product or sum of two f32s), so cutting its low 29 mantissa bits
 // is rounding it toward zero to 24 bits. A value past the f32 range comes out
 // infinite, which the write's clamp makes the largest value.
-@(private)
 rtz_f32 :: #force_inline proc "contextless" (d: f64) -> f32 {
 	b := transmute(u64)d
 	if (b >> 52) & 0x7ff < 1023 - 126 {return transmute(f32)(u32(b >> 32) & 0x80000000)}
@@ -196,14 +195,12 @@ rtz_f32 :: #force_inline proc "contextless" (d: f64) -> f32 {
 }
 
 // a * b on the PS2: the exact product, rounded toward zero (rtz_f32).
-@(private)
 ps2_mul :: #force_inline proc "contextless" (a, b: f32) -> f32 {return rtz_f32(f64(a) * f64(b))}
 
 // a + b on the PS2: the operand with the smaller exponent loses the bits
 // below the other's last mantissa bit (all of them, keeping its sign, 24 or
 // more exponents down), then the exact sum rounds toward zero. A difference
 // is a + -b.
-@(private)
 ps2_add :: #force_inline proc "contextless" (a, b: f32) -> f32 {
 	ua, ub := transmute(u32)a, transmute(u32)b
 	big, small := ua, ub

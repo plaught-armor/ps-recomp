@@ -228,8 +228,21 @@ Asm :: struct {
 	// wasm32: a generated function has type (ctx: i32) -> (), an Odin
 	// proc(), and takes no entry pc (entry_pc is then unavailable).
 	ctx_only:  bool,
+	// x86-64: the function being emitted runs its float code with MXCSR at
+	// MXCSR_RZ (func_begin's round_zero): set at each entry, MXCSR_RN put
+	// back at each exit, around each call out of the function, and inside
+	// each near region (near_begin).
+	round_zero: bool,
+	near:       int, // the near regions open
 	wa:        Wasm, // wasm32 only
 }
+
+// MXCSR as the host runs: round to nearest, every exception masked.
+MXCSR_RN :: 0x1f80
+// MXCSR in a round_zero function: round toward zero, with denormal results
+// flushed to zero (FTZ). Not DAZ: recomp/vu's MADD adds an ACC that may be
+// denormal as it is, as ps2/vu does (tests/vu_rz macc_acc).
+MXCSR_RZ :: MXCSR_RN | 0x6000 | 0x8000
 
 // A runtime procedure's signature: n 32-bit arguments then the context, and
 // a 32-bit result or none.
@@ -245,6 +258,7 @@ Sig :: struct {
 @(private)
 Cold :: struct {
 	far, done, slow: Label,
+	body:            proc(a: ^Asm), // set: emitted at far instead of a call of slow
 }
 
 // A shared routine that does a load (signed: sign-extended) or store of
@@ -428,8 +442,12 @@ get32 :: proc(a: ^Asm, at: int) -> u32 {
 // holding the address of the guest register file, kept in a fixed host
 // register for the state_* operations. A vec_load or vec_store through
 // import state uses that register too, rather than reading the slot.
-func_begin :: proc(a: ^Asm, state: string) -> int {
+// With round_zero (x86-64 only), the function's float code runs with MXCSR
+// at MXCSR_RZ, but for its near regions and its calls out (Asm.round_zero).
+func_begin :: proc(a: ^Asm, state: string, round_zero := false) -> int {
+	assert(!round_zero || a.arch == .X64_SysV || a.arch == .X64_Win, "native: round_zero off x86-64")
 	if a.arch == .Wasm32 {return wasm_func_begin(a, state)}
+	a.round_zero = round_zero
 	align_code(a)
 	at := len(a.code)
 	a.epilogue = new_label(a)
@@ -515,8 +533,12 @@ func_end :: proc(a: ^Asm, left := "") {
 		bind(a, a.leave)
 		switch a.arch {
 		case .X64_SysV, .X64_Win:
+			// MXCSR_RN once, for the call and the exit both
+			if a.round_zero {x64_mxcsr(a, MXCSR_RN)}
+			a.near += 1
 			x64_call(a, imp(a, left), nil)
 			x64_epilogue(a)
+			a.near -= 1
 		case .Arm64:
 			a64_call(a, imp(a, left), nil)
 			a64_epilogue(a)
@@ -526,6 +548,11 @@ func_end :: proc(a: ^Asm, left := "") {
 	}
 	for c in a.cold {
 		bind(a, c.far)
+		if c.body != nil {
+			c.body(a)
+			jmp(a, c.done)
+			continue
+		}
 		switch a.arch {
 		case .X64_SysV, .X64_Win:
 			x64_call_label(a, c.slow)
@@ -537,6 +564,24 @@ func_end :: proc(a: ^Asm, left := "") {
 		jmp(a, c.done)
 	}
 	clear(&a.cold)
+	assert(a.near == 0, "native: a near region left open")
+	a.round_zero = false
+}
+
+// From near_begin to its near_end, a round_zero function's float code
+// rounds to nearest as the host's does (MXCSR_RN); elsewhere these emit
+// nothing. Regions nest, and no jump enters one from outside it.
+near_begin :: proc(a: ^Asm) {
+	if !a.round_zero {return}
+	if a.near == 0 {x64_mxcsr(a, MXCSR_RN)}
+	a.near += 1
+}
+
+near_end :: proc(a: ^Asm) {
+	if !a.round_zero {return}
+	assert(a.near > 0, "native: near_end without near_begin")
+	a.near -= 1
+	if a.near == 0 {x64_mxcsr(a, MXCSR_RZ)}
 }
 
 // Return from the function.
@@ -1208,7 +1253,7 @@ load :: proc(a: ^Asm, w: Width, signed: bool, slow: string) {
 		panic("native: wasm32")
 	}
 	bind(a, done)
-	append(&a.cold, Cold{far, done, slow_path(a, s)})
+	append(&a.cold, Cold{far = far, done = done, slow = slow_path(a, s)})
 }
 
 // Guest register n, the 8- or 16-byte (w B64 or B128) state field at off,
@@ -1239,7 +1284,7 @@ load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 		panic("native: wasm32")
 	}
 	bind(a, done)
-	append(&a.cold, Cold{far, done, slow_path(a, s)})
+	append(&a.cold, Cold{far = far, done = done, slow = slow_path(a, s)})
 }
 
 // Store the low bytes of B at guest address A: in place when the address
@@ -1337,6 +1382,16 @@ call_label :: proc(a: ^Asm, l: Label) {
 	case .Wasm32:
 		panic("native: wasm32")
 	}
+}
+
+// A rare path out of line: code branches to far, body is emitted at the
+// end of the function (where the hot path's straight run does not carry
+// it), then jumps back to done, which the caller binds after the branch.
+// body runs in the same register and rounding state as the branch.
+out_of_line :: proc(a: ^Asm, body: proc(a: ^Asm)) -> (far, done: Label) {
+	far, done = new_label(a), new_label(a)
+	append(&a.cold, Cold{far = far, done = done, body = body})
+	return
 }
 
 // The label of the shared routine s describes, made on first use.

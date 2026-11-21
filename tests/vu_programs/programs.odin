@@ -612,11 +612,49 @@ DELAY := []u32 {
 // Entries at each part, and inside the first two windows.
 DELAY_PCS := []u32{0, 0x38, 0x48, 0x58, 0x60, 0x88, 0xb0, 0xd0, 0xf8}
 
+// Round toward zero (recomp/vu round_zero_span): 27 add and mul ops to
+// one each of DIV, ITOF and ESADD, so the span runs its add and mul in
+// RZ and those three in round to nearest. MADD, MSUB and OPMSUB take the
+// product's FLT_MAX check; random operands overflow it often.
+MSUB :: 0x2d
+OPMSUB :: 0x2e
+RZ_MIX := []u32 {
+	lower_sp(DIV, 0b0110, 1, 2), upper(MUL, 3, 1, 2),
+	NOP_L, upper(ADD, 4, 3, 1),
+	lower_sp(ESADD, XYZ, 0, 4), upper(MADD, 5, 4, 2),
+	NOP_L, upper(MSUB, 6, 5, 3),
+	NOP_L, upper(OPMSUB, 7, 6, 5),
+	NOP_L, upper(SUB, 8, 7, 1),
+	NOP_L, upper(MULq, 9, 8, 0),
+	NOP_L, upper_sp(ITOF0, 15, 10, 11),
+	NOP_L, upper(MUL, 12, 9, 10),
+	NOP_L, upper(MADD, 13, 12, 4),
+	NOP_L, upper(ADDx, 14, 13, 12),
+	NOP_L, upper(MSUB, 15, 14, 2),
+	NOP_L, upper(MULi, 16, 15, 0),
+	NOP_L, upper(ADD, 17, 16, 3),
+	NOP_L, upper(MADD, 18, 17, 9),
+	NOP_L, upper(OPMSUB, 19, 18, 17),
+	lower_sp(MFP, 0b1111, 20, 0), upper(MUL, 21, 19, 18),
+	NOP_L, upper(SUB, 22, 21, 13),
+	NOP_L, upper(MADD, 23, 22, 14),
+	NOP_L, upper(MSUB, 24, 23, 15),
+	NOP_L, upper(ADDw, 25, 24, 20),
+	NOP_L, upper(MUL, 26, 25, 24),
+	NOP_L, upper(MADD, 27, 26, 21),
+	NOP_L, upper(OPMSUB, 28, 27, 26),
+	NOP_L, upper(ADD, 29, 28, 22),
+	NOP_L, upper(MSUB, 30, 29, 23),
+	NOP_L, upper(MUL, 31, 30, 27) | E_BIT,
+	NOP_L, NOP_U,
+}
+
 // Every program, on each unit it runs on.
 programs :: proc() -> (progs: [dynamic]Prog) {
 	for w in PROGRAMS {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
 	for w in PROGRAMS_DIV {append(&progs, Prog{w, .VU0, nil, AT_0, nil}, Prog{status_first(w), .VU1, nil, AT_0, nil})}
 	for w in DIV_DUE {append(&progs, Prog{w, .VU1, nil, AT_0, nil}, Prog{w, .VU0, nil, AT_0, nil})}
+	append(&progs, Prog{RZ_MIX, .VU1, nil, AT_0, nil}, Prog{RZ_MIX, .VU0, nil, AT_0, nil})
 	for w in PROGRAMS_VU0 {append(&progs, Prog{w, .VU0, nil, AT_0, nil})}
 	// The late-flag and Q programs, every pair labelled and as captured images
 	// entered at each pc.
