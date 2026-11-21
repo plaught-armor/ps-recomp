@@ -100,26 +100,8 @@ disc_read :: proc(lba: u32, buf: []u8) -> bool {
 	return true
 }
 
-// Sectors that are not on the image: the game returns the 2048 bytes
-// of user data of an added sector (one past the disc's end), or nil.
-sector_hook: proc(lba: u32) -> []u8
-
 @(private)
 read_sector :: proc(lba: u32, buf: []u8) -> bool {
-	if sector_hook != nil {
-		if data := sector_hook(lba); data != nil {
-			// A Mode 2 Form 1 data sector: sync, header, subheader, data.
-			for &b in buf[:12] {
-				b = 0xff
-			}
-			buf[0], buf[11] = 0, 0
-			buf[12], buf[13], buf[14] = msf(lba)
-			buf[15] = 2
-			copy(buf[16:24], []u8{0, 0, 0x08, 0, 0, 0, 0x08, 0})
-			copy(buf[DISC_DATA_AT:DISC_DATA_AT + DISC_DATA], data)
-			return true
-		}
-	}
 	return disc.read_raw(&cd.disc, lba, buf)
 }
 
