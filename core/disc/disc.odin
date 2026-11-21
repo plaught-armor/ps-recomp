@@ -324,11 +324,24 @@ read_raw :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
 	return err == nil && n == DATA
 }
 
+// A port's view over disc images (nil: none): called after every read of
+// whole sectors, with the first LBA, the buffer and whether the image held
+// all of it. It may change the bytes, fill sectors past the image and return
+// whether the buffer is now valid. Host state; a port installs and clears it.
+read_hook: proc(d: ^Disc, lba: u32, buf: []u8, ok: bool) -> bool
+
 // Read the user data of whole sectors from lba on into buf, a multiple of
 // DATA long: a Mode 2 Form 1 sector's from byte 24, a Mode 1 one's from
 // byte 16. False past the image, or on an audio, Mode 0 or Mode 2 Form 2
-// sector, which hold no 2048 bytes of data.
+// sector, which hold no 2048 bytes of data; read_hook may change both.
 read :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
+	ok := read_image(d, lba, buf)
+	if read_hook != nil {ok = read_hook(d, lba, buf, ok)}
+	return ok
+}
+
+@(private = "file")
+read_image :: proc(d: ^Disc, lba: u32, buf: []u8) -> bool {
 	assert(len(buf) % DATA == 0, "disc: read not in whole sectors")
 	raw: [RAW]u8
 	for i := 0; i < len(buf) / DATA; {

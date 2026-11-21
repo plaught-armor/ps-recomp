@@ -8,8 +8,10 @@
 // zero length, a directory past the volume, unknown cue lines, a TRACK with
 // no FILE, a missing file, overlapping tracks and a bad time. Disc ids hash
 // the volume descriptor, SYSTEM.CNF and the boot file, the same for each
-// image format. The IOP finds files on an opened image by the paths games
-// pass it (cdrom0:\DIR\FILE.EXT;1), a second lookup from its cache.
+// image format. A post-read hook changes a good read, fills past the image,
+// propagates failure, and changes nothing while nil. The IOP finds files on
+// an opened image by the paths games pass it (cdrom0:\DIR\FILE.EXT;1), a
+// second lookup from its cache.
 // The images are written to a directory under the OS temp directory,
 // removed at the end whether the test passes or fails.
 package main
@@ -116,6 +118,106 @@ open :: proc(path: string, what: string) -> (d: disc.Disc, ok: bool) {
 		fail("%s: open", what)
 	}
 	return
+}
+
+@(private = "file")
+hook_seen: struct {
+	d:     ^disc.Disc,
+	lba:   u32,
+	size:  int,
+	ok:    bool,
+	calls: int,
+}
+
+@(private = "file")
+hook_record :: proc(d: ^disc.Disc, lba: u32, buf: []u8, ok: bool) {
+	hook_seen = {d = d, lba = lba, size = len(buf), ok = ok, calls = hook_seen.calls + 1}
+}
+
+@(private = "file")
+hook_modify :: proc(d: ^disc.Disc, lba: u32, buf: []u8, ok: bool) -> bool {
+	hook_record(d, lba, buf, ok)
+	buf[0] = 0xa5
+	return ok
+}
+
+@(private = "file")
+hook_fill :: proc(d: ^disc.Disc, lba: u32, buf: []u8, ok: bool) -> bool {
+	hook_record(d, lba, buf, ok)
+	for &b in buf[disc.DATA:] {
+		b = 0x5a
+	}
+	return true
+}
+
+@(private = "file")
+hook_pass :: proc(d: ^disc.Disc, lba: u32, buf: []u8, ok: bool) -> bool {
+	hook_record(d, lba, buf, ok)
+	return ok
+}
+
+@(private = "file")
+all_byte :: proc(buf: []u8, value: u8) -> bool {
+	for b in buf {
+		if b != value {return false}
+	}
+	return true
+}
+
+// The port-owned read hook sees the complete request after the image read.
+@(private = "file")
+test_read_hook :: proc(iso: []u8) {
+	d, ok := open(write("hook.iso", iso), "read hook")
+	if !ok {return}
+	defer disc.close(&d)
+	defer disc.read_hook = nil
+
+	buf: [2 * disc.DATA]u8
+	disc.read_hook = nil
+	check(
+		disc.read(&d, 22, buf[:disc.DATA]) &&
+		string(buf[:disc.DATA]) == string(discimg.sector(iso, 22)),
+		"read hook: nil leaves a good read unchanged",
+	)
+	check(!disc.read(&d, discimg.VOLUME, buf[:disc.DATA]), "read hook: nil leaves failure unchanged")
+
+	hook_seen = {}
+	disc.read_hook = hook_modify
+	check(disc.read(&d, 22, buf[:]) && buf[0] == 0xa5, "read hook: modifies a good read")
+	check(
+		hook_seen.d == &d && hook_seen.lba == 22 && hook_seen.size == len(buf) &&
+		hook_seen.ok && hook_seen.calls == 1,
+		"read hook: good read arguments",
+	)
+
+	for &b in buf {
+		b = 0xcc
+	}
+	hook_seen = {}
+	disc.read_hook = hook_fill
+	check(disc.read(&d, discimg.VOLUME - 1, buf[:]), "read hook: fills past the image")
+	check(
+		all_byte(buf[:disc.DATA], 0) && all_byte(buf[disc.DATA:], 0x5a),
+		"read hook: keeps image data and fills the missing sector",
+	)
+	check(
+		hook_seen.d == &d && hook_seen.lba == discimg.VOLUME - 1 &&
+		hook_seen.size == len(buf) && !hook_seen.ok && hook_seen.calls == 1,
+		"read hook: partial read arguments",
+	)
+
+	for &b in buf[:disc.DATA] {
+		b = 0xcc
+	}
+	hook_seen = {}
+	disc.read_hook = hook_pass
+	check(!disc.read(&d, discimg.VOLUME, buf[:disc.DATA]), "read hook: propagates failure")
+	check(
+		hook_seen.d == &d && hook_seen.lba == discimg.VOLUME &&
+		hook_seen.size == disc.DATA && !hook_seen.ok && hook_seen.calls == 1,
+		"read hook: failed read arguments",
+	)
+	check(all_byte(buf[:disc.DATA], 0xcc), "read hook: failed read buffer unchanged")
 }
 
 @(private = "file")
@@ -416,6 +518,7 @@ main :: proc() {
 	}
 	iso := discimg.make_iso(discimg.CNF_PS2)
 	test_formats(iso, discimg.make_raw(discimg.make_iso(discimg.CNF_PS1), 1), discimg.make_raw(iso, 2), discimg.make_audio(discimg.AUDIO))
+	test_read_hook(iso)
 	test_dual_layer(iso)
 	test_corrupt(iso)
 	test_id()
