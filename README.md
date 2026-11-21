@@ -39,8 +39,8 @@ have bugs.
 
 | System | Status |
 |---|---|
-| Linux | The only system games have been played on. Automated tests run on x86-64 and arm64. |
-| Windows | Untested with games. Only the automated tests have run here. |
+| Linux | Games have been played here. The automated tests run here. |
+| Windows | A port runs here natively with Vulkan: [SDF_Macross](https://github.com/Tzeentchnet/SDF_Macross). |
 | macOS | Untested. The code is type-checked for macOS, but neither games nor the automated tests run there. |
 
 ## Guides
