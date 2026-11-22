@@ -1047,9 +1047,10 @@ th_mark :: proc() -> Th_Mark {
 	return {s.next_thid, s.next_semid, s.next_evfid, s.next_mbxid, s.next_fplid}
 }
 
-// Undoes a failed load: deletes the semaphores, event flags and threads
-// made since mark `m`, killing the threads' coroutines. Their stacks are
-// freed by the caller's sys_blocks restore.
+// Undoes a failed load: deletes the semaphores, event flags, message boxes,
+// block pools and threads made since mark `m`, killing the threads'
+// coroutines. The threads' stacks and the pools' memory are freed by the
+// caller's sys_blocks restore, so the pools are dropped without sys_free.
 th_undo :: proc(m: Th_Mark) {
 	s := &iop_sched
 	thid := m.thid
@@ -1750,8 +1751,15 @@ FA_THPRI :: 0x001
 @(private = "file")
 FA_MEMBTM :: 0x200 // the pool at the top of the highest gap that fits
 
+// A broken free list was shown, once a run; not state.
+@(private = "file")
+fpl_broken_logged: bool
+
 // Function fno of thfpool, as th_base: CreateFpl, DeleteFpl, pAllocateFpl,
-// ipAllocateFpl and FreeFpl. The blocking AllocateFpl (6) is not served.
+// ipAllocateFpl, FreeFpl and (i)ReferFplStatus. The blocking AllocateFpl
+// (6) is not served. The free list lives in guest memory, so a guest write
+// to a freed block can break it: an allocation checks the link it takes,
+// and a walk stops at the first bad one.
 th_fpool :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	s := &iop_sched
 	a0, a1 := r3000.state.r[4], r3000.state.r[5]
@@ -1773,6 +1781,8 @@ th_fpool :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		s.next_fplid += 1
 		return s.next_fplid - 1, true
 	case 5: // DeleteFpl(fplid): its memory goes back to sysmem
+		// No thread waits on a pool while 6 is not served. Serving 6 needs
+		// this to wake the waiters with KE_WAIT_DELETE, as mbx_delete does.
 		for f, i in s.fpls {
 			if f.id != a0 {continue}
 			sys_free(f.base)
@@ -1785,18 +1795,60 @@ th_fpool :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if f == nil {return ke(KE_UNKNOWN_FPLID), true}
 		if f.free == 0 {return ke(KE_NO_MEMORY), true}
 		b := f.free
-		f.free = r32(b)
+		next := r32(b)
+		if next != 0 && !fpl_block(f, next) {
+			// A guest write to the free block broke the link: the pool is
+			// left as it is, and no block outside it is handed out.
+			if !fpl_broken_logged {
+				fpl_broken_logged = true
+				fmt.eprintfln("iop: pool %d's free block %08x links to %08x, not a block of the pool; KE_NO_MEMORY", f.id, b, next)
+			}
+			return ke(KE_NO_MEMORY), true
+		}
+		f.free = next
 		return b, true
 	case 9: // FreeFpl(fplid, block): back on the free list
+		// No thread waits on a pool while 6 is not served. Serving 6 needs
+		// this to hand the block to the first waiter instead.
 		f := fpl_find(a0)
 		if f == nil {return ke(KE_UNKNOWN_FPLID), true}
-		off := a1 - f.base
-		if a1 < f.base || off >= f.block_size * f.blocks || off % f.block_size != 0 {return ke(KE_ILLEGAL_MEMBLOCK), true}
+		if !fpl_block(f, a1) {return ke(KE_ILLEGAL_MEMBLOCK), true}
+		// A block already free would make the list loop on itself.
+		if _, listed := fpl_walk(f, a1); listed {return ke(KE_ILLEGAL_MEMBLOCK), true}
 		w32(a1, f.free)
 		f.free = a1
 		return KE_OK, true
+	case 11, 12: // ReferFplStatus(fplid, iop_fpl_info_t *), iReferFplStatus
+		f := fpl_find(a0)
+		if f == nil {return ke(KE_UNKNOWN_FPLID), true}
+		free, _ := fpl_walk(f, 0)
+		// attr, option, block size, blocks, free blocks, waiters (none
+		// while 6 is not served), then 4 reserved words.
+		for w, i in ([10]u32{f.attr, f.option, f.block_size, f.blocks, free, 0, 0, 0, 0, 0}) {
+			w32(a1 + 4 * u32(i), w)
+		}
+		return KE_OK, true
 	}
 	return 0, false
+}
+
+// Whether `b` is a block of pool `f`: inside it, on a block's start.
+@(private = "file")
+fpl_block :: proc(f: ^Iop_Fpl, b: u32) -> bool {
+	off := b - f.base
+	return b >= f.base && off < f.block_size * f.blocks && off % f.block_size == 0
+}
+
+// Walks pool `f`'s free list, at most `blocks` links and only through
+// blocks of the pool: the free blocks counted, and whether `b` (not 0) is
+// one of them.
+@(private = "file")
+fpl_walk :: proc(f: ^Iop_Fpl, b: u32) -> (free: u32, listed: bool) {
+	for p := f.free; p != 0 && free < f.blocks && fpl_block(f, p); p = r32(p) {
+		if p == b {return free, true}
+		free += 1
+	}
+	return free, false
 }
 
 @(private = "file")

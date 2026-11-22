@@ -73,9 +73,12 @@
 // - mc2_s1, the driver some games load instead (Burnout 3), has no 13:
 //   command 4 answers 2 for a new card and clears the mark itself, and
 //   while the card is new every command but 4 is refused as above, 13 too.
-//   Once the card is known, 13 is a command it does not have. Its other
-//   commands are mc2_d's. (MC2_S1.IRX v0x305, by module offset: the
-//   dispatcher's refusal at 0x1fa0, which lets only 4 through; its jump
+//   Once the card is known, 13 is a command it does not have: it answers
+//   result 1, as the setup before the dispatch left it, having done
+//   nothing. Its other commands are mc2_d's. (MC2_S1.IRX v0x305, by module
+//   offset: the dispatcher's refusal at 0x1fa0, which lets only 4 through;
+//   the setup's result 1 at 0x1fe8; the bound check at 0x2118, which sends
+//   a command 0 or above 12 straight to the reply at 0x2a64; its jump
 //   table at 0x34a0, commands 1..12; command 4 at 0x2914, which reads the
 //   mark (0x534) and on 2 stores 0 (0x558).) The load's name picks the
 //   driver (dbcman_module).
@@ -215,6 +218,11 @@ Dbc_Pad_Driver :: struct {
 // DualShock 2 mode: 18, the pressures too. Neither module checks the
 // pressures against the buttons in a way pad_poll_bytes' could fail (ds2u
 // sets a pressure of 0 for a held button to 1, and of a released one to 0).
+// ds2o (Burnout 3's DS2O.IRX, "PsIIpdman 2800") is served as ds2u: its code
+// is ds2u's (DS2U.IRX "3000") but for a guard, which sends the pressure
+// setup only to a pad whose mode list has id 7 (flag 2 at +0x1b4, set at
+// 0x448, read at 0x4e8), as a DualShock 2's does; then 0x4f with ff ff 03 00,
+// all 18 bytes (0x578, 0xee8). ds1o_d has no 0x4f.
 DBC_DS1O_D :: Dbc_Pad_Driver{0x73, {0xff, 0xff, 0x0f, 0x00}}
 DBC_DS2U :: Dbc_Pad_Driver{0x79, {0xff, 0xff, 0xff, 0xff}}
 
@@ -300,8 +308,8 @@ dbcman_module :: proc(path: string, image: []u8 = nil) {
 	case strings.equal_fold(name, "mc2_s1"): mc2.s1 = true
 	}
 	switch {
-	case strings.equal_fold(name, "ds1o_d") || strings.equal_fold(name, "ds2o") || strings.equal_fold(name, "ds2o_d"): dbc.pad = DBC_DS1O_D
-	case strings.equal_fold(name, "ds2u") || strings.equal_fold(name, "ds2u_d"): dbc.pad = DBC_DS2U
+	case strings.equal_fold(name, "ds1o_d") || strings.equal_fold(name, "ds2o_d"): dbc.pad = DBC_DS1O_D
+	case strings.equal_fold(name, "ds2u") || strings.equal_fold(name, "ds2u_d") || strings.equal_fold(name, "ds2o"): dbc.pad = DBC_DS2U
 	case: return
 	}
 	dbc.frame = {}

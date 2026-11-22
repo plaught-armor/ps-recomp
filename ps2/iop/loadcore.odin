@@ -758,6 +758,10 @@ modload_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 22: // SearchModuleByName(name): the newest such module's id, or KE_UNKNOWN_MODULE
 		if r[4] == 0 {return ke(KE_UNKNOWN_MODULE), true}
 		name := cstr(r[4])
+		// A Sony module's name is never found (none is loaded), so a module
+		// that looks for one to gate its own start takes its "not found"
+		// path: the name shows which.
+		if cpu.debug >= 1 {fmt.eprintfln("iop: SearchModuleByName(%q) ra %08x", name, r[31])}
 		#reverse for m in iop_loader.modules {
 			m := m
 			if strings.truncate_to_byte(string(m.name[:]), 0) == name {return m.id, true}

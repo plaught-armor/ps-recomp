@@ -4717,6 +4717,26 @@ test_fpool :: proc() {
 	check(fp(7, id) == ke(-400), "thfpool: pAllocateFpl of an empty pool is KE_NO_MEMORY")
 	check(fp(9, id, b1 + 4) == ke(-426) && fp(9, id, b2 + 8) == ke(-426), "thfpool: FreeFpl of no block of the pool is KE_ILLEGAL_MEMBLOCK")
 	check(fp(9, id, b1) == 0 && fp(7, id) == b1, "thfpool: a freed block is the next one allocated")
+	// A double free is refused, the head and a block further down alike,
+	// and the list keeps no loop.
+	INFO :: 0x1f0100
+	free_n :: proc(id: u32) -> u32 {
+		check(fp(11, id, INFO) == 0, "thfpool: ReferFplStatus served")
+		return iop.iop_u32(INFO + 16)^
+	}
+	check(fp(9, id, b0) == 0 && fp(9, id, b2) == 0 && free_n(id) == 2, "thfpool: two blocks freed, 2 free")
+	check(fp(9, id, b2) == ke(-426) && fp(9, id, b0) == ke(-426), "thfpool: FreeFpl of a block already free is KE_ILLEGAL_MEMBLOCK")
+	check(free_n(id) == 2 && iop.iop_u32(INFO + 8)^ == 8 && iop.iop_u32(INFO + 12)^ == 3 && iop.iop_u32(INFO + 20)^ == 0, "thfpool: ReferFplStatus: block size 8, 3 blocks, 2 free, no waiters")
+	check(fp(12, id, INFO) == ke(-100), "thfpool: iReferFplStatus off a handler is KE_ILLEGAL_CONTEXT")
+	// A guest write to the free head (b2, linking to b0) breaks the list:
+	// an address outside the pool, then one inside it off a block's start.
+	// The allocation is refused and the pool is left as it was.
+	iop.iop_u32(b2)^ = 0x100
+	check(fp(7, id) == ke(-400) && iop.iop_u32(b2)^ == 0x100, "thfpool: a link outside the pool is KE_NO_MEMORY")
+	iop.iop_u32(b2)^ = b0 + 4
+	check(fp(7, id) == ke(-400) && free_n(id) == 1, "thfpool: a link off a block's start is KE_NO_MEMORY; the walk stops there")
+	iop.iop_u32(b2)^ = b0
+	check(fp(7, id) == b2 && fp(7, id) == b0 && fp(7, id) == ke(-400), "thfpool: the link mended, both blocks handed out")
 	check(fp(7, 9) == ke(-412) && fp(9, 9, b0) == ke(-412) && fp(5, 9) == ke(-412), "thfpool: an unknown id is KE_UNKNOWN_FPLID")
 	check(fp(8, id) == ke(-100), "thfpool: ipAllocateFpl off a handler is KE_ILLEGAL_CONTEXT")
 	iop.iop_u32(P)^ = 0x2
@@ -7561,9 +7581,9 @@ test_dbcman :: proc() {
 	check(r[0x208c / 4] == 1, "dbcman 131b 0x8000131c: a driver call")
 	iop.dbcman_module("ds2o_d")
 	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 131b: no image, still 131b; ds2o_d served as ds1o_d")
-	iop.dbcman_module("ds2u")
 	iop.dbcman_module("cdrom0:\\IOP\\DS2O.IRX;1")
-	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 131b: ds2o, after ds2u, served as ds1o_d")
+	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x79, "dbcman 131b: ds2o, after ds2o_d, served as ds2u")
+	iop.dbcman_module("ds1o_d")
 	mid_off :: proc(buf: []u8) -> bool {return !iop.sif.servers[iop.DBC_SID_MID](0, buf, 0x90) && pad_cmd(buf, 0, 0, 0x0101800c) == 1}
 	iop.dbcman_module("dbc.irx", dbc_image(0x310))
 	check(mid_off(buf[:]), "dbcman: a 0x310 image, the fast set")
