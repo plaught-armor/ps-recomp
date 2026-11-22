@@ -364,6 +364,7 @@ notes, settings and picture it holds a port that builds as it is:
 | `port/src/local.odin` | Reads `local.tsv`: the disc image, the player's data for the disc, its settings, memory cards and learned code. |
 | `tests/run.sh` | A headless compatibility run of `port/game`, `press.txt` as its input, to a frame count (3600 by default), on the player's memory cards for the disc. |
 | `local.tsv` | Where the disc image and the player's data are. Git ignores it. |
+| `.recomp.json` | The port's row on [recomp.fyi](https://recomp.fyi/add.html), read from the root of a public repository: game, system, serial, `status` `exploring`, `targets` `Linux`. Move `status` on as the port grows; add `region`, `maintainers` and `notes` there. It never names the disc image: the site refuses a file that mentions a ROM or an ISO. |
 
 The README gives the commands: add ps-recomp as a submodule at the
 commit of the player that wrote the export, then `sh setup.sh`. The

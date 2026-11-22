@@ -1239,8 +1239,8 @@ test_export :: proc() {
 	files := listed(out1)
 	port := []string{"port/build.sh", "port/src/local.odin", "port/src/main.odin"}
 	tools := []string{"tests/run.sh", "tools/recomp.tsv"}
-	want := slice.concatenate([][]string{{".gitignore", "README.md", "docs/notes.md", "local.tsv"}, port, {"press.txt", "settings.tsv", "setup.sh", "shots/thumb.png"}, tools}, context.temp_allocator)
-	ps2_want := slice.concatenate([][]string{{".gitignore", "README.md", "docs/notes.md", "local.tsv"}, port, {"setup.sh"}, tools}, context.temp_allocator)
+	want := slice.concatenate([][]string{{".gitignore", ".recomp.json", "README.md", "docs/notes.md", "local.tsv"}, port, {"press.txt", "settings.tsv", "setup.sh", "shots/thumb.png"}, tools}, context.temp_allocator)
+	ps2_want := slice.concatenate([][]string{{".gitignore", ".recomp.json", "README.md", "docs/notes.md", "local.tsv"}, port, {"setup.sh"}, tools}, context.temp_allocator)
 	check(name, slice.equal(files, want), fmt.tprint("PS1 files:", files))
 	check(name, read(out1, "settings.tsv") == settings && read(out1, "press.txt") == press, "settings or press not copied")
 	png := read(out1, "shots/thumb.png")
@@ -1264,6 +1264,9 @@ test_export :: proc() {
 	check(name, strings.contains(ps1_readme, "it needs the network"), "README does not say the submodule add needs the network")
 	check(name, strings.contains(ps1_readme, "as the player does: with `settings.tsv`, the player's"), "PS1 README does not name its settings.tsv")
 	check(name, strings.contains(ps1_readme, "```sh\nplay <your disc image>\nsh setup.sh\n"), "PS1 README has no LEARN step")
+	manifest := read(out1, ".recomp.json")
+	check(name, strings.contains(manifest, "\"$schema\": \"https://recomp.fyi/schema/v1.json\"") && strings.contains(manifest, "\"system\": \"PS1\"") && strings.contains(manifest, "\"status\": \"exploring\"") && strings.contains(manifest, "\"targets\": [\n    \"Linux\"\n  ]"), fmt.tprintf("PS1 .recomp.json:\n%s", manifest))
+	check(name, !strings.contains(manifest, ps1) && !strings.contains(manifest, filepath.base(ps1)), fmt.tprintf("PS1 .recomp.json names the disc image:\n%s", manifest))
 	clean(name, out1, files, forbidden)
 
 	out2, _ := filepath.join({tmp, "export_ps2_repo"}, context.temp_allocator)
@@ -1279,6 +1282,7 @@ test_export :: proc() {
 	readme := read(out2, "README.md")
 	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "- `settings.tsv`"), fmt.tprintf("PS2 README:\n%s", readme))
 	check(name, strings.contains(readme, "as the player does: with the player's") && !strings.contains(readme, "PS_LEARN=1"), fmt.tprintf("PS2 README names a settings.tsv or the LEARN step:\n%s", readme))
+	check(name, strings.contains(read(out2, ".recomp.json"), "\"system\": \"PS2\""), fmt.tprintf("PS2 .recomp.json:\n%s", read(out2, ".recomp.json")))
 	clean(name, out2, files, forbidden)
 
 	// Refused: the directory again, and one holding another file.

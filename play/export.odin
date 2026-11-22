@@ -22,13 +22,16 @@
 // repository's settings.tsv, the player's memory cards for the disc and its
 // learned code when the player that made it is the port's ps-recomp
 // commit), and tests/run.sh (a compatibility run of the port). The README
-// gives the commit: the player's own.
+// gives the commit: the player's own. .recomp.json lists the port on
+// recomp.fyi once the repository is public: the game, system and serial,
+// status exploring, never the disc image.
 //
 // The export is written to <dir>.ps-recomp-export and then renamed to dir,
 // so a failed one leaves no half repository. dir must be missing or an
 // empty directory: an export never overwrites or merges.
 package play
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
@@ -55,6 +58,7 @@ Export_File :: enum {
 	Main,
 	Port_Local,
 	Run,
+	Manifest,
 }
 
 EXPORT_FILES :: [Export_File]string {
@@ -71,6 +75,7 @@ EXPORT_FILES :: [Export_File]string {
 	.Main       = "port/src/main.odin",
 	.Port_Local = "port/src/local.odin",
 	.Run        = "tests/run.sh",
+	.Manifest   = ".recomp.json",
 }
 
 // The .gitignore: everything ignored, then the tracked files listed.
@@ -82,6 +87,7 @@ EXPORT_IGNORE :: `# Only the files listed here are tracked. local.tsv (the paths
 /*
 !/.gitignore
 !/.gitmodules
+!/.recomp.json
 !/ps-recomp
 !/README.md
 !/settings.tsv
@@ -458,7 +464,7 @@ export :: proc(image, dir: string) -> int {
 // info, into the new directory root. False, after a message, on a failure.
 @(private = "file")
 export_write :: proc(root, src, id: string, info: [Info]string, psx_exe: bool) -> bool {
-	files: bit_set[Export_File] = {.Readme, .Ignore, .Local, .Notes, .Recomp, .Setup, .Build, .Main, .Port_Local, .Run}
+	files: bit_set[Export_File] = {.Readme, .Ignore, .Local, .Notes, .Recomp, .Setup, .Build, .Main, .Port_Local, .Run, .Manifest}
 	copied := [?]struct {
 		file: Export_File,
 		from: core.Disc_File,
@@ -493,6 +499,7 @@ export_write :: proc(root, src, id: string, info: [Info]string, psx_exe: bool) -
 	main_odin, _ = strings.replace(main_odin, "{title}", fmt.tprintf("%q", export_title(id, info)), 1, context.temp_allocator)
 	export_put(root, .Main, transmute([]u8)main_odin) or_return
 	export_put(root, .Run, transmute([]u8)string(PORT_RUN)) or_return
+	export_put(root, .Manifest, export_manifest(id, info)) or_return
 	return export_put(root, .Readme, export_readme(id, info, files))
 }
 
@@ -526,6 +533,54 @@ export_recomp :: proc(info: [Info]string, psx_exe: bool) -> []u8 {
 	}
 	strings.write_string(&b, "out\tport/src/rec\nquiet\ttrue\n")
 	return b.buf[:]
+}
+
+// .recomp.json: the port's row on recomp.fyi (https://recomp.fyi/add.html),
+// which reads the file from the repository's root. It names the game and its
+// serial, never the disc image: the site refuses a file that names a ROM or
+// an ISO. The status starts at exploring, for the porter to move on.
+@(private = "file")
+export_manifest :: proc(id: string, info: [Info]string) -> []u8 {
+	Original :: struct {
+		serial: string,
+	}
+	Link :: struct {
+		label: string,
+		url:   string,
+	}
+	Manifest :: struct {
+		schema:    string `json:"$schema"`,
+		game:      string,
+		system:    string,
+		type:      string,
+		original:  Maybe(Original) `json:"original,omitempty"`,
+		project:   string,
+		status:    string,
+		targets:   []string,
+		toolchain: string,
+		approach:  string,
+		links:     []Link,
+	}
+	title := export_title(id, info)
+	ps2 := info[.System] == "ps2"
+	targets := [?]string{"Linux"}
+	links := [?]Link{{"ps-recomp", "https://github.com/plaught-armor/ps-recomp"}}
+	m := Manifest {
+		schema    = "https://recomp.fyi/schema/v1.json",
+		game      = title,
+		system    = "PS2" if ps2 else "PS1",
+		type      = "recomp",
+		original  = Original{info[.Serial]} if info[.Serial] != "" else nil,
+		project   = fmt.tprintf("%s recomp", title),
+		status    = "exploring",
+		targets   = targets[:],
+		toolchain = "ps-recomp",
+		approach  = "Static recompilation of the EE code to Odin on a reimplemented PS2, no BIOS; Vulkan renderer" if ps2 else "Static recompilation of the MIPS code to Odin on a reimplemented PS1, no BIOS; Vulkan renderer",
+		links     = links[:],
+	}
+	data, err := json.marshal(m, {pretty = true, use_spaces = true, spaces = 2}, context.temp_allocator)
+	assert(err == nil, "a fixed struct of strings marshals")
+	return data
 }
 
 // The disc's name: its title, else its serial, else its id.
@@ -583,6 +638,7 @@ export_readme :: proc(id: string, info: [Info]string, files: bit_set[Export_File
 		"code, memory cards, logs), which stay where they are.\n\n",
 	)
 	strings.write_string(&b, "- `docs/notes.md`: your notes, and the player's last compatibility run\n")
+	strings.write_string(&b, "- `.recomp.json`: the port's row on https://recomp.fyi once the repository is\n  public; move `status` on from `exploring` as the port grows\n")
 	if .Settings in files {
 		strings.write_string(&b, "- `settings.tsv`: the player's settings for this disc, `NAME<TAB>value` rows\n")
 	}
