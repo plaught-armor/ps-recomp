@@ -223,9 +223,27 @@ cd_spin :: proc() {
 	iop_cd.stopped = false
 }
 
+// Sectors a second the drive reads at a PS2's default speeds, 4x for a DVD
+// (1x is 1,385,000 bytes a second) and 24x for a CD (1x is 153,600), in
+// 2048-byte sectors.
+CD_DVD_RATE :: 4 * 1_385_000 / DISC_SECTOR
+CD_CD_RATE :: 24 * 153_600 / DISC_SECTOR
+
+// The least a read takes, in EE cycles: 1 ms, for the drive's seek and the
+// completion interrupt, so even a read of no sectors ends after its call.
+CD_READ_MIN_EE :: cpu.EE_CLOCK / 1000
+
+// The EE cycles the drive takes to read `sectors` sectors (cdvdfsv's Read
+// and stream reads): the time at the disc's rate, never under CD_READ_MIN_EE.
+cd_read_ee :: proc(sectors: u32) -> u64 {
+	rate: u64 = CD_DVD_RATE if cd_disk_type() == CD_DISK_PS2_DVD else CD_CD_RATE
+	return max(u64(sectors) * cpu.EE_CLOCK / rate, CD_READ_MIN_EE)
+}
+
 // cdvdfsv's stream N-command (sceCdSt*): {lsn, sectors, EE buffer, cmd,
-// mode[3]}, the answer as the command's sceCdSt call returns it. A read is
-// done at once, so the ring always holds every sector it can: a read takes
+// mode[3]}, the answer as the command's sceCdSt call returns it. A read's
+// data lands at once, its RPC_END after cd_read_ee, and the ring always
+// holds every sector it can: a read takes
 // all it asks for, error 0 in the answer's high half, and the status is the
 // ring's size while the stream runs. Pause and resume change nothing a read
 // sees. A read with no stream running takes nothing.
@@ -240,6 +258,7 @@ cd_stream :: proc(cmd, lsn, sectors, dest: u32) -> u32 {
 		n := sectors & 0xffff
 		disc_read(s.st_lsn, n, dest)
 		s.st_lsn += n
+		sif.call_hold = cd_read_ee(n)
 		return n
 	case 3: s.st_on = false // sceCdStStop
 	case 4, 9: s.st_lsn = lsn // sceCdStSeek, sceCdStSeekF

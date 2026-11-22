@@ -68,6 +68,9 @@ sif: struct {
 	sreg:      [32]u32,
 	ee_buf:    u32, // EE receive buffer for replies
 	replies:   [dynamic]Sif_Reply,
+	// RPC_ENDs held back until the disc drive's read is over (sif_reply's
+	// hold), first due first: each joins replies at its due.
+	held:      [dynamic]Sif_Reply,
 	servers:   map[u32]Rpc_Server,
 	bound:     map[u32]u32, // sid -> fake server descriptor address
 	next_dma:  i32,
@@ -79,6 +82,9 @@ sif: struct {
 	// The EE client of the RPC a host server is answering, 0 outside one:
 	// set and cleared around the server's call in sif_command's RPC_CALL.
 	call_client: u32,
+	// The EE cycles the server of the RPC being answered holds its RPC_END
+	// back, 0 for none: set by the server, taken by sif_command's RPC_CALL.
+	call_hold: u64,
 }
 
 sif_init :: proc() {
@@ -233,14 +239,25 @@ sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 // is due at EE now; one an IOP thread sends (from_iop) is due no earlier
 // than the IOP clock, which runs up to a slice past EE now while it idles.
 @(private)
-sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false) {
+// Queues a packet for the EE. With hold, it waits hold EE cycles after the
+// held packet before it, as a disc drive's reads follow one another, and
+// then joins the queue: the packets queued meanwhile go ahead of it.
+sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u64 = 0) {
 	p := make([]u8, 16 + 4 * len(payload))
 	w := ([^]u32)(raw_data(p))
 	w[0] = u32(len(p))
 	w[2] = cid
 	w[3] = opt
 	for v, i in payload {w[4 + i] = v}
-	sif_queue(p, from_iop)
+	if hold == 0 {
+		sif_queue(p, from_iop)
+		return
+	}
+	start := cpu.state.cycles
+	if n := len(sif.held); n != 0 {start = max(start, sif.held[n - 1].due)}
+	due := start + hold
+	append(&sif.held, Sif_Reply{due, p})
+	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, due)}
 }
 
 // Queue a copy of packet `p`, its header filled in, sent by an IOP thread
@@ -264,21 +281,31 @@ sif_wake :: proc() {
 	if !cpu.in_interrupt && sif_next_ee() <= cpu.state.cycles {cpu.next_event = cpu.state.cycles}
 }
 
-// The EE cycle the next queued reply may arrive at, max(u64) with none.
+// The EE cycle the next queued or held reply may arrive at, max(u64) with
+// none.
 sif_next_ee :: proc() -> u64 {
-	return max(u64) if len(sif.replies) == 0 else sif.replies[0].due
+	due := max(u64) if len(sif.replies) == 0 else sif.replies[0].due
+	if len(sif.held) != 0 {due = min(due, sif.held[0].due)}
+	return due
 }
 
 // Drop every queued reply.
 sif_drop_replies :: proc() {
 	for r in sif.replies {delete(r.p)}
 	clear(&sif.replies)
+	for r in sif.held {delete(r.p)}
+	clear(&sif.held)
 }
 
 // Move the next queued reply into the EE buffer once it is due and the EE
 // has consumed the previous one. Called while delivering interrupts.
 sif_pump :: proc() {
-	if sif_next_ee() > cpu.state.cycles || sif.ee_buf == 0 || mem.dmac_stat & (1 << mem.DMA_SIF0) != 0 {return}
+	for len(sif.held) != 0 && sif.held[0].due <= cpu.state.cycles {
+		r := sif.held[0]
+		ordered_remove(&sif.held, 0)
+		sif_queue(r.p, false)
+	}
+	if len(sif.replies) == 0 || sif.replies[0].due > cpu.state.cycles || sif.ee_buf == 0 || mem.dmac_stat & (1 << mem.DMA_SIF0) != 0 {return}
 	r := sif.replies[0]
 	ordered_remove(&sif.replies, 0)
 	copy(mem.ram_slice(sif.ee_buf, u32(len(r.p))), r.p)
@@ -415,9 +442,11 @@ sif_command :: proc(a, pc: u32) {
 		if cdvd_poff_held(sid, fno) {return}
 		buf := iop_mem(server + 0x100, 0xff00)
 		handler, ok := sif.servers[sid]
-		sif.call_client = client
+		sif.call_client, sif.call_hold = client, 0
 		served := ok && handler(fno, buf, send_size)
 		sif.call_client = 0
+		hold := sif.call_hold
+		sif.call_hold = 0
 		if !served {
 			sif_unknown(pc, .Sif_Rpc, sid, fno, client = client)
 			fmt.eprintfln("sif: unhandled rpc %08x fno %d send %d recv %d", sid, fno, send_size, recv_size)
@@ -425,7 +454,7 @@ sif_command :: proc(a, pc: u32) {
 		if receive != 0 && recv_size != 0 {
 			copy(mem.ram_slice(receive, recv_size), buf[:min(recv_size, u32(len(buf)))])
 		}
-		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_CALL, server, 0, 0})
+		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_CALL, server, 0, 0}, hold = hold)
 	case SIF_CMD_RPC_RDATA:
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		src, dest, size := arg(a, 4), arg(a, 5), arg(a, 6)
@@ -1161,7 +1190,9 @@ disc_sectors :: proc(lsn: u32, buf: []u8) {
 }
 
 // cdvdfsv N-commands. The EE library sends them without waiting and learns
-// of completion from the RPC end callback, so a read finishes at once.
+// of completion from the RPC end callback. A read's data lands at once, but
+// its RPC_END waits for the drive's read time (cd_read_ee): a game that
+// starts a read and then records what it started must see the end after.
 @(private)
 cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
@@ -1173,6 +1204,7 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		}
 		if cpu.debug >= 1 {fmt.eprintfln("cdvd: read lsn %x sectors %d -> %08x", w[0], w[1], w[2])}
 		disc_read(w[0], w[1], w[2])
+		sif.call_hold = cd_read_ee(w[1])
 		// The data went straight to the buffer: no unaligned head or tail
 		// for the end callback to copy out of {size1, size2, dest1, dest2}.
 		if w[4] != 0 {
