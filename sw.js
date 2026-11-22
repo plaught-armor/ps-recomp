@@ -1,4 +1,4 @@
-const COMMIT = "663e3e91f358e521cfd2672482dd28118bd35cf7";
+const COMMIT = "185534032c81ab07b6375fb23eae640218c36f7e";
 const SHELL = ["index.html", "page.css", "page.js", "worker.js", "readers.js", "wasi.js", "play.html", "play.js", "play-worker.js", "band.js", "band-worker.js", "learn.js", "native.js", "sdl.js", "net.js", "keys.js", "layout.js", "present.js", "audio.js", "recomp.wasm", "play.wasm", "commit.txt", ];
 // The pages' service worker. It does two things.
 //
