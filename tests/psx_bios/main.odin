@@ -842,6 +842,106 @@ main :: proc() {
 	check("byte written by A(03h)", u32(cpu.r8(CARD_BUF + 0x7f)), 0xa5)
 	check("close", b(0x36, fd), fd)
 
+	// The cards answer on SIO0 as the hardware does, from the same images
+	// the B functions use. Each byte but a frame's last is acknowledged.
+	sio_byte :: proc(tx: u8) -> (rx: u8, ack: bool) {
+		io.events[.Sio] = io.EVENT_OFF
+		bios.sio0_write(0, u32(tx), 1)
+		return u8(bios.sio0_read(0, 1)), io.events[.Sio] != io.EVENT_OFF
+	}
+	// One transaction on port 2 (or 1): select, the bytes, deselect. Every
+	// reply lands in rx; acks counts the acknowledged bytes.
+	sio_frame :: proc(port2: bool, tx: []u8, rx: []u8) -> (acks: int) {
+		ctrl: u32 = port2 ? 0x3003 : 0x1003
+		bios.sio0_write(0xa, 0, 2)
+		bios.sio0_write(0xa, ctrl, 2)
+		for t, k in tx {
+			got, ack := sio_byte(t)
+			rx[k] = got
+			if ack {acks += 1}
+		}
+		bios.sio0_write(0xa, 0, 2)
+		return
+	}
+	{
+		// ID: the card's FLAG says it has not been written since power-on.
+		id_tx: [10]u8
+		id_tx[0], id_tx[1] = 0x81, 'S'
+		id_rx: [10]u8
+		check("ID acks", u32(sio_frame(false, id_tx[:], id_rx[:])), 9)
+		want_id := [10]u8{0xff, 0x08, 0x5a, 0x5d, 0x5c, 0x5d, 0x04, 0x00, 0x00, 0x80}
+		for w, k in want_id {
+			check(fmt.tprintf("ID byte %d", k), u32(id_rx[k]), u32(w))
+		}
+
+		// Read frame 0 of the card in slot 1: the bytes _card_read gives,
+		// the checksum over the sector number and the data, then 'G'.
+		READ_LEN :: 10 + 128 + 2
+		rd_tx: [READ_LEN]u8
+		rd_tx[0], rd_tx[1], rd_tx[4], rd_tx[5] = 0x81, 'R', 0x00, 0x00
+		rd_rx: [READ_LEN]u8
+		check("read acks", u32(sio_frame(false, rd_tx[:], rd_rx[:])), READ_LEN - 1)
+		want_rd := [10]u8{0xff, 0x08, 0x5a, 0x5d, 0x00, 0x00, 0x5c, 0x5d, 0x00, 0x00}
+		for w, k in want_rd {
+			check(fmt.tprintf("read byte %d", k), u32(rd_rx[k]), u32(w))
+		}
+		check("_card_read frame 0", b(0x4f, 0x00, 0, CARD_BUF), 1)
+		chk: u8
+		for k in 0 ..< 128 {
+			want := cpu.r8(CARD_BUF + u32(k))
+			if rd_rx[10 + k] != want {
+				fail("SIO read byte %d is %02x, _card_read's %02x", k, rd_rx[10 + k], want)
+			}
+			chk ~= want
+		}
+		check("first bytes of frame 0", u32(rd_rx[10]) | u32(rd_rx[11]) << 8, 'M' | 'C' << 8)
+		check("read checksum", u32(rd_rx[138]), u32(chk))
+		check("read end", u32(rd_rx[139]), 'G')
+
+		// Write frame 0x3f1 of the card in slot 2; _card_read on port 0x10
+		// reads it back. The FLAG then says the card has been written.
+		SECTOR :: 0x3f1
+		WRITE_LEN :: 6 + 128 + 4
+		wr_tx: [WRITE_LEN]u8
+		wr_tx[0], wr_tx[1], wr_tx[4], wr_tx[5] = 0x81, 'W', SECTOR >> 8, SECTOR & 0xff
+		wchk: u8 = (SECTOR >> 8) ~ (SECTOR & 0xff)
+		for k in 0 ..< 128 {
+			wr_tx[6 + k] = u8(k * 3 + 1)
+			wchk ~= wr_tx[6 + k]
+		}
+		wr_tx[134] = wchk
+		wr_rx: [WRITE_LEN]u8
+		check("write acks", u32(sio_frame(true, wr_tx[:], wr_rx[:])), WRITE_LEN - 1)
+		check("write echoes the byte before", u32(wr_rx[7]), u32(wr_tx[6]))
+		check("write ACK1", u32(wr_rx[135]), 0x5c)
+		check("write ACK2", u32(wr_rx[136]), 0x5d)
+		check("write end", u32(wr_rx[137]), 'G')
+		check("_card_read frame 0x3f1", b(0x4f, 0x10, SECTOR, CARD_BUF), 1)
+		for k in 0 ..< 128 {
+			if cpu.r8(CARD_BUF + u32(k)) != wr_tx[6 + k] {
+				fail("_card_read byte %d of the SIO-written frame is %02x", k, cpu.r8(CARD_BUF + u32(k)))
+			}
+		}
+		sio_frame(true, id_tx[:], id_rx[:])
+		check("FLAG after a write", u32(id_rx[1]), 0x00)
+		sio_frame(false, id_tx[:], id_rx[:])
+		check("FLAG of the other card", u32(id_rx[1]), 0x08)
+
+		// A bad checksum is 'N' and leaves the frame as it was.
+		wr_tx[6], wr_tx[134] = 0xee, wchk
+		sio_frame(true, wr_tx[:], wr_rx[:])
+		check("bad checksum end", u32(wr_rx[137]), 'N')
+		b(0x4f, 0x10, SECTOR, CARD_BUF)
+		check("frame after a bad checksum", u32(cpu.r8(CARD_BUF)), 1)
+
+		// The pad answers on port 1 only.
+		pad_tx := [3]u8{0x01, 0x42, 0x00}
+		pad_rx: [3]u8
+		check("port 1 pad acks", u32(sio_frame(false, pad_tx[:], pad_rx[:])) >= 2 ? 1 : 0, 1)
+		check("port 2 pad acks", u32(sio_frame(true, pad_tx[:], pad_rx[:])), 0)
+		check("port 2 pad reply", u32(pad_rx[1]), 0xff)
+	}
+
 	// A(3Eh) puts through the A0 vector is B(3Fh), as the Bios trace shows.
 	clock: u64
 	core.trace.present, core.trace.cycles = &clock, &clock
@@ -1007,7 +1107,7 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs, return-0 stubs, thread tables")
+	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, SIO0 memory cards, A functions run as B, the executable loaders, C library slots, hang stubs, return-0 stubs, thread tables")
 }
 
 // OpenTh, ChangeTh, syscall 3, CloseTh and exception returns between the

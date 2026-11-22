@@ -1,5 +1,7 @@
-// SIO0 (0x1f801040-0x1f80104f): controller port 1 and the pad on it.
-// Memory cards and port 2 answer as absent.
+// SIO0 (0x1f801040-0x1f80104f): the pad on controller port 1 and the
+// memory cards in both slots. The first byte of a transaction picks the
+// device: 0x01 the pad (port 2 has none), 0x81 the card in the port the
+// control register selects.
 //
 // The pad is a digital pad (ID 0x41), or a DualShock when rumble is enabled
 // (pad_set_rumble). The DualShock follows the SCPH-1200 protocol: it answers
@@ -37,11 +39,21 @@ sio: struct {
 	baud:   u32,
 	rx:     u8,
 	rx_full: bool,
-	// Byte position within the current pad transaction; -1 when no device
+	// Byte position within the current transaction; -1 when no device
 	// answers.
 	step:   int,
+	// The device answering the current transaction, picked by its first
+	// byte.
+	dev:    Sio_Device,
 	ack:    bool,
 	irq:    bool,
+}
+
+@(private)
+Sio_Device :: enum u8 {
+	None,
+	Pad,
+	Card,
 }
 
 @(private)
@@ -205,11 +217,32 @@ sio_transfer :: proc(tx: u8) {
 	}
 	sio.rx_full = true
 	selected := sio.ctrl & 0x2 != 0
-	if !selected || sio.ctrl & 0x2000 != 0 || sio.step < 0 {
+	if !selected || sio.step < 0 {
 		sio.rx = 0xff
 		return
 	}
-	rx, ack := pad_response(tx)
+	if sio.step == 0 {
+		port2 := sio.ctrl & 0x2000 != 0
+		switch {
+		case tx == 0x01 && !port2:
+			sio.dev = .Pad
+		case tx == 0x81:
+			sio.dev = .Card
+			mcd.slot = port2 ? CARD_SLOT_2 : CARD_SLOT_1
+		case:
+			sio.dev = .None
+		}
+	}
+	rx: u8 = 0xff
+	ack := false
+	switch sio.dev {
+	case .Pad:
+		rx, ack = pad_response(tx)
+	case .Card:
+		rx, ack = mcd_response(tx)
+	case .None:
+		sio.step = -1
+	}
 	if .Sio in core.trace.active {
 		core.tracef(.Sio, "rx %02x ack %v", rx, ack)
 	}
@@ -284,4 +317,142 @@ sio0_write :: proc(reg, v, size: u32) {
 	case 0xe:
 		sio.baud = v & 0xffff
 	}
+}
+
+// The memory card answering a transaction that began with 0x81, per the
+// public nocash PSX specification: commands 'R' (0x52) read a 128-byte
+// frame, 'W' (0x57) write one and 'S' (0x53) the card's ID. The bytes are
+// the slot's image in card.images, the one the BIOS card functions use; a
+// written frame is saved at once, as _card_write saves it.
+@(private)
+mcd: struct {
+	slot:    int,
+	cmd:     u8,
+	sector:  u32,
+	chk:     u8,
+	// The byte sent before the current one: a card echoes it while a frame
+	// is written to it.
+	prev:    u8,
+	// A write's end status: 'G' (0x47) good, 'N' (0x4e) a bad checksum,
+	// 0xff a bad sector.
+	status:  u8,
+	frame:   [FRAME_SIZE]u8,
+	// FLAG bit 3 is set from power-on until the card's first write.
+	written: [CARD_SLOTS]bool,
+}
+
+// The reply to byte sio.step of a card transaction, and whether the card
+// acknowledges it (asks for the next byte).
+@(private)
+mcd_response :: proc(tx: u8) -> (u8, bool) {
+	prev := mcd.prev
+	mcd.prev = tx
+	switch sio.step {
+	case 0:
+		return 0xff, true
+	case 1:
+		mcd.cmd = tx
+		flag: u8 = mcd.written[mcd.slot] ? 0x00 : 0x08
+		return flag, tx == 'R' || tx == 'W' || tx == 'S'
+	case 2:
+		return 0x5a, true
+	case 3:
+		return 0x5d, true
+	}
+	switch mcd.cmd {
+	case 'R':
+		return mcd_read(sio.step, tx, prev)
+	case 'W':
+		return mcd_write(sio.step, tx, prev)
+	case 'S':
+		id := [?]u8{0x5c, 0x5d, 0x04, 0x00, 0x00, 0x80}
+		k := sio.step - 4
+		if k < len(id) {
+			return id[k], k + 1 < len(id)
+		}
+	}
+	return 0xff, false
+}
+
+// 'R': sector MSB and LSB in, ACK1 ACK2, the confirmed sector, 128 data
+// bytes, the checksum (XOR of the sector bytes and the data) and 'G'.
+@(private)
+mcd_read :: proc(step: int, tx, prev: u8) -> (u8, bool) {
+	switch step {
+	case 4:
+		mcd.sector = u32(tx) << 8
+		return 0x00, true
+	case 5:
+		mcd.sector |= u32(tx)
+		return prev, true
+	case 6:
+		return 0x5c, true
+	case 7:
+		return 0x5d, true
+	case 8, 9:
+		if mcd.sector >= CARD_SIZE / FRAME_SIZE {
+			return 0xff, step == 8
+		}
+		mcd.chk = u8(mcd.sector >> 8) ~ u8(mcd.sector)
+		return step == 8 ? u8(mcd.sector >> 8) : u8(mcd.sector), true
+	}
+	k := step - 10
+	switch {
+	case k < FRAME_SIZE:
+		b := frame_ptr(&card.images[mcd.slot], int(mcd.sector))[k]
+		mcd.chk ~= b
+		return b, true
+	case k == FRAME_SIZE:
+		return mcd.chk, true
+	case k == FRAME_SIZE + 1:
+		return 'G', false
+	}
+	return 0xff, false
+}
+
+// 'W': sector MSB and LSB, 128 data bytes and the checksum in, each
+// answered by the byte before it; then ACK1, ACK2 and the end status. A
+// good frame lands on the card with the end status.
+@(private)
+mcd_write :: proc(step: int, tx, prev: u8) -> (u8, bool) {
+	switch step {
+	case 4:
+		mcd.sector = u32(tx) << 8
+		mcd.chk = tx
+		return 0x00, true
+	case 5:
+		mcd.sector |= u32(tx)
+		mcd.chk ~= tx
+		return prev, true
+	}
+	k := step - 6
+	switch {
+	case k < FRAME_SIZE:
+		mcd.frame[k] = tx
+		mcd.chk ~= tx
+		return prev, true
+	case k == FRAME_SIZE:
+		switch {
+		case mcd.sector >= CARD_SIZE / FRAME_SIZE:
+			mcd.status = 0xff
+		case tx != mcd.chk:
+			mcd.status = 'N'
+		case:
+			mcd.status = 'G'
+		}
+		return prev, true
+	case k == FRAME_SIZE + 1:
+		return 0x5c, true
+	case k == FRAME_SIZE + 2:
+		return 0x5d, true
+	case k == FRAME_SIZE + 3:
+		if mcd.status == 'G' {
+			img := &card.images[mcd.slot]
+			copy(frame_ptr(img, int(mcd.sector)), mcd.frame[:])
+			card_save(img)
+			mcd.written[mcd.slot] = true
+		}
+		return mcd.status, false
+	}
+	return 0xff, false
 }
