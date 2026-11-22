@@ -23,7 +23,7 @@ hooks_init :: proc "contextless" () {
 	cpu.irq_check = io.irq_check
 	when core.FLAT {
 		cpu.interp_run = cpu.flat_nested
-		cpu.flat_step = cpu.mod_flat_step
+		cpu.flat_step = bios.flat_step
 	} else {
 		cpu.interp_run = cpu.interp_loop
 	}

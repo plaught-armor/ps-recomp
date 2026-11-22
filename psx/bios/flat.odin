@@ -10,6 +10,12 @@
 // A thread that lost its slot while running (an orphan, the coroutine
 // model's zombie) runs on until it switches away; its run is then dropped,
 // or started over when its slot's new thread first runs.
+//
+// A preempt's switch can be owed until native code returned and interrupts
+// are on. A ChangeTh before then writes the PCB, which would take that switch
+// back, so the owed one lands first and the ChangeTh waits on a continuation
+// (change_waits): on the console the caller was preempted before it got to
+// make that call.
 package psx_bios
 
 import "ps:core"
@@ -38,6 +44,35 @@ when core.FLAT {
 
 	@(private)
 	flat: Bios_Flat
+
+	// The continuation tag of a ChangeTh that waits (beside cpu.FLAT_MOD).
+	@(private = "file")
+	FLAT_CHANGE :: cpu.FLAT_MOD + 1
+
+	// Whether ChangeTh to slot i waits for the switch a preempt owes: the run
+	// stops for that one, and makes the call when it next runs. Not for a
+	// switch the PCB took back, nor in native code (which flat_block names),
+	// nor for an orphan, whose run would be dropped with the call.
+	@(private)
+	change_waits :: proc(i: int) -> bool {
+		if !flat.preempt_owed || !cpu.flat_can_stop() || !slot_owned() {return false}
+		if _, ok := preempt_target(); !ok {return false}
+		cpu.flat_push_cont(FLAT_CHANGE).w[0] = u32(i)
+		cpu.flat_block("ChangeTh")
+		return true
+	}
+
+	// cpu.flat_step for the PS1: a ChangeTh that waited is made, and any other
+	// continuation is a mod thunk's.
+	flat_step :: proc(x: ^cpu.Flat_Ctx, h: ^cpu.Flat_Host) {
+		if h.tag != FLAT_CHANGE {
+			cpu.mod_flat_step(x, h)
+			return
+		}
+		i := h.w[0]
+		cpu.flat_pop_cont()
+		change_thread(i)
+	}
 }
 
 when core.FLAT {

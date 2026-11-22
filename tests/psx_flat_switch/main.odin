@@ -527,7 +527,7 @@ main :: proc() {
 	cpu.bios_syscall = bios.bios_syscall
 	when core.FLAT {
 		cpu.interp_run = cpu.flat_nested
-		cpu.flat_step = cpu.mod_flat_step
+		cpu.flat_step = bios.flat_step
 	} else {
 		cpu.interp_run = cpu.interp_loop
 	}
@@ -627,13 +627,14 @@ passed :: proc() {
 }
 
 // A case run as a child, and how it ends: fatal "" with status 0, else with
-// that fatal under FLAT (the coroutines skip it), learned whether the fatal
-// names the native code to play's known switches.
+// that fatal under FLAT, learned whether the fatal names the native code to
+// play's known switches. The coroutines skip those and the flat_only ones.
 @(private = "file")
 Case :: struct {
-	name:    string,
-	fatal:   string,
-	learned: bool,
+	name:      string,
+	fatal:     string,
+	learned:   bool,
+	flat_only: bool,
 }
 
 @(private = "file")
@@ -642,16 +643,20 @@ CASES :: [?]Case {
 	{name = "below_preempt"},
 	{name = "below_two"},
 	{name = "nest"},
-	{"restart", "a thread closed or started over while held", true},
-	{"closed", "a thread closed or started over while held", true},
-	{"end", "thread 1 returned from its entry", false},
-	{"main_end", "the executable returned from its entry with a thread held", false},
+	{"restart", "a thread closed or started over while held", true, true},
+	{"closed", "a thread closed or started over while held", true, true},
+	{"end", "thread 1 returned from its entry", false, true},
+	{"main_end", "the executable returned from its entry with a thread held", false, true},
+	{name = "owed_change", flat_only = true},
+	{name = "owed_self", flat_only = true},
+	{name = "owed_syscall", flat_only = true},
+	{name = "owed_back", flat_only = true},
 }
 
 @(private = "file")
 run_case :: proc(c: Case) {
 	when !core.FLAT {
-		if c.fatal != "" {return}
+		if c.flat_only {return}
 	}
 	self, err := os.get_executable_path(context.temp_allocator)
 	state: os.Process_State
@@ -709,6 +714,23 @@ child_script :: proc(name: string) {
 		case_one(proc() {op(.End)})
 	case "main_end":
 		case_main_end()
+	case "owed_change":
+		case_owed(proc() {
+			owe_switch()
+			op(.Change, THIRD_THREAD)
+		}, proc() {owed_third()})
+	case "owed_syscall":
+		case_owed(proc() {
+			owe_switch()
+			op(.Syscall, 3, tcb(2))
+		}, proc() {owed_third()})
+	case "owed_self":
+		case_owed(proc() {
+			owe_switch()
+			op(.Change, SECOND_THREAD)
+		}, proc() {owed_self()})
+	case "owed_back":
+		case_owed_back()
 	case:
 		fmt.eprintfln("FAIL psx_flat_switch: no case %s", name)
 		os.exit(2)
@@ -847,5 +869,81 @@ case_nest :: proc() {
 			irq_now()
 		})
 		op_ram_store()
+	})
+}
+
+@(private = "file")
+SECOND_THREAD :: 0xff000001
+@(private = "file")
+THIRD_THREAD :: 0xff000002
+
+// The second thread, above the held main thread, is preempted to it in native
+// code: the switch is owed, and that code returns with interrupts off, so the
+// run goes on to its next BIOS call.
+@(private = "file")
+owe_switch :: proc() {
+	on(1)
+	r()[16] = 0x6161
+	point_pcb(tcb(0))
+	irq_now()
+	cpu.cop0.sr &= ~u32(0x401)
+	r()[2] = 0
+}
+
+// That call is a ChangeTh or syscall 3 (call): the owed switch lands first,
+// and the call is made when the second thread next runs, up to then (last).
+@(private = "file")
+case_owed :: proc(call, last: proc()) {
+	add_step(proc() {
+		hold_main(2)
+		on(0)
+		check("steps before the owed switch landed", u32(s.n), 2)
+		check("main thread's s0", r()[16], 0x6060)
+		check("main thread's interrupts on", cpu.cop0.sr & 0x401, 0x401)
+		point_pcb(tcb(1))
+		irq_now()
+		on(0)
+		check("steps before the call made late went back", u32(s.n), 3)
+		op(.End)
+	})
+	add_step(call)
+	add_step(last)
+}
+
+@(private = "file")
+owed_third :: proc() {
+	on(2)
+	check("third thread's s0 at its entry", r()[16], 0)
+	check("v0 of the call made late", cpu.r32(reg(tcb(1), 2)), 1)
+	check("s0 of the call made late", cpu.r32(reg(tcb(1), 16)), 0x6161)
+	op(.Change, MAIN_THREAD)
+}
+
+@(private = "file")
+owed_self :: proc() {
+	on(1)
+	check("v0 of a ChangeTh to the caller made late", r()[2], 1)
+	check("s0 of a ChangeTh to the caller made late", r()[16], 0x6161)
+	check("critical section kept over the call made late", cpu.cop0.sr & 0x401, 0)
+	op(.Change, MAIN_THREAD)
+}
+
+// The PCB names the caller again before the call: nothing waits.
+@(private = "file")
+case_owed_back :: proc() {
+	add_step(proc() {
+		hold_main(2)
+		on(0)
+		check("steps with the owed switch taken back", u32(s.n), 3)
+		op(.End)
+	})
+	add_step(proc() {
+		owe_switch()
+		point_pcb(tcb(1))
+		op(.Change, THIRD_THREAD)
+	})
+	add_step(proc() {
+		on(2)
+		op(.Change, MAIN_THREAD)
 	})
 }

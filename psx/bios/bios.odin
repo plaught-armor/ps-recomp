@@ -1413,6 +1413,9 @@ change_thread :: proc(h: u32) {
 		ret(0)
 		return
 	}
+	when core.FLAT {
+		if change_waits(i) {return}
+	}
 	ret(1)
 	if i == cur_thread {
 		return
