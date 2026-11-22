@@ -28,7 +28,7 @@ jobs:
             odin check recomp -collection:ps=. -target:$t -vet -strict-style
             echo "== $t play"
             odin check play -collection:ps=. -target:$t -vet -strict-style
-            for p in tests/core tests/native tests/blob_arch tests/psx_cover tests/ee_native tests/wasm_sigs tests/wasm_ctx_only tests/vu_capture_delta tests/ee_spin tests/fpu tests/lower tests/discover tests/vu tests/gs tests/gs_tex tests/ipu tests/gs_pixel tests/gs_span tests/gs_clut tests/gs_decode tests/gs_hw tests/vu_macro tests/vu_micro tests/vu_native tests/vu_text tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/iop_learned tests/ee_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/psx_access_cycles tests/psx_gpu_upload tests/ps2_kernel tests/ee_flush tests/ps2_iop tests/iop_thread_grow tests/ps2_interp tests/ee_syscall_handler tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/mod tests/psx_mod tests/psx_mod_region tests/psx_mod_native tests/ps2_mod tests/ps2_mod_elf tests/mod_api tests/read_dir tests/psx_interp tests/psx_jr tests/compat tests/learn tests/gamedata tests/play tests/ee_flat_learn tests/ee_spin_flat tests/ee_unwind tests/gs_band tests/gs_scanout tests/gs_upload tests/libm_wasi tests/psx_flat_learn tests/rollback tests/wasm_asm tests/ee_access_cycles; do
+            for p in tests/core tests/native tests/blob_arch tests/psx_cover tests/ee_native tests/wasm_sigs tests/wasm_ctx_only tests/vu_capture_delta tests/ee_spin tests/fpu tests/lower tests/discover tests/vu tests/gs tests/gs_tex tests/ipu tests/gs_pixel tests/gs_span tests/gs_clut tests/gs_decode tests/gs_hw tests/vu_macro tests/vu_micro tests/vu_native tests/vu_text tests/ee_emit tests/spu tests/psx_fallback tests/psx_codewatch tests/psx_learned tests/iop_learned tests/ee_learned tests/psx_unaligned tests/psx_gte tests/psx_timer tests/psx_access_cycles tests/psx_gpu_upload tests/ps2_kernel tests/ee_flush tests/ps2_iop tests/iop_thread_grow tests/ps2_interp tests/ee_syscall_handler tests/psx_bios tests/psx_bios_libc tests/disc tests/host_frames tests/data tests/mod tests/psx_mod tests/psx_mod_region tests/psx_mod_native tests/ps2_mod tests/ps2_mod_elf tests/mod_api tests/read_dir tests/psx_interp tests/psx_jr tests/psx_flat_switch tests/compat tests/learn tests/gamedata tests/play tests/ee_flat_learn tests/ee_spin_flat tests/ee_unwind tests/gs_band tests/gs_scanout tests/gs_upload tests/libm_wasi tests/psx_flat_learn tests/rollback tests/wasm_asm tests/ee_access_cycles; do
               echo "== $t $p"
               odin check $p -collection:ps=. -target:$t -vet -strict-style
             done
@@ -124,6 +124,7 @@ jobs:
           odin run tests/ee_syscall_handler -collection:ps=. -out:ee_syscall_handler_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_syscall_handler -collection:ps=. -define:PS_FLAT=true -out:ee_syscall_handler_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios -collection:ps=. -out:psx_bios_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_flat_switch -collection:ps=. -out:psx_flat_switch_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios_libc -collection:ps=. -out:psx_bios_libc_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/disc -collection:ps=. -out:disc_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/learn -collection:ps=. -out:learn_test${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -148,5 +149,6 @@ jobs:
           odin run tests/psx_interp -collection:ps=. -out:psx_interp_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_jr -collection:ps=. -out:psx_jr_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_jr -collection:ps=. -define:PS_FLAT=true -out:psx_jr_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/psx_flat_switch -collection:ps=. -define:PS_FLAT=true -out:psx_flat_switch_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/compat -collection:ps=. -out:compat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/play -collection:ps=. -define:COMMIT=test -out:play_test${{ runner.os == 'Windows' && '.exe' || '' }}

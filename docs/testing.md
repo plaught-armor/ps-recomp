@@ -107,6 +107,8 @@ node tests/read_dir/run.mjs read_dir.wasm
 odin run tests/psx_interp -collection:ps=.
 odin run tests/psx_jr -collection:ps=.
 odin run tests/psx_jr -collection:ps=. -define:PS_FLAT=true
+odin run tests/psx_flat_switch -collection:ps=.
+odin run tests/psx_flat_switch -collection:ps=. -define:PS_FLAT=true
 odin run tests/compat -collection:ps=.
 odin run tests/learn -collection:ps=.
 odin run tests/play -collection:ps=. -define:COMMIT=test
@@ -165,6 +167,7 @@ here.
 | `psx_bios_libc` | The BIOS C library |
 | `psx_interp` | The PS1 interpreter's jumps into the BIOS |
 | `psx_jr` | The PS1 `jr`, interpreted and under FLAT: a plain jump, only one to the run's return address returns; a `jr $ra` to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps |
+| `psx_flat_switch` | Guest-code PS1 thread switches (ChangeTh, syscall 3, epc restart, slot reuse, preempt, a preempt in a jr's delay slot), in the coroutine model and under FLAT; FLAT also drops an owed switch the PCB took back |
 | `disc` | Disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image |
 | `host_frames` | Each host, headless, exits at FRAMES |
 | `data` | The user data directory and its cached native code |

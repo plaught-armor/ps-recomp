@@ -207,6 +207,7 @@ script :: proc() {
 	// A guest write of its epc starts it over there; the continuation it
 	// left is never resumed.
 	add(proc() {
+		on(0)
 		cpu.w32(tcb(1) + 0x88, D_ALT)
 		cpu.w32(tcb(1) + 0x94, 0x40000010)
 		op(.Change, s.h)
@@ -335,6 +336,8 @@ script :: proc() {
 	// callback they delivered nested under a run that had to stop).
 	add(proc() {
 		check("PCB naming no TCB: no switch", from(), D_MAIN)
+		check("PCB naming no TCB: main thread's s0", r()[16], 0xcccc)
+		check("PCB naming no TCB: the BIOS leaves it", cpu.r32(cpu.r32(0x108)), 0x1234)
 		point_pcb(tcb(0))
 		on(0)
 		r()[16] = 0xeeee
