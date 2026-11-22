@@ -798,10 +798,21 @@ starts_function :: proc(img: Image, a: u32) -> bool {
 // Referenced code addresses that begin a function: a prologue, or a lead
 // before one (Rules.lead). Jump table targets do not, and splitting at one
 // would turn a loop through it into recursion. Functions after a `jr $ra`
-// are covered by return_boundaries.
+// are covered by return_boundaries. A delay slot is no entry: it belongs to
+// the jump before it, and a data word that holds its address is no pointer
+// to code (FFX 0x3304a0 holds 0x24fffc, the `addiu $sp, $sp, 0x20` slot of
+// a `jr $ra` before a prologue, a Loose lead). A prologue right after a
+// jump stays an entry: there the jump ended the function before with a
+// one-word slot after it that is not this word (Okami 0x4632f8 holds
+// 0x401280, the prologue after the `jr $ra` at 0x40127c with its slot
+// folded in), and a data word before a prologue decoding as a jump is no
+// delay slot.
 @(private = "file")
 pointer_entries :: proc(r: Rules, img: Image, ptrs: []u32, lo: u32, out: ^Set) {
 	for p in ptrs {
+		if w, ok := word(img, p - 4); ok && !is_prologue(img, p) && zero_fields(w) && has_delay(r.decode(p - 4, w)) {
+			continue
+		}
 		for k in u32(0) ..= MAX_PRE_PROLOGUE {
 			q := p + 4 * k
 			if is_prologue(img, q) {

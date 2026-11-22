@@ -308,6 +308,40 @@ main :: proc() {
 	mips.func_free(k)
 	delete(five)
 
+	// A data word holding a delay slot's address (FFX 0x3304a0 = 0x24fffc,
+	// the `addiu $sp, $sp, 0x20` slot right before a prologue) is no
+	// entry; a Loose lead took it, and the function before lost its slot.
+	ptr := make([]u8, 0x18)
+	put(ptr, 0x1000, JR_RA, 0x27bd0020, 0x27bdffe0, JR_RA, 0x27bd0020) // addiu $sp, $sp, +-0x20
+	ptrs := mips.Image {
+		base     = 0x1000,
+		data     = ptr,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(ptr)), data = ptr, flags = mips.SHF_ALLOC | mips.SHF_EXEC}},
+	}
+	pe, pc, pg := mips.module_entries(r5900.RULES, ptrs, 0x1000, 0x1018, nil, set(0x1004, 0x1008), {})
+	check(0x1004 not_in pe, "pointer to a delay slot: 0x1004 an entry")
+	check(0x1008 in pe, "pointer to a prologue: 0x1008 not an entry")
+	delete(pe)
+	delete(pc)
+	delete(pg)
+	delete(ptr)
+
+	// A prologue right after a jump is an entry (Okami 0x4632f8 holds
+	// 0x401280, a prologue after the `jr $ra` at 0x40127c).
+	ok_ptr := make([]u8, 0x10)
+	put(ok_ptr, 0x1000, JR_RA, 0x27bdffc0, JR_RA, 0x27bd0040) // addiu $sp, $sp, -+0x40
+	ok_img := mips.Image {
+		base     = 0x1000,
+		data     = ok_ptr,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(ok_ptr)), data = ok_ptr, flags = mips.SHF_ALLOC | mips.SHF_EXEC}},
+	}
+	oe, oc, og := mips.module_entries(r5900.RULES, ok_img, 0x1000, 0x1010, nil, set(0x1004), {})
+	check(0x1004 in oe, "pointer to a prologue after a jr: 0x1004 not an entry")
+	delete(oe)
+	delete(oc)
+	delete(og)
+	delete(ok_ptr)
+
 	test_unpacked()
 	test_unpack_agree()
 	if failed != 0 {
