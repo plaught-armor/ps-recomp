@@ -481,7 +481,18 @@ when core.FLAT {
 			if x.depth > 0 {
 				f := &x.frames[x.depth - 1]
 				if f.host {
+					// A host callee that returned past its caller, to the
+					// calling run's own return address (a coroutine's yield,
+					// as cpu.call_back sees in native code): that run
+					// returns too.
+					back := f.kind == .Call && state.r[31] != f.ret && state.r[31] == f.outer
 					flat_pop(x, L)
+					if back && !x.ended && x.depth > 0 {
+						if top := x.frames[x.depth - 1]; !top.host && top.kind != .Cont {
+							call_backs += 1
+							flat_pop(x, L)
+						}
+					}
 					continue
 				}
 				if f.kind == .Cont {

@@ -8,6 +8,10 @@
 //     passed over.
 //   - One to that address with another $sp is a jump too: the code there
 //     runs in the callee's run.
+//   - A host callee that returns with $ra the calling run's own return
+//     address, not its link (a coroutine's yield, FF8's LZS decoder),
+//     returns for that run: the run's code after the call is passed over,
+//     as cpu.call_back does in native code.
 // Each case is told apart by v0 and by the unwinds and jumps counted.
 // Runs on both builds: natively, and with -define:PS_FLAT=true.
 package main
@@ -61,6 +65,17 @@ LABEL :: JUMP + 0x20
 @(private = "file")
 TOP :: 0x80002600
 
+// jal YIELD; nop; addiu v0, v0, 100; jr s4; nop.
+@(private = "file")
+CALLER :: 0x80002700
+
+// Host code: v0 = 1, $ra = yield_ra, return.
+@(private = "file")
+YIELD :: 0x80002800
+
+@(private = "file")
+yield_ra: u32
+
 @(private = "file")
 put :: proc(at: u32, code: []u32) {
 	for w, k in code {
@@ -98,7 +113,8 @@ run :: proc(entry, ra: u32) -> (v0: u32, unwinds, jumps: u32) {
 }
 
 main :: proc() {
-	cpu.register_funcs({}) // no recompiled code: every function interpreted
+	// No recompiled code but YIELD: every other function interpreted.
+	cpu.register_funcs({{YIELD, proc() {cpu.state.r[2], cpu.state.r[31] = 1, yield_ra}}})
 	cpu.next_event = max(u64)
 	r := &cpu.state.r
 
@@ -143,8 +159,22 @@ main :: proc() {
 	check("unwinds of a jr $ra with another $sp", unwinds, 0)
 	check("jumps of a jr $ra with another $sp", jumps, 1)
 
+	// YIELD returns past CALLER, to BACK: 1, CALLER's 100 passed over.
+	// Back to its link, CALLER goes on: 101.
+	put(CALLER, {jal(YIELD), 0, 0x24420064, 0x02800008, 0})
+	r[20] = BACK
+	backs := cpu.call_backs
+	yield_ra = BACK
+	v0, _, _ = run(CALLER, BACK)
+	check("v0 after a host callee returns past its caller", v0, 1)
+	check("returns past the caller counted", u32(cpu.call_backs - backs), 1)
+	yield_ra = CALLER + 8
+	v0, _, _ = run(CALLER, BACK)
+	check("v0 after a host callee returns to its link", v0, 101)
+	check("returns past the caller counted after one to its link", u32(cpu.call_backs - backs), 1)
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_jr: jr is a plain jump, only one to frame_ret returns; a jr $ra to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps")
+	fmt.println("ok psx_jr: jr is a plain jump, only one to frame_ret returns; a jr $ra to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps; a host callee's return past its caller returns for it")
 }

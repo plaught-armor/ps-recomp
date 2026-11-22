@@ -207,12 +207,27 @@ interp_call :: proc(st: ^Interp, ret, t: u32, tail := false) -> bool {
 		tail   = tail,
 		prev   = interp_top,
 	}
+	mine := frame_ret
 	interp_top = &fr
 	interp_next = t
 	call(t)
+	// No run of the interpreter took t: the callee was host code all through.
+	host := interp_next == t
 	interp_next = 0
 	interp_top = fr.prev
-	if interp_unwind == nil {return false}
+	if interp_unwind == nil {
+		// The host callee returned past this run, to the run's own return
+		// address (a coroutine's yield, as cpu.call_back sees in native
+		// code): the run returns too, not on at ret. An interpreted callee's
+		// `jr`s are this interpreter's own, and $ra after one may hold
+		// anything.
+		if ra := state.r[31]; host && !tail && ra != ret && ra == mine {
+			call_backs += 1
+			st.done = true
+			return true
+		}
+		return false
+	}
 	if interp_unwind == &fr {
 		interp_unwind = nil
 		return false
