@@ -748,14 +748,34 @@ main :: proc() {
 	elem(ELEM_NOP, 0, 0, 0)
 	c(0x02, 0, ELEM_NOP)
 	c(0x02, 0, ELEM_COUNT)
-	check("chain 0 head after re-enqueuing", bios.bios.chains[0], ELEM_COUNT)
+	check("chain 0 head after re-enqueuing", cpu.r32(cpu.r32(0x100)), ELEM_COUNT)
 	check("chain 0 second", cpu.r32(ELEM_COUNT), ELEM_NOP)
 	check("chain 0 tail", cpu.r32(ELEM_NOP), 0)
 	check("SysDeqIntRP of a queued element", c(0x03, 0, ELEM_NOP), ELEM_NOP)
 	check("chain 0 after SysDeqIntRP", cpu.r32(ELEM_COUNT), 0)
 	check("SysDeqIntRP of an element not queued", c(0x03, 0, ELEM_NOP), 0)
 	check("SysDeqIntRP of the head", c(0x03, 0, ELEM_COUNT), ELEM_COUNT)
-	check("chain 0 empty", bios.bios.chains[0], 0)
+	check("chain 0 empty", cpu.r32(cpu.r32(0x100)), 0)
+
+	// The chain heads are guest RAM: [0x100] points at one 8-byte entry per
+	// priority, [0x104] is the table's size. An element linked by writing
+	// a head directly, as FF8's card library does, runs on the interrupt.
+	check("interrupt chain table size", cpu.r32(0x104), 0x20)
+	second := calls.second
+	head := cpu.r32(0x100) + 2 * 8
+	old := cpu.r32(head)
+	cpu.w32(ELEM_COUNT, old)
+	cpu.w32(head, ELEM_COUNT)
+	// With ChangeClearRCnt(3) set the vblank handler ends the exception
+	// before chain 2 runs.
+	clear_rcnt := c(0x0a, 3, 0)
+	irq(0)
+	c(0x0a, 3, clear_rcnt)
+	if calls.second != second + 1 {
+		fail("an element linked into chain 2 by hand ran %d times, want 1", calls.second - second)
+	}
+	check("SysDeqIntRP of the hand-linked element", c(0x03, 2, ELEM_COUNT), ELEM_COUNT)
+	check("chain 2 head after SysDeqIntRP", cpu.r32(head), old)
 
 	// Memory cards.
 	bios.card_files = {"/psx-bios-test-no-such-dir/1.mcd", "/psx-bios-test-no-such-dir/2.mcd"}

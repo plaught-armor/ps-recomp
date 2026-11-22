@@ -15,8 +15,6 @@ bios: struct {
 	hook:      u32,
 	rand_seed: u32,
 	pad_buf:   [2]u32,
-	// SysEnqIntRP chain heads by priority.
-	chains:    [4]u32,
 	// B(15h) button word destination, written every vblank.
 	pad_word:  u32,
 	// ChangeClearRCnt flags: timers 0-2 and vblank (3) auto-acknowledge
@@ -751,6 +749,9 @@ bios_init :: proc() {
 	cpu.w32(0x10c, 4)
 	cpu.w32(0x110, KSEG1 | TCB_ARRAY)
 	cpu.w32(0x114, MAX_THREADS * TCB_SIZE)
+	libc.memset(EXCB, 0, EXCB_SIZE)
+	cpu.w32(0x100, KSEG1 | EXCB)
+	cpu.w32(0x104, EXCB_SIZE)
 	// Retail boots with the kernel heap at 0xa000e000 and allocates its
 	// tables from it; here they are fixed, and the heap is what they leave.
 	libc.sys_init_memory(KSEG1 | KERNEL_HEAP, 0x10000 - KERNEL_HEAP)
@@ -968,8 +969,8 @@ deliver_irq :: proc() {
 // handler ends the walk.
 @(private)
 run_int_chains :: proc() {
-	for head, pri in bios.chains {
-		e := head
+	for pri in u32(0) ..< INT_CHAINS {
+		e := cpu.r32(int_chain_head(pri))
 		for guard := 0; e != 0 && guard < 64; guard += 1 {
 			first := cpu.r32(e + 8)
 			second := cpu.r32(e + 4)
@@ -1088,30 +1089,42 @@ irq_events :: proc() {
 	}
 }
 
+// The address of chain pri's head: word 0 of its 8-byte entry in the
+// table [0x100] points at, read on every call as the retail kernel does
+// (verified against v4.5 retail kernel). Games link elements by writing the
+// head themselves (FF8's card library), so the heads live there and nowhere
+// else.
+@(private)
+int_chain_head :: proc(pri: u32) -> u32 {
+	return cpu.r32(0x100) + pri * 8
+}
+
 // SysEnqIntRP pushes at the head. An element already in the chain moves to
 // the head instead of being linked twice; the retail kernel would link the
 // head to itself and loop.
 @(private)
 int_chain_enqueue :: proc(pri, elem: u32) {
-	if pri >= len(bios.chains) {
+	if pri >= INT_CHAINS {
 		return
 	}
 	int_chain_dequeue(pri, elem)
-	cpu.w32(elem, bios.chains[pri])
-	bios.chains[pri] = elem
+	head := int_chain_head(pri)
+	cpu.w32(elem, cpu.r32(head))
+	cpu.w32(head, elem)
 }
 
 // SysDeqIntRP: the element unlinked, or 0 when it is not in the chain.
 @(private)
 int_chain_dequeue :: proc(pri, elem: u32) -> u32 {
-	if pri >= len(bios.chains) {
+	if pri >= INT_CHAINS {
 		return 0
 	}
-	if bios.chains[pri] == elem {
-		bios.chains[pri] = cpu.r32(elem)
+	head := int_chain_head(pri)
+	if cpu.r32(head) == elem {
+		cpu.w32(head, cpu.r32(elem))
 		return elem
 	}
-	e := bios.chains[pri]
+	e := cpu.r32(head)
 	for guard := 0; e != 0 && guard < 64; guard += 1 {
 		if cpu.r32(e) == elem {
 			cpu.w32(e, cpu.r32(elem))
@@ -1153,9 +1166,18 @@ KSEG1 :: 0xa0000000
 PCB :: 0xe000
 @(private)
 TCB_ARRAY :: 0xe010
-// The kernel heap at boot: the rest of 0xe000-0xffff after the TCBs.
+// The interrupt chain table [0x100] points at, [0x104] its size: one 8-byte
+// entry per SysEnqIntRP priority, word 0 the chain's head. It follows the
+// TCBs.
 @(private)
-KERNEL_HEAP :: TCB_ARRAY + MAX_THREADS * TCB_SIZE
+EXCB :: TCB_ARRAY + MAX_THREADS * TCB_SIZE
+@(private)
+INT_CHAINS :: 4
+@(private)
+EXCB_SIZE :: INT_CHAINS * 8
+// The kernel heap at boot: the rest of 0xe000-0xffff after the tables.
+@(private)
+KERNEL_HEAP :: EXCB + EXCB_SIZE
 @(private)
 TCB_SIZE :: 0xc0
 
