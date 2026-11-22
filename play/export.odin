@@ -542,6 +542,7 @@ export_recomp :: proc(info: [Info]string, psx_exe: bool) -> []u8 {
 @(private = "file")
 export_manifest :: proc(id: string, info: [Info]string) -> []u8 {
 	Original :: struct {
+		region: string `json:"region,omitempty"`,
 		serial: string,
 	}
 	Link :: struct {
@@ -570,7 +571,7 @@ export_manifest :: proc(id: string, info: [Info]string) -> []u8 {
 		game      = title,
 		system    = "PS2" if ps2 else "PS1",
 		type      = "recomp",
-		original  = Original{info[.Serial]} if info[.Serial] != "" else nil,
+		original  = Original{serial_region(info[.Serial]), info[.Serial]} if info[.Serial] != "" else nil,
 		project   = fmt.tprintf("%s recomp", title),
 		status    = "exploring",
 		targets   = targets[:],
@@ -581,6 +582,26 @@ export_manifest :: proc(id: string, info: [Info]string) -> []u8 {
 	data, err := json.marshal(m, {pretty = true, use_spaces = true, spaces = 2}, context.temp_allocator)
 	assert(err == nil, "a fixed struct of strings marshals")
 	return data
+}
+
+// The region a Sony serial's prefix names ("SLUS-01324" is USA), "" for a
+// prefix not listed.
+@(private)
+serial_region :: proc(serial: string) -> string {
+	if len(serial) < 4 {
+		return ""
+	}
+	switch serial[:4] {
+	case "SCUS", "SLUS":
+		return "USA"
+	case "SCES", "SLES", "SCED", "SLED":
+		return "Europe"
+	case "SCPS", "SLPS", "SLPM", "SCPM", "SCAJ", "SIPS", "PBPX":
+		return "Japan"
+	case "SCKA", "SLKA":
+		return "Korea"
+	}
+	return ""
 }
 
 // The disc's name: its title, else its serial, else its id.

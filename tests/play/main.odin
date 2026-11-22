@@ -1282,7 +1282,9 @@ test_export :: proc() {
 	readme := read(out2, "README.md")
 	check(name, strings.contains(readme, "PS2 disc") && !strings.contains(readme, "- `settings.tsv`"), fmt.tprintf("PS2 README:\n%s", readme))
 	check(name, strings.contains(readme, "as the player does: with the player's") && !strings.contains(readme, "PS_LEARN=1"), fmt.tprintf("PS2 README names a settings.tsv or the LEARN step:\n%s", readme))
-	check(name, strings.contains(read(out2, ".recomp.json"), "\"system\": \"PS2\""), fmt.tprintf("PS2 .recomp.json:\n%s", read(out2, ".recomp.json")))
+	ps2_manifest := read(out2, ".recomp.json")
+	check(name, strings.contains(ps2_manifest, "\"system\": \"PS2\"") && strings.contains(ps2_manifest, "\"region\": \"USA\""), fmt.tprintf("PS2 .recomp.json (an SLUS serial is USA):\n%s", ps2_manifest))
+	check(name, !strings.contains(manifest, "\"region\""), "PS1 .recomp.json: a disc without a serial names no region")
 	clean(name, out2, files, forbidden)
 
 	// Refused: the directory again, and one holding another file.
