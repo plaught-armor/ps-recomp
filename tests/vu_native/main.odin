@@ -18,6 +18,8 @@
 // read, registered alone, must make each outside read of VU1 status a
 // compat row (vu_programs.stale_status). A VU0 program that waits for the
 // EE parks in native code where the interpreter parks it (test_park).
+// On x86-64 the host rounds to nearest after each run, and in each call
+// the RZ_MIX program makes out to vu.wait or vu1.wait (wait_check).
 // The seed is fixed, so a run is reproducible.
 //
 //   odin run tests/vu_native -collection:ps=.
@@ -122,7 +124,10 @@ main :: proc() {
 		}
 		free_all(context.temp_allocator)
 	}
-	code, err := core.native_load(native.make_blob(&a, nil, {}, vus), ps2.native_imports())
+	imports := ps2.native_imports()
+	imports["vu.wait"] = u64(uintptr(rawptr(wait0)))
+	imports["vu1.wait"] = u64(uintptr(rawptr(wait1)))
+	code, err := core.native_load(native.make_blob(&a, nil, {}, vus), imports)
 	if err != "" {
 		fmt.eprintln("FAIL vu_native: native_load:", err)
 		os.exit(1)
@@ -170,7 +175,9 @@ main :: proc() {
 				v^ = init
 				copy(mem, mem_init)
 				nr.pc, nr.budget = i32(pc), BUDGET
+				in_rz_mix = raw_data(p.words) == raw_data(vu_programs.RZ_MIX)
 				run()
+				in_rz_mix = false
 				if !host_round_nearest() {
 					rz_fails += 1
 					if rz_fails < 10 {fmt.eprintfln("FAIL vu_native program %d (vu%d, from %04x): the host rounds toward zero after the run", k, vu0 ? 0 : 1, pc)}
@@ -356,6 +363,11 @@ main :: proc() {
 	// A VU0 case whose divisors never set I or D would not test the merge.
 	if status_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU0 I or D set in only %d trials", status_set); os.exit(1)}
 	if vu1_set < TRIALS * 3 {fmt.eprintfln("FAIL vu_native: VU1 I or D set in only %d trials", vu1_set); os.exit(1)}
+	fmt.printfln("vu_native: RZ_MIX called vu.wait or vu1.wait %d times, %d of them not rounding to nearest", wait_calls, wait_fails)
+	when ODIN_ARCH == .amd64 {
+		if wait_calls == 0 {fmt.eprintln("FAIL vu_native: RZ_MIX made no call out to vu.wait or vu1.wait"); rz_fails += 1}
+		if wait_fails > 0 {fmt.eprintfln("FAIL vu_native: %d calls out of RZ_MIX ran the host in round toward zero", wait_fails); rz_fails += 1}
+	}
 	if fails > 0 || slow_fails > 0 || dispatch_fails > 0 || rz_fails > 0 {os.exit(1)}
 }
 
@@ -872,3 +884,16 @@ host_round_nearest :: proc() -> bool {
 	sum := intrinsics.volatile_load(&rn_one) + intrinsics.volatile_load(&rn_part)
 	return transmute(u32)sum == 0x3f800001
 }
+
+// vu.wait and vu1.wait as the test loads them: each call out of the RZ_MIX
+// program, a round_zero function on x86-64, must find the host rounding to
+// nearest (recomp/native x64_call), which wait_fails counts it does not.
+in_rz_mix: bool
+wait_calls, wait_fails: int
+wait_check :: proc() {
+	if !in_rz_mix {return}
+	wait_calls += 1
+	if !host_round_nearest() {wait_fails += 1}
+}
+wait0 :: proc(s: u32) {wait_check(); vu.vu0_wait(s)}
+wait1 :: proc(s: u32) {wait_check(); vu.vu1_wait(s)}

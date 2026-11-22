@@ -615,12 +615,14 @@ DELAY_PCS := []u32{0, 0x38, 0x48, 0x58, 0x60, 0x88, 0xb0, 0xd0, 0xf8}
 // Round toward zero (recomp/vu round_zero_span): 27 add and mul ops to
 // one each of DIV, ITOF and ESADD, so the span runs its add and mul in
 // RZ and those three in round to nearest. MADD, MSUB and OPMSUB take the
-// product's FLT_MAX check; random operands overflow it often.
+// product's FLT_MAX check; random operands overflow it often. The WAITQ
+// stalls on the DIV, a call out to vu.wait the host must take in round to
+// nearest (tests/vu_native wait_check).
 MSUB :: 0x2d
 OPMSUB :: 0x2e
 RZ_MIX := []u32 {
 	lower_sp(DIV, 0b0110, 1, 2), upper(MUL, 3, 1, 2),
-	NOP_L, upper(ADD, 4, 3, 1),
+	lower_sp(WAITQ, 0, 0, 0), upper(ADD, 4, 3, 1),
 	lower_sp(ESADD, XYZ, 0, 4), upper(MADD, 5, 4, 2),
 	NOP_L, upper(MSUB, 6, 5, 3),
 	NOP_L, upper(OPMSUB, 7, 6, 5),

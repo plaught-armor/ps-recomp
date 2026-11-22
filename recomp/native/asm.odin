@@ -1253,6 +1253,7 @@ load :: proc(a: ^Asm, w: Width, signed: bool, slow: string) {
 		panic("native: wasm32")
 	}
 	bind(a, done)
+	cold_check(a)
 	append(&a.cold, Cold{far = far, done = done, slow = slow_path(a, s)})
 }
 
@@ -1284,6 +1285,7 @@ load_state :: proc(a: ^Asm, w: Width, off, n: u32, slow: string, base := "") {
 		panic("native: wasm32")
 	}
 	bind(a, done)
+	cold_check(a)
 	append(&a.cold, Cold{far = far, done = done, slow = slow_path(a, s)})
 }
 
@@ -1389,9 +1391,17 @@ call_label :: proc(a: ^Asm, l: Label) {
 // it), then jumps back to done, which the caller binds after the branch.
 // body runs in the same register and rounding state as the branch.
 out_of_line :: proc(a: ^Asm, body: proc(a: ^Asm)) -> (far, done: Label) {
+	cold_check(a)
 	far, done = new_label(a), new_label(a)
 	append(&a.cold, Cold{far = far, done = done, body = body})
 	return
+}
+
+// A cold path is emitted at func_end, outside every near region, so it
+// runs in the rounding of the function, not of a region: none starts in one.
+@(private)
+cold_check :: proc(a: ^Asm) {
+	assert(!a.round_zero || a.near == 0, "native: a cold path in a near region")
 }
 
 // The label of the shared routine s describes, made on first use.
