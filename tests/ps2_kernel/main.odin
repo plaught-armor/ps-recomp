@@ -543,7 +543,7 @@ flush_text_test :: proc() {
 	cpu.dispatch_set(!e.text_off)
 	fmt.println("ok FlushCache text check")
 }
-reset_version :: proc(path: string) -> string {
+reset_version :: proc(path: string) -> (loadfile, fileio: string) {
 	LIST :: PARAM + 0x300
 	PKT :: PARAM + 0x400
 	for &b in mem.ram_slice(PKT, 0x100) {b = 0}
@@ -553,19 +553,24 @@ reset_version :: proc(path: string) -> string {
 	if sys(0x77, LIST, 1) <= 0 {fail("fail: SifSetDma of the reset failed")}
 	buf: [16]u8
 	if !iop.sif.servers[0x80000006](255, buf[:], 4) {fail("fail: loadfile fno 255 unhandled")}
-	return strings.clone(string(buf[:4]), context.temp_allocator)
+	loadfile = strings.clone(string(buf[:4]), context.temp_allocator)
+	buf = {}
+	if !iop.sif.servers[0x80000001](255, buf[:], 8) {fail("fail: fileio fno 255 unhandled")}
+	fileio = strings.clone(string(buf[:4]), context.temp_allocator)
+	return
 }
 
 // IOPRP images built here: a ROMDIR table of RESET, ROMDIR, a placeholder
-// module and LOADFILE, whose bytes are placeholders around the version.
+// module, LOADFILE and FILEIO, whose bytes are placeholders around the
+// version (FILEIO's after a space-padded name, as IOPRP 2.55's).
 loadfile_version_test :: proc() {
 	dir, err := os.make_directory_temp("", "ps_ioprp_test_*", context.allocator)
 	if err != nil {fail("fail: temp dir: %v", err)}
 	defer if os.remove_all(dir) != nil {fmt.eprintln("ioprp: temp dir left:", dir)}
 	iop.disc_dir = dir
-	image :: proc(dir, name: string, loadfile: []u8) {
+	image :: proc(dir, name: string, loadfile, fileio: []u8) {
 		Entry :: struct {name: string, size: int}
-		entries := [?]Entry{{"RESET", 0}, {"ROMDIR", 5 * 16}, {"OTHER", 0x23}, {"LOADFILE", len(loadfile)}}
+		entries := [?]Entry{{"RESET", 0}, {"ROMDIR", 6 * 16}, {"OTHER", 0x23}, {"LOADFILE", len(loadfile)}, {"FILEIO", len(fileio)}}
 		img: [dynamic]u8
 		defer delete(img)
 		for e in entries {
@@ -579,6 +584,7 @@ loadfile_version_test :: proc() {
 		for &b in other[:0x23] {b = 0xee}
 		append(&img, ..other)
 		append(&img, ..loadfile)
+		append(&img, ..fileio)
 		if os.write_entire_file(fmt.tprintf("%s/%s", dir, name), img[:]) != nil {fail("fail: write %s", name)}
 	}
 	with: [dynamic]u8
@@ -586,23 +592,30 @@ loadfile_version_test :: proc() {
 	append(&with, ..make([]u8, 0x40, context.temp_allocator))
 	append(&with, "PsIIloadfile3210")
 	append(&with, ..make([]u8, 0x10, context.temp_allocator))
-	image(dir, "NEW.IMG", with[:])
+	fio := make([]u8, 0x30, context.temp_allocator)
+	copy(fio[0x10:], "PsIIfileio  2550")
+	image(dir, "NEW.IMG", with[:], fio)
 	without := make([]u8, 0x50, context.temp_allocator)
 	copy(without[0x40:], "PsIIloadfileXY")
-	image(dir, "OLD.IMG", without)
+	fio_without := make([]u8, 0x20, context.temp_allocator)
+	copy(fio_without[0x10:], "PsIIfileio  25")
+	image(dir, "OLD.IMG", without, fio_without)
 
-	Case :: struct {path, want: string}
+	Case :: struct {path, loadfile, fileio: string}
 	cases := [?]Case {
-		{"rom0:UDNL cdrom0:\\NEW.IMG;1", "3210"},
-		{"", "3000"}, // no image: rom0's modules again
-		{"rom0:UDNL cdrom0:\\NEW.IMG;1", "3210"},
-		{"rom0:UDNL cdrom0:\\OLD.IMG;1", "3000"}, // no version after the marker
-		{"rom0:UDNL cdrom0:\\NONE.IMG;1", "3000"},
+		{"rom0:UDNL cdrom0:\\NEW.IMG;1", "3210", "2550"},
+		{"", "3000", "3000"}, // no image: rom0's modules again
+		{"rom0:UDNL cdrom0:\\NEW.IMG;1", "3210", "2550"},
+		{"rom0:UDNL cdrom0:\\OLD.IMG;1", "3000", "3000"}, // no version after the marker
+		{"rom0:UDNL cdrom0:\\NONE.IMG;1", "3000", "3000"},
 	}
 	for c in cases {
-		if got := reset_version(c.path); got != c.want {fail("fail: version after reset %q is %q, want %q", c.path, got, c.want)}
+		lf, fio := reset_version(c.path)
+		if lf != c.loadfile || fio != c.fileio {
+			fail("fail: versions after reset %q are %q %q, want %q %q", c.path, lf, fio, c.loadfile, c.fileio)
+		}
 	}
-	fmt.println("ok LOADFILE version")
+	fmt.println("ok LOADFILE and FILEIO versions")
 }
 
 // exec_boot with a packed executable's code (mem.unpacked_code): code that
