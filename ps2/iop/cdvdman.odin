@@ -239,7 +239,8 @@ CD_READ_MIN_EE :: cpu.EE_CLOCK / 1000
 // at a time, so a stream read behind a Read waits for it. The sectors are
 // in the ring already, so the drive's time is not paid, but the END still
 // lands after the sceCdStRead call returns: DDS (SLUS-20974) jumps to 0
-// from 0x2cfc50 when it lands at once.
+// from 0x2cfc50 when it lands at once. DDS needs 18 EE cycles or more
+// there, native and interpreted alike, so 0.1 ms (29491) leaves room.
 CD_ST_READ_EE :: CD_READ_MIN_EE / 10
 
 // The EE cycles the drive takes to read `sectors` sectors (cdvdfsv's Read
