@@ -275,6 +275,7 @@ game :: proc(_: rawptr) {
 	test_sdrdrv()
 	test_sdr_thread()
 	test_timrman()
+	test_timer_intr()
 	test_system_time()
 	test_alarm()
 	test_wakeup_cancel()
@@ -6396,6 +6397,95 @@ test_timrman :: proc() {
 
 	fresh()
 	check(iop.iop_timr == {} && iop.tim_next_ee() == max(u64), "timrman: the loader's reset clears the timers")
+}
+
+// A timer driven through its registers, its handler on its interrupt line,
+// as SNDCTLTX.IRX runs a 66-line tick: GetHardTimerIntrCode's lines and -1,
+// RegisterIntrHandler's and ReleaseIntrHandler's errors; the handler runs
+// only once EnableIntr enables its line, at each compare a line count of
+// the NTSC line rate apart, its arg in a0; GetTimerStatus reads the mode
+// and a compare flag the read clears; a v0 of 0 disables the line, which
+// EnableIntr enables again; a mode without the repeat bit interrupts once;
+// a counter without the restart wraps at its width before its next
+// compare; ReleaseIntrHandler stops it.
+test_timer_intr :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	TF := [?]u32{4, 7, 8, 11, 16}
+	IF := [?]u32{4, 5, 6, 7}
+	// d {count, a0, v0}: h counts, records a0 and returns d's v0.
+	a: Asm
+	tms := imports(&a, "timrman", ..TF[:])
+	ins := imports(&a, "intrman", ..IF[:])
+	d := at(&a)
+	put(&a, 0, 0, 0)
+	h := at(&a)
+	la(&a, T0, d)
+	put(&a, 0x8d090000, 0, 0x25290001, 0xad090000) // lw t1, 0(t0); nop; addiu t1, t1, 1; sw t1, 0(t0)
+	put(&a, 0xad040004, 0x8d020008, JR_RA, 0) // sw a0, 4(t0); lw v0, 8(t0); jr ra
+	entry := at(&a)
+	put(&a, JR_RA, 0x24020000)
+	id, _ := iop.iop_load(build_mod("modi", &a, entry), "modi", nil)
+	b := module_base(id)
+	tf, inf := TF, IF
+	tm := proc(s: u32, tf: []u32, fno: u32, args: ..u32) -> u32 {return lib_call(s, tf, fno, ..args)}
+	word :: proc(at: u32) -> u32 {return iop.iop_u32(at)^}
+	t, n := b + tms, b + ins
+	x := &iop.iop_timr
+
+	check(id > 0 && tm(t, tf[:], 4, 4, 16, 1) == TIMER1, "timer intr: the 16-bit hline timer is timer 1")
+	check(tm(t, tf[:], 16, TIMER1) == 5 && tm(t, tf[:], 16, TIMER3) == 14 && tm(t, tf[:], 16, TIMER5) == 16 && tm(t, tf[:], 16, 0) == 0xffff_ffff, "timer intr: GetHardTimerIntrCode's lines, -1 for no timer")
+	check(tm(n, inf[:], 4, 5, 1, b + h, 0x77) == 0 && tm(n, inf[:], 4, 5, 1, b + h, 0) == neg(104), "timer intr: RegisterIntrHandler, then one already set")
+	check(tm(n, inf[:], 4, 50, 1, b + h, 0) == neg(101) && tm(n, inf[:], 5, 9) == neg(105) && tm(n, inf[:], 5, 50) == neg(101), "timer intr: a bad line, none to release")
+
+	P :: u64(66 * iop.TIMR_HLINE_CYCLES)
+	C :: u64(100_000)
+	r3000.state.cycles = C
+	tm(t, tf[:], 11, TIMER1, 0x10042)
+	check(tm(t, tf[:], 7, TIMER1, 0x158) == 0 && x.armed == 0 && iop.tim_next_ee() == max(u64), "timer intr: mode set, the line not enabled, nothing due")
+	tm(n, inf[:], 6, 5)
+	check(x.armed == 1 << 1 && iop.tim_next_ee() == (C + P) * 8, "timer intr: EnableIntr, due 66 lines on (the 16-bit compare)")
+	iop.iop_u32(b + d + 8)^ = 1
+	iop.iop_tick((C + P - 1) * 8)
+	check(word(b + d) == 0, "timer intr: nothing before the compare")
+	iop.iop_tick((C + P) * 8)
+	check(word(b + d) == 1 && word(b + d + 4) == 0x77 && iop.tim_next_ee() == (C + 2 * P) * 8, "timer intr: the handler at the compare, its arg in a0, the next a period on")
+	check(tm(t, tf[:], 8, TIMER1) == 0x958 && tm(t, tf[:], 8, TIMER1) == 0x158, "timer intr: the status's compare flag, cleared by the read")
+	iop.iop_u32(b + d + 8)^ = 0
+	iop.iop_tick((C + 2 * P) * 8)
+	check(word(b + d) == 2 && x.armed == 0, "timer intr: v0 0 disables the line")
+	iop.iop_u32(b + d + 8)^ = 1
+	tm(n, inf[:], 6, 5)
+	iop.iop_tick((C + 3 * P) * 8)
+	check(word(b + d) == 3, "timer intr: EnableIntr again, the handler at the next compare")
+	tm(n, inf[:], 7, 5, 0)
+	check(x.armed == 0, "timer intr: DisableIntr stops it")
+	tm(n, inf[:], 6, 5)
+
+	// No repeat bit: once.
+	cur := r3000.state.cycles
+	tm(t, tf[:], 7, TIMER1, 0x118)
+	iop.iop_tick((cur + P) * 8)
+	check(word(b + d) == 4 && x.armed == 0, "timer intr: without the repeat bit, one interrupt")
+	check(tm(n, inf[:], 5, 5) == 0 && tm(n, inf[:], 5, 5) == neg(105), "timer intr: released")
+	tm(t, tf[:], 7, TIMER1, 0x158)
+	check(x.armed == 0, "timer intr: released, never due")
+
+	// Timer 2 at the sysclock, no restart: the next compare a 16-bit wrap on.
+	check(tm(t, tf[:], 4, 1, 16, 8) == TIMER2 && tm(n, inf[:], 4, 6, 1, b + h, 0) == 0, "timer intr: timer 2, its handler on line 6")
+	tm(n, inf[:], 6, 6)
+	tm(t, tf[:], 11, TIMER2, 1000)
+	cur = r3000.state.cycles
+	tm(t, tf[:], 7, TIMER2, 0x50)
+	iop.iop_tick((cur + 1000) * 8)
+	check(word(b + d) == 5 && iop.tim_next_ee() == (cur + 1000 + 0x10000) * 8, "timer intr: without the restart, the next compare after a wrap")
+	cur = r3000.state.cycles
+	tm(t, tf[:], 7, TIMER2, 0x258)
+	check(iop.tim_next_ee() == (cur + 8 * 1000) * 8, "timer intr: prescale 8 (0x200)")
+
+	fresh()
+	check(iop.iop_timr == {}, "timer intr: the loader's reset clears the lines")
 }
 
 // thbase 43 GetSystemTimeLow: the low word of what 34 GetSystemTime gives,

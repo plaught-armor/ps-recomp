@@ -5,9 +5,19 @@
 // handler runs from iop_tick at each compare due (tim_intr_run), on the
 // handler coroutine (th_intr), as retail runs it in the timer's interrupt.
 // The handler's v0 is the next compare, counted from this one, as the
-// timer's counter restarts at each compare; 0 stops the timer. A timer set
-// to count another source, or gated, is set up and started as on retail and
-// never fires, with a compat row.
+// timer's counter restarts at each compare; 0 stops the timer. A timer
+// counting horizontal lines is timed at NTSC's line rate (TIMR_HLINE_CYCLES).
+// A timer set to count pixels, or gated, is set up and started as on retail
+// and never fires, with a compat row.
+//
+// A module may instead drive a timer's registers itself: SetTimerMode,
+// SetTimerCompare and GetTimerStatus write and read them, and intrman's
+// RegisterIntrHandler puts a handler on the timer's interrupt line
+// (GetHardTimerIntrCode). That handler runs at each compare once its line is
+// enabled (EnableIntr), on the same path as a compare handler; as retail's
+// dispatcher does, its v0 of 0 disables the line again, and anything else
+// leaves it enabled. intrman's other lines have handlers kept but never run:
+// no other device interrupts here.
 //
 // thbase's alarms (SetAlarm) run on the same path. Retail's thbase keeps
 // them on a hardware timer of its own, which no module sees allocated; here
@@ -28,6 +38,7 @@ KE_TIMER_BUSY :: -154
 KE_TIMER_NOT_SETUP :: -155
 KE_TIMER_NOT_INUSE :: -156
 KE_ILLEGAL_MODE :: -405
+KE_ILLEGAL_INTRCODE :: -101
 
 TIMR_N :: 6
 // Sources, as AllocHardTimer and SetupHardTimer take them.
@@ -40,6 +51,14 @@ TIMR_HOLD :: 8
 TIMR_CMP :: 0x58 // interrupt on compare, the counter restarting, repeated
 TIMR_RESET :: 0x08 // the counter restarts at its compare
 TIMR_INTR :: 0x30
+TIMR_INTR_CMP :: 0x10 // interrupt on compare
+TIMR_REPEAT :: 0x40 // interrupt at every compare, not only the first
+TIMR_EXT :: 0x100 // count the timer's other source: pixels or lines
+// Status bits the mode register reads back, cleared by the read.
+TIMR_FLAG_CMP :: 0x800
+// IOP cycles a horizontal line, cut to a whole cycle: NTSC has 525 lines a
+// frame of 1001/30000 seconds.
+TIMR_HLINE_CYCLES :: IOP_CLOCK * 1001 / (30000 * 525) // 2342
 // The most compare handlers one tick runs: a timer far behind its compares
 // (the EE stalled, a load ran) skips the rest.
 TIMR_INTR_MAX :: 16
@@ -70,6 +89,10 @@ TIMR_HW := [TIMR_N]Timr_Hw {
 	{0xbf8014a0, TIMR_SYSCLOCK, 32, 256},
 }
 
+// Each timer's interrupt line on the IOP's INTC.
+@(private = "file")
+TIMR_INTR_CODE := [TIMR_N]u32{4, 5, 6, 14, 15, 16}
+
 // The order AllocHardTimer searches the timers in.
 @(private = "file")
 TIMR_ORDER := [TIMR_N]u32{2, 5, 4, 3, 0, 1}
@@ -86,6 +109,16 @@ Iop_Timer :: struct {
 	due:     u64, // the IOP cycle of the next compare, while armed
 	start:   u64, // the IOP cycle its counter was last 0, while running
 	count:   u32, // its counter when it stopped
+	flags:   u16, // status bits set since GetTimerStatus last read them
+	spent:   bool, // its mode interrupts once only, and has
+}
+
+// intrman's interrupt lines, as RegisterIntrHandler numbers them.
+INTR_LINES :: 64
+
+// A handler RegisterIntrHandler put on a line; handler 0 is none.
+Iop_Intr :: struct {
+	handler, arg: u32, // IOP addresses
 }
 
 // A thbase alarm: SetAlarm's handler and argument, due at an IOP cycle.
@@ -101,6 +134,10 @@ Iop_Timr :: struct {
 	alarms: [ALARM_N]Iop_Alarm,
 	nalarm: u32, // alarms[:nalarm] are set
 	seq:    u32, // the next alarm's seq
+	lines:  [INTR_LINES]Iop_Intr,
+	// The lines EnableIntr enabled, as retail's mask: DisableIntr, or a
+	// handler's v0 of 0, disables one again.
+	line_on: u64,
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -129,6 +166,47 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if t == nil || a0 != tim_id((a0 >> 28) - 1) || t.use == 0 {return ke(KE_NO_TIMER), true}
 		t.use -= 1
 		return KE_OK, true
+	case 7: // SetTimerMode(id, mode): the mode register written, which
+		// restarts the counter at 0 and starts the timer whatever it did,
+		// counting as the mode says
+		i, found := tim_reg(a0, fno)
+		if !found {return 0, true}
+		t := &iop_timr.t[i]
+		t.mode = 0x8000_0000 | a1 & 0xffff
+		t.start, t.count, t.flags, t.spent = r3000.state.cycles, 0, 0, false
+		t.scale = tim_scale(i, a1)
+		t.due = t.start + tim_period(a0, t.compare)
+		if t.scale == 0 {
+			core.compat_unknown(.Iop_Timer, a1, sub = 7, pc = r[31])
+			fmt.eprintfln("iop: timer %d set to mode %x, not timed here", i, a1)
+		}
+		tim_arm()
+		iop_wake_set()
+		return KE_OK, true
+	case 8: // GetTimerStatus(id): the mode register read, which clears its
+		// compare flag
+		i, found := tim_reg(a0, fno)
+		if !found {return 0, true}
+		t := &iop_timr.t[i]
+		v := t.mode & 0xffff | u32(t.flags)
+		t.flags = 0
+		return v, true
+	case 11: // SetTimerCompare(id, compare): the compare register written
+		i, found := tim_reg(a0, fno)
+		if !found {return 0, true}
+		t := &iop_timr.t[i]
+		t.compare = a1 & 0xffff if TIMR_HW[i].bits == 16 else a1
+		if t.mode != 0 && t.scale != 0 {
+			// Due when the counter next meets it: from its last restart, or,
+			// once past it, after the counter wraps at its width.
+			now := r3000.state.cycles
+			t.due = t.start + tim_period(a0, t.compare)
+			wrap := tim_wrap(i)
+			if t.due <= now {t.due += ((now - t.due) / wrap + 1) * wrap}
+			tim_arm()
+			iop_wake_set()
+		}
+		return KE_OK, true
 	case 10: // GetTimerCounter(id): the counter's register, read as the id's base names it, no check
 		i := (a0 >> 28) - 1
 		if i >= TIMR_N {
@@ -136,6 +214,13 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			return 0, true
 		}
 		return tim_count(i), true
+	case 16: // GetHardTimerIntrCode(id): the interrupt line of the timer
+		// whose registers the id names, as retail reads only those bits;
+		// -1 for none
+		for hw, i in TIMR_HW {
+			if hw.base == a0 << 4 {return TIMR_INTR_CODE[i], true}
+		}
+		return 0xffff_ffff, true
 	case 20: // SetTimerHandler(id, compare, handler, arg)
 		t := tim_find(a0)
 		if t == nil {return ke(KE_ILLEGAL_TIMERID), true}
@@ -166,11 +251,11 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			case 256: setup |= 0x6000
 			case: return ke(KE_ILLEGAL_PRESCALE), true
 			}
-			if a2 == 0 {t.scale = a3}
 		case:
 			return ke(KE_ILLEGAL_SOURCE), true
 		}
 		t.setup = setup
+		t.scale = tim_scale(i, setup)
 		if t.scale == 0 {
 			core.compat_unknown(.Iop_Timer, a1, sub = a2, pc = r[31])
 			fmt.eprintfln("iop: timer %d counts source %d in mode %d, not timed here", i, a1, a2)
@@ -182,7 +267,7 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if t.mode != 0 {return ke(KE_TIMER_BUSY), true}
 		if t.setup == 0 {return ke(KE_TIMER_NOT_SETUP), true}
 		t.mode = t.setup | u32(t.cmp)
-		t.start = r3000.state.cycles
+		t.start, t.flags, t.spent = r3000.state.cycles, 0, false
 		t.due = t.start + tim_period(a0, t.compare)
 		tim_arm()
 		iop_wake_set()
@@ -203,6 +288,43 @@ timrman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 @(private = "file")
 tim_id :: proc(i: u32) -> u32 {
 	return (i + 1) << 28 | TIMR_HW[i].base >> 4
+}
+
+// The timer whose registers id `id` names, as retail's register calls
+// reach them with no other check; for none, false and a compat row of
+// timrman's call fno.
+@(private = "file")
+tim_reg :: proc(id, fno: u32) -> (i: u32, ok: bool) {
+	for hw, j in TIMR_HW {
+		if hw.base == id << 4 {return u32(j), true}
+	}
+	core.compat_unknown(.Iop_Call, core.compat_name("timrman"), fno, pc = r3000.state.r[31])
+	return 0, false
+}
+
+// IOP cycles a count of timer i in mode register value `mode`: the line
+// rate for a timer that counts lines, its prescale of the system clock
+// otherwise; 0 for one gated or counting pixels, which is not timed here.
+@(private = "file")
+tim_scale :: proc(i, mode: u32) -> u32 {
+	hw := TIMR_HW[i]
+	if mode & 1 != 0 {return 0}
+	if mode & TIMR_EXT != 0 && hw.sources & (TIMR_PIXEL | TIMR_HLINE) != 0 {
+		return TIMR_HLINE_CYCLES if hw.sources & TIMR_HLINE != 0 else 0
+	}
+	if hw.bits == 16 {return 8 if hw.prescale == 8 && mode & 0x200 != 0 else 1}
+	switch mode >> 13 & 3 {
+	case 1: return 8
+	case 2: return 16
+	case 3: return 256
+	}
+	return 1
+}
+
+// IOP cycles timer i's counter takes to wrap at its width.
+@(private = "file")
+tim_wrap :: proc(i: u32) -> u64 {
+	return u64(1) << TIMR_HW[i].bits * u64(iop_timr.t[i].scale)
 }
 
 // The timer id `id` names by its top 4 bits, nil past the six. Retail reads
@@ -240,13 +362,60 @@ tim_count :: proc(i: u32) -> u32 {
 	return u32(n % wrap)
 }
 
-// Sets armed from the timers: running, timed, with a compare handler.
+// Sets armed from the timers: running and timed, with a compare handler,
+// or else interrupting on compare, not yet spent, into an enabled line with
+// a handler.
 @(private = "file")
 tim_arm :: proc() {
-	iop_timr.armed = 0
-	for t, i in iop_timr.t {
-		if t.mode & TIMR_INTR != 0 && t.scale != 0 && t.handler != 0 {iop_timr.armed |= 1 << u32(i)}
+	x := &iop_timr
+	x.armed = 0
+	for t, i in x.t {
+		if t.mode & TIMR_INTR == 0 || t.scale == 0 {continue}
+		line := TIMR_INTR_CODE[i]
+		on := x.line_on & (1 << line) != 0 && x.lines[line].handler != 0
+		if t.handler != 0 || t.mode & TIMR_INTR_CMP != 0 && !t.spent && on {x.armed |= 1 << u32(i)}
 	}
+}
+
+// RegisterIntrHandler(line, mode, handler, arg), as retail: refused inside
+// an interrupt, for a line intrman has no handler for, or for one that has
+// a handler already. The mode, which registers retail's dispatcher saves,
+// means nothing here.
+intr_register :: proc(line, handler, arg: u32) -> u32 {
+	if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT)}
+	if !intr_line_ok(line) {return ke(KE_ILLEGAL_INTRCODE)}
+	l := &iop_timr.lines[line]
+	if l.handler != 0 {return ke(KE_FOUND_HANDLER)}
+	l^ = {handler, arg}
+	tim_arm()
+	iop_wake_set()
+	return KE_OK
+}
+
+// ReleaseIntrHandler(line), as retail: the line's handler dropped.
+intr_release :: proc(line: u32) -> u32 {
+	if iop_sched.intr {return ke(KE_ILLEGAL_CONTEXT)}
+	if !intr_line_ok(line) {return ke(KE_ILLEGAL_INTRCODE)}
+	l := &iop_timr.lines[line]
+	if l.handler == 0 {return ke(KE_NOTFOUND_HANDLER)}
+	l^ = {}
+	tim_arm()
+	return KE_OK
+}
+
+// EnableIntr or DisableIntr of a line: what its timer's handler waits on.
+intr_enable :: proc(line: u32, on: bool) {
+	if line >= INTR_LINES {return}
+	if on {iop_timr.line_on |= 1 << line} else {iop_timr.line_on &~= 1 << line}
+	tim_arm()
+	iop_wake_set()
+}
+
+// The lines retail's intrman keeps handlers for: the INTC's 32, its DMA
+// lines 32 to 45, and the two software ones at 62 and 63.
+@(private = "file")
+intr_line_ok :: proc(line: u32) -> bool {
+	return line < 46 || line == 62 || line == 63
 }
 
 // When, in EE cycles, a timer's compare or an alarm is due next; max(u64)
@@ -385,7 +554,7 @@ tim_cmp_run :: proc() {
 	}
 	for &t, i in iop_timr.t {
 		if iop_timr.armed & (1 << u32(i)) == 0 || t.due > now {continue}
-		p := tim_period(tim_id(u32(i)), t.compare)
+		p := tim_step(u32(i))
 		t.due += (now - t.due) / p * p + p
 	}
 }
@@ -399,6 +568,10 @@ tim_cmp_run :: proc() {
 tim_intr :: proc(i: u32) {
 	t := &iop_timr.t[i]
 	handler := t.handler
+	if handler == 0 {
+		tim_line_intr(i)
+		return
+	}
 	next: u32
 	switch th_intr(handler, t.arg, 0) {
 	case .None:
@@ -426,6 +599,48 @@ tim_intr :: proc(i: u32) {
 	t.due += tim_period(tim_id(i), next)
 }
 
+// Runs the handler on timer i's interrupt line with its argument, the
+// timer's compare flag set. A v0 of 0, or a handler stopped for waiting or a
+// call the HLE lacks, disables the line, as retail's dispatcher leaves it
+// masked. The timer runs on as its mode says: its next compare a period on
+// (tim_step), or none when it interrupts only once. A handler that rewrites
+// the timer's mode or compare has set its next compare itself.
+@(private = "file")
+tim_line_intr :: proc(i: u32) {
+	t := &iop_timr.t[i]
+	line := TIMR_INTR_CODE[i]
+	l := iop_timr.lines[line]
+	t.flags |= TIMR_FLAG_CMP
+	due, start := t.due, t.start
+	keep := false
+	switch th_intr(l.handler, l.arg, 0) {
+	case .None:
+		keep = iop_sched.intr_v0 != 0
+	case .Blocked:
+		core.compat_unknown(.Iop_Timer_Intr, l.handler, pc = l.handler)
+		fmt.eprintfln("iop: interrupt handler at %x blocked", l.handler)
+	case .Call:
+		fmt.eprintfln("iop: interrupt handler at %x stopped", l.handler)
+	}
+	if !keep {iop_timr.line_on &~= 1 << line}
+	if t.due == due && t.start == start {
+		if t.mode & TIMR_REPEAT == 0 {t.spent = true}
+		if t.mode & TIMR_RESET != 0 {t.start = t.due}
+		t.due += tim_step(i)
+	}
+	tim_arm()
+}
+
+// IOP cycles from one of timer i's compares to the next: its compare's
+// period when the counter restarts there or a compare handler gives the
+// next, else a wrap of the counter.
+@(private = "file")
+tim_step :: proc(i: u32) -> u64 {
+	t := &iop_timr.t[i]
+	if t.handler == 0 && t.mode & TIMR_RESET == 0 {return tim_wrap(i)}
+	return tim_period(tim_id(i), t.compare)
+}
+
 // After a failed load: puts back, as it was when the load began (`saved`),
 // each timer the load allocated, or left with its handler or argument in
 // `freed`, the memory its undo frees. An alarm whose handler or argument is
@@ -433,6 +648,9 @@ tim_intr :: proc(i: u32) {
 tim_undo :: proc(saved: Iop_Timr, freed: []Sys_Block) {
 	for &t, i in iop_timr.t {
 		if t.use > saved.t[i].use || sys_in(freed, t.handler) || sys_in(freed, t.arg) {t = saved.t[i]}
+	}
+	for &l in iop_timr.lines {
+		if sys_in(freed, l.handler) || sys_in(freed, l.arg) {l = {}}
 	}
 	tim_arm()
 	for i := iop_timr.nalarm; i > 0; i -= 1 {

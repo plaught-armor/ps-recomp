@@ -636,15 +636,16 @@ start_drop :: proc(i: int, why: string) {
 }
 
 // What a failed StartModule leaves pointing into `freed`, the blocks it
-// drops, for start_drop's log: handlers of timrman, thbase's alarms, sifcmd,
-// libsd, sdrdrv, vblank and cdvdman by their address, and stubs of modules
-// other than `m` patched to jump there. Retail modload unlinks only the
-// module's own imports (UnLinkLibraryEntries) and releases neither, so both
-// stay; a later crash through one points here. `libs` counts the libraries
-// `m` registered, which module_drop removes.
+// drops, for start_drop's log: handlers of timrman, intrman, thbase's
+// alarms, sifcmd, libsd, sdrdrv, vblank and cdvdman by their address, and
+// stubs of modules other than `m` patched to jump there. Retail modload
+// unlinks only the module's own imports (UnLinkLibraryEntries) and releases
+// neither, so both stay; a later crash through one points here. `libs`
+// counts the libraries `m` registered, which module_drop removes.
 drop_dangling :: proc(freed: []Sys_Block, m: Iop_Module) -> (handlers, stubs, libs: int) {
 	in_f :: proc(freed: []Sys_Block, a: u32) -> int {return 1 if a != 0 && sys_in(freed, a) else 0}
 	for t in iop_timr.t {handlers += in_f(freed, t.handler)}
+	for l in iop_timr.lines {handlers += in_f(freed, l.handler)}
 	for a in iop_timr.alarms[:iop_timr.nalarm] {handlers += in_f(freed, a.handler)}
 	s := &iop_sifcmd
 	for h in s.sys {handlers += in_f(freed, h.handler)}
@@ -1137,10 +1138,18 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		case 9: // CpuEnableIntr
 			th_intr_set(false)
 			return KE_OK, true
-		case 6: // EnableIntr(irq): every line counts as enabled, as above
+		case 4: // RegisterIntrHandler(irq, mode, handler, arg)
+			return intr_register(a0, a2, r[7]), true
+		case 5: // ReleaseIntrHandler(irq)
+			return intr_release(a0), true
+		case 6: // EnableIntr(irq): every line counts as enabled, as above;
+			// a timer's line lets its handler run (intr_enable)
+			intr_enable(a0, true)
 			return KE_OK, true
-		case 7: // DisableIntr(irq, int *res): the old state, which is always
-			// enabled, so res gets irq as retail gives an enabled line's
+		case 7: // DisableIntr(irq, int *res): the old state, which counts as
+			// enabled, so res gets irq as retail gives an enabled line's; a
+			// timer's line stops its handler running
+			intr_enable(a0 & 0xff, false)
 			if a1 != 0 {w32(a1, a0)}
 			return KE_OK, true
 		case 17: // CpuSuspendIntr(int *state): the old state stored whether
