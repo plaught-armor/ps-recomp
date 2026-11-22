@@ -239,7 +239,7 @@ discover :: proc(o: mips.Options, img: mips.Image) -> (funcs: [dynamic]^Func, la
 		for c in ranges {
 			mips.address_constants(RULES, img, c[0], c[1], t[0], t[1], &refs)
 		}
-		for e in mips.call_targets(img, t[0], t[1]) {
+		for e in mips.call_targets(RULES, img, t[0], t[1]) {
 			calls[e] = {}
 		}
 	}

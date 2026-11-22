@@ -691,18 +691,32 @@ image_range :: proc(img: Image) -> (lo, hi: u32) {
 // in the image are zero is not a function: it is padding the executable
 // leaves for code loaded there later (a PS1 overlay slot), which the
 // runtime finds by other means. A jal to its own return address is no
-// call (a get-pc idiom) and adds nothing.
-call_targets :: proc(img: Image, lo, hi: u32) -> Set {
+// call (a get-pc idiom) and adds nothing. A delay slot is no call target
+// (delay_slot): in a section that holds code and data together a data word
+// can decode as a jal to one (Burnout 3's byte table word 0x0c0c0f01 at
+// 0x48c9b4, `jal 0x303c04`, the `addiu $sp, $sp, 0x230` slot of the
+// `jr $ra` that ends 0x303a40).
+call_targets :: proc(r: Rules, img: Image, lo, hi: u32) -> Set {
 	out: Set
 	for a := lo; a < hi; a += 4 {
 		if w, ok := word(img, a); ok && w >> 26 == 3 {
 			t := (a + 4) & 0xf0000000 | (w & 0x3ffffff) << 2
-			if t != a + 8 && !zero_words(img, t) {
+			if t != a + 8 && !zero_words(img, t) && !delay_slot(r, img, t) {
 				out[t] = {}
 			}
 		}
 	}
 	return out
+}
+
+// Whether a is the delay slot of the jump before it, so no function can
+// start there: the word before decodes as a jump or branch with its zero
+// fields clear, and a is no prologue (a data word before a prologue that
+// decodes as a jump is no delay slot; pointer_entries).
+@(private = "file")
+delay_slot :: proc(r: Rules, img: Image, a: u32) -> bool {
+	w, ok := word(img, a - 4)
+	return ok && !is_prologue(img, a) && zero_fields(w) && has_delay(r.decode(a - 4, w))
 }
 
 @(private = "file")
@@ -810,7 +824,7 @@ starts_function :: proc(img: Image, a: u32) -> bool {
 @(private = "file")
 pointer_entries :: proc(r: Rules, img: Image, ptrs: []u32, lo: u32, out: ^Set) {
 	for p in ptrs {
-		if w, ok := word(img, p - 4); ok && !is_prologue(img, p) && zero_fields(w) && has_delay(r.decode(p - 4, w)) {
+		if delay_slot(r, img, p) {
 			continue
 		}
 		for k in u32(0) ..= MAX_PRE_PROLOGUE {
@@ -921,7 +935,7 @@ union_sorted :: proc(a: []u32, b: Set) -> []u32 {
 // listed entries that ordinary code falls through into are dropped (Ghidra
 // places some mid-function), but `jal` targets are always kept.
 module_entries :: proc(r: Rules, img: Image, lo, hi: u32, listed: []u32, refs: Set, known: Set) -> (entries, calls, guessed: Set) {
-	calls = call_targets(img, lo, hi)
+	calls = call_targets(r, img, lo, hi)
 	for e in listed {
 		if e in calls || terminator_before(r, img, e) {
 			entries[e] = {}

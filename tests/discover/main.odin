@@ -340,6 +340,25 @@ main :: proc() {
 	delete(oe)
 	delete(oc)
 	delete(og)
+
+	// A data word that decodes as a jal to a delay slot calls nothing
+	// (Burnout 3's byte table word 0x0c0c0f01 at 0x48c9b4, `jal 0x303c04`,
+	// the slot of the `jr $ra` that ends 0x303a40, which lost its
+	// `addiu $sp, $sp, 0x230`); a jal to a prologue still does.
+	jal_ds := make([]u8, 0x18)
+	put(jal_ds, 0x1000, 0x27bdfdd0, JR_RA, 0x27bd0230, 0x0c000402, 0x0c000400, 0) // addiu $sp, $sp, -+0x230; jal 0x1008; jal 0x1000
+	jal_img := mips.Image {
+		base     = 0x1000,
+		data     = jal_ds,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(jal_ds)), data = jal_ds, flags = mips.SHF_ALLOC | mips.SHF_EXEC}},
+	}
+	je, jc, jg := mips.module_entries(r5900.RULES, jal_img, 0x1000, 0x1018, nil, {}, {})
+	check(0x1008 not_in jc && 0x1008 not_in je, "jal to a delay slot: 0x1008 a call target or entry")
+	check(0x1000 in jc && 0x1000 in je, "jal to a prologue: 0x1000 not a call target")
+	delete(je)
+	delete(jc)
+	delete(jg)
+	delete(jal_ds)
 	delete(ok_ptr)
 
 	test_unpacked()
