@@ -363,10 +363,68 @@ main :: proc() {
 
 	test_unpacked()
 	test_unpack_agree()
+	test_jump_tables()
 	if failed != 0 {
 		os.exit(1)
 	}
 	fmt.println("ok discover")
+}
+
+// r5900.discover on one writable executable section, code and jump tables
+// together (Burnout 3's one section: its printf's `%s` case 0x129c10 was no
+// label, so the native jump to it missed and ran in the interpreter):
+//
+//   0x1000  lui; addiu $a1 = 0x1030             F, a built label stops the
+//   0x1008  sll; lui $v1, 0; addu; lw 0x1100($v1); jr $v1; nop   sweep
+//   0x1020  li $v0, 1; jr $ra; nop             case A
+//   0x102c  li $v0, 2                           case B, past a return: guessed
+//   0x1030  jr $ra; nop
+//   0x1040  lui $s5, 0; lui; addiu $a1 = 0x1078 G, the table's lui hoisted
+//   0x104c  beqz $a0, 0x1078; sll                 before a branch
+//   0x1054  addiu $v1, $s5, 0x1110; addu; lw 0($v0); jr $a0; nop
+//   0x1068  li $v0, 3; b 0x1078; nop            case C
+//   0x1074  li $v0, 4                           case D
+//   0x1078  jr $ra; nop
+//   0x1080  lui; addiu $a1 = 0x1098             N, a jump through a loaded
+//   0x1088  lw $v1, 0($a0); jr $v1; nop           pointer, no table
+//   0x1094  li $v0, 5; jr $ra; nop
+//   0x1100  F's table A, B, A; G's C, D; a run of three words into N
+//
+// A to D are labels (B a guessed entry that must not end F's table); 0x1094 is no label.
+@(private = "file")
+test_jump_tables :: proc() {
+	data := make([]u8, 0x140)
+	defer delete(data)
+	put(data, 0x1000, 0x3c050000, 0x24a51030, 0x00041080, 0x3c030000, 0x00621821, 0x8c631100, 0x00600008, NOP)
+	put(data, 0x1020, 0x24020001, JR_RA, NOP, 0x24020002, JR_RA, NOP)
+	put(data, 0x1040, 0x3c150000, 0x3c050000, 0x24a51078, 0x1080000a, 0x00041080)
+	put(data, 0x1054, 0x26a31110, 0x00431021, 0x8c440000, 0x00800008, NOP)
+	put(data, 0x1068, 0x24020003, 0x10000002, NOP, 0x24020004, JR_RA, NOP)
+	put(data, 0x1080, 0x3c050000, 0x24a51098, 0x8c830000, 0x00600008, NOP, 0x24020005, JR_RA, NOP)
+	X :: 0xffffffff
+	put(data, 0x1100, 0x1020, 0x102c, 0x1020, X, 0x1068, 0x1074, X, X, 0x1094, 0x1094, 0x1098, X)
+	img := mips.Image {
+		name     = "jump tables",
+		base     = 0x1000,
+		entry    = 0x1000,
+		data     = data,
+		sections = {{name = ".text", addr = 0x1000, size = u32(len(data)), data = data, flags = mips.SHF_ALLOC | mips.SHF_WRITE | mips.SHF_EXEC}},
+	}
+	funcs, labels, _, _ := r5900.discover({path = "jump tables"}, img)
+	defer delete(labels)
+	// Each case and the function it is a label of.
+	want := [?][2]u32{{0x1020, 0x1000}, {0x102c, 0x1000}, {0x1068, 0x1040}, {0x1074, 0x1040}}
+	for ce in want {
+		c, e := ce[0], ce[1]
+		ok := false
+		for f in funcs {
+			if f.start == e {ok = ok || c in f.labels}
+		}
+		check(ok || c in labels, fmt.tprintf("jump table: case %x no label of %x", c, e))
+	}
+	check(0x1094 not_in labels, "jump table: 0x1094, in a run with no table jump, a label")
+	for f in funcs {mips.func_free(f)}
+	delete(funcs)
 }
 
 // mips.unpacked on a stub section that starts [u32 size][zlib stream][u32

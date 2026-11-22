@@ -652,6 +652,147 @@ table_labels :: proc(r: Rules, img: Image, lo, hi: u32, ptrs: Set, pairs: [][2]u
 	}
 }
 
+// Words in a jump table, at most this many, that jump_tables reads.
+MAX_CASES :: 1024
+
+// How far back, in instructions, jump_tables looks for the `lw` of a
+// jump-table jr and the `addu` before it (in one block), and for the `lui`
+// of the table's base (anywhere in the function before: a compiler hoists
+// it out of a loop into a saved register).
+CASE_WINDOW :: 8
+BASE_WINDOW :: 256
+
+// The cases of the jump tables in a section that holds code and data
+// together (in_mixed_section), which data_pointers and so table_labels do
+// not see: the words in a row from the table's start that point into the
+// function (between two entries) that jumps through it. A jump table is
+// found by its jump, as a compiler writes it:
+//
+//     lui   b, hi            (or: lui b, hi; addiu b, b, lo)
+//     ...
+//     addu  t, x, b          (x: the index, shifted; either order)
+//     lw    t, off(t)
+//     jr    t
+//
+// The table starts at hi (+ lo) + off. The `addu` and `lw` are the last
+// writes of their registers before the `jr`, in its block; the `lui` (and
+// `addiu`) is the last write of b before the `addu`, in the function. The
+// cases go to out as labels of that function, so its walk reaches them; a
+// case reached only through the table is no label otherwise, and the
+// native code's jump to it misses. The function's bounds are entries not
+// in guessed: a case after a case's `jr $ra` looks like a function's start
+// to return_boundaries (BO3 1ff7e4, the second of 1ff798's five).
+jump_tables :: proc(img: Image, lo, hi: u32, entries, guessed: Set, out: ^Set) {
+	starts := make([dynamic]u32, 0, len(entries))
+	defer delete(starts)
+	for e in entries {
+		if e not_in guessed {append(&starts, e)}
+	}
+	slice.sort(starts[:])
+	for a := lo; a + 4 <= hi; a += 4 {
+		w, ok := word(img, a)
+		if !ok || w & 0xfc1fffff != 8 || w >> 21 == 0 || w >> 21 == 31 {continue}
+		k := bisect_right(starts[:], a)
+		from := k > 0 ? starts[k - 1] : lo
+		to := k < len(starts) ? starts[k] : hi
+		table, found := table_base(img, from, a, w >> 21)
+		if !found || table & 3 != 0 || !in_mixed_section(img, table) {continue}
+		for n in u32(0) ..< MAX_CASES {
+			v, v_ok := word(img, table + 4 * n)
+			if !v_ok || !(from <= v && v < to) || v & 3 != 0 {break}
+			out[v] = {}
+		}
+	}
+}
+
+// The address of the table the `jr t` at jr loads its target from (jump_tables).
+@(private = "file")
+table_base :: proc(img: Image, from, jr, t: u32) -> (u32, bool) {
+	lw_pc, lw, lw_ok := last_write(img, from, jr, t, CASE_WINDOW, true)
+	if !lw_ok || lw >> 26 != 0x23 {return 0, false}
+	b := lw >> 21 & 31
+	add_pc, add, add_ok := last_write(img, from, lw_pc, b, CASE_WINDOW, true)
+	if !add_ok || add >> 26 != 0 || add & 0x7ff != 0x21 && add & 0x7ff != 0x2d {return 0, false}
+	for x in ([2]u32{add >> 21 & 31, add >> 16 & 31}) {
+		if base, ok := built_base(img, from, add_pc, x); ok {
+			return base + u32(sx16(lw)), true
+		}
+	}
+	return 0, false
+}
+
+// The address x holds at pc by its last write before it in [from, pc): a
+// `lui`, or an `addiu`/`daddiu` of a register whose last write is a `lui`.
+@(private = "file")
+built_base :: proc(img: Image, from, pc, x: u32) -> (u32, bool) {
+	if x == 0 {return 0, false}
+	at, w, ok := last_write(img, from, pc, x, BASE_WINDOW, false)
+	if !ok {return 0, false}
+	op := w >> 26
+	if op == 0x0f {return (w & 0xffff) << 16, true}
+	if op != 0x09 && op != 0x19 {return 0, false}
+	s := w >> 21 & 31
+	_, u, u_ok := last_write(img, from, at, s, BASE_WINDOW, false)
+	if s == 0 || !u_ok || u >> 26 != 0x0f {return 0, false}
+	return (u & 0xffff) << 16 + u32(sx16(w)), true
+}
+
+// The last instruction in [from, pc), at most n back, that may write GPR x
+// (writes_gpr). With in_block, a jump or branch on the way ends the search
+// unfound.
+@(private = "file")
+last_write :: proc(img: Image, from, pc, x, n: u32, in_block: bool) -> (at, w: u32, ok: bool) {
+	for k in u32(1) ..= n {
+		if pc < from + 4 * k {return}
+		a := pc - 4 * k
+		v, v_ok := word(img, a)
+		if !v_ok {return}
+		if writes_gpr(v, x) {return a, v, true}
+		if in_block && control(v) {return}
+	}
+	return
+}
+
+// Whether the instruction w may write GPR x: never for stores, branches,
+// `j` and coprocessor loads; the link register for calls; rd for SPECIAL
+// and MMI (EE `mult` writes rd too); rt otherwise (`ld`, `lq` and a
+// coprocessor move too, mtc or not).
+@(private = "file")
+writes_gpr :: proc(w, x: u32) -> bool {
+	op, rt, rd := w >> 26, w >> 16 & 31, w >> 11 & 31
+	switch op {
+	case 0:
+		switch w & 63 {
+		case 0x08, 0x0c, 0x0d, 0x0f, 0x11, 0x13, 0x1a, 0x1b:
+			return false
+		}
+		return rd == x
+	case 0x1c:
+		return rd == x
+	case 0x01, 0x03:
+		return x == 31
+	case 0x02, 0x04 ..= 0x07, 0x14 ..= 0x17, 0x1f, 0x28 ..= 0x2f, 0x31, 0x33, 0x35, 0x36, 0x39, 0x3d ..= 0x3f:
+		return false
+	}
+	return rt == x
+}
+
+// Whether w is a jump or branch (control leaves the straight line after its
+// delay slot).
+@(private = "file")
+control :: proc(w: u32) -> bool {
+	op := w >> 26
+	switch op {
+	case 0:
+		return w & 63 == 0x08 || w & 63 == 0x09
+	case 0x01 ..= 0x07, 0x14 ..= 0x17:
+		return true
+	case 0x10 ..= 0x12:
+		return w >> 21 & 31 == 8
+	}
+	return false
+}
+
 // Addresses in [lo, hi) built in the code in [from, to) by `lui` +
 // `addiu`/`daddiu`/`ori` pairs, such as callbacks passed as arguments.
 address_constants :: proc(r: Rules, img: Image, from, to, lo, hi: u32, out: ^Set) {

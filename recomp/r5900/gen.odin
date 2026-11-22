@@ -277,6 +277,9 @@ discover :: proc(o: mips.Options, img: mips.Image) -> (funcs: [dynamic]^Func, la
 		entries, _, guessed := mips.module_entries(RULES, img, t[0], t[1], nil, refs, known)
 		tables: mips.Set
 		mips.table_labels(RULES, img, t[0], t[1], ptrs, pairs[:], entries, &tables)
+		// And the jump tables in a section that holds code and data
+		// together, which data_pointers skips.
+		mips.jump_tables(img, t[0], t[1], entries, guessed, &tables)
 		for a in tables {
 			labels[a] = {}
 		}
