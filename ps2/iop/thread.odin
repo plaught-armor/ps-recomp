@@ -272,6 +272,17 @@ when core.FLAT {
 when core.FLAT {
 	@(private = "file")
 	th_intr_run: ^r3000.Flat_Ctx
+
+	// Drops the handlers' run, as co_kill drops the handler coroutine: the
+	// calls still on it never return (r3000.flat_free). The next handler
+	// makes a new one.
+	@(private = "file")
+	th_intr_drop :: proc() {
+		if th_intr_run == nil {return}
+		r3000.flat_free(th_intr_run)
+		free(th_intr_run, core.emu_allocator())
+		th_intr_run = nil
+	}
 }
 
 // Emulated state (sif_snap): the handlers' run under FLAT. Each thread's
@@ -290,7 +301,7 @@ th_flat_busy :: proc() -> bool {
 th_init :: proc() {
 	s := &iop_sched
 	for &t in s.threads {th_drop(&t)}
-	when !core.FLAT {if s.intr_co != nil {core.co_kill(s.intr_co)}}
+	when core.FLAT {th_intr_drop()} else {if s.intr_co != nil {core.co_kill(s.intr_co)}}
 	clear(&s.threads)
 	clear(&s.semas)
 	clear(&s.evfs)
@@ -980,7 +991,7 @@ th_intr :: proc(handler, a0, a1: u32) -> Intr_Stop {
 	r3000.run_events = th_budget
 	when core.FLAT {
 		// th_intr_main's one handler, on the handlers' run: a stopped one
-		// is dropped as it is, the next starting it over.
+		// is dropped after (th_intr_drop), the next making a new one.
 		if th_intr_run == nil {th_intr_run = new(r3000.Flat_Ctx, core.emu_allocator())}
 		r := &r3000.state.r
 		r[4], r[5] = a0, a1
@@ -994,7 +1005,9 @@ th_intr :: proc(handler, a0, a1: u32) -> Intr_Stop {
 	r3000.next_event = IOP_EVENT_OFF
 	r3000.run_events = proc() {}
 	s.intr = false
-	when !core.FLAT {
+	when core.FLAT {
+		if s.intr_stop != .None {th_intr_drop()}
+	} else {
 		if s.intr_stop != .None && s.intr_co != nil {
 			core.co_kill(s.intr_co)
 			s.intr_co = nil
