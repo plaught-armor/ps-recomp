@@ -1379,8 +1379,11 @@ change_thread :: proc(h: u32) {
 // Exception return: retail loads the registers of the TCB the PCB names,
 // so a handler that points the PCB at another TCB switches threads when it
 // returns (MGS1's task scheduler does so from its VSync callback). The
-// switch here waits for a later return while it cannot happen: in a mod
-// hook, or under FLAT where the run cannot stop (cpu.flat_preempt_ok).
+// switch here waits for a later return while it cannot happen: under FLAT
+// where the run cannot stop (cpu.flat_preempt_ok), which is every return
+// but one from events a backward jump ran, so a thread waiting in the BIOS
+// (WaitEvent, VSync) gives way only once its wait ends. mod_depth is held
+// by run_events already; the check here only keeps that true.
 @(private)
 preempt :: proc() {
 	p := cpu.r32(pcb()) & 0x1fffffff
@@ -1411,8 +1414,9 @@ preempt :: proc() {
 @(private)
 switch_to :: proc(i: int) {
 	// A thread that lost its slot has no TCB to save into; OpenTh may have
-	// handed it to another thread.
-	if slot_owned() {
+	// handed it to another thread. Nor has one whose slot a game's smaller
+	// table ([0x114]) no longer holds.
+	if slot_owned() && cur_thread < thread_count() {
 		t := tcb(cur_thread)
 		for v, n in cpu.state.r {
 			cpu.w32(t + TCB_REGS + 4 * u32(n), v)

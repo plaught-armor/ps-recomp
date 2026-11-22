@@ -663,7 +663,7 @@ sys_init_memory :: proc(addr, size: u32) {
 heap_init :: proc(heap: ^Heap, addr, size: u32) {
 	cpu.w32(addr, 0)
 	heap.cursor = addr
-	heap.end = addr + size &~ 3 + 4
+	heap.end = addr + size &~ 3
 	heap.size = size
 	heap.ready = false
 }

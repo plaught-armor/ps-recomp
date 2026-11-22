@@ -532,6 +532,17 @@ kernel_heap_test :: proc() {
 	check("free_kernel_memory sets bit 0", cpu.r32(KHEAP), 32 | 1)
 	check("kernel reuses freed", libc.alloc_kernel_memory(32), k)
 	check("kernel too big", libc.alloc_kernel_memory(0x1000), NEG)
+
+	// A full heap ending where the kernel heap does (0x10000) keeps its end
+	// mark inside: the word past it is the game's.
+	cpu.w32(0x80010000, 0x5a5a5a5a)
+	libc.sys_init_memory(0x8000f000, 0x1000)
+	n := 0
+	for n < 64 && libc.alloc_kernel_memory(0x7c) != NEG {
+		n += 1
+	}
+	check("full kernel heap blocks", u32(n), 0x1000 / 0x80 - 1)
+	check("full kernel heap leaves the word past it", cpu.r32(0x80010000), 0x5a5a5a5a)
 }
 
 main :: proc() {

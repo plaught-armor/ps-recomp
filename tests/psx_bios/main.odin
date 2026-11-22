@@ -168,6 +168,7 @@ th: struct {
 	restart_s0, restart_sr: u32,
 	preempts:               int,
 	preempt_s0:             u32,
+	shrink:                 bool,
 }
 
 @(private = "file")
@@ -347,6 +348,10 @@ main :: proc() {
 					for {
 						th.preempts += 1
 						th.preempt_s0 = cpu.state.r[16]
+						if th.shrink {
+							cpu.w32(0x114, 0xc0)
+							cpu.state.r[16] = 0x7777
+						}
 						cpu.w32(cpu.r32(0x108), cpu.r32(0x110) & 0x1fffffff)
 						irq(0)
 					}
@@ -812,6 +817,17 @@ main :: proc() {
 	check("exception return to a TCB of a game's table", u32(th.preempts), 3)
 	check("main thread s0 back from a game's table", r[16], 0xdddd)
 	check("running TCB in a game's table", cpu.r32(NEW_PCB) & 0x1fffffff, NEW_TCBS & 0x1fffffff)
+	// A table the thread shrinks under itself has no slot to save it in: the
+	// switch back leaves the word past the table alone.
+	cpu.w32(reg(NEW_TCBS + 0xc0, 16), 0x5a5a)
+	th.shrink = true
+	cpu.w32(NEW_PCB, NEW_TCBS + 0xc0)
+	irq(0)
+	th.shrink = false
+	check("exception return in a shrunk table", u32(th.preempts), 4)
+	check("main thread s0 back from a shrunk table", r[16], 0xdddd)
+	check("no save past a shrunk table", cpu.r32(reg(NEW_TCBS + 0xc0, 16)), 0x5a5a)
+	cpu.w32(0x114, 4 * 0xc0)
 	check("CloseTh in a game's table", b(0x0f, h), 1)
 	cpu.w32(0x108, old_pcb)
 	cpu.w32(0x110, old_tcbs)

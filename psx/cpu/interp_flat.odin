@@ -565,9 +565,12 @@ when core.FLAT {
 		x.pc = target
 		if (check || target <= pc) && state.cycles >= next_event {
 			x.goto_owed = true
+			// Saved, not cleared: a callback's own flat_goto inside these
+			// events must not turn the flag off under them.
+			outer := flat_goto_events
 			flat_goto_events = true
 			run_events()
-			flat_goto_events = false
+			flat_goto_events = outer
 			return false
 		}
 		if flat_fn_target(target) {
