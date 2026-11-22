@@ -74,7 +74,13 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		size := r32(r[29] + 16)
 		if a1 & 3 > 1 {return 0, true}
 		sd_voice_trans(a1, a2, a3, size)
-		if s.trans[a0 & 1].func != 0 {s.pending |= SD_PENDING_TRANS << (a0 & 1)}
+		// Only a DMA transfer ends in the channel's transfer interrupt. An
+		// IO-mode one (mode bit 3, SD_TRANS_BY_IO) is PIO, which retail
+		// (Burnout 3's LIBSD.IRX export 17, text 0x1890, IO path 0x19bc)
+		// finishes inline without calling the handler. Burnout 3's RWA takes
+		// a handler call as its DMA request's end and dereferences the
+		// request, null after its IO-mode init transfers.
+		if a1 & 8 == 0 && s.trans[a0 & 1].func != 0 {s.pending |= SD_PENDING_TRANS << (a0 & 1)}
 		// Retail moves whole 64-byte blocks and returns the size rounded up
 		// to them, and callers check it: Jak II's OVERLORD takes less as a
 		// short transfer and retries it forever.

@@ -5022,6 +5022,15 @@ test_libsd :: proc() {
 	check(sd_call(17, 0, 0, b + adp, 0x5000, 32) == 64, "libsd: VoiceTrans writes, returning the size rounded up to 64 bytes")
 	check(sd_call(17, 0, 1, b + rd, 0x5000, 32) == 64 && mem_eq(b + rd, b + adp, 32), "libsd: VoiceTrans reads it back")
 	check(sd_call(17, 0, 0, b + adp, 0x5000, 0x40) == 0x40, "libsd: VoiceTrans of whole 64-byte blocks returns the size")
+	// Channel 1 has h as its transfer handler: an IO-mode (mode 8) voice
+	// transfer leaves it uncalled, a DMA one owes it.
+	pend := iop.iop_sd.pending
+	iop.iop_sd.pending = 0
+	sd_call(17, 1, 8, b + adp, 0x5000, 32)
+	check(iop.iop_sd.pending == 0, "libsd: an IO-mode VoiceTrans does not call the transfer handler")
+	sd_call(17, 1, 0, b + adp, 0x5000, 32)
+	check(iop.iop_sd.pending == iop.SD_PENDING_TRANS << 1, "libsd: a DMA VoiceTrans owes the transfer handler a call")
+	iop.iop_sd.pending = pend
 	sd_call(9, 0x2040, 0x5000)
 	sd_call(5, 0x0200, 0x1000)
 	sd_call(5, 0x0000, 0x3fff)
