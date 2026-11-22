@@ -1154,6 +1154,22 @@ call_func :: proc(a: ^Asm, l: Label, leave := "") {
 	call_after(a, leave)
 }
 
+// call_func then ret as one jump (not wasm32): the cached fields go to the
+// state, this function's frame goes, and the function at label l returns
+// to this one's caller. A loop of tail calls between functions keeps one
+// host frame, and the caller's call_after sees an unwind.
+tail_func :: proc(a: ^Asm, l: Label) {
+	cache_sync(a, true)
+	switch a.arch {
+	case .X64_SysV, .X64_Win:
+		x64_tail_func(a, l)
+	case .Arm64:
+		a64_tail_func(a, l)
+	case .Wasm32:
+		panic("native: tail_func on wasm32")
+	}
+}
+
 // After a call: with leave not "", when the byte at import `leave` is set,
 // go to the epilogue past its write-back of the cached fields, which the
 // call already wrote and the callee may have changed since (an unwind

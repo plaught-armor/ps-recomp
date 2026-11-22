@@ -157,7 +157,7 @@ x64_prologue :: proc(a: ^Asm, state: int) {
 	}
 }
 
-x64_epilogue :: proc(a: ^Asm) {
+x64_epilogue :: proc(a: ^Asm, ret := true) {
 	emit8(a, 0x48, 0x83, 0xc4, frame(a)) // add rsp, frame
 	if win_cache(a) {
 		emit8(a, 0x5f, 0x5e) // pop rdi rsi
@@ -166,7 +166,7 @@ x64_epilogue :: proc(a: ^Asm) {
 		emit8(a, 0x5d, 0x41, 0x5f) // pop rbp r15
 	}
 	emit8(a, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5b) // pop r14 r13 r12 rbx
-	emit8(a, 0xc3)
+	if ret {emit8(a, 0xc3)}
 }
 
 @(private = "file")
@@ -731,6 +731,16 @@ x64_call_func :: proc(a: ^Asm, l: Label) {
 	regs := SYSV_ARGS if a.arch == .X64_SysV else WIN_ARGS
 	op_rr(a, true, 0x89, R12, regs[0]) // the context
 	x64_call_label(a, l)
+}
+
+// x64_call_func's tail form: the context goes in first, as the epilogue
+// restores r12, then the frame goes and the jump leaves the return address
+// on the stack for the callee.
+x64_tail_func :: proc(a: ^Asm, l: Label) {
+	regs := SYSV_ARGS if a.arch == .X64_SysV else WIN_ARGS
+	op_rr(a, true, 0x89, R12, regs[0]) // the context
+	x64_epilogue(a, ret = false)
+	x64_jmp(a, l)
 }
 
 x64_jmp :: proc(a: ^Asm, l: Label) {

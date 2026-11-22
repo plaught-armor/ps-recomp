@@ -1749,7 +1749,12 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				native.mov_imm(a, .A, s.n - 8)
 				native.mov_imm(a, .B, s.target)
 				native.call_leave(a, UNWINDING, "ps2.learned_goto", .A, .B)
-			} else if l, ok := funcs[s.target]; ok {
+			} else if l, ok := funcs[s.target]; ok && s.check {
+				// a branch out of the function, its .Return next: one
+				// host frame for a loop through two functions (FFX
+				// 001087d4 nested 0x10000 calls, past the 8 MiB stack)
+				native.tail_func(a, l)
+			} else if ok {
 				native.call_func(a, l, UNWINDING)
 			} else {
 				native.mov_imm(a, .A, s.target)

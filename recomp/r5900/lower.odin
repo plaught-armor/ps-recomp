@@ -11,7 +11,7 @@ Step_Kind :: enum u8 {
 	Cycles,   // charge `n` cycles
 	Return,   // exact: t = the address `jr $ra` jumps to; `check`: ERET's instead; else `n`: the `jr $ra`'s pc (0: no `jr`), `check`: t = the address it jumps to
 	Goto,     // pc = `target` within the function (exact: or outside it); `check`: run due events first; `n`: the jump's pc
-	Call,     // call the function at `target`, returning to `n`
+	Call,     // call the function at `target`, returning to `n`; `check`: a branch out of the function, a Return next (a tail call)
 	Branch,   // t := the condition of branch `i`, up to the matching End
 	Link,     // register `n` = `target` (a return address)
 	If_Taken, // when t, the steps up to the matching End

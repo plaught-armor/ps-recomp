@@ -109,13 +109,13 @@ a64_prologue :: proc(a: ^Asm, state: int) {
 	}
 }
 
-a64_epilogue :: proc(a: ^Asm) {
+a64_epilogue :: proc(a: ^Asm, ret := true) {
 	ram := a.ram.base != ""
 	if ram {emit32(a, 0xa94363f7)} // ldp x23, x24, [sp, #48]
 	emit32(a, 0xa9425bf5) // ldp x21, x22, [sp, #32]
 	emit32(a, 0xa94153f3) // ldp x19, x20, [sp, #16]
 	emit32(a, 0xa8c47bfd if ram else 0xa8c37bfd) // ldp x29, x30, [sp], #64 or #48
-	emit32(a, 0xd65f03c0) // ret
+	if ret {emit32(a, 0xd65f03c0)} // ret
 }
 
 a64_cache_sync :: proc(a: ^Asm, k: int, off: u32, store: bool) {
@@ -536,6 +536,14 @@ a64_call :: proc(a: ^Asm, k: int, args: []Reg) {
 a64_call_func :: proc(a: ^Asm, l: Label) {
 	emit32(a, 0xaa0003e0 | CTX << 16) // mov x0, the context
 	a64_call_label(a, l)
+}
+
+// a64_call_func's tail form: the context goes in first, as the epilogue
+// restores x20, then the frame goes with x30 back to the caller's return.
+a64_tail_func :: proc(a: ^Asm, l: Label) {
+	emit32(a, 0xaa0003e0 | CTX << 16) // mov x0, the context
+	a64_epilogue(a, ret = false)
+	a64_jmp(a, l)
 }
 
 a64_jmp :: proc(a: ^Asm, l: Label) {

@@ -1179,7 +1179,8 @@ main :: proc() {
 	}
 	failed += check_calls(arch)
 	failed += check_jalr(arch)
-	checks += 2 + JALR_CHECKS
+	failed += check_tail(arch)
+	checks += 3 + JALR_CHECKS
 	if failed != 0 {
 		fmt.eprintfln("%d of %d checks failed", failed, checks)
 		os.exit(1)
@@ -1243,6 +1244,56 @@ check_calls :: proc(arch: native.Arch) -> (failed: int) {
 			failed += 1
 			fmt.eprintfln("FAIL jal %08x: r3 r2 ra %x, want %x", progs[k].words[0], got, want)
 		}
+	}
+	return
+}
+
+// Two functions in the blob branching to each other's start, as FFX's
+// 001087d4 loop: each branch is a tail jump, not a call, so 2^20 turns run
+// in one host frame. As a call each turn nested a frame, 48 MiB of stack.
+@(private = "file")
+check_tail :: proc(arch: native.Arch) -> (failed: int) {
+	A, B :: u32(0x00200400), u32(0x00200500)
+	TURNS :: 1 << 20
+	JR_RA :: 0x03e00008
+	ADDIU_DEC :: 0x09 << 26 | 3 << 21 | 3 << 16 | 0xffff // addiu r3, r3, -1
+	bne_r3 :: proc(pc, t: u32) -> u32 {return 0x05 << 26 | 3 << 21 | (t - pc - 4) >> 2 & 0xffff}
+	Prog :: struct {
+		at:    u32,
+		words: [4]u32,
+	}
+	// bne r3, $zero, the other function; r3 -= 1 in the delay slot
+	progs := [?]Prog{{A, {bne_r3(A, B), ADDIU_DEC, JR_RA, 0}}, {B, {bne_r3(B, A), ADDIU_DEC, JR_RA, 0}}}
+	a := r5900.native_asm(arch)
+	labels := make(map[u32]native.Label)
+	defer delete(labels)
+	for p in progs {labels[p.at] = native.new_label(&a)}
+	funcs: [len(progs)]native.Blob_Func
+	slow: map[string]int
+	defer delete(slow)
+	for p, k in progs {
+		data: [len(p.words) * 4]u8
+		for w, n in p.words {
+			data[4 * n], data[4 * n + 1], data[4 * n + 2], data[4 * n + 3] = u8(w), u8(w >> 8), u8(w >> 16), u8(w >> 24)
+		}
+		f := mips.func_make(p.at, p.at + len(data))
+		mips.discover(r5900.RULES, {base = p.at, data = data[:]}, f, {})
+		funcs[k] = {p.at, r5900.native_func(&a, f, {}, 1, &slow, labels)[0].off}
+		free_all(context.temp_allocator)
+	}
+	code, err := core.native_load(native.make_blob(&a, funcs[:], {}), ps2.native_imports())
+	if err != "" {
+		fmt.eprintln("native_load:", err)
+		os.exit(1)
+	}
+	cpu.text_range(A, B + 0x100)
+	cpu.state = {}
+	cpu.state.r[3].d[0] = TURNS
+	run := cast(proc())rawptr(code.base + uintptr(code.funcs[0].off))
+	run()
+	if got := cpu.state.r[3].d[0]; got != max(u64) {
+		failed += 1
+		fmt.eprintfln("FAIL tail branch loop: r3 %x, want %x", got, max(u64))
 	}
 	return
 }
