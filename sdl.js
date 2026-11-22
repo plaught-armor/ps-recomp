@@ -65,6 +65,7 @@ export class Sdl {
 		this.ctl = new Int32Array(control);
 		this.ctlView = new DataView(control);
 		this.ctlBytes = new Uint8Array(control);
+		this.tickAt = new BigInt64Array(control, CONTROL.TICK_AT, 1);
 		this.audioWords = new Int32Array(audio, 0, AUDIO.RING / 4);
 		this.ring = new Int16Array(audio, AUDIO.RING, AUDIO.RING_FRAMES * 2);
 		this.presentBuf = present;
@@ -91,6 +92,7 @@ export class Sdl {
 		this.nextTexture = 0x1000;
 		this.cmds = [];
 		this.frame = 0;
+		this.imageStamp = 0; // STAMP of the last present with a new texture version
 		this.warned = new Set();
 		this.audioRate = 0;
 		this.imports = this.makeImports();
@@ -258,6 +260,7 @@ export class Sdl {
 
 	// Writes the frame into a free present slot and publishes it.
 	present() {
+		const t0 = performance.now();
 		const P = this.presentWords;
 		const latest = Atomics.load(P, PRESENT.LATEST_WORD), reading = Atomics.load(P, PRESENT.READING_WORD);
 		let s = 0;
@@ -277,7 +280,7 @@ export class Sdl {
 			words.set(c, (PRESENT.CMDS / 4) + i * PRESENT.CMD_WORDS);
 			if (c[0] === CMD.COPY) used.add(c[1]);
 		});
-		let at = PRESENT.TEXTURES, ntex = 0;
+		let at = PRESENT.TEXTURES, ntex = 0, copied = 0, image = false;
 		for (const id of used) {
 			const t = this.textures.get(id);
 			if (!t) continue;
@@ -288,6 +291,9 @@ export class Sdl {
 			new Int32Array(this.presentBuf, base + at, PRESENT.TEX_HEADER / 4).set([id, t.kind, t.w, t.h, t.version, t.scale, 0, 0]);
 			bytes.set(t.pixels, at + PRESENT.TEX_HEADER);
 			at += PRESENT.TEX_HEADER + t.pixels.length;
+			copied += t.pixels.length;
+			if (t.published !== t.version) image = true;
+			t.published = t.version;
 			ntex++;
 		}
 		words[PRESENT.W_WORD] = out.w;
@@ -296,6 +302,13 @@ export class Sdl {
 		words[PRESENT.NTEX_WORD] = ntex;
 		words[PRESENT.INTEGER_WORD] = this.integer;
 		words[PRESENT.FRAME_WORD] = ++this.frame;
+		words[PRESENT.COPIED_WORD] = copied;
+		const t1 = performance.now();
+		const f = new Float64Array(this.presentBuf, base + PRESENT.STAMP_BYTE, 3);
+		f[0] = performance.timeOrigin + t1;
+		f[1] = t1 - t0;
+		if (image) this.imageStamp = f[0];
+		f[2] = this.imageStamp;
 		Atomics.store(P, PRESENT.LATEST_WORD, s);
 		Atomics.add(P, PRESENT.FRAMES_WORD, 1);
 		this.cmds = [];
@@ -305,6 +318,15 @@ export class Sdl {
 		const ok = () => 0;
 		const none = () => {};
 		const imports = {
+			// Not SDL's: the page's last display tick (ps2/host/display.odin).
+			// Its time in microseconds to at; returns the tick count, 0 before
+			// the first. The count is read first, so a tick between the two
+			// loads gives a newer time, never an older one.
+			PsDisplayTick: (at) => {
+				const n = Atomics.load(this.ctl, CONTROL.TICK_WORD);
+				this.dv().setBigInt64(at, Atomics.load(this.tickAt, 0), true);
+				return n;
+			},
 			// Init and stubs.
 			Init: ok,
 			InitSubSystem: ok,

@@ -3,7 +3,7 @@
 // module runs; the page reaches it only through the SharedArrayBuffers.
 import { Bands, NO_BAND } from "./band.js";
 import { buildId, NetImports, NO_NET } from "./net.js";
-import { LearnImports, NO_LEARN, NO_SDL } from "./learn.js";
+import { LearnImports, NO_LEARN, NO_SDL, NO_VU, VuImports } from "./learn.js";
 import { dataLoad, dataSave, discOf, openStored, store } from "./readers.js";
 import { Native } from "./native.js";
 import { Sdl } from "./sdl.js";
@@ -29,6 +29,11 @@ const buffers = (files) => (files ?? []).map(([, b]) => b.buffer);
 // openStored tries on a held lock: LOCK_TRIES more, LOCK_WAIT_MS apart.
 const LOCK_TRIES = 30;
 const LOCK_WAIT_MS = 100;
+// gs_warm calls per step of the raster warm (ps2/gs/warm_wasm.odin): one
+// step is 1024 empty rows, so it overruns its sleep's deadline by little.
+// The whole warm is 73728 calls; in Okami its nine procs reach TurboFan
+// long before frame 254 (OKAMI-60 STEP 20).
+const GS_WARM_STEP = 1024;
 
 // The disc for Wasi, {disc, close()}, and how it is read, which goes to the
 // page as {store: {kind, ...}}. stored: play that stored disc. store with
@@ -75,7 +80,9 @@ async function discFor({ files, urls, store: name, stored }) {
 // there). Before /data is stored the page gets {saving}: from then on
 // stopping the Worker could cut a write short. A mid-run learned compile
 // (web/learn.js) goes to the page as {learn: {records, interp, buffer,
-// gen}}: the LEARN buffer, made at the first, and the compile's generation.
+// gen, cpu}}: the LEARN buffer, made at the first, the compile's generation
+// and its cpu. A mid-run VU conversion goes as {vu: {exe, vu0, vu1,
+// buffer, gen}} (VuImports), on a buffer of its own.
 //
 // The software GS's band workers (PS_BANDS, ps2/gs/band_wasm.odin) run on
 // a pool of Workers (web/band.js) made before the run: as many as
@@ -89,8 +96,11 @@ async function discFor({ files, urls, store: name, stored }) {
 // out: a tool run, as a mid-run learned compile's (web/learn.js): no disc,
 // no store and no window; /data holds only seed (path -> bytes), and done
 // carries what the module wrote there as files.
+//
+// useStore: a test run (test mode's convert=1) that loads and stores /data
+// as a normal run does, not one from an empty /data.
 onmessage = async ({ data }) => {
-	const { wasm, args, env = {}, test = false, failSaves = true, control, audio, present, net: netBuffer, out = false, seed } = data;
+	const { wasm, args, env = {}, test = false, useStore = false, failSaves = true, control, audio, present, net: netBuffer, out = false, seed } = data;
 	let wasi = null;
 	let disc = null;
 	const ring = [];
@@ -145,8 +155,14 @@ onmessage = async ({ data }) => {
 		const net = netBuffer ? new NetImports(netBuffer, await buildId(bytes)) : null;
 		const learn = out
 			? null
-			: new LearnImports((records, interp, buffer, gen) => {
-					postMessage({ learn: { records, interp, buffer, gen } }, [records.buffer, interp.buffer]);
+			: new LearnImports((records, interp, buffer, gen, cpu) => {
+					postMessage({ learn: { records, interp, buffer, gen, cpu } }, [records.buffer, interp.buffer]);
+					return true;
+				});
+		const vu = out
+			? null
+			: new VuImports((exe, vu0, vu1, buffer, gen) => {
+					postMessage({ vu: { exe, vu0, vu1, buffer, gen } }, [exe.buffer, vu0.buffer, vu1.buffer]);
 					return true;
 				});
 		times.compileMs = Math.round(performance.now() - t0);
@@ -157,11 +173,30 @@ onmessage = async ({ data }) => {
 			disc = await discFor(data);
 			postMessage({ store: disc.info });
 		}
-		wasi = new Wasi({ args: [wasm.replace(/\.wasm$/, ""), ...args], env, disc: disc.disc, log });
+		// The run's game data each time the module writes it (core/gamedata.odin
+		// renames a tmp file over gamedata.tsv, core/file.odin
+		// write_file_atomic), copied to the page for its Send: /data reaches
+		// the store only when the run ends.
+		const renamed = out ? null : (path, bytes) => {
+			if (path.split("/").at(-1) !== "gamedata.tsv") return;
+			const copy = bytes.slice();
+			postMessage({ gamedata: copy }, [copy.buffer]);
+		};
+		// Learned code, then the native blob, is compiled in the pace sleep
+		// before the run first calls it (web/native.js warm); PS_WARM=0
+		// turns that off.
+		const native = new Native({ log: (text) => postMessage({ log: text }) });
+		// The runtime's own raster procs go first: ps2/gs/warm_wasm.odin.
+		let gsWarm = null;
+		const idle = env.PS_WARM === "0" ? null : (deadline) => {
+			gsWarm?.(deadline);
+			native.warm(deadline);
+		};
+		wasi = new Wasi({ args: [wasm.replace(/\.wasm$/, ""), ...args], env, disc: disc.disc, log, renamed, idle });
 		// /data from the store (readers.js), but in test mode, whose runs start
-		// from an empty /data so they compare with native ones.
+		// from an empty /data so they compare with native ones (unless useStore).
 		if (seed) wasi.seed(seed);
-		if (!test && !out && typeof navigator.storage?.getDirectory === "function") {
+		if ((!test || useStore) && !out && typeof navigator.storage?.getDirectory === "function") {
 			try {
 				stored = await dataLoad();
 				wasi.seed(stored);
@@ -172,7 +207,6 @@ onmessage = async ({ data }) => {
 		}
 		const tee = test ? (samples) => ring.push(samples.slice()) : null;
 		const sdl = out ? null : new Sdl({ control, audio, present, post: (m) => postMessage(m), tee });
-		const native = new Native({ log: (text) => postMessage({ log: text }) });
 		const instance = await WebAssembly.instantiate(module, {
 			...wasi.imports,
 			...(memory && { env: { memory } }),
@@ -180,12 +214,25 @@ onmessage = async ({ data }) => {
 			"system:ps_native": native.imports,
 			"system:ps_net": net?.imports ?? NO_NET,
 			"system:ps_learn": learn?.imports ?? NO_LEARN,
+			"system:ps_vu": vu?.imports ?? NO_VU,
 			"system:ps_band": bands?.imports ?? NO_BAND,
 		});
 		sdl?.attach(instance);
 		native.attach(instance);
 		net?.attach(instance);
 		learn?.attach(instance);
+		vu?.attach(instance);
+		const warmStep = instance.exports.gs_warm;
+		if (warmStep !== undefined) {
+			gsWarm = (deadline) => {
+				while (performance.now() < deadline) {
+					if (warmStep(GS_WARM_STEP) <= 0) {
+						gsWarm = null;
+						return;
+					}
+				}
+			};
+		}
 		t1 = performance.now();
 		const code = wasi.run(instance);
 		times.runMs = Math.round(performance.now() - t1);

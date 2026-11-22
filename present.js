@@ -59,6 +59,11 @@ export class Present {
 		this.textures = new Map(); // id -> {gl, w, h, version, scale, used}
 		this.shown = 0; // FRAME_WORD of the last frame drawn
 		this.drawn = 0; // frames replayed
+		// Texture uploads: the host uploads the screen only when it changed,
+		// so a frame() that moves this shows a new image (play.js hitches).
+		this.images = 0;
+		// The last shown slot's present timing (web/layout.js STAMP_BYTE).
+		this.shownTiming = { stamp: 0, cost: 0, image: 0, copied: 0 };
 		// Whether texSubImage2D took a view of the SharedArrayBuffer itself:
 		// null until the first upload; false when it threw and uploads go
 		// through a copy.
@@ -120,6 +125,7 @@ export class Present {
 			if (!again && slot.frame === this.shown) return false;
 			f(slot);
 			this.shown = slot.frame;
+			this.shownTiming = slot.timing;
 			return true;
 		} finally {
 			Atomics.store(P, PRESENT.READING_WORD, -1);
@@ -143,7 +149,9 @@ export class Present {
 			textures.set(id, { kind, w: tw, h: th, version, scale, pixels: new Uint8Array(this.buf, base + at + PRESENT.TEX_HEADER, n) });
 			at += PRESENT.TEX_HEADER + n;
 		}
+		const f = new Float64Array(this.buf, base + PRESENT.STAMP_BYTE, 3);
 		return {
+			timing: { stamp: f[0], cost: f[1], image: f[2], copied: w[PRESENT.COPIED_WORD] },
 			w: w[PRESENT.W_WORD], h: w[PRESENT.H_WORD], integer: w[PRESENT.INTEGER_WORD] !== 0,
 			frame: w[PRESENT.FRAME_WORD], cmds, textures,
 		};
@@ -266,6 +274,7 @@ export class Present {
 		}
 		if (g.version === t.version) return;
 		g.version = t.version;
+		this.images++;
 		if (this.sabUpload !== false) {
 			try {
 				gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, t.w, t.h, gl.RGBA, gl.UNSIGNED_BYTE, t.pixels);

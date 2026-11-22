@@ -8,6 +8,26 @@
 // release clears the range, so a stale index traps instead of running freed
 // code, and frees it for the next load: reloading the same blob takes back
 // its own range, and the table stops growing. No dependencies.
+//
+// V8 compiles a wasm function lazily on its first call, on the calling
+// thread, inside the frame that first calls it (Okami: learned code at
+// f827/f833, 40-50 ms; the native blob at f304, 60 ms). A module core marks
+// warm (core/native.odin Native_Warm) is queued, First ones ahead of After
+// ones, and warm(deadline) calls its functions before the run does, from
+// the pace sleep: each on a second instance of the same Module (so the
+// same compiled code) with its own table, zeroed globals and fresh memory,
+// at pc 1. No block starts at pc 1, so the code leaves with None at once
+// and runs no guest code (recomp/r5900/native.odin, the entry search); a
+// trap on the dummy memory is caught. A call starts only when its
+// compile, guessed from its body's bytes, ends by the deadline, so the
+// sleep is not overrun; one guessed over WARM_MAX_MS, more than most
+// frames' sleep, is left to its first call, and the next waits for a sleep
+// it fits in.
+//
+// Liftoff compile time per body byte: most of Okami's calls over 150 KB
+// (2.7e-5 to 5.7e-5 ms, Brave 157, 2026-11-19, tmp/okami60/step4-results.md).
+const WARM_MS_PER_BYTE = 6e-5;
+const WARM_MAX_MS = 12;
 
 export class Native {
 	// log(text): where a failed instantiate is said, once.
@@ -16,8 +36,9 @@ export class Native {
 		this.said = false;
 		this.free = []; // {base, n}, the released ranges
 		this.used = new Map(); // base -> n
+		this.queue = []; // {table, sizes, next, order}: modules to warm, by order
 		this.imports = {
-			instantiate: (code, n, slots, nSlots, nFuncs) => this.instantiate(code, n, slots, nSlots, nFuncs),
+			instantiate: (code, n, slots, nSlots, nFuncs, warm) => this.instantiate(code, n, slots, nSlots, nFuncs, warm),
 			release: (base) => this.release(base),
 		};
 	}
@@ -29,8 +50,8 @@ export class Native {
 	}
 
 	// Table index of the module code[0:n]'s first function, or 0; *nFuncs =
-	// how many functions it put in the table.
-	instantiate(code, n, slots, nSlots, nFuncs) {
+	// how many functions it put in the table. warm: a Native_Warm, 0 none.
+	instantiate(code, n, slots, nSlots, nFuncs, warm = 0) {
 		try {
 			if (this.table === undefined) throw new Error("play.wasm exports no function table");
 			const bytes = new Uint8Array(this.memory.buffer, code, n).slice();
@@ -48,11 +69,49 @@ export class Native {
 				throw e;
 			}
 			new DataView(this.memory.buffer).setUint32(nFuncs, count, true);
+			if (warm !== 0) this.enqueue(module, bytes, count, warm);
 			return base;
 		} catch (e) {
 			if (!this.said) this.log(`native: cannot instantiate the wasm32 code: ${e?.message ?? e}\n`);
 			this.said = true;
 			return 0;
+		}
+	}
+
+	// Queue module (bytes, count functions) for warm after the queued ones
+	// of its order or a lower one; a failure to make its second instance only
+	// costs the warm, said once.
+	enqueue(module, bytes, count, order) {
+		try {
+			const g = (v) => new WebAssembly.Global({ value: "i32", mutable: false }, v);
+			const env = { table: new WebAssembly.Table({ element: "anyfunc", initial: count }), base: g(0) };
+			const { memory, sizes } = layout(bytes, count);
+			if (memory !== null) env.memory = new WebAssembly.Memory(memory);
+			for (const { module: m, name, kind } of WebAssembly.Module.imports(module)) {
+				if (m === "env" && kind === "global" && name !== "base") env[name] = g(0);
+			}
+			new WebAssembly.Instance(module, { env });
+			const at = this.queue.findIndex((d) => d.order > order);
+			this.queue.splice(at < 0 ? this.queue.length : at, 0, { table: env.table, sizes, next: 0, order });
+		} catch (e) {
+			if (!this.saidWarm) this.log(`native: cannot warm the wasm32 code: ${e?.message ?? e}\n`);
+			this.saidWarm = true;
+		}
+	}
+
+	// Call queued functions while each one's guessed compile ends before
+	// deadline (a performance.now() time), until the queue is empty.
+	warm(deadline) {
+		while (this.queue.length > 0) {
+			const d = this.queue[0];
+			const ms = d.sizes[d.next] * WARM_MS_PER_BYTE;
+			if (ms <= WARM_MAX_MS) {
+				if (performance.now() + ms >= deadline) return;
+				try {
+					d.table.get(d.next)?.(1, 0);
+				} catch {}
+			}
+			if (++d.next >= d.sizes.length) this.queue.shift();
 		}
 	}
 
@@ -114,4 +173,67 @@ function elements(b) {
 		at = end;
 	}
 	throw new Error("no element segment of the expected form");
+}
+
+// Of module bytes b, whose element segment puts count functions in the
+// table: its memory import's limits (the play memory's) as a
+// WebAssembly.Memory descriptor, or null when it imports none, and the body
+// bytes of the function at each table slot.
+function layout(b, count) {
+	let at = 8;
+	const uleb = () => {
+		let v = 0, shift = 0, c;
+		do {
+			c = b[at++];
+			v += (c & 0x7f) * 2 ** shift;
+			shift += 7;
+		} while (c & 0x80);
+		return v;
+	};
+	let memory = null, elems = null, bodies = null;
+	while (at < b.length) {
+		const id = b[at++];
+		const size = uleb();
+		const end = at + size;
+		if (id === 2) {
+			for (let n = uleb(); n > 0; n--) {
+				for (let k = 0; k < 2; k++) {
+					const len = uleb(); // module, then field name
+					at += len;
+				}
+				const kind = b[at++];
+				if (kind === 0) uleb();
+				else if (kind === 1) {
+					at++; // element type
+					const flags = uleb();
+					uleb();
+					if (flags & 1) uleb();
+				} else if (kind === 2) {
+					const flags = uleb();
+					const initial = uleb();
+					const maximum = flags & 1 ? uleb() : undefined;
+					memory = { initial, maximum: maximum ?? initial, shared: (flags & 2) !== 0 };
+				} else if (kind === 3) at += 2;
+			}
+		} else if (id === 9) {
+			// One active segment at global.get base (elements checked it).
+			uleb(); // segments
+			uleb(); // flags
+			at++; // global.get
+			uleb(); // base
+			at++; // end
+			elems = new Uint32Array(uleb());
+			for (let k = 0; k < elems.length; k++) elems[k] = uleb();
+		} else if (id === 10) {
+			bodies = new Uint32Array(uleb());
+			for (let k = 0; k < bodies.length; k++) {
+				bodies[k] = uleb();
+				at += bodies[k];
+			}
+		}
+		at = end;
+	}
+	const sizes = new Uint32Array(count);
+	for (let k = 0; k < count; k++) sizes[k] = bodies?.[elems?.[k]] ?? 0;
+	return { memory, sizes };
 }

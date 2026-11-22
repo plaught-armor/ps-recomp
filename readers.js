@@ -145,7 +145,23 @@ export async function dataSave(files, before) {
 		const dir = await parent(path, false).catch(notFound);
 		await dir?.removeEntry(path.split("/").at(-1)).catch(notFound);
 	}
-	const same = (a, b) => a !== undefined && a.length === b.length && a.every((v, i) => v === b[i]);
+	// Four bytes a step where both views share an alignment: a run's /data
+	// is megabytes, and this runs before the run's done goes to the page.
+	const same = (a, b) => {
+		if (a === undefined || a.length !== b.length) return false;
+		const n = a.length;
+		let i = 0;
+		if (a.byteOffset % 4 === b.byteOffset % 4) {
+			for (; i < n && (a.byteOffset + i) % 4 !== 0; i++) if (a[i] !== b[i]) return false;
+			const w = (n - i) >> 2;
+			const a32 = new Int32Array(a.buffer, a.byteOffset + i, w);
+			const b32 = new Int32Array(b.buffer, b.byteOffset + i, w);
+			for (let k = 0; k < w; k++) if (a32[k] !== b32[k]) return false;
+			i += 4 * w;
+		}
+		for (; i < n; i++) if (a[i] !== b[i]) return false;
+		return true;
+	};
 	const changed = [...files].filter(([path, bytes]) => !same(old.get(path), bytes));
 	const dirOf = (path) => path.slice(0, path.lastIndexOf("/") + 1);
 	const touched = new Set(changed.filter(([path]) => !path.endsWith(".key")).map(([path]) => dirOf(path)));

@@ -8,6 +8,11 @@ export const CONTROL = {
 	RING_WRITE_WORD: 0, // events pushed by main, a running count
 	RING_READ_WORD: 1, // events taken by the Worker, a running count
 	FOCUS_WORD: 2, // 1 while the page has keyboard focus
+	// The page's display: main bumps TICK_WORD at each rAF tick after storing
+	// the tick's time at TICK_AT (an i64, microseconds on the timeOrigin-based
+	// clock both threads read); the Worker paces to it (ps2/host/display.odin).
+	TICK_WORD: 3,
+	TICK_AT: 16,
 	PADS: 64,
 	PAD_SIZE: 128,
 	PADS_MAX: 4,
@@ -71,6 +76,15 @@ export const PRESENT = {
 	NTEX_WORD: 3,
 	INTEGER_WORD: 4, // 1: scale by whole multiples only
 	FRAME_WORD: 5,
+	// Present timing, measured by the Worker: STAMP_BYTE an f64, the
+	// publish time (performance.timeOrigin + now(), ms); COST_BYTE an f64,
+	// present()'s own ms; IMAGE_BYTE an f64, the STAMP of the first present
+	// that carried a texture version this one carries; COPIED_WORD the
+	// texture bytes it copied.
+	STAMP_BYTE: 24,
+	COST_BYTE: 32,
+	IMAGE_BYTE: 40,
+	COPIED_WORD: 12,
 	CMDS: 64,
 	CMD_WORDS: 16,
 	CMDS_MAX: 64,
@@ -120,7 +134,7 @@ NET.SIZE = NET.IN + NET.SLOTS * NET.SLOT_SIZE;
 export const LEARN = {
 	STATE_WORD: 0, // EMPTY, WRITING, READY or TAKEN (web/learn.js)
 	LEN_WORD: 1, // the blob's size, or FAILED or OVERSIZED
-	WARNED_WORD: 2, // 1 once an oversized blob was said
+	// word 2 unused
 	GEN_WORD: 3, // the compile in flight, counted from 1
 	BLOB_GEN_WORD: 4, // the compile the blob is from
 	DATA: 32,

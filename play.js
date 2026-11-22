@@ -9,11 +9,17 @@
 // and the page reloads once under it.
 //
 // Test mode, play.html?test=1[&wasm=<url>][&disc=<url>...][&env=<K=V>...]
-// [&input=0][&store=url][&seconds=<n>]: runs that module (play.wasm by
+// [&input=0][&store=url][&seconds=<n>][&convert=1]: runs that module (play.wasm by
 // default) on the disc files read from those URLs, if any (the module's
 // argument is the .cue among them, else the only one), with those
 // environment variables. The files are copied into the browser's storage
 // and read from there first, as a picked disc is, unless store=url.
+// convert=1 first runs `play --convert-store` on the disc, which stores
+// /data as Play does (playStored), and then the test run starts from that
+// stored /data instead of an empty one, so it takes the native code a
+// player's run takes. It needs a build with a commit (not -dirty), whose
+// blobs play takes as cached; the report gives the conversion's
+// convertMs, and its failure in errors.
 // Only test mode has the fake standard gamepad, driven by window.testPad.
 // Once the first frame is drawn the page presses A on it and the Z key for
 // half a second each (not with input=0, which leaves emulation untouched),
@@ -44,8 +50,18 @@
 // (the last REPORT_SECONDS): frames presented, the page's animation frames
 // (tick) and the frames the audio worklet played as silence for an empty
 // ring. No backend exists (the site is static), so the player files it.
+//
+// Send game data, the run's gamedata.tsv (core/gamedata.odin, written
+// every GAMEDATA_EVERY vblanks; the Worker posts each write): enabled once
+// the first write arrives. The click shows a dialog with the file's size,
+// its first rows and the issue's exact text, and says the issue is public;
+// Cancel sends nothing. Open issue opens a new GitHub issue titled
+// "Game data: <serial or disc id> <build>" (gamedataIssue) and downloads
+// the file as it was shown, gzipped, for the player to drag in; a
+// maintainer's game-data label then has .github/workflows/game-data.yml
+// check it (tools/gamedata) and open a pull request adding it under games/.
 import { SCANCODE_OF_CODE } from "./keys.js";
-import { LEARN_ARGS, LEARN_OUT, learnDeliver, learnSeed } from "./learn.js";
+import { LEARN_OUT, learnArgs, learnDeliver, learnSeed, VU_OUT, vuArgs, vuSeed } from "./learn.js";
 import { AUDIO, CONTROL, EV, NET, PAD, PRESENT } from "./layout.js";
 import { serveLink } from "./net.js";
 import { Present } from "./present.js";
@@ -113,6 +129,7 @@ function refuse(why) {
 let shared = null;
 let ctl = null;
 let ctlView = null;
+let tickAt = null; // CONTROL.TICK_AT
 
 function makeShared() {
 	shared = {
@@ -122,6 +139,7 @@ function makeShared() {
 	};
 	ctl = new Int32Array(shared.control);
 	ctlView = new DataView(shared.control);
+	tickAt = new BigInt64Array(shared.control, CONTROL.TICK_AT, 1);
 	const P = new Int32Array(shared.present, 0, PRESENT.SLOTS / 4);
 	Atomics.store(P, PRESENT.LATEST_WORD, -1);
 	Atomics.store(P, PRESENT.READING_WORD, -1);
@@ -513,6 +531,7 @@ let startedAt = 0; // performance.now() at start()
 let firstPresentMs = null; // from start() to the first frame seen
 let endedAt = null; // performance.now() when done was set
 let written = []; // test mode: [name, bytes] of the module's files
+let gamedata = null; // the run's gamedata.tsv as last written (Uint8Array)
 
 function onMessage({ data }) {
 	if (data.log !== undefined) return log(data.log);
@@ -522,8 +541,14 @@ function onMessage({ data }) {
 		return;
 	}
 	if (data.audio !== undefined) return startAudio(data.audio);
+	if (data.gamedata !== undefined) {
+		gamedata = data.gamedata;
+		$("send").disabled = false;
+		return;
+	}
 	if (data.store !== undefined) return onStore(data.store);
 	if (data.learn !== undefined) return learnCompile(data.learn);
+	if (data.vu !== undefined) return vuConvert(data.vu);
 	if (data.fullscreen !== undefined) {
 		if (data.fullscreen && !document.fullscreenElement) $("screen").requestFullscreen?.().catch(() => {});
 		else if (!data.fullscreen && document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -548,52 +573,62 @@ function onMessage({ data }) {
 	audioContext = null;
 }
 
-// A mid-run learned compile the play Worker asked for (web/learn.js): run
-// `play --learned psx` in a Worker of its own (an `out` run) and hand its
-// blob to the play Worker. Its log goes to the page's; the instantiate's
-// time is said, for the cost of a mid-run compile on this browser. One
-// compile Worker runs at a time: a new compile, or a new run (start),
-// ends the one before, whose blob would be dropped anyway (its generation
-// is not the one in flight).
-let learnConv = null;
-function learnStop() {
-	learnConv?.terminate();
-	learnConv = null;
+// A mid-run compile the play Worker asked for: a learned compile
+// (web/learn.js LearnImports, `play --learned <psx | ee>`) or a VU
+// conversion (VuImports, `play --convert-vu`). Each runs in a Worker of its
+// own (an `out` run) and hands its blob to the play Worker. Its log goes to
+// the page's; the instantiate's time is said, for the cost of a mid-run
+// compile on this browser. One Worker of each kind runs at a time: a new
+// compile of that kind, or a new run (start), ends the one before, whose
+// blob would be dropped anyway (its generation is not the one in flight).
+const convs = { learn: null, vu: null };
+function convStop() {
+	for (const kind in convs) {
+		convs[kind]?.terminate();
+		convs[kind] = null;
+	}
 }
-function learnCompile({ records, interp, buffer, gen }) {
-	learnStop();
+// what names the compile in the log; noun, in learnDeliver's.
+function convRun(kind, what, noun, args, seed, transfer, outName, buffer, gen) {
+	convs[kind]?.terminate();
 	const t0 = performance.now();
 	const conv = new Worker("play-worker.js", { type: "module" });
-	learnConv = conv;
+	convs[kind] = conv;
 	let over = false;
 	const finish = (blob) => {
 		if (over) return;
 		over = true;
 		conv.terminate();
-		if (learnConv === conv) learnConv = null;
-		learnDeliver(buffer, blob, log, gen);
+		if (convs[kind] === conv) convs[kind] = null;
+		learnDeliver(buffer, blob, log, gen, noun);
 	};
 	conv.onmessage = ({ data }) => {
 		if (data.log !== undefined) {
 			log(data.log);
 		} else if (data.done !== undefined) {
 			const files = new Map(data.files ?? []);
-			log(`play: mid-run learned compile: exit ${data.done.code}, ${Math.round(performance.now() - t0)} ms (worker start, fetch and compile ${data.done.compileMs} ms, run ${data.done.runMs} ms)\n`);
-			finish(data.done.code === 0 ? (files.get(LEARN_OUT) ?? null) : null);
+			log(`play: mid-run ${what}: exit ${data.done.code}, ${Math.round(performance.now() - t0)} ms (worker start, fetch and compile ${data.done.compileMs} ms, run ${data.done.runMs} ms)\n`);
+			finish(data.done.code === 0 ? (files.get(outName) ?? null) : null);
 		} else if (data.error !== undefined) {
-			log(`play: mid-run learned compile failed: ${data.error.split("\n")[0]}\n`);
+			log(`play: mid-run ${what} failed: ${data.error.split("\n")[0]}\n`);
 			finish(null);
 		}
 	};
 	conv.onerror = (e) => {
-		log(`play: mid-run learned compile failed: ${e.message || "worker failed to load"}\n`);
+		log(`play: mid-run ${what} failed: ${e.message || "worker failed to load"}\n`);
 		finish(null);
 	};
 	conv.onmessageerror = () => {
-		log("play: mid-run learned compile failed: a message from its worker could not be read\n");
+		log(`play: mid-run ${what} failed: a message from its worker could not be read\n`);
 		finish(null);
 	};
-	conv.postMessage({ wasm: "play.wasm", args: LEARN_ARGS.slice(1), out: true, seed: learnSeed(records, interp) }, [records.buffer, interp.buffer]);
+	conv.postMessage({ wasm: "play.wasm", args, out: true, seed }, transfer);
+}
+function learnCompile({ records, interp, buffer, gen, cpu }) {
+	convRun("learn", "learned compile", "learned", learnArgs(cpu).slice(1), learnSeed(records, interp), [records.buffer, interp.buffer], LEARN_OUT, buffer, gen);
+}
+function vuConvert({ exe, vu0, vu1, buffer, gen }) {
+	convRun("vu", "VU conversion", "VU", vuArgs(vu0, vu1).slice(1), vuSeed(exe, vu0, vu1), [exe.buffer, vu0.buffer, vu1.buffer], VU_OUT, buffer, gen);
 }
 
 // The run's history, a second an entry while it runs: {t: seconds since
@@ -612,14 +647,143 @@ function record(now) {
 	Object.assign(sample, { at: now, frames, ticks: 0, silent: audioStats.silent });
 }
 
+// Visible hitches. A new image is a tick whose frame() uploaded a texture:
+// the host uploads the screen only when the GS changed it (gs.scan_fresh).
+// A gap is the ticks since the previous new image. The cadence is the larger
+// of the medians of the last CADENCE_GAPS gaps and of the last 3, so a change
+// of rate (60 to 30 fps) costs at most 2 hitches. A hitch is a gap over the
+// cadence, its extra ticks gap - cadence. Its pace ticks are gap - dF * k
+// (floored at 0), dF the frames run since the previous image and k the ticks
+// one frame spans (frameTicks: 2 on a 120 Hz display): a gap the game
+// filled with frames that drew nothing is extra but not pace. rafMs keeps the last RAF_KEEP tick
+// intervals, to show the rAF rate the ticks stand for.
+const CADENCE_GAPS = 31;
+const HITCH_LIST = 1000; // hitches listed, the first ones
+const RAF_KEEP = 1024;
+// OKAMI-60 STEP 12 timing: tickAt keeps each tick's time (timeOrigin ms) by
+// tick number. A hitch's edge is the tick at last + cadence, where the image
+// was due; its class compares the image's stamp (the Worker's first present
+// of that texture version, web/layout.js IMAGE_BYTE) with the edge: within
+// PHASE_MS phase, later workerLate, earlier mainLate when a tick interval in
+// the gap is over MAIN_LATE_MS, else other. imgs keeps the first IMG_KEEP
+// images as [present frame, gap, tick - stamp ms, FRAME_WORD delta]; shown
+// keeps every shown slot's present() ms and bytes copied.
+const PHASE_MS = 1;
+const MAIN_LATE_MS = 20;
+const IMG_KEEP = 4096;
+const SHOWN_KEEP = 8192;
+const hitch = {
+	at: 0, tick: 0, last: -1, gaps: [], count: 0, extra: 0, pace: 0, list: [], next: null, images: 0, raf: new Float64Array(RAF_KEEP), nraf: 0,
+	tickAt: new Float64Array(RAF_KEEP), lastFrame: 0, shownFrame: 0, classes: { phase: 0, workerLate: 0, mainLate: 0, other: 0 },
+	imgs: [], cost: new Float32Array(SHOWN_KEEP), copied: new Int32Array(SHOWN_KEEP), nshown: 0,
+};
+const median = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+const cadence = (g) => Math.max(median(g), median(g.slice(-3)));
+// The display ticks one emulated frame (NTSC, 16.683 ms) spans, from the
+// median tick interval: 1 at 60 Hz or below, 2 at 120 Hz.
+const FRAME_MS = 16.683;
+const frameTicks = () => {
+	const n = Math.min(hitch.nraf, RAF_KEEP);
+	return n > 0 ? Math.max(1, Math.round(FRAME_MS / median(hitch.raf.subarray(0, n)))) : 1;
+};
+
+const r2 = (x) => Math.round(x * 100) / 100;
+
+// A hitch's class and timing: [class, stamp - edge ms, max tick interval ms].
+function hitchClass(c, stamp) {
+	const gap = hitch.tick - hitch.last;
+	if (gap >= RAF_KEEP || stamp <= 0) return ["other", null, null];
+	let maxRaf = 0;
+	for (let i = hitch.last + 1; i <= hitch.tick; i++)
+		maxRaf = Math.max(maxRaf, hitch.tickAt[i % RAF_KEEP] - hitch.tickAt[(i - 1) % RAF_KEEP]);
+	const d = stamp - hitch.tickAt[(hitch.last + c) % RAF_KEEP];
+	const cls = Math.abs(d) <= PHASE_MS ? "phase" : d > 0 ? "workerLate" : maxRaf > MAIN_LATE_MS ? "mainLate" : "other";
+	return [cls, r2(d), r2(maxRaf)];
+}
+
+function noteShown(frame, timing) {
+	if (frame === hitch.shownFrame) return;
+	hitch.shownFrame = frame;
+	if (hitch.nshown >= SHOWN_KEEP) return;
+	hitch.cost[hitch.nshown] = timing.cost;
+	hitch.copied[hitch.nshown++] = timing.copied;
+}
+
+function noteTick(now, fresh, frame, timing) {
+	if (hitch.at > 0) hitch.raf[hitch.nraf++ % RAF_KEEP] = now - hitch.at;
+	hitch.at = now;
+	hitch.tick++;
+	const at = performance.timeOrigin + now;
+	hitch.tickAt[hitch.tick % RAF_KEEP] = at;
+	noteShown(frame, timing);
+	if (!fresh) return;
+	hitch.images++;
+	if (hitch.imgs.length < IMG_KEEP)
+		hitch.imgs.push([frame, hitch.last >= 0 ? hitch.tick - hitch.last : null, timing.image > 0 ? r2(at - timing.image) : null, frame - hitch.lastFrame]);
+	const dF = frame - hitch.lastFrame;
+	hitch.lastFrame = frame;
+	if (hitch.last >= 0) {
+		const gap = hitch.tick - hitch.last;
+		if (hitch.next) hitch.next[3] = gap;
+		hitch.next = null;
+		if (hitch.gaps.length > 0) {
+			const c = cadence(hitch.gaps);
+			if (gap > c) {
+				const [cls, d, maxRaf] = hitchClass(c, timing.image);
+				hitch.count++;
+				hitch.extra += gap - c;
+				const pace = Math.max(0, gap - dF * frameTicks());
+				hitch.pace += pace;
+				hitch.classes[cls]++;
+				const img = hitch.imgs.at(-1);
+				if (hitch.list.length < HITCH_LIST) hitch.list.push((hitch.next = [frame, gap, c, null, cls, d, img[2], img[3], maxRaf, pace]));
+			}
+		}
+		hitch.gaps.push(gap);
+		if (hitch.gaps.length > CADENCE_GAPS) hitch.gaps.shift();
+	}
+	hitch.last = hitch.tick;
+}
+
+// The report's hitches: list entries are [present frame, gap, cadence,
+// the gap after it, class, stamp - edge ms, tick - stamp ms, FRAME_WORD
+// delta, max tick interval ms, pace ticks]; present is the shown slots' present() ms
+// and bytes copied.
+function hitchState() {
+	const raf = hitch.raf.subarray(0, Math.min(hitch.nraf, RAF_KEEP));
+	return {
+		rafMedianMs: raf.length ? Math.round(median(raf) * 100) / 100 : null,
+		ticks: hitch.tick, images: hitch.images,
+		cadence: hitch.gaps.length ? cadence(hitch.gaps) : null,
+		count: hitch.count, extraTicks: hitch.extra, paceTicks: hitch.pace, list: [...hitch.list],
+		classes: { ...hitch.classes }, imgs: [...hitch.imgs], present: shownState(),
+	};
+}
+
+function shownState() {
+	const n = hitch.nshown;
+	if (n === 0) return null;
+	const cost = [...hitch.cost.subarray(0, n)].sort((x, y) => x - y), copied = [...hitch.copied.subarray(0, n)].sort((x, y) => x - y);
+	return {
+		shown: n, msMedian: r2(cost[n >> 1]), msP95: r2(cost[Math.floor(n * 0.95)]), msMax: r2(cost[n - 1]),
+		bytesMedian: copied[n >> 1], bytesMax: copied[n - 1],
+	};
+}
+
 function tick() {
 	const now = performance.now();
+	if (ctl) {
+		Atomics.store(tickAt, 0, BigInt(Math.round((performance.timeOrigin + now) * 1000)));
+		Atomics.add(ctl, CONTROL.TICK_WORD, 1);
+	}
 	if (worker && firstPresentMs === null && Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD) > 0)
 		firstPresentMs = Math.round(now - startedAt);
 	if (worker && done === null) record(now);
 	if (present) {
 		try {
+			const images = present.images;
 			present.frame();
+			if (worker && done === null) noteTick(now, present.images !== images, present.shown, present.shownTiming);
 		} catch (e) {
 			errors.push(`present: ${e.message}`);
 			present = null;
@@ -636,7 +800,7 @@ function start(msg) {
 		msg = { ...msg, env: { ...msg.env } };
 		msg.net = startNet(msg.env);
 	}
-	learnStop();
+	convStop();
 	$("start").disabled = true;
 	$("log").textContent = "";
 	const canvas = $("screen");
@@ -670,9 +834,11 @@ async function testState() {
 		done,
 		store: storeInfo,
 		firstPresentMs,
+		convertMs,
 		files: written.map(([name, bytes]) => ({ name, size: bytes.length })),
 		net: netLink && { player: netPlayer, ...netLink.stats },
 		history: [...history],
+		hitches: hitchState(),
 		log: $("log").textContent,
 		errors: [...errors],
 		userAgent: navigator.userAgent,
@@ -706,7 +872,7 @@ function issueReport(fit) {
 		return [
 			"<details><summary>Report</summary>",
 			"",
-			`Isolated: ${crossOriginIsolated}, memory: ${navigator.deviceMemory ?? "?"} GiB, first frame: ${firstPresentMs ?? "?"} ms, frames: ${Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD)}`,
+			`Isolated: ${crossOriginIsolated}, memory: ${memoryBucket() ?? "?"} GiB, first frame: ${firstPresentMs ?? "?"} ms, frames: ${Atomics.load(new Int32Array(shared.present, 0, 4), PRESENT.FRAMES_WORD)}`,
 			`Audio: ${audioContext?.state ?? "none"}, ${audioStats.silent} silent frames`,
 			`Disc read: ${storeInfo ? JSON.stringify({ ...storeInfo, name: undefined }).slice(0, 200) : "?"}`,
 			`Exit: ${done ? JSON.stringify(done).slice(0, 200) : "running"}`,
@@ -740,15 +906,25 @@ function issueReport(fit) {
 	return at(nRuns, nErr, nLog);
 }
 
-// Save a report's click (the comment at the top). The issue tab opens
-// first, before any await, or the browser blocks it as a popup.
-// The host's cores rounded down to 1, 2, 4, 8 or 16, as game data's host row
-// (core/gamedata.odin): the count, never the exact machine.
-function coresBucket() {
-	const n = navigator.hardwareConcurrency ?? 0;
-	return [16, 8, 4, 2, 1].find((c) => n >= c) ?? null;
+// n rounded down to the first of steps (largest first) it reaches, or null:
+// the class of the machine, never the exact one. The host's cores to 1, 2,
+// 4, 8 or 16, as game data's host row (core/gamedata.odin); its memory to
+// 1, 2, 4 or 8 GiB.
+const bucket = (n, steps) => steps.find((c) => (n ?? 0) >= c) ?? null;
+const coresBucket = () => bucket(navigator.hardwareConcurrency, [16, 8, 4, 2, 1]);
+const memoryBucket = () => bucket(navigator.deviceMemory, [8, 4, 2, 1]);
+
+// The browser saves blob as name.
+function download(blob, name) {
+	const a = document.createElement("a");
+	a.href = URL.createObjectURL(blob);
+	a.download = name;
+	a.click();
+	setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 }
 
+// Save a report's click (the comment at the top). The issue tab opens
+// first, before any await, or the browser blocks it as a popup.
 async function saveReport() {
 	const sha = $("sha").textContent;
 	const title = document.title.slice(0, 100); // the URL stays short
@@ -780,14 +956,70 @@ async function saveReport() {
 		delete report.userAgent;
 		delete report.files;
 		if (report.store) report.store = { ...report.store, name: undefined };
-		Object.assign(report, { title: document.title, commit: sha, cores: coresBucket(), deviceMemory: navigator.deviceMemory ?? null });
-		const a = document.createElement("a");
-		a.href = URL.createObjectURL(new Blob([JSON.stringify(report, null, 1)], { type: "application/json" }));
-		a.download = name;
-		a.click();
-		setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+		Object.assign(report, { title: document.title, commit: sha, cores: coresBucket(), deviceMemory: memoryBucket() });
+		download(new Blob([JSON.stringify(report, null, 1)], { type: "application/json" }), name);
 	} catch (e) {
 		log(`Save a report: ${e.message}\n`);
+	}
+}
+
+const SEND_ROWS = 40; // rows of the file the dialog shows
+
+// Send game data's issue for the file bytes: its title, as tools/gamedata
+// place names the file (the id row's serial, else its disc id, and the
+// build's first 7 characters), a body of what the file holds, and the
+// download's name. No await: the issue tab opens within the click.
+function gamedataIssue(bytes) {
+	const rows = new TextDecoder().decode(bytes).split("\n");
+	if (rows.at(-1) === "") rows.pop();
+	const field = (kind) => rows.find((r) => r.startsWith(`${kind}\t`))?.split("\t") ?? [];
+	const id = field("id");
+	const end = field("end");
+	const game = id[2] || id[1] || "unknown";
+	const build = id[4] ?? "?";
+	const counts = new Map();
+	for (const r of rows) {
+		const kind = r.split("\t", 1)[0];
+		counts.set(kind, (counts.get(kind) ?? 0) + 1);
+	}
+	const name = `gamedata-${game}-${build.slice(0, 7)}.tsv.gz`;
+	const body = [
+		`Game: ${game}`,
+		`Build: ${build}`,
+		`Cores: ${coresBucket() ?? "?"}, memory: ${memoryBucket() ?? "?"} GiB`,
+		`Run: ${end[1] ?? "?"} at frame ${end[2] ?? "?"}`,
+		`Rows: ${[...counts].map(([k, n]) => `${k} ${n}`).join(", ")}`,
+		"",
+		`**Drag ${name} into this box before you submit.** It was downloaded with this issue; a maintainer's game-data label has the repository check it and add it under games/.`,
+		"",
+	].join("\n");
+	return { title: `Game data: ${game} ${build.slice(0, 7)}`, body, name, rows };
+}
+
+// What the dialog shows is what Open issue sends: the file as it was when
+// the dialog opened, though the run goes on writing it.
+let sendShown = null;
+
+function sendDialog() {
+	const bytes = gamedata;
+	const issue = gamedataIssue(bytes);
+	const more = issue.rows.length - SEND_ROWS;
+	$("send-name").textContent = issue.name;
+	$("send-size").textContent = `${bytes.length} bytes, ${issue.rows.length} rows, before gzip`;
+	$("send-rows").textContent = issue.rows.slice(0, SEND_ROWS).join("\n") + (more > 0 ? `\n(and ${more} more rows)` : "");
+	$("send-body").textContent = `${issue.title}\n\n${issue.body}`;
+	sendShown = { issue, bytes };
+	$("send-dialog").showModal();
+}
+
+async function sendGamedata() {
+	const { issue, bytes } = sendShown;
+	window.open(`${ISSUES}?${new URLSearchParams({ title: issue.title, body: issue.body })}`, "_blank", "noopener");
+	try {
+		const gz = await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+		download(gz, issue.name);
+	} catch (e) {
+		log(`Send game data: ${e.message}\n`);
 	}
 }
 
@@ -820,6 +1052,8 @@ async function main() {
 		start({ wasm: "play.wasm", args: [`/disc/${img.name}`], files, store: canStore ? img.name : undefined });
 	});
 	$("report").addEventListener("click", saveReport);
+	$("send").addEventListener("click", sendDialog);
+	$("send-ok").addEventListener("click", sendGamedata);
 	requestAnimationFrame(tick);
 	showStored();
 	if (!test) return;
@@ -841,7 +1075,9 @@ async function main() {
 	}
 	$("picked").textContent = `Test: ${wasm}` + (img ? ` on ${img.name}` : "");
 	const store = img && canStore && params.get("store") !== "url" ? img.name : undefined;
-	start({ wasm, args: img ? [`/disc/${img.name}`] : [], urls, store, env, test: true });
+	const convert = params.get("convert") === "1";
+	if (convert && img) await testConvert(img, urls, env);
+	start({ wasm, args: img ? [`/disc/${img.name}`] : [], urls, store, env, test: true, useStore: convert });
 	await selfTest(Number(params.get("seconds") ?? 20) * 1000, params.get("input") !== "0");
 }
 
@@ -874,6 +1110,29 @@ async function selfTest(limit, input) {
 		if (!r.ok) report.errors.push(`file/${dir}${name}: ${r.status ?? r.message}`);
 	}
 	await postReport(report);
+}
+
+// Test mode's convert=1: `play --convert-store` on the test disc in a
+// Worker, /data stored as playStored's conversion stores it, before the
+// test run. Its time goes in the report as convertMs, a failure in errors.
+let convertMs = null;
+function testConvert(img, urls, env) {
+	const t0 = performance.now();
+	return new Promise((resolve) => {
+		const conv = new Worker("play-worker.js", { type: "module" });
+		const end = (note) => {
+			conv.terminate();
+			convertMs = Math.round(performance.now() - t0);
+			if (note) errors.push(note);
+			resolve();
+		};
+		conv.onmessage = ({ data }) => {
+			if (data.done !== undefined) end(data.done.code === 0 ? "" : `test: convert exit ${data.done.code}`);
+			else if (data.error !== undefined) end(`test: convert: ${data.error.split("\n")[0]}`);
+		};
+		conv.onerror = (e) => end(`test: convert: ${e.message || "worker failed to load"}`);
+		conv.postMessage({ wasm: "play.wasm", args: ["--convert-store", `/disc/${img.name}`], urls, env, failSaves: false, ...shared });
+	});
 }
 
 // Test mode's report, to tests/wasi/serve.py.

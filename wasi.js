@@ -124,11 +124,17 @@ const isDir = (node) => node.entries !== undefined;
 
 export class Wasi {
 	// args: argv strings. env: an object of environment variables. disc: Map
-	// of name -> reader. log(fd, text): fd 1 and 2.
-	constructor({ args, env = {}, disc, log }) {
+	// of name -> reader. log(fd, text): fd 1 and 2. renamed(path, bytes),
+	// if given: a file the module renamed, by its new path (as the module
+	// gave it) and a view of its bytes, after the rename. idle(deadline), if
+	// given: work done at the start of a sleep, which returns by deadline (a
+	// performance.now() time).
+	constructor({ args, env = {}, disc, log, renamed = null, idle = null }) {
 		this.args = args.map((a) => new TextEncoder().encode(a + "\0"));
 		this.env = Object.entries(env).map(([k, v]) => new TextEncoder().encode(`${k}=${v}\0`));
 		this.log = log;
+		this.renamed = renamed;
+		this.idle = idle;
 		this.decoders = [null, new TextDecoder(), new TextDecoder()];
 		this.stats = {
 			calls: {},
@@ -221,9 +227,16 @@ export class Wasi {
 		return out;
 	}
 
-	// Blocks the thread for `ms` milliseconds.
+	// Blocks the thread for `ms` milliseconds, the first of them (all but
+	// the last 1) given to idle.
 	sleep(ms) {
 		if (!(ms > 0)) return;
+		if (this.idle !== null) {
+			const t0 = performance.now();
+			this.idle(t0 + ms - 1);
+			ms -= performance.now() - t0;
+			if (!(ms > 0)) return;
+		}
 		if (this.sleeper === null && typeof SharedArrayBuffer === "function") {
 			this.sleeper = new Int32Array(new SharedArrayBuffer(4));
 		}
@@ -515,6 +528,7 @@ export class Wasi {
 				}
 				a.parent.entries.delete(a.name);
 				b.parent.entries.set(b.name, a.node);
+				if (this.renamed && !isDir(a.node)) this.renamed(this.str(newPath, newLen), a.node.buf.subarray(0, a.node.size));
 				return ERR.SUCCESS;
 			},
 			path_filestat_get: (fd, _flags, path, len, ptr) => {

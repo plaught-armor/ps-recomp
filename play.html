@@ -25,7 +25,25 @@ saves are kept there too, stored when the game stops.</p>
 <p id="convert" hidden><span id="convert-text"></span> <button id="skip" type="button">Skip</button></p>
 <p id="picked"></p>
 <p><button id="start" type="button" disabled>Start</button></p>
-<p><button id="report" type="button" disabled>Save a report</button></p>
+<p><button id="report" type="button" disabled>Save a report</button>
+<button id="send" type="button" disabled>Send game data</button></p>
+<dialog id="send-dialog">
+<form method="dialog">
+<h2>Send game data</h2>
+<p>This opens a new GitHub issue in another tab and downloads
+<code id="send-name"></code>, for you to drag into the issue. The issue
+is <strong>public</strong>, under your GitHub account, and nothing is sent
+until you submit it there.</p>
+<p>The file is <span id="send-size"></span>: what this run saw of the game
+(addresses, counts, hashes, the system calls it made), never the
+game&rsquo;s own bytes, your file names or your browser. Its first rows:</p>
+<pre id="send-rows"></pre>
+<p>The issue:</p>
+<pre id="send-body"></pre>
+<p><button id="send-cancel" value="cancel">Cancel</button>
+<button id="send-ok" value="ok">Open issue</button></p>
+</form>
+</dialog>
 <canvas id="screen" tabindex="0"></canvas>
 <pre id="log"></pre>
 <p id="commit">Built from ps-recomp <code id="sha">?</code>.</p>
