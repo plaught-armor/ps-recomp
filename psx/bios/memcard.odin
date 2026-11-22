@@ -275,6 +275,15 @@ card_filename :: proc(path: string) -> (slot: int, name: string, ok: bool) {
 	return 0, "", false
 }
 
+// A "buXY:" name: a memory card port. card_filename resolves the two with a
+// card behind them; any other port (a multitap sub-port such as bu01:) has
+// no card here.
+@(private)
+card_bu_port :: proc(path: string) -> bool {
+	digit :: proc(c: u8) -> bool {return c >= '0' && c <= '9'}
+	return len(path) >= 5 && path[:2] == "bu" && digit(path[2]) && digit(path[3]) && path[4] == ':'
+}
+
 // firstfile's search pattern, built as the BIOS builds it: "" is 19 '?';
 // otherwise the name up to a '*', which pads the rest to 20 with '?'.
 @(private)
@@ -521,10 +530,20 @@ card_nextfile :: proc(dst: u32, first: bool, pattern: string = "") -> u32 {
 	if first {
 		delete(card.search)
 		card.search = ""
+		// The retail firstfile (A(69h) dev_card_firstfile) reads the card's
+		// directory through the low-level driver whether or not a file
+		// matches, and the driver's IRQ code delivers HwCARD: IOE for a
+		// card that answers, TIMEOUT for none. SwCARD comes only from the
+		// bu device's read and write. Games wait on that HwCARD event after
+		// a firstfile on a blank card (Tarzan's menu probe).
 		slot, name, ok := card_filename(pattern)
 		if !ok {
+			if card_bu_port(pattern) {
+				deliver_event(EV_HWCARD, EV_SPEC_TIMEOUT)
+			}
 			return 0
 		}
+		deliver_event(EV_HWCARD, EV_SPEC_IOE)
 		card.slot = slot
 		card.search = card_pattern(name)
 		card.cursor = 0

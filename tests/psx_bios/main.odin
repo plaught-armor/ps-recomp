@@ -265,6 +265,27 @@ card_find :: proc(pattern: string) -> (names: [4]string, n: int) {
 	return
 }
 
+// firstfile delivers one HwCARD event of spec want and no SwCARD event.
+@(private = "file")
+check_card_event :: proc(pattern: string, want: u32) {
+	other: u32 = want == 0x0004 ? 0x0100 : 0x0004
+	hw := open(0xf0000011, want, 0x1000, FN_CALLBACK)
+	hw_other := open(0xf0000011, other, 0x2000)
+	sw_ioe := open(0xf4000001, 0x0004, 0x2000)
+	sw_timeout := open(0xf4000001, 0x0100, 0x2000)
+	before := calls.callback
+	b(0x42, guest_string(pattern), CARD_DIR)
+	if calls.callback - before != 1 {
+		fail("firstfile %q delivered HwCARD %x %d times, want 1", pattern, want, calls.callback - before)
+	}
+	check("firstfile, the other HwCARD spec", test(hw_other), 0)
+	check("firstfile, SwCARD IOE", test(sw_ioe), 0)
+	check("firstfile, SwCARD TIMEOUT", test(sw_timeout), 0)
+	for h in ([?]u32{hw, hw_other, sw_ioe, sw_timeout}) {
+		b(0x09, h)
+	}
+}
+
 @(private = "file")
 check_find :: proc(pattern: string, want: ..string) {
 	names, n := card_find(pattern)
@@ -804,6 +825,13 @@ main :: proc() {
 	check_find("bu00:OTHER??", "OTHER")
 	check_find("bu00:BASLUS")
 	check_find("bu10:*")
+	// Every firstfile on a card reads its directory: IOE on a card with
+	// files and on a blank one, TIMEOUT on a port with no card.
+	b(0x09, cb)
+	check_card_event("bu00:*", 0x0004)
+	check_card_event("bu10:*", 0x0004)
+	check_card_event("bu01:*", 0x0100)
+	check("firstfile on a port with no card", b(0x42, guest_string("bu01:*"), CARD_DIR), 0)
 	b(0x42, guest_string("bu00:BASLUS-00001CD"), CARD_DIR)
 	check("DIRENTRY attr", cpu.r32(CARD_DIR + 0x14), 0x50)
 	check("DIRENTRY size", cpu.r32(CARD_DIR + 0x18), 0x2000)
