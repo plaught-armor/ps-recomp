@@ -2739,6 +2739,35 @@ test_reply_due :: proc() {
 	kernel.run_events()
 	cpu.state.cop0[12] = sr
 	check(pumped(0x1a) && len(iop.sif.replies) == 0, "reply due: then it is pumped")
+
+	// A disc read's RPC_END is held for the drive's read time, apart from
+	// the FIFO: a reply sent after it is not kept behind it.
+	cpu.state.cycles = 1000
+	r3000.state.cycles = 0
+	cpu.next_event = max(u64)
+	iop.sif_reply(0x21, 0, nil, hold = 5000)
+	check(len(iop.sif.replies) == 0 && len(iop.sif.held) == 1 && iop.sif_next_ee() == 6000 && cpu.next_event == 6000, "reply held: out of the FIFO, due after its hold, the EE's next event")
+	cpu.state.cycles = 5999
+	iop.sif_pump()
+	kernel.update_next_event()
+	check(!pumped(0x21) && len(iop.sif.held) == 1 && cpu.next_event == 6000, "reply held: not pumped before its due")
+	send(&pkt, 0x22)
+	iop.sif_pump()
+	check(pumped(0x22) && len(iop.sif.held) == 1, "reply held: a reply sent after it goes first")
+	cpu.state.cycles = 6000
+	iop.sif_pump()
+	check(pumped(0x21) && len(iop.sif.held) == 0 && len(iop.sif.replies) == 0, "reply held: pumped at its due")
+	// One drive: the second read starts when the first ends.
+	cpu.state.cycles = 7000
+	iop.sif_reply(0x23, 0, nil, hold = 5000)
+	iop.sif_reply(0x24, 0, nil, hold = 300)
+	check(len(iop.sif.held) == 2 && iop.sif.held[0].due == 12000 && iop.sif.held[1].due == 12300, "reply held: two reads are serial")
+	drop_replies()
+	check(len(iop.sif.held) == 0 && iop.sif_next_ee() == max(u64), "reply held: dropped with the queue")
+	// The read time: 1 ms at least; a DVD at 4x reads 2705 sectors in about a second.
+	d := iop.cd_read_ee(2705)
+	check(iop.cd_read_ee(0) == iop.CD_READ_MIN_EE, "reply held: no sectors take the least read time")
+	check(iop.cd_disk_type() == iop.CD_DISK_PS2_DVD && d > cpu.EE_CLOCK * 99 / 100 && d < cpu.EE_CLOCK * 101 / 100, "reply held: 2705 DVD sectors take about 1 s")
 	fresh()
 }
 
@@ -5532,11 +5561,15 @@ test_cdvd_search_server :: proc() {
 	rw := ([^]u32)(raw_data(rbuf[:]))
 	rw[0], rw[1], rw[2] = 23, 2, READ_DEST
 	check(ncmd(1, rbuf[:], 0x18), "stream: a Read to compare against")
+	check(iop.sif.call_hold == iop.cd_read_ee(2), "stream: the Read holds its RPC_END for the drive's time")
+	iop.sif.call_hold = 0
 	check(stream(ncmd, 5, 64, 8, 0x80000) == 1, "stream: init")
 	check(stream(ncmd, 2, 0, 1, ST_DEST) == 0, "stream: a read with no stream takes nothing")
 	check(stream(ncmd, 6, 0, 0, 0) == 0, "stream: no status with no stream")
 	check(stream(ncmd, 1, 23, 0, 0) == 1 && stream(ncmd, 6, 0, 0, 0) == 64, "stream: started, the ring full")
 	check(stream(ncmd, 2, 0, 1, ST_DEST) == 1 && stream(ncmd, 2, 0, 1, ST_DEST + 2048) == 1, "stream: reads answer the sectors read, error 0")
+	check(iop.sif.call_hold == iop.cd_read_ee(1), "stream: a stream read holds its RPC_END too")
+	iop.sif.call_hold = 0
 	same := true
 	for i in u32(0) ..< 2 * 2048 / 4 {same &&= mem.rd32(ST_DEST + 4 * i) == mem.rd32(READ_DEST + 4 * i)}
 	check(same, "stream: two reads of one sector are the next two sectors")

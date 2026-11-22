@@ -238,10 +238,9 @@ sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 // One built while the EE runs (a command's synchronous reply, an HLE server)
 // is due at EE now; one an IOP thread sends (from_iop) is due no earlier
 // than the IOP clock, which runs up to a slice past EE now while it idles.
-@(private)
-// Queues a packet for the EE. With hold, it waits hold EE cycles after the
-// held packet before it, as a disc drive's reads follow one another, and
-// then joins the queue: the packets queued meanwhile go ahead of it.
+// With hold, it waits hold EE cycles after the held packet before it, as a
+// disc drive's reads follow one another, and then joins the queue: the
+// packets queued meanwhile go ahead of it.
 sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u64 = 0) {
 	p := make([]u8, 16 + 4 * len(payload))
 	w := ([^]u32)(raw_data(p))
