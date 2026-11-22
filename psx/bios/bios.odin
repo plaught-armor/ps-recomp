@@ -1427,17 +1427,19 @@ change_thread :: proc(h: u32) {
 // Exception return: retail loads the registers of the TCB the PCB names,
 // so a handler that points the PCB at another TCB switches threads when it
 // returns (MGS1's task scheduler does so from its VSync callback). Under
-// FLAT the running run stops first (flat_block) and flat_main switches once
-// it has (preempt_owed): the registers saved are those the thread stopped
-// with, whatever instructions or host code (a WaitEvent) finish before the
-// stop. Where the run cannot stop at all (cpu.flat_can_stop), the switch
-// waits for a later return. mod_depth is held by run_events already; the
-// check here only keeps that true.
+// FLAT the running run stops first (cpu.flat_stop_soon) and flat_main
+// switches once it has (preempt_owed): the registers saved are those the
+// thread stopped with, whatever instructions or host code (a WaitEvent)
+// finish before the stop. Where the run cannot stop yet, in native code or
+// a nested run, it stops once that has returned and interrupts are on: the
+// guest already counts the thread named as running, and waiting for a later
+// exception return, which may land in native code again, lost MGS1 frames
+// from boot on, and an overlay load. mod_depth is held by run_events
+// already; the check here only keeps that true.
 @(private)
 preempt :: proc() {
 	when core.FLAT {
-		if _, ok := preempt_target(); ok && cpu.flat_can_stop() {
-			cpu.flat_block("preempt")
+		if _, ok := preempt_target(); ok && cpu.flat_stop_soon() {
 			flat.preempt_owed = true
 		}
 	} else {

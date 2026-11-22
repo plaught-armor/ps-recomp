@@ -28,8 +28,8 @@ import "core:slice"
 // interp lists functions the compiler left to the interpreter on purpose,
 // each its entry and its code's bytes [lo, hi), for a later compile of the
 // same program to leave too, along with code inside them: a PS1 program's
-// on wasm32, the functions that may switch threads (recomp/r3000
-// thread_switches).
+// on wasm32, the functions that may switch threads, loop with no way out or
+// dispatch for such a loop (recomp/r3000 thread_switches).
 BLOB_MAGIC :: 0x4e525350 // "PSRN"
 // core.NATIVE_VERSION, which reads it. 5: a wasm32 blob imports a shared
 // memory (wasm.odin). 6: EE code takes cop0[9] as the base of Count

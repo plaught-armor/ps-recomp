@@ -9,6 +9,9 @@
 // step sees the registers its thread came back with. tests/psx_bios
 // thread_switches drives the same BIOS calls from host code, coroutines
 // only.
+//
+// Last, under FLAT, a switch that cannot be made: in guest code that native
+// code called. Its fatal must hand the native code to play's known switches.
 package main
 
 import "core:fmt"
@@ -47,6 +50,10 @@ MAIN_THREAD :: 0xff000000
 // IRQ 0, whose exception return goes on with the TCB the PCB names.
 @(private = "file")
 TRIG :: 0x1f801050
+
+// A word of RAM nothing reads.
+@(private = "file")
+SPARE :: 0x80022000
 
 // What a step asks DISPATCH to do next (t0).
 @(private = "file")
@@ -365,16 +372,80 @@ script :: proc() {
 			point_pcb(tcb(1))
 			op(.Store)
 		} else {
-			finish()
+			irq_in_native()
 		}
 	})
 	when core.FLAT {
 		add(proc() {
 			on(0)
 			check("owed switch dropped", u32(cpu.flat_switches_dropped - s.dropped), 1)
+			irq_in_native()
+		})
+	}
+	// An exception return in native code (a step is native) that names the
+	// other thread: that thread is the next to run guest code. The switch
+	// does not wait for a later exception return, which under FLAT left
+	// MGS1's scheduler counting on a task that was not running.
+	add(proc() {
+		check("switched when the native code returned (the thread's s0)", r()[16], 0x3333)
+		s.trig = .Irq
+		point_pcb(tcb(0))
+		op(.Store)
+	})
+	add(proc() {
+		check("main thread s0 after the native code's switch", r()[16], 0xabcd)
+		when core.FLAT {
+			// Native code that entered a critical section after that exception
+			// return: the switch waits for interrupts to be on again.
+			r()[16] = 0x5151
+			point_pcb(tcb(1))
+			irq_now()
+			cpu.cop0.sr &= ~u32(0x401)
+			op_ram_store()
+		} else {
+			finish()
+		}
+	})
+	when core.FLAT {
+		add(proc() {
+			check("no switch in a critical section", r()[16], 0x5151)
+			cpu.cop0.sr |= 0x401
+			op_ram_store()
+		})
+		add(proc() {
+			check("switched once interrupts are on (the thread's s0)", r()[16], 0x3333)
+			point_pcb(tcb(0))
+			op(.Store)
+		})
+		add(proc() {
+			check("main thread s0 after the critical section's switch", r()[16], 0x5151)
 			finish()
 		})
 	}
+}
+
+// IRQ 0 here, in a step, with interrupts on as io delivers one.
+@(private = "file")
+irq_now :: proc() {
+	cpu.cop0.sr |= 0x401
+	io.irq_regs.stat, io.irq_regs.mask = 1, 1
+	bios.deliver_irq()
+}
+
+// The step's op is a store to RAM: DISPATCH goes on with no interrupt.
+@(private = "file")
+op_ram_store :: proc() {
+	op(.Store)
+	r()[12] = SPARE
+}
+
+// The main thread's step that an exception return switches from.
+@(private = "file")
+irq_in_native :: proc() {
+	r()[16] = 0xabcd
+	point_pcb(tcb(1))
+	irq_now()
+	op_ram_store()
 }
 
 // The last reuse round's main step: the preempt cases' first.
@@ -445,5 +516,44 @@ main :: proc() {
 		fmt.eprintfln("psx_flat_switch: %d failed", failed)
 		os.exit(1)
 	}
-	fmt.println("ok psx_flat_switch: ChangeTh round trip, TCB writes, epc restart, syscall 3, slot reuse, preempt, a preempt in a jr's delay slot, a dropped owed switch")
+	when core.FLAT {switch_under_native()}
+	passed()
+}
+
+// A ChangeTh in guest code that native code called is fatal under FLAT, the
+// nested run and the native frame both being in the host's. The fatal must
+// first name that native code (flat_native_fatal), or every later run dies
+// the same way (MGS1's 0x800150c4, above the nested 0x8001fc3c). The hook
+// runs just before the fatal, so it ends the test.
+when core.FLAT {
+	@(private = "file")
+	switch_under_native :: proc() {
+		OUTER :: 0x80030000
+		NATIVE :: 0x80030100
+		TASK :: 0x80030200
+		outer := [?]u32{0x0c00c040, 0, 0x03e00008, 0} // jal NATIVE
+		task := [?]u32{0x240a00b0, 0x01400008, 0x24090010} // PSY-Q's ChangeTh stub
+		for w, k in outer {cpu.w32(OUTER + 4 * u32(k), w)}
+		for w, k in task {cpu.w32(TASK + 4 * u32(k), w)}
+		cpu.register_funcs({{NATIVE, proc() {cpu.call(TASK)}}})
+		cpu.bios_b = proc(_: u32) {cpu.flat_block("a test's ChangeTh")}
+		cpu.flat_native_fatal = proc(entries: []u32) {
+			if len(entries) != 1 || entries[0] != NATIVE {
+				fmt.eprintfln("FAIL psx_flat_switch: a switch under native code names %x, want %x", entries, u32(NATIVE))
+				os.exit(1)
+			}
+			passed()
+			os.exit(0)
+		}
+		x: cpu.Flat_Ctx
+		cpu.flat_start(&x, OUTER)
+		cpu.flat_run(&x)
+		fmt.eprintln("FAIL psx_flat_switch: a switch under native code was not fatal")
+		os.exit(1)
+	}
+}
+
+@(private = "file")
+passed :: proc() {
+	fmt.println("ok psx_flat_switch: ChangeTh round trip, TCB writes, epc restart, syscall 3, slot reuse, preempt, a preempt in a jr's delay slot, a dropped owed switch, a preempt in native code")
 }

@@ -28,7 +28,12 @@
 //     function, one that calls a run that switches (to a fixed point), and
 //     one that calls an entry the Switches file names (core.known_switches,
 //     which keeps each entry once). A syscall or A/B table call switches
-//     unless its block proves a0 or t1 another function number.
+//     unless its block proves a0 or t1 another function number. A loop
+//     with no way out (an idle thread's) counts as switching, for a run and
+//     in a static blob (r3000.thread_switches); one that ends in a return, a
+//     halt or a jump out, and a jump to itself, do not. In a static blob a
+//     function that such a loop calls counts too when it calls through a
+//     register (the loop's dispatcher).
 package main
 
 import "core:fmt"
@@ -231,6 +236,8 @@ main :: proc() {
 	test_first_wins()
 	test_recomp(tmp)
 	test_switches(tmp)
+	test_endless()
+	test_dispatcher()
 
 	if os.remove_all(tmp) != nil {
 		check(false, fmt.tprintf("cannot remove %s", tmp))
@@ -238,7 +245,7 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; a callee's jr $ra to a label the caller or the callee put in $ra goes on there, and one past the caller returns, as does a learned call to a yield in the executable that returns past its caller; a jump over words a learned run never ran goes on in its frame; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads to the interpreter")
+	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; a callee's jr $ra to a label the caller or the callee put in $ra goes on there, and one past the caller returns, as does a learned call to a yield in the executable that returns past its caller; a jump over words a learned run never ran goes on in its frame; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads, and loops with no way out with their dispatchers, to the interpreter")
 }
 
 // A `j` out of a function (a tail call) when $ra holds a label of the
@@ -593,6 +600,96 @@ test_switches :: proc(tmp: string) {
 	check(switch_skips(caller[:], nil) == 0, "caller left with no known switches")
 	healed := [?]native.Blob_Interp{{SWITCHED, SWITCHED, SWITCHED}}
 	check(switch_skips(caller[:], healed[:]) == 1, "run calling a known switch compiled")
+}
+
+// An exception return that names another thread cannot switch under native
+// code, so wasm32 interprets a loop with no way out and what calls it (MGS1's
+// idle thread, 0x8008e514, kept every other thread from running).
+@(private = "file")
+test_endless :: proc() {
+	AT :: 0x80028000
+	CALLER :: 0x80028100
+	JR_RA :: 0x03e00008
+	J_AT :: 0x0800a000
+	Case :: struct {
+		words: []u32,
+		left:  bool,
+		what:  string,
+	}
+	cases := [?]Case {
+		{{0x8c820000, 0x1040fffe, 0, J_AT, 0}, true, "a wait in a loop with no way out"},
+		{{0x24420001, J_AT, 0}, true, "a jump back with no way out"},
+		{{0x2442ffff, 0x1440fffe, 0, JR_RA, 0}, false, "a loop, then a return"},
+		{{0x2442ffff, 0x1440fffe, 0, 0x0000004d}, false, "a loop, then a halt"}, // break 1
+		{{0x2442ffff, 0x1440fffe, 0, 0x0800a400, 0}, false, "a loop, then a jump out"},
+		{{J_AT, 0}, false, "a jump to itself"},
+	}
+	call := [?]u32{0x0c00a000, 0, JR_RA, 0} // jal AT
+	for c in cases {
+		runs := [?]r3000.Learned{{CALLER, CALLER, call[:]}, {AT, AT, c.words}}
+		want := 2 if c.left else 0
+		got := switch_skips(runs[:], nil)
+		check(got == want, fmt.tprintf("%s: %d runs left, want %d", c.what, got, want))
+
+		out := static_switches(runs[:])
+		check((AT in out) == c.left, fmt.tprintf("%s: in a static blob, left %v", c.what, AT in out))
+		check((CALLER in out) == c.left, fmt.tprintf("%s: its caller in a static blob, left %v", c.what, CALLER in out))
+		delete(out)
+	}
+}
+
+// What r3000.thread_switches leaves of runs, as a static blob's functions.
+@(private = "file")
+static_switches :: proc(runs: []r3000.Learned) -> r3000.Set {
+	funcs := make([]^mips.Func, len(runs))
+	defer delete(funcs)
+	for r, k in runs {
+		img := mips.Image {
+			base  = r.lo,
+			data  = ([^]u8)(raw_data(r.words))[:4 * len(r.words)],
+			entry = r.entry,
+		}
+		funcs[k] = mips.func_make(r.entry, r.lo + 4 * u32(len(r.words)), r.lo)
+		mips.discover(r3000.RULES, img, funcs[k], nil)
+	}
+	defer for f in funcs {mips.func_free(f)}
+	return r3000.thread_switches([][]^mips.Func{funcs})
+}
+
+// Native code cannot be suspended, so a task it calls through a register
+// cannot switch threads on wasm32. A loop with no way out is interpreted;
+// so is what it calls that calls through a register (MGS1's main loop calls
+// 0x800150c4, which calls each task's function from its list).
+@(private = "file")
+test_dispatcher :: proc() {
+	DISPATCH :: 0x80028000
+	LOOP :: 0x80028100
+	OTHER :: 0x80028200
+	JR_RA :: 0x03e00008
+	JAL :: 0x0c00a000 // jal DISPATCH
+	loop := [?]u32{JAL, 0, 0x0800a040, 0} // and j LOOP
+	once := [?]u32{JAL, 0, JR_RA, 0}
+	by_reg := [?]u32{0x8c880000, 0, 0x0100f809, 0, JR_RA, 0} // lw t0, 0(a0); jalr t0
+	direct := [?]u32{0x24420001, JR_RA, 0}
+	{
+		runs := [?]r3000.Learned{{DISPATCH, DISPATCH, by_reg[:]}, {LOOP, LOOP, loop[:]}, {OTHER, OTHER, once[:]}}
+		out := static_switches(runs[:])
+		defer delete(out)
+		check(DISPATCH in out, "a loop's dispatcher compiled")
+		check(OTHER in out, "another caller of a loop's dispatcher compiled")
+	}
+	{
+		runs := [?]r3000.Learned{{DISPATCH, DISPATCH, direct[:]}, {LOOP, LOOP, loop[:]}}
+		out := static_switches(runs[:])
+		defer delete(out)
+		check(DISPATCH not_in out, "a loop's callee with no call through a register left")
+	}
+	{
+		runs := [?]r3000.Learned{{DISPATCH, DISPATCH, by_reg[:]}, {OTHER, OTHER, once[:]}}
+		out := static_switches(runs[:])
+		defer delete(out)
+		check(len(out) == 0, "a call through a register outside such a loop left")
+	}
 }
 
 // An interpreted main loop calls a learned run that calls a coroutine yield

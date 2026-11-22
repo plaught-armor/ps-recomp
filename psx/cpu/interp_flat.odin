@@ -116,13 +116,17 @@ when core.FLAT {
 	flat_returns, flat_mismatch: u64
 	flat_max_depth: u32
 	// Stops put off until native code or a nested run returned (the IOP's
-	// budget, th_budget), each counted once (flat_put_off).
+	// budget, th_budget, and flat_stop_soon), each counted once (flat_put_off).
 	flat_late: u64
 	// Thread switches a stopped run owed that its owner dropped: by the time
 	// the run stopped, the guest had named the running thread again.
 	flat_switches_dropped: u64
 	@(private = "file")
 	flat_late_owed: bool // the running run has one put off, counted
+	// flat_stop_soon's stop waits for the run to be one that can stop
+	// (flat_settle takes it).
+	@(private = "file")
+	flat_stop_owed: bool
 	// LEARN notes the runs of this flat_run (learn_on as it began): its
 	// loop is the one that fetches into them (flat_loop's learn).
 	@(private = "file")
@@ -203,6 +207,7 @@ when core.FLAT {
 		frame_ret, tail_depth = outer_ret, outer_tail
 		flat_cur = nil
 		flat_stop = false
+		flat_stop_owed = false
 		flat_late_owed = false
 		return x.ended
 	}
@@ -247,7 +252,9 @@ when core.FLAT {
 	// below would run on as if it had returned: fatal.
 	flat_block :: proc(what: string) {
 		if flat_cur == nil {fatal("%s outside a flat run", what)}
-		if flat_nest_depth > 0 {fatal("%s inside a guest call made by host code (FLAT runs those nested)", what)}
+		// Native code first, below a nested run or in it: the nested run may
+		// be its call of guest code, and the next run can leave it to the
+		// interpreter, where there is no nesting.
 		if flat_native > 0 {
 			b := strings.builder_make(context.temp_allocator)
 			named := flat_native_at[:min(flat_native, FLAT_NAMED)]
@@ -257,6 +264,7 @@ when core.FLAT {
 			if flat_native_fatal != nil {flat_native_fatal(named)}
 			fatal("%s inside native code (FLAT), entered at %s, ra %08x", what, strings.to_string(b), state.r[31])
 		}
+		if flat_nest_depth > 0 {fatal("%s inside a guest call made by host code (FLAT runs those nested)", what)}
 		flat_stop = true
 	}
 
@@ -274,6 +282,21 @@ when core.FLAT {
 	// not inside a nested run or native code.
 	flat_can_stop :: proc() -> bool {
 		return flat_cur != nil && flat_nest_depth == 0 && flat_native == 0
+	}
+
+	// What an exception return that names another thread calls: the run
+	// stops now, or where native code or a nested run below has returned and
+	// interrupts are on, as they were at that return (a switch cannot land in
+	// a critical section). False outside a run, which nothing can stop.
+	flat_stop_soon :: proc() -> bool {
+		if flat_cur == nil {return false}
+		if flat_can_stop() {
+			flat_stop = true
+		} else {
+			flat_stop_owed = true
+			flat_put_off()
+		}
+		return true
 	}
 
 	// Push a continuation on the running run, for host code to go on in steps
@@ -495,6 +518,10 @@ when core.FLAT {
 	@(private = "file")
 	flat_settle :: proc(x: ^Flat_Ctx, $L: bool) -> bool {
 		for {
+			if flat_stop_owed && flat_can_stop() && cop0.sr & 0x401 == 0x401 {
+				flat_stop_owed = false
+				flat_stop = true
+			}
 			if flat_stop || x.ended {return false}
 			if x.enter {
 				x.enter = false

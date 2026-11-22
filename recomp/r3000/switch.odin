@@ -10,14 +10,21 @@ import "../native"
 // native code, so a thread switch under it is fatal (psx/cpu flat_block).
 //
 // A function switches when it may call ChangeTh or ChangeThreadSubFunction
-// itself (switches_here), or reaches code that does: through jal, or a
-// branch or jump out of its own code, each to the function holding the
-// target (a jump into the middle of one passes through its rest). Calls
-// through a register are not followed: a path through one stays fatal, and
-// the fatal names the native functions it passed, for the next run to
-// leave (play's known switches). Entries are by address across every
-// module, so an overlay's entry that switches also leaves the same entry of
-// another overlay to the interpreter; that costs speed, never correctness.
+// itself (switches_here), loops with no way out (loops_forever: an exception
+// return that names another thread waits for the native code under it to
+// return, so in such a loop it waits for ever), is such a loop's dispatcher
+// (the loop calls it by jal and it calls through a register: the thread's
+// work, which may switch; MGS1's main loop calls 0x800150c4, which calls
+// each task from a list), or reaches code that does one of these: through
+// jal, or a branch or jump out of its own code, each to the function holding
+// the target (a jump into the middle of one passes through its rest). Other
+// calls through a register are not followed: a ChangeTh past one stays
+// fatal, and the fatal names the native functions it passed, for the next
+// run to leave (play's known switches); a switch owed in a loop past one
+// waits, and only play's exit count of stops put off shows it. Entries are
+// by address across every module, so an overlay's entry that switches also
+// leaves the same entry of another overlay to the interpreter; that costs
+// speed, never correctness.
 //
 // mods holds each module's functions; the result is in context.allocator.
 thread_switches :: proc(mods: [][]^mips.Func) -> Set {
@@ -42,14 +49,18 @@ thread_switches :: proc(mods: [][]^mips.Func) -> Set {
 		append(&c, caller)
 		callers[callee] = c
 	}
+	looped: Set // what a loop with no way out calls by jal
+	defer delete(looped)
 	for funcs, k in mods {
 		for f in funcs {
-			if switches_here(f) && f.entry not_in out {
+			loops := loops_forever(f)
+			if (loops || switches_here(f)) && f.entry not_in out {
 				out[f.entry] = {}
 				append(&work, f.entry)
 			}
 			for _, i in f.insns {
 				if i.kind != .Call {continue}
+				if loops {looped[i.target] = {}}
 				edge(&callers, i.target, f.entry)
 				holding(index, k, i.target, &holders)
 				for h in holders {edge(&callers, h, f.entry)}
@@ -57,6 +68,14 @@ thread_switches :: proc(mods: [][]^mips.Func) -> Set {
 			for t in f.exits {
 				holding(index, k, t, &holders)
 				for h in holders {edge(&callers, h, f.entry)}
+			}
+		}
+	}
+	for funcs in mods {
+		for f in funcs {
+			if f.entry in looped && f.entry not_in out && calls_by_register(f) {
+				out[f.entry] = {}
+				append(&work, f.entry)
 			}
 		}
 	}
@@ -169,12 +188,44 @@ interp_overlaps :: proc(s: Interp_Set, lo, hi: u32) -> bool {
 // and the runs found to switch so far): a run calls, or branches or jumps
 // out of its words, into code of s.
 run_switches :: proc(f: ^mips.Func, s: Interp_Set) -> bool {
-	if switches_here(f) {return true}
+	if switches_here(f) || loops_forever(f) {return true}
 	for _, i in f.insns {
 		if i.kind == .Call && interp_holds(s, i.target) {return true}
 	}
 	for t in f.exits {
 		if interp_holds(s, t) {return true}
+	}
+	return false
+}
+
+// Whether f loops with no way out: its reachable code has a backward branch
+// or jump, and no jr, halt or exit from its range. MGS1's idle thread
+// (0x8008e514) is one, and its other threads run only when an exception
+// return takes the CPU from it. A program's start also has a loop (it
+// clears the bss) and no jr, but ends in a halt (break 1) after main. A
+// jump to itself is not counted: it is a halt too (MGS1's fault handler,
+// 0x8008e64c), and its callers would all be left to the interpreter.
+@(private = "file")
+loops_forever :: proc(f: ^mips.Func) -> bool {
+	if len(f.exits) > 0 {return false}
+	loops := false
+	for pc, i in f.insns {
+		if i.halt {return false}
+		#partial switch i.kind {
+		case .Jr:
+			return false
+		case .Branch, .Jump:
+			if i.target < pc && mips.inside(f, i.target) {loops = true}
+		}
+	}
+	return loops
+}
+
+// Whether f has a jalr.
+@(private = "file")
+calls_by_register :: proc(f: ^mips.Func) -> bool {
+	for _, i in f.insns {
+		if i.kind == .Jalr {return true}
 	}
 	return false
 }

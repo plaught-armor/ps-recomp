@@ -25,8 +25,8 @@ when core.FLAT {
 		fresh:  [MAX_THREADS]bool,
 		// The running thread lost its slot.
 		orphan: bool,
-		// An exception return stopped the running run to switch threads
-		// (preempt): flat_main switches once it has stopped.
+		// An exception return named another thread (preempt): flat_main
+		// switches once the running run has stopped (cpu.flat_stop_soon).
 		preempt_owed: bool,
 	}
 
