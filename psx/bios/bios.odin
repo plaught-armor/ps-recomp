@@ -1430,7 +1430,8 @@ change_thread :: proc(h: u32) {
 // FLAT a run in native code is held there, host frames and all, and the
 // others run until it is that thread's turn again (flat_switch_held): MGS1
 // runs native code for frames on end, and a switch waiting for its return
-// left the captions up to 15 s late. Holds nest, a thread's once. Elsewhere,
+// left the captions up to 15 s late. Holds nest, a thread's once, and end
+// last held first: one out of that order waits for those above it. Elsewhere,
 // and for a switch to a thread held (its frames are below the running
 // one's), the running run stops first (cpu.flat_stop_soon) and flat_main or
 // flat_switch_held switches once it has (preempt_owed): the registers saved

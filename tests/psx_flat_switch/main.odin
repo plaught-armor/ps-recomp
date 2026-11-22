@@ -10,12 +10,17 @@
 // thread_switches drives the same BIOS calls from host code, coroutines
 // only.
 //
+// The test runs itself as a child for each case of CASES: holds that end
+// in another order than made, and those that cannot end, whose fatal ends
+// the process.
+//
 // Last, under FLAT, a switch that cannot be made: in guest code that native
 // code called. Its fatal must hand the native code to play's known switches.
 package main
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import bios "ps:psx/bios"
 import cpu "ps:psx/cpu"
 import io "ps:psx/io"
@@ -88,6 +93,8 @@ s: struct {
 	events:    int, // run_events calls counted
 	events_s0: u32, // s0 when they ran
 	dropped:   u64, // cpu.flat_switches_dropped before the rename case
+	deep:      int, // guest calls from host code open (deep)
+	deep_then: proc(), // run in the innermost
 }
 
 @(private = "file")
@@ -555,17 +562,28 @@ main :: proc() {
 	cpu.next_event = max(u64)
 	put_dispatch(D_MAIN)
 	put_dispatch(D_ALT)
-	script()
+	if len(os.args) == 2 {child_script(os.args[1])} else {script()}
 
 	r()[29], r()[31] = 0x801ffe00, 0x80001234
 	when core.FLAT {bios.flat_main(D_MAIN)} else {cpu.call(D_MAIN)}
 	check("steps run", u32(s.n), u32(len(s.steps)))
 	check("back on the main thread's sp", r()[29], 0x801ffe00)
 	when core.FLAT {cpu.flat_print()}
+	done()
+}
+
+// The script is over: a child reports by its status, the parent runs them.
+@(private = "file")
+done :: proc() {
+	child := len(os.args) == 2
+	if !child {
+		for c in CASES {run_case(c)}
+	}
 	if failed > 0 {
 		fmt.eprintfln("psx_flat_switch: %d failed", failed)
 		os.exit(1)
 	}
+	if child {os.exit(0)}
 	when core.FLAT {switch_under_native()}
 	passed()
 }
@@ -605,5 +623,229 @@ when core.FLAT {
 
 @(private = "file")
 passed :: proc() {
-	fmt.println("ok psx_flat_switch: ChangeTh round trip, TCB writes, epc restart, syscall 3, slot reuse, preempt, a preempt in a jr's delay slot, a dropped owed switch, a preempt in native code and one above it")
+	fmt.println("ok psx_flat_switch: ChangeTh round trip, TCB writes, epc restart, syscall 3, slot reuse, preempt, a preempt in a jr's delay slot, a dropped owed switch, a preempt in native code and one above it, holds ended out of order")
+}
+
+// A case run as a child, and how it ends: fatal "" with status 0, else with
+// that fatal under FLAT (the coroutines skip it), learned whether the fatal
+// names the native code to play's known switches.
+@(private = "file")
+Case :: struct {
+	name:    string,
+	fatal:   string,
+	learned: bool,
+}
+
+@(private = "file")
+CASES :: [?]Case {
+	{name = "below"},
+	{name = "below_preempt"},
+	{name = "below_two"},
+	{name = "nest"},
+	{"restart", "a thread closed or started over while held", true},
+	{"closed", "a thread closed or started over while held", true},
+	{"end", "thread 1 returned from its entry", false},
+	{"main_end", "the executable returned from its entry with a thread held", false},
+}
+
+@(private = "file")
+run_case :: proc(c: Case) {
+	when !core.FLAT {
+		if c.fatal != "" {return}
+	}
+	self, err := os.get_executable_path(context.temp_allocator)
+	state: os.Process_State
+	out, errs: []u8
+	if err == nil {
+		state, out, errs, err = os.process_exec({command = {self, c.name}}, context.temp_allocator)
+	}
+	if err != nil {
+		fmt.eprintfln("FAIL psx_flat_switch %s: cannot run the child: %v", c.name, err)
+		failed += 1
+		return
+	}
+	want := 1 if c.fatal != "" else 0
+	learned := strings.contains(string(out), LEARNED)
+	if !state.exited || state.exit_code != want || learned != c.learned || !strings.contains(string(errs), c.fatal) {
+		fmt.eprintfln("FAIL psx_flat_switch %s: status %d, learned %v, stderr:\n%s", c.name, state.exit_code, learned, errs)
+		failed += 1
+	}
+}
+
+@(private = "file")
+LEARNED :: "learned"
+
+@(private = "file")
+child_script :: proc(name: string) {
+	when core.FLAT {
+		cpu.flat_native_fatal = proc(_: []u32) {
+			fmt.println(LEARNED)
+			os.flush(os.stdout)
+		}
+	}
+	switch name {
+	case "below":
+		case_below(proc() {op(.Change, MAIN_THREAD)})
+	case "below_preempt":
+		case_below(proc() {
+			point_pcb(tcb(0))
+			op(.Store)
+		})
+	case "closed":
+		case_below(proc() {
+			check("CloseTh of a held thread", bios_b(0x0f, 0xff000001), 1)
+			op(.Change, MAIN_THREAD)
+		})
+	case "below_two":
+		case_below_two()
+	case "nest":
+		case_nest()
+	case "restart":
+		case_one(proc() {
+			cpu.w32(tcb(0) + 0x88, D_ALT)
+			op(.Change, MAIN_THREAD)
+		})
+	case "end":
+		case_one(proc() {op(.End)})
+	case "main_end":
+		case_main_end()
+	case:
+		fmt.eprintfln("FAIL psx_flat_switch: no case %s", name)
+		os.exit(2)
+	}
+}
+
+@(private = "file")
+add_step :: proc(p: proc()) {append(&s.steps, p)}
+
+// The main thread's step: n threads opened, the first switched to from its
+// native code.
+@(private = "file")
+hold_main :: proc(n: u32) {
+	for i in 1 ..= n {
+		check("OpenTh", bios_b(0x0e, D_MAIN, THREAD_SP - 0x1000 * i, 0), 0xff000000 | i)
+	}
+	r()[16] = 0x6060
+	point_pcb(tcb(1))
+	irq_now()
+}
+
+// Thread i's step, in native code: on to the next. Where that native code
+// goes on before the main thread's, it has thread i's registers.
+@(private = "file")
+hold_next :: proc(i: u32) {
+	on(i)
+	r()[16] = 0x4000 + i
+	point_pcb(tcb(i + 1))
+	irq_now()
+	check("s0 of native code held above", r()[16], 0x4000 + i)
+	op_ram_store()
+}
+
+// The main thread held, the second above it, and the third going to the
+// main thread (last): the second's native code returns, then the main
+// thread goes on.
+@(private = "file")
+case_below :: proc(last: proc()) {
+	add_step(proc() {
+		hold_main(2)
+		on(0)
+		check("steps before the main thread went on", u32(s.n), 3)
+		check("main thread's s0", r()[16], 0x6060)
+		check("second thread's s0 in its TCB", cpu.r32(reg(tcb(1), 16)), 0x4001)
+		check("third thread's s0 in its TCB", cpu.r32(reg(tcb(2), 16)), 0)
+		op(.End)
+	})
+	add_step(proc() {hold_next(1)})
+	add_step(last)
+}
+
+// The same, two held above the main thread.
+@(private = "file")
+case_below_two :: proc() {
+	add_step(proc() {
+		hold_main(3)
+		on(0)
+		check("steps before the main thread went on", u32(s.n), 4)
+		check("main thread's s0", r()[16], 0x6060)
+		check("third thread's s0 in its TCB", cpu.r32(reg(tcb(2), 16)), 0x4002)
+		op(.End)
+	})
+	add_step(proc() {hold_next(1)})
+	add_step(proc() {hold_next(2)})
+	add_step(proc() {op(.Change, MAIN_THREAD)})
+}
+
+@(private = "file")
+case_one :: proc(last: proc()) {
+	add_step(proc() {
+		hold_main(1)
+		op(.End)
+	})
+	add_step(last)
+}
+
+@(private = "file")
+case_main_end :: proc() {
+	add_step(proc() {
+		check("OpenTh", bios_b(0x0e, D_MAIN, THREAD_SP, 0), 0xff000001)
+		point_pcb(tcb(1))
+		op(.Store)
+	})
+	add_step(proc() {
+		point_pcb(tcb(0))
+		irq_now()
+	})
+	add_step(proc() {op(.End)})
+}
+
+// Guest code that tail-jumps to DEEP_STEP.
+@(private = "file")
+DEEP :: 0x80023000
+@(private = "file")
+DEEP_STEP :: 0x80001800
+// Each thread's guest calls from host code: under FLAT's limit, two threads'
+// over it.
+@(private = "file")
+DEEP_CALLS :: 5
+
+// Run p that many guest calls from host code deep.
+@(private = "file")
+deep :: proc(p: proc()) {
+	ra := r()[31]
+	s.deep, s.deep_then = 0, p
+	cpu.call(DEEP)
+	r()[31] = ra
+}
+
+@(private = "file")
+case_nest :: proc() {
+	put(DEEP, 0x08000000 | (DEEP_STEP >> 2) & 0x3ffffff)
+	put(DEEP + 4, 0)
+	cpu.register_funcs({{DEEP_STEP, proc() {
+				s.deep += 1
+				if s.deep < DEEP_CALLS {
+					cpu.call(DEEP)
+				} else {
+					s.deep_then()
+				}
+			}}})
+	add_step(proc() {
+		check("OpenTh", bios_b(0x0e, D_MAIN, THREAD_SP, 0), 0xff000001)
+		r()[16] = 0x6060
+		deep(proc() {
+			point_pcb(tcb(1))
+			irq_now()
+		})
+		on(0)
+		check("main thread's s0 after nested calls", r()[16], 0x6060)
+		op(.End)
+	})
+	add_step(proc() {
+		deep(proc() {
+			point_pcb(tcb(0))
+			irq_now()
+		})
+		op_ram_store()
+	})
 }

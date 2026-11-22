@@ -3,7 +3,7 @@
 // run (cpu.flat_block) after it has switched the registers, and flat_main,
 // the owner of the runs, goes on with the thread switched to. An exception
 // return in native code cannot stop its run: flat_switch_held is the owner
-// inside it until that thread is switched back to.
+// inside it until that thread, or one held below it, is switched back to.
 //
 // A thread's TCB, registers and slot bookkeeping are as in the coroutine
 // model (bios.odin): only where a thread's host continuation lives differs.
@@ -52,7 +52,7 @@ when core.FLAT {
 				i := cur_thread
 				if !flat_run_current() {continue}
 				if i == 0 && flat.boot {return}
-				cpu.fatal("thread %d returned from its entry %#08x", i, threads[i].entry)
+				thread_returned(i)
 			}
 		}
 	}
@@ -80,14 +80,24 @@ when core.FLAT {
 		return false
 	}
 
+	@(private = "file")
+	thread_returned :: proc(i: int) -> ! {
+		cpu.fatal("thread %d returned from its entry %#08x", i, threads[i].entry)
+	}
+
 	// Switch to thread j from inside the running thread's native code, which h
-	// holds, and own the runs until that thread is switched back to: its
-	// registers are loaded then, and the native code goes on. The host frames
-	// cannot be dropped, so a thread started over meanwhile, or a run that
-	// ended, is fatal as a switch in native code is, naming it for play to
-	// leave to the interpreter. So is a switch to a thread held below this one:
-	// its frames cannot go on before these. A thread held never runs, so is
-	// never held again: MAX_THREADS bounds the host stack.
+	// holds, and own the runs until that thread, or one held below it, is
+	// switched back to. Its native code goes on then with its registers. For
+	// one below, whose frames cannot go on before these, that switch is owed
+	// as a preempt's in native code is: the native code returns first, and the
+	// thread below is late by as long.
+	//
+	// The host frames cannot be dropped, so a held thread closed or started
+	// over is fatal, naming the native code for play to leave to the
+	// interpreter. A thread's return from its entry is fatal as in flat_main,
+	// and the executable's with a thread held, its frames being above
+	// flat_main's: neither is the native code's, so neither names it. A thread
+	// held never runs, so is never held again.
 	@(private)
 	flat_switch_held :: proc(h: ^cpu.Flat_Hold, j: int) {
 		home := cur_thread
@@ -100,13 +110,30 @@ when core.FLAT {
 		ended := false
 		// The scheduler's loop, as flat_main's: it lasts as long as the others run.
 		for !ended && !flat.held[cur_thread] {ended = flat_run_current()}
+		to := cur_thread
+		if ended {
+			if to == 0 && flat.boot {
+				cpu.fatal("the executable returned from its entry with a thread held in native code (FLAT)")
+			}
+			thread_returned(to)
+		}
 		flat.held[home] = false
 		cpu.mod_inner = inner
 		cpu.flat_resume(h)
-		if ended || flat.fresh[home] {
-			cpu.flat_block("a thread's end or restart with a thread held")
-		} else if cur_thread != home {
-			cpu.flat_block("a switch to a thread held below another")
+		if flat.fresh[home] || to != home && !resumable(home) {
+			cpu.flat_block("a thread closed or started over while held")
+		} else if to != home {
+			switch_to(home)
+			cpu.w32(pcb(), KSEG1 | tcb(to))
+			cpu.flat_stop_soon()
+			flat.preempt_owed = true
 		}
+	}
+
+	// Whether switch_to would go on with thread i's host continuation: it
+	// kept its slot, and its TCB the epc it stopped with.
+	@(private = "file")
+	resumable :: proc(i: int) -> bool {
+		return i < thread_count() && thread_started(i) && cpu.r32(tcb(i) + TCB_EPC) == TCB_PARKED
 	}
 }

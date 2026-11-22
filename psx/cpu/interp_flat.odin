@@ -41,8 +41,11 @@ FLAT_DEPTH_MAX :: 32768
 FLAT_HOST :: 4
 // Words of a continuation's state.
 FLAT_HOST_WORDS :: 48
-// Guest calls from host code nested inside one another.
+// Guest calls from host code nested inside one another, above each hold.
 FLAT_NEST :: 8
+// Runs held at once (flat_hold). It bounds the host frames' count, not
+// their bytes: they share one host stack.
+FLAT_HOLDS :: 16
 
 Flat_Kind :: enum u8 {
 	Base, // the run's first call (flat_start): its return ends the run
@@ -140,7 +143,7 @@ when core.FLAT {
 	flat_interp: []core.Native_Interp
 
 	@(private = "file")
-	flat_nest: [FLAT_NEST]Flat_Ctx
+	flat_nest: [FLAT_NEST * (FLAT_HOLDS + 1)]Flat_Ctx
 	@(private = "file")
 	flat_nest_depth: int
 	// Fixed, overlay or learned functions running: native code, whose host
@@ -235,7 +238,7 @@ when core.FLAT {
 	// addr is interpreted. Run it to its end on a run of its own.
 	flat_nested :: proc(addr: u32) {
 		if flat_cur == nil {fatal("guest code at %08x interpreted outside a flat run", addr)}
-		if flat_nest_depth == FLAT_NEST {fatal("guest calls from the host nested %d deep at %08x", FLAT_NEST, addr)}
+		if flat_nest_depth - flat_nest_base == FLAT_NEST {fatal("guest calls from the host nested %d deep at %08x", FLAT_NEST, addr)}
 		outer := flat_cur
 		x := &flat_nest[flat_nest_depth]
 		flat_nest_depth += 1
@@ -310,9 +313,10 @@ when core.FLAT {
 	// Hold the running run where it is, in native code, so that its owner can
 	// run others (flat_run) from inside it, as a coroutine's switch would,
 	// then go on with it (flat_resume), the last held first. False, nothing
-	// changed, outside native code. The owner bounds the depth.
+	// changed, outside native code or with FLAT_HOLDS held: the caller puts
+	// its stop off then (flat_stop_soon).
 	flat_hold :: proc(h: ^Flat_Hold) -> bool {
-		if flat_cur == nil || flat_native == 0 {return false}
+		if flat_cur == nil || flat_native == 0 || flat_held == FLAT_HOLDS {return false}
 		h^ = {flat_cur, flat_nest_base, flat_native, flat_native_at, no_returns, flat_stop, flat_learning, flat_host_call}
 		flat_cur, flat_native = nil, 0
 		flat_stop, flat_host_call = false, false
