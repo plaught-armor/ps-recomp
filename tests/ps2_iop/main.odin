@@ -227,6 +227,7 @@ game :: proc(_: rawptr) {
 	test_loader_snap()
 	test_loader()
 	test_modload()
+	test_stop_unload()
 	test_threads()
 	test_failed_paths()
 	test_irx_mem_size()
@@ -981,6 +982,65 @@ libi_registered :: proc() -> bool {
 		if string(b.name[:4]) == "libi" {return true}
 	}
 	return false
+}
+
+// "modst": its start returns `start`; called to stop (argc < 0) it keeps
+// argc and argv[0] in its data and returns 1, NO_RESIDENT_END.
+mod_stoppable :: proc(start: u32) -> (f: []u8, d: u32) {
+	c: Asm
+	d = at(&c)
+	put(&c, 0, 0)
+	entry := at(&c)
+	prologue(&c)
+	put(&c, 0x04800000 | A0 << 21 | 5, 0) // bltz a0, stop; nop
+	li(&c, V0, start)
+	epilogue(&c)
+	// stop:
+	la(&c, T0, d)
+	put(&c, 0xad040000, 0x8ca90000, 0xad090004) // sw a0, 0(t0); lw t1, 0(a1); sw t1, 4(t0)
+	li(&c, V0, 1)
+	epilogue(&c)
+	return build_mod("modst", &c, entry), d
+}
+
+// LOADFILE's StopModule (7) and UnloadModule (8), as Midway Arcade
+// Treasures 2 stops and unloads its RAD_IOP_SIDE before an IOP reset.
+test_stop_unload :: proc() {
+	l := &iop.iop_loader
+	buf: [512]u8
+	lf := iop.sif.servers[0x80000006]
+	// Words 0-1 of the request, the rest of `buf` as it stands.
+	rpc :: proc(lf: iop.Rpc_Server, fno: u32, buf: []u8, words: ..u32) -> [2]u32 {
+		w := ([^]u32)(&buf[0])
+		for i in 0 ..< 2 {w[i] = words[i] if i < len(words) else 0}
+		if !lf(fno, buf, 512) {return {0xdead, 0xdead}}
+		return {w[0], w[1]}
+	}
+	err :: proc(e: i32) -> u32 {return u32(e)}
+
+	fresh()
+	f, d := mod_stoppable(2)
+	id, r := iop.iop_load(f, "modst", nil)
+	b := module_base(id)
+	check(id > 0 && r == 2 && len(l.modules) == 1 && l.modules[0].removable, "stop: a start returning 2 leaves its module removable")
+	check(rpc(lf, 8, buf[:], u32(id))[0] == err(-210), "unload: a running module is KE_NOT_STOPPED")
+	copy(buf[0x104:], "x\x00")
+	v := rpc(lf, 7, buf[:], u32(id), 2)
+	check(v == {u32(id), 1}, "stop: replies the id and what the stop returned")
+	check(iop.iop_u32(b + d)^ == err(-2), "stop: the entry runs with argc negated, one arg after argv[0]")
+	check(string(iop.iop_mem(iop.iop_u32(b + d + 4)^, 6)) == "other\x00", "stop: argv[0] is \"other\"")
+	check(rpc(lf, 7, buf[:], u32(id))[0] == err(-208), "stop: a stopped module is KE_ALREADY_STOPPED")
+	check(rpc(lf, 8, buf[:], u32(id))[0] == u32(id) && len(l.modules) == 0, "unload: a stopped module is dropped, the reply its id")
+	check(rpc(lf, 8, buf[:], u32(id))[0] == err(-202) && rpc(lf, 7, buf[:], u32(id))[0] == err(-202), "stop, unload: an unknown id is KE_UNKNOWN_MODULE")
+	check(rpc(lf, 7, buf[:], 2) == {2, 1} && rpc(lf, 8, buf[:], 2)[0] == 2, "stop, unload: a module not run here answers as stopped, unloaded")
+
+	// A resident start refuses both; a stop that keeps the module running.
+	fresh()
+	f, d = mod_stoppable(0)
+	id, r = iop.iop_load(f, "modst", nil)
+	check(id > 0 && r == 0 && !l.modules[0].removable, "stop: a start returning 0 leaves its module resident")
+	check(rpc(lf, 7, buf[:], u32(id))[0] == err(-211) && iop.iop_u32(module_base(id) + d)^ == 0, "stop: a resident module is KE_NOT_REMOVABLE, its entry not run")
+	check(rpc(lf, 8, buf[:], u32(id))[0] == err(-211) && len(l.modules) == 1, "unload: a resident module is KE_NOT_REMOVABLE")
 }
 
 test_modload :: proc() {
@@ -2464,10 +2524,11 @@ test_ds2 :: proc() {
 
 // sceSifSetCmdBuffer and sceSifAddCmdHandler fill the module's table and the
 // system one; a cid past either table is refused, with nothing written.
+// sceSifRemoveCmdHandler clears a handler, its harg kept.
 test_sifcmd :: proc() {
 	fresh()
 	a: Asm
-	sc := imports(&a, "sifcmd", 4, 8, 10)
+	sc := imports(&a, "sifcmd", 4, 8, 10, 11)
 	out := at(&a)
 	put(&a, 1, 1, 1, 1, 1, 1, 1)
 	tab := at(&a)
@@ -2493,6 +2554,12 @@ test_sifcmd :: proc() {
 	add(&a, sc + 16, 0, 2, 0x1111, 0x22, out + 12)
 	add(&a, sc + 16, 0x8000, 5, 0x4444, 0x55, out + 16)
 	add(&a, sc + 16, 0x8000, 32, 0x3333, 0x66, out + 20)
+	add(&a, sc + 16, 0, 0, 0x5555, 0x56, out + 24)
+	add(&a, sc + 16, 0x8000, 6, 0x6666, 0x67, out + 24)
+	put(&a, 0x3c040000, 0x34840000) // lui a0, 0; ori a0, a0, 0
+	jal(&a, sc + 24)
+	put(&a, 0x3c048000, 0x34840006) // lui a0, 0x8000; ori a0, a0, 6
+	jal(&a, sc + 24)
 	la(&a, A0, tab2)
 	li(&a, A1, 1)
 	jal(&a, sc + 8)
@@ -2509,6 +2576,7 @@ test_sifcmd :: proc() {
 	check(u(b, out + 12) == 0xffffffff && u(b, tab + 16) == 0x77777777, "sifcmd: a cid past the table is refused, nothing written")
 	check(u(b, out + 16) == 0 && s.sys[5].handler == 0x4444 && s.sys[5].harg == 0x55, "sifcmd: a system handler lands in the system table")
 	check(u(b, out + 20) == 0xffffffff, "sifcmd: a system cid past 31 is refused")
+	check(u(b, tab) == 0 && u(b, tab + 4) == 0x56 && s.sys[6] == {0, 0x67}, "sifcmd: a removed handler is cleared, its harg kept")
 	check(u(b, out + 24) == b + tab && s.user_tab == b + tab2 && s.user_size == 1, "sifcmd: a second table returns the first")
 	iop.iop_loader_init()
 	check(s^ == {}, "sifcmd: the loader's reset clears the tables")

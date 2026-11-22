@@ -58,6 +58,7 @@ KE_ERROR :: -1
 // What a start returns in its low 2 bits.
 RESIDENT_END :: 0
 NO_RESIDENT_END :: 1
+REMOVABLE_RESIDENT_END :: 2 // resident, and StopModule may stop it
 
 // The Sony modules and libraries: what a LOADFILE does not run, and the
 // imports the HLE serves. Module and library names only, as the PS2SDK's
@@ -100,6 +101,8 @@ Iop_Module :: struct {
 	argv:           u32, // its argument block, 0 until its start is made
 	entry, gp:      u32, // absolute
 	started:        bool, // its start was made (StartModule refuses a second)
+	removable:      bool, // its start returned REMOVABLE_RESIDENT_END
+	stopped:        bool, // a StopModule's stop returned NO_RESIDENT_END
 	hash:           u64, // its file's, for failed_key
 	name:           [32]u8, // its module info's, NUL-padded, cut at 32
 }
@@ -342,6 +345,30 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 	m.hash = hash
 	f.thid = module_start(&m, path, args)
 	if f.thid == 0 {return fail(key, x.name, "no memory")}
+	why = ee_start_run(x.name)
+	if why != "" {return fail(key, x.name, why)}
+	failed_paths_retry()
+	frame_pop(frame_ee())
+	result = s.start_result
+	m.started = true
+	m.removable = result & 3 == REMOVABLE_RESIDENT_END
+	if result & 3 == NO_RESIDENT_END {
+		module_drop(m)
+	} else {
+		append(&l.modules, m)
+	}
+	core.gamedata_irx(strings.truncate_to_byte(string(m.name[:]), 0), m.base, m.size, m.hash)
+	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" at %x id %d start %x", x.name, m.base, m.id, result)}
+	return i32(m.id), result
+}
+
+// Runs the EE's frame, its start thread made, to the thread's return: the
+// start of iop_load and the stop of iop_stop. Why it failed, "" when it did
+// not. A start out of its budget, blocked, or leaving threads ready past
+// the budget raises its row, by `name`, the module's.
+@(private = "file")
+ee_start_run :: proc(name: string) -> string {
+	s := &iop_sched
 	s.start_done = false
 	iop_sync(cpu.state.cycles)
 	// In slices, so the interrupt handlers due meanwhile run between them as
@@ -366,34 +393,23 @@ iop_load :: proc(data: []u8, path: string, args: []u8) -> (id: i32, result: u32)
 		}
 		iop_intr_run(r3000.state.cycles * IOP_EE_RATIO)
 	}
-	if slices > 1 {fmt.eprintfln("iop: start of \"%s\" ran %d slices", x.name, slices)}
+	if slices > 1 {fmt.eprintfln("iop: start of \"%s\" ran %d slices", name, slices)}
 	if !s.start_done && s.budget {
-		core.compat_unknown(.Iop_Start, core.compat_name(x.name))
-		return fail(key, x.name, "start ran out of its budget")
+		core.compat_unknown(.Iop_Start, core.compat_name(name))
+		return "start ran out of its budget"
 	}
 	if !s.start_done {
-		core.compat_unknown(.Iop_Blocked, core.compat_name(x.name))
-		return fail(key, x.name, "start waits with no thread ready")
+		core.compat_unknown(.Iop_Blocked, core.compat_name(name))
+		return "start waits with no thread ready"
 	}
-	if load_ee_failed() {return fail(key, x.name, "start called what the HLE lacks")}
+	if load_ee_failed() {return "start called what the HLE lacks"}
 	if s.budget {
 		// The start returned, so the load succeeds; the threads it left ready
 		// stay so, their context saved, for a later load to run on.
-		core.compat_unknown(.Iop_Threads, core.compat_name(x.name))
-		fmt.eprintfln("iop: threads of \"%s\" ran out of the budget", x.name)
+		core.compat_unknown(.Iop_Threads, core.compat_name(name))
+		fmt.eprintfln("iop: threads of \"%s\" ran out of the budget", name)
 	}
-	failed_paths_retry()
-	frame_pop(frame_ee())
-	result = s.start_result
-	m.started = true
-	if result & 3 == NO_RESIDENT_END {
-		module_drop(m)
-	} else {
-		append(&l.modules, m)
-	}
-	core.gamedata_irx(strings.truncate_to_byte(string(m.name[:]), 0), m.base, m.size, m.hash)
-	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" at %x id %d start %x", x.name, m.base, m.id, result)}
-	return i32(m.id), result
+	return ""
 }
 
 // Links IRX file `data`, module info `x`, as module `id`: its image
@@ -434,17 +450,28 @@ module_link :: proc(data: []u8, x: Irx, id: u32) -> (m: Iop_Module, why: string)
 @(private = "file")
 module_start :: proc(m: ^Iop_Module, path: string, args: []u8) -> u32 {
 	m.argv = argv_block(path, args)
-	stack := sys_alloc(.High, IOP_START_STACK)
-	if m.argv == 0 || stack == 0 {
+	thid := module_thread(m^, m.argv, stop = false)
+	if thid == 0 {
 		if m.argv != 0 {sys_free(m.argv)}
-		if stack != 0 {sys_free(stack)}
 		m.argv = 0
-		return 0
 	}
+	return thid
+}
+
+// Makes a thread of module m's entry ready at IOP_START_PRIO, on argument
+// block `argv` (argv_block): argc as the block holds it, negated for a
+// stop, as retail's modload calls the entry to stop a module. Its id, or 0
+// when `argv` is 0 or memory for its stack ran out.
+@(private = "file")
+module_thread :: proc(m: Iop_Module, argv: u32, stop: bool) -> u32 {
+	if argv == 0 {return 0}
+	stack := sys_alloc(.High, IOP_START_STACK)
+	if stack == 0 {return 0}
 	st := th_new(m.entry, stack, IOP_START_STACK, m.gp, IOP_START_PRIO)
 	st.start, st.exit_delete = true, true
-	st.ctx.r[4] = r32(m.argv)
-	st.ctx.r[5] = m.argv + 4
+	argc := i32(r32(argv))
+	st.ctx.r[4] = u32(-argc if stop else argc)
+	st.ctx.r[5] = argv + 4
 	th_ready(st)
 	return st.id
 }
@@ -510,7 +537,8 @@ frame_ee :: proc() -> int {
 
 // The EE's load failed: what it did is undone, the threads, semaphores and
 // event flags made since it began deleted, and its image of `key` is not
-// run again (failed_add). The StartModules begun since are inside the undo:
+// run again (failed_add; a "" key, a stop's, marks none). The StartModules
+// begun since are inside the undo:
 // their frames end, their callers woken with KE_ERROR if the undo keeps them.
 @(private = "file")
 load_ee_fail :: proc(key, name, why: string) {
@@ -525,7 +553,7 @@ load_ee_fail :: proc(key, name, why: string) {
 	frame_pop(i)
 	th_undo(l.ee_mark)
 	undo_restore()
-	failed_add(key, name)
+	if key != "" {failed_add(key, name)}
 }
 
 // A start's thread `thid` ended, its v0 `v`: the EE load's start is done
@@ -576,6 +604,7 @@ load_start_finish :: proc(thid: u32) {
 	}
 	k := module_index(f.id)
 	assert(k >= 0, "iop: a started module not loaded")
+	l.modules[k].removable = f.result & 3 == REMOVABLE_RESIDENT_END
 	m := l.modules[k]
 	failed_paths_retry()
 	frame_pop(i)
@@ -737,6 +766,76 @@ IOP_SONY_ID :: 2
 KE_ILLEGAL_OBJECT :: -201
 KE_UNKNOWN_MODULE :: -202
 KE_ALREADY_STARTED :: -206
+KE_NOT_STARTED :: -207
+KE_ALREADY_STOPPED :: -208
+KE_CAN_NOT_STOP :: -209
+KE_NOT_STOPPED :: -210
+KE_NOT_REMOVABLE :: -211
+
+// LOADFILE's StopModule of module `id`, from the EE, as retail's modload
+// stops one: a started module its start left removable has its entry run
+// again, argc negated, argv[0] "other" and then `args`, and `modres` is
+// what that returns. Its low 2 bits NO_RESIDENT_END stop the module, the
+// reply its id; any other leaves it running, KE_CAN_NOT_STOP. A module not
+// run here (IOP_SONY_ID) is answered as stopped. The stop runs as an EE
+// load's start does; one that fails is undone as a failed load is and
+// answered KE_ERROR, its image left free to load again.
+@(private)
+iop_stop :: proc(id: u32, args: []u8) -> (v0, modres: u32) {
+	if id == IOP_SONY_ID {return id, NO_RESIDENT_END}
+	l := &iop_loader
+	k := module_index(id)
+	if k < 0 {return ke(KE_UNKNOWN_MODULE), 0}
+	m := l.modules[k]
+	name := lib_name32(&m.name)
+	switch {
+	case !m.started:
+		return ke(KE_NOT_STARTED), 0
+	case m.stopped:
+		return ke(KE_ALREADY_STOPPED), 0
+	case !m.removable:
+		return ke(KE_NOT_REMOVABLE), 0
+	}
+	if l.depth == IOP_LOAD_DEPTH {
+		fmt.eprintfln("iop: stop of \"%s\" refused: %d starts under way", name, l.depth)
+		return ke(KE_ERROR), 0
+	}
+	defer iop_wake_set()
+	f := frame_push(id, ee = true)
+	argv := argv_block("other", args)
+	f.thid = module_thread(m, argv, stop = true)
+	why := "no memory" if f.thid == 0 else ee_start_run(name)
+	if why != "" {
+		// The undo frees the block with the rest of sysmem's.
+		load_ee_fail("", name, why)
+		return ke(KE_ERROR), 0
+	}
+	frame_pop(frame_ee())
+	sys_free(argv)
+	modres = iop_sched.start_result
+	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" id %d stop %x", name, id, modres)}
+	if modres & 3 != NO_RESIDENT_END {return ke(KE_CAN_NOT_STOP), modres}
+	// The stop can have loaded modules, so its index moved.
+	if k = module_index(id); k >= 0 {l.modules[k].stopped = true}
+	return id, modres
+}
+
+// LOADFILE's UnloadModule of module `id`, as retail's modload unloads one:
+// a module stopped, or loaded and never started, is dropped, the reply its
+// id; a started one is KE_NOT_REMOVABLE when its start left it resident,
+// else KE_NOT_STOPPED. A module not run here is answered as unloaded.
+@(private)
+iop_unload :: proc(id: u32) -> u32 {
+	if id == IOP_SONY_ID {return id}
+	k := module_index(id)
+	if k < 0 {return ke(KE_UNKNOWN_MODULE)}
+	m := iop_loader.modules[k]
+	if m.started && !m.removable {return ke(KE_NOT_REMOVABLE)}
+	if m.started && !m.stopped {return ke(KE_NOT_STOPPED)}
+	if cpu.debug >= 1 {fmt.eprintfln("iop: \"%s\" id %d unloaded", lib_name32(&m.name), id)}
+	module_drop(m)
+	return id
+}
 
 // modload's LoadModuleBuffer (10) and StartModule (8), as a start that loads
 // modules itself calls them (PLD.IRX), the module id lists (16, 18) and

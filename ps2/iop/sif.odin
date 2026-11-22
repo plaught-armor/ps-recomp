@@ -563,6 +563,13 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 			if id, result := iop_load(data, name, args); id >= 0 {w[0], w[1] = u32(id), result}
 		}
 		return true
+	case 7: // StopModule {id, arg length, unused[252], args[252]}, reply
+		// {id or error, what the stop returned}
+		w[0], w[1] = iop_stop(w[0], buf[0x104:][:min(w[1], 252)])
+		return true
+	case 8: // UnloadModule {id}, reply {id or error}
+		w[0] = iop_unload(w[0])
+		return true
 	case 255: // version handshake: the EE library refuses to load modules
 		// through a LOADFILE whose version it does not know
 		copy(buf, sif.versions.loadfile[:])

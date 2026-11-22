@@ -72,6 +72,15 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			w32(s.user_tab + 8 * i + 4, a2)
 		}
 		return 0, true
+	case 11: // sceSifRemoveCmdHandler(cid): the handler cleared, its harg kept,
+		// so the command is delivered to none
+		i := a0 & 0x7fffffff
+		if a0 & 0x80000000 != 0 {
+			if i < IOP_SYS_CMDS {s.sys[i].handler = 0}
+		} else if i < s.user_size {
+			w32(s.user_tab + 8 * i, 0)
+		}
+		return 0, true
 	case 12, 13: // sceSifSendCmd, isceSifSendCmd(cid, packet, psize, src, dest, size)
 		return sifcmd_send(a0, a1, max(a2 & 0xff, 16), r[7], r32(r[29] + 16), r32(r[29] + 20)), true
 	case 15: // sceSifBindRpc(client, sid, mode)
