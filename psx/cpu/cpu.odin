@@ -187,6 +187,12 @@ frame_ret: u32
 // Native calls that returned past their function to its caller (call_back).
 call_backs: u64
 
+// Counts host calls that returned here though on the console they never do
+// (ReturnFromException, exit, a longjmp refused). A run that jumped to a
+// function which made one does not go on at its link (goto_target). An
+// interrupt's are not the interrupted code's (bios.deliver_irq).
+no_returns: u32
+
 // Execute the MIPS function at addr and return when it returns.
 call :: proc(addr: u32) {
 	// A jump to the caller's return address through a register other than

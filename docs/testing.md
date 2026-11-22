@@ -110,6 +110,8 @@ node tests/read_dir/run.mjs read_dir.wasm
 odin run tests/psx_interp -collection:ps=.
 odin run tests/psx_jr -collection:ps=.
 odin run tests/psx_jr -collection:ps=. -define:PS_FLAT=true
+odin run tests/psx_rfe -collection:ps=.
+odin run tests/psx_rfe -collection:ps=. -define:PS_FLAT=true
 odin run tests/psx_flat_switch -collection:ps=.
 odin run tests/psx_flat_switch -collection:ps=. -define:PS_FLAT=true
 odin run tests/compat -collection:ps=.
@@ -181,8 +183,9 @@ off, see [CI](#ci)); a new test goes there and here.
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |
 | `psx_interp` | The PS1 interpreter's jumps into the BIOS |
-| `psx_jr` | The PS1 `jr`, interpreted and under FLAT: a plain jump, only one to the run's return address returns; a `jr $ra` to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps |
-| `psx_jump_miss` | The same as `ee_jump_miss`, for the PS1 |
+| `psx_jr` | The PS1 `jr`, interpreted and under FLAT: a plain jump, only one to the run's return address returns; a `jr $ra` to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps; a jump to a function of host code that returns to a link inside the run goes on there, an interrupt inside it or not, to one outside ends the run |
+| `psx_rfe` | A jump to a call that never returns on the console, interpreted and under FLAT: a handler's `jr` to B(17h) ReturnFromException with the link of its last call in $ra, at the vector or through a function that makes the call, ends the handler |
+| `psx_jump_miss` | The same as `ee_jump_miss`, for the PS1; and a native loop through a routine whose link is no label runs each pass and returns through its own epilogue |
 | `psx_flat_switch` | Guest-code PS1 thread switches (ChangeTh, syscall 3, epc restart, slot reuse, preempt, a preempt in a jr's delay slot), in the coroutine model and under FLAT; FLAT also drops an owed switch the PCB took back |
 | `disc` | Disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image |
 | `host_frames` | Each host, headless, exits at FRAMES |

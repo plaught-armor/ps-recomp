@@ -12,6 +12,12 @@
 //     address, not its link (a coroutine's yield, FF8's LZS decoder),
 //     returns for that run: the run's code after the call is passed over,
 //     as cpu.call_back does in native code.
+//   - A jump to a function of host code with $ra a pc the run came through
+//     (a link it made, or the one it began at: a loop through a routine)
+//     comes back there when the function returns to it, an interrupt's
+//     ReturnFromException in the meantime or not. With $ra a pc outside the
+//     run that return is the run's, as it is for a jump to a BIOS vector or
+//     for a function that never returns (tests/psx_rfe).
 // Each case is told apart by v0 and by the unwinds and jumps counted.
 // Runs on both builds: natively, and with -define:PS_FLAT=true.
 package main
@@ -20,7 +26,9 @@ import "core:fmt"
 import "core:os"
 import "ps:core"
 import _ "ps:psx" // the PS1 hooks: interp_run among them
+import bios "ps:psx/bios"
 import cpu "ps:psx/cpu"
+import io "ps:psx/io"
 
 @(private = "file")
 failed: int
@@ -76,6 +84,40 @@ YIELD :: 0x80002800
 @(private = "file")
 yield_ra: u32
 
+// Host code: v0 += 10, return.
+@(private = "file")
+LEAF :: 0x80002900
+
+// Host code: takes an interrupt whose chain handler calls
+// ReturnFromException, then v0 += 10, return.
+@(private = "file")
+LEAF_IRQ :: 0x80002c80
+@(private = "file")
+FIRST :: 0x80002d00 // first(): returns 1
+@(private = "file")
+SECOND :: 0x80002d80 // second(): ReturnFromException
+@(private = "file")
+ELEM :: 0x80006000 // the chain element {next, second, first, unused}
+
+@(private = "file")
+rfes: u32
+
+// addiu v0, zero, 0; $ra = LINK + 20; jr s6 (LEAF); nop. LINK + 20:
+// addiu v0, v0, 1; jr s5; nop.
+@(private = "file")
+LINK :: 0x80002a00
+
+// addiu v0, zero, 0. AGAIN: addiu v0, v0, 1; slti t0, v0, 3; beq t0, zero,
+// OUT; nop; $ra = AGAIN; j LEAF; nop. OUT: jr s5; nop.
+@(private = "file")
+LOOP :: 0x80002b00
+@(private = "file")
+AGAIN :: LOOP + 4
+
+// addiu v0, zero, 0; $ra = LINK + 20, outside this run; j LEAF; nop.
+@(private = "file")
+AWAY :: 0x80002c00
+
 @(private = "file")
 put :: proc(at: u32, code: []u32) {
 	for w, k in code {
@@ -114,7 +156,21 @@ run :: proc(entry, ra: u32) -> (v0: u32, unwinds, jumps: u32) {
 
 main :: proc() {
 	// No recompiled code but YIELD: every other function interpreted.
-	cpu.register_funcs({{YIELD, proc() {cpu.state.r[2], cpu.state.r[31] = 1, yield_ra}}})
+	cpu.register_funcs({
+		{YIELD, proc() {cpu.state.r[2], cpu.state.r[31] = 1, yield_ra}},
+		{LEAF, proc() {cpu.state.r[2] += 10}},
+		{LEAF_IRQ, proc() {
+				io.irq_regs.stat, io.irq_regs.mask = 1, 1
+				bios.deliver_irq()
+				cpu.state.r[2] += 10
+			}},
+		{FIRST, proc() {cpu.state.r[2] = 1}},
+		{SECOND, proc() {
+				rfes += 1
+				cpu.bios_b(0x17)
+			}},
+	})
+	bios.bios_init()
 	cpu.next_event = max(u64)
 	r := &cpu.state.r
 
@@ -173,8 +229,32 @@ main :: proc() {
 	check("v0 after a host callee returns to its link", v0, 101)
 	check("returns past the caller counted after one to its link", u32(cpu.call_backs - backs), 1)
 
+	r[21], r[22] = BACK, LEAF
+	put(LINK, {0x24020000, 0, 0, 0x02c00008, 0, 0x24420001, 0x02a00008, 0})
+	set_ra(LINK + 4, LINK + 20)
+	v0, _, _ = run(LINK, BACK)
+	check("v0 after host code jumped to with the link after the jr", v0, 11)
+
+	put(ELEM, {0, SECOND, FIRST, 0})
+	cpu.state.r[4], cpu.state.r[5] = 0, ELEM
+	bios.bios_c(0x02) // SysEnqIntRP
+	r[21], r[22] = BACK, LEAF_IRQ
+	v0, _, _ = run(LINK, BACK)
+	check("ReturnFromExceptions inside host code jumped to", rfes, 1)
+	check("v0 after host code jumped to took an interrupt", v0, 11)
+
+	put(LOOP, {0x24020000, 0x24420001, 0x28480003, 0x11000005, 0, 0, 0, 0x08000000 | (LEAF >> 2) & 0x3ffffff, 0, 0x02a00008, 0})
+	set_ra(LOOP + 20, AGAIN)
+	v0, _, _ = run(LOOP, BACK)
+	check("v0 after a loop through host code", v0, 12)
+
+	put(AWAY, {0x24020000, 0, 0, 0x08000000 | (LEAF >> 2) & 0x3ffffff, 0})
+	set_ra(AWAY + 4, LINK + 20)
+	v0, _, _ = run(AWAY, BACK)
+	check("v0 after host code jumped to with a link outside the run", v0, 10)
+
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_jr: jr is a plain jump, only one to frame_ret returns; a jr $ra to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps; a host callee's return past its caller returns for it")
+	fmt.println("ok psx_jr: jr is a plain jump, only one to frame_ret returns; a jr $ra to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps; a host callee's return past its caller returns for it; host code jumped to returns to the link the run came through")
 }

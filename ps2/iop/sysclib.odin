@@ -215,6 +215,7 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		r[28] = r32(a0 + 44)
 		r[2] = v
 		if !th_longjmp(ra, sp) {
+			r3000.no_returns += 1
 			r^ = saved
 			return 0, false
 		}

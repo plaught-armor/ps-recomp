@@ -45,7 +45,7 @@ FLAT_NEST :: 8
 Flat_Kind :: enum u8 {
 	Base, // the run's first call (flat_start): its return ends the run
 	Call, // jal, jalr, a linking regimm branch: the caller goes on at ret
-	Tail, // goto_target's tail call: its return ends the caller's run too
+	Tail, // goto_target's tail call: its return ends the caller's run too, but one to ret (goto_link; 0 once it made a call that never returns, flat_enter)
 	Jump, // jump's tail call at a run's first word, counted in tail_depth
 	Cont, // a continuation, x.host[slot]
 }
@@ -60,7 +60,7 @@ Flat_Lookup :: enum u8 {
 }
 
 Flat_Frame :: struct {
-	ret:   u32, // where the caller goes on (Call)
+	ret:   u32, // where the caller goes on (Call; Tail, 0 none)
 	start: u32, // the caller run's first word
 	outer: u32, // frame_ret before the call, put back as it returns
 	sp:    u32, // the caller's $sp at the call (a `jr $ra` unwinding to it, flat_unwind)
@@ -89,6 +89,8 @@ Flat_Ctx :: struct {
 	enter:   bool,
 	// goto_target(pc) is owed: the events check before it stopped the run.
 	goto_owed: bool,
+	// The word after the owed jump's delay slot (goto_link).
+	goto_next: u32,
 	ended:   bool,
 	hosts:   u32,
 	host:    [FLAT_HOST]Flat_Host,
@@ -374,9 +376,14 @@ when core.FLAT {
 		if lookup == .All && is_ram_addr(addr) && addr & 3 == 0 {
 			if fn := dispatch.fixed[fn_index(addr)]; fn != nil {
 				f.host = true
+				at, n := x.depth - 1, no_returns
 				flat_native_in(addr)
 				fn()
 				flat_native -= 1
+				// A tail call that made a call which never returns has no
+				// link to go on at (goto_target). fn may have grown the
+				// stack, or restarted the run: f is not used again.
+				if kind == .Tail && ret != 0 && no_returns != n && at < x.depth {x.frames[at].ret = 0}
 				return
 			}
 		}
@@ -502,7 +509,12 @@ when core.FLAT {
 					// as cpu.call_back sees in native code): that run
 					// returns too.
 					back := f.kind == .Call && state.r[31] != f.ret && state.r[31] == f.outer
+					// A tail call that returned to the run's own link
+					// returns as a call made there does (goto_target).
+					linked := f.kind == .Tail && f.ret != 0 && state.r[31] == f.ret
+					if linked {f.kind = .Call}
 					flat_pop(x, L)
+					if linked {events_due()}
 					if back && !x.ended && x.depth > 0 {
 						if top := x.frames[x.depth - 1]; !top.host && top.kind != .Cont {
 							call_backs += 1
@@ -522,7 +534,7 @@ when core.FLAT {
 			}
 			if x.goto_owed {
 				x.goto_owed = false
-				if flat_fn_target(x.pc) {flat_enter(x, x.pc, 0, .Tail)}
+				if flat_fn_target(x.pc) {flat_enter(x, x.pc, goto_link(x.pc, x.start, x.goto_next), .Tail)}
 				continue
 			}
 			return true
@@ -570,16 +582,16 @@ when core.FLAT {
 	flat_goto :: #force_inline proc(x: ^Flat_Ctx, pc, target: u32, check: bool) -> bool {
 		x.pc = target
 		if flat_stop {
-			x.goto_owed = true
+			x.goto_owed, x.goto_next = true, pc + 8
 			return false
 		}
 		if (check || target <= pc) && state.cycles >= next_event {
-			x.goto_owed = true
+			x.goto_owed, x.goto_next = true, pc + 8
 			run_events()
 			return false
 		}
 		if flat_fn_target(target) {
-			x.goto_owed = true
+			x.goto_owed, x.goto_next = true, pc + 8
 			return false
 		}
 		return true

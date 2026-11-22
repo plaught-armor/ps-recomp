@@ -4,6 +4,12 @@
 // T; F calls H, then jumps through a word in DATA to CASE_B, in F but no
 // label. Right: G's continuation and T run once each, and sp is back where
 // it was. The R3000 code waits out each load's delay slot.
+//
+// And a loop through a routine whose link is no label (Tarzan's MDEC
+// decoder, 8002fbc4): P calls R, and after the call branches back to R with
+// the call's link still in $ra. R's return misses P's labels and is
+// interpreted from the link, and the interpreted branch to R must come back
+// there as often as the loop asks, not end P ahead of its epilogue.
 package main
 
 import "core:fmt"
@@ -19,6 +25,11 @@ G :: u32(0x80020000)
 F :: u32(0x80020100)
 T :: u32(0x80020200)
 H :: u32(0x80020300)
+P :: u32(0x80020400)
+R :: u32(0x80020500)
+P_LINK :: P + 4 * 4 // no label
+P_OUT :: P + 14 * 4
+ROUNDS :: 4
 DATA :: u32(0x80010000)
 TGT :: DATA + 0x00
 CNT :: DATA + 0x10
@@ -63,6 +74,15 @@ t_words :: proc() -> [6]u32 {
 	return {lui(T7, DATA >> 16), lw(T1, CNT2 - DATA, T7), NOP, addiu(T1, T1, 1), JR_RA, sw(T1, CNT2 - DATA, T7)}
 }
 H_W :: [2]u32{JR_RA, NOP}
+p_words :: proc() -> [18]u32 {
+	return {
+		addiu(SP, SP, 0xfff0), sw(RA, 0, SP), jal(R), NOP,
+		lui(T7, DATA >> 16), lw(T1, CNT - DATA, T7), NOP, addiu(T1, T1, 1),
+		sw(T1, CNT - DATA, T7), addiu(T2, ZERO, ROUNDS), beq(P + 10 * 4, T1, T2, P_OUT), NOP,
+		beq(P + 12 * 4, ZERO, ZERO, R), NOP,
+		lw(RA, 0, SP), NOP, JR_RA, addiu(SP, SP, 16),
+	}
+}
 
 Prog :: struct {
 	at:    u32,
@@ -86,8 +106,9 @@ main :: proc() {
 	cpu.interp_run = cpu.interp_loop
 	cpu.next_event = max(u64)
 	gw, fw, tw, hw := g_words(), f_words(), t_words(), H_W
+	pw, rw := p_words(), t_words()
 	case_a := [?]u32{CASE_A}
-	progs := [?]Prog{{G, gw[:], nil}, {F, fw[:], case_a[:]}, {T, tw[:], nil}, {H, hw[:], nil}}
+	progs := [?]Prog{{G, gw[:], nil}, {F, fw[:], case_a[:]}, {T, tw[:], nil}, {H, hw[:], nil}, {P, pw[:], nil}, {R, rw[:], nil}}
 	na := native.make_asm(native.Arch(core.NATIVE_ARCH), r3000.native_ram(), r3000.NATIVE_CACHED[:])
 	funcs: [len(progs)]native.Blob_Func
 	for p, k in progs {
@@ -95,6 +116,7 @@ main :: proc() {
 		f := mips.func_make(p.at, p.at + 4 * u32(len(p.words)))
 		mips.discover(r3000.RULES, {base = p.at, data = ([^]u8)(raw_data(p.words))[:4 * len(p.words)]}, f, p.extra)
 		if p.at == F && (CASE_B in f.labels || CASE_A not_in f.labels) {fail("F's labels are not CASE_A without CASE_B")}
+		if p.at == P && P_LINK in f.labels {fail("P's link is a label")}
 		funcs[k] = {p.at, r3000.native_func(&na, f, nil, 1)}
 		free_all(context.temp_allocator)
 	}
@@ -110,5 +132,12 @@ main :: proc() {
 	want := [4]u32{1, 1, 2, STACK}
 	fmt.printfln("cnt cnt2 mark sp %x, want %x", got, want)
 	if got != want {fail("F's miss ran on past its return")}
+	for at in ([?]u32{CNT, CNT2}) {(^u32le)(&cpu.ram[at & 0x1fffff])^ = 0}
+	cpu.state.r[29], cpu.state.r[31] = STACK, RET
+	cpu.call(P)
+	loop := [3]u32{rd(CNT), rd(CNT2), cpu.state.r[29]}
+	loop_want := [3]u32{ROUNDS, ROUNDS, STACK}
+	fmt.printfln("loop cnt cnt2 sp %x, want %x", loop, loop_want)
+	if loop != loop_want {fail("the loop through R ended P early")}
 	fmt.println("ok")
 }

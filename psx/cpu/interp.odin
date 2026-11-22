@@ -261,16 +261,45 @@ interp_unwind_find :: proc(st: ^Interp, t: u32) -> bool {
 }
 
 // A jump to a function, or to a BIOS vector or table stub (no guest code
-// there to step), is a tail call: call it, and its return is this code's.
+// there to step), is a tail call: call it, and its return is this code's,
+// unless a function returns to a link of the run's own (goto_link) and made
+// no call that never returns (no_returns): the run goes on there.
 @(private)
 goto_target :: proc(st: ^Interp, target: u32) {
 	fixed := is_ram_addr(target) && dispatch.fixed[fn_index(target)] != nil
 	if fixed || host_call(target, false) {
+		back := goto_link(target, st.start, st.pc)
+		n := no_returns
 		call(target)
+		if back != 0 && state.r[31] == back && no_returns == n {
+			st.pc = back
+			events_due()
+			return
+		}
 		st.done = true
 		return
 	}
 	st.pc = target
+}
+
+// Where a run from start that jumps to target, host code, next the word after
+// the jump's delay slot, goes on when that code returns with $ra as it is now:
+// 0 when that return is the run's too. It always is for a target that is no
+// function (a BIOS vector or table stub, an IOP import): what is called there
+// may never return on the console, and $ra may be a stale link, as a handler's
+// is at its jump to ReturnFromException. As tail_call's pc in [start, end) in
+// native code, with what an interpreted run knows of its extent: a $ra that
+// is not the run's return address and is a pc from start up to next is a
+// link the run made, or the one it began at (a loop through a routine whose
+// link is no label, which jump_unknown interprets from), and no frame under
+// the run goes on there. One outside may be an outer frame's, which goes on
+// there itself.
+@(private)
+goto_link :: proc(target, start, next: u32) -> u32 {
+	if !has_func(target) {return 0}
+	ra := state.r[31]
+	if ra == frame_ret || ra & 3 != 0 || ra < start || ra > next {return 0}
+	return ra
 }
 
 @(private)

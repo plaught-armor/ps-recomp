@@ -321,7 +321,9 @@ bios_b :: proc(fn: u32) {
 		ret(v)
 	case 0x17:
 		// ReturnFromException. The handler still returns normally here;
-		// deliver_irq then skips the rest of the chains and the hook.
+		// deliver_irq then skips the rest of the chains and the hook. Code
+		// that jumped to what made the call must not go on (cpu.no_returns).
+		cpu.no_returns += 1
 		if io.irq_regs.in_handler {
 			bios.rfe = true
 		}
@@ -526,6 +528,26 @@ returns_0_on_retail :: proc(table: string, fn: u32) -> bool {
 	return false
 }
 
+// Whether an unhandled table(fn) never returns on retail: one that hangs or
+// faults there, a longjmp (A 14h, which A B2h calls, as C 19h calls A B2h), exit
+// (B 38h, which ends in the hang A 3Ah) or the reboot (A A0h).
+@(private)
+never_returns :: proc(table: string, fn: u32) -> bool {
+	if hangs_on_retail(table, fn) {return true}
+	switch table {
+	case "A":
+		switch fn {
+		case 0x0b, 0x32, 0x14, 0xa0, 0xb2:
+			return true
+		}
+	case "B":
+		return fn == 0x38
+	case "C":
+		return fn == 0x19
+	}
+	return false
+}
+
 // A call the HLE BIOS does not handle stops the game, except under COMPAT,
 // where it returns 0. One the retail kernel sends to a return-0 stub returns
 // 0 silently, as retail does, and is not counted. One that hangs on the
@@ -543,6 +565,7 @@ bios_unknown :: proc(table: string, fn: u32) {
 	}
 	// ra is the game's call: the library stub that jumps here leaves it.
 	if core.compat_unknown(kind, fn, ra = cpu.state.r[31]) {
+		if never_returns(table, fn) {cpu.no_returns += 1}
 		ret(0)
 		return
 	}
@@ -936,6 +959,7 @@ deliver_irq :: proc() {
 	}
 	saved_cpu := cpu.state
 	saved_sr := cpu.cop0.sr
+	saved_no_returns := cpu.no_returns
 	// Exception entry: push the interrupt-enable stack, disabling interrupts.
 	cpu.cop0.sr = (cpu.cop0.sr & ~u32(0x3f)) | ((cpu.cop0.sr << 2) & 0x3c)
 	io.irq_regs.in_handler = true
@@ -958,6 +982,8 @@ deliver_irq :: proc() {
 	cpu.state = saved_cpu
 	cpu.state.cycles = cycles
 	cpu.cop0.sr = saved_sr
+	// The handler's ReturnFromException does not end the interrupted code.
+	cpu.no_returns = saved_no_returns
 	preempt()
 }
 
