@@ -1089,7 +1089,7 @@ undo_save :: proc(u: ^Load_Undo) {
 		append(&u.sif_tab, r32(iop_sifcmd.user_tab + 4 * i))
 	}
 	clear(&u.open)
-	for f in fileio.files {append(&u.open, f.f != nil)}
+	for f in fileio.files {append(&u.open, file_in_use(f))}
 }
 
 @(private = "file")
@@ -1127,7 +1127,7 @@ undo_restore :: proc() {
 	vbl_undo(u.vbl, freed[:])
 	rpc_undo(u.rpc, freed[:])
 	for &f, i in fileio.files {
-		if f.f != nil && (i >= len(u.open) || !u.open[i]) {f = {}}
+		if file_in_use(f) && (i >= len(u.open) || !u.open[i]) {f = {}}
 	}
 	clear(&sys_blocks)
 	append(&sys_blocks, ..u.blocks[:])

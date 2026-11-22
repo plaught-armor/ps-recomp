@@ -5629,6 +5629,32 @@ test_fileio_getstat :: proc() {
 		res, _, _ = stat(fio, name)
 		check(res == -19, fmt.tprintf("getstat: %q is another device, -ENODEV", name))
 	}
+
+	// rom0:ROMVER through OPEN, READ, SEEK and CLOSE: the ROM's version,
+	// 4 digits, region, type, an 8-digit date, a line feed and a NUL.
+	call :: proc(fio: iop.Rpc_Server, fno: u32, words: ..u32, name := "") -> i32 {
+		buf: [0x420]u8
+		w := ([^]u32)(raw_data(buf[:]))
+		w[0], w[1], w[2] = 0xe, 0x00100900, 4
+		for x, i in words {w[3 + i] = x}
+		copy(buf[0x14:], name)
+		check(fio(fno, buf[:], 0x420) && w[0] == 1, fmt.tprintf("rom0: fno %d answers", fno))
+		return i32(endian.unchecked_get_u32le(mem.ram_slice(REPLY, 0x20)[0x10:]))
+	}
+	EE_BUF :: 0x00101000
+	fd := call(fio, 0, 1, 0, name = "rom0:ROMVER")
+	check(fd >= 0, "rom0: ROMVER opens read-only")
+	check(call(fio, 2, u32(fd), EE_BUF, 0x100) == 16, "rom0: a read gets its 16 bytes")
+	v: [16]u8 // a copy: the reads below write the same buffer
+	copy(v[:], mem.ram_slice(EE_BUF, 16))
+	digits := true
+	for i in ([]int{0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13}) {digits &&= '0' <= v[i] && v[i] <= '9'}
+	check(digits && v[4] == 'A' && v[5] == 'C' && v[14] == '\n' && v[15] == 0, "rom0: ROMVER's version, region, type, date, line feed and NUL")
+	check(call(fio, 4, u32(fd), 6, 0) == 6 && call(fio, 2, u32(fd), EE_BUF, 8) == 8 && string(mem.ram_slice(EE_BUF, 8)) == string(v[6:14]), "rom0: a seek and read of the date")
+	check(call(fio, 2, u32(fd), EE_BUF, 8) == 2 && call(fio, 4, u32(fd), 0, 2) == 16, "rom0: a read stops at the end, which is 16")
+	check(call(fio, 1, u32(fd)) == 0 && call(fio, 2, u32(fd), EE_BUF, 1) == -9, "rom0: close; the fd is bad after")
+	check(call(fio, 0, 2, 0, name = "rom0:ROMVER") == -2, "rom0: a write open fails")
+	check(call(fio, 0, 1, 0, name = "rom0:OSDSYS") == -2, "rom0: another rom0 file is not found")
 }
 
 test_cdvd_search_server :: proc() {
@@ -5954,6 +5980,8 @@ test_cdvdman :: proc() {
 	bigf := str_words(&a, "cdrom0:\\BIG.BIN;1")
 	host := str_words(&a, "host:x")
 	stm := str_words(&a, "cdrom_stm0:\\X;1")
+	romv := str_words(&a, "rom0:ROMVER")
+	romx := str_words(&a, "rom0:OSDSYS")
 	file := at(&a)
 	for _ in 0 ..< iop.CD_FILE / 4 {put(&a, 0)}
 	mode := at(&a)
@@ -6115,6 +6143,12 @@ test_cdvdman :: proc() {
 	// row, named by the device's first four bytes.
 	stm_dev := [4]u8{'c', 'd', 'r', 'o'}
 	check(io_call(io, 4, b + stm, 1) == neg(19) && core.compat.calls[core.Compat_Key{.Iop_Io, transmute(u32)stm_dev, 0}].n == 1, "ioman: the stream device is not here, a compat row")
+	// rom0:ROMVER is the ROM's version, 16 bytes to a NUL; no other rom0 file.
+	fd = io_call(io, 4, b + romv, 1)
+	check(i32(fd) >= 0 && io_call(io, 6, fd, b + buf, 32) == 16, "ioman: rom0:ROMVER opens and reads 16 bytes")
+	check(data[4] == 'A' && data[5] == 'C' && data[14] == '\n' && data[15] == 0, "ioman: ROMVER's region, type, line feed and NUL")
+	check(io_call(io, 5, fd) == 0, "ioman: ROMVER closes")
+	check(io_call(io, 4, b + romx, 1) == neg(2), "ioman: another rom0 file is not found")
 }
 
 mem_eq :: proc(x, y, n: u32) -> bool {

@@ -758,7 +758,7 @@ fileio_reset :: proc() {
 
 @(private)
 fileio_file :: proc(fd: u32) -> ^Iop_File {
-	if int(fd) >= len(fileio.files) || fileio.files[fd].f == nil {return nil}
+	if int(fd) >= len(fileio.files) || !file_in_use(fileio.files[fd]) {return nil}
 	return &fileio.files[fd]
 }
 
@@ -888,7 +888,15 @@ disc_lookup :: proc(name: string, layer: u8) -> (e: disc.Entry, ok: bool) {
 
 @(private)
 fileio_open :: proc(name: string, flags: u32) -> i32 {
-	file, path, ok := disc_find(name)
+	file: Disc_File
+	path: string
+	ok: bool
+	if strings.has_prefix(name, "rom0:") {
+		file, ok = rom_file(name[len("rom0:"):])
+		path = "the IOP's ROM"
+	} else {
+		file, path, ok = disc_find(name)
+	}
 	if !ok || flags & 3 != 1 { // O_RDONLY is 1 in the IOP's ioman
 		fmt.eprintfln("fileio: open \"%s\" flags %x failed", name, flags)
 		return -ENOENT
@@ -896,7 +904,7 @@ fileio_open :: proc(name: string, flags: u32) -> i32 {
 	if cpu.debug >= 1 {fmt.eprintfln("fileio: open \"%s\" -> %s lba %d (%d bytes)", name, path, file.lba, file.size)}
 	gd_note(file, file.lba, name)
 	for &e, i in fileio.files {
-		if e.f == nil {
+		if !file_in_use(e) {
 			e = {file, 0}
 			return i32(i)
 		}
@@ -906,12 +914,37 @@ fileio_open :: proc(name: string, flags: u32) -> i32 {
 }
 
 // A file of the disc: the host file holding it, its first LBA on the disc
-// image (0 under disc_dir) and its size.
+// image (0 under disc_dir) and its size. A file of the IOP's ROM (rom_file)
+// has no host file and no LBA: its bytes are `rom`.
 @(private)
 Disc_File :: struct {
 	f:    ^os.File,
 	lba:  u32,
 	size: i64,
+	rom:  []u8,
+}
+
+// Whether an fd slot holds a file, of the disc or the ROM.
+@(private)
+file_in_use :: proc(file: Disc_File) -> bool {
+	return file.f != nil || file.rom != nil
+}
+
+// The ROM's version, which rom0:ROMVER holds: 4 digits of version, the
+// region (A: America), the console type (C: retail) and the date, YYYYMMDD,
+// then a line feed and a NUL, 16 bytes. A game reads it to learn the region
+// and how new the ROM is: Ghost Recon: Jungle Storm reads it a byte at a
+// time to the NUL and takes the 8 digits before the line feed as the date,
+// before it saves a profile. Our own value, of a 2.30 ROM.
+@(private)
+rom_romver := "0230AC20080101\n\x00"
+
+// A file of the IOP's ROM by its name after `rom0:`: only ROMVER is served.
+// The game reads it as any other file, through the same fds.
+@(private)
+rom_file :: proc(name: string) -> (file: Disc_File, ok: bool) {
+	if name != "ROMVER" {return {}, false}
+	return {rom = transmute([]u8)rom_romver, size = i64(len(rom_romver))}, true
 }
 
 // The disc image disc_image_open opened (host state, like disc_files), and
@@ -964,12 +997,12 @@ disc_find :: proc(name: string, layer: u8 = 0) -> (file: Disc_File, path: string
 		f, err := disc_open(path)
 		if err != nil {return {}, "", false}
 		size, _ := os.file_size(f)
-		return {f, 0, size}, path, true
+		return {f = f, size = size}, path, true
 	}
 	e := disc_lookup(name, layer) or_return
 	t := disc.track_of(&image, e.lba)
 	if e.dir || t == nil {return {}, "", false}
-	return {t.file, e.lba, i64(e.size)}, "", true
+	return {f = t.file, lba = e.lba, size = i64(e.size)}, "", true
 }
 
 // Read len(buf) bytes from byte pos of a disc file; the count read. The
@@ -977,6 +1010,7 @@ disc_find :: proc(name: string, layer: u8 = 0) -> (file: Disc_File, path: string
 // for the host's own use).
 @(private)
 disc_file_read :: proc(file: Disc_File, pos: i64, buf: []u8, spin := true) -> int {
+	if file.rom != nil {return copy(buf, file.rom[min(pos, i64(len(file.rom))):])}
 	if spin {cd_spin()}
 	if image.volume != 0 {
 		return disc.read_at(&image, file.lba, pos, buf)

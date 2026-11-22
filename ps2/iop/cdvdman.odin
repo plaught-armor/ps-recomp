@@ -344,7 +344,7 @@ ioman_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 4: // open(name, flags)
 		name := cstr(a0)
 		dev := name[:max(strings.index_byte(name, ':'), 0)]
-		if dev != "cdrom" && dev != "cdrom0" {
+		if dev != "cdrom" && dev != "cdrom0" && dev != "rom0" {
 			id: [4]u8
 			copy(id[:], name)
 			core.compat_unknown(.Iop_Io, transmute(u32)id, pc = r[31])

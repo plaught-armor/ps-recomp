@@ -29,10 +29,10 @@ Gd_Extent :: struct {
 gd_extents: [dynamic]Gd_Extent
 
 // Note the name a disc file was opened or found by, and, at lsn (0: not
-// known), the sectors of its size.
+// known), the sectors of its size. A file of the ROM is not the disc's.
 @(private)
 gd_note :: proc(file: Disc_File, lsn: u32, name: string) {
-	if !core.gamedata.on {return}
+	if !core.gamedata.on || file.rom != nil {return}
 	context.allocator = core.long_allocator()
 	key := Gd_File_Key{file.f, file.lba}
 	if key not_in gd_files {gd_files[key] = strings.clone(core.gamedata_disc_path(name))}
@@ -44,10 +44,11 @@ gd_note :: proc(file: Disc_File, lsn: u32, name: string) {
 	append(&gd_extents, Gd_Extent{lsn, sectors, file.size, gd_files[key]})
 }
 
-// cpu's read of data from byte pos of file into its RAM at dest.
+// cpu's read of data from byte pos of file into its RAM at dest; none of
+// a file of the ROM.
 @(private)
 gd_file_load :: proc(cpu: core.Gamedata_Cpu, file: Disc_File, pos: i64, dest: u32, data: []u8) {
-	if !core.gamedata.on {return}
+	if !core.gamedata.on || file.rom != nil {return}
 	name := gd_files[{file.f, file.lba}] or_else fmt.tprintf("lsn:%08x", file.lba)
 	core.gamedata_load(cpu, name, u64(pos), dest, data)
 }
