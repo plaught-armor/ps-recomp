@@ -187,7 +187,7 @@ game :: proc(_: rawptr) {
 		0x00000000, // nop
 	}
 	for w, i in code {(^u32)(&iop.iop_ram[CODE + 4 * i])^ = w}
-	r3000.interp_run(CODE)
+	guest_run(CODE, true)
 
 	check((^u32)(&iop.iop_ram[0x10])^ == 0xdeadbeef, "store through the mirror lands in RAM")
 	check(hle^ == 0x5a5a5a5a, "the HLE's area untouched by IOP code")
@@ -208,7 +208,7 @@ game :: proc(_: rawptr) {
 	core.snap_yield()
 	// Here after the save, and again after the load.
 	if !loaded {
-		r3000.interp_run(GROW)
+		guest_run(GROW, true)
 		check(len(iop.iop_io_seen) == GROWN, "each SPU2 address logged once")
 		(^u32)(&iop.iop_ram[0x10])^ = 0
 		loaded = true
@@ -217,7 +217,7 @@ game :: proc(_: rawptr) {
 	}
 	check((^u32)(&iop.iop_ram[0x10])^ == 0xdeadbeef, "IOP RAM restored by the snapshot")
 	check(len(iop.iop_io_seen) == 0, "logged addresses restored by the snapshot")
-	r3000.interp_run(GROW)
+	guest_run(GROW, true)
 	check(len(iop.iop_io_seen) == GROWN, "the restored map grows again")
 	for k in u32(0) ..< GROWN {check(0x1f900000 + 4 * k in iop.iop_io_seen, "SPU2 address in the map")}
 
@@ -308,8 +308,12 @@ main :: proc() {
 	mem.mem_init()
 	iop.sif_init()
 	context.allocator = core.emu_allocator()
-	core.co_allocator = context.allocator
-	core.snap_run(core.co_create(game, nil))
+	when core.FLAT {
+		game(nil)
+	} else {
+		core.co_allocator = context.allocator
+		core.snap_run(core.co_create(game, nil))
+	}
 }
 
 // The scratchpad past the PS1 bus's 1KB is memory, and the base register
@@ -726,8 +730,23 @@ mod_b :: proc(call: bool) -> (f: []u8, stub: u32) {
 // Calls `addr` from the host as a module would.
 iop_call :: proc(addr: u32) -> u32 {
 	r3000.state.r[31] = 0
-	r3000.call(addr)
+	guest_run(addr, false)
 	return r3000.state.r[2]
+}
+
+// Runs the guest code at addr from the host to its return: interp_run, or
+// cpu.call with interp false. FLAT interprets only on a run, so there it
+// gets one of its own.
+guest_run :: proc(addr: u32, interp: bool) {
+	when core.FLAT {
+		x: r3000.Flat_Ctx
+		r3000.flat_start(&x, addr)
+		ended := r3000.flat_run(&x)
+		r3000.flat_free(&x)
+		check(ended, "a host call's guest code runs to its return")
+	} else {
+		if interp {r3000.interp_run(addr)} else {r3000.call(addr)}
+	}
 }
 
 module_base :: proc(id: i32) -> u32 {
@@ -1200,11 +1219,22 @@ call_addr :: proc(a: ^Asm, stub, off, out: u32) {
 	store_v0(a, out)
 }
 
+// The live coroutines, or under FLAT the live flat runs that stand in
+// for them (iop.th_flat_runs).
 coroutines :: proc() -> (n: int) {
-	for co in core.co_stack_owner {
-		if co != nil {n += 1}
+	when core.FLAT {
+		return iop.th_flat_runs()
+	} else {
+		for co in core.co_stack_owner {
+			if co != nil {n += 1}
+		}
+		return
 	}
-	return
+}
+
+// Thread t has a coroutine, or under FLAT a flat run.
+has_run :: proc(t: iop.Iop_Thread) -> bool {
+	when core.FLAT {return t.flat.run != nil} else {return t.co != nil}
 }
 
 test_threads :: proc() {
@@ -1251,7 +1281,7 @@ test_threads :: proc() {
 	check(id > 0 && r == 0, "threads: modt loads")
 	check(log_equal(base, logp, {1, 2, 3, 4, 5}), "threads: start, then by priority, a signal yields to the thread it wakes")
 	check(len(s.threads) == 2 && len(s.semas) == 1, "threads: the start thread is gone, H, L and sem stay")
-	for t in s.threads {check(t.status == .Dormant && t.co == nil, "threads: an ended thread is dormant, its coroutine dropped")}
+	for t in s.threads {check(t.status == .Dormant && !has_run(t), "threads: an ended thread is dormant, its coroutine dropped")}
 	check(coroutines() == cos, "threads: no coroutine left")
 	check(r3000.next_event == iop.IOP_EVENT_OFF && s.cur == 0, "threads: the budget is off after a load")
 
@@ -1371,7 +1401,7 @@ test_thread_budget :: proc() {
 	key := core.Compat_Key{.Iop_Threads, core.compat_name("modd"), 0}
 	check(id > 0 && r == 0 && core.compat.calls[key].n == 1, "budget: threads spinning after the start: the load succeeds with a compat row")
 	t := iop.th_find(iop.iop_u32(module_base(id) + th)^)
-	check(t != nil && t.status == .Ready && t.co != nil, "budget: the spinning thread stays ready with its coroutine")
+	check(t != nil && t.status == .Ready && has_run(t^), "budget: the spinning thread stays ready with its coroutine")
 	check(t != nil && t.ctx.r[29] > t.stack && t.ctx.r[29] < t.stack + t.stacksize, "budget: its context saved")
 	// `j el` at its run's first word is a tail call each time round, so the
 	// thread spins TAIL_DEPTH_MAX deep: its own count, not the loader's.

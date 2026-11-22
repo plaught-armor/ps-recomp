@@ -292,6 +292,18 @@ th_snap :: proc() {
 	when core.FLAT {core.snap_add(&th_intr_run)}
 }
 
+// Test-facing (tests/ps2_iop's coroutines), as th_intr_run is file
+// private: under FLAT the live flat runs, each thread's and the
+// handlers', which stand for what core.co_stack_owner counts otherwise.
+// 0 when !FLAT.
+th_flat_runs :: proc() -> (n: int) {
+	when core.FLAT {
+		for t in iop_sched.threads {if t.flat.run != nil {n += 1}}
+		if th_intr_run != nil {n += 1}
+	}
+	return
+}
+
 // FLAT: an IOP run is live. Never at an EE frame boundary, where the IOP
 // has returned to the EE: a snapshot there would miss the run's host frames.
 th_flat_busy :: proc() -> bool {
