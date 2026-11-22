@@ -20,7 +20,9 @@
 // runs one with flat_run until it ends or something stops it (flat_block:
 // a thread switch, a wait), then picks the next. A guest call the host makes
 // itself (call, from host code) runs nested: to its end, and a stop inside
-// it is fatal.
+// it is fatal, but for one switch: the owner may hold a run that is in native
+// code, host frames and all, and run others until it is that one's turn
+// again (flat_hold).
 package psx_cpu
 
 @(require) import "core:fmt" // used only under FLAT
@@ -151,6 +153,14 @@ when core.FLAT {
 	// Native code's own calls to native code do not pass here.
 	@(private = "file")
 	flat_native_at: [FLAT_NAMED]u32
+	// A run is held (flat_hold), and the nested runs open below it: those
+	// above are the runs' that run meanwhile.
+	@(private = "file")
+	flat_held: bool
+	@(private = "file")
+	flat_nest_base: int
+	// Runs held.
+	flat_holds: u64
 	// Called with the entries flat_block's fatal names (those not 0,
 	// outermost first) just before it, nil none: play keeps them for the
 	// runs after to leave to the interpreter (core.known_switches). Each
@@ -264,7 +274,7 @@ when core.FLAT {
 			if flat_native_fatal != nil {flat_native_fatal(named)}
 			fatal("%s inside native code (FLAT), entered at %s, ra %08x", what, strings.to_string(b), state.r[31])
 		}
-		if flat_nest_depth > 0 {fatal("%s inside a guest call made by host code (FLAT runs those nested)", what)}
+		if flat_nest_depth > flat_nest_base {fatal("%s inside a guest call made by host code (FLAT runs those nested)", what)}
 		flat_stop = true
 	}
 
@@ -281,7 +291,46 @@ when core.FLAT {
 	// Whether flat_block may stop the running run now: on its own guest code,
 	// not inside a nested run or native code.
 	flat_can_stop :: proc() -> bool {
-		return flat_cur != nil && flat_nest_depth == 0 && flat_native == 0
+		return flat_cur != nil && flat_nest_depth == flat_nest_base && flat_native == 0
+	}
+
+	// What flat_hold puts aside: the state of the running run that is not in
+	// its Flat_Ctx or its host frames.
+	Flat_Hold :: struct {
+		cur:        ^Flat_Ctx,
+		native:     int,
+		native_at:  [FLAT_NAMED]u32,
+		no_returns: type_of(no_returns),
+		stop:       bool,
+		learning:   bool,
+		host_call:  bool,
+	}
+
+	// Hold the running run where it is, in native code, so that its owner can
+	// run others (flat_run) from inside it, as a coroutine's switch would,
+	// then go on with it (flat_resume). False, nothing changed, outside native
+	// code or with a run held already: one level, which bounds the host stack.
+	flat_hold :: proc(h: ^Flat_Hold) -> bool {
+		if flat_cur == nil || flat_native == 0 || flat_held {return false}
+		h^ = {flat_cur, flat_native, flat_native_at, no_returns, flat_stop, flat_learning, flat_host_call}
+		flat_cur, flat_native = nil, 0
+		flat_stop, flat_host_call = false, false
+		// A switch owed before is this one, or stale.
+		flat_stop_owed, flat_late_owed = false, false
+		flat_held, flat_nest_base = true, flat_nest_depth
+		flat_holds += 1
+		return true
+	}
+
+	// Go on with the run h holds, the runs since stopped or ended.
+	flat_resume :: proc(h: ^Flat_Hold) {
+		if !flat_held || flat_cur != nil || flat_native != 0 || flat_nest_depth != flat_nest_base {
+			fatal("a held flat run resumed inside another")
+		}
+		flat_cur, flat_native, flat_native_at = h.cur, h.native, h.native_at
+		no_returns, flat_stop = h.no_returns, h.stop
+		flat_learning, flat_host_call = h.learning, h.host_call
+		flat_held, flat_nest_base = false, 0
 	}
 
 	// What an exception return that names another thread calls: the run
@@ -350,7 +399,7 @@ when core.FLAT {
 	flat_print :: proc() {
 		when core.FLAT {
 			who := learn_cpu == .Iop ? "iop" : "psx"
-			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run, %d owed thread switches dropped", who, flat_returns, flat_mismatch, flat_max_depth, flat_late, flat_switches_dropped)
+			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run, %d owed thread switches dropped, %d runs held in native code", who, flat_returns, flat_mismatch, flat_max_depth, flat_late, flat_switches_dropped, flat_holds)
 			interp_print()
 		}
 	}

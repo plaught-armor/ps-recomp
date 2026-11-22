@@ -1427,19 +1427,29 @@ change_thread :: proc(h: u32) {
 // Exception return: retail loads the registers of the TCB the PCB names,
 // so a handler that points the PCB at another TCB switches threads when it
 // returns (MGS1's task scheduler does so from its VSync callback). Under
-// FLAT the running run stops first (cpu.flat_stop_soon) and flat_main
-// switches once it has (preempt_owed): the registers saved are those the
-// thread stopped with, whatever instructions or host code (a WaitEvent)
-// finish before the stop. Where the run cannot stop yet, in native code or
-// a nested run, it stops once that has returned and interrupts are on: the
-// guest already counts the thread named as running, and waiting for a later
-// exception return, which may land in native code again, lost MGS1 frames
-// from boot on, and an overlay load. mod_depth is held by run_events
-// already; the check here only keeps that true.
+// FLAT a run in native code is held there, host frames and all, and the
+// others run until it is that thread's turn again (flat_switch_held): MGS1
+// runs native code for frames on end, and a switch waiting for its return
+// left the captions up to 15 s late. Elsewhere, and with a thread held
+// already, the running run stops first (cpu.flat_stop_soon) and flat_main or
+// flat_switch_held switches once it has (preempt_owed): the registers saved
+// are those the thread stopped with, whatever instructions or host code (a
+// WaitEvent) finish before the stop. Where the run cannot stop yet, in
+// native code or a nested run, it stops once that has returned and
+// interrupts are on: the guest already counts the thread named as running,
+// and waiting for a later exception return, which may land in native code
+// again, lost MGS1 frames from boot on, and an overlay load. mod_depth is
+// held by run_events already; the check here only keeps that true.
 @(private)
 preempt :: proc() {
 	when core.FLAT {
-		if _, ok := preempt_target(); ok && cpu.flat_stop_soon() {
+		j, ok := preempt_target()
+		if !ok {return}
+		h: cpu.Flat_Hold
+		// A thread with no TCB to save into (switch_to) is not one to go back to.
+		if slot_owned() && cur_thread < thread_count() && cpu.flat_hold(&h) {
+			flat_switch_held(&h, j)
+		} else if cpu.flat_stop_soon() {
 			flat.preempt_owed = true
 		}
 	} else {

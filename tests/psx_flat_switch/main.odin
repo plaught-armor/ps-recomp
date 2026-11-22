@@ -383,11 +383,10 @@ script :: proc() {
 		})
 	}
 	// An exception return in native code (a step is native) that names the
-	// other thread: that thread is the next to run guest code. The switch
-	// does not wait for a later exception return, which under FLAT left
-	// MGS1's scheduler counting on a task that was not running.
+	// other thread: that thread runs before the native code goes on. Waiting
+	// for the native code's return left MGS1's captions up to 15 s late.
 	add(proc() {
-		check("switched when the native code returned (the thread's s0)", r()[16], 0x3333)
+		check("switched inside the native code (the thread's s0)", r()[16], 0x3333)
 		s.trig = .Irq
 		point_pcb(tcb(0))
 		op(.Store)
@@ -395,12 +394,16 @@ script :: proc() {
 	add(proc() {
 		check("main thread s0 after the native code's switch", r()[16], 0xabcd)
 		when core.FLAT {
-			// Native code that entered a critical section after that exception
-			// return: the switch waits for interrupts to be on again.
+			// One thread is held in native code at a time. A switch from native
+			// code of the thread it went to waits for that code's return, and
+			// in a critical section entered since, for interrupts to be on.
 			r()[16] = 0x5151
+			n := s.n
 			point_pcb(tcb(1))
 			irq_now()
-			cpu.cop0.sr &= ~u32(0x401)
+			check("thread's steps while the main thread was held", u32(s.n - n), 2)
+			check("held main thread's s0", r()[16], 0x5151)
+			on(0)
 			op_ram_store()
 		} else {
 			finish()
@@ -408,17 +411,20 @@ script :: proc() {
 	})
 	when core.FLAT {
 		add(proc() {
-			check("no switch in a critical section", r()[16], 0x5151)
+			check("switched with the main thread held (the thread's s0)", r()[16], 0x3333)
+			point_pcb(tcb(0))
+			irq_now()
+			check("no second switch inside native code", r()[16], 0x3333)
+			cpu.cop0.sr &= ~u32(0x401)
+			op_ram_store()
+		})
+		add(proc() {
+			check("no switch in a critical section", r()[16], 0x3333)
 			cpu.cop0.sr |= 0x401
 			op_ram_store()
 		})
 		add(proc() {
-			check("switched once interrupts are on (the thread's s0)", r()[16], 0x3333)
-			point_pcb(tcb(0))
-			op(.Store)
-		})
-		add(proc() {
-			check("main thread s0 after the critical section's switch", r()[16], 0x5151)
+			check("main thread s0 after its hold", r()[16], 0x5151)
 			finish()
 		})
 	}
@@ -443,8 +449,12 @@ op_ram_store :: proc() {
 @(private = "file")
 irq_in_native :: proc() {
 	r()[16] = 0xabcd
+	n := s.n
 	point_pcb(tcb(1))
 	irq_now()
+	check("steps of the other thread before the native code went on", u32(s.n - n), 1)
+	check("native code's s0 after the switch back", r()[16], 0xabcd)
+	on(0)
 	op_ram_store()
 }
 
