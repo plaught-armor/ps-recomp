@@ -1073,8 +1073,8 @@ test_midload_status :: proc() {
 	cases := [?]Case {
 		// FSSET (lower 0x15) writes status, reading none.
 		{"midload_known", 0x2a000000, "play: mid-run VU load: 1 microprograms (1 already loaded)", "play: mid-run VU loads: 1 (1 microprograms), 0 skipped for status, 0 failed"},
-		// FSAND (lower 0x16) reads it.
-		{"midload_status", 0x2c000000, "", "play: mid-run VU loads: 0 (0 microprograms), 1 skipped for status, 0 failed"},
+		// FSAND (lower 0x16) with every immediate bit set reads all of it.
+		{"midload_status", 0x2c2007ff, "", "play: mid-run VU loads: 0 (0 microprograms), 1 skipped for status, 0 failed"},
 	}
 	for c in cases {
 		path := write(c.name, ps2_vif_disc(c.lower0))
