@@ -1532,6 +1532,11 @@ test_sysclib :: proc() {
 	check(call(19, C, A, 0xfffffff9, B) == 5 && str(C) == "-7-ok" && ram[C + 5] == 0, "sysclib: sprintf returns the count without the NUL")
 	ram[C] = 0xee
 	check(call(19, C, 0) == 0 && ram[C] == 0xee, "sysclib: sprintf of a null format writes none")
+	// vsprintf: the arguments from the va_list, not the registers after it.
+	put_str(A, "%d-%s-%x")
+	for v, i in ([]u32{0xfffffff9, B, 0xab}) {iop.iop_u32(0x1f200 + 4 * u32(i))^ = v}
+	for i in u32(0) ..< 12 {ram[C + i] = 0xee}
+	check(call(42, C, A, 0x1f200, 0x55) == 8 && str(C) == "-7-ok-ab" && ram[C + 8] == 0, "sysclib: vsprintf reads its arguments from the va_list")
 	put_str(A, "abcd")
 	check(call(19, TOP - 2, A) == 4 && ram[TOP - 2] == 'a' && ram[TOP - 1] == 'b', "sysclib: sprintf stops at RAM's end")
 	r[5], r[6], r[7], r[29] = 0x12345678, 0xfffffff4, 0, 0x1f000

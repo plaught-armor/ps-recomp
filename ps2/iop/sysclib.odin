@@ -57,13 +57,17 @@ stdio_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 // Output past IOP_RAM_SIZE characters, more than any buffer in IOP RAM
 // holds, is counted and not kept: `n` is the count the kernel returns, its
 // 32 bits wrapping as its counter does. `out` holds until the next call.
-iop_format :: proc(format: string, first := 1) -> (out: string, n: u32) {
+// With a `list` (vsprintf's va_list), the arguments are the words from that
+// address on instead.
+iop_format :: proc(format: string, first := 1, list: Maybe(u32) = nil) -> (out: string, n: u32) {
 	o := Fmt_Out{b = strings.builder_from_bytes(fmt_buf[:])}
 	arg := first
-	next :: proc(arg: ^int) -> u32 {
+	if list != nil {arg = 0}
+	next :: proc(arg: ^int, list: Maybe(u32)) -> u32 {
 		r := &r3000.state.r
 		i := arg^
 		arg^ += 1
+		if l, ok := list.?; ok {return r32(l + 4 * u32(i))}
 		return r[4 + i] if i < 4 else r32(r[29] + 4 * u32(i))
 	}
 	for i := 0; i < len(format); i += 1 {
@@ -84,7 +88,7 @@ iop_format :: proc(format: string, first := 1) -> (out: string, n: u32) {
 			case '#': alt = true
 			case 'h', 'l', 'L':
 			case '*':
-				width = i32(next(&arg))
+				width = i32(next(&arg, list))
 				if width < 0 {width, left = -width, true}
 			case '1' ..= '9':
 				width = 0
@@ -93,7 +97,7 @@ iop_format :: proc(format: string, first := 1) -> (out: string, n: u32) {
 			case '.':
 				i += 1
 				if i < len(format) && format[i] == '*' {
-					prec = max(i32(next(&arg)), -1)
+					prec = max(i32(next(&arg, list)), -1)
 					continue
 				}
 				prec = 0
@@ -109,7 +113,7 @@ iop_format :: proc(format: string, first := 1) -> (out: string, n: u32) {
 		dprec := -1 // a number's precision
 		switch c := format[i]; c {
 		case 'd', 'i', 'D', 'u', 'U', 'o', 'O', 'x', 'X', 'p':
-			v := next(&arg)
+			v := next(&arg, list)
 			base: u32 = 16
 			switch c {
 			case 'd', 'i', 'D':
@@ -135,15 +139,15 @@ iop_format :: proc(format: string, first := 1) -> (out: string, n: u32) {
 			body = strings.clone(string(buf[n:]), context.temp_allocator)
 		case 'c':
 			sign = 0
-			body = strings.clone(string([]u8{u8(next(&arg))}), context.temp_allocator)
+			body = strings.clone(string([]u8{u8(next(&arg, list))}), context.temp_allocator)
 		case 's':
 			sign = 0
-			p := next(&arg)
+			p := next(&arg, list)
 			body = "(null)" if p == 0 else cstr(p)
 			if prec >= 0 && int(prec) < len(body) {body = body[:prec]}
 		case 'n':
 			w := o.n
-			copy(ram_w(next(&arg), 4), ([^]u8)(&w)[:4])
+			copy(ram_w(next(&arg, list), 4), ([^]u8)(&w)[:4])
 			continue
 		case:
 			fmt_put(&o, c)
@@ -248,9 +252,9 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 17: // bzero(p, n)
 		for &b in ram_w(a0, u32(max(i32(a1), 0))) {b = 0}
 		return 0, true
-	case 19: // sprintf(buf, format, ...): the characters it wrote, not counting the NUL
+	case 19, 42: // sprintf(buf, format, ...), vsprintf(buf, format, va_list): the characters written, not counting the NUL
 		if a1 == 0 {return 0, true}
-		out, count := iop_format(cstr(a1), 2)
+		out, count := iop_format(cstr(a1), 2, a2 if fno == 42 else nil)
 		dst := ram_w(a0, u32(len(out)) + 1)
 		n := copy(dst, out)
 		if n < len(dst) {dst[n] = 0}
