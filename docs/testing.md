@@ -114,11 +114,15 @@ odin run tests/psx_flat_switch -collection:ps=.
 odin run tests/psx_flat_switch -collection:ps=. -define:PS_FLAT=true
 odin run tests/compat -collection:ps=.
 odin run tests/learn -collection:ps=.
+odin run tests/ee_jump_miss -collection:ps=.
+odin run tests/psx_jump_miss -collection:ps=.
+odin run tests/gamedata -collection:ps=.
+odin run tests/gs_band -collection:ps=.
 odin run tests/play -collection:ps=. -define:COMMIT=test
 ```
 
-`.github/workflows/ci.yml` is the list CI runs; a new test goes there and
-here.
+`.github/workflows/ci.yml` holds the list CI would run (it is switched
+off, see [CI](#ci)); a new test goes there and here.
 
 ## What each test covers
 
@@ -126,21 +130,26 @@ here.
 |---|---|
 | `core` | Coroutines, snapshots, rollback, file writes, PS2 ELF loading, the mod set in input records and replays, netplay HELLO checks, a full emulated heap ending the process (a child run) |
 | `native` | The machine-code emitter |
+| `wasm_asm` | Random control flow through the wasm32 encoder: the modules it emits against an interpretation of the same programs (`main.odin` gives the two commands; Node 24 or newer) |
 | `ee_native` | EE instructions through the native backend against the interpreter |
 | `wasm_sigs` | Every runtime procedure native code imports (`ps2.native_imports`, `psx_native.imports`) has a signature in `r5900.EE_SIGS` or `r3000.R3000_SIGS`, the signatures wasm32 code calls them with, each agrees with its procedure (Odin convention, argument count, a result or none, every argument and result fits one i32), and no signature lacks an import |
 | `wasm_ctx_only` | A wasm32 function's type is (ctx) or (pc, ctx) by the `Asm.ctx_only` it began with, not the flag when it is laid out (the next func_begin or finish) |
+| `wasm_native` | `web/native.js` placing and releasing a wasm32 blob's functions in the function table (`node tests/wasm_native/run.mjs`, Node 24 or newer) |
 | `vu_capture_delta` | A mid-run VU conversion's capture delta (ps2/vu `capture_delta`) gives the converter the programs of the whole capture less those already converted; a delta from inside a record or past a bad record is refused |
 | `ee_spin` | The EE spin skip on synthetic loops: on and off end the same, cycles included; a pure spin, a same-value store, an INTC_STAT poll and two threads at one priority handing the EE back and forth with RotateThreadReadyQueue are skipped, and end the same when the other thread rotates at two sites in turn; a counter, a GIF_STAT poll and a timer poll are not |
 | `ee_spin_flat` | The spin skip under FLAT (build with `-define:PS_FLAT=true`), where a call is no side effect and the probe compares the shadow stacks: a loop calling a function that only returns is skipped; one whose function counts in memory is not, nor one whose passes match in cpu.state but leave the innermost return address on the shadow stack other each pass (more than cpu.UNWIND_MAX calls open). Each runs with the skip on and off and both must end the same |
+| `ee_spin_wasm` | The spin skip under FLAT on `wasi_wasm32`: a wait loop interpreted, as a learned function, and as one calling another (`run.mjs` gives the build command; Node 24 or newer) |
 | `fpu` | EE FPU vectors |
 | `lower` | r5900 and r3000 branch lowering |
 | `discover` | Functions with no prologue that tables of methods in a writable code section point at: thunks, leaves and jumps on through a register, stubs in a row included, are entries; code after a `b` or a `j` inside a function, code that calls or uses `$sp`, data after a `jr` with stray fields or a jump in a delay slot, a jump table's cases (tables of functions next to each other in one run included) and a pair of words are not |
 | `gs_hw` | The Vulkan GS against the software GS, bit for bit, at scales 1 to 3, run twice each: sprites that sample the buffers they draw: the frame as CT32 (decoded, and too big to decode at scale 3), as PSMT8 through a CLUT, in region repeat, on the top pages wrapping to page 0, sampled past its buffer's width, and the depth buffer as a texture; and a decoded texture sampled again after PSMT8 rows uploaded over it at an odd width, and after one page of it uploaded again; and two sprites on one state, the second sampling what the first drew. Without a Vulkan device it prints `gs_hw: skip, no Vulkan device` and exits 0, which is a skip, not a pass |
+| `gs_band` | Banded software drawing on 1, 2, 4 and 8 workers against drawing in order, bit for bit, on random streams that reach each hazard that makes a join |
 | `vu` | VU0 microprograms from the EE, macro flags |
 | `vu_macro` | The EE recompiler's VU0 macro code against the interpreter |
 | `ee_emit` | The EE recompiler's inline MMI, multiply-add and FPU code against the interpreter |
 | `vu_micro` | Whole VU microprograms through the VU recompiler against the interpreter |
 | `vu_native` | VU microprograms through the native backend against the interpreter |
+| `vu_programs` | Not a test: the VU microprograms `vu`, `vu_macro`, `vu_micro` and `vu_native` share |
 | `vu_rz` | x86-64 only: SSE addps, mulps and the MADD/MSUB guard under MXCSR round toward zero, as recomp/vu's round_zero spans emit them, against ps2_add and ps2_mul |
 | `vu_text` | `.vutext`'s programs as the conversion finds them: a bundle of MPGs that cannot be placed from micro address 0 is left out and the scan goes on; a conversion whose VU half fails (a bad capture, a bad `.vutext`) still writes the EE blob, and the VU programs alone fail |
 | `spu` | SPU2 voices through the port API, sound RAM in snapshots |
@@ -153,6 +162,7 @@ here.
 | `ps2_interp` | Whole EE functions in the interpreter |
 | `ee_syscall_handler` | A SetSyscall handler switched away from (an alarm wakes a thread of higher priority) and sleeping, in the coroutine model and under FLAT: the same log and cycles |
 | `ee_unwind` | A `jr $ra` to an outer call's return address with that call's sp (a longjmp), in the coroutine model and under FLAT: it unwinds there 2 calls down and at the search's last call (`UNWIND_MAX`), and returns as before for a plain return, one call past the search, and past a SetSyscall handler's host call; to an address no call returns to with that sp it jumps (from under that host call it returns as before), the calls left open, and a coroutine's later `jr $ra` to an outer call unwinds there. `learn`: under LEARN the run that jumps ends there, written `.Open`, so no record holds the code it jumped to. `getpc`: a bgezal, jal or jalr to its own return address is no call. `frames`: two calls with one return address and other sps; a `jr $ra` there with the outer one's sp unwinds to it, as a return needs the address and the sp both. `away`: calls that jump back instead of returning leave at most `UNWIND_MAX` + 1 open. `cap`: endless recursion is a fatal at the chain's cap (`INTERP_DEPTH_MAX`, `FLAT_DEPTH_MAX` under FLAT). `native` (not FLAT): the default cases with native code compiled for the calls between the runs: an unwind and a jump across native code's calls leave it at once, a jump from a handler past the kernel's call (call_handler) returns as before, and (x64 SysV) an unwind past two native frames gives each one's caller its callee-saved registers back. `stale` (not FLAT): a jump that would leave more than `NATIVE_STALE_MAX` gaps of native code open returns as before, once logged. `learned` (not FLAT): C is learned code, whose own `jr $ra` unwinds and jumps as the interpreted C's does (`ps2.learned_jr`). `goto` (not FLAT): a function that reads Count around a loop a vblank falls in, interpreted, then with its words up to a call learned, then with the code after that call learned too: each gives the same four Count values, the vblank at the same cycle and turn of the loop, and no unwind, as learned code charges each instruction before one that can read the counter and goes on past its recorded words in the function's own run (`ps2.learned_goto`) |
+| `ee_jump_miss` | A disc-blob EE function's computed jump to a target in itself that is no label runs on to that function's own return, once (`run.mjs` gives the `wasi_wasm32` build command) |
 | `psx_cover` | Which R3000 encodings each PS1 backend does inline |
 | `psx_fallback` | The PS1 ways out of recompiled code and their counts |
 | `psx_codewatch` | Recompiled PS1 code demoted when a write changes it, promoted again when it is back |
@@ -172,6 +182,7 @@ here.
 | `psx_bios_libc` | The BIOS C library |
 | `psx_interp` | The PS1 interpreter's jumps into the BIOS |
 | `psx_jr` | The PS1 `jr`, interpreted and under FLAT: a plain jump, only one to the run's return address returns; a `jr $ra` to its own label goes on there, one to an outer call's return with its $sp returns from both, with another $sp it jumps |
+| `psx_jump_miss` | The same as `ee_jump_miss`, for the PS1 |
 | `psx_flat_switch` | Guest-code PS1 thread switches (ChangeTh, syscall 3, epc restart, slot reuse, preempt, a preempt in a jr's delay slot), in the coroutine model and under FLAT; FLAT also drops an owed switch the PCB took back |
 | `disc` | Disc images, cue sheets and ISO9660, malformed ones included; disc ids; the IOP's file lookups on an image |
 | `host_frames` | Each host, headless, exits at FRAMES |
@@ -185,6 +196,7 @@ here.
 | `read_dir` | `core.read_dir`, the listing code that runs on the web uses, on the host and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer): every entry once with its type, no `.` or `..`, past `fd_readdir`'s first buffer, an empty and a missing directory; on wasi the toolchain's own listing asserts on the first entry |
 | `mod_api` | The PS1 mod API (`recomp --mod-api`) against committed `mod_api.h` and `mod.ld`, in any row order: names, aliases and left-out rows, error rows and a short overlay, the region constants and `mod_call_original`'s address; with clang, ld.lld, llvm-nm and sh, `mods/build.sh` builds a mod whose hooks read back with the right keys and a replacement that calls `mod_call_original` at its address, with no `jal` or `j` out of the image except in controls built without `long_call`, and refuses overlapping images by name; a mod's `MOD_SETTING`s read back in order from `.mod_settings`, each loaded at its default, and `core.mod_values_write` puts values in their records in the region; `game/game.odin` against its committed copy and, with odin and llc too, an Odin mod (`odin/hook.odin`) whose before, after and replace hooks read back with the right keys, call the game through `jalr` and `mod_call_original`, with its settings read back, and a global set by Odin's startup code (`odin/late.odin`) failing the build by name; builds fail for a mod defining a game function's name or `mod_call_original`, an unplaced section, an image past the region, a setting whose default is outside its range, and a bad `--origin`. The EE's on a hand-made ELF against committed `ee/mod_api.h` and `ee/mod.ld`: the functions recomp finds, plain calls, keyed by the id the kernel gives the same ELF, unchanged by a `words` patch, a native blob built with `mod_hooks` naming its hooked set by import slot, and the region constants; with llvm-objdump too, `build.sh` builds an EE mod whose hooks read back with those keys and whose calls into the game and `mod_call_original` are plain `jal`, and fails a mod with a 64-bit multiply, a double or `(int)f`; with llvm-mc, `build.sh`'s float operations are exactly the decoder's |
 | `compat` | Each host's compat line, and stubbed calls, under COMPAT; the mod set in the build column |
+| `gamedata` | The game data file a run writes follows its schema |
 | `play` | `play` on small synthetic PS1 discs, converted and interpreted, and its compat mode on PS1 and PS2 discs, a second executable loaded and a PS2 program switch included; the launcher, its picture checked by point and a non-ASCII title cell by cell against the font |
 | `discimg` | The small disc images `disc` and `play` use |
 
@@ -634,12 +646,13 @@ node tests/wasi/run.mjs rollback.wasm out-test path/to/any/file
 
 ## CI
 
-CI type-checks every package on Linux and macOS (amd64 and arm64) and on
-Windows, and runs the tests on Linux (x86-64, arm64) and Windows. No CI job
-runs the tests on macOS.
+CI is switched off: changes are checked and tested locally. The workflow,
+when on, type-checks every package on Linux and macOS (amd64 and arm64) and
+on Windows, and runs the tests on Linux (x86-64, arm64) and Windows. No job
+in it runs the tests on macOS.
 
-Before sending a change, check what it touches as CI does, with vet and
-strict style:
+Before sending a change, check what it touches as the workflow does, with
+vet and strict style:
 
 ```sh
 odin check psx -no-entry-point -collection:ps=. -vet -strict-style
@@ -650,7 +663,7 @@ odin check tests/core -collection:ps=. -vet -strict-style
 
 The runtime packages (`core`, `core/disc`, `core/learnfile`, `psx`, `ps2`,
 `ps2/host`) and `tests/discimg` take `-no-entry-point`; `recomp`, `play`
-and the tests do not. Add `-target:` to check another platform, as CI does
+and the tests do not. Add `-target:` to check another platform, as the workflow does
 for `linux_arm64`, `darwin_amd64` and `darwin_arm64`. recomp is also
 checked for `wasi_wasm32`, the target of the web converter: a recomp
 import of a package that needs the host (such as `core`) fails there.

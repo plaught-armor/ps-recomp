@@ -23,6 +23,10 @@ a disc the user owns), a `recomp` options file, and any per-game code. See
 | `core/` | Console-independent runtime: coroutines, save states and rollback, netplay, input and rebinding, audio, recording and replay, Vulkan device, capture; `disc` (disc images, ISO9660 and disc ids); the user data directory; compatibility counters and the COMPAT line |
 | `psx/` | PS1 runtime: `cpu`, `gte`, `gpu` and `render`, `spu`, `mdec`, `bios`, `io`, `native` (the names native code imports), `host` (SDL2 window, pacing, input), and the interpreter, checkpoints and hooks |
 | `ps2/` | PS2 runtime: `cpu`, `mem`, `dma`, `gif`, `gs` (Vulkan), `vu`, `ipu`, `iop` (HLE IOP modules, memory cards), `kernel`, `r5900` (EE instruction decoder), `host` (SDL2 window, audio, input, net), and the interpreter and bus |
+| `web/` | The browser pages (convert and play), their build and deploy scripts |
+| `mods/` | `build.sh`: builds a mod from C or Odin against a game's mod API |
+| `tools/` | `gamedata` (checks, places and ranks game data files), `hle_scan` (the calls into Sony code a disc makes, and which of them the HLE serves) |
+| `.github/` | Workflows: `ci`, switched off, and `game-data`, which turns a labelled game data issue into a pull request |
 | `tests/` | The tests; see [Tests](testing.md) |
 | `docs/` | These pages |
 
@@ -44,7 +48,7 @@ in the disc's folder under the user data directory. A build made without
 When the conversion fails, the game runs in the interpreter.
 
 `play --compat` runs each disc in a child of the same executable as `play`
-would run it, headless, unpaced and as a COMPAT run (`core/compat`), and
+would run it, headless, unpaced and as a COMPAT run (`core/compat.odin`), and
 keeps one row per disc id in `compat.tsv`. `play/compat.odin` describes
 each column.
 
@@ -147,12 +151,16 @@ handles. play's data directory (`GetPrefPath` is `/data/`: settings,
 memory cards, and any wasm32 native blobs and their keys) is mirrored
 there file for file: loaded before a run and written back when the
 module exits or fails. A run that the tab's closing cuts short stores
-nothing. A wasm32 blob is made by a native play or recomp (`--arch
-wasm32`); neither page can put one in the store yet, so outside test mode
-a game runs without one. Test mode starts from an empty `/data` and
-stores nothing, so its runs compare with native ones. The wasm build has
-no GPU GS, so a PS2 game draws in software. Netplay is not in the page
-yet.
+nothing. Play on a stored disc first runs `play --convert-store` in a
+Worker, which puts the disc's wasm32 blob in the store unless this
+build's is there already; a disc just picked starts without that step.
+During a run, learned code and VU microprograms are compiled in Workers
+of their own. Test mode starts from an empty `/data` and stores nothing,
+so its runs compare with native ones, unless `convert=1` converts and
+stores first. The wasm build has no GPU GS, so a PS2 game draws in
+software. Netplay works only between two pages on one machine, through
+the test server's signalling (`tests/wasi/serve.py --net`); the public
+page has no signalling server.
 
 Tested: headless Brave and Firefox on Linux (`tests/wasi/serve.py --play`,
 see [testing](testing.md)). Other browsers and phones are untested. Some
