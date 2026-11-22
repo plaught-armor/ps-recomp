@@ -1165,6 +1165,7 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case 0x05: // Seek {lsn}
 		cd_spin()
 		w[0] = 1
+	case 0x09: w[0] = cd_stream(w[3], w[0], w[1], w[2]) // Stream {lsn, sectors, buffer, cmd, mode[3]}
 	case 0x0e: w[0] = 2 // DiskReady (non-blocking): 2 is ready, 6 not ready
 	case: return false
 	}

@@ -72,6 +72,9 @@ Iop_Cd :: struct {
 	pending:   [CD_PENDING]u32, // the function codes of the completed commands' callbacks not yet run, first made first
 	stopped:   bool, // sceCdStop stopped the disc, and no command has spun it up since
 	poff:      [2]u32, // sceCdPOffCallback's function and argument; the power button is never pressed here
+	st_on:     bool, // sceCdStStart started a stream, and no sceCdStStop has ended it
+	st_lsn:    u32, // the sector the stream's next read starts at
+	st_bufmax: u32, // the sectors sceCdStInit gave the stream's ring
 }
 
 // Emulated state, snapshotted (sif_snap) and reset with the loader.
@@ -218,6 +221,34 @@ cd_done :: proc(code: u32) {
 // sceCdPause: a sceCdStop is over (cd_status).
 cd_spin :: proc() {
 	iop_cd.stopped = false
+}
+
+// cdvdfsv's stream N-command (sceCdSt*): {lsn, sectors, EE buffer, cmd,
+// mode[3]}, the answer as the command's sceCdSt call returns it. A read is
+// done at once, so the ring always holds every sector it can: a read takes
+// all it asks for, error 0 in the answer's high half, and the status is the
+// ring's size while the stream runs. Pause and resume change nothing a read
+// sees. A read with no stream running takes nothing.
+cd_stream :: proc(cmd, lsn, sectors, dest: u32) -> u32 {
+	s := &iop_cd
+	switch cmd {
+	case 1: // sceCdStStart(lsn, mode)
+		cd_spin()
+		s.st_on, s.st_lsn = true, lsn
+	case 2: // sceCdStRead(sectors, EE buffer, mode, err *)
+		if !s.st_on {return 0}
+		n := sectors & 0xffff
+		disc_read(s.st_lsn, n, dest)
+		s.st_lsn += n
+		return n
+	case 3: s.st_on = false // sceCdStStop
+	case 4, 9: s.st_lsn = lsn // sceCdStSeek, sceCdStSeekF
+	case 5: s.st_on, s.st_bufmax = false, lsn // sceCdStInit(bufmax, bankmax, IOP buffer)
+	case 6: return s.st_bufmax if s.st_on else 0 // sceCdStStat
+	case 7, 8: // sceCdStPause, sceCdStResume
+	case: return 0
+	}
+	return 1
 }
 
 // The drive's ready register as sceCdDiskReady mode 8 reads it: the ready

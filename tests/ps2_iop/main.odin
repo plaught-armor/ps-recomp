@@ -5328,6 +5328,37 @@ test_cdvd_search_server :: proc() {
 	found, rec = ask(search, 0x130, 0x20, 1, "\\BIG.BIN;1")
 	check(found == 1 && lsn(rec) == 23 && endian.unchecked_get_u32le(rec[0x20:]) == 0xaaaaaaaa, "search server: another size is an old request")
 
+	// The stream N-command reads as the Read N-command does, from where
+	// sceCdStStart or a seek put it, only while a stream runs.
+	ncmd := iop.sif.servers[0x80000595]
+	stream :: proc(ncmd: iop.Rpc_Server, cmd, lsn, sectors, dest: u32) -> u32 {
+		buf: [0x14]u8
+		w := ([^]u32)(raw_data(buf[:]))
+		w[0], w[1], w[2], w[3] = lsn, sectors, dest, cmd
+		ok := ncmd(9, buf[:], 0x14)
+		check(ok, "stream: fno 9 answers")
+		return w[0]
+	}
+	ST_DEST :: 0x00104000
+	READ_DEST :: 0x00108000
+	rbuf: [0x18]u8
+	rw := ([^]u32)(raw_data(rbuf[:]))
+	rw[0], rw[1], rw[2] = 23, 2, READ_DEST
+	check(ncmd(1, rbuf[:], 0x18), "stream: a Read to compare against")
+	check(stream(ncmd, 5, 64, 8, 0x80000) == 1, "stream: init")
+	check(stream(ncmd, 2, 0, 1, ST_DEST) == 0, "stream: a read with no stream takes nothing")
+	check(stream(ncmd, 6, 0, 0, 0) == 0, "stream: no status with no stream")
+	check(stream(ncmd, 1, 23, 0, 0) == 1 && stream(ncmd, 6, 0, 0, 0) == 64, "stream: started, the ring full")
+	check(stream(ncmd, 2, 0, 1, ST_DEST) == 1 && stream(ncmd, 2, 0, 1, ST_DEST + 2048) == 1, "stream: reads answer the sectors read, error 0")
+	same := true
+	for i in u32(0) ..< 2 * 2048 / 4 {same &&= mem.rd32(ST_DEST + 4 * i) == mem.rd32(READ_DEST + 4 * i)}
+	check(same, "stream: two reads of one sector are the next two sectors")
+	check(stream(ncmd, 4, 23, 0, 0) == 1 && stream(ncmd, 2, 0, 2, ST_DEST + 8192) == 2, "stream: a seek moves the next read")
+	same = true
+	for i in u32(0) ..< 2 * 2048 / 4 {same &&= mem.rd32(ST_DEST + 8192 + 4 * i) == mem.rd32(READ_DEST + 4 * i)}
+	check(same, "stream: a read after a seek starts there")
+	check(stream(ncmd, 3, 0, 0, 0) == 1 && stream(ncmd, 2, 0, 1, ST_DEST) == 0, "stream: stopped, a read takes nothing")
+
 	on_dual, start := dual_info()
 	check(on_dual == 1 && start == V, "dual info: a dual-layer image's second layer start")
 	// One layer with 11 sectors past its volume: the image's count, not
