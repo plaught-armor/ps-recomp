@@ -317,7 +317,7 @@ syscall :: proc(pc: u32) {
 	case 0x70: ret = i64(mem.gs_imr) // GsGetIMR
 	case 0x71: // GsPutIMR
 		ret = i64(mem.gs_imr)
-		mem.gs_imr = a0
+		mem.gs_imr_write(u32(a0))
 	case 0x73: // SetVSyncFlag(*flag, *csr)
 		k.vsync_flag = a0
 		k.vsync_csr = a1

@@ -44,6 +44,7 @@ hw_read :: proc(addr: u32, size: int) -> u64 {
 		switch o &~ 7 {
 		case 0x1000: return u64(mem.gs_csr) | mem.GS_CSR_ID
 		case 0x1010: return u64(mem.gs_imr)
+		case 0x1080: return gs.state.siglbl // SIGLBLID, set by SIGNAL and LABEL
 		}
 		return (^u64)(&mem.gsregs[o &~ 7])^
 	}
@@ -134,7 +135,10 @@ hw_write :: proc(addr: u32, v: u64, size: int) {
 			if v & 0x200 != 0 {gs.display_reset()} // RESET
 			return
 		case 0x1010:
-			mem.gs_imr = u32(v)
+			mem.gs_imr_write(u32(v))
+			return
+		case 0x1080:
+			gs.state.siglbl = v
 			return
 		}
 		(^u64)(&mem.gsregs[o &~ 7])^ = v

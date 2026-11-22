@@ -5,11 +5,15 @@
 // rectangle reaches a shown buffer from base 0; a held display skips
 // nothing; display_reset clears the latch and a snapshot load does not; and
 // nothing is skipped while replays is set.
+// SIGNAL and LABEL: their IDs read back from SIGLBLID, which the EE can also
+// write; a SIGNAL masked in IMR sets CSR without interrupting, and an IMR
+// write that unmasks a CSR event still set interrupts then, once.
 package main
 
 import "core:fmt"
 import "core:os"
 import "ps:core"
+import "ps:ps2"
 import "ps:ps2/gs"
 import "ps:ps2/mem"
 
@@ -129,6 +133,37 @@ main :: proc() {
 	sprite(A, 0xbb)
 	if px(A) != 0xbb {fail("draw skipped with replays set: %x", px(A))}
 
+	signal_test()
+
 	if failed > 0 {os.exit(1)}
 	fmt.println("ok gs")
+}
+
+@(private = "file")
+signal_test :: proc() {
+	CSR, IMR, SIGLBLID :: 0x12001000, 0x12001010, 0x12001080
+	GS_LINE :: u32(1) << mem.INTC_GS
+	mem.gs_csr, mem.intc_pending = 0, 0
+	ps2.hw_write(IMR, 0xff00, 8) // all masked
+	gs.gs_write(gs.GS_SIGNAL, 0xffffffff_00000005)
+	if mem.gs_csr & 1 == 0 {fail("SIGNAL left CSR %x", mem.gs_csr)}
+	if mem.intc_pending & GS_LINE != 0 {fail("masked SIGNAL interrupted")}
+	gs.gs_write(gs.GS_LABEL, 0xffffffff_00000007)
+	if got := ps2.hw_read(SIGLBLID, 8); got != 7 << 32 | 5 {fail("SIGLBLID %x, want 7_00000005", got)}
+	gs.gs_write(gs.GS_SIGNAL, 0x000000f0_000000a3) // IDMSK: only bits 4-7
+	if got := ps2.hw_read(SIGLBLID, 8); got != 7 << 32 | 0xa5 {fail("SIGNAL IDMSK gave %x, want 7_000000a5", got)}
+
+	ps2.hw_write(IMR, 0xfe00, 8) // unmasks SIGNAL, still set
+	if mem.intc_pending & GS_LINE == 0 {fail("unmasking a set SIGNAL did not interrupt")}
+	mem.intc_pending = 0
+	ps2.hw_write(IMR, 0xfe00, 8) // already unmasked
+	if mem.intc_pending & GS_LINE != 0 {fail("a second unmasked IMR write interrupted again")}
+	ps2.hw_write(IMR, 0xff00, 8)
+	ps2.hw_write(CSR, 1, 8) // cleared before unmasking
+	ps2.hw_write(IMR, 0xfe00, 8)
+	if mem.intc_pending & GS_LINE != 0 {fail("unmasking a cleared SIGNAL interrupted")}
+
+	ps2.hw_write(SIGLBLID, 0x1234, 8)
+	if got := ps2.hw_read(SIGLBLID, 8); got != 0x1234 {fail("SIGLBLID write read back %x", got)}
+	mem.gs_csr, mem.intc_pending, mem.gs_imr = 0, 0, 0x7f00
 }

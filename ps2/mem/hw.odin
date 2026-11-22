@@ -70,6 +70,14 @@ intc_raise :: proc(n: u32) {
 	if !cpu.in_interrupt {cpu.next_event = cpu.state.cycles}
 }
 
+// Write GS IMR (the register or GsPutIMR). A CSR event that was masked
+// when it happened and that this write unmasks interrupts now: CSR still
+// holds it until the EE clears it.
+gs_imr_write :: proc(v: u32) {
+	if gs_csr & 0x1f & ((gs_imr &~ v) >> 8) != 0 {intc_raise(INTC_GS)}
+	gs_imr = v
+}
+
 // Mark a DMA channel finished and raise its DMAC interrupt.
 dma_finish :: proc(ch: u32) {
 	chcr := dma_reg(ch, 0)
