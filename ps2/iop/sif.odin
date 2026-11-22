@@ -444,11 +444,15 @@ sif_command :: proc(a, pc: u32) {
 
 // ------------------------------------------------------------- servers
 
-// loadfile: modules are native here, so loading one only reports success;
-// an ELF is loaded into EE RAM (loadelf). With PS_IRX=1 a module that is no
-// Sony one is loaded and started on the IOP (loadcore.odin); one whose load
-// fails is answered as without it, its servers left to the HLE (iop_load's
-// Iop_Fallback row).
+// loadcore's error for a module file that cannot be opened.
+@(private)
+KE_NOFILE :: -203
+
+// loadfile: modules are native here, so loading one only reports success,
+// or KE_NOFILE for a cdrom file the disc lacks; an ELF is loaded into EE
+// RAM (loadelf). With PS_IRX=1 a module that is no Sony one is loaded and
+// started on the IOP (loadcore.odin); one whose load fails is answered as
+// without it, its servers left to the HLE (iop_load's Iop_Fallback row).
 @(private)
 loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	w := ([^]u32)(raw_data(buf))
@@ -472,6 +476,16 @@ loadfile_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		dbcman_module(path, data if cd else nil)
 		w[0] = 2
 		w[1] = 0
+		// A cdrom module the disc does not hold fails as on retail, with
+		// KE_NOFILE: a game may try another path, or load the module from
+		// a buffer, after that.
+		if cd {
+			if _, _, found := disc_find(path); !found {
+				fmt.eprintfln("sif: load module \"%s\": no such file", path)
+				w[0] = transmute(u32)i32(KE_NOFILE)
+				return true
+			}
+		}
 		if iop_irx && data != nil && iop_runs(data) {
 			if id, result := iop_load(data, path, args); id >= 0 {w[0], w[1] = u32(id), result}
 		}
