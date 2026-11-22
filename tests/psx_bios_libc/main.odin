@@ -514,11 +514,32 @@ heap_test :: proc() {
 	check("unaligned malloc", libc.malloc(4), HEAP + 5)
 }
 
+// The kernel heap (C 08h, B 00h, B 01h) is a second heap of the same kind,
+// apart from the user heap.
+kernel_heap_test :: proc() {
+	KHEAP :: 0x8000e800
+	libc.init_heap(HEAP, 0x40)
+	libc.sys_init_memory(KHEAP, 0x1000)
+	check("SysInitMemory clears the first header", cpu.r32(KHEAP), 0)
+	k := libc.alloc_kernel_memory(32)
+	check("alloc_kernel_memory", k, KHEAP + 4)
+	check("kernel header", cpu.r32(KHEAP), 32)
+	check("kernel end marker", cpu.r32(KHEAP + 36), 0xfffffffe)
+	check("user heap apart", libc.malloc(4), HEAP + 4)
+	k2 := libc.alloc_kernel_memory(7)
+	check("kernel second block", k2, KHEAP + 40)
+	libc.free(k)
+	check("free_kernel_memory sets bit 0", cpu.r32(KHEAP), 32 | 1)
+	check("kernel reuses freed", libc.alloc_kernel_memory(32), k)
+	check("kernel too big", libc.alloc_kernel_memory(0x1000), NEG)
+}
+
 main :: proc() {
 	strings_test()
 	memory_test()
 	sort_test()
 	search_test()
 	heap_test()
-	fmt.println("ok psx_bios_libc: strings, memory, strtol, qsort/bsearch through guest calls, strncpy to strtok, bcopy, todigit, atob, lsearch, heap")
+	kernel_heap_test()
+	fmt.println("ok psx_bios_libc: strings, memory, strtol, qsort/bsearch through guest calls, strncpy to strtok, bcopy, todigit, atob, lsearch, heap, kernel heap")
 }

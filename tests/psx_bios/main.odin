@@ -22,7 +22,7 @@
 //   sr as exception entry saves it) and loaded back from it after a guest
 //   write (sr through rfe), a guest epc write
 //   restarting the thread there, syscall 3 to a TCB switching as ChangeTh
-//   does, and CloseTh or a guest-freed TCB letting OpenTh reuse the slot
+//   does, an exception return switching to the TCB the PCB names, and CloseTh or a guest-freed TCB letting OpenTh reuse the slot
 //   without running out of coroutines.
 //   The kernel layout games read and patch: the exception vector (at 0x00
 //   too), the C0 and B0 tables (every entry callable but the B0 ones the
@@ -95,6 +95,8 @@ FN_EXEC :: 0x80001600 // an executable's pc0: records its registers, returns 7
 FN_THREAD :: 0x80001700 // a thread: records what it sees, switches back
 @(private = "file")
 FN_RESTART :: 0x80001800 // a thread's new entry: counts, switches back
+@(private = "file")
+FN_PREEMPT :: 0x80001900 // a thread: records s0, points the PCB back, takes an IRQ
 
 // HookEntryInt jump buffer, and the setjmp return site it holds: a jal to
 // FN_HOOK.
@@ -164,6 +166,8 @@ th: struct {
 	abandoned:              bool,
 	restarts, resumes:      int,
 	restart_s0, restart_sr: u32,
+	preempts:               int,
+	preempt_s0:             u32,
 }
 
 @(private = "file")
@@ -337,6 +341,14 @@ main :: proc() {
 					th.abandoned = true
 					for {
 						b(0x10, MAIN_THREAD)
+					}
+				}},
+			{FN_PREEMPT, proc() {
+					for {
+						th.preempts += 1
+						th.preempt_s0 = cpu.state.r[16]
+						cpu.w32(cpu.r32(0x108), cpu.r32(0x110) & 0x1fffffff)
+						irq(0)
 					}
 				}},
 			{FN_RESTART, proc() {
@@ -624,6 +636,21 @@ main :: proc() {
 	check("GetConf threads after SetConf", cpu.r32(CONF_BUF + 4), 4)
 	check("GetConf stack after SetConf", cpu.r32(CONF_BUF + 8), 0x801ff000)
 
+	// A game that sets the counts itself (MGS1) finds their address in the
+	// code [0x474] points at: (lui imm << 16) + store offset - 8.
+	code := cpu.r32(0x474)
+	conf := (cpu.r32(code) & 0xffff) << 16 + u32(i32(i16(cpu.r32(code + 4)))) - 8
+	cpu.w32(conf, 8)
+	cpu.w32(conf + 4, 24)
+	cpu.w32(conf + 8, 0x801fe000)
+	a(0x9d, CONF_BUF, CONF_BUF + 4, CONF_BUF + 8)
+	check("GetConf events after a patch", cpu.r32(CONF_BUF), 24)
+	check("GetConf threads after a patch", cpu.r32(CONF_BUF + 4), 8)
+	check("GetConf stack after a patch", cpu.r32(CONF_BUF + 8), 0x801fe000)
+	c(0x00)
+	c(0x01)
+	c(0x0c)
+
 	// SetMemSize: 2 clears RAM_SIZE bits 8-10 and 8 sets bits 8-9, keeping
 	// the rest, each storing the size at 00000060h; any other size changes
 	// neither.
@@ -738,6 +765,57 @@ main :: proc() {
 	}
 	check("restarted thread runs after reuse", u32(th.restarts), 141)
 	check("resumes over the reuse rounds", u32(th.resumes), 140)
+
+	// An exception return goes on with the TCB the PCB names: a handler
+	// pointing it at another thread's TCB switches there, the main thread's
+	// registers saved, and the thread pointing it back returns at its own
+	// next exception. A PCB naming no open thread's TCB stays put.
+	h = b(0x0e, FN_PREEMPT, 0x801f0000, 0)
+	r[16] = 0xcccc
+	cpu.w32(cpu.r32(0x108), tcb1)
+	irq(0)
+	check("thread runs after an exception return to its TCB", u32(th.preempts), 1)
+	check("thread s0 after the switch", th.preempt_s0, 0)
+	check("main thread s0 back from the thread", r[16], 0xcccc)
+	check("running TCB back on the main thread after the thread's exception", cpu.r32(cpu.r32(0x108)), tcbs)
+	cpu.w32(reg(tcb1, 16), 0x3333)
+	cpu.w32(cpu.r32(0x108), tcb1)
+	irq(0)
+	check("thread resumes at its exception return", u32(th.preempts), 2)
+	check("resumed thread's s0 from its TCB", th.preempt_s0, 0x3333)
+	check("main thread s0 after the second round", r[16], 0xcccc)
+	cpu.w32(cpu.r32(0x108), 0x1234)
+	irq(0)
+	check("PCB naming no TCB: no switch", u32(th.preempts), 2)
+	cpu.w32(cpu.r32(0x108), tcbs)
+	check("CloseTh of the preempted thread", b(0x0f, h), 1)
+
+	// Thread tables a game sets up itself (MGS1, in the kernel heap): OpenTh,
+	// ChangeTh and exception returns follow the system table's pointers.
+	old_pcb, old_tcbs, old_size := cpu.r32(0x108), cpu.r32(0x110), cpu.r32(0x114)
+	NEW_PCB :: 0xa0170000
+	NEW_TCBS :: 0xa0170010
+	cpu.w32(0x108, NEW_PCB)
+	cpu.w32(0x110, NEW_TCBS)
+	cpu.w32(0x114, 4 * 0xc0)
+	for k in u32(0) ..< 4 {
+		cpu.w32(NEW_TCBS + k * 0xc0, k == 0 ? 0x4000 : 0x1000)
+	}
+	cpu.w32(NEW_PCB, NEW_TCBS)
+	h = b(0x0e, FN_PREEMPT, 0x801f0000, 0)
+	check("OpenTh in a game's table", h, 0xff000001)
+	check("OpenTh status in a game's table", cpu.r32(NEW_TCBS + 0xc0), 0x4000)
+	check("OpenTh epc in a game's table", cpu.r32(NEW_TCBS + 0xc0 + 0x88), FN_PREEMPT)
+	r[16] = 0xdddd
+	cpu.w32(NEW_PCB, NEW_TCBS + 0xc0)
+	irq(0)
+	check("exception return to a TCB of a game's table", u32(th.preempts), 3)
+	check("main thread s0 back from a game's table", r[16], 0xdddd)
+	check("running TCB in a game's table", cpu.r32(NEW_PCB) & 0x1fffffff, NEW_TCBS & 0x1fffffff)
+	check("CloseTh in a game's table", b(0x0f, h), 1)
+	cpu.w32(0x108, old_pcb)
+	cpu.w32(0x110, old_tcbs)
+	cpu.w32(0x114, old_size)
 
 	// libpad's pointers into the pad driver stop and restart pad reading.
 	check("InitPAD", b(0x12, PAD_BUF, 0x22, 0, 0), 1)

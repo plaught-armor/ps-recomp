@@ -612,23 +612,28 @@ lsearch :: proc(key, base, n, size, cmp: u32) -> u32 {
 
 // ---------------------------------------------------------------- heap
 
-// The user heap of A(39h) InitHeap, in guest RAM, laid out as retail lays
-// it: blocks one after another, each a header word holding its data size (a
-// multiple of 4) with bit 0 set while free, and an end marker word of
-// END_MARK after the last. The heap starts empty and grows from cursor as
-// malloc needs room. malloc is next fit: it goes on from the block it last
-// stopped at (rover), joins free neighbours as it walks, splits off the rest
-// of a block that is too big, and goes round from the first block once more
-// before it grows the heap. The state below is the kernel's, kept host side.
+// A heap in guest RAM, laid out as retail lays it: blocks one after another,
+// each a header word holding its data size (a multiple of 4) with bit 0 set
+// while free, and an end marker word of END_MARK after the last. The heap
+// starts empty and grows from cursor as malloc needs room. malloc is next
+// fit: it goes on from the block it last stopped at (rover), joins free
+// neighbours as it walks, splits off the rest of a block that is too big, and
+// goes round from the first block once more before it grows the heap. The
+// state is the kernel's, kept host side. Retail runs two such heaps with the
+// same algorithm: the user heap of A(39h) InitHeap and A(33h) malloc, and the
+// kernel heap of C(08h) SysInitMemory and B(00h) alloc_kernel_memory.
 @(private = "file")
 END_MARK :: 0xfffffffe
 
 @(private = "file")
-heap: struct {
+Heap :: struct {
 	cursor, size, end: u32, // the next end marker goes at cursor-4
 	first, rover:      u32,
 	ready:             bool, // the first malloc lays out the first block
 }
+
+@(private = "file")
+user_heap, kernel_heap: Heap
 
 // malloc's two failure results: 0, and -1 when growing fails at the end of
 // its second round (retail's bug).
@@ -646,6 +651,16 @@ words :: proc(v: u32) -> u32 {
 // A(39h) InitHeap: no alignment; writes 0 at addr. Again, it frees every
 // block.
 init_heap :: proc(addr, size: u32) {
+	heap_init(&user_heap, addr, size)
+}
+
+// C(08h) SysInitMemory: InitHeap for the kernel heap.
+sys_init_memory :: proc(addr, size: u32) {
+	heap_init(&kernel_heap, addr, size)
+}
+
+@(private = "file")
+heap_init :: proc(heap: ^Heap, addr, size: u32) {
 	cpu.w32(addr, 0)
 	heap.cursor = addr
 	heap.end = addr + size &~ 3 + 4
@@ -657,7 +672,7 @@ init_heap :: proc(addr, size: u32) {
 // it. Retail takes the larger of n and the InitHeap size when that fits, else
 // the smaller, so in practice n.
 @(private = "file")
-grow :: proc(n: u32) -> bool {
+grow :: proc(heap: ^Heap, n: u32) -> bool {
 	t: u32 = 0
 	if n == 0 {
 		if heap.cursor >= heap.end {
@@ -685,6 +700,16 @@ grow :: proc(n: u32) -> bool {
 // whose headers the game overwrote into a loop; this stops as fatal after
 // as many steps as RAM has words, as no sound heap takes that many.
 malloc :: proc(size: u32) -> u32 {
+	return heap_alloc(&user_heap, size)
+}
+
+// B(00h) alloc_kernel_memory: malloc on the kernel heap.
+alloc_kernel_memory :: proc(size: u32) -> u32 {
+	return heap_alloc(&kernel_heap, size)
+}
+
+@(private = "file")
+heap_alloc :: proc(heap: ^Heap, size: u32) -> u32 {
 	n := (size + 3) &~ 3
 	if !heap.ready {
 		if heap.cursor >= heap.end {
@@ -693,7 +718,7 @@ malloc :: proc(size: u32) -> u32 {
 		cpu.w32(heap.cursor, END_MARK)
 		heap.rover = heap.cursor
 		heap.cursor += 4
-		if !grow(n) {
+		if !grow(heap, n) {
 			return 0
 		}
 		heap.first = heap.rover
@@ -712,7 +737,7 @@ malloc :: proc(size: u32) -> u32 {
 			rounds -= 1
 			if rounds > 0 {
 				heap.rover = heap.first
-			} else if !grow(n) {
+			} else if !grow(heap, n) {
 				return max(u32)
 			}
 			continue
@@ -731,7 +756,7 @@ malloc :: proc(size: u32) -> u32 {
 			rounds -= 1
 			if rounds > 0 {
 				heap.rover = heap.first
-			} else if !grow(n) {
+			} else if !grow(heap, n) {
 				return 0
 			}
 		case nh & 1 != 0:
@@ -743,7 +768,8 @@ malloc :: proc(size: u32) -> u32 {
 	cpu.fatal("BIOS heap at %#08x is corrupt, malloc found no end marker (ra %#08x)", heap.first, cpu.state.r[31])
 }
 
-// A(34h) free: sets bit 0 of the word before ptr, for any ptr. Retail does
+// A(34h) free, and B(01h) free_kernel_memory: sets bit 0 of the word before
+// ptr, for any ptr. Retail does
 // that for NULL too, at FFFFFFFCh; this ignores ptr below 4 rather than wrap
 // the write into the top of RAM.
 free :: proc(ptr: u32) {
@@ -807,7 +833,7 @@ resize :: proc(ptr, size: u32) -> u32 {
 		qh := cpu.r32(q)
 		if qh == END_MARK {
 			more := n - have
-			if u32(i32(heap.end - q) >> 2) - 4 < more {
+			if u32(i32(user_heap.end - q) >> 2) - 4 < more {
 				break
 			}
 			cpu.w32(q + more &~ 3, END_MARK)

@@ -252,6 +252,19 @@ when core.FLAT {
 		flat_native += 1
 	}
 
+	// Events run from flat_goto, between two instructions of the running
+	// run, which goes on from its owed jump after a stop.
+	@(private = "file")
+	flat_goto_events: bool
+
+	// Whether an exception return may switch threads now (psx_bios
+	// preempt): flat_block can stop the run, and the run stops between two
+	// instructions. Events run from elsewhere (an I/O store, a BIOS wait)
+	// return into code that goes on with the registers it has.
+	flat_preempt_ok :: proc() -> bool {
+		return flat_goto_events && flat_can_stop()
+	}
+
 	// Whether flat_block may stop the running run now: on its own guest code,
 	// not inside a nested run or native code.
 	flat_can_stop :: proc() -> bool {
@@ -552,7 +565,9 @@ when core.FLAT {
 		x.pc = target
 		if (check || target <= pc) && state.cycles >= next_event {
 			x.goto_owed = true
+			flat_goto_events = true
 			run_events()
+			flat_goto_events = false
 			return false
 		}
 		if flat_fn_target(target) {

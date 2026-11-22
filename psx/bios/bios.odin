@@ -36,8 +36,9 @@ bios: struct {
 	// thread restarted at a new epc (change_thread), warned about once.
 	tcb_warn:  bool,
 	epc_warn:  bool,
-	// SetConf/GetConf: event and thread control block counts, stack top.
-	conf:      [3]u32,
+	// The PCB pointed at no open thread's TCB on an exception return
+	// (preempt), warned about once.
+	pcb_warn:  bool,
 }
 
 // Host input and GPU, set by package psx (hooks.odin) so this package does
@@ -217,12 +218,14 @@ bios_a :: proc(fn: u32) {
 				MAX_THREADS,
 			)
 		}
-		bios.conf = {arg(0), arg(1), arg(2)}
+		cpu.w32(CONF + CONF_STACK, arg(2))
+		cpu.w32(CONF + CONF_EVENTS, arg(0))
+		cpu.w32(CONF + CONF_THREADS, arg(1))
 	case 0x9d:
 		// GetConf(&events, &threads, &stack top), stored in the retail order.
-		cpu.w32(arg(2), bios.conf[2])
-		cpu.w32(arg(0), bios.conf[0])
-		cpu.w32(arg(1), bios.conf[1])
+		cpu.w32(arg(2), cpu.r32(CONF + CONF_STACK))
+		cpu.w32(arg(0), cpu.r32(CONF + CONF_EVENTS))
+		cpu.w32(arg(1), cpu.r32(CONF + CONF_THREADS))
 	case 0x9f:
 		set_mem_size(arg(0))
 	case 0xab, 0xac:
@@ -262,6 +265,10 @@ bios_b :: proc(fn: u32) {
 		core.tracef(.Bios, "B(%02xh) a0=%x a1=%x a2=%x ra=%x", fn, arg(0), arg(1), arg(2), cpu.state.r[31])
 	}
 	switch fn {
+	case 0x00:
+		ret(libc.alloc_kernel_memory(arg(0)))
+	case 0x01:
+		libc.free(arg(0)) // free_kernel_memory
 	case 0x07:
 		deliver_event(arg(0), arg(1))
 		ret(1)
@@ -382,6 +389,13 @@ bios_c :: proc(fn: u32) {
 		ret(0)
 	case 0x03:
 		ret(int_chain_dequeue(arg(0), arg(1)))
+	case 0x00, 0x01, 0x0c:
+		// EnqueueTimerAndVblankIrqs, EnqueueSyscallHandler and
+		// InitDefInt: the kernel's own handlers on its chains. The HLE runs
+		// those handlers host side, so there is nothing to enqueue.
+		ret(0)
+	case 0x08:
+		libc.sys_init_memory(arg(0), arg(1))
 	case 0x0a:
 		// ChangeClearRCnt(t, flag): returns the old flag.
 		if t := arg(0); t < len(bios.rcnt_ack) {
@@ -424,9 +438,8 @@ bios_entry :: proc(addr: u32, run: bool) -> bool {
 // class 0xf0000010 spec 0x4000.
 bios_syscall :: proc() {
 	if arg(0) == 3 {
-		off := (arg(1) & 0x1fffffff) - TCB_ARRAY
-		if off < MAX_THREADS * TCB_SIZE && off % TCB_SIZE == 0 {
-			change_thread(off / TCB_SIZE)
+		if i := tcb_slot(arg(1)); i >= 0 {
+			change_thread(u32(i))
 			return
 		}
 		if !bios.tcb_warn {
@@ -669,12 +682,32 @@ STACK_TOP :: 0x801fff00
 @(private)
 TABLE_STUBS :: FAKE_DCB_TABLE + 0x100
 
+// SetConf's counts and stack top, at the retail address: threads, events,
+// stack top. Games that set them without SetConf (MGS1) find the address in
+// the kernel's code: [0x474] points at the two instructions that store the
+// stack top, lui at, hi; sw a2, lo(at), and the counts sit 8 bytes before
+// that address. CONF_CODE holds those two instructions.
+@(private)
+CONF :: 0xb940
+@(private)
+CONF_THREADS :: 0
+@(private)
+CONF_EVENTS :: 4
+@(private)
+CONF_STACK :: 8
+@(private)
+CONF_CODE :: TABLE_STUBS + 8 * (B0_ENTRIES + C0_ENTRIES)
+@(private)
+CONF_CODE_PTR :: 0x474
+
 // Kernel RAM the HLE BIOS fixes, from 0x3000: the DCB table and the stubs
-// to 0x34f0, KERNEL_EXEC (exec.odin) at 0x3800, PAD_DRIVER at 0x4000 to
-// 0x598c, strtok's buffer and pointer (libc) at 0x9030-0x9133, and the
-// thread tables (PCB, TCB_ARRAY) at 0xe000-0xec10, in the 0xe000-0xffff
-// heap the retail kernel allocates them from.
+// to 0x34f0, the SetConf code words (CONF_CODE) to 0x34f8, KERNEL_EXEC
+// (exec.odin) at 0x3800, PAD_DRIVER at 0x4000 to 0x598c, strtok's buffer and
+// pointer (libc) at 0x9030-0x9133, SetConf's words (CONF) at 0xb940-0xb94b,
+// and the thread tables (PCB, TCB_ARRAY) at 0xe000-0xec10, in the
+// 0xe000-0xffff heap the retail kernel allocates them from.
 #assert(PAD_DRIVER + PAD_DRIVER_SIZE <= 0x9030)
+#assert(CONF_CODE + 8 <= KERNEL_EXEC)
 #assert(PCB >= 0xe000 && TCB_ARRAY + MAX_THREADS * TCB_SIZE <= 0x10000)
 
 bios_init :: proc() {
@@ -718,8 +751,18 @@ bios_init :: proc() {
 	cpu.w32(0x10c, 4)
 	cpu.w32(0x110, KSEG1 | TCB_ARRAY)
 	cpu.w32(0x114, MAX_THREADS * TCB_SIZE)
+	// Retail boots with the kernel heap at 0xa000e000 and allocates its
+	// tables from it; here they are fixed, and the heap is what they leave.
+	libc.sys_init_memory(KSEG1 | KERNEL_HEAP, 0x10000 - KERNEL_HEAP)
 	bios.rcnt_ack = {0 ..< len(bios.rcnt_ack) = true}
-	bios.conf = {MAX_EVENTS, MAX_THREADS, STACK_TOP}
+	conf: u32 = KSEG1 | (CONF + CONF_STACK)
+	hi := (conf + 0x8000) >> 16
+	cpu.w32(CONF_CODE, 0x3c010000 | hi) // lui at, hi
+	cpu.w32(CONF_CODE + 4, 0xac260000 | (conf & 0xffff)) // sw a2, lo(at)
+	cpu.w32(CONF_CODE_PTR, CONF_CODE)
+	cpu.w32(CONF + CONF_THREADS, MAX_THREADS)
+	cpu.w32(CONF + CONF_EVENTS, MAX_EVENTS)
+	cpu.w32(CONF + CONF_STACK, STACK_TOP)
 	threads_init()
 }
 
@@ -914,6 +957,7 @@ deliver_irq :: proc() {
 	cpu.state = saved_cpu
 	cpu.state.cycles = cycles
 	cpu.cop0.sr = saved_sr
+	preempt()
 }
 
 // SysEnqIntRP chains, highest priority (0) first. Each element is
@@ -1100,14 +1144,18 @@ MAX_THREADS :: 16
 // from the system table (verified against v4.5 retail kernel): [0x108] the
 // process control block, whose one word is the running thread's TCB, and
 // [0x10c] its size; [0x110] the TCBs, and [0x114] their size in bytes. The
-// pointers are uncached, as the retail kernel heap's are. Here the tables
-// sit at fixed addresses in that heap (bios_init).
+// pointers are uncached, as the retail kernel heap's are. At boot the
+// tables sit at fixed addresses in that heap (bios_init); tcb and pcb follow
+// the pointers.
 @(private)
 KSEG1 :: 0xa0000000
 @(private)
 PCB :: 0xe000
 @(private)
 TCB_ARRAY :: 0xe010
+// The kernel heap at boot: the rest of 0xe000-0xffff after the TCBs.
+@(private)
+KERNEL_HEAP :: TCB_ARRAY + MAX_THREADS * TCB_SIZE
 @(private)
 TCB_SIZE :: 0xc0
 
@@ -1176,9 +1224,36 @@ reap_zombie :: proc() {
 	}
 }
 
+// The thread tables are wherever the system table points: a game may set
+// up its own in the kernel heap (MGS1 does, with B(00h)), and then OpenTh,
+// ChangeTh and exception returns use those. The HLE's slots cover at most
+// MAX_THREADS of its TCBs.
 @(private)
 tcb :: #force_inline proc(i: int) -> u32 {
-	return TCB_ARRAY + u32(i) * TCB_SIZE
+	return (cpu.r32(0x110) & 0x1fffffff) + u32(i) * TCB_SIZE
+}
+
+// The number of TCBs the table holds that the HLE has slots for.
+@(private)
+thread_count :: proc() -> int {
+	return min(MAX_THREADS, int(cpu.r32(0x114) / TCB_SIZE))
+}
+
+// The PCB, whose word is the running thread's TCB.
+@(private)
+pcb :: #force_inline proc() -> u32 {
+	return cpu.r32(0x108) & 0x1fffffff
+}
+
+// The slot of the TCB at address a (any segment), or -1 for an address
+// that is not one of the table's TCBs.
+@(private)
+tcb_slot :: proc(a: u32) -> int {
+	off := (a & 0x1fffffff) - tcb(0)
+	if off % TCB_SIZE != 0 || off / TCB_SIZE >= u32(thread_count()) {
+		return -1
+	}
+	return int(off / TCB_SIZE)
 }
 
 @(private)
@@ -1188,7 +1263,7 @@ threads_init :: proc() {
 	for i in 0 ..< MAX_THREADS {
 		cpu.w32(tcb(i) + TCB_STATUS, i == 0 ? TCB_USED : TCB_FREE)
 	}
-	cpu.w32(PCB, KSEG1 | tcb(0))
+	cpu.w32(pcb(), KSEG1 | tcb(0))
 	cur_thread = 0
 	when core.FLAT {flat = {live = {0 = true}}}
 }
@@ -1221,7 +1296,7 @@ drop_thread :: proc(i: int) {
 // there after OpenTh.
 @(private)
 open_thread :: proc(pc, sp, gp: u32) -> u32 {
-	for i in 0 ..< MAX_THREADS {
+	for i in 0 ..< thread_count() {
 		t := tcb(i)
 		if cpu.r32(t + TCB_STATUS) != TCB_FREE {
 			continue
@@ -1272,7 +1347,7 @@ thread_entry :: proc(arg: rawptr) {
 @(private)
 close_thread :: proc(h: u32) -> u32 {
 	i := int(h & 0xffff)
-	if i == 0 || i >= MAX_THREADS || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
+	if i == 0 || i >= thread_count() || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
 		return 0
 	}
 	cpu.w32(tcb(i) + TCB_STATUS, TCB_FREE)
@@ -1285,7 +1360,7 @@ close_thread :: proc(h: u32) -> u32 {
 @(private)
 change_thread :: proc(h: u32) {
 	i := int(h & 0xffff)
-	if i >= MAX_THREADS || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
+	if i >= thread_count() || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
 		fmt.eprintfln("bios: ChangeTh to bad handle %#x", h)
 		ret(0)
 		return
@@ -1298,6 +1373,43 @@ change_thread :: proc(h: u32) {
 		cpu.fatal("ChangeTh to thread %d inside a mod hook: hooks run in frozen time and cannot switch threads (ra %#08x)", i, cpu.state.r[31])
 	}
 	when core.FLAT {cpu.flat_block("ChangeTh")}
+	switch_to(i)
+}
+
+// Exception return: retail loads the registers of the TCB the PCB names,
+// so a handler that points the PCB at another TCB switches threads when it
+// returns (MGS1's task scheduler does so from its VSync callback). The
+// switch here waits for a later return while it cannot happen: in a mod
+// hook, or under FLAT where the run cannot stop (cpu.flat_preempt_ok).
+@(private)
+preempt :: proc() {
+	p := cpu.r32(pcb()) & 0x1fffffff
+	if p == tcb(cur_thread) {
+		return
+	}
+	i := tcb_slot(p)
+	if i < 0 || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
+		if !bios.pcb_warn {
+			fmt.eprintfln("bios: PCB names %#x, not an open thread's TCB; staying on the running thread", p)
+			bios.pcb_warn = true
+		}
+		return
+	}
+	if cpu.mod_depth > 0 {
+		return
+	}
+	when core.FLAT {
+		if !cpu.flat_preempt_ok() {
+			return
+		}
+		cpu.flat_block("preempt")
+	}
+	switch_to(i)
+}
+
+// Save the running thread's registers in its TCB and go on with thread i's.
+@(private)
+switch_to :: proc(i: int) {
 	// A thread that lost its slot has no TCB to save into; OpenTh may have
 	// handed it to another thread.
 	if slot_owned() {
@@ -1312,7 +1424,7 @@ change_thread :: proc(h: u32) {
 		cpu.w32(t + TCB_EPC, TCB_PARKED)
 	}
 	t := tcb(i)
-	cpu.w32(PCB, KSEG1 | t)
+	cpu.w32(pcb(), KSEG1 | t)
 	for n in 1 ..< len(cpu.state.r) {
 		cpu.state.r[n] = cpu.r32(t + TCB_REGS + 4 * u32(n))
 	}
