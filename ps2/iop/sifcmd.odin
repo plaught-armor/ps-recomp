@@ -87,6 +87,8 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return rpc_client_bind(a0, a1, a2), true
 	case 16: // sceSifCallRpc(client, fno, mode, send, ...)
 		return rpc_client_call(a0, a1, a2, r[7]), true
+	case 18: // sceSifCheckStatRpc(client): 1 while its last call is out
+		return rpc_client_busy(a0), true
 	case 14, 17, 19, 20, 21, 22, 24, 25:
 		return sifrpc_fn(fno)
 	case 23: // sceSifGetOtherData(rd, src, dest, size, mode): done at once

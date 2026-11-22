@@ -2813,12 +2813,14 @@ test_reply_due :: proc() {
 	cpu.next_event = max(u64)
 	send_pkt(iop.SIF_CMD_INIT_CMD)
 	check(len(iop.sif.replies) == 2 && iop.sif.replies[0].due == 1000 && iop.sif.replies[1].due == 1000 && cpu.next_event == 1000, "reply due: an EE-side reply is due at EE now, the IOP ahead")
-	// And behind an IOP reply in flight it keeps the order.
+	// And it goes ahead of an IOP reply due later, which retail had not sent
+	// yet; the send costs the IOP thread SIF_SEND_CYCLES.
 	drop_replies()
 	r3000.state.cycles = 500
 	send(&pkt, 0x17)
+	check(r3000.state.cycles == 500 + iop.SIF_SEND_CYCLES, "reply due: a send costs the IOP thread")
 	send_pkt(iop.SIF_CMD_INIT_CMD)
-	check(len(iop.sif.replies) == 3 && iop.sif.replies[2].due == 4000, "reply due: an EE-side reply behind one in flight waits for it")
+	check(len(iop.sif.replies) == 3 && iop.sif.replies[0].due == 1000 && iop.sif.replies[1].due == 1000 && iop.sif.replies[2].due == 4000 && reply_word(2, 2) == 0x17, "reply due: an EE-side reply goes ahead of an IOP one due later")
 
 	// The SIF reset drops the queued replies.
 	send_pkt(iop.SIF_CMD_RESET, 0, 0, 0) // an empty path at +24
@@ -2827,6 +2829,7 @@ test_reply_due :: proc() {
 
 	// Held while due: update_next_event leaves it out; what frees it wakes the EE.
 	cpu.state.cycles = 4000
+	r3000.state.cycles = 0
 	send(&pkt, 0x18)
 	mem.dmac_stat |= 1 << mem.DMA_SIF0
 	kernel.update_next_event()
@@ -3117,7 +3120,7 @@ test_rpc :: proc() {
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6, 20)
 	ts := imports(&a, "thsemap", 4, 6, 8)
-	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 18)
+	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 9)
 	logp := log_words(&a, 24)
 	sem, th := at(&a), at(&a) + 4
 	put(&a, 0, 0)
@@ -3325,7 +3328,7 @@ test_rpc :: proc() {
 	// and leaves a row; its server goes, and the next call is modp's.
 	call(40, 3, 0, 0, 0, hsd)
 	lost := core.Compat_Key{.Iop_Rpc, RPC_SID, 3}
-	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 18}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
+	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 9}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
 	check(len(iop.sif.replies) == 0 && s.n_servers == 1 && s.n_queues == 1 && s.servers[0].sd == bp + psd, "rpc: no RPC_END, R's server dropped, modp's left")
 	call(41, 3, 0, 0, 0, hsd)
 	want = []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4, 1, 4, 1, 4, 3, 0} // R logged fno 3 before it stopped
@@ -3550,7 +3553,8 @@ test_rpc_self_remove :: proc() {
 // packet; the 33rd packet out returns -1; an unbound client or a pointer past
 // RAM is refused with a row; a bind no server answers returns 0 with a row; a
 // stray RPC_END and one for a client a failed load freed are rows; without
-// PS_IRX RPC_END is left to sif_command's row, the client untouched.
+// PS_IRX RPC_END is left to sif_command's row, the client untouched;
+// sceSifCheckStatRpc is 1 while a client's call is out and 0 once it ends.
 test_rpc_client :: proc() {
 	fresh()
 	clear(&core.compat.calls)
@@ -3731,13 +3735,24 @@ test_rpc_client :: proc() {
 	// NOWAIT with no end function: no RPC_END asked; the EE's DMA frees it.
 	check(fn_call(stk, c2, 3, 1, b + send, 4, b + recv, 4, 0, 0) == 0 && reply_word(0, 12) == 0, "rpc client: NOWAIT with no end function asks no RPC_END")
 	pkt := word(c2, iop.CL_PKT)
+	stat :: proc(client: u32) -> u32 {
+		r3000.state.r[4] = client
+		v, ok := iop.sifcmd_fn(18)
+		check(ok, "rpc client: sceSifCheckStatRpc served")
+		return v
+	}
+	check(stat(c2) == 1, "rpc client: CheckStatRpc is 1 while a NOWAIT call is out")
+	check(stat(c3) == 0 && stat(c2 + 1) == 0 && stat(0) == 0, "rpc client: CheckStatRpc is 0 for a client with no call, a misaligned one, none")
 	drop_replies()
 	for i in u32(0) ..< 16 {mem.wr32(EE_PKT + 4 * i, 0)}
 	for w, i in ([4]u32{EE_PKT, pkt, 64, 0}) {mem.wr32(EE_LIST + 4 * u32(i), w)}
 	iop.sif_set_dma(EE_LIST, 1, 0)
+	check(stat(c2) == 0, "rpc client: CheckStatRpc is 0 once the EE's DMA freed the packet")
 	check(fn_call(stk, c2, 4, 1, b + send, 4, b + recv, 4, end + b, 0) == 0 && word(c2, iop.CL_PKT) == pkt, "rpc client: the EE's DMA freed the packet")
+	check(stat(c2) == 1, "rpc client: CheckStatRpc is 1 while a call waits on its RPC_END")
 	drop_replies()
 	ee_end(c2, iop.SIF_CMD_RPC_CALL, 0, 0, 0, 0, 0)
+	check(stat(c2) == 0, "rpc client: CheckStatRpc is 0 once RPC_END freed the packet")
 
 	// The pool: 32 out, the 33rd refused; an END frees one.
 	for _ in 0 ..< iop.RPC_PKTS {

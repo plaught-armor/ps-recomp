@@ -236,6 +236,15 @@ rpc_pkt_free :: proc(pkt: u32) {
 	w32(pkt + PK_RPC_ID, 0)
 }
 
+// sceSifCheckStatRpc(client): 1 while the packet of its last bind or call is
+// out, 0 once RPC_END or the EE's DMA over it freed it.
+rpc_client_busy :: proc(client: u32) -> u32 {
+	if !rpc_client_ok(client) {return 0}
+	pkt := r32(client + CL_PKT)
+	if pkt == 0 || !rpc_iop_fits(pkt, RPC_PKT_SIZE) {return 0}
+	return 1 if r32(pkt + PK_REC_ID) & PK_IN_USE != 0 && r32(pkt + PK_CLIENT) == client else 0
+}
+
 // A free packet made ready for `client`, recorded there; 0 with none, which
 // bind and call return as -1.
 @(private = "file")

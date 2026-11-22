@@ -281,17 +281,34 @@ sif_held_server :: proc(server: u32) -> u64 {
 }
 
 // Queue a copy of packet `p`, its header filled in, sent by an IOP thread
-// (SifSendCmd), for the EE.
+// (SifSendCmd), for the EE. The send costs the thread SIF_SEND_CYCLES.
 sif_send_raw :: proc(p: []u8) {
 	sif_queue(slice.clone(p), true)
+	r3000.state.cycles += SIF_SEND_CYCLES
 }
+
+// What one SifSendCmd costs the IOP thread. Retail sets up the DMA in a
+// syscall of hundreds of instructions, so one thread's commands to the EE do
+// not all fall on one cycle (DDS: SET_SREG, then a bind to the EE server the
+// EE registers on seeing it). Our HLE calls cost nothing.
+SIF_SEND_CYCLES :: 200
 
 @(private = "file")
 sif_queue :: proc(p: []u8, from_iop: bool) {
 	due := cpu.state.cycles
 	if from_iop {due = max(due, r3000.state.cycles * IOP_EE_RATIO)}
-	if n := len(sif.replies); n != 0 {due = max(due, sif.replies[n - 1].due)} // FIFO
-	append(&sif.replies, Sif_Reply{due, p})
+	// What an IOP thread sends stays in send order, each waiting for the one
+	// before. A reply made at EE now goes ahead of IOP packets due later: the
+	// IOP runs a slice ahead of the EE, and on retail those were not yet sent
+	// (DDS: the EE's heap bind reply must land before SDFSDMAN's bind to
+	// 'SNRT', which the EE registers only after it).
+	i := len(sif.replies)
+	if from_iop {
+		if i != 0 {due = max(due, sif.replies[i - 1].due)}
+	} else {
+		for i > 0 && sif.replies[i - 1].due > due {i -= 1}
+	}
+	inject_at(&sif.replies, i, Sif_Reply{due, p})
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, due)}
 }
 
