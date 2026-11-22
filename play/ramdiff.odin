@@ -1,7 +1,7 @@
 // play --ramdiff: the main RAM bytes that a press script moves, for a PRESS
 // condition (core input_script_load). It reads the RAM dumps DUMP writes
-// (ram_<frame>.bin: PS1 main RAM, 2 MB, at the presents PS_DUMP_RAM says;
-// PS2 EE RAM, 32 MB, at every dumped frame) and prints each byte that
+// (ram_<frame>.bin, frame in 5 digits at least: PS1 main RAM, 2 MB, at
+// the presents PS_DUMP_RAM says; PS2 EE RAM, 32 MB, at every dumped frame) and prints each byte that
 // changed between every two frames named in a row, with its value at each:
 // "u8[801f2a40] 0 3 0", the address as a condition takes it (PS1 RAM at
 // 80000000). A frame written "=<frame>" instead wants the byte unchanged
@@ -40,7 +40,7 @@ ramdiff :: proc(dir: string, frames: []string) -> int {
 			return 2
 		}
 		// The name core.dump_put gives the dump.
-		path, _ := filepath.join({dir, fmt.tprintf("ram_%d.bin", frame)}, context.temp_allocator)
+		path, _ := filepath.join({dir, fmt.tprintf("ram_%05d.bin", frame)}, context.temp_allocator)
 		data, err := os.read_entire_file(path, context.temp_allocator)
 		if err != nil {
 			fmt.eprintln("ramdiff: cannot read", path, err)

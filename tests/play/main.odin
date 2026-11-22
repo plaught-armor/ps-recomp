@@ -2785,12 +2785,12 @@ test_ramdiff :: proc() {
 	ram := make([]u8, 2 << 20, context.temp_allocator)
 	for r, i in rams {
 		copy(ram, r)
-		path, _ := filepath.join({dir, fmt.tprintf("ram_%d.bin", i * 10)}, context.temp_allocator)
+		path, _ := filepath.join({dir, fmt.tprintf("ram_%05d.bin", i * 10)}, context.temp_allocator)
 		if os.write_entire_file(path, ram) != nil {
 			check(name, false, fmt.tprintf("cannot write %s", path))
 		}
 	}
-	small, _ := filepath.join({dir, "ram_40.bin"}, context.temp_allocator)
+	small, _ := filepath.join({dir, "ram_00040.bin"}, context.temp_allocator)
 	if os.write_entire_file(small, rams[0]) != nil {
 		check(name, false, fmt.tprintf("cannot write %s", small))
 	}

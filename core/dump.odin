@@ -9,8 +9,9 @@
 // so a headless run has a fixed length without SHOT.
 //
 // DUMP=<dir>: the game writes pictures and memory into dir as
-// <kind>_<frame>.<ext>, from frame DUMP_FROM (default 1) every DUMP_EVERY
-// frames (default 1). With DUMP_HASH=1 each dump is instead a line
+// <kind>_<frame>.<ext> (frame in 5 digits at least), at each frame from
+// DUMP_FROM (default 1) on that is a multiple of DUMP_EVERY (default 1).
+// With DUMP_HASH=1 each dump is instead a line
 // "<kind>\t<frame>\t<XXH3 of data>" in <dir>/hashes.tsv, which two runs can
 // be diffed by for the first frame they diverge. With DUMP_FD=<n> each dump
 // is instead written whole to the open file descriptor n (a pipe from a
