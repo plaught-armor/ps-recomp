@@ -65,6 +65,8 @@ init :: proc() {
 	mem.vu_mem_addr = vu.vu_mem_addr
 	mem.trace_store = kernel.trace_store
 	cpu.interp_hook = flat_call when core.FLAT else interp_call
+	// FLAT runs no native code, which alone calls jump_unknown.
+	when !core.FLAT {cpu.jump_hook = interp_jump}
 	mem.mem_init()
 	vu.vu_init()
 	vu.vif_dma_hook = dma.vif_dma

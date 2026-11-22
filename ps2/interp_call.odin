@@ -1,5 +1,6 @@
 // The EE interpreter for whole functions: cpu.call and cpu.jump_unknown run
-// an address no function is registered at here (cpu.interp_hook), so code
+// an address no function is registered at here (cpu.interp_hook, and
+// cpu.jump_hook for a jump: interp_jump), so code
 // the recompiler never saw, or a native blob that lacks a function, plays on
 // instead of stopping. It follows the recompiled code's control flow
 // (recomp/r5900/lower.odin): a call is a host call, `jr $ra` returns, and a
@@ -114,10 +115,26 @@ goto_pc :: proc(entry, pc, t: u32) -> bool {
 }
 
 interp_call :: proc(entry: u32) {
+	interp_start(entry, false)
+}
+
+// cpu.jump_hook: native code's jump to pc, inside its function but no label
+// of it (cpu.jump_unknown), interprets the rest of that function, and
+// returns at its `jr $ra`, an unwind aside: the native code under it is
+// the function's own frame and its callers', which go on from there. As a
+// call, a `jr $ra` to the caller's code would be a jump (interp_unwind_find)
+// that runs the caller's rest here, and then again in the caller.
+interp_jump :: proc(pc: u32) {
+	interp_start(pc, true)
+}
+
+@(private = "file")
+interp_start :: #force_inline proc(entry: u32, jumped: bool) {
 	// Learned code for the words RAM holds at entry now runs in place of the
 	// interpreter (learned.odin).
 	if fn := learned_find(entry); fn != nil {
 		lr := cpu.Learned_Run{interp_run(entry), entry, cpu.learned_top}
+		lr.jumped = jumped
 		cpu.learned_top = &lr
 		fn()
 		cpu.learned_top = lr.prev
@@ -126,6 +143,7 @@ interp_call :: proc(entry: u32) {
 	interp_enter(entry)
 	if cpu.state.cycles >= cpu.next_event {kernel.run_events()}
 	run := interp_run(entry)
+	run.jumped = jumped
 	if !core.learn_on(.Ee) {
 		interp_body(entry, nil, run, entry)
 		return
@@ -199,7 +217,7 @@ learned_jr_to :: proc(pc, t: u32) {
 learned_return :: #force_inline proc(pc, t: u32) {
 	lr := cpu.learned_top
 	if lr == nil {return}
-	if t == lr.ra && u32(cpu.state.r[29].d[0]) == lr.sp || !interp_unwind_find(t, lr.direct, lr.gaps) {return}
+	if t == lr.ra && u32(cpu.state.r[29].d[0]) == lr.sp || !interp_unwind_find(t, lr.run) {return}
 	if !goto_pc(lr.entry, pc, t) {interp_body(lr.entry, nil, lr.run, t)}
 	learned_left()
 }
@@ -325,7 +343,7 @@ interp_body :: proc(entry: u32, lf_in: ^core.Learn_Frame, run: cpu.Interp_Run, s
 			t := u32(c.r[i.rs].d[0])
 			delay_slot(pc + 4, lf)
 			if i.rs == 31 {
-				if t == ra && u32(c.r[29].d[0]) == sp || !interp_unwind_find(t, direct, gaps) {return}
+				if t == ra && u32(c.r[29].d[0]) == sp || !interp_unwind_find(t, run) {return}
 				// A jump to another fiber's code: this run ends here
 				// for LEARN, so none of that code is noted in it.
 				if lf != nil {
@@ -380,7 +398,8 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool, gaps: u32) -> bool
 // returns to t with another sp is no match. Else the `jr` returns as
 // before, except when no record matches and no run down to the thread's
 // base has host code's call under it: true, a jump, the native code under
-// the run (gaps, the run's) left open, at most cpu.NATIVE_STALE_MAX gaps.
+// the run (gaps, the run's) left open, at most cpu.NATIVE_STALE_MAX gaps;
+// never for a jumped run (interp_jump), whose `jr` returns.
 // A barrier record (host code's call) is under every run above it, and not
 // counted.
 //
@@ -395,7 +414,8 @@ interp_calls :: #force_inline proc(ret, t: u32, direct: bool, gaps: u32) -> bool
 // address (asserted here), and of a record and a run the one at the lower
 // address is the inner.
 @(private = "file")
-interp_unwind_find :: proc(t: u32, direct: bool, gaps: u32) -> bool {
+interp_unwind_find :: proc(t: u32, run: cpu.Interp_Run) -> bool {
+	direct, gaps := run.direct, run.gaps
 	sp := u32(cpu.state.r[29].d[0])
 	lm: ^cpu.Learned_Run
 	for l, k := cpu.learned_top, 0; l != nil && k < cpu.UNWIND_MAX; l, k = l.prev, k + 1 {
@@ -463,6 +483,9 @@ interp_unwind_find :: proc(t: u32, direct: bool, gaps: u32) -> bool {
 		cpu.interp_unwinds_native += 1
 		return false
 	}
+	// A jumped run (interp_jump) is the rest of a native function, whose
+	// `jr $ra` is that function's return: the native code under it goes on.
+	if run.jumped {return false}
 	if !ok {
 		if cpu.debug >= 1 && .Under not_in unwind_shown {
 			unwind_shown += {.Under}

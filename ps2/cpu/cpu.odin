@@ -291,10 +291,17 @@ thread_call :: proc(addr: u32) {
 	call(addr)
 }
 
+// Runs the rest of a native function from pc, inside it but no label of it
+// (jump_unknown), and returns at the function's `jr $ra`: ps2 sets the EE
+// interpreter here (interp_jump). Nil makes such a jump fatal.
+jump_hook: proc(pc: u32)
+
 // A jump inside a function to an address that is no label of it. Discovery
 // splits a function after a mid-body `jr $ra`, so switch cases past it land
 // in what was recompiled as another function: continue there as a tail call
-// (the guest stack frame is shared, and its `jr $ra` returns for us).
+// (the guest stack frame is shared). A pc no function is registered at runs
+// in jump_hook, whose `jr $ra` returns here, the function's return: the
+// native code then returns too.
 jump_unknown :: proc(fn, pc: u32) {
 	spin_dirty |= SPIN_SIDE
 	// Only x64 and arm64 code calls it, which FLAT never runs; a FLAT
@@ -305,8 +312,8 @@ jump_unknown :: proc(fn, pc: u32) {
 			return
 		}
 	}
-	if interp_hook != nil {
-		interp_hook(pc)
+	if jump_hook != nil {
+		jump_hook(pc)
 		return
 	}
 	fatal("function %08x: jump to %08x which is not a label", fn, pc)
@@ -379,9 +386,12 @@ interp_tops: [256]^Interp_Frame
 // host code's call is under it (direct: mods' chains count as one); and the
 // gaps under it (Interp_Frame): one more than the top record's when the call
 // into it is not that record's, or with none, not the thread's base.
+// jumped: the run is the rest of a native function from a pc no label of
+// it (jump_hook), so its `jr $ra` that unwinds to no call returns.
 Interp_Run :: struct {
 	ra, sp, gaps: u32,
 	direct:       bool,
+	jumped:       bool,
 }
 
 // A learned function running (ps2 interp_call), so its `jr $ra` to another

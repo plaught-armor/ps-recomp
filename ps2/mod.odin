@@ -221,6 +221,7 @@ mod_install :: proc(mods: []core.Mod_Manifest, chains: []core.Mod_Chain, prog: u
 		kernel.flat_drop = mod_flat_drop
 	} else {
 		cpu.interp_hook = mod_interp_hook
+		cpu.jump_hook = mod_jump_hook
 	}
 	return ""
 }
@@ -294,6 +295,18 @@ mod_live :: proc(site: int) -> bool {
 // while dispatch is off) runs the chain.
 @(private = "file")
 mod_interp_hook :: proc(addr: u32) {
+	mod_hook(addr, false)
+}
+
+// cpu.jump_hook with mods: as mod_interp_hook, the guest code at pc then
+// interpreted as the rest of the jumping function (interp_jump).
+@(private = "file")
+mod_jump_hook :: proc(pc: u32) {
+	mod_hook(pc, true)
+}
+
+@(private = "file")
+mod_hook :: #force_inline proc(addr: u32, jumped: bool) {
 	if fn := mem.mod_native(addr); fn != nil {
 		fn()
 		return
@@ -307,7 +320,11 @@ mod_interp_hook :: proc(addr: u32) {
 		return
 	}
 	if mem.mod_ram_has(addr) {mem.mod_interp_calls += 1}
-	interp_call(addr)
+	if jumped {
+		interp_jump(addr)
+	} else {
+		interp_call(addr)
+	}
 }
 
 // What a call to hooked site runs, recursive model: its chain when live,
