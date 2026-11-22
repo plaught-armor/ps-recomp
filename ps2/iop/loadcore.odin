@@ -750,16 +750,31 @@ modload_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	case 10: // LoadModuleBuffer(buffer)
 		return module_buffer_load(r[4]), true
 	case 16: // GetModuleIdList(int *list, int max, int *count)
-		// The ids of the modules run here, up to max of them; count gets
-		// how many there are. A Sony module has no record of its own.
-		l := &iop_loader
-		for m, i in l.modules {
-			if i32(i) < i32(r[5]) {w32(r[4] + u32(i) * 4, m.id)}
-		}
-		if r[6] != 0 {w32(r[6], u32(len(l.modules)))}
-		return KE_OK, true
+		return module_id_list("", false, r[4], r[5], r[6]), true
+	case 18: // GetModuleIdListByName(name, int *list, int max, int *count)
+		return module_id_list(r[4] != 0 ? cstr(r[4]) : "", r[4] != 0, r[5], r[6], r[7]), true
 	}
 	return 0, false
+}
+
+// GetModuleIdList(ByName): the ids of the modules run here (those named
+// `name` when by_name), up to max of them, into list; count gets how many
+// there are, and the call returns how many it wrote. A Sony module has no
+// record of its own.
+@(private = "file")
+module_id_list :: proc(name: string, by_name: bool, list, max_n, count: u32) -> u32 {
+	n, wrote: u32
+	for m in iop_loader.modules {
+		m := m
+		if by_name && strings.truncate_to_byte(string(m.name[:]), 0) != name {continue}
+		if i32(wrote) < i32(max_n) {
+			w32(list + wrote * 4, m.id)
+			wrote += 1
+		}
+		n += 1
+	}
+	if count != 0 {w32(count, n)}
+	return wrote
 }
 
 // LoadModuleBuffer: links the IRX image at `buf`, which the caller may free

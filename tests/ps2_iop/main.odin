@@ -984,6 +984,23 @@ test_modload :: proc() {
 	check(l.depth == 0 && l.loading == 0, "modload: no start under way after the load")
 	inner_base := module_base(idi)
 
+	// GetModuleIdList (16) and GetModuleIdListByName (18): ids up to max,
+	// the count of all, how many written returned; a null name is any.
+	{
+		ml :: proc(fno: u32, args: ..u32) -> u32 {
+			for v, i in args {r3000.state.r[4 + i] = v}
+			v, ok := iop.hle_fn("modload", fno)
+			check(ok, fmt.tprintf("modload: fno %d served", fno))
+			return v
+		}
+		LIST, CNT, NAME :: 0x1f0000, 0x1f0100, 0x1f0200
+		copy(iop.iop_ram[NAME:], "inner\x00")
+		check(ml(16, LIST, 8, CNT) == 2 && w(CNT, 0) == 2 && w(LIST, 0) + w(LIST, 1) == u32(ido + idi) && w(LIST, 0) != w(LIST, 1), "modload: id list, all")
+		check(ml(16, LIST + 0x10, 1, CNT) == 1 && w(CNT, 0) == 2, "modload: id list, max 1 counts all")
+		check(ml(18, NAME, LIST, 8, CNT) == 1 && w(LIST, 0) == u32(idi) && w(CNT, 0) == 1, "modload: id list by name")
+		check(ml(18, NAME + 1, LIST, 8, CNT) == 0 && w(CNT, 0) == 0 && ml(18, 0, LIST, 8, 0) == 2, "modload: by name, none; null name any")
+	}
+
 	// An inner start that calls what the HLE lacks: only its module dropped,
 	// pldm loads.
 	fresh()
@@ -1450,6 +1467,15 @@ test_sysclib :: proc() {
 	check(call(8, '~') == 0x10 && call(8, 0xffffffff) == 0 && call(8, 150) == 0, "sysclib: ctype punct; EOF and 128..158 are 0")
 	ct := core.Compat_Key{.Iop_Call, core.compat_name("sysclib"), 8}
 	check(core.compat.calls[ct].n == 0 && call(8, 159) == 0 && call(8, 0xfffffffe) == 0 && core.compat.calls[ct].n == 2, "sysclib: ctype past -1..158 is 0 with a row")
+
+	// toupper, tolower: letters only, other values as they are.
+	check(call(6, 'a') == 'A' && call(6, 'z') == 'Z' && call(6, 'A') == 'A' && call(6, '{') == '{' && call(6, 0xffffffff) == 0xffffffff, "sysclib: toupper")
+	check(call(7, 'A') == 'a' && call(7, 'Z') == 'z' && call(7, 'a') == 'a' && call(7, '@') == '@' && call(7, 0x1c1) == 0x1c1, "sysclib: tolower")
+
+	// strrchr: the last match, the NUL for 0, 0 for none or null.
+	put_str(A, "a/b/c")
+	check(call(32, A, '/') == A + 3 && call(32, A, 'a') == A && call(32, A, 0x100 + 'c') == A + 4, "sysclib: strrchr last, char of c")
+	check(call(32, A, 0) == A + 5 && call(32, A, 'x') == 0 && call(32, 0, '/') == 0, "sysclib: strrchr NUL, none, null")
 
 	// memcmp: n <= 0, first difference unsigned, -1/1.
 	put_str(A, "ab\x80")
@@ -6722,7 +6748,8 @@ test_alarm :: proc() {
 }
 
 // thbase 27 CancelWakeupThread: a thread's call only; the thread's wakeups,
-// 0 the caller's, returned and cleared; an unknown thread -407.
+// 0 the caller's, returned and cleared; an unknown thread -407. 28
+// iCancelWakeupThread: a handler's call only, thread 0 -406.
 test_wakeup_cancel :: proc() {
 	fresh()
 	s := &iop.iop_sched
@@ -6738,6 +6765,12 @@ test_wakeup_cancel :: proc() {
 	s.cur, t.wakeups = id, 2
 	check(tb_call(27, 0) == 2 && t.wakeups == 0, "cancel wakeup: thread 0 is the caller")
 	s.cur = cur
+	t.wakeups = 4
+	check(tb_call(28, id) == neg(-iop.KE_ILLEGAL_CONTEXT) && t.wakeups == 4, "icancel wakeup: in a thread illegal")
+	s.intr = true
+	check(tb_call(28, 0) == neg(-iop.KE_ILLEGAL_THID), "icancel wakeup: thread 0 illegal")
+	check(tb_call(28, id) == 4 && t.wakeups == 0, "icancel wakeup: the count returned and cleared")
+	s.intr = false
 	fresh()
 }
 

@@ -259,6 +259,12 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		n := copy(dst, out)
 		if n < len(dst) {dst[n] = 0}
 		return count, true
+	case 6: // toupper(c)
+		c := i32(a0)
+		return u32(c - 0x20 if c >= 'a' && c <= 'z' else c), true
+	case 7: // tolower(c)
+		c := i32(a0)
+		return u32(c + 0x20 if c >= 'A' && c <= 'Z' else c), true
 	case 20: // strcat(dst, src): dst; 0 when either is null or both end at one address
 		if a0 == 0 || a1 == 0 {return 0, true}
 		end, src := a0 + u32(len(cstr(a0))), cstr(a1)
@@ -282,6 +288,12 @@ sysclib_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		k := copy(dst, src)
 		for &b in dst[k:] {b = 0}
 		return a0, true
+	case 32: // strrchr(s, c): the last (char)c in s, its NUL for 0; 0 for null s or none
+		if a0 == 0 {return 0, true}
+		str, c := cstr(a0), u8(a1)
+		if c == 0 {return a0 + u32(len(str)), true}
+		i := strings.last_index_byte(str, c)
+		return i < 0 ? 0 : a0 + u32(i), true
 	case 34: // strstr(hay, needle)
 		return iop_strstr(a0, a1), true
 	case 36: // strtol(s, char **end, base): see iop_strtol; a null s gives 0 and leaves *end

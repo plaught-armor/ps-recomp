@@ -1174,14 +1174,14 @@ th_refer :: proc(id, info: u32) -> u32 {
 // those served here, and which of them are its i-variants.
 @(rodata)
 TH_CHECKED := [Th_Lib]Fno_Set {
-	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 19, 20, 22, 24, 25, 26, 27, 33, 35, 36, 37, 38, 42},
+	.Base  = {4, 5, 6, 7, 8, 9, 10, 11, 14, 16, 19, 20, 22, 24, 25, 26, 27, 28, 33, 35, 36, 37, 38, 42},
 	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
 	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
 	.Msgbx = {4, 5, 6, 7, 8, 9},
 }
 @(rodata)
 TH_IVAR := [Th_Lib]Fno_Set {
-	.Base  = {11, 19, 26, 36, 38},
+	.Base  = {11, 19, 26, 28, 36, 38},
 	.Semap = {7, 12},
 	.Event = {7, 9, 14},
 	.Msgbx = {7},
@@ -1328,7 +1328,8 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return th_release_wait(a0), true
 	case 25, 26: // WakeupThread(thid), iWakeupThread(thid)
 		return th_wakeup(a0), true
-	case 27: // CancelWakeupThread(thid): thid 0 the caller; its wakeups, now none
+	case 27, 28: // CancelWakeupThread(thid), iCancelWakeupThread(thid): thid 0 the caller, which a handler has not; its wakeups, now none
+		if a0 == 0 && fno == 28 {return ke(KE_ILLEGAL_THID), true}
 		t := th_find(s.cur if a0 == 0 else a0)
 		if t == nil {return ke(KE_UNKNOWN_THID), true}
 		n := t.wakeups
