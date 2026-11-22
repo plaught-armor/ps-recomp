@@ -687,151 +687,11 @@ main :: proc() {
 	for k in u32(0) ..< 16 {
 		check(fmt.tprintf("TCB %d status at boot", k), cpu.r32(tcbs + k * 0xc0), k == 0 ? 0x4000 : 0x1000)
 	}
-	tcb1 := tcbs + 0xc0
-	reg :: proc(t: u32, n: u32) -> u32 {return t + 8 + 4 * n}
-	h := b(0x0e, FN_THREAD, 0x801f0000, 0x80012345)
-	check("OpenTh", h, 0xff000001)
-	check("OpenTh status", cpu.r32(tcb1), 0x4000)
-	check("OpenTh mode", cpu.r32(tcb1 + 4), 0x1000)
-	check("OpenTh gp", cpu.r32(reg(tcb1, 28)), 0x80012345)
-	check("OpenTh sp", cpu.r32(reg(tcb1, 29)), 0x801f0000)
-	check("OpenTh fp", cpu.r32(reg(tcb1, 30)), 0x801f0000)
-	check("OpenTh epc", cpu.r32(tcb1 + 0x88), FN_THREAD)
-	check("OpenTh sr", cpu.r32(tcb1 + 0x94), 0x40000404)
-
-	// A round trip: the thread starts on its TCB's registers, and comes back
-	// to the main thread's with v0 1. Its own are left in its TCB.
+	// Switches the host makes itself run only as coroutines: under FLAT a
+	// thread switch stops the running flat run, and host code cannot (see
+	// thread_switches).
+	when !core.FLAT {thread_switches(tcbs)}
 	r := &cpu.state.r
-	r[16], r[29] = 0xaaaa, 0x801ffe00
-	main_sr := cpu.cop0.sr
-	check("ChangeTh", b(0x10, h), 1)
-	check("main thread s0 after ChangeTh", r[16], 0xaaaa)
-	check("main thread sp after ChangeTh", r[29], 0x801ffe00)
-	check("thread s0 at entry", th.s0, 0)
-	check("thread gp at entry", th.gp, 0x80012345)
-	check("thread sr at entry, the TCB's after rfe", th.sr, 0x40000401)
-	check("main thread sr after ChangeTh", cpu.cop0.sr, main_sr)
-	check("main thread's sr in its TCB, as exception entry saves it", cpu.r32(tcbs + 0x94), (main_sr & ~u32(0x3f)) | ((main_sr << 2) & 0x3c))
-	check("running TCB in the thread", th.pcb, tcb1)
-	check("running TCB back on the main thread", cpu.r32(cpu.r32(0x108)), tcbs)
-	check("suspended thread's s0 in its TCB", cpu.r32(reg(tcb1, 16)), 0x1111)
-	check("suspended thread's v0 in its TCB", cpu.r32(reg(tcb1, 2)), 1)
-	check("main thread's s0 in its TCB", cpu.r32(reg(tcbs, 16)), 0xaaaa)
-
-	// A guest write to a suspended TCB's s0 is what the thread resumes with.
-	cpu.w32(reg(tcb1, 16), 0x2222)
-	b(0x10, h)
-	check("thread v0 after its ChangeTh", th.v0[0], 1)
-	check("thread s0 after a write to its TCB", th.s0_back[0], 0x2222)
-
-	// A guest write of its epc starts it over there; the continuation it
-	// left is never resumed.
-	cpu.w32(tcb1 + 0x88, FN_RESTART)
-	cpu.w32(tcb1 + 0x94, 0x40000010)
-	b(0x10, h)
-	if th.restarts != 1 || th.abandoned {
-		fail("after an epc write the thread restarted %d times, abandoned continuation ran %v", th.restarts, th.abandoned)
-	}
-	check("restarted thread's s0", th.restart_s0, 0x2222)
-	check("restarted thread's sr after a write to its TCB", th.restart_sr, 0x40000014)
-
-	// syscall 3 to its TCB, in any segment, switches as ChangeTh does; to any
-	// other address it stays on the running thread.
-	r[4], r[5], r[16] = 3, 0x80000000 | (tcb1 & 0x1fffffff), 0xbbbb
-	cpu.syscall(0)
-	check("syscall 3 to a TCB", r[2], 1)
-	check("main thread s0 after syscall 3", r[16], 0xbbbb)
-	check("thread resumes after syscall 3", u32(th.resumes), 1)
-	for a5 in ([?]u32{tcb1 + 4, tcbs + 16 * 0xc0, 0x1234}) {
-		r[2], r[4], r[5] = 0, 3, a5
-		cpu.syscall(0)
-		check(fmt.tprintf("syscall 3 to %#x", a5), r[2], 1)
-	}
-	check("thread resumes after syscall 3 to other addresses", u32(th.resumes), 1)
-	check("running TCB after syscall 3 to other addresses", cpu.r32(cpu.r32(0x108)), tcbs)
-
-	// CloseTh frees the TCB; so does a guest write of its status. OpenTh
-	// then reuses the slot and lets the old coroutine go: more rounds than
-	// the coroutine pool holds stacks.
-	check("CloseTh", b(0x0f, h), 1)
-	check("CloseTh status", cpu.r32(tcb1), 0x1000)
-	check("ChangeTh to a closed thread", b(0x10, h), 0)
-	th.resumes = 0
-	for k in 0 ..< 140 {
-		h = b(0x0e, FN_RESTART, 0x801f0000, 0)
-		check("OpenTh of a freed slot", h, 0xff000001)
-		b(0x10, h)
-		b(0x10, h)
-		if k < 70 {
-			b(0x0f, h)
-		} else {
-			cpu.w32(tcb1, 0x1000)
-		}
-	}
-	check("restarted thread runs after reuse", u32(th.restarts), 141)
-	check("resumes over the reuse rounds", u32(th.resumes), 140)
-
-	// An exception return goes on with the TCB the PCB names: a handler
-	// pointing it at another thread's TCB switches there, the main thread's
-	// registers saved, and the thread pointing it back returns at its own
-	// next exception. A PCB naming no open thread's TCB stays put.
-	h = b(0x0e, FN_PREEMPT, 0x801f0000, 0)
-	r[16] = 0xcccc
-	cpu.w32(cpu.r32(0x108), tcb1)
-	irq(0)
-	check("thread runs after an exception return to its TCB", u32(th.preempts), 1)
-	check("thread s0 after the switch", th.preempt_s0, 0)
-	check("main thread s0 back from the thread", r[16], 0xcccc)
-	check("running TCB back on the main thread after the thread's exception", cpu.r32(cpu.r32(0x108)), tcbs)
-	cpu.w32(reg(tcb1, 16), 0x3333)
-	cpu.w32(cpu.r32(0x108), tcb1)
-	irq(0)
-	check("thread resumes at its exception return", u32(th.preempts), 2)
-	check("resumed thread's s0 from its TCB", th.preempt_s0, 0x3333)
-	check("main thread s0 after the second round", r[16], 0xcccc)
-	cpu.w32(cpu.r32(0x108), 0x1234)
-	irq(0)
-	check("PCB naming no TCB: no switch", u32(th.preempts), 2)
-	cpu.w32(cpu.r32(0x108), tcbs)
-	check("CloseTh of the preempted thread", b(0x0f, h), 1)
-
-	// Thread tables a game sets up itself (MGS1, in the kernel heap): OpenTh,
-	// ChangeTh and exception returns follow the system table's pointers.
-	old_pcb, old_tcbs, old_size := cpu.r32(0x108), cpu.r32(0x110), cpu.r32(0x114)
-	NEW_PCB :: 0xa0170000
-	NEW_TCBS :: 0xa0170010
-	cpu.w32(0x108, NEW_PCB)
-	cpu.w32(0x110, NEW_TCBS)
-	cpu.w32(0x114, 4 * 0xc0)
-	for k in u32(0) ..< 4 {
-		cpu.w32(NEW_TCBS + k * 0xc0, k == 0 ? 0x4000 : 0x1000)
-	}
-	cpu.w32(NEW_PCB, NEW_TCBS)
-	h = b(0x0e, FN_PREEMPT, 0x801f0000, 0)
-	check("OpenTh in a game's table", h, 0xff000001)
-	check("OpenTh status in a game's table", cpu.r32(NEW_TCBS + 0xc0), 0x4000)
-	check("OpenTh epc in a game's table", cpu.r32(NEW_TCBS + 0xc0 + 0x88), FN_PREEMPT)
-	r[16] = 0xdddd
-	cpu.w32(NEW_PCB, NEW_TCBS + 0xc0)
-	irq(0)
-	check("exception return to a TCB of a game's table", u32(th.preempts), 3)
-	check("main thread s0 back from a game's table", r[16], 0xdddd)
-	check("running TCB in a game's table", cpu.r32(NEW_PCB) & 0x1fffffff, NEW_TCBS & 0x1fffffff)
-	// A table the thread shrinks under itself has no slot to save it in: the
-	// switch back leaves the word past the table alone.
-	cpu.w32(reg(NEW_TCBS + 0xc0, 16), 0x5a5a)
-	th.shrink = true
-	cpu.w32(NEW_PCB, NEW_TCBS + 0xc0)
-	irq(0)
-	th.shrink = false
-	check("exception return in a shrunk table", u32(th.preempts), 4)
-	check("main thread s0 back from a shrunk table", r[16], 0xdddd)
-	check("no save past a shrunk table", cpu.r32(reg(NEW_TCBS + 0xc0, 16)), 0x5a5a)
-	cpu.w32(0x114, 4 * 0xc0)
-	check("CloseTh in a game's table", b(0x0f, h), 1)
-	cpu.w32(0x108, old_pcb)
-	cpu.w32(0x110, old_tcbs)
-	cpu.w32(0x114, old_size)
 
 	// libpad's pointers into the pad driver stop and restart pad reading.
 	check("InitPAD", b(0x12, PAD_BUF, 0x22, 0, 0), 1)
@@ -1128,4 +988,160 @@ main :: proc() {
 		os.exit(1)
 	}
 	fmt.println("ok psx_bios: event matching, WaitEvent, root counter and IRQ events, ReturnFromException, B(15h)/B(16h), kernel layout, pad driver, memory card, A functions run as B, the executable loaders, C library slots, hang stubs, return-0 stubs, thread tables")
+}
+
+// OpenTh, ChangeTh, syscall 3, CloseTh and exception returns between the
+// main thread and FN_THREAD, FN_RESTART and FN_PREEMPT. The test drives
+// them from host code: the threads are host procs, and ChangeTh returns
+// to the host check that called it. That is the coroutine model only;
+// under FLAT a switch stops the running flat run (cpu.flat_block), which
+// host code outside a run, or a registered proc inside one, has none of.
+// tests/psx_mod test_threads switches guest-code threads under FLAT.
+@(private = "file")
+thread_switches :: proc(tcbs: u32) {
+	tcb1 := tcbs + 0xc0
+	reg :: proc(t: u32, n: u32) -> u32 {return t + 8 + 4 * n}
+	h := b(0x0e, FN_THREAD, 0x801f0000, 0x80012345)
+	check("OpenTh", h, 0xff000001)
+	check("OpenTh status", cpu.r32(tcb1), 0x4000)
+	check("OpenTh mode", cpu.r32(tcb1 + 4), 0x1000)
+	check("OpenTh gp", cpu.r32(reg(tcb1, 28)), 0x80012345)
+	check("OpenTh sp", cpu.r32(reg(tcb1, 29)), 0x801f0000)
+	check("OpenTh fp", cpu.r32(reg(tcb1, 30)), 0x801f0000)
+	check("OpenTh epc", cpu.r32(tcb1 + 0x88), FN_THREAD)
+	check("OpenTh sr", cpu.r32(tcb1 + 0x94), 0x40000404)
+
+	// A round trip: the thread starts on its TCB's registers, and comes back
+	// to the main thread's with v0 1. Its own are left in its TCB.
+	r := &cpu.state.r
+	r[16], r[29] = 0xaaaa, 0x801ffe00
+	main_sr := cpu.cop0.sr
+	check("ChangeTh", b(0x10, h), 1)
+	check("main thread s0 after ChangeTh", r[16], 0xaaaa)
+	check("main thread sp after ChangeTh", r[29], 0x801ffe00)
+	check("thread s0 at entry", th.s0, 0)
+	check("thread gp at entry", th.gp, 0x80012345)
+	check("thread sr at entry, the TCB's after rfe", th.sr, 0x40000401)
+	check("main thread sr after ChangeTh", cpu.cop0.sr, main_sr)
+	check("main thread's sr in its TCB, as exception entry saves it", cpu.r32(tcbs + 0x94), (main_sr & ~u32(0x3f)) | ((main_sr << 2) & 0x3c))
+	check("running TCB in the thread", th.pcb, tcb1)
+	check("running TCB back on the main thread", cpu.r32(cpu.r32(0x108)), tcbs)
+	check("suspended thread's s0 in its TCB", cpu.r32(reg(tcb1, 16)), 0x1111)
+	check("suspended thread's v0 in its TCB", cpu.r32(reg(tcb1, 2)), 1)
+	check("main thread's s0 in its TCB", cpu.r32(reg(tcbs, 16)), 0xaaaa)
+
+	// A guest write to a suspended TCB's s0 is what the thread resumes with.
+	cpu.w32(reg(tcb1, 16), 0x2222)
+	b(0x10, h)
+	check("thread v0 after its ChangeTh", th.v0[0], 1)
+	check("thread s0 after a write to its TCB", th.s0_back[0], 0x2222)
+
+	// A guest write of its epc starts it over there; the continuation it
+	// left is never resumed.
+	cpu.w32(tcb1 + 0x88, FN_RESTART)
+	cpu.w32(tcb1 + 0x94, 0x40000010)
+	b(0x10, h)
+	if th.restarts != 1 || th.abandoned {
+		fail("after an epc write the thread restarted %d times, abandoned continuation ran %v", th.restarts, th.abandoned)
+	}
+	check("restarted thread's s0", th.restart_s0, 0x2222)
+	check("restarted thread's sr after a write to its TCB", th.restart_sr, 0x40000014)
+
+	// syscall 3 to its TCB, in any segment, switches as ChangeTh does; to any
+	// other address it stays on the running thread.
+	r[4], r[5], r[16] = 3, 0x80000000 | (tcb1 & 0x1fffffff), 0xbbbb
+	cpu.syscall(0)
+	check("syscall 3 to a TCB", r[2], 1)
+	check("main thread s0 after syscall 3", r[16], 0xbbbb)
+	check("thread resumes after syscall 3", u32(th.resumes), 1)
+	for a5 in ([?]u32{tcb1 + 4, tcbs + 16 * 0xc0, 0x1234}) {
+		r[2], r[4], r[5] = 0, 3, a5
+		cpu.syscall(0)
+		check(fmt.tprintf("syscall 3 to %#x", a5), r[2], 1)
+	}
+	check("thread resumes after syscall 3 to other addresses", u32(th.resumes), 1)
+	check("running TCB after syscall 3 to other addresses", cpu.r32(cpu.r32(0x108)), tcbs)
+
+	// CloseTh frees the TCB; so does a guest write of its status. OpenTh
+	// then reuses the slot and lets the old coroutine go: more rounds than
+	// the coroutine pool holds stacks.
+	check("CloseTh", b(0x0f, h), 1)
+	check("CloseTh status", cpu.r32(tcb1), 0x1000)
+	check("ChangeTh to a closed thread", b(0x10, h), 0)
+	th.resumes = 0
+	for k in 0 ..< 140 {
+		h = b(0x0e, FN_RESTART, 0x801f0000, 0)
+		check("OpenTh of a freed slot", h, 0xff000001)
+		b(0x10, h)
+		b(0x10, h)
+		if k < 70 {
+			b(0x0f, h)
+		} else {
+			cpu.w32(tcb1, 0x1000)
+		}
+	}
+	check("restarted thread runs after reuse", u32(th.restarts), 141)
+	check("resumes over the reuse rounds", u32(th.resumes), 140)
+
+	// An exception return goes on with the TCB the PCB names: a handler
+	// pointing it at another thread's TCB switches there, the main thread's
+	// registers saved, and the thread pointing it back returns at its own
+	// next exception. A PCB naming no open thread's TCB stays put.
+	h = b(0x0e, FN_PREEMPT, 0x801f0000, 0)
+	r[16] = 0xcccc
+	cpu.w32(cpu.r32(0x108), tcb1)
+	irq(0)
+	check("thread runs after an exception return to its TCB", u32(th.preempts), 1)
+	check("thread s0 after the switch", th.preempt_s0, 0)
+	check("main thread s0 back from the thread", r[16], 0xcccc)
+	check("running TCB back on the main thread after the thread's exception", cpu.r32(cpu.r32(0x108)), tcbs)
+	cpu.w32(reg(tcb1, 16), 0x3333)
+	cpu.w32(cpu.r32(0x108), tcb1)
+	irq(0)
+	check("thread resumes at its exception return", u32(th.preempts), 2)
+	check("resumed thread's s0 from its TCB", th.preempt_s0, 0x3333)
+	check("main thread s0 after the second round", r[16], 0xcccc)
+	cpu.w32(cpu.r32(0x108), 0x1234)
+	irq(0)
+	check("PCB naming no TCB: no switch", u32(th.preempts), 2)
+	cpu.w32(cpu.r32(0x108), tcbs)
+	check("CloseTh of the preempted thread", b(0x0f, h), 1)
+
+	// Thread tables a game sets up itself (MGS1, in the kernel heap): OpenTh,
+	// ChangeTh and exception returns follow the system table's pointers.
+	old_pcb, old_tcbs, old_size := cpu.r32(0x108), cpu.r32(0x110), cpu.r32(0x114)
+	NEW_PCB :: 0xa0170000
+	NEW_TCBS :: 0xa0170010
+	cpu.w32(0x108, NEW_PCB)
+	cpu.w32(0x110, NEW_TCBS)
+	cpu.w32(0x114, 4 * 0xc0)
+	for k in u32(0) ..< 4 {
+		cpu.w32(NEW_TCBS + k * 0xc0, k == 0 ? 0x4000 : 0x1000)
+	}
+	cpu.w32(NEW_PCB, NEW_TCBS)
+	h = b(0x0e, FN_PREEMPT, 0x801f0000, 0)
+	check("OpenTh in a game's table", h, 0xff000001)
+	check("OpenTh status in a game's table", cpu.r32(NEW_TCBS + 0xc0), 0x4000)
+	check("OpenTh epc in a game's table", cpu.r32(NEW_TCBS + 0xc0 + 0x88), FN_PREEMPT)
+	r[16] = 0xdddd
+	cpu.w32(NEW_PCB, NEW_TCBS + 0xc0)
+	irq(0)
+	check("exception return to a TCB of a game's table", u32(th.preempts), 3)
+	check("main thread s0 back from a game's table", r[16], 0xdddd)
+	check("running TCB in a game's table", cpu.r32(NEW_PCB) & 0x1fffffff, NEW_TCBS & 0x1fffffff)
+	// A table the thread shrinks under itself has no slot to save it in: the
+	// switch back leaves the word past the table alone.
+	cpu.w32(reg(NEW_TCBS + 0xc0, 16), 0x5a5a)
+	th.shrink = true
+	cpu.w32(NEW_PCB, NEW_TCBS + 0xc0)
+	irq(0)
+	th.shrink = false
+	check("exception return in a shrunk table", u32(th.preempts), 4)
+	check("main thread s0 back from a shrunk table", r[16], 0xdddd)
+	check("no save past a shrunk table", cpu.r32(reg(NEW_TCBS + 0xc0, 16)), 0x5a5a)
+	cpu.w32(0x114, 4 * 0xc0)
+	check("CloseTh in a game's table", b(0x0f, h), 1)
+	cpu.w32(0x108, old_pcb)
+	cpu.w32(0x110, old_tcbs)
+	cpu.w32(0x114, old_size)
 }
