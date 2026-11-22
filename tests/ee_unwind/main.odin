@@ -73,7 +73,9 @@
 // and with another sp than K's (DELTA 16), which no call has: a jump, then
 // K's own return unwinds to the call of K. Last, a learned X that jumps
 // out of its words to Y with another sp: Y's return is one to X's own
-// call, which X's jump out must end.
+// call, which X's jump out must end. And a learned X that `jr`s out of its
+// words with another stack and $ra, as a GOAL state's enter: the code
+// there goes on in X's run, as the interpreted X's does.
 //
 // With the argument goto (the coroutine model only), G saves $ra, reads
 // Count after three register instructions, calls H, then counts down a
@@ -829,6 +831,7 @@ Catch_Case :: struct {
 	learned: bit_set[Catch_Fn],
 	delta:   u32,
 	tail:    bool, // main calls X, not K
+	jr_out:  bool, // X leaves by a `jr` with its own sp and $ra (XJ_)
 	ref:     int, // the case with none learned it must end as
 	counted: bool, // with as many unwinds and jumps too
 }
@@ -847,6 +850,14 @@ CATCH_CASES :: [?]Catch_Case {
 	// The interpreted X goes on in its own run; the learned one's jump
 	// out is a run of its own, whose return unwinds to X's call.
 	{name = "learned X jumps out", learned = {.X}, tail = true, ref = 2},
+	// A GOAL state's enter (Jak II 0033c3d4): X `jr`s out of its words to
+	// Y with sp on another stack and $ra Z, no call's. Y's `jr $ra` is a
+	// jump to Z in X's run, and Z's return, with X's caller's $ra and sp,
+	// is X's. The learned X goes on in its own run too (ps2 learned_goto):
+	// a run of its own from Y would take Z as its return address, and Y's
+	// return would come back to X on the other stack, Z skipped.
+	{name = "none learned, a jr out", tail = true, jr_out = true, ref = 11, counted = true},
+	{name = "learned X jrs out", learned = {.X}, tail = true, jr_out = true, ref = 11, counted = true},
 }
 
 CATCH_BASE :: u32(0x00110000) // case k's code at CATCH_BASE + k * 0x1000
@@ -854,6 +865,9 @@ CATCH_FN :: 0x100 // each function's room; X's Y is past X's
 STEP :: DATA + 0x200 // the cases done
 GO :: DATA + 0x204 // the cases the host has seen done
 CATCH_RES :: DATA + 0x300
+XJ_SP :: DATA + 0x208 // jr out: X's caller's sp, which Z restores
+XJ_RA :: DATA + 0x20c // and its $ra
+XJ_STACK :: DATA + 0x3000 // the other stack X's jr out takes
 
 catch_fn :: proc(k: int, f: Catch_Fn) -> u32 {
 	return CATCH_BASE + u32(k) * 0x1000 + (u32(f) + 1) * CATCH_FN
@@ -900,6 +914,26 @@ program_catch :: proc() {
 		// frame, counts and returns to X's caller.
 		f = {catch_fn(k, .X)}
 		y := f.pc + CATCH_FN
+		if c.jr_out {
+			// jr out: X saves its caller's sp and $ra, takes XJ_STACK and
+			// $ra Z, and `jr`s to Y, which counts 7 and returns to Z;
+			// Z counts 300 and returns to X's caller with its sp.
+			z := y + CATCH_FN / 2
+			li(&f, T7, DATA)
+			put(&f, sw(SP, XJ_SP - DATA, T7), sw(RA, XJ_RA - DATA, T7))
+			li(&f, SP, XJ_STACK)
+			li(&f, RA, z)
+			li(&f, T0, y)
+			put(&f, jr(T0), NOP)
+			catch_load(c, .X, f)
+			f = {y}
+			put(&f, addiu(S2, S2, 7), JR_RA, NOP)
+			assert(f.pc <= z)
+			f = {z}
+			li(&f, T7, DATA)
+			put(&f, addiu(S2, S2, 300), lw(SP, XJ_SP - DATA, T7), lw(RA, XJ_RA - DATA, T7), JR_RA, NOP)
+			continue
+		}
 		put(&f, addiu(SP, SP, -16), j_type(2, y), NOP)
 		catch_load(c, .X, f)
 		f = {y}
@@ -944,9 +978,11 @@ vblank_catch :: proc() {
 		}
 	}
 	// What the cases with none learned must be: K's count alone, with one
-	// unwind; the same after one jump; Y's count, a plain return.
-	refs := [3][3]u64{{1, 1, 0}, {1, 1, 1}, {7, 0, 0}}
-	for w, k in refs {
+	// unwind; the same after one jump; Y's count, a plain return; Y's and
+	// Z's, after one jump (Y's return to Z).
+	refs := [4][4]u64{{0, 1, 1, 0}, {1, 1, 1, 1}, {2, 7, 0, 0}, {11, 307, 0, 1}}
+	for &r in refs {
+		k, w := int(r[0]), r[1:]
 		if u64(mem.rd32(CATCH_RES + 4 * u32(k))) != w[0] || catch_got[k] != {w[1], w[2]} {
 			ok = false
 			fmt.eprintfln("fail: catch: %s: s2 %d with %d unwinds and %d jumps, want %d, %d, %d", cases[k].name, mem.rd32(CATCH_RES + 4 * u32(k)), catch_got[k][0], catch_got[k][1], w[0], w[1], w[2])

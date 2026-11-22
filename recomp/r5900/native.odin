@@ -1807,6 +1807,9 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 			} else {
 				events(a)
 			}
+			// learned: the jr's pc in A for the miss's ps2.learned_goto
+			// (search compares T alone)
+			if learned && !wasm {native.mov_imm(a, .A, s.n)}
 			if lookup < 0 {lookup = native.new_label(a)}
 			native.jmp(a, lookup)
 			leaves = true
@@ -1829,6 +1832,16 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		native.bind(a, miss)
 		if wasm {
 			native.inline_jump(a, WASM_CALL, .T)
+		} else if learned {
+			// A `jr` to code outside the function's words goes on in the
+			// function's run, as interp_body's .Jr: a fresh call there
+			// (cpu.jump_unknown) would take the $ra the jr set up (a GOAL
+			// state's enter, Jak II 0033c3d4: new sp, $ra the
+			// return-from-thread code) as the run's own, and its `jr $ra`
+			// would return into this function on the switched stack.
+			native.mov(a, .B, .T)
+			native.call_leave(a, UNWINDING, "ps2.learned_goto", .A, .B)
+			native.ret(a)
 		} else {
 			native.mov_imm(a, .A, f.entry)
 			native.mov(a, .B, .T)
