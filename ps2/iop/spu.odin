@@ -59,6 +59,9 @@ Spu_Voice :: struct {
 	level:      i32, // envelope, 0..0x7fff
 	counter:    u32, // toward its next step (spu_rate_step)
 	ssa, lsa:   u32, // byte addresses in sound RAM
+	// LSAX written since key on: a block's loop start flag leaves LSA then
+	// (PCSX2's LoopMode, Mixer.cpp; how the SPU2 does it is not known).
+	loop_mode:  bool,
 	nax:        u32, // the block playing
 	endx:       bool, // a block with the end flag has finished since key on
 	flags:      u8, // its loop flags
@@ -200,7 +203,8 @@ spu_voice :: proc(id: u32) -> ^Spu_Voice {
 	return &spu.voice[id & 1][min((id >> 1) & 31, 23)]
 }
 
-// Enter the block at v.nax: take its loop flags (a loop start sets LSA),
+// Enter the block at v.nax: take its loop flags (a loop start sets LSA,
+// but not while an LSAX write holds it: loop_mode),
 // decode it if the voice plays, and raise the IRQ if it is at IRQA. A
 // stopped voice's blocks are not decoded, its ADPCM history kept, as
 // PCSX2's DecodeSamples.
@@ -209,7 +213,7 @@ spu_block :: proc(v: ^Spu_Voice) {
 	F := [5][2]i32{{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}}
 	b := spu.ram[v.nax & (SPU_RAM_SIZE - 16):][:16]
 	v.flags = b[1]
-	if v.flags & 4 != 0 {v.lsa = v.nax}
+	if v.flags & 4 != 0 && !v.loop_mode {v.lsa = v.nax}
 	if v.phase != .Stopped {
 		shift := u32(b[0] & 15)
 		f := min(int(b[0] >> 4), 4)
@@ -340,11 +344,18 @@ spu_ram16 :: #force_inline proc(a: u32) -> i32 {
 // (~15), an approximation for a pitch-0 key-on: PCSX2 stops such a voice
 // with NextA at SSA+5 halfwords, so an IRQA at bytes SSA+10 to SSA+14 never
 // raises there, while here it does.
+//
+// Key on copies SSA to the current address only (psx-spx, SSA and LSAX;
+// PCSX2's V_Voice::Start): LSA is the last one written or found, until a
+// loop start flag sets it. OVERLORD's stereo VAG stream re-keys a voice
+// mid-stream at its NAX (PauseVAG, UnPauseVAG) and relies on the LSAX it
+// wrote; taking SSA there looped the voice in its half of the buffer and
+// froze Jak II's intro. Key on also ends LSAX's hold on LSA (loop_mode).
 @(private = "file")
 spu_start :: proc(v: ^Spu_Voice) {
 	v.endx = false
 	v.phase, v.level, v.counter = .Attack, 0, 0
-	v.nax, v.lsa = v.ssa, v.ssa
+	v.nax, v.loop_mode = v.ssa, false
 	v.idx, v.frac, v.last, v.hist = 0, 0, {}, {}
 	spu_block(v)
 }
@@ -832,7 +843,7 @@ sd_set_addr :: proc(id, addr: u32) -> bool {
 	v := spu_voice(id)
 	switch id & 0xff00 {
 	case SD_VA_SSA & 0xff00: v.ssa = addr & (SPU_RAM_SIZE - 16)
-	case SD_VA_LSAX & 0xff00: v.lsa = addr & (SPU_RAM_SIZE - 16)
+	case SD_VA_LSAX & 0xff00: v.lsa, v.loop_mode = addr & (SPU_RAM_SIZE - 16), true
 	case SD_VA_NAX & 0xff00:
 		v.nax, v.idx = addr & (SPU_RAM_SIZE - 16), 0
 		spu_block(v)

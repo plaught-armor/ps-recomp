@@ -162,7 +162,9 @@ voices :: proc() {
 	iop.spu_voice_on(1, 23, key(ONCE))
 	mix(56)
 	st = iop.spu_voice_status(1, 23)
-	check(!st.on && st.endx && st.nax == ONCE, "end without repeat stops, NAX at LSA")
+	// Key on leaves LSA and neither of ONCE's blocks has a loop start flag,
+	// so the end takes NAX to the LSA the voice was reset with.
+	check(!st.on && st.endx && st.nax == 0x5000 && st.lsax == 0x5000, "end without repeat stops, NAX at LSA")
 	check(st.envx == 0, "end without repeat zeroes ENVX")
 	iop.spu_voice_on(1, 23, key(ONCE))
 	st = iop.spu_voice_status(1, 23)
@@ -197,6 +199,31 @@ voices :: proc() {
 
 	edge: [8]u8
 	check(iop.spu_write(iop.SPU_RAM_SIZE - 4, edge[:]) == 4, "spu_write clipped at the end of sound RAM")
+}
+
+// LSAX against key on and the loop start flag, on core 0's voice 1 (libsd
+// ids 0x2142 LSAX, 0x2242 NAX, 0x1500 KON): key on copies SSA to NAX only,
+// so a written LSA survives it (psx-spx; PCSX2's V_Voice::Start), and once
+// LSAX is written a loop start flag leaves LSA until the next key on
+// (PCSX2's LoopMode).
+loop_mode :: proc() {
+	check(iop.sd_set_addr(0x2142, LOOP + 16), "LSAX set")
+	iop.spu_voice_on(0, 1, key(ONCE))
+	st := iop.spu_voice_status(0, 1)
+	check(st.on && st.nax == ONCE && st.lsax == LOOP + 16, "key on keeps a written LSA")
+
+	iop.spu_voice_on(0, 1, key(LOOP))
+	check(iop.spu_voice_status(0, 1).lsax == LOOP, "key on, then a loop start flag sets LSA")
+	check(iop.sd_set_addr(0x2142, ONCE), "LSAX set while playing")
+	check(iop.sd_set_addr(0x2242, LOOP), "NAX set to the loop start block")
+	st = iop.spu_voice_status(0, 1)
+	check(st.nax == LOOP && st.lsax == ONCE, "a loop start flag after an LSAX write leaves LSA")
+
+	check(iop.sd_set_switch(0x1500, 1 << 1), "KON")
+	check(iop.spu_voice_status(0, 1).lsax == LOOP, "key on ends LSAX's hold: the loop start flag sets LSA again")
+	iop.spu_voice_off(0, 1)
+	mix(4)
+	check(!iop.spu_voice_status(0, 1).on, "voice 1 released")
 }
 
 // The envelope steps and the sample takes its new level in the same sample,
@@ -756,6 +783,7 @@ block_audio :: proc() {
 game :: proc(_: rawptr) {
 	reset_irq()
 	voices()
+	loop_mode()
 	envelope()
 	interp()
 	wide()
