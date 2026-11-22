@@ -208,13 +208,22 @@ exec_insn :: proc(i: r5900.Insn) #no_bounds_check {
 		case 9:
 			// Count: what a loop reads here is not in the state the spin
 			// probe compares.
-			v = u32(c.cycles)
+			v = cpu.count_read(c)
 			cpu.spin_dirty |= cpu.SPIN_SIDE
 		case 15: v = 0x2e20 // PRId
 		}
 		if i.rt != 0 {c.r[i.rt].d[0] = cpu.sx32(v)}
 		return
-	case .MTC0: c.cop0[i.rd] = u32(t.d[0]); return
+	case .MTC0:
+		v := u32(t.d[0])
+		if i.rd == 9 {
+			// Count's base moves with the cycles, so on every pass of a loop.
+			cpu.count_write(c, v)
+			cpu.spin_dirty |= cpu.SPIN_SIDE
+		} else {
+			c.cop0[i.rd] = v
+		}
+		return
 	case .EI: kernel.ei(); return
 	case .DI: c.cop0[12] &~= 0x10000; return
 	case .TLBR, .TLBWI, .TLBWR, .TLBP: return

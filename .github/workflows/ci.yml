@@ -123,6 +123,8 @@ jobs:
           odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true -out:ps2_interp_count_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_syscall_handler -collection:ps=. -out:ee_syscall_handler_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/ee_syscall_handler -collection:ps=. -define:PS_FLAT=true -out:ee_syscall_handler_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ee_count -collection:ps=. -out:ee_count_test${{ runner.os == 'Windows' && '.exe' || '' }}
+          odin run tests/ee_count -collection:ps=. -define:PS_FLAT=true -out:ee_count_flat_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios -collection:ps=. -out:psx_bios_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_flat_switch -collection:ps=. -out:psx_flat_switch_test${{ runner.os == 'Windows' && '.exe' || '' }}
           odin run tests/psx_bios_libc -collection:ps=. -out:psx_bios_libc_test${{ runner.os == 'Windows' && '.exe' || '' }}

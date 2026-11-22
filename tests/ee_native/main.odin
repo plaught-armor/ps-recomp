@@ -303,6 +303,7 @@ main :: proc() {
 		{0x40816000, .MTC0}, // Status = r1
 		{0x40827000, .MTC0}, // EPC = r2
 		{0x40803000, .MTC0}, // Wired = r0
+		{0x40824800, .MTC0}, // Count = r2
 		{0x42000018, .ERET},
 		{0x4443f800, .CFC1}, // r3 = fcr31
 		{0x44430000, .CFC1}, // r3 = FCR0
@@ -564,6 +565,7 @@ main :: proc() {
 		{mmi(0x28, 0x1b) &~ (31 << 21) | 3 << 21, .QFSRV}, // rs = rd
 		{mmi(0x28, 0x1b) &~ (31 << 11), .QFSRV}, // rd = 0
 		{0x40036000, .MFC0}, // r3 = Status
+		{0x40034800, .MFC0}, // r3 = Count
 		{0x40037000, .MFC0}, // r3 = EPC
 		{0x40007000, .MFC0}, // to r0
 		{0x4003f000, .MFC0}, // PRId
@@ -1092,6 +1094,11 @@ main :: proc() {
 				start.hi.d = {x ~ 0x5555, y}
 				start.lo.d = {y ~ 0xaaaa, x}
 				start.cop0[12] = u32(x) | 0x10000
+				count := (c.op == .MTC0 || c.op == .MFC0) && c.w >> 11 & 31 == 9
+				if count {
+					start.cycles = u64(u32(x ~ y >> 7)) | (y & 0xffff) << 32
+					start.cop0[9] = u32(y * 0x9e3779b9) ~ 0x12345678
+				}
 				start.fcr31 = u32(y)
 				start.sa = u32(x) & 127
 				// QFSRV: every SA, and the 128 to 255 only direct state can
@@ -1130,14 +1137,27 @@ main :: proc() {
 				cpu.state, vu.vu0 = start, vu_start
 				copy(vu.vu0.mem, vu_mem[:])
 				trapped = false
+				if count {cpu.spin_dirty = 0}
 				run()
 				native_trapped, native_pc := trapped, trapped_pc
 				native_got, native_vu := cpu.state, vu.vu0
 				copy(native_mem[:], vu.vu0.mem)
+				if count {
+					checks += 1
+					failed += count_check(c, &start, &native_got)
+					checks += 1
+					failed += count_spin_check(c, "native")
+				}
 				cpu.state, vu.vu0 = start, vu_start
+				// As its loop does, charge the instruction before it runs.
+				if count {cpu.state.cycles, cpu.spin_dirty = start.cycles + cpu.CYCLES_PER_INSN, 0}
 				copy(vu.vu0.mem, vu_mem[:])
 				trapped = false
 				ps2.exec_insn(r5900.decode(funcs[k].addr, c.w))
+				if count {
+					checks += 1
+					failed += count_spin_check(c, "interp")
+				}
 				// A trap calls cpu.trap at its pc in both, exactly when the
 				// encoding says; the state compare below shows nothing written.
 				if taken := trap_taken(c.w, x, y); taken || native_trapped || trapped {
@@ -1186,6 +1206,33 @@ main :: proc() {
 		os.exit(1)
 	}
 	fmt.printfln("ok ee_native %v: %d instructions, %d checks", arch, len(cases), checks)
+}
+
+// Count is the cycles less its base, cop0[9]: a write of v moves the base so
+// that a read at those cycles gives v. The instruction's own cycle is in them,
+// as the interpreter counts, the return's after it are not. 1 if native code
+// did otherwise.
+@(private = "file")
+count_check :: proc(c: Case, start, got: ^cpu.Cpu) -> int {
+	now := u32(start.cycles) + cpu.CYCLES_PER_INSN
+	got_v, want: u64
+	if c.op == .MTC0 {
+		got_v, want = u64(got.cop0[9]), u64(now - u32(start.r[2].d[0]))
+	} else {
+		got_v, want = got.r[3].d[0], cpu.sx32(now - start.cop0[9])
+	}
+	if got_v == want {return 0}
+	fmt.eprintfln("FAIL Count %v: native %016x, want %016x", c.op, got_v, want)
+	return 1
+}
+
+// What a loop writes to or reads from Count the spin probe cannot compare, so
+// either is an effect to it. 1 if the one just run by `by` did not say so.
+@(private = "file")
+count_spin_check :: proc(c: Case, by: string) -> int {
+	if cpu.spin_dirty & cpu.SPIN_SIDE != 0 {return 0}
+	fmt.eprintfln("FAIL Count %v: %s left spin_dirty clear", c.op, by)
+	return 1
 }
 
 // A jal to a function in the blob is a direct call to its native code, one

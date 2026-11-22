@@ -63,6 +63,8 @@ odin run tests/ps2_interp -collection:ps=.
 odin run tests/ps2_interp -collection:ps=. -define:FALLBACK_COUNT=true
 odin run tests/ee_syscall_handler -collection:ps=.
 odin run tests/ee_syscall_handler -collection:ps=. -define:PS_FLAT=true
+odin run tests/ee_count -collection:ps=.
+odin run tests/ee_count -collection:ps=. -define:PS_FLAT=true
 odin run tests/ee_unwind -collection:ps=.
 odin run tests/ee_unwind -collection:ps=. -define:PS_FLAT=true
 odin run tests/ee_unwind -collection:ps=. -- learn
@@ -163,7 +165,8 @@ here.
 | `psx_gte` | GTE register moves as native code |
 | `psx_timer` | Root counter timing |
 | `psx_access_cycles` | The cycles a PS1 load or store off RAM, an mtc0 to SR and a syscall see, interpreted and learned alike, in the coroutine model, under FLAT and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer, the learned function as wasm32 code): every instruction before it and its own, right after a label the block before falls into, in a delay slot, and as a load and the instruction after it |
-| `ee_access_cycles` | The cycles an EE COP0 Count read sees, interpreted and learned alike, on the host and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer, the learned function as wasm32 code, whose cycles are charged in batches): every instruction before it and its own, right after a label the block before falls into, after instructions whose cycles wait for a flush, after a call to interpreted code returns, in a delay slot, in a branch-likely's and in one that is a branch's target; and the cycles the whole call takes |
+| `ee_count` | A write to EE COP0 Count is what `mfc0` and GetCop0 read from then on, plus the cycles since, across a thread switch, the wrap, an interrupt handler, one nested in it and a thread's exit, in the coroutine model and under FLAT |
+| `ee_access_cycles` | The cycles an EE COP0 Count read sees (a write of Count sets what it counts from), interpreted and learned alike, on the host and built for `wasi_wasm32` (`run.mjs`, Node 24 or newer, the learned function as wasm32 code, whose cycles are charged in batches): every instruction before it and its own, right after a label the block before falls into, after instructions whose cycles wait for a flush, after a call to interpreted code returns, in a delay slot, in a branch-likely's and in one that is a branch's target; and the cycles the whole call takes |
 | `psx_gpu_upload` | VRAM uploads a run at a time, as a pixel at a time: row wrap, a dropped half word, mask bits |
 | `psx_bios` | BIOS events, counters and IRQs, the executable loaders |
 | `psx_bios_libc` | The BIOS C library |

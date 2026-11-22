@@ -63,7 +63,8 @@ Native_Code :: struct {
 
 NATIVE_MAGIC :: 0x4e525350 // "PSRN"
 // 5: a wasm32 blob imports a shared memory (recomp/native/wasm.odin).
-NATIVE_VERSION :: 5
+// 6: EE code takes cop0[9] as the base of Count (ps2/cpu count_read).
+NATIVE_VERSION :: 6
 // Bytes of the header: magic, version, arch, then the counts and sizes.
 NATIVE_HEADER :: 48
 

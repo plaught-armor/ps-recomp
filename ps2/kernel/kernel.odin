@@ -316,7 +316,8 @@ syscall :: proc(pc: u32) {
 		config := abs(n) == 0x61 ? c.cop0[16] | bits : c.cop0[16] &~ bits
 		c.cop0[16] = config
 		for t in k.threads {if t != nil {t.regs.cop0[16] = config}}
-	case 0x63, 0x67: ret = i64(cpu.state.cop0[a0 & 31]) // GetCop0, iGetCop0
+	case 0x63, 0x67: // GetCop0, iGetCop0
+		ret = i64(a0 & 31 == 9 ? cpu.count_read(c) : c.cop0[a0 & 31])
 	case 0x64, 0x68:
 		// FlushCache, iFlushCache: there is no cache, only code loaded over the
 		// recompiled functions to see, and only a flush that invalidates the
@@ -854,9 +855,7 @@ switch_to :: proc(next: ^Thread) {
 		if cur.status == .Run {cur.status = .Ready}
 		k.current = next
 		next.status = .Run
-		cycles := cpu.state.cycles
-		cpu.state = next.regs
-		cpu.state.cycles = cycles
+		cpu.state_restore(&next.regs)
 		core.co_switch(next.co)
 		reap()
 	}
@@ -1050,9 +1049,7 @@ call_handler :: proc(fn, gp, a0, a1, a2: u32) -> u32 {
 	cpu.state.r[31].d[0] = 0
 	cpu.host_call(fn)
 	ret := u32(cpu.state.r[2].d[0])
-	cycles := cpu.state.cycles
-	cpu.state = saved
-	cpu.state.cycles = cycles
+	cpu.state_restore(&saved)
 	return ret
 }
 

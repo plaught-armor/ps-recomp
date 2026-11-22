@@ -8,7 +8,8 @@
 //
 // A loop runs three times and stores each read into BUF: interpreted, then
 // as a learned function (native code from the same words). Both stores and
-// the cycles after the call match.
+// the cycles after the call match. A second function, run the same two ways,
+// writes Count after instructions that batch, and reads it 3 cycles on.
 //
 // Run it on the host (not FLAT: no learned code runs there) and built for
 // wasi_wasm32 (run.mjs), whose learned function is wasm32 code, the one
@@ -40,6 +41,25 @@ check :: proc(ok: bool, what: string, loc := #caller_location) {
 
 @(private = "file")
 T :: u32(0x00100000)
+
+// W: writes Count and reads it.
+@(private = "file")
+W :: u32(0x00100200)
+
+@(private = "file")
+WROTE :: u32(0xfffffffe) // what W writes: the read is past the wrap
+
+@(rodata, private = "file")
+W_CODE := [?]u32 {
+	0x24080001, // addiu t0, zero, 1
+	0x24090002, // addiu t1, zero, 2     batched with it
+	0x40844800, // mtc0 a0, Count
+	0x01095021, // addu t2, t0, t1
+	0x01495821, // addu t3, t2, t1
+	0x40024800, // mfc0 v0, Count        3 cycles on
+	0x03e00008, // jr ra
+	0x00000000, // nop
+}
 
 // F: interpreted, no native code holds it.
 @(private = "file")
@@ -104,6 +124,7 @@ run :: proc() -> (got: [N_WORDS]u32, took: u64, ran: bool) {
 	cpu.state.r = {}
 	cpu.state.r[29].d[0], cpu.state.r[31].d[0] = u64(SP), u64(RA)
 	cpu.state.r[5].d[0] = u64(BUF)
+	cpu.state.cop0[9] = 0 // never written: T's reads are the cycles themselves
 	calls := cpu.learned_calls
 	at := cpu.state.cycles
 	cpu.call(T)
@@ -113,29 +134,51 @@ run :: proc() -> (got: [N_WORDS]u32, took: u64, ran: bool) {
 	return got, took, cpu.learned_calls != calls
 }
 
+// Call W with a0 = WROTE from the host: what it read, and whether learned
+// code ran.
+@(private = "file")
+run_write :: proc() -> (got: u32, ran: bool) {
+	cpu.state.r = {}
+	cpu.state.r[29].d[0], cpu.state.r[31].d[0] = u64(SP), u64(RA)
+	cpu.state.r[4].d[0] = cpu.sx32(WROTE)
+	calls := cpu.learned_calls
+	cpu.call(W)
+	return u32(cpu.state.r[2].d[0]), cpu.learned_calls != calls
+}
+
 // The checks, run as the game's coroutine on the host (as tests/ee_learned)
 // and from main on wasm32.
 @(private = "file")
 game :: proc(_: rawptr) {
-	code, f_code := CODE, F_CODE
+	code, f_code, w_code := CODE, F_CODE, W_CODE
 	for w, k in code {mem.wr32(T + 4 * u32(k), w)}
 	for w, k in f_code {mem.wr32(F + 4 * u32(k), w)}
+	for w, k in w_code {mem.wr32(W + 4 * u32(k), w)}
 
 	interp, interp_took, interp_ran := run()
 	check(!interp_ran, "a learned function ran before any was loaded")
 	check(interp[0] != 0 && interp[N_WORDS - 2] > interp[N_WORDS - 3], fmt.tprintf("interpreted reads %v: no read seen", interp))
 
-	blob, skipped := r5900.learned_blob({{T, T, code[:]}}, native.Arch(core.NATIVE_ARCH))
+	want := WROTE
+	want += 3
+	wrote, wrote_ran := run_write()
+	check(!wrote_ran, "a learned W ran before any was loaded")
+	check(wrote == want, fmt.tprintf("interpreted read %08x after the write, want %08x", wrote, want))
+
+	blob, skipped := r5900.learned_blob({{T, T, code[:]}, {W, W, w_code[:]}}, native.Arch(core.NATIVE_ARCH))
 	check(skipped == 0, fmt.tprintf("%d runs not lowered", skipped))
 	check(ps2.load_learned_blob(blob, "learned"), "load the blob")
 	learned, learned_took, learned_ran := run()
 	check(learned_ran, "the learned function did not run")
 	check(slice.equal(learned[:], interp[:]), fmt.tprintf("learned reads %v, interpreted %v (cycles from the call)", learned, interp))
 	check(learned_took == interp_took, fmt.tprintf("learned call %d cycles, interpreted %d", learned_took, interp_took))
+	wrote, wrote_ran = run_write()
+	check(wrote_ran, "the learned W did not run")
+	check(wrote == want, fmt.tprintf("learned read %08x after the write, want %08x", wrote, want))
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.printfln("ok ee_access_cycles: a COP0 Count read sees the cycles up to it and its own, after a fallthrough label, batched instructions and a call's return, in a delay slot, a branch-likely's and one that is a branch target, interpreted and learned alike (%v)", interp)
+	fmt.printfln("ok ee_access_cycles: a COP0 Count read sees the cycles up to it and its own, after a fallthrough label, batched instructions and a call's return, in a delay slot, a branch-likely's and one that is a branch target, and counts from what was written to it, interpreted and learned alike (%v)", interp)
 	os.exit(0)
 }
 

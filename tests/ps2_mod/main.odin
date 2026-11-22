@@ -14,6 +14,9 @@
 //   G_C  a before hook (b) that counts; registered recompiled code in the
 //        plain build (its thunk calls the registered procedure)
 //
+// G_A's before hook also writes COP0 Count and then runs a while in the
+// hook's frozen time: the program's read after the call sees that write.
+//
 // Then from host code (the vblank hook): a call to G_A runs its chain; with
 // another program named in RAM (kernel k.exec.prog), or G_A's fourth word
 // changed, it runs without. Then the program is started again, each run
@@ -70,6 +73,7 @@ DONE :: DATA + 0x100
 CHILD :: DATA + 0x104 // a child's: the function the program calls first
 NEXT :: DATA + 0x108 // once done, the syscall to start the program again with
 NEXT_A0 :: DATA + 0x10c // and its a0
+COUNT_READ :: DATA + 0x110 // Count, after the first call to G_A
 NAME :: DATA + 0x200 // LoadExecPS2's file name
 TEXT_WORD :: ENTRY + 0xf00 // in the recompiled range, in no function
 STACK :: u32(0x001a0000)
@@ -81,6 +85,10 @@ M_COUNT :: mem.MOD_BASE + 0x300
 M_ORIGINAL :: mem.MOD_BASE + 0x400 // a before hook that calls the original
 M_REPLACE_Y :: mem.MOD_BASE + 0x500
 MOD_CODE :: 0x600
+HOOK_COUNT :: u32(0x50000000) // what G_A's before hook writes to Count
+HOOK_LOOPS :: 2000 // and the loop it runs after, 3 instructions a pass
+MTC0_T4_COUNT :: 0x408c4800
+MFC0_T4_COUNT :: 0x400c4800
 
 ZERO :: 0
 V0 :: 2
@@ -164,6 +172,7 @@ program :: proc() {
 	put(&a, i_type(4, T9, ZERO, 3), NOP) // beq t9, zero, past the call
 	put(&a, r_type(T9, 0, RA, 0, 9), NOP) // jalr t9
 	call_log(&a, G_A, 5)
+	put(&a, MFC0_T4_COUNT, lui(T7, DATA >> 16), sw(T4, COUNT_READ - DATA, T7))
 	call_log(&a, G_R, 1)
 	call_log(&a, G_L, 3)
 	call_log(&a, G_T, 5)
@@ -205,6 +214,8 @@ mod_code :: proc() -> []u8 {
 	log_code(&a, 1)
 	put(&a, r_type(0, SP, T4, 24, 2)) // srl t4, sp, 24
 	log(&a, T4)
+	put(&a, lui(T4, HOOK_COUNT >> 16), MTC0_T4_COUNT, addiu(T5, ZERO, HOOK_LOOPS))
+	put(&a, addiu(T5, T5, -1), i_type(5, T5, ZERO, -2), NOP) // bne t5, zero, back
 	put(&a, addiu(A0, ZERO, 77), addiu(S0, ZERO, 99), JR_RA, NOP)
 
 	a.pc = M_AFTER_B
@@ -396,6 +407,10 @@ vblank :: proc() {
 	same := len(got) == len(want)
 	for v, i in got {if i < len(want) && v != want[i] {same = false}}
 	check(same, fmt.tprintf("run %d: log %v, want %v", pass, got, want))
+	if pass == 0 {
+		d := mem.rd32(COUNT_READ) - HOOK_COUNT
+		check(d >= 2 * HOOK_LOOPS && d < 1 << 20, fmt.tprintf("Count after the hook's write: %d past it", i32(d)))
+	}
 	when !core.FLAT {
 		calls := [5]int{1, 1, 2, 3, 4} // run 1 interprets G_C
 		check(c_calls == calls[pass], fmt.tprintf("run %d: G_C's procedure ran %d times", pass, c_calls))

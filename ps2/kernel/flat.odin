@@ -259,15 +259,13 @@ flat_commit :: proc() {
 	flat.from = nil
 	next := k.current
 	if from != nil && from != next {
-		cycles := cpu.state.cycles
 		if from == k.dead {
 			k.dead = nil
 			free(from)
 		} else {
 			from.regs = cpu.state
 		}
-		cpu.state = next.regs
-		cpu.state.cycles = cycles
+		cpu.state_restore(&next.regs)
 	}
 	// Set only for a thread switched away, or one blocked as an idle was
 	// owed, which may run on with no switch.

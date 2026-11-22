@@ -1083,6 +1083,10 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 				native.imp_store(a, "cpu.spin_dirty", .A)
 			}
 			native.state_load(a, .A, CYCLES if rd == 9 else COP0 + 4 * u32(rd))
+			if rd == 9 { // less its base (cpu.count_read)
+				native.state_load(a, .B, COP0 + 4 * 9)
+				native.alu(a, .Sub, .A, .B)
+			}
 		}
 		put_sx(a, rt, .A)
 	case .DI:
@@ -1091,7 +1095,17 @@ inline_op :: proc(a: ^native.Asm, i: Insn) -> bool {
 		native.state_store(a, COP0 + 4 * 12, .A)
 	case .MTC0:
 		get(a, .A, rt)
-		native.state_store(a, COP0 + 4 * u32(rd), .A)
+		if rd == 9 {
+			// Count: the base moves (cpu.count_write) with the cycles, so on
+			// every pass of a loop.
+			native.state_load(a, .B, CYCLES)
+			native.alu(a, .Sub, .B, .A)
+			native.state_store(a, COP0 + 4 * 9, .B)
+			native.mov_imm(a, .A, 1) // cpu.SPIN_SIDE
+			native.imp_store(a, "cpu.spin_dirty", .A)
+		} else {
+			native.state_store(a, COP0 + 4 * u32(rd), .A)
+		}
 	case .ERET:
 		// lower returns after it; leave ERL if set, else EXL
 		erl, done := native.new_label(a), native.new_label(a)

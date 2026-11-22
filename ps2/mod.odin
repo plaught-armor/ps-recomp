@@ -456,7 +456,8 @@ mod_after :: proc(s: ^Mod_Site, entry: Mod_Args) {
 // The bytes of a Cpu a hook's return puts back: every register but cop0
 // (cycles, after it, apart). A hook's own C code cannot write cop0; game
 // code the hook calls can (EI, DI, Status), and that is real execution,
-// so it stays. One copy costs about 30% less than the whole Cpu.
+// so it stays, Count's base moved to the cycles put back (mod_call). One
+// copy costs about 30% less than the whole Cpu.
 @(private = "file")
 MOD_REGS :: int(offset_of(cpu.Cpu, cop0))
 #assert(offset_of(cpu.Cpu, fcr31) < offset_of(cpu.Cpu, cop0) && offset_of(cpu.Cpu, cop0) < offset_of(cpu.Cpu, cycles))
@@ -468,6 +469,7 @@ MOD_REGS :: int(offset_of(cpu.Cpu, cop0))
 mod_call :: proc(fn: u32, p: cpu.Func_Proc) {
 	regs := (^[MOD_REGS]u8)(&cpu.state)^
 	cycles, next, held := cpu.state.cycles, cpu.next_event, cpu.mod_held
+	base := cpu.state.cop0[9]
 	if cpu.mod_depth == 0 {cpu.state.r[29].q = u128(mem.mod_sp)}
 	cpu.next_event, cpu.mod_held = max(u64), false
 	cpu.mod_depth += 1
@@ -479,6 +481,8 @@ mod_call :: proc(fn: u32, p: cpu.Func_Proc) {
 	// goes on, and handles what is due.
 	due := cpu.next_event != max(u64) || cpu.mod_held
 	(^[MOD_REGS]u8)(&cpu.state)^ = regs
+	// A Count the hook wrote goes on from what it read at the hook's end.
+	if cpu.state.cop0[9] != base {cpu.state.cop0[9] += u32(cycles - cpu.state.cycles)}
 	cpu.state.cycles, cpu.mod_held = cycles, held
 	cpu.next_event = due ? min(next, cycles) : next
 }

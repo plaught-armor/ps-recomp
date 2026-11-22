@@ -175,7 +175,12 @@ emit_op :: proc(i: Insn, out: ^[dynamic]string) -> (slow: bool) {
 	case .MTLO: append(out, fmt.tprintf("c.lo.d[0] = %s", R64(rs)))
 	case .MTHI1: append(out, fmt.tprintf("c.hi.d[1] = %s", R64(rs)))
 	case .MTLO1: append(out, fmt.tprintf("c.lo.d[1] = %s", R64(rs)))
-	case .MTC0: append(out, fmt.tprintf("c.cop0[%d] = %s", rd, R32(rt)))
+	case .MTC0:
+		if rd == 9 { // Count: cop0[9] is its base (cpu.count_write)
+			append(out, fmt.tprintf("c.cop0[9] = u32(c.cycles) - %s", R32(rt)))
+		} else {
+			append(out, fmt.tprintf("c.cop0[%d] = %s", rd, R32(rt)))
+		}
 	case .ERET: // lower returns after it; leave ERL if set, else EXL
 		append(out, "if c.cop0[12] & 4 != 0 {c.cop0[12] &~= 4} else {c.cop0[12] &~= 2}")
 	case .CFC1: set64(out, rt, fmt.tprintf("sx32(%s)", rd == 0 ? "0x2e30" : "c.fcr31"))
@@ -398,7 +403,7 @@ emit_mmi :: proc(i: Insn, out: ^[dynamic]string) -> bool {
 		append(out, fmt.tprintf("c.sa = ((%s ~ %d) & 7) * 16", R32(i.rs), u32(i.imm) & 7))
 		return true
 	case .MFC0:
-		src := i.rd == 9 ? "u32(c.cycles)" : i.rd == 15 ? "u32(0x2e20)" : fmt.tprintf("c.cop0[%d]", i.rd)
+		src := i.rd == 9 ? "u32(c.cycles) - c.cop0[9]" : i.rd == 15 ? "u32(0x2e20)" : fmt.tprintf("c.cop0[%d]", i.rd)
 		if i.rt != 0 {append(out, fmt.tprintf("c.r[%d].d[0] = sx32(%s)", i.rt, src))}
 		return true
 	case .DI:

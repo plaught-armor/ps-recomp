@@ -118,6 +118,8 @@ main :: proc() {
 	append(&words, 0x40816000, 0x40827000, 0x40803000, 0x42000018, 0x4443f800, 0x44430000, 0x4440f800, 0x44c1f800, 0x44c10000, 0x46020830)
 	// MFC0 Status, PRId and PRId to r0; TLBR, TLBWI, TLBWR and TLBP
 	append(&words, 0x40036000, 0x4003f000, 0x4000f000, 0x42000001, 0x42000002, 0x42000006, 0x42000008)
+	// MTC0 Count from r2, r3 and r0; MFC0 Count to r3 and to r0
+	append(&words, 0x40824800, 0x40834800, 0x40804800, 0x40034800, 0x40004800)
 	// CFC2 r0 and r3 = each VU0 control register; CTC2 the other way,
 	// but for CMSAR1 (31), whose write starts VU1
 	for cr in u32(0) ..< 32 {
@@ -315,6 +317,8 @@ main :: proc() {
 			for k in 0 ..< 32 {init.f[k].u = rand.uint32() % 2 == 0 ? SPECIAL[rand.uint32() % len(SPECIAL)] : rand.uint32()}
 			init.acc.u, init.fcr31, init.sa = rand.uint32(), rand.uint32(), rand.uint32() & 127
 			init.cop0[12] = rand.uint32()
+			count := (op == .MTC0 || op == .MFC0) && c.w >> 11 & 31 == 9
+			if count {init.cycles, init.cop0[9] = rand.uint64(), rand.uint32()}
 			rs, rt := (c.w >> 21) & 31, (c.w >> 16) & 31
 			if trap {
 				// every other trial rs equal to rt or the immediate, so the
@@ -372,6 +376,21 @@ main :: proc() {
 			trapped = false
 			c.f()
 			got, got_vu0, got_trapped, got_pc := cpu.state, vu.vu0, trapped, trapped_pc
+			if count {
+				// Count is the cycles less its base, cop0[9], which a write moves.
+				want := init
+				now := u32(init.cycles)
+				if op == .MTC0 {
+					want.cop0[9] = now - init.r[rt].w[0]
+				} else if rt != 0 {
+					want.r[rt].d[0] = cpu.sx32(now - init.cop0[9])
+				}
+				if runtime.memory_compare(&got, &want, size_of(cpu.Cpu)) != 0 {
+					fails += 1
+					if fails < 10 {fmt.eprintfln("FAIL ee_emit %08x: Count", c.w)}
+					break
+				}
+			}
 			if unaligned {
 				runtime.mem_copy_non_overlapping(&got_spr, &mem.spr, mem.SPR_SIZE)
 				runtime.mem_copy_non_overlapping(&mem.spr, &spr, mem.SPR_SIZE)

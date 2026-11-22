@@ -44,7 +44,7 @@ Cpu :: struct {
 	f:      [32]Fpr,
 	acc:    Fpr,
 	fcr31:  u32,
-	cop0:   [32]u32,
+	cop0:   [32]u32, // [9] is not Count but its base (count_read)
 	cycles: u64,
 }
 
@@ -65,7 +65,7 @@ in_interrupt: bool
 // What ran since the spin skip (ps2/spin.odin) armed its probe that a loop
 // at a fixed point must not do: SPIN_SIDE for an effect the snapshot of EE
 // state and RAM cannot show (a register read, a syscall, the interpreter, a
-// read of COP0 Count), SPIN_EVENT for run_events and all its handlers did,
+// read or write of COP0 Count), SPIN_EVENT for run_events and all its handlers did,
 // SPIN_ROTATE for a RotateThreadReadyQueue, whose effects on the threads the
 // probe compares itself (kernel/spin.odin). Nonzero but for SPIN_ROTATE, the
 // probe does not skip.
@@ -87,6 +87,25 @@ FCR31_C :: 0x800000
 
 sx32 :: #force_inline proc "contextless" (v: u32) -> u64 {
 	return u64(i64(i32(v)))
+}
+
+// COP0 Count runs with the cycles, so cop0[9] holds its base: the cycles at
+// which it read 0. A write of v moves the base. Emitted and native code do
+// the same inline (recomp/r5900).
+count_read :: proc "contextless" (c: ^Cpu) -> u32 {
+	return u32(c.cycles) - c.cop0[9]
+}
+
+count_write :: proc "contextless" (c: ^Cpu, v: u32) {
+	c.cop0[9] = u32(c.cycles) - v
+}
+
+// Make state the saved registers of a thread or of interrupted code. The
+// cycles and Count's base are the machine's, so they stay as they are.
+state_restore :: proc "contextless" (saved: ^Cpu) {
+	cycles, base := state.cycles, state.cop0[9]
+	state = saved^
+	state.cycles, state.cop0[9] = cycles, base
 }
 
 // ---------------------------------------------------------------- dispatch
