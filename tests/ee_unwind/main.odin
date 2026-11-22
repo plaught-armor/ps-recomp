@@ -847,9 +847,9 @@ CATCH_CASES :: [?]Catch_Case {
 	{name = "learned T past learned N to interpreted K and M", learned = {.N, .T}, ref = 0, counted = true},
 	{name = "learned T, another sp", learned = {.K, .M, .N, .T}, delta = 16, ref = 1, counted = true},
 	{name = "interpreted T, another sp, learned K and M", learned = {.K, .M}, delta = 16, ref = 1, counted = true},
-	// The interpreted X goes on in its own run; the learned one's jump
-	// out is a run of its own, whose return unwinds to X's call.
-	{name = "learned X jumps out", learned = {.X}, tail = true, ref = 2},
+	// X's jump out of its words goes on in X's run, interpreted or
+	// learned (ps2.learned_goto), so Y's return is X's.
+	{name = "learned X jumps out", learned = {.X}, tail = true, ref = 2, counted = true},
 	// A GOAL state's enter (Jak II 0033c3d4): X `jr`s out of its words to
 	// Y with sp on another stack and $ra Z, no call's. Y's `jr $ra` is a
 	// jump to Z in X's run, and Z's return, with X's caller's $ra and sp,

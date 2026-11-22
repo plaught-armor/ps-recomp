@@ -315,7 +315,7 @@ lower :: proc(f: ^Func, cycles: int, quiet: bool, exact := false, each := false,
 			// The delay slot is itself a jump target: give it its own block.
 			if l.open_case {
 				flush(&l)
-				put(&l, {kind = .Goto, target = pc + 8})
+				put(&l, {kind = .Goto, target = pc + 8, n = pc + 4})
 			}
 			if has_delay(d) {
 				// A branch there (data decoded as code, as a rule) is a

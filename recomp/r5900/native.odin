@@ -1571,10 +1571,12 @@ sys_exit :: proc(a: ^native.Asm, pc: u32) {
 	native.bind(a, skip)
 }
 
-// pc = t: the block at t, or outside the function's blocks (learned: in
-// a learned function, jump_out).
+// pc = t from the instruction at pc: the block at t, or outside the
+// function's blocks (jump_out; learned: ps2.learned_goto, which goes on in
+// the function's run as the Goto_Reg miss and a static jump out of the
+// words do, not in a fresh one whose `jr $ra` would take $ra as its own).
 @(private = "file")
-go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32, learned: bool) {
+go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, pc, t: u32, learned: bool) {
 	if l, ok := labels[t]; ok {
 		native.jmp(a, l)
 		return
@@ -1582,6 +1584,13 @@ go :: proc(a: ^native.Asm, f: ^Func, labels: map[u32]native.Label, t: u32, learn
 	if a.arch == .Wasm32 {
 		native.mov_imm(a, .T, t)
 		native.inline_jump(a, WASM_CALL, .T)
+		return
+	}
+	if learned {
+		native.mov_imm(a, .A, pc)
+		native.mov_imm(a, .B, t)
+		native.call_leave(a, UNWINDING, "ps2.learned_goto", .A, .B)
+		native.ret(a)
 		return
 	}
 	native.mov_imm(a, .A, f.entry)
@@ -1681,7 +1690,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 		if l, ok := funcs[f.entry]; ok {native.bind_at(a, l, int(at))}
 		trace(a, f.entry)
 		events(a)
-		go(a, f, labels, f.entry, learned)
+		go(a, f, labels, f.entry, f.entry, learned)
 	}
 	// Open ifs: the label each one ends at, or -1 for a group (Branch,
 	// Jump_Reg) that only scopes t.
@@ -1732,7 +1741,7 @@ native_func :: proc(a: ^native.Asm, f: ^Func, entries: []u32, cycles: int, slow:
 				}
 				if s.n - s.target < SPIN_SPAN * 4 {spin(a, s.n)}
 			}
-			go(a, f, labels, s.target, learned)
+			go(a, f, labels, s.n, s.target, learned)
 			leaves = true
 		case .Call:
 			if wasm {
