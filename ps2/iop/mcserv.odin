@@ -114,7 +114,15 @@ mcserv_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	case:
 		return false
 	}
-	if cpu.debug >= 1 {fmt.eprintfln("mc: fno %02x -> %d", fno, r)}
+	if cpu.debug >= 1 {
+		// Path commands carry a name; file commands carry data there.
+		switch fno {
+		case 0x02, 0x0c, 0x0d, 0x0e, 0x0f, 0x12:
+			fmt.eprintfln("mc: fno %02x \"%s\" -> %d", fno, mc_name(buf), r)
+		case:
+			fmt.eprintfln("mc: fno %02x -> %d", fno, r)
+		}
+	}
 	w[0] = u32(r)
 	return true
 }
