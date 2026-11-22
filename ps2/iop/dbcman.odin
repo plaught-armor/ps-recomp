@@ -70,6 +70,15 @@
 //   returns 2 as the RPC reply, and sends the status as it stands: number,
 //   index and extra bytes from the last command, so the EE reads it as
 //   failed.
+// - mc2_s1, the driver some games load instead (Burnout 3), has no 13:
+//   command 4 answers 2 for a new card and clears the mark itself, and
+//   while the card is new every command but 4 is refused as above, 13 too.
+//   Once the card is known, 13 is a command it does not have. Its other
+//   commands are mc2_d's. (MC2_S1.IRX v0x305, by module offset: the
+//   dispatcher's refusal at 0x1fa0, which lets only 4 through; its jump
+//   table at 0x34a0, commands 1..12; command 4 at 0x2914, which reads the
+//   mark (0x534) and on 2 stores 0 (0x558).) The load's name picks the
+//   driver (dbcman_module).
 // - Otherwise the command is taken: the extra bytes cleared, 0x2080
 //   written at +8 of the request, result 1, the index set, the number
 //   counted. With ECC on (and always for command 8) each page carries 3
@@ -264,7 +273,8 @@ dbcman_init :: proc() {
 // The pad driver the load names, by file or module name (ds1o_d, ds2o,
 // ds2o_d, or ds2u or ds2u_d, ignoring case and any directory, extension or
 // version), is the one served from then on, its frame counters at 0 as its
-// start leaves them. Other names change nothing.
+// start leaves them. A card driver's name, mc2_d or mc2_s1, picks the card
+// commands served the same way. Other names change nothing.
 dbcman_module :: proc(path: string, image: []u8 = nil) {
 	name := dbc_module_name(path)
 	if v, ok := dbc_module_version(image); ok {
@@ -284,6 +294,10 @@ dbcman_module :: proc(path: string, image: []u8 = nil) {
 			dbc_logged.no_image = true
 			fmt.eprintfln("dbcman: no image of %s to read the version of; serving the fast set", path)
 		}
+	}
+	switch {
+	case strings.equal_fold(name, "mc2_d"): mc2.s1 = false
+	case strings.equal_fold(name, "mc2_s1"): mc2.s1 = true
 	}
 	switch {
 	case strings.equal_fold(name, "ds1o_d") || strings.equal_fold(name, "ds2o") || strings.equal_fold(name, "ds2o_d"): dbc.pad = DBC_DS1O_D
@@ -602,7 +616,8 @@ Mc2_Params :: struct {
 mc2: struct {
 	status:        Mc2_Status,
 	toggle:        u32, // 0: the next status goes to A
-	fresh:         [MCRAW_PORTS]bool, // the card new to the driver, until 13
+	fresh:         [MCRAW_PORTS]bool, // the card new to the driver, until 13 (mc2_s1: 4)
+	s1:            bool, // the driver is mc2_s1, not mc2_d
 	page, verify:  [MC2_BUF]u8, // the page buffer and the read-back one
 	port:          int,
 	p:             Mc2_Params,
@@ -644,7 +659,7 @@ mc2_push :: proc(d: int) {
 mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 	st := &mc2.status
 	port := int(DBC_DRIVERS[d].port) - 2
-	if mc2.fresh[port] && cmd != 4 && cmd != 13 {
+	if mc2.fresh[port] && cmd != 4 && (mc2.s1 || cmd != 13) {
 		st.result = 2
 		mc2_push(d)
 		return 2
@@ -679,7 +694,8 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 		return 0
 	}
 	n := int(p.size)
-	switch cmd {
+	// mc2_s1 has no 13: the unknown command's case.
+	switch cmd if !(mc2.s1 && cmd == 13) else 0 {
 	case 1:
 		for i in 0 ..< p.count {
 			ok := mc2_read(p.start + i, mc2.page[:])
@@ -696,7 +712,9 @@ mc2_exec :: proc(d: int, cmd: u32, buf: []u8) -> i32 {
 		return st.result
 	case 2: st.result = mc2_write_blocks(data)
 	case 3: copy(st.extra[:], MC2_SPEC[:])
-	case 4: st.result = 2 if mc2.fresh[port] else 1
+	case 4:
+		st.result = 2 if mc2.fresh[port] else 1
+		if mc2.s1 {mc2.fresh[port] = false}
 	case 12: st.result = 2
 	case 5:
 		r, blk := mc2_backup_check()

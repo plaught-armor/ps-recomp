@@ -8003,6 +8003,28 @@ test_mc2 :: proc() {
 	check(mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 4) == 1, "mc2 new card: 13, 1; then 4, 1")
 	check(mc2_cmd(buf[:], 0, 12) == 2 && mc2_cmd(buf[:], 0, 1, mc2_pages(32, 1)) == 1 && endian.unchecked_get_u32le(buf[8:]) == 0x2080, "mc2 new card: after 13 the port re-armed, 12 2 and 1 taken")
 
+	// mc2_s1 (Burnout 3): no 13, 4 clears the mark. A new card refuses 13
+	// and 3; 4 answers 2 once, then 3 gives the size and 4 answers 1. On a
+	// known card 13 is an unknown command, 1. mc2_d again after it.
+	iop.pad_init()
+	iop.dbcman_module("cdrom0:\\MODULES\\MC2_S1.IRX;1")
+	check(mc2_socket(buf[:], 2, A, B) == 0, "mc2_s1: socket 0")
+	check(mc2_cmd(buf[:], 0, 13) == 2 && mc2_cmd(buf[:], 0, 3) == 2, "mc2_s1 new card: 13 and 3 refused")
+	check(mc2_cmd(buf[:], 0, 4) == 2 && mc2_cmd(buf[:], 0, 4) == 1, "mc2_s1 new card: 4, 2, the mark cleared; then 4, 1")
+	check(mc2_cmd(buf[:], 0, 3) == 1, "mc2_s1: 3 taken after 4")
+	spec_ok := false
+	for st_at in ([2]u32{A, B}) {
+		sq, _, rs := mc2_status(st_at)
+		x := mem.ram_slice(st_at + 0xc, 8)
+		if rs == 1 && sq > 0 && slice.equal(x, []u8{0x00, 0x02, 0x10, 0x00, 0x00, 0x40, 0x00, 0x00}) {spec_ok = true}
+	}
+	check(spec_ok, "mc2_s1 3: 512-byte pages, 16 a block, 0x4000 pages")
+	check(mc2_cmd(buf[:], 0, 13) == 1, "mc2_s1: 13 on a known card, unknown, 1")
+	iop.dbcman_module("mc2_d.irx")
+	iop.pad_init()
+	check(mc2_socket(buf[:], 2, A, B) == 0 && mc2_cmd(buf[:], 0, 4) == 2 && mc2_cmd(buf[:], 0, 4) == 2, "mc2_d again: 4 leaves the mark")
+	check(mc2_cmd(buf[:], 0, 13) == 1 && mc2_cmd(buf[:], 0, 4) == 1, "mc2_d again: 13 clears it")
+
 	// Parameters no command may act on: each gives 0 and changes nothing.
 	check(mc2_cmd(buf[:], 0, 2, mc2_pages(0, 1), pat[:]) == 1 && iop.mcraw[0].blocks[0] != nil, "mc2 edges: block 0 written")
 	b0 := slice.clone(mc2_block(0, 0), context.temp_allocator)
