@@ -56,6 +56,20 @@ mtap: struct {
 	open:   [4]bool, // libmtap ports; 2 and 3 are the taps in pad ports 0 and 1
 }
 
+// Open answers, in its sixth word, the IOP address of two 0x20-byte frames
+// per port and slot. Newer libpads (Jak II's) send SetActDirect there by SIF
+// DMA each vblank instead of by RPC: {counter, pending, ?, act bytes[6]},
+// alternating frames. padman acts on the frame with the higher counter
+// whose pending word is set, then clears that word. Every socket's frames
+// sit in one sysmem block taken at the first Open, so a reopen answers the
+// same address; 0 until then.
+@(private = "file") PAD_DMA_FRAME :: 0x20
+@(private = "file") PAD_DMA_SLOT :: 2 * PAD_DMA_FRAME
+@(private = "file") PAD_DMA_ACT :: 0xc
+
+@(private = "file")
+pad_dma_base: u32
+
 PAD_STATE_STABLE :: 6
 
 // pad_data field offsets, as read by libpad (its frame pick, GetState and
@@ -95,6 +109,7 @@ pad_init :: proc() {
 	pads[0].connected = true
 	for &a in act_align {a = 0xff}
 	for &m in btn_mask {m = DS2_RESPONSE_ANALOG}
+	pad_dma_base = 0
 	ds2_reset()
 	dbcman_init()
 }
@@ -122,6 +137,28 @@ pad_open :: proc(port, slot: u32) -> int {
 	return pad_player(port, slot)
 }
 
+// IOP address of a socket's two SetActDirect frames (port < 2, slot < 4).
+@(private = "file")
+pad_dma_addr :: proc(port, slot: u32) -> u32 {
+	return pad_dma_base + (port * 4 + slot) * PAD_DMA_SLOT
+}
+
+// SetActDirect: the socket's player drives the motors its align maps the
+// six bytes to; an empty socket changes nothing.
+@(private = "file")
+pad_act_direct :: proc(port, slot: u32, b: []u8) {
+	player := pad_player(port, slot)
+	if player < 0 {return}
+	pad := &pads[player]
+	pad.small, pad.large = 0, 0
+	for a, i in act_align[player] {
+		switch a {
+		case 0: pad.small = b[i]
+		case 1: pad.large = b[i]
+		}
+	}
+}
+
 // Writes the current host input into every open pad area, and the
 // multitap connection table.
 pad_update :: proc() {
@@ -130,6 +167,15 @@ pad_update :: proc() {
 		for slot in u32(0) ..< 4 {
 			addr := pad_area[port][slot]
 			if addr == 0 {continue}
+			if pad_dma_base != 0 {
+				f := iop_mem(pad_dma_addr(port, slot), PAD_DMA_SLOT)
+				w := ([^]u32)(raw_data(f))
+				o := PAD_DMA_FRAME if w[0] < w[PAD_DMA_FRAME / 4] else 0
+				if w[o / 4 + 1] != 0 {
+					pad_act_direct(port, slot, f[o + PAD_DMA_ACT:][:6])
+					w[o / 4 + 1] = 0
+				}
+			}
 			player := pad_player(port, slot)
 			for half in u32(0) ..< 2 {
 				pad_fill(mem.ram_slice(addr + half * 128, 128), pad_frame * 2 + half, player, btn_mask[port][slot])
@@ -238,6 +284,11 @@ padman :: proc(sid: u32, buf: []u8) -> bool {
 		if w[1] < 2 && w[2] < 4 {
 			pad_area[w[1]][w[2]] = w[4]
 			btn_mask[w[1]][w[2]] = DS2_RESPONSE_ANALOG
+			if pad_dma_base == 0 {pad_dma_base = sys_alloc(.Low, 2 * 4 * PAD_DMA_SLOT)}
+			if pad_dma_base != 0 {
+				w[5] = pad_dma_addr(w[1], w[2])
+				for &b in iop_mem(w[5], PAD_DMA_SLOT) {b = 0}
+			}
 			pad_update()
 		}
 		w[3] = 1
@@ -252,21 +303,14 @@ padman :: proc(sid: u32, buf: []u8) -> bool {
 	case 0x06: w[5] = 1
 	case 0x07, 0x08: // SetActDirect, SetActAlign {cmd, port, slot, u8[6]}
 		w[5] = 1
-		player := pad_player(w[1], w[2]) if w[1] < 2 && w[2] < 4 else -1
-		if player < 0 {break}
+		if w[1] >= 2 || w[2] >= 4 {break}
 		b := buf[12:18]
-		if cmd == 0x08 {
-			copy(act_align[player][:], b)
+		if cmd == 0x07 {
+			pad_act_direct(w[1], w[2], b)
 			break
 		}
-		pad := &pads[player]
-		pad.small, pad.large = 0, 0
-		for a, i in act_align[player] {
-			switch a {
-			case 0: pad.small = b[i]
-			case 1: pad.large = b[i]
-			}
-		}
+		player := pad_player(w[1], w[2])
+		if player >= 0 {copy(act_align[player][:], b)}
 	// GetButtonMask {cmd, port, slot}: what the pad answered wire 0x41 at
 	// open, which a DualShock 2 in analog mode answers with every byte.
 	case 0x09: w[3] = DS2_RESPONSE_DUALSHOCK2 if pad_open(w[1], w[2]) >= 0 else 0
@@ -324,6 +368,7 @@ mtap_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 // Emulated state, saved and restored by snapshots (snap.odin).
 pad_snap :: proc() {
 	core.snap_add(&pad_area)
+	core.snap_add(&pad_dma_base)
 	core.snap_add(&btn_mask)
 	core.snap_add(&act_align)
 	core.snap_add(&mtap)

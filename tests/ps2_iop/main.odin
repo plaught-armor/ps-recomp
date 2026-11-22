@@ -2288,6 +2288,25 @@ test_padman :: proc() {
 	length :: proc(d: []u8) -> u32 {return endian.unchecked_get_u32le(d[0x60:])}
 	check(d[1] == iop.DS2_ANALOG && length(d) == 8 && d[8 + 6] == 0 && d[0x65] == iop.DS2_ANALOG && d[0x69] == 1, "padman: open, analog, length 8, no pressures")
 	check(endian.unchecked_get_u32le(d[0x79:]) == iop.DS2_RESPONSE_DUALSHOCK2, "padman: the pad area advertises every DualShock 2 button")
+
+	// Open's sixth word: the socket's SetActDirect frames in IOP RAM, one
+	// address per socket and the same on a reopen. padman acts on the newer
+	// frame's pending request and clears it.
+	f00 := w[5]
+	cmd(buf[:], 0x01, 1, 0, 0, AREA + 0x100)
+	f10 := w[5]
+	cmd(buf[:], 0x0e, 1, 0)
+	cmd(buf[:], 0x01, 0, 0, 0, AREA)
+	check(f00 != 0 && f10 != 0 && f00 != f10 && w[5] == f00, "padman: open answers a frame address per socket, the same on a reopen")
+	cmd(buf[:], 0x08, 0, 0, 0xffff0100, 0xffff)
+	f := iop.iop_mem(f00, 0x40)
+	fw := ([^]u32)(raw_data(f))
+	fw[0], fw[1] = 1, 0 // the older frame, no request
+	fw[8], fw[9] = 2, 1 // the newer one, pending
+	f[0x20 + 0xc], f[0x20 + 0xd] = 1, 0x80
+	iop.pad_update()
+	check(iop.pads[0].small == 1 && iop.pads[0].large == 0x80 && fw[9] == 0, "padman: a SetActDirect sent by DMA drives the motors and is cleared")
+	iop.pads[0].small, iop.pads[0].large = 0, 0
 	cmd(buf[:], 0x09, 0, 0)
 	check(w[3] == iop.DS2_RESPONSE_DUALSHOCK2, "padman 0x09: an open DualShock 2, 0x3ffff")
 	cmd(buf[:], 0x0a, 0, 0, 0xfff)
