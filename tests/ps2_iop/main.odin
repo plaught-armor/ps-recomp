@@ -4732,7 +4732,7 @@ test_fpool :: proc() {
 	// an address outside the pool, then one inside it off a block's start.
 	// The allocation is refused and the pool is left as it was.
 	iop.iop_u32(b2)^ = 0x100
-	check(fp(7, id) == ke(-400) && iop.iop_u32(b2)^ == 0x100, "thfpool: a link outside the pool is KE_NO_MEMORY")
+	check(fp(7, id) == ke(-400) && iop.iop_u32(b2)^ == 0x100 && iop.iop_sched.fpls[0].free == b2, "thfpool: a link outside the pool is KE_NO_MEMORY; the free head stays")
 	iop.iop_u32(b2)^ = b0 + 4
 	check(fp(7, id) == ke(-400) && free_n(id) == 1, "thfpool: a link off a block's start is KE_NO_MEMORY; the walk stops there")
 	iop.iop_u32(b2)^ = b0
@@ -4746,6 +4746,21 @@ test_fpool :: proc() {
 	check(fp(4, P) == ke(-427), "thfpool: CreateFpl of no blocks is KE_ILLEGAL_MEMSIZE")
 	iop.iop_u32(P + 8)^, iop.iop_u32(P + 12)^ = 0x100000, 4
 	check(fp(4, P) == ke(-400), "thfpool: CreateFpl bigger than free memory is KE_NO_MEMORY")
+	// A block size within 3 of 2^32 would round to 0 bytes.
+	for sz in ([?]u32{0xfffffffd, 0xffffffff, iop.IOP_RAM_SIZE + 1}) {
+		iop.iop_u32(P + 8)^, iop.iop_u32(P + 12)^ = sz, 1
+		check(fp(4, P) == ke(-400), fmt.tprintf("thfpool: CreateFpl of block size %x is KE_NO_MEMORY", sz))
+	}
+	check(len(iop.iop_sched.fpls) == 1, "thfpool: no pool made by the refused creates")
+	// A failed load's undo drops the pools made since its mark, not before.
+	iop.iop_u32(P + 8)^, iop.iop_u32(P + 12)^ = 16, 2
+	m := iop.th_mark()
+	id2 := fp(4, P)
+	id3 := fp(4, P)
+	check(id2 == id + 1 && id3 == id + 2 && len(iop.iop_sched.fpls) == 3, "thfpool: two pools made after the mark")
+	iop.th_undo(m)
+	check(len(iop.iop_sched.fpls) == 1 && iop.iop_sched.fpls[0].id == id, "thfpool: th_undo drops the pools made since the mark")
+	check(fp(7, id2) == ke(-412), "thfpool: an undone pool's id is unknown")
 	_, total0 := iop.sys_free_sizes()
 	check(fp(5, id) == 0 && len(iop.iop_sched.fpls) == 0, "thfpool: DeleteFpl drops the pool")
 	_, total1 := iop.sys_free_sizes()

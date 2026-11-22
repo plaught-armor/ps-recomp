@@ -1769,6 +1769,9 @@ th_fpool :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		attr, size, n := r32(a0), r32(a0 + 8), r32(a0 + 12)
 		if attr &~ (FA_THPRI | FA_MEMBTM) != 0 {return ke(KE_ILLEGAL_ATTR), true}
 		if size == 0 || n == 0 {return ke(KE_ILLEGAL_MEMSIZE), true}
+		// Checked before rounding: a size within 3 of 2^32 rounds to 0,
+		// and a pool of 0-byte blocks has no block for fpl_block to find.
+		if size > IOP_RAM_SIZE {return ke(KE_NO_MEMORY), true}
 		size = (size + 3) &~ 3
 		if u64(size) * u64(n) > IOP_RAM_SIZE {return ke(KE_NO_MEMORY), true}
 		base := sys_alloc(.High if attr & FA_MEMBTM != 0 else .Low, size * n)
