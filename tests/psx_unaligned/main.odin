@@ -13,6 +13,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "ps:core"
 import psx_native "ps:psx/native"
 import cpu "ps:psx/cpu"
@@ -595,8 +596,42 @@ main :: proc() {
 	check_jalr()
 	check_lone()
 	check_scratch()
+	check_watch()
 	if failed != 0 {
 		os.exit(1)
 	}
 	fmt.printfln("ok psx_unaligned %v: %d addresses", native.Arch(core.NATIVE_ARCH), len(ADDRS))
+}
+
+// A memory watch sees a store through any copy of RAM: one on 0x80010000
+// a store to 0x80210000, one on 0x80210000 a store to 0x80010000, and
+// neither one to 0x80020000.
+@(private = "file")
+check_watch :: proc() {
+	clock: u64
+	core.trace.present, core.trace.cycles = &clock, &clock
+	core.trace.active = {.Mem}
+	core.trace.watching = true
+	defer {
+		core.trace.active = {}
+		core.trace.watching = false
+		core.trace.watch_lo, core.trace.watch_hi = 0, 0
+		strings.builder_reset(&core.trace.buf)
+	}
+	Case :: struct {
+		lo, hi, hit, miss: u32,
+	}
+	for c in ([]Case{{0x10000, 0x10003, 0x80210000, 0x80020000}, {0x210000, 0x210003, 0x80010000, 0x80220000}}) {
+		strings.builder_reset(&core.trace.buf)
+		core.trace.watch_lo, core.trace.watch_hi = c.lo, c.hi
+		cpu.sw(c.miss, 1)
+		cpu.sw(c.hit, 2)
+		text := strings.to_string(core.trace.buf)
+		if !strings.contains(text, fmt.tprintf("store32 [%08x] = 2", c.hit)) {
+			fail("watch %x-%x missed the store to %08x; trace: %s", c.lo, c.hi, c.hit, text)
+		}
+		if strings.contains(text, fmt.tprintf("[%08x]", c.miss)) {
+			fail("watch %x-%x saw the store to %08x; trace: %s", c.lo, c.hi, c.miss, text)
+		}
+	}
 }
