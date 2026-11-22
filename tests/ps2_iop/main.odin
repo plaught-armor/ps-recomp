@@ -5122,6 +5122,14 @@ test_libsd :: proc() {
 	check(sd_call(29) == 9, "libsd: GetSpu2IntrHandlerArgument is the argument 27 set")
 	sd_call(9, 0x1f00, 0x5010)
 	check(sd_call(10, 0x1f00) == 0x5010, "libsd: GetAddr returns IRQA")
+	// ESA keeps bits 4 up, EEA bits 17 up with its low 17 read as 1s, per
+	// core.
+	sd_call(9, 0x1c00, 0x1fff1f)
+	sd_call(9, 0x1c01, 0xdfff1)
+	sd_call(9, 0x1d00, 0x1fffff)
+	sd_call(9, 0x1d01, 0xe0000)
+	check(sd_call(10, 0x1c00) == 0x1fff10 && sd_call(10, 0x1c01) == 0xdfff0, "libsd: GetAddr returns ESA without bits 0-3, per core")
+	check(sd_call(10, 0x1d00) == 0x1fffff && sd_call(10, 0x1d01) == 0xfffff, "libsd: GetAddr returns EEA with bits 0-16 set, per core")
 	sd_call(11, 0x4, 1)
 	iop.spu_mix(out)
 	check(iop.iop_sd.pending == iop.SD_PENDING_SPU2 && iop.iop_wake_ee == r3000.state.cycles * 8, "libsd: the voice at IRQA raises core 0's IRQ, the wake at once")
@@ -5321,6 +5329,7 @@ test_libsd :: proc() {
 	// core each. An id's other low bits are ignored, as LIBSD 1.5 takes
 	// the core from bit 0 alone.
 	sd_call(4, 0)
+	check(sd_call(10, 0x1c00) == 0x1dfff0 && sd_call(10, 0x1c01) == 0x1ffff0 && sd_call(10, 0x1d00) == 0x1dffff && sd_call(10, 0x1d01) == 0x1fffff, "libsd: sceSdInit resets ESA and EEA to effect mode OFF's area")
 	check(sd_call(8, 0x1800) == 0xffffff && sd_call(8, 0x1901) == 0xffffff && sd_call(8, 0x1a00) == 0xffffff && sd_call(8, 0x1b01) == 0xffffff && sd_call(8, 0x1300) == 0 && sd_call(8, 0x1401) == 0, "libsd: GetSwitch after sceSdInit: the mixes all ones, PMON and NON 0")
 	SWITCHES :: [?]u32{0x1300, 0x1400, 0x1800, 0x1900, 0x1a00, 0x1b00}
 	for id, i in SWITCHES {

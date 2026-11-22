@@ -86,6 +86,10 @@ spu: struct {
 	mmix:   [2]u16, // MMIX as last written, for sceSdGetParam; no gate of it is modelled
 	block:  [2]Sdr_Block, // the block transfers, per channel
 	irqa:   [2]u32, // IRQA, a byte address, per core (libsd)
+	// ESA and EEA per core as sceSdGetAddr reads them back (libsd); the
+	// effect's work area is not in sound RAM here, so nothing else reads them.
+	esa: [2]u32,
+	eea: [2]u32,
 	irq_watch: u8, // the cores with IRQ_ENABLE set, a bit each (libsd)
 	mute:      u8, // the cores with MUTE set, a bit each, ATTR bit 14; nothing is muted by it here (libsd)
 	noise_clk: [2]u8, // NOISE_CLK, ATTR bits 8 to 13, per core; no voice plays noise here (libsd)
@@ -1081,23 +1085,33 @@ spu_switch :: proc(id: u32) -> (Spu_Switch, bool) {
 	return {}, false
 }
 
-// sceSdSetAddr(id, address) for a core's IRQA; ESA, EEA and TSA are taken
-// and change nothing (the effect's work area is not in sound RAM here).
+// sceSdSetAddr(id, address) for a core's IRQA, ESA and EEA; TSA is taken
+// and changes nothing. ESA and EEA are kept as their register pair holds
+// them: ESA's high half takes address bits 17-31 and its low half bits 4-16
+// (bits 0-3 drop); EEA has the high half only, its low 17 bits read 1s.
+// Nothing reads them but sceSdGetAddr (the effect's work area is not in
+// sound RAM here).
 sd_addr_extra :: proc(id, addr: u32) -> bool {
 	switch id & 0xff00 {
 	case SD_A_IRQA:
 		spu.irqa[id & 1] = addr & (SPU_RAM_SIZE - 1)
 		sd_in_arm(id & 1)
-	case SD_A_ESA, SD_A_EEA, SD_A_TSA:
+	case SD_A_ESA: spu.esa[id & 1] = addr &~ 0xf
+	case SD_A_EEA: spu.eea[id & 1] = addr | 0x1ffff
+	case SD_A_TSA:
 	case: return false
 	}
 	return true
 }
 
-// sceSdGetAddr(id) for a core's IRQA.
+// sceSdGetAddr(id) for a core's IRQA, ESA and EEA.
 sd_get_addr_extra :: proc(id: u32) -> (u32, bool) {
-	if id & 0xff00 != SD_A_IRQA {return 0, false}
-	return spu.irqa[id & 1], true
+	switch id & 0xff00 {
+	case SD_A_IRQA: return spu.irqa[id & 1], true
+	case SD_A_ESA: return spu.esa[id & 1], true
+	case SD_A_EEA: return spu.eea[id & 1], true
+	}
+	return 0, false
 }
 
 // sceSdSetCoreAttr(entry, value) for EFFECT_ENABLE and IRQ_ENABLE; MUTE,
@@ -1150,9 +1164,14 @@ sd_clear_effect :: proc(core: u32) {
 // stopped, and every voice in the four mixes, as LIBSD 1.5's init writes
 // VMIXL, VMIXEL, VMIXR and VMIXER all ones on both cores (sd_init's voices
 // are out of no send already). It does not write PMON or NON: they are
-// kept 0, the zero state, as their value at power on is not known.
+// kept 0, the zero state, as their value at power on is not known. EEA's
+// high half is set to 0xe and 0xf, and ESA to 14 bytes below the EEA it
+// read (effect mode OFF's area), as ps2sdk's freesd init does: with that
+// EEA already set, ESA reads 0x1dfff0 and 0x1ffff0, EEA 0x1dffff and
+// 0x1fffff, the effect areas PCSX2's V_Core::Init sets at power on.
 sd_lib_init :: proc() {
 	spu.irqa, spu.irq_watch, spu.in_irq, spu.bvol = {}, 0, {max(u64), max(u64)}, {}
+	spu.esa, spu.eea = {0x1dfff0, 0x1ffff0}, {0x1dffff, 0x1fffff}
 	spu.mute, spu.noise_clk, spu.effect = 0, {}, {} // retail's init sets ATTR to the core's enable alone; SPDIF it keeps
 	spu.block = {}
 	spu.mmix = {0xff0, 0xffc} // as PCSX2's V_Core::Init leaves it, the value it notes a PS2 reads after sceSdInit
