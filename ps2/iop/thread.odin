@@ -80,6 +80,7 @@ KE_UNKNOWN_THID :: -407
 KE_UNKNOWN_SEMID :: -408
 KE_UNKNOWN_EVFID :: -409
 KE_UNKNOWN_MBXID :: -410
+KE_UNKNOWN_FPLID :: -412
 KE_DORMANT :: -413
 KE_NOT_DORMANT :: -414
 KE_CAN_NOT_WAIT :: -417
@@ -90,6 +91,8 @@ KE_EVF_MULTI :: -422
 KE_EVF_ILPAT :: -423
 KE_MBOX_NOMSG :: -424
 KE_WAIT_DELETE :: -425
+KE_ILLEGAL_MEMBLOCK :: -426
+KE_ILLEGAL_MEMSIZE :: -427
 KE_NOT_WAIT :: -416
 KE_RELEASE_WAIT :: -418
 
@@ -208,15 +211,26 @@ Iop_Mbx :: struct {
 	last:             u32,
 }
 
+// A fixed-size block pool: `blocks` blocks of `block_size` bytes (rounded
+// up to 4) from `base`, one sysmem block. The free blocks are a list through
+// their own first words, `free` the head, 0 at its end.
+Iop_Fpl :: struct {
+	id, attr, option:   u32,
+	block_size, blocks: u32,
+	base, free:         u32,
+}
+
 // Emulated state, in the emu heap: snapshotted (sif_snap).
 iop_sched: struct {
 	threads:              [dynamic]Iop_Thread,
 	semas:                [dynamic]Iop_Sema,
 	evfs:                 [dynamic]Iop_Evf,
 	mbxs:                 [dynamic]Iop_Mbx,
+	fpls:                 [dynamic]Iop_Fpl,
 	next_thid, next_semid: u32,
 	next_evfid:           u32,
 	next_mbxid:           u32,
+	next_fplid:           u32,
 	lock:                 i32, // sio2man's transfer lock, a semaphore's count
 	lock_holder:          u32, // the thread that last took it, 0 when given back
 	head, tail:           i64, // the next seq at a queue's head, at its tail
@@ -281,15 +295,18 @@ th_init :: proc() {
 	clear(&s.semas)
 	clear(&s.evfs)
 	clear(&s.mbxs)
+	clear(&s.fpls)
 	s^ = {
 		threads    = s.threads,
 		semas      = s.semas,
 		evfs       = s.evfs,
 		mbxs       = s.mbxs,
+		fpls       = s.fpls,
 		next_thid  = 1,
 		next_semid = 1,
 		next_evfid = 1,
 		next_mbxid = 1,
+		next_fplid = 1,
 		lock       = 1,
 		head       = -1,
 	}
@@ -1022,12 +1039,12 @@ th_intr_stop :: proc(why: Intr_Stop) {
 
 // The ids a load's threads, semaphores and event flags start from.
 Th_Mark :: struct {
-	thid, semid, evfid, mbxid: u32,
+	thid, semid, evfid, mbxid, fplid: u32,
 }
 
 th_mark :: proc() -> Th_Mark {
 	s := &iop_sched
-	return {s.next_thid, s.next_semid, s.next_evfid, s.next_mbxid}
+	return {s.next_thid, s.next_semid, s.next_evfid, s.next_mbxid, s.next_fplid}
 }
 
 // Undoes a failed load: deletes the semaphores, event flags and threads
@@ -1044,6 +1061,9 @@ th_undo :: proc(m: Th_Mark) {
 	}
 	for i := len(s.mbxs) - 1; i >= 0; i -= 1 {
 		if s.mbxs[i].id >= m.mbxid {mbx_delete(i)}
+	}
+	for i := len(s.fpls) - 1; i >= 0; i -= 1 {
+		if s.fpls[i].id >= m.fplid {ordered_remove(&s.fpls, i)}
 	}
 	for i := len(s.threads) - 1; i >= 0; i -= 1 {
 		t := &s.threads[i]
@@ -1110,7 +1130,7 @@ sema_delete :: proc(i: int) {
 // ------------------------------------------------------------- call context
 
 Fno_Set :: bit_set[0 ..< 64; u64]
-Th_Lib :: enum u8 {Base, Semap, Event, Msgbx}
+Th_Lib :: enum u8 {Base, Semap, Event, Msgbx, Fpool}
 
 // ReferThreadStatus's iop_thread_info_t at `info` for thread id: attr,
 // option, status, entry, stack, stacksize, gp, initPriority,
@@ -1178,6 +1198,7 @@ TH_CHECKED := [Th_Lib]Fno_Set {
 	.Semap = {4, 5, 6, 7, 8, 9, 11, 12},
 	.Event = {4, 5, 6, 7, 8, 9, 10, 11, 13, 14},
 	.Msgbx = {4, 5, 6, 7, 8, 9},
+	.Fpool = {4, 5, 6, 7, 8, 9, 11, 12},
 }
 @(rodata)
 TH_IVAR := [Th_Lib]Fno_Set {
@@ -1185,6 +1206,7 @@ TH_IVAR := [Th_Lib]Fno_Set {
 	.Semap = {7, 12},
 	.Event = {7, 9, 14},
 	.Msgbx = {7},
+	.Fpool = {8, 12},
 }
 
 // The calls refused so far, each shown once under PS_DEBUG; not state.
@@ -1719,4 +1741,68 @@ evf_delete :: proc(i: int) {
 	for &t in s.threads {
 		if t.status == .Evf && t.sema == id {th_wake(&t, ke(KE_WAIT_DELETE))}
 	}
+}
+
+// ------------------------------------------------------------------ thfpool
+
+@(private = "file")
+FA_THPRI :: 0x001
+@(private = "file")
+FA_MEMBTM :: 0x200 // the pool at the top of the highest gap that fits
+
+// Function fno of thfpool, as th_base: CreateFpl, DeleteFpl, pAllocateFpl,
+// ipAllocateFpl and FreeFpl. The blocking AllocateFpl (6) is not served.
+th_fpool :: proc(fno: u32) -> (v0: u32, ok: bool) {
+	s := &iop_sched
+	a0, a1 := r3000.state.r[4], r3000.state.r[5]
+	if th_wrong_context(.Fpool, fno) {return ke(KE_ILLEGAL_CONTEXT), true}
+	switch fno {
+	case 4: // CreateFpl(iop_fpl_param *): attr, option, block_size, blocks
+		attr, size, n := r32(a0), r32(a0 + 8), r32(a0 + 12)
+		if attr &~ (FA_THPRI | FA_MEMBTM) != 0 {return ke(KE_ILLEGAL_ATTR), true}
+		if size == 0 || n == 0 {return ke(KE_ILLEGAL_MEMSIZE), true}
+		size = (size + 3) &~ 3
+		if u64(size) * u64(n) > IOP_RAM_SIZE {return ke(KE_NO_MEMORY), true}
+		base := sys_alloc(.High if attr & FA_MEMBTM != 0 else .Low, size * n)
+		if base == 0 {return ke(KE_NO_MEMORY), true}
+		for i in 0 ..< n {
+			b := base + i * size
+			w32(b, b + size if i + 1 < n else 0)
+		}
+		append(&s.fpls, Iop_Fpl{id = s.next_fplid, attr = attr, option = r32(a0 + 4), block_size = size, blocks = n, base = base, free = base})
+		s.next_fplid += 1
+		return s.next_fplid - 1, true
+	case 5: // DeleteFpl(fplid): its memory goes back to sysmem
+		for f, i in s.fpls {
+			if f.id != a0 {continue}
+			sys_free(f.base)
+			ordered_remove(&s.fpls, i)
+			return KE_OK, true
+		}
+		return ke(KE_UNKNOWN_FPLID), true
+	case 7, 8: // pAllocateFpl(fplid), ipAllocateFpl: a free block, or KE_NO_MEMORY
+		f := fpl_find(a0)
+		if f == nil {return ke(KE_UNKNOWN_FPLID), true}
+		if f.free == 0 {return ke(KE_NO_MEMORY), true}
+		b := f.free
+		f.free = r32(b)
+		return b, true
+	case 9: // FreeFpl(fplid, block): back on the free list
+		f := fpl_find(a0)
+		if f == nil {return ke(KE_UNKNOWN_FPLID), true}
+		off := a1 - f.base
+		if a1 < f.base || off >= f.block_size * f.blocks || off % f.block_size != 0 {return ke(KE_ILLEGAL_MEMBLOCK), true}
+		w32(a1, f.free)
+		f.free = a1
+		return KE_OK, true
+	}
+	return 0, false
+}
+
+@(private = "file")
+fpl_find :: proc(id: u32) -> ^Iop_Fpl {
+	for &f in iop_sched.fpls {
+		if f.id == id {return &f}
+	}
+	return nil
 }

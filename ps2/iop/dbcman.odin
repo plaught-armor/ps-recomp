@@ -1,6 +1,6 @@
 // HLE dbcman (module version 0x310) and the device drivers behind it: a pad
-// driver (ds1o_d, ds2o_d or ds2u) and the memory card driver mc2_d, so none
-// of these modules, nor sio2d under them, runs on the IOP.
+// driver (ds1o_d, ds2o, ds2o_d or ds2u) and the memory card driver (mc2_d or
+// mc2_s1), so none of these modules, nor sio2d under them, runs on the IOP.
 //
 // Three server sets, keyed on the Dbc_Manager module version (its .iopmod
 // header) of the image the game loads (dbcman_module); each is a row of
@@ -261,8 +261,8 @@ dbcman_init :: proc() {
 // disc file that cannot be read) takes the fast set, logged once. Any other
 // load leaves the set as it is.
 //
-// The pad driver the load names, by file or module name (ds1o_d, ds2o_d,
-// or ds2u or ds2u_d, ignoring case and any directory, extension or
+// The pad driver the load names, by file or module name (ds1o_d, ds2o,
+// ds2o_d, or ds2u or ds2u_d, ignoring case and any directory, extension or
 // version), is the one served from then on, its frame counters at 0 as its
 // start leaves them. Other names change nothing.
 dbcman_module :: proc(path: string, image: []u8 = nil) {
@@ -286,7 +286,7 @@ dbcman_module :: proc(path: string, image: []u8 = nil) {
 		}
 	}
 	switch {
-	case strings.equal_fold(name, "ds1o_d") || strings.equal_fold(name, "ds2o_d"): dbc.pad = DBC_DS1O_D
+	case strings.equal_fold(name, "ds1o_d") || strings.equal_fold(name, "ds2o") || strings.equal_fold(name, "ds2o_d"): dbc.pad = DBC_DS1O_D
 	case strings.equal_fold(name, "ds2u") || strings.equal_fold(name, "ds2u_d"): dbc.pad = DBC_DS2U
 	case: return
 	}

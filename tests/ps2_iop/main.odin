@@ -268,6 +268,7 @@ game :: proc(_: rawptr) {
 	test_sif_dma_intr()
 	test_sif_dma_stat()
 	test_libsd()
+	test_fpool()
 	test_vblank_samples()
 	test_cdvdman()
 	test_cdvd_search_server()
@@ -999,6 +1000,8 @@ test_modload :: proc() {
 		check(ml(16, LIST + 0x10, 1, CNT) == 1 && w(CNT, 0) == 2, "modload: id list, max 1 counts all")
 		check(ml(18, NAME, LIST, 8, CNT) == 1 && w(LIST, 0) == u32(idi) && w(CNT, 0) == 1, "modload: id list by name")
 		check(ml(18, NAME + 1, LIST, 8, CNT) == 0 && w(CNT, 0) == 0 && ml(18, 0, LIST, 8, 0) == 2, "modload: by name, none; null name any")
+		check(ml(22, NAME) == u32(idi), "modload: SearchModuleByName finds inner")
+		check(ml(22, NAME + 1) == UNKNOWN && ml(22, 0) == UNKNOWN, "modload: SearchModuleByName of no such module, or null, is KE_UNKNOWN_MODULE")
 	}
 
 	// An inner start that calls what the HLE lacks: only its module dropped,
@@ -4647,7 +4650,7 @@ test_sif_dma_stat :: proc() {
 }
 
 // libsd's functions, in the order "modl" imports them.
-LIBSD_FNOS := [?]u32{4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 17, 18, 19, 20, 23, 25, 26, 27, 28}
+LIBSD_FNOS := [?]u32{4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 17, 18, 19, 20, 23, 25, 26, 27, 28, 29}
 
 // "modl" as loaded: its base, the offsets of its libsd stubs, its data
 // (handler calls, the handler's a0 and a1, thread passes, sem, th) and a
@@ -4691,6 +4694,43 @@ test_vblank_samples :: proc() {
 }
 
 SD_HALF :: 0x1000 * cpu.EE_CLOCK / (48000 * 4) // EE cycles to move half of a 0x2000-byte buffer
+
+test_fpool :: proc() {
+	fresh()
+	iop.th_init()
+	fp :: proc(fno: u32, args: ..u32) -> u32 {
+		for v, i in args {r3000.state.r[4 + i] = v}
+		v, ok := iop.hle_fn("thfpool", fno)
+		check(ok, fmt.tprintf("thfpool: fno %d served", fno))
+		return v
+	}
+	ke :: proc(e: i32) -> u32 {return u32(e)}
+	P :: 0x1f0000
+	iop.iop_u32(P)^ = 0
+	iop.iop_u32(P + 4)^ = 0
+	iop.iop_u32(P + 8)^ = 6 // rounded up to 8
+	iop.iop_u32(P + 12)^ = 3
+	id := fp(4, P)
+	check(id == 1, "thfpool: CreateFpl gives id 1")
+	b0, b1, b2 := fp(7, id), fp(7, id), fp(7, id)
+	check(b0 != 0 && b1 == b0 + 8 && b2 == b1 + 8, fmt.tprintf("thfpool: pAllocateFpl hands out the 3 blocks, 8 apart (%x %x %x)", b0, b1, b2))
+	check(fp(7, id) == ke(-400), "thfpool: pAllocateFpl of an empty pool is KE_NO_MEMORY")
+	check(fp(9, id, b1 + 4) == ke(-426) && fp(9, id, b2 + 8) == ke(-426), "thfpool: FreeFpl of no block of the pool is KE_ILLEGAL_MEMBLOCK")
+	check(fp(9, id, b1) == 0 && fp(7, id) == b1, "thfpool: a freed block is the next one allocated")
+	check(fp(7, 9) == ke(-412) && fp(9, 9, b0) == ke(-412) && fp(5, 9) == ke(-412), "thfpool: an unknown id is KE_UNKNOWN_FPLID")
+	check(fp(8, id) == ke(-100), "thfpool: ipAllocateFpl off a handler is KE_ILLEGAL_CONTEXT")
+	iop.iop_u32(P)^ = 0x2
+	check(fp(4, P) == ke(-401), "thfpool: CreateFpl refuses an attr bit retail lacks")
+	iop.iop_u32(P)^ = 0
+	iop.iop_u32(P + 12)^ = 0
+	check(fp(4, P) == ke(-427), "thfpool: CreateFpl of no blocks is KE_ILLEGAL_MEMSIZE")
+	iop.iop_u32(P + 8)^, iop.iop_u32(P + 12)^ = 0x100000, 4
+	check(fp(4, P) == ke(-400), "thfpool: CreateFpl bigger than free memory is KE_NO_MEMORY")
+	_, total0 := iop.sys_free_sizes()
+	check(fp(5, id) == 0 && len(iop.iop_sched.fpls) == 0, "thfpool: DeleteFpl drops the pool")
+	_, total1 := iop.sys_free_sizes()
+	check(total1 > total0, fmt.tprintf("thfpool: DeleteFpl gives its memory back (%d -> %d)", total0, total1))
+}
 
 test_libsd :: proc() {
 	fresh()
@@ -5008,6 +5048,7 @@ test_libsd :: proc() {
 	// The SPU2 handler runs once a voice enters the block at IRQA, with a0
 	// the core's bit.
 	check(sd_call(27, b + h, 9) == 0, "libsd: SetSpu2IntrHandler returns the previous handler, none")
+	check(sd_call(29) == 9, "libsd: GetSpu2IntrHandlerArgument is the argument 27 set")
 	sd_call(9, 0x1f00, 0x5010)
 	check(sd_call(10, 0x1f00) == 0x5010, "libsd: GetAddr returns IRQA")
 	sd_call(11, 0x4, 1)
@@ -7520,6 +7561,9 @@ test_dbcman :: proc() {
 	check(r[0x208c / 4] == 1, "dbcman 131b 0x8000131c: a driver call")
 	iop.dbcman_module("ds2o_d")
 	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 131b: no image, still 131b; ds2o_d served as ds1o_d")
+	iop.dbcman_module("ds2u")
+	iop.dbcman_module("cdrom0:\\IOP\\DS2O.IRX;1")
+	check(pad_cmd(buf[:], iop.DBC_SID_MID, 0, 0x01010002) == 0 && r[0x108c / 4] == 1 && w[3] == 0x73, "dbcman 131b: ds2o, after ds2u, served as ds1o_d")
 	mid_off :: proc(buf: []u8) -> bool {return !iop.sif.servers[iop.DBC_SID_MID](0, buf, 0x90) && pad_cmd(buf, 0, 0, 0x0101800c) == 1}
 	iop.dbcman_module("dbc.irx", dbc_image(0x310))
 	check(mid_off(buf[:]), "dbcman: a 0x310 image, the fast set")
@@ -7573,7 +7617,7 @@ test_dbcman :: proc() {
 	check(mid_off(buf[:]), "dbcman: init serves the fast set again")
 	iop.dbcman_module("dbc.irx", dbc_image(0x310))
 
-	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d"), "dbcman: the device modules are Sony ones")
+	check(iop.iop_sony("dbcman") && iop.iop_sony("sio2d") && iop.iop_sony("ds1o_d") && iop.iop_sony("ds2o_d") && iop.iop_sony("ds2u_d") && iop.iop_sony("mc2_d") && iop.iop_sony("ds2o") && iop.iop_sony("mc2_s1"), "dbcman: the device modules are Sony ones")
 }
 
 // The 900 server set: a Dbc_Manager image of module version 0x202 serves

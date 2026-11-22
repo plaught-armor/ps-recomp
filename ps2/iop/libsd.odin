@@ -131,6 +131,8 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 			return 0, true
 		}
 		return s.trans[a0].arg, true
+	case 29: // sceSdGetSpu2IntrHandlerArgument(): the arg 27 set
+		return s.spu2.arg, true
 	}
 	return 0, false
 }

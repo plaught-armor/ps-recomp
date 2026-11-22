@@ -70,7 +70,7 @@ IOP_SONY := [?]string {
 	"loadfile", "modload", "ioman", "iomanx", "cdvdman", "cdvdfsv", "sio2man",
 	"padman", "mtapman", "mcman", "mcserv", "libsd", "sdrdrv", "usbd", "dev9",
 	"rmman", "siftool", "reboot", "eesync", "cdvdstm", "dbcman", "sio2d",
-	"ds1o_d", "ds2o_d", "ds2u", "ds2u_d", "mc2_d",
+	"ds1o_d", "ds2o", "ds2o_d", "ds2u", "ds2u_d", "mc2_d", "mc2_s1",
 }
 
 Iop_Lib :: struct {
@@ -739,7 +739,9 @@ KE_UNKNOWN_MODULE :: -202
 KE_ALREADY_STARTED :: -206
 
 // modload's LoadModuleBuffer (10) and StartModule (8), as a start that loads
-// modules itself calls them (PLD.IRX). Numbers as modload's export table.
+// modules itself calls them (PLD.IRX), the module id lists (16, 18) and
+// SearchModuleByName (22). Numbers as modload's export table. A Sony module
+// has no record, so a search for one finds nothing.
 @(private = "file")
 modload_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 	r := &r3000.state.r
@@ -753,6 +755,14 @@ modload_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return module_id_list("", false, r[4], r[5], r[6]), true
 	case 18: // GetModuleIdListByName(name, int *list, int max, int *count)
 		return module_id_list(r[4] != 0 ? cstr(r[4]) : "", r[4] != 0, r[5], r[6], r[7]), true
+	case 22: // SearchModuleByName(name): the newest such module's id, or KE_UNKNOWN_MODULE
+		if r[4] == 0 {return ke(KE_UNKNOWN_MODULE), true}
+		name := cstr(r[4])
+		#reverse for m in iop_loader.modules {
+			m := m
+			if strings.truncate_to_byte(string(m.name[:]), 0) == name {return m.id, true}
+		}
+		return ke(KE_UNKNOWN_MODULE), true
 	}
 	return 0, false
 }
@@ -1203,6 +1213,8 @@ hle_fn :: proc(name: string, fno: u32) -> (v0: u32, ok: bool) {
 		return th_semap(fno)
 	case "thmsgbx":
 		return th_msgbx(fno)
+	case "thfpool":
+		return th_fpool(fno)
 	case "sio2man":
 		return sio2man_fn(fno)
 	case "thevent":
