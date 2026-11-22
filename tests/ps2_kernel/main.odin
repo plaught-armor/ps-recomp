@@ -25,6 +25,9 @@
 // FlushCache of the instruction cache leaves the function table on while each
 // recompiled function's first word is the boot program's and turns it off,
 // until an exec, once one changed; a data-cache flush checks nothing.
+// GetOsdConfigParam boots English with a nonzero version, so libscf reads
+// the language field; SetOsdConfigParam2 and GetOsdConfigParam2 copy
+// bytes of the 0x80-byte Config2 block, cut at its end.
 package main
 
 import "core:fmt"
@@ -730,9 +733,53 @@ main :: proc() {
 	flush_text_test()
 	vsync_flag_test()
 	loadfile_version_test()
+	osd_config_test()
 
 	// ExecPS2 frees the coroutine the program ran on, so it is not the host's.
 	main_t.co = core.co_create(proc(_: rawptr) {exec_prog()}, nil)
 	core.co_switch(main_t.co)
 	fail("fail: the program's coroutine returned")
+}
+
+// libscf's sceScfGetLanguage: (param >> 16) & 0x1f when the version (bits
+// 13-15) is not 0, else the japLanguage bit 4. Both say English (1) at boot.
+// The timezone (bits 21-31, signed) is 540, which libscf's local time takes
+// back off. Config2 holds what a Set wrote; a range past 0x80 is cut there,
+// and a size whose sum with the offset wraps copies nothing.
+osd_config_test :: proc() {
+	sys(0x4b, PARAM)
+	param := mem.rd32(PARAM)
+	if (param >> 13) & 7 == 0 || (param >> 16) & 0x1f != 1 || (param >> 4) & 1 != 1 {
+		fail("fail: GetOsdConfigParam %x, want version != 0, language 1, japLanguage 1", param)
+	}
+	if tz := i32(param) >> 21; tz != 540 {fail("fail: GetOsdConfigParam timezone %d, want 540", tz)}
+	saved := param
+	mem.wr32(PARAM, 0x12345678)
+	sys(0x4a, PARAM)
+	mem.wr32(PARAM, 0)
+	sys(0x4b, PARAM)
+	if got := mem.rd32(PARAM); got != 0x12345678 {fail("fail: GetOsdConfigParam %x after a Set of 12345678", got)}
+	mem.wr32(PARAM, saved)
+	sys(0x4a, PARAM)
+
+	for i in u32(0) ..< 4 {mem.wr8(PARAM + i, u8(0xa0 + i))}
+	sys(0x6e, PARAM, 2, 1) // bytes 1 and 2
+	sys(0x6e, PARAM, 4, 0x7e) // only 0x7e and 0x7f: cut at the end
+	sys(0x6e, PARAM, 4, 0x90) // past the end: nothing
+	for i in u32(0) ..< 8 {mem.wr8(PARAM + i, 0xff)}
+	sys(0x6f, PARAM, 4, 0)
+	if got := mem.rd32(PARAM); got != 0x00a1a000 {fail("fail: Config2 bytes 0-3 %08x, want 00a1a000", got)}
+	sys(0x6f, PARAM + 4, 4, 0x7e)
+	if got := mem.rd32(PARAM + 4); got != 0xffffa1a0 {fail("fail: Config2 bytes 7e-7f %08x, want a1a0 below ffff", got)}
+	for i in u32(0) ..< 4 {mem.wr8(PARAM + i, u8(0xb0 + i))}
+	sys(0x6e, PARAM, 0xfffffff0, 0x20) // size + offset wraps: nothing
+	mem.wr32(PARAM + 8, 0xffffffff)
+	sys(0x6f, PARAM + 8, 4, 0x20)
+	if got := mem.rd32(PARAM + 8); got != 0 {fail("fail: Config2 bytes 20-23 %08x after a wrapping Set, want 0", got)}
+	sys(0x6e, PARAM, 1, 0x20)
+	mem.wr32(PARAM + 12, 0xffffffff)
+	sys(0x6f, PARAM + 12, 0xfffffff0, 0x20) // wraps: nothing
+	if got := mem.rd32(PARAM + 12); got != 0xffffffff {fail("fail: a wrapping Get of Config2 wrote %08x", got)}
+	kernel.k.osd_config2 = {}
+	fmt.println("ok OsdConfigParam, OsdConfigParam2")
 }

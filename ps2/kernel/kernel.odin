@@ -96,7 +96,11 @@ k: struct {
 	next_alarm:   i32,
 	seq:          u64,
 	heap_end:     u32,
-	osd_config:   u32, // English, 4:3, no spdif
+	// ConfigParam (SetOsdConfigParam, GetOsdConfigParam) and the 0x80-byte
+	// Config2 block (SetOsdConfigParam2, GetOsdConfigParam2), as OSDSYS
+	// leaves them for a game.
+	osd_config:   u32,
+	osd_config2:  [OSD_CONFIG2_SIZE]u8,
 	vblank_start: u64, // next vblank start
 	vblank_end:   u64,
 	frame:        u64,
@@ -109,6 +113,15 @@ k: struct {
 	vsync_flag:   u32,
 	vsync_csr:    u32,
 }
+
+// ConfigParam: English (language 1, bits 16-20), version 2 (bits 13-15),
+// japLanguage 1 (bit 4), 4:3, no spdif, timezone 540 minutes (bits 21-31).
+// libscf reads the language field only when the version is not 0; with
+// version 0 it reads japLanguage, where 0 is Japanese and 1 English. With a
+// version, sceScfGetLocalTimefromRTC adds timezone - 540 (JST, what it takes
+// at version 0) to the RTC, so 540 keeps local time equal to the RTC.
+OSD_CONFIG :: 540 << 21 | 1 << 16 | 2 << 13 | 1 << 4
+OSD_CONFIG2_SIZE :: 0x80
 
 KE_OK :: 0
 KE_ERROR :: -1
@@ -125,7 +138,7 @@ kernel_init :: proc() {
 	k.current = t
 	if core.gamedata.on {gamedata_thread_new(t)}
 	k.next_handler = 1
-	k.osd_config = 1 << 16
+	k.osd_config = OSD_CONFIG
 	switch core.env("DEBUG") {
 	case "": cpu.debug = 0
 	case "2": cpu.debug = 2
@@ -288,6 +301,7 @@ syscall :: proc(pc: u32) {
 	case 0x47, 0x48: ret = refer_sema(i32(a0), a1)
 	case 0x4a: k.osd_config = mem.rd32(a0) // SetOsdConfigParam(*param)
 	case 0x4b: mem.wr32(a0, k.osd_config) // GetOsdConfigParam(*param)
+	case 0x6e, 0x6f: osd_config2(a0, a1, a2, n == 0x6e) // Set/GetOsdConfigParam2(buf, size, offset)
 	case 0x5c ..= 0x5f: // Enable/Disable Intc/Dmac handler(cid, id)
 		list := abs(n) <= 0x5d ? &k.intc : &k.dmac
 		for &h in list {if h.id == i32(a0) || h.id == i32(a1) {h.enabled = abs(n) & 1 == 0}}
@@ -1008,6 +1022,21 @@ release_alarm :: proc(id: i32) -> i64 {
 		}
 	}
 	return KE_ERROR
+}
+
+// SetOsdConfigParam2 and GetOsdConfigParam2 copy `size` bytes between buf
+// and the Config2 block from `offset`, as retail does: an offset at or past
+// the block's end copies nothing; a range whose u32 sum size + offset ends
+// past it is cut at the end; a sum that wraps 2^32 keeps its huge size, which
+// retail's copy loop runs 0 times. Retail's Get returns a kernel field that
+// is 0 here; libscf ignores it.
+osd_config2 :: proc(buf, size, offset: u32, set: bool) {
+	if offset >= OSD_CONFIG2_SIZE {return}
+	n := size if size + offset <= OSD_CONFIG2_SIZE else OSD_CONFIG2_SIZE - offset
+	if n > OSD_CONFIG2_SIZE {return}
+	for i in 0 ..< n {
+		if set {k.osd_config2[offset + i] = mem.rd8(buf + i)} else {mem.wr8(buf + i, k.osd_config2[offset + i])}
+	}
 }
 
 // Call a guest interrupt handler with the interrupted state preserved.
