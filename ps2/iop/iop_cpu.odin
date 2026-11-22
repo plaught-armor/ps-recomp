@@ -24,6 +24,7 @@ when core.FLAT {
 	//   - a thread's entry (th_main): the thread's own run (th_flat_run);
 	//   - a command or interrupt handler (th_intr_main): the handlers' run;
 	//   - sceSifRpcLoop's server calls (rpc_exec): FLAT_RPC_LOOP;
+	//   - sceSifExecRequest's server call (rpc_exec): FLAT_RPC_EXEC;
 	//   - sdrdrv's user command handler (sdr_serve): FLAT_SDR_SERVE.
 	// None is nested (r3000.flat_nested), where a wait would be fatal.
 	@(private = "file")
@@ -33,6 +34,8 @@ when core.FLAT {
 			rpc_loop_step(h)
 		case FLAT_SDR_SERVE:
 			sdr_serve_step(h)
+		case FLAT_RPC_EXEC:
+			rpc_exec_step(h)
 		case:
 			r3000.fatal("iop: flat continuation %d", h.tag)
 		}

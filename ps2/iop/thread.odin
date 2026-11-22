@@ -1338,8 +1338,9 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if t := th_find(s.cur); t != nil {t.wake_at = r3000.state.cycles + u64(a0) * (IOP_CLOCK / 1000) / 1000}
 		return th_wait(.Delay), true
 	case 34: // GetSystemTime(iop_sys_clock_t *)
-		w32(a0, u32(r3000.state.cycles))
-		w32(a0 + 4, u32(r3000.state.cycles >> 32))
+		t := th_system_time()
+		w32(a0, u32(t))
+		w32(a0 + 4, u32(t >> 32))
 		return KE_OK, true
 	case 39: // USec2SysClock(usec, iop_sys_clock_t *)
 		c := u64(a0) * IOP_CLOCK / 1_000_000
@@ -1359,10 +1360,20 @@ th_base :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if t := th_find(s.cur); t != nil {return t.prio, true}
 		return IOP_START_PRIO, true
 	case 43: // GetSystemTimeLow: the system clock's low 32 bits, as 34 gives them
-		return u32(r3000.state.cycles), true
+		return u32(th_system_time()), true
 	}
 	return 0, false
 }
+
+// IOP_BOOT_TIME: cycles the system clock has run before the HLE IOP's first instruction.
+// Retail thbase starts the clock at IOP reboot, then the game's modules load from disc,
+// which takes far more than a second; HLE loads them in no time. FFX's IOPSOUND timer
+// stores its first reading whole and later ones >>8, then adds 0x1000000 when the new one
+// is smaller: a first reading under 0x1000000 makes the second tick run ~27k sound steps.
+IOP_BOOT_TIME :: IOP_CLOCK
+
+// th_system_time: the thbase system clock (GetSystemTime, GetSystemTimeLow), in IOP cycles
+th_system_time :: proc() -> u64 {return r3000.state.cycles + IOP_BOOT_TIME}
 
 // Function fno of thsemap, as th_base.
 th_semap :: proc(fno: u32) -> (v0: u32, ok: bool) {

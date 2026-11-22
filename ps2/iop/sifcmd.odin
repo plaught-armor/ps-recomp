@@ -78,7 +78,7 @@ sifcmd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return rpc_client_bind(a0, a1, a2), true
 	case 16: // sceSifCallRpc(client, fno, mode, send, ...)
 		return rpc_client_call(a0, a1, a2, r[7]), true
-	case 14, 17, 19, 22, 24, 25:
+	case 14, 17, 19, 20, 21, 22, 24, 25:
 		return sifrpc_fn(fno)
 	case 23: // sceSifGetOtherData(rd, src, dest, size, mode): done at once
 		// rd filled as retail fills it, -1 with no packet free (rpc_other_data).

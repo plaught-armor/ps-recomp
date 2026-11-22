@@ -81,6 +81,31 @@ sifrpc_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		for o := u32(4); o <= 0x14; o += 4 {w32(a0 + o, 0)}
 		rpc_queue_set(a0, a1)
 		return 0, true
+	case 20: // sceSifGetNextRequest(qd): the server whose request is next, 0 for none
+		// A module that runs its own loop (Final Fantasy X's IOPSOUND) takes
+		// each request here, runs it with sceSifExecRequest, and sleeps when
+		// this returns 0; iop_rpc_call wakes it as it wakes sceSifRpcLoop's
+		// thread. A queue runs one loop or the other, on its one thread, so
+		// only one of them takes its requests.
+		req, found := rpc_next(a0)
+		if !found {return 0, true}
+		rpc_sd_fill(req)
+		return req.sd, true
+	case 21: // sceSifExecRequest(sd): runs the request sceSifGetNextRequest took
+		q := rpc_queue_running(a0)
+		if q == nil {
+			core.compat_unknown(.Iop_Rpc, a0, sub = max(u32) - 1)
+			fmt.eprintfln("iop: sceSifExecRequest(%x) with no request taken", a0)
+			return 0, true
+		}
+		when core.FLAT {
+			c := (^Rpc_Exec_Cont)(&r3000.flat_push_cont(FLAT_RPC_EXEC).w)
+			c^ = {req = q.cur}
+			return 0, true
+		} else {
+			rpc_exec(q.cur)
+			return 0, true
+		}
 	case 22: // sceSifRpcLoop(qd): returns only on a thread that cannot sleep
 		when core.FLAT {
 			c := (^Rpc_Loop_Cont)(&r3000.flat_push_cont(FLAT_RPC_LOOP).w)
@@ -404,6 +429,57 @@ when core.FLAT {
 	rpc_loop_return :: proc(v: u32) {
 		r3000.flat_pop_cont()
 		hle_return(v)
+	}
+}
+
+// The queue whose thread runs a request for server descriptor sd, taken
+// with sceSifGetNextRequest; nil for none.
+@(private = "file")
+rpc_queue_running :: proc(sd: u32) -> ^Iop_Rpc_Queue {
+	s := &iop_rpc
+	for &q in s.queues[:s.n_queues] {
+		if q.busy && q.cur.sd == sd {return &q}
+	}
+	return nil
+}
+
+// sceSifGetNextRequest's server descriptor gets the request's fields, as
+// retail's command handler writes them there for the module to read: size
+// (+0x0c), client (+0x1c), packet (+0x20), function number (+0x24), receive
+// (+0x28) and its size (+0x2c).
+@(private = "file")
+rpc_sd_fill :: proc(req: Iop_Rpc_Req) {
+	w32(req.sd + 0x0c, req.size)
+	w32(req.sd + 0x1c, req.client)
+	w32(req.sd + 0x20, req.pkt)
+	w32(req.sd + 0x24, req.fno)
+	w32(req.sd + 0x28, req.receive)
+	w32(req.sd + 0x2c, req.rsize)
+}
+
+// FLAT: sceSifExecRequest's server call as a continuation
+// (r3000.flat_push_cont), on the thread's run, where it may wait.
+FLAT_RPC_EXEC :: 3
+
+Rpc_Exec_Cont :: struct {
+	req:    Iop_Rpc_Req,
+	called: bool,
+	saved:  [32]u32, // rpc_exec's registers
+}
+#assert(size_of(Rpc_Exec_Cont) <= r3000.FLAT_HOST_WORDS * size_of(u32))
+
+when core.FLAT {
+	rpc_exec_step :: proc(h: ^r3000.Flat_Host) {
+		c := (^Rpc_Exec_Cont)(&h.w)
+		if !c.called {
+			c.called = true
+			c.saved = rpc_exec_begin(c.req)
+			r3000.flat_call(r32(c.req.sd + 4))
+			return
+		}
+		rpc_exec_end(c.req, c.saved)
+		r3000.flat_pop_cont()
+		hle_return(0)
 	}
 }
 

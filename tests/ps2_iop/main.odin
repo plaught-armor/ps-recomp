@@ -254,6 +254,7 @@ game :: proc(_: rawptr) {
 	test_reply_due()
 	test_rpc_bind()
 	test_rpc()
+	test_rpc_own_loop()
 	test_rpc_remove()
 	test_rpc_self_remove()
 	test_cdvd_poff()
@@ -2779,6 +2780,85 @@ snap5_loaded: bool // not emulated state
 RPC_SID :: 0x4321
 RPC_SID2 :: 0x4322 // registered by a load that fails
 
+// A module that runs its own loop, as FFX's IOPSOUND does: GetNextRequest
+// takes the queued call, ExecRequest runs func and sends the reply, and the
+// thread sleeps when GetNextRequest gives 0, until the next call wakes it.
+// Conditions: each call reaches func with fno and size, and ends in RPC_END;
+// GetNextRequest fills the server data's fno.
+test_rpc_own_loop :: proc() {
+	fresh()
+	iop.iop_irx = true
+	defer iop.iop_irx = false
+	drop_replies()
+	defer drop_replies()
+	cpu.state.cycles = 0
+	cpu.next_event = 1 << 40
+	a: Asm
+	tb := imports(&a, "thbase", 4, 6, 20, 24)
+	sc := imports(&a, "sifcmd", 14, 17, 19, 20, 21)
+	logp := log_words(&a, 8)
+	th := at(&a)
+	put(&a, 0)
+	sd := at(&a)
+	for _ in 0 ..< 18 {put(&a, 0)}
+	qd := at(&a)
+	for _ in 0 ..< 8 {put(&a, 0)}
+	buf := at(&a)
+	for _ in 0 ..< 16 {put(&a, 0)}
+	fn := at(&a) // logs fno and size, returns buf
+	la(&a, T0, logp)
+	put(&a, 0x8d090000, 0, 0xad240000, 0xad260004, 0x25290008, 0xad090000) // lw t1, 0(t0); nop; sw a0, 0(t1); sw a2, 4(t1); addiu t1, t1, 8; sw t1, 0(t0)
+	put(&a, JR_RA, 0x00a01025) // jr ra; or v0, a1, zero
+	er := at(&a)
+	li(&a, A0, 0)
+	jal(&a, sc)
+	jal(&a, tb + 16)
+	la(&a, A0, qd)
+	put(&a, 0x00402825) // or a1, v0, zero
+	jal(&a, sc + 16)
+	la(&a, A0, sd)
+	li(&a, A1, RPC_SID)
+	la(&a, A2, fn)
+	la(&a, A3, buf)
+	la(&a, T0, qd)
+	put(&a, 0x27bdffe0, 0xafa00010, 0xafa00014, 0xafa80018) // addiu sp, sp, -32; sw zero, 16(sp); sw zero, 20(sp); sw t0, 24(sp)
+	jal(&a, sc + 8)
+	top := at(&a)
+	la(&a, A0, qd)
+	jal(&a, sc + 24)
+	got := bne(&a, V0, 0)
+	jal(&a, tb + 24)
+	put(&a, 0x10000000 | (top - at(&a) - 4) / 4 & 0xffff, 0) // b top
+	branch_to(&a, got)
+	put(&a, 0x00402025) // or a0, v0, zero
+	jal(&a, sc + 32)
+	put(&a, 0x10000000 | (top - at(&a) - 4) / 4 & 0xffff, 0) // b top
+	tp := thread_param(&a, er, 10)
+	entry := at(&a)
+	prologue(&a)
+	call_addr(&a, tb, tp, th)
+	call_word(&a, tb + 8, th)
+	li(&a, V0, 0)
+	epilogue(&a)
+
+	id, _ := iop.iop_load(build_mod("modl", &a, entry), "modl", nil)
+	b := module_base(id)
+	s := &iop.iop_rpc
+	check(id > 0 && s.n_servers == 1 && s.servers[0] == {RPC_SID, b + sd, b + qd} && s.n_queues == 1 && !s.queues[0].busy, "rpc own loop: L registers its server and sleeps")
+	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, RPC_SID)
+	hsd := reply_word(0, 9)
+	check(len(iop.sif.replies) == 1 && hsd != 0, "rpc own loop: the bind gets the HLE's descriptor")
+	drop_replies()
+	EE_RECV :: 0x00100400
+	iop.iop_u32(hsd + 0x100)^ = 0x12345678
+	send_pkt(iop.SIF_CMD_RPC_CALL, 10, 0, 0, 0, 1, 8, EE_RECV, 4, 0, hsd)
+	check(log_equal(b, logp, {1, 8}) && iop.iop_u32(b + sd + 0x24)^ == 1, "rpc own loop: ExecRequest runs func with the request GetNextRequest took")
+	check(mem.rd32(EE_RECV) == 0x12345678 && call_ends(hsd, 10) && !s.queues[0].busy, "rpc own loop: the reply, RPC_END, and L sleeps again")
+	drop_replies()
+	send_pkt(iop.SIF_CMD_RPC_CALL, 11, 0, 0, 0, 5, 4, EE_RECV, 4, 0, hsd)
+	check(log_equal(b, logp, {1, 8, 5, 4}) && iop.iop_u32(b + sd + 0x24)^ == 5 && call_ends(hsd, 11), "rpc own loop: the next call wakes L")
+}
+
 // With PS_IRX=1 a bind to a sid the HLE serves gets its descriptor, module
 // or not, and no row; a sid nobody serves gets server 0 and one row, however
 // often the EE binds again, and the table past SIF_BIND_SIDS sids counts by
@@ -2850,7 +2930,7 @@ test_rpc :: proc() {
 	a: Asm
 	tb := imports(&a, "thbase", 4, 6, 20)
 	ts := imports(&a, "thsemap", 4, 6, 8)
-	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 21)
+	sc := imports(&a, "sifcmd", 14, 17, 19, 22, 18)
 	logp := log_words(&a, 24)
 	sem, th := at(&a), at(&a) + 4
 	put(&a, 0, 0)
@@ -3058,7 +3138,7 @@ test_rpc :: proc() {
 	// and leaves a row; its server goes, and the next call is modp's.
 	call(40, 3, 0, 0, 0, hsd)
 	lost := core.Compat_Key{.Iop_Rpc, RPC_SID, 3}
-	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 21}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
+	check(core.compat.calls[{.Iop_Call, core.compat_name("sifcmd"), 18}].n == 1 && core.compat.calls[lost].n == 1, "rpc: a call that stops R leaves an Iop_Call row and an Iop_Rpc one")
 	check(len(iop.sif.replies) == 0 && s.n_servers == 1 && s.n_queues == 1 && s.servers[0].sd == bp + psd, "rpc: no RPC_END, R's server dropped, modp's left")
 	call(41, 3, 0, 0, 0, hsd)
 	want = []u32{1, 8, 0, 8, 1, 0, 1, 8, 2, 4, 1, 4, 1, 4, 1, 4, 3, 0} // R logged fno 3 before it stopped
@@ -6536,7 +6616,8 @@ test_system_time :: proc() {
 	r3000.state.cycles = C
 	check(id > 0 && lib_call(b + tb, fnos[:], 34, b + d) == 0, "thbase: GetSystemTime")
 	lo, hi := iop.iop_u32(b + d)^, iop.iop_u32(b + d + 4)^
-	check(lo == 0x2345_6789 && hi == 1 && lib_call(b + tb, fnos[:], 43) == lo, "thbase: GetSystemTimeLow is GetSystemTime's low word")
+	W :: C + iop.IOP_BOOT_TIME // the clock ran before the IOP's first instruction
+	check(lo == u32(W & 0xffff_ffff) && hi == u32(W >> 32) && lib_call(b + tb, fnos[:], 43) == lo, "thbase: GetSystemTimeLow is GetSystemTime's low word")
 	r3000.state.cycles = C + 1000
 	check(lib_call(b + tb, fnos[:], 43) == lo + 1000, "thbase: GetSystemTimeLow tracks the clock")
 }
