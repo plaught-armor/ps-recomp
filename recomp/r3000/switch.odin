@@ -297,11 +297,19 @@ writes :: proc(w: u32, r: int) -> bool {
 // (returns_elsewhere_here). One that saves $ra in a global and restores it
 // to return to its own caller counts too (Crash, FF7): its calls only cost
 // the check. mods holds each module's functions.
-returns_elsewhere :: proc(mods: [][]^mips.Func) -> int {
-	here: Set
+//
+// With outside, a call to the entry of no function in mods counts too:
+// nothing here shows how that callee returns. Learned runs need it, since
+// their callees are mostly in the main blob or interpreted. FF8 discs 2-4
+// learned the decompressor's resume at 0x800395b8 as a run whose jal to
+// the yield went on at jal+8 and wrote past the buffer again.
+returns_elsewhere :: proc(mods: [][]^mips.Func, outside := false) -> int {
+	here, known: Set
 	defer delete(here)
+	defer delete(known)
 	for funcs in mods {
 		for f in funcs {
+			known[f.entry] = {}
 			if returns_elsewhere_here(f) {here[f.entry] = {}}
 		}
 	}
@@ -309,7 +317,7 @@ returns_elsewhere :: proc(mods: [][]^mips.Func) -> int {
 	for funcs in mods {
 		for f in funcs {
 			for _, i in f.insns {
-				if i.kind == .Call && i.target in here {
+				if i.kind == .Call && (i.target in here || outside && i.target not_in known) {
 					f.back[i.target] = {}
 					n += 1
 				}

@@ -42,7 +42,7 @@ learned_blob :: proc(runs: []Learned, arch: native.Arch, exact := true, interp: 
 		funcs[k] = mips.func_make(r.entry, r.lo + 4 * u32(len(r.words)), r.lo)
 		mips.discover(RULES, img, funcs[k], nil)
 	}
-	returns_elsewhere([][]^mips.Func{funcs})
+	returns_elsewhere([][]^mips.Func{funcs}, outside = true)
 	left := make([]bool, len(runs))
 	defer delete(left)
 	if arch == .Wasm32 {

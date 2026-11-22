@@ -227,6 +227,7 @@ main :: proc() {
 	check(same(got, want_loop) && native_ran, "loop put back whole not run native")
 
 	test_tail_call(tmp)
+	test_yield(tmp)
 	test_first_wins()
 	test_recomp(tmp)
 	test_switches(tmp)
@@ -237,7 +238,7 @@ main :: proc() {
 	if failed != 0 {
 		os.exit(1)
 	}
-	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; a callee's jr $ra to a label the caller or the callee put in $ra goes on there, and one past the caller returns; a jump over words a learned run never ran goes on in its frame; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads to the interpreter")
+	fmt.println("ok psx_learned: open runs compiled and stored-into code not; failed loads register nothing; learned code runs native only while RAM holds its words, and leaves what the interpreter does; a callee's jr $ra to a label the caller or the callee put in $ra goes on there, and one past the caller returns, as does a learned call to a yield in the executable that returns past its caller; a jump over words a learned run never ran goes on in its frame; the first function for the same code wins; the recompiler writes the compilable runs as learned functions; wasm32 leaves runs that may switch threads to the interpreter")
 }
 
 // A `j` out of a function (a tail call) when $ra holds a label of the
@@ -592,4 +593,53 @@ test_switches :: proc(tmp: string) {
 	check(switch_skips(caller[:], nil) == 0, "caller left with no known switches")
 	healed := [?]native.Blob_Interp{{SWITCHED, SWITCHED, SWITCHED}}
 	check(switch_skips(caller[:], healed[:]) == 1, "run calling a known switch compiled")
+}
+
+// An interpreted main loop calls a learned run that calls a coroutine yield
+// in the executable (no learned run): the yield loads $ra from a global (the
+// loop's return, YIELD_OUTER + 12) and returns there with v0 = 1, past its
+// caller, as FF8's decompressor yield at 0x800394d0 does. The caller must
+// return too, not go on at jal+8 (v0 + 100): the loop then adds 1000.
+@(private = "file")
+YIELD_OUTER :: 0x80027000
+@(private = "file")
+YIELD_CALLER :: 0x80027040
+@(private = "file")
+YIELD :: 0x80027080
+@(rodata, private = "file")
+CODE_YIELD_OUTER := [?]u32 {
+	0x03e08025, // or s0, ra, zero
+	0x0c000000 | (YIELD_CALLER >> 2) & 0x3ffffff, // jal YIELD_CALLER
+	0x00000000,
+	0x244203e8, // addiu v0, v0, 1000
+	0x02000008, // jr s0
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_YIELD_CALLER := [?]u32 {
+	0x0c000000 | (YIELD >> 2) & 0x3ffffff, // jal YIELD
+	0x00000000,
+	0x24420064, // addiu v0, v0, 100
+	0x03e00008, // jr ra
+	0x00000000,
+}
+
+@(private = "file")
+yield :: proc() {
+	cpu.state.r[31] = YIELD_OUTER + 12
+	cpu.state.r[2] = 1
+}
+
+test_yield :: proc(tmp: string) {
+	outer, caller := CODE_YIELD_OUTER, CODE_YIELD_CALLER
+	put(YIELD_OUTER, outer[:])
+	put(YIELD_CALLER, caller[:])
+	cpu.register_funcs({{addr = YIELD, fn = yield}})
+	defer cpu.dispatch.fixed[cpu.fn_index(YIELD)] = nil
+	want, native_ran := run(YIELD_OUTER, 0, 0)
+	check(want.r[2] == 1001 && !native_ran, fmt.tprintf("interpreted call to a yield: v0 %d, want 1001", want.r[2]))
+	check(psx_native.load_learned(write(tmp, "yield.bin", blob({{YIELD_CALLER, YIELD_CALLER, caller[:]}}))), "load the yield's caller")
+	got: Regs
+	got, native_ran = run(YIELD_OUTER, 0, 0)
+	check(native_ran && same(got, want), fmt.tprintf("learned call to a yield: v0 %d, want %d", got.r[2], want.r[2]))
 }
