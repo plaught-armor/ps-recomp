@@ -17,3 +17,5 @@ links to it. Every other row was run with `play`.
 | Star Ocean: Till the End of Time | PS2 | Opening scene and the first hotel; some floors and walls are not drawn | |
 | Okami | PS2 | Runs in the browser at 60 fps after startup | |
 | Jak and Daxter: The Precursor Legacy | PS2 | Title screen | |
+| Final Fantasy X | PS2 | New Game through the opening into Zanarkand at night | |
+| Tom Clancy's Ghost Recon: Jungle Storm | PS2 | Intro film, title screen and profile menus | |
