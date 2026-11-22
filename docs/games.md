@@ -19,3 +19,4 @@ links to it. Every other row was run with `play`.
 | Jak and Daxter: The Precursor Legacy | PS2 | Title screen | |
 | Final Fantasy X | PS2 | New Game through the opening into Zanarkand at night | |
 | Tom Clancy's Ghost Recon: Jungle Storm | PS2 | Intro film, title screen and profile menus | |
+| Metal Gear Solid | PS1 | Konami logo and the opening submarine scene | |
