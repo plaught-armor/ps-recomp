@@ -889,6 +889,16 @@ sd_block_status :: proc(channel: u32) -> u32 {
 	return pos & 0xffffff | half << 24
 }
 
+// libsd's sceSdStopTrans(channel): a running block transfer stops, and the
+// answer is its status as it stopped; with none, 0. Voice transfers are done
+// at once, so there is no other to stop.
+sd_stop_trans :: proc(channel: u32) -> u32 {
+	if !spu.block[channel & 1].on {return 0}
+	v := sd_block_status(channel)
+	sd_block_trans(channel, SD_TRANS_STOP, 0, 0, 0)
+	return v
+}
+
 // libsd's calls past sdrdrv's, which only libsd.odin makes, after the shared
 // ones above did not decode the id.
 

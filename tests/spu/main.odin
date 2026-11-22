@@ -637,6 +637,17 @@ block_trans :: proc() {
 	cpu.state.cycles += SECOND
 	check(sdr_call(0x8100, 1, 0) == BLOCK_BASE + BLOCK_SIZE | 1 << 24, "a one-shot block transfer stops at its end, in the second half")
 	sdr_call(0x80e0, 1, 2)
+	// libsd's sceSdStopTrans answers as a status would, then stops; with
+	// nothing running it answers 0.
+	sdr_call(0x80e0, 1, 0x13, BLOCK_BASE, BLOCK_SIZE, BLOCK_BASE)
+	cpu.state.cycles += SECOND / 100 * 5 // 9600 bytes, in the second half
+	r3000.state.r[4] = 1
+	v, ok := iop.libsd_fn(30)
+	check(ok && v == (BLOCK_BASE + 9600) | 1 << 24, "sceSdStopTrans answers where a block transfer read, and its half")
+	cpu.state.cycles += SECOND
+	check(sdr_call(0x8100, 1, 0) == (BLOCK_BASE + 9600) | 1 << 24, "sceSdStopTrans stops the block transfer")
+	v, ok = iop.libsd_fn(30)
+	check(ok && v == 0, "sceSdStopTrans with no transfer answers 0")
 }
 
 block_audio_chunk :: proc(chunk: u32, value: i16) {

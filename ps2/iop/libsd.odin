@@ -88,6 +88,8 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return 1, true
 	case 20: // sceSdBlockTransStatus(channel, flag)
 		return sd_block_status(a0), true
+	case 30: // sceSdStopTrans(channel): voice transfers are done at once, so only a block transfer stops
+		return sd_stop_trans(a0), true
 	case 23: // sceSdSetEffectAttr(core, sceSdEffectAttr *)
 		e := a1
 		return sd_set_effect_attr(a0, {r32(e), r32(e + 4), r32(e + 8), r32(e + 12), r32(e + 16)}), true
