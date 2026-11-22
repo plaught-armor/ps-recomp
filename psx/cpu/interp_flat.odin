@@ -92,6 +92,10 @@ Flat_Ctx :: struct {
 	ended:   bool,
 	hosts:   u32,
 	host:    [FLAT_HOST]Flat_Host,
+	// frame_ret and tail_depth while the run is stopped: each thread's run
+	// has its own, as each has its own records.
+	frame_ret:  u32,
+	tail_depth: int,
 	// Records, innermost last; len is the capacity, emu heap.
 	frames:  []Flat_Frame,
 }
@@ -164,6 +168,7 @@ when core.FLAT {
 		x.enter = true
 		x.goto_owed = false
 		x.ended = false
+		x.frame_ret, x.tail_depth = 0, 0
 	}
 
 	// Let go of x's shadow stack.
@@ -185,8 +190,12 @@ when core.FLAT {
 	flat_run :: proc(x: ^Flat_Ctx) -> bool {
 		if flat_cur != nil {fatal("a flat run started inside another")}
 		flat_cur = x
+		outer_ret, outer_tail := frame_ret, tail_depth
+		frame_ret, tail_depth = x.frame_ret, x.tail_depth
 		flat_learning = core.learn_on(learn_cpu)
 		if flat_learning {flat_loop(x, true)} else {flat_loop(x, false)}
+		x.frame_ret, x.tail_depth = frame_ret, tail_depth
+		frame_ret, tail_depth = outer_ret, outer_tail
 		flat_cur = nil
 		flat_stop = false
 		flat_late_owed = false
@@ -250,19 +259,6 @@ when core.FLAT {
 	flat_native_in :: #force_inline proc(addr: u32) {
 		if flat_native < FLAT_NAMED {flat_native_at[flat_native] = addr}
 		flat_native += 1
-	}
-
-	// Events run from flat_goto, between two instructions of the running
-	// run, which goes on from its owed jump after a stop.
-	@(private = "file")
-	flat_goto_events: bool
-
-	// Whether an exception return may switch threads now (psx_bios
-	// preempt): flat_block can stop the run, and the run stops between two
-	// instructions. Events run from elsewhere (an I/O store, a BIOS wait)
-	// return into code that goes on with the registers it has.
-	flat_preempt_ok :: proc() -> bool {
-		return flat_goto_events && flat_can_stop()
 	}
 
 	// Whether flat_block may stop the running run now: on its own guest code,
@@ -565,12 +561,7 @@ when core.FLAT {
 		x.pc = target
 		if (check || target <= pc) && state.cycles >= next_event {
 			x.goto_owed = true
-			// Saved, not cleared: a callback's own flat_goto inside these
-			// events must not turn the flag off under them.
-			outer := flat_goto_events
-			flat_goto_events = true
 			run_events()
-			flat_goto_events = outer
 			return false
 		}
 		if flat_fn_target(target) {
@@ -708,6 +699,16 @@ when core.FLAT {
 				target := pc + 4 + (signed_imm(w) << 2)
 				flat_slot(x, pc, L, lf)
 				if taken {settle = !flat_goto(x, pc, target, false)}
+			case 0x28 ..= 0x2e:
+				// A store to I/O can run events (an interrupt acknowledged)
+				// that switch threads: the run stops before the next
+				// instruction, as the switch would come on hardware.
+				when L {
+					if lf != nil {learn_store_of(lf, w)}
+				}
+				interp_exec(&flat_dummy, pc, w, x.pending)
+				r[0] = 0
+				settle = flat_stop
 			case 0x10:
 				interp_exec(&flat_dummy, pc, w, x.pending)
 				r[0] = 0

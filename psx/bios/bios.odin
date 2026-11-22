@@ -1378,17 +1378,32 @@ change_thread :: proc(h: u32) {
 
 // Exception return: retail loads the registers of the TCB the PCB names,
 // so a handler that points the PCB at another TCB switches threads when it
-// returns (MGS1's task scheduler does so from its VSync callback). The
-// switch here waits for a later return while it cannot happen: under FLAT
-// where the run cannot stop (cpu.flat_preempt_ok), which is every return
-// but one from events a backward jump ran, so a thread waiting in the BIOS
-// (WaitEvent, VSync) gives way only once its wait ends. mod_depth is held
-// by run_events already; the check here only keeps that true.
+// returns (MGS1's task scheduler does so from its VSync callback). Under
+// FLAT the running run stops first (flat_block) and flat_main switches once
+// it has (preempt_owed): the registers saved are those the thread stopped
+// with, whatever instructions or host code (a WaitEvent) finish before the
+// stop. Where the run cannot stop at all (cpu.flat_can_stop), the switch
+// waits for a later return. mod_depth is held by run_events already; the
+// check here only keeps that true.
 @(private)
 preempt :: proc() {
+	when core.FLAT {
+		if _, ok := preempt_target(); ok && cpu.flat_can_stop() {
+			cpu.flat_block("preempt")
+			flat.preempt_owed = true
+		}
+	} else {
+		if i, ok := preempt_target(); ok {switch_to(i)}
+	}
+}
+
+// The slot of the thread the PCB names when an exception return switches
+// to it (preempt): another open thread, outside a mod.
+@(private)
+preempt_target :: proc() -> (int, bool) {
 	p := cpu.r32(pcb()) & 0x1fffffff
 	if p == tcb(cur_thread) {
-		return
+		return 0, false
 	}
 	i := tcb_slot(p)
 	if i < 0 || cpu.r32(tcb(i) + TCB_STATUS) != TCB_USED {
@@ -1396,18 +1411,9 @@ preempt :: proc() {
 			fmt.eprintfln("bios: PCB names %#x, not an open thread's TCB; staying on the running thread", p)
 			bios.pcb_warn = true
 		}
-		return
+		return 0, false
 	}
-	if cpu.mod_depth > 0 {
-		return
-	}
-	when core.FLAT {
-		if !cpu.flat_preempt_ok() {
-			return
-		}
-		cpu.flat_block("preempt")
-	}
-	switch_to(i)
+	return i, cpu.mod_depth == 0
 }
 
 // Save the running thread's registers in its TCB and go on with thread i's.

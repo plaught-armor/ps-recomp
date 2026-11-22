@@ -25,6 +25,9 @@ when core.FLAT {
 		fresh:  [MAX_THREADS]bool,
 		// The running thread lost its slot.
 		orphan: bool,
+		// An exception return stopped the running run to switch threads
+		// (preempt): flat_main switches once it has stopped.
+		preempt_owed: bool,
 	}
 
 	@(private)
@@ -47,7 +50,12 @@ when core.FLAT {
 					if i == 0 {boot = false}
 					cpu.flat_start(x, threads[i].entry)
 				}
-				if !cpu.flat_run(x) {continue}
+				ended := cpu.flat_run(x)
+				if flat.preempt_owed {
+					flat.preempt_owed = false
+					if j, ok := preempt_target(); ok && !ended {switch_to(j)}
+				}
+				if !ended {continue}
 				if i == 0 && boot {return}
 				cpu.fatal("thread %d returned from its entry %#08x", i, threads[i].entry)
 			}
