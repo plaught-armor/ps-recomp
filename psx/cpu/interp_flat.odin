@@ -153,10 +153,10 @@ when core.FLAT {
 	// Native code's own calls to native code do not pass here.
 	@(private = "file")
 	flat_native_at: [FLAT_NAMED]u32
-	// A run is held (flat_hold), and the nested runs open below it: those
-	// above are the runs' that run meanwhile.
+	// The runs held (flat_hold), and the nested runs open below the last:
+	// those above are the runs' that run meanwhile.
 	@(private = "file")
-	flat_held: bool
+	flat_held: int
 	@(private = "file")
 	flat_nest_base: int
 	// Runs held.
@@ -298,6 +298,7 @@ when core.FLAT {
 	// its Flat_Ctx or its host frames.
 	Flat_Hold :: struct {
 		cur:        ^Flat_Ctx,
+		nest_base:  int,
 		native:     int,
 		native_at:  [FLAT_NAMED]u32,
 		no_returns: type_of(no_returns),
@@ -308,29 +309,31 @@ when core.FLAT {
 
 	// Hold the running run where it is, in native code, so that its owner can
 	// run others (flat_run) from inside it, as a coroutine's switch would,
-	// then go on with it (flat_resume). False, nothing changed, outside native
-	// code or with a run held already: one level, which bounds the host stack.
+	// then go on with it (flat_resume), the last held first. False, nothing
+	// changed, outside native code. The owner bounds the depth.
 	flat_hold :: proc(h: ^Flat_Hold) -> bool {
-		if flat_cur == nil || flat_native == 0 || flat_held {return false}
-		h^ = {flat_cur, flat_native, flat_native_at, no_returns, flat_stop, flat_learning, flat_host_call}
+		if flat_cur == nil || flat_native == 0 {return false}
+		h^ = {flat_cur, flat_nest_base, flat_native, flat_native_at, no_returns, flat_stop, flat_learning, flat_host_call}
 		flat_cur, flat_native = nil, 0
 		flat_stop, flat_host_call = false, false
 		// A switch owed before is this one, or stale.
 		flat_stop_owed, flat_late_owed = false, false
-		flat_held, flat_nest_base = true, flat_nest_depth
+		flat_held += 1
+		flat_nest_base = flat_nest_depth
 		flat_holds += 1
 		return true
 	}
 
 	// Go on with the run h holds, the runs since stopped or ended.
 	flat_resume :: proc(h: ^Flat_Hold) {
-		if !flat_held || flat_cur != nil || flat_native != 0 || flat_nest_depth != flat_nest_base {
+		if flat_held == 0 || flat_cur != nil || flat_native != 0 || flat_nest_depth != flat_nest_base {
 			fatal("a held flat run resumed inside another")
 		}
 		flat_cur, flat_native, flat_native_at = h.cur, h.native, h.native_at
 		no_returns, flat_stop = h.no_returns, h.stop
 		flat_learning, flat_host_call = h.learning, h.host_call
-		flat_held, flat_nest_base = false, 0
+		flat_held -= 1
+		flat_nest_base = h.nest_base
 	}
 
 	// What an exception return that names another thread calls: the run

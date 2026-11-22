@@ -25,6 +25,8 @@ when core.FLAT {
 		live:   [MAX_THREADS]bool,
 		// Its run starts over at threads[i].entry when it next runs.
 		fresh:  [MAX_THREADS]bool,
+		// Held in native code (flat_switch_held), the last held on top.
+		held:   [MAX_THREADS]bool,
 		// The running thread lost its slot.
 		orphan: bool,
 		// An exception return named another thread (preempt): the runs' owner
@@ -83,10 +85,13 @@ when core.FLAT {
 	// registers are loaded then, and the native code goes on. The host frames
 	// cannot be dropped, so a thread started over meanwhile, or a run that
 	// ended, is fatal as a switch in native code is, naming it for play to
-	// leave to the interpreter.
+	// leave to the interpreter. So is a switch to a thread held below this one:
+	// its frames cannot go on before these. A thread held never runs, so is
+	// never held again: MAX_THREADS bounds the host stack.
 	@(private)
 	flat_switch_held :: proc(h: ^cpu.Flat_Hold, j: int) {
 		home := cur_thread
+		flat.held[home] = true
 		// The replacements running are the held thread's, as in switch_to.
 		inner := cpu.mod_inner
 		cpu.mod_inner = nil
@@ -94,11 +99,14 @@ when core.FLAT {
 		switch_to(j)
 		ended := false
 		// The scheduler's loop, as flat_main's: it lasts as long as the others run.
-		for cur_thread != home && !ended {ended = flat_run_current()}
+		for !ended && !flat.held[cur_thread] {ended = flat_run_current()}
+		flat.held[home] = false
 		cpu.mod_inner = inner
 		cpu.flat_resume(h)
 		if ended || flat.fresh[home] {
 			cpu.flat_block("a thread's end or restart with a thread held")
+		} else if cur_thread != home {
+			cpu.flat_block("a switch to a thread held below another")
 		}
 	}
 }

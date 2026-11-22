@@ -1430,8 +1430,9 @@ change_thread :: proc(h: u32) {
 // FLAT a run in native code is held there, host frames and all, and the
 // others run until it is that thread's turn again (flat_switch_held): MGS1
 // runs native code for frames on end, and a switch waiting for its return
-// left the captions up to 15 s late. Elsewhere, and with a thread held
-// already, the running run stops first (cpu.flat_stop_soon) and flat_main or
+// left the captions up to 15 s late. Holds nest, a thread's once. Elsewhere,
+// and for a switch to a thread held (its frames are below the running
+// one's), the running run stops first (cpu.flat_stop_soon) and flat_main or
 // flat_switch_held switches once it has (preempt_owed): the registers saved
 // are those the thread stopped with, whatever instructions or host code (a
 // WaitEvent) finish before the stop. Where the run cannot stop yet, in
@@ -1447,7 +1448,7 @@ preempt :: proc() {
 		if !ok {return}
 		h: cpu.Flat_Hold
 		// A thread with no TCB to save into (switch_to) is not one to go back to.
-		if slot_owned() && cur_thread < thread_count() && cpu.flat_hold(&h) {
+		if slot_owned() && cur_thread < thread_count() && !flat.held[j] && cpu.flat_hold(&h) {
 			flat_switch_held(&h, j)
 		} else if cpu.flat_stop_soon() {
 			flat.preempt_owed = true

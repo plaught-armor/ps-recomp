@@ -394,9 +394,10 @@ script :: proc() {
 	add(proc() {
 		check("main thread s0 after the native code's switch", r()[16], 0xabcd)
 		when core.FLAT {
-			// One thread is held in native code at a time. A switch from native
-			// code of the thread it went to waits for that code's return, and
-			// in a critical section entered since, for interrupts to be on.
+			// A switch to a thread held, from native code of the thread it went
+			// to, waits for that code's return (the held one's frames are below
+			// it), and in a critical section entered since, for interrupts to
+			// be on.
 			r()[16] = 0x5151
 			n := s.n
 			point_pcb(tcb(1))
@@ -406,7 +407,7 @@ script :: proc() {
 			on(0)
 			op_ram_store()
 		} else {
-			finish()
+			hold_two()
 		}
 	})
 	when core.FLAT {
@@ -425,9 +426,32 @@ script :: proc() {
 		})
 		add(proc() {
 			check("main thread s0 after its hold", r()[16], 0x5151)
-			finish()
+			hold_two()
 		})
 	}
+	// The thread that a held thread's switch went to is held in turn: a third
+	// runs before that one's native code goes on. Waiting for its return left
+	// MGS1's captions up to 10 s late.
+	add(proc() {
+		on(1)
+		r()[16] = 0x3434
+		n := s.n
+		point_pcb(tcb(2))
+		irq_now()
+		check("third thread's steps before the second's native code went on", u32(s.n - n), 1)
+		check("second thread's native code's s0 after the switch back", r()[16], 0x3434)
+		on(1)
+		s.trig = .Irq
+		point_pcb(tcb(0))
+		op(.Store)
+	})
+	add(proc() {
+		on(2)
+		check("third thread's s0 at its entry", r()[16], 0)
+		s.trig = .Irq
+		point_pcb(tcb(1))
+		op(.Store)
+	})
 }
 
 // IRQ 0 here, in a step, with interrupts on as io delivers one.
@@ -466,6 +490,22 @@ preempt_start :: proc() {
 	r()[16] = 0xcccc
 	point_pcb(tcb(1))
 	op(.Store)
+}
+
+// The main thread's step that two threads are held from, itself the first.
+@(private = "file")
+hold_two :: proc() {
+	h := bios_b(0x0e, D_MAIN, THREAD_SP - 0x1000, 0)
+	check("OpenTh of a third thread", h, 0xff000002)
+	r()[16] = 0x6060
+	n := s.n
+	point_pcb(tcb(1))
+	irq_now()
+	check("both threads' steps before the main's native code went on", u32(s.n - n), 2)
+	check("main thread's s0 after both were held", r()[16], 0x6060)
+	on(0)
+	check("CloseTh of the third thread", bios_b(0x0f, h), 1)
+	finish()
 }
 
 @(private = "file")
@@ -565,5 +605,5 @@ when core.FLAT {
 
 @(private = "file")
 passed :: proc() {
-	fmt.println("ok psx_flat_switch: ChangeTh round trip, TCB writes, epc restart, syscall 3, slot reuse, preempt, a preempt in a jr's delay slot, a dropped owed switch, a preempt in native code")
+	fmt.println("ok psx_flat_switch: ChangeTh round trip, TCB writes, epc restart, syscall 3, slot reuse, preempt, a preempt in a jr's delay slot, a dropped owed switch, a preempt in native code and one above it")
 }
