@@ -382,7 +382,12 @@ ipu_exec :: proc() {
 	case 3: // VDEC
 		ipu_vdec(v)
 	case 4: // FDEC
-		ipu_advance(v & 0x3f)
+		// No bits come after a stream's sequence end code, so the hardware
+		// flags one at BP or past the skip on ECD at once; a film player
+		// waits for the command to end or for ECD.
+		skip := v & 0x3f
+		if ipu_end_code_at(0) || ipu_end_code_at(skip) {ipu.ctrl |= IPU_CTRL_ECD}
+		ipu_advance(skip)
 		ipu.data = ipu_peek(32)
 		ipu.top = ipu.data
 	case 5: // SETIQ
@@ -742,6 +747,16 @@ ipu_speek :: #force_inline proc(bits: u32) -> i32 {
 ipu_try_peek32 :: proc() -> (u32, bool) {
 	if !ipu_fill(32) {return 0, false}
 	return u32(ipu_window() >> 32), true
+}
+
+// Whether the 32 bits `off` past BP are the sequence end code 0x000001b7,
+// pulling the input in FIFO but never waiting for more.
+@(private)
+ipu_end_code_at :: proc(off: u32) -> bool {
+	if !ipu_fill(off + 32) {return false}
+	ipu.bp += off
+	defer ipu.bp -= off
+	return u32(ipu_window() >> 32) == 0x000001b7
 }
 
 @(private)

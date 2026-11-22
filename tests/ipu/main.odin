@@ -3,6 +3,9 @@
 // values: Y 0, 16 and 255, Cb and Cr 0, 128 and 255, TH0 off and on, TH1
 // at 0, mid and 0x1ff, and the SGN offset both ways. Each pixel takes the
 // chroma sample of its 2x2 block.
+//
+// FDEC flags the sequence end code 0x000001b7 on CTRL ECD when it sits at
+// BP or past the skip, and not otherwise.
 package main
 
 import "core:fmt"
@@ -64,9 +67,45 @@ main :: proc() {
 		}
 		if failed > 10 {break}
 	}
+	failed += fdec_end_code()
 	if failed > 0 {
 		fmt.eprintfln("ipu: %d failed", failed)
 		os.exit(1)
 	}
 	fmt.println("ipu: ok")
+}
+
+// FDEC skip over one quadword of stream bytes (first byte in the low
+// byte): ECD and the 32 bits it leaves at BP.
+@(private = "file")
+fdec :: proc(q: u128, skip: u32) -> (ecd: bool, data: u32) {
+	ipu.ipu_write(0x10, 1 << 30) // reset
+	ipu.ipu_fifo_write(q)
+	ipu.ipu_write(0x00, 4 << 28 | skip)
+	return ipu.ipu_read(0x10) & (1 << 14) != 0, u32(ipu.ipu_read(0x00))
+}
+
+@(private = "file")
+fdec_end_code :: proc() -> (failed: int) {
+	Case :: struct {
+		q:    u128,
+		skip: u32,
+		ecd:  bool,
+		data: u32,
+	}
+	CASES :: [?]Case {
+		{0xb7010000, 0, true, 0x000001b7}, // at BP
+		{0xb7010000_78563412, 32, true, 0x000001b7}, // past the skip
+		{0xb7010000_78563412, 0, false, 0x12345678}, // 32 bits past BP, no skip
+		{0xf0debc9a_78563412, 32, false, 0x9abcdef0},
+		{0xb3010000_78563412, 32, false, 0x000001b3}, // another start code
+	}
+	for c, i in CASES {
+		ecd, data := fdec(c.q, c.skip)
+		if ecd != c.ecd || data != c.data {
+			fmt.eprintfln("fdec: case %d: ecd %v data %08x, want %v %08x", i, ecd, data, c.ecd, c.data)
+			failed += 1
+		}
+	}
+	return
 }
