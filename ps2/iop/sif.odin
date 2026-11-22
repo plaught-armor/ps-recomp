@@ -240,15 +240,17 @@ sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 // than the IOP clock, which runs up to a slice past EE now while it idles.
 // With hold, it waits hold EE cycles after the held packet before it, as a
 // disc drive's reads follow one another, and then joins the queue: the
-// packets queued meanwhile go ahead of it.
-sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u64 = 0) {
+// packets queued meanwhile go ahead of it. With held and no hold, it is due
+// as the held packet before it is, and joins the queue right after it: the
+// answer of a server busy with a read waits for that read's.
+sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u64 = 0, held := false) {
 	p := make([]u8, 16 + 4 * len(payload))
 	w := ([^]u32)(raw_data(p))
 	w[0] = u32(len(p))
 	w[2] = cid
 	w[3] = opt
 	for v, i in payload {w[4 + i] = v}
-	if hold == 0 {
+	if hold == 0 && !held {
 		sif_queue(p, from_iop)
 		return
 	}
@@ -257,6 +259,18 @@ sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u
 	due := start + hold
 	append(&sif.held, Sif_Reply{due, p})
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, due)}
+}
+
+// Whether an RPC_END held back (sif_reply's hold) answers a call to the
+// server at descriptor `server`: one server serves one call at a time, so
+// its next answer comes after that one.
+@(private)
+sif_held_server :: proc(server: u32) -> bool {
+	for r in sif.held {
+		w := ([^]u32)(raw_data(r.p))
+		if w[2] == SIF_CMD_RPC_END && w[8] == SIF_CMD_RPC_CALL && w[9] == server {return true}
+	}
+	return false
 }
 
 // Queue a copy of packet `p`, its header filled in, sent by an IOP thread
@@ -453,7 +467,7 @@ sif_command :: proc(a, pc: u32) {
 		if receive != 0 && recv_size != 0 {
 			copy(mem.ram_slice(receive, recv_size), buf[:min(recv_size, u32(len(buf)))])
 		}
-		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_CALL, server, 0, 0}, hold = hold)
+		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_CALL, server, 0, 0}, hold = hold, held = sif_held_server(server))
 	case SIF_CMD_RPC_RDATA:
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		src, dest, size := arg(a, 4), arg(a, 5), arg(a, 6)

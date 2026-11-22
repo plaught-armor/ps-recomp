@@ -5568,7 +5568,7 @@ test_cdvd_search_server :: proc() {
 	check(stream(ncmd, 6, 0, 0, 0) == 0, "stream: no status with no stream")
 	check(stream(ncmd, 1, 23, 0, 0) == 1 && stream(ncmd, 6, 0, 0, 0) == 64, "stream: started, the ring full")
 	check(stream(ncmd, 2, 0, 1, ST_DEST) == 1 && stream(ncmd, 2, 0, 1, ST_DEST + 2048) == 1, "stream: reads answer the sectors read, error 0")
-	check(iop.sif.call_hold == iop.cd_read_ee(1), "stream: a stream read holds its RPC_END too")
+	check(iop.sif.call_hold == iop.CD_ST_READ_EE && iop.CD_ST_READ_EE != 0, "stream: a stream read copies from the ring, its RPC_END held only the RPC's round trip")
 	iop.sif.call_hold = 0
 	same := true
 	for i in u32(0) ..< 2 * 2048 / 4 {same &&= mem.rd32(ST_DEST + 4 * i) == mem.rd32(READ_DEST + 4 * i)}
@@ -5578,6 +5578,32 @@ test_cdvd_search_server :: proc() {
 	for i in u32(0) ..< 2 * 2048 / 4 {same &&= mem.rd32(ST_DEST + 8192 + 4 * i) == mem.rd32(READ_DEST + 4 * i)}
 	check(same, "stream: a read after a seek starts there")
 	check(stream(ncmd, 3, 0, 0, 0) == 1 && stream(ncmd, 2, 0, 1, ST_DEST) == 0, "stream: stopped, a read takes nothing")
+
+	// One server, one call at a time: a call to cdvdfsv's N-command server
+	// while its Read's RPC_END is held is answered after that one, though it
+	// holds nothing itself.
+	drop_replies()
+	send_pkt(iop.SIF_CMD_RPC_BIND, 1, 0, 0, 0, 0x80000595)
+	nsd := reply_word(0, 9)
+	drop_replies()
+	cpu.state.cycles = 1000
+	nbuf := iop.iop_mem(nsd + 0x100, 0x18)
+	nw := ([^]u32)(raw_data(nbuf))
+	nw[0], nw[1], nw[2], nw[3], nw[4] = 23, 2, READ_DEST, 0, 0
+	send_pkt(iop.SIF_CMD_RPC_CALL, 40, 0, 0, 0, 1, 0x18, 0, 0, 0, nsd)
+	nw[0], nw[1], nw[2], nw[3] = 0, 0, 0, 6
+	send_pkt(iop.SIF_CMD_RPC_CALL, 41, 0, 0, 0, 9, 0x14, 0, 0, 0, nsd)
+	held_word :: proc(i, w: int) -> u32 {return ([^]u32)(raw_data(iop.sif.held[i].p))[w]}
+	read_due := 1000 + iop.cd_read_ee(2)
+	check(nsd != 0 && len(iop.sif.replies) == 0 && len(iop.sif.held) == 2, "stream: a Read and the stream call after it are both held")
+	check(held_word(0, 4) == 40 && held_word(1, 4) == 41 && iop.sif.held[0].due == read_due && iop.sif.held[1].due == read_due, "stream: the stream call is due with the Read, after it")
+	ee_buf := iop.sif.ee_buf
+	iop.sif.ee_buf = 0 // join the queue only: none taken into the EE buffer
+	cpu.state.cycles = read_due
+	iop.sif_pump()
+	iop.sif.ee_buf = ee_buf
+	check(len(iop.sif.held) == 0 && len(iop.sif.replies) == 2 && reply_word(0, 4) == 40 && reply_word(1, 4) == 41, "stream: at the Read's due both join the queue, in call order")
+	drop_replies()
 
 	on_dual, start := dual_info()
 	check(on_dual == 1 && start == V, "dual info: a dual-layer image's second layer start")
