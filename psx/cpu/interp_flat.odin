@@ -116,6 +116,9 @@ when core.FLAT {
 	// Stops put off until native code or a nested run returned (the IOP's
 	// budget, th_budget), each counted once (flat_put_off).
 	flat_late: u64
+	// Thread switches a stopped run owed that its owner dropped: by the time
+	// the run stopped, the guest had named the running thread again.
+	flat_switches_dropped: u64
 	@(private = "file")
 	flat_late_owed: bool // the running run has one put off, counted
 	// LEARN notes the runs of this flat_run (learn_on as it began): its
@@ -225,8 +228,12 @@ when core.FLAT {
 		f := flat_push(x, .Base, 0)
 		x.pc, x.start = addr, addr
 		flat_learn_begin(f, addr)
+		// The nested run counts its own tail calls (cpu.call keeps frame_ret).
+		outer_tail := tail_depth
+		tail_depth = 0
 		events_due()
 		if flat_learning {flat_loop(x, true)} else {flat_loop(x, false)}
+		tail_depth = outer_tail
 		if !x.ended {fatal("guest code at %08x the host called stopped", addr)}
 		flat_nest_depth -= 1
 		flat_cur = outer
@@ -318,7 +325,7 @@ when core.FLAT {
 	flat_print :: proc() {
 		when core.FLAT {
 			who := learn_cpu == .Iop ? "iop" : "psx"
-			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run", who, flat_returns, flat_mismatch, flat_max_depth, flat_late)
+			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run, %d owed thread switches dropped", who, flat_returns, flat_mismatch, flat_max_depth, flat_late, flat_switches_dropped)
 			interp_print()
 		}
 	}
@@ -555,10 +562,17 @@ when core.FLAT {
 
 	// A taken jump from pc to target that is not a call (branch's, after the
 	// slot): events first when it goes back (or always, check), then
-	// goto_target. False when x then has something to settle.
+	// goto_target. False when x then has something to settle. A stop the
+	// delay slot asked for (a store's event) is taken first: no events run
+	// while one is owed, or a callback they deliver would nest under a run
+	// that has to stop.
 	@(private = "file")
 	flat_goto :: #force_inline proc(x: ^Flat_Ctx, pc, target: u32, check: bool) -> bool {
 		x.pc = target
+		if flat_stop {
+			x.goto_owed = true
+			return false
+		}
 		if (check || target <= pc) && state.cycles >= next_event {
 			x.goto_owed = true
 			run_events()
@@ -647,6 +661,8 @@ when core.FLAT {
 					if t != pc + 8 {
 						flat_enter(x, t, pc + 8, .Call)
 						settle = true
+					} else {
+						settle = flat_stop
 					}
 				case 0x0c, 0x0d:
 					interp_exec(&flat_dummy, pc, w, x.pending)
@@ -666,10 +682,12 @@ when core.FLAT {
 					if taken && target != pc + 8 {
 						flat_enter(x, target, pc + 8, .Call)
 						settle = true
+					} else {
+						settle = flat_stop
 					}
 				} else {
 					flat_slot(x, pc, L, lf)
-					if taken {settle = !flat_goto(x, pc, target, false)}
+					settle = taken ? !flat_goto(x, pc, target, false) : flat_stop
 				}
 			case 0x02:
 				target := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2)
@@ -686,6 +704,8 @@ when core.FLAT {
 				if t := (pc & 0xf0000000) | ((w & 0x3ffffff) << 2); t != pc + 8 {
 					flat_enter(x, t, pc + 8, .Call)
 					settle = true
+				} else {
+					settle = flat_stop
 				}
 			case 0x04 ..= 0x07:
 				rs, rt := r[(w >> 21) & 31], r[(w >> 16) & 31]
@@ -698,7 +718,7 @@ when core.FLAT {
 				}
 				target := pc + 4 + (signed_imm(w) << 2)
 				flat_slot(x, pc, L, lf)
-				if taken {settle = !flat_goto(x, pc, target, false)}
+				settle = taken ? !flat_goto(x, pc, target, false) : flat_stop
 			case 0x28 ..= 0x2e:
 				// A store to I/O can run events (an interrupt acknowledged)
 				// that switch threads: the run stops before the next

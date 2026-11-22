@@ -53,7 +53,11 @@ when core.FLAT {
 				ended := cpu.flat_run(x)
 				if flat.preempt_owed {
 					flat.preempt_owed = false
-					if j, ok := preempt_target(); ok && !ended {switch_to(j)}
+					if j, ok := preempt_target(); ok && !ended {
+						switch_to(j)
+					} else if !ended {
+						cpu.flat_switches_dropped += 1
+					}
 				}
 				if !ended {continue}
 				if i == 0 && boot {return}
