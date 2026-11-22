@@ -240,37 +240,44 @@ sif_set_dma :: proc(list, count, pc: u32) -> u32 {
 // than the IOP clock, which runs up to a slice past EE now while it idles.
 // With hold, it waits hold EE cycles after the held packet before it, as a
 // disc drive's reads follow one another, and then joins the queue: the
-// packets queued meanwhile go ahead of it. With held and no hold, it is due
-// as the held packet before it is, and joins the queue right after it: the
-// answer of a server busy with a read waits for that read's.
-sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u64 = 0, held := false) {
+// packets queued meanwhile go ahead of it. With held_due (not 0) and no
+// hold, it is due at held_due or now, whichever is later, and joins the
+// queue right after the held packet due then: the answer of a server busy
+// with a read waits for that read's, not for other servers' reads.
+sif_reply :: proc(cid: u32, opt: u32, payload: []u32, from_iop := false, hold: u64 = 0, held_due: u64 = 0) {
 	p := make([]u8, 16 + 4 * len(payload))
 	w := ([^]u32)(raw_data(p))
 	w[0] = u32(len(p))
 	w[2] = cid
 	w[3] = opt
 	for v, i in payload {w[4 + i] = v}
-	if hold == 0 && !held {
+	if hold == 0 && held_due == 0 {
 		sif_queue(p, from_iop)
 		return
 	}
-	start := cpu.state.cycles
-	if n := len(sif.held); n != 0 {start = max(start, sif.held[n - 1].due)}
-	due := start + hold
-	append(&sif.held, Sif_Reply{due, p})
+	due := max(cpu.state.cycles, held_due)
+	if hold != 0 {
+		if n := len(sif.held); n != 0 {due = max(due, sif.held[n - 1].due)}
+		due += hold
+	}
+	// First due first, after every packet due no later: a server's answer
+	// lands right after its held read's, ahead of later reads.
+	i := len(sif.held)
+	for i > 0 && sif.held[i - 1].due > due {i -= 1}
+	inject_at(&sif.held, i, Sif_Reply{due, p})
 	if !cpu.in_interrupt {cpu.next_event = min(cpu.next_event, due)}
 }
 
-// Whether an RPC_END held back (sif_reply's hold) answers a call to the
-// server at descriptor `server`: one server serves one call at a time, so
-// its next answer comes after that one.
+// The due of the last RPC_END held back (sif_reply's hold) that answers a
+// call to the server at descriptor `server`, 0 for none: one server serves
+// one call at a time, so its next answer comes after that one.
 @(private)
-sif_held_server :: proc(server: u32) -> bool {
-	for r in sif.held {
+sif_held_server :: proc(server: u32) -> u64 {
+	#reverse for r in sif.held {
 		w := ([^]u32)(raw_data(r.p))
-		if w[2] == SIF_CMD_RPC_END && w[8] == SIF_CMD_RPC_CALL && w[9] == server {return true}
+		if w[2] == SIF_CMD_RPC_END && w[8] == SIF_CMD_RPC_CALL && w[9] == server {return r.due}
 	}
-	return false
+	return 0
 }
 
 // Queue a copy of packet `p`, its header filled in, sent by an IOP thread
@@ -467,7 +474,7 @@ sif_command :: proc(a, pc: u32) {
 		if receive != 0 && recv_size != 0 {
 			copy(mem.ram_slice(receive, recv_size), buf[:min(recv_size, u32(len(buf)))])
 		}
-		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_CALL, server, 0, 0}, hold = hold, held = sif_held_server(server))
+		sif_reply(SIF_CMD_RPC_END, 0, {rec_id, pkt, rpc_id, client, SIF_CMD_RPC_CALL, server, 0, 0}, hold = hold, held_due = sif_held_server(server))
 	case SIF_CMD_RPC_RDATA:
 		rec_id, pkt, rpc_id, client := arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)
 		src, dest, size := arg(a, 4), arg(a, 5), arg(a, 6)

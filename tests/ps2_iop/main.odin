@@ -2762,6 +2762,13 @@ test_reply_due :: proc() {
 	iop.sif_reply(0x23, 0, nil, hold = 5000)
 	iop.sif_reply(0x24, 0, nil, hold = 300)
 	check(len(iop.sif.held) == 2 && iop.sif.held[0].due == 12000 && iop.sif.held[1].due == 12300, "reply held: two reads are serial")
+	// A server's answer waits for its own held read, not another's.
+	iop.sif_reply(0x25, 0, nil, held_due = 12000)
+	cid :: proc(i: int) -> u32 {return ([^]u32)(raw_data(iop.sif.held[i].p))[2]}
+	check(len(iop.sif.held) == 3 && cid(1) == 0x25 && iop.sif.held[1].due == 12000 && cid(2) == 0x24 && iop.sif.held[2].due == 12300, "reply held: a server's answer is due with its read, ahead of a later read")
+	cpu.state.cycles = 13000
+	iop.sif_reply(0x26, 0, nil, held_due = 12000)
+	check(len(iop.sif.held) == 4 && cid(3) == 0x26 && iop.sif.held[3].due == 13000, "reply held: a server's answer after its read's due is due now")
 	drop_replies()
 	check(len(iop.sif.held) == 0 && iop.sif_next_ee() == max(u64), "reply held: dropped with the queue")
 	// The read time: 1 ms at least; a DVD at 4x reads 2705 sectors in about a second.
@@ -5604,6 +5611,18 @@ test_cdvd_search_server :: proc() {
 	iop.sif.ee_buf = ee_buf
 	check(len(iop.sif.held) == 0 && len(iop.sif.replies) == 2 && reply_word(0, 4) == 40 && reply_word(1, 4) == 41, "stream: at the Read's due both join the queue, in call order")
 	drop_replies()
+	// A stream read on the same server waits its round trip after the
+	// held Read's END.
+	cpu.state.cycles = 1000
+	nw[0], nw[1], nw[2], nw[3], nw[4] = 23, 2, READ_DEST, 0, 0
+	send_pkt(iop.SIF_CMD_RPC_CALL, 42, 0, 0, 0, 1, 0x18, 0, 0, 0, nsd)
+	nw[0], nw[1], nw[2], nw[3] = 23, 0, 0, 1
+	send_pkt(iop.SIF_CMD_RPC_CALL, 43, 0, 0, 0, 9, 0x14, 0, 0, 0, nsd)
+	nw[0], nw[1], nw[2], nw[3] = 0, 1, ST_DEST, 2
+	send_pkt(iop.SIF_CMD_RPC_CALL, 44, 0, 0, 0, 9, 0x14, 0, 0, 0, nsd)
+	check(len(iop.sif.held) == 3 && held_word(2, 4) == 44 && iop.sif.held[1].due == read_due && iop.sif.held[2].due == read_due + iop.CD_ST_READ_EE, "stream: a stream read after a held Read is due its round trip after it")
+	drop_replies()
+	stream(ncmd, 3, 0, 0, 0)
 
 	on_dual, start := dual_info()
 	check(on_dual == 1 && start == V, "dual info: a dual-layer image's second layer start")

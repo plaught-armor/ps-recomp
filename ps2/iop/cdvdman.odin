@@ -234,9 +234,12 @@ CD_CD_RATE :: 24 * 153_600 / DISC_SECTOR
 CD_READ_MIN_EE :: cpu.EE_CLOCK / 1000
 
 // What a stream read's RPC_END waits, in EE cycles: 0.1 ms, the RPC's own
-// round trip. The sectors are in the ring already, so the drive's time is
-// not paid, but the END still lands after the sceCdStRead call returns:
-// DDS (SLUS-20974) jumps to 0 from 0x2cfc50 when it lands at once.
+// round trip, counted from now or from the last held read's END, whichever
+// is later (sif_reply's hold): cdvdfsv's N-command server answers one call
+// at a time, so a stream read behind a Read waits for it. The sectors are
+// in the ring already, so the drive's time is not paid, but the END still
+// lands after the sceCdStRead call returns: DDS (SLUS-20974) jumps to 0
+// from 0x2cfc50 when it lands at once.
 CD_ST_READ_EE :: CD_READ_MIN_EE / 10
 
 // The EE cycles the drive takes to read `sectors` sectors (cdvdfsv's Read
@@ -248,8 +251,9 @@ cd_read_ee :: proc(sectors: u32) -> u64 {
 
 // cdvdfsv's stream N-command (sceCdSt*): {lsn, sectors, EE buffer, cmd,
 // mode[3]}, the answer as the command's sceCdSt call returns it. A read
-// copies out of the ring the drive keeps filling, so its RPC_END waits only
-// the RPC's round trip (CD_ST_READ_EE), not the drive (cd_read_ee), and the
+// copies out of the ring the drive keeps filling, so its RPC_END waits the
+// RPC's round trip (CD_ST_READ_EE) after any held read, not the drive's
+// time for its own sectors (cd_read_ee), and the
 // ring always holds every sector it can: a read takes
 // all it asks for, error 0 in the answer's high half, and the status is the
 // ring's size while the stream runs. Pause and resume change nothing a read
