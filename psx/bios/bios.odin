@@ -692,6 +692,15 @@ FAKE_DCB_TABLE :: 0x3000
 @(private)
 DCB_SIZE :: 0x50
 
+// The kernel's exception stack, at the retail top: the exception handler
+// walks the SysEnqIntRP chains on it, not on the interrupted code's stack,
+// which may be a game's 1 KB scratchpad stack with no room left below its
+// sp (Driver 2's pad and card handler wrote past 0x1f800000).
+@(private)
+EXC_STACK_TOP :: 0x85d8
+@(private)
+EXC_STACK_SIZE :: 0x400
+
 // The stack top GetConf reports until SetConf: the retail default.
 @(private)
 STACK_TOP :: 0x801fff00
@@ -723,11 +732,12 @@ CONF_CODE_PTR :: 0x474
 
 // Kernel RAM the HLE BIOS fixes, from 0x3000: the DCB table and the stubs
 // to 0x34f0, the SetConf code words (CONF_CODE) to 0x34f8, KERNEL_EXEC
-// (exec.odin) at 0x3800, PAD_DRIVER at 0x4000 to 0x598c, strtok's buffer and
+// (exec.odin) at 0x3800, PAD_DRIVER at 0x4000 to 0x598c, the exception
+// stack (EXC_STACK_TOP) at 0x81d8-0x85d7, strtok's buffer and
 // pointer (libc) at 0x9030-0x9133, SetConf's words (CONF) at 0xb940-0xb94b,
 // and the thread tables (PCB, TCB_ARRAY) at 0xe000-0xec10, in the
 // 0xe000-0xffff heap the retail kernel allocates them from.
-#assert(PAD_DRIVER + PAD_DRIVER_SIZE <= 0x9030)
+#assert(PAD_DRIVER + PAD_DRIVER_SIZE <= EXC_STACK_TOP - EXC_STACK_SIZE && EXC_STACK_TOP <= 0x9030)
 #assert(CONF_CODE + 8 <= KERNEL_EXEC)
 #assert(PCB >= 0xe000 && TCB_ARRAY + MAX_THREADS * TCB_SIZE <= 0x10000)
 
@@ -964,6 +974,12 @@ deliver_irq :: proc() {
 	cpu.cop0.sr = (cpu.cop0.sr & ~u32(0x3f)) | ((cpu.cop0.sr << 2) & 0x3c)
 	io.irq_regs.in_handler = true
 	bios.rfe = false
+	// The BIOS saves the interrupted registers, then walks the chains on its
+	// own exception stack (retail and OpenBIOS alike: OpenBIOS ROM +0x20790
+	// loads sp from its exception stack word before the walk). gp stays the
+	// game's; the hook below takes the jump buffer's sp, and saved_cpu puts
+	// the interrupted sp back.
+	cpu.state.r[29] = 0x80000000 | EXC_STACK_TOP
 	run_int_chains()
 	if target != 0 && !bios.rfe {
 		buf := bios.hook

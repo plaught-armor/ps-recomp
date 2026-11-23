@@ -8,7 +8,8 @@
 //   WaitEvent returns 0 when disabled, takes a ready event at once, and
 //   otherwise runs time forward until the event is delivered, through
 //   every device event on its due cycle.
-//   deliver_irq runs the chains, the kernel's root counter handlers at the
+//   deliver_irq runs the chains on the kernel's exception stack, the
+//   interrupted sp coming back after, with the kernel's root counter handlers at the
 //   tail of chain 1 and its IRQ event handler at the tail of chain 3;
 //   ChangeClearRCnt's flag and ReturnFromException end the walk early,
 //   skipping the HookEntryInt handler; an acknowledged counter ends it
@@ -97,6 +98,8 @@ FN_THREAD :: 0x80001700 // a thread: records what it sees, switches back
 FN_RESTART :: 0x80001800 // a thread's new entry: counts, switches back
 @(private = "file")
 FN_PREEMPT :: 0x80001900 // a thread: records s0, points the PCB back, takes an IRQ
+@(private = "file")
+FN_FIRST_SP :: 0x80001a00 // first(): records its sp, returns 0
 
 // HookEntryInt jump buffer, and the setjmp return site it holds: a jal to
 // FN_HOOK.
@@ -115,6 +118,13 @@ ELEM_COUNT :: 0x2020
 
 @(private = "file")
 ELEM_NOP :: 0x2030
+
+@(private = "file")
+ELEM_SP :: 0x20a0
+
+// The sp FN_FIRST_SP saw.
+@(private = "file")
+handler_sp: u32
 
 @(private = "file")
 PAD_WORD :: 0x2100
@@ -325,6 +335,10 @@ main :: proc() {
 					cpu.state.r[2] = 0
 				}},
 			{FN_HOOK, proc() {calls.hook += 1}},
+			{FN_FIRST_SP, proc() {
+					handler_sp = cpu.state.r[29]
+					cpu.state.r[2] = 0
+				}},
 			{FN_EXEC, proc() {
 					r := &cpu.state.r
 					exec_regs = {r[4], r[5], r[29], r[30], r[28]}
@@ -518,6 +532,20 @@ main :: proc() {
 	if calls.second != 1 || calls.late != 3 || calls.hook != 3 {
 		fail("with no ReturnFromException: second ran %d times, chain 2 %d, hook %d, want 1, 3 and 3", calls.second, calls.late, calls.hook)
 	}
+
+	// The chain handlers run on the kernel's exception stack, not on the
+	// interrupted code's: a game deep in a scratchpad stack (Driver 2) has
+	// no room below its sp for them. The game's sp comes back after.
+	elem(ELEM_SP, 0, 0, FN_FIRST_SP)
+	c(0x02, 0, ELEM_SP)
+	game_sp: u32 = 0x1f800010
+	cpu.state.r[29] = game_sp
+	irq(0)
+	if handler_sp == game_sp || handler_sp & 0x1fffffff >= 0x10000 {
+		fail("chain handler ran on sp %#x, want the kernel exception stack (the game's was %#x)", handler_sp, game_sp)
+	}
+	check("game sp after the interrupt", cpu.state.r[29], game_sp)
+	c(0x03, 0, ELEM_SP)
 
 	// SetDefaultExitFromException: the walk runs to the end, then the
 	// exception ends without the hook; SetCustomExitFromException brings
