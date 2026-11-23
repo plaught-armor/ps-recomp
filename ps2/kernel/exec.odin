@@ -306,6 +306,7 @@ load_exec :: proc(filename, argc, argv: u32) {
 	name := strings.clone(string(k.exec.args[:len(name_in)]), context.temp_allocator)
 	exec_reset("LoadExecPS2")
 	iop.fileio_reset()
+	iop.mcserv_reboot()
 	colon := strings.index_byte(name, ':')
 	data: []u8
 	found := colon < 0 || strings.has_prefix(name, "cdrom")

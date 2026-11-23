@@ -111,6 +111,9 @@
 // while host writes are off a commit counts nothing and a rewind returns
 // none. String keys are the store's own copies.
 //
+// mc getinfo: mcserv's GetInfo says new card (-1) on a port's first call,
+// the same card (0) after; an IOP reset makes each card new again.
+//
 // mc2: the raw card behind mc2_d, its image in a temp dir. Port 0 a blank
 // card, port 1 none (its socket unbound). Each command: the status at A,
 // then B, seq counting, 0x2080 at +8; a read's pages at A+0x80 and its
@@ -293,6 +296,7 @@ game :: proc(_: rawptr) {
 	test_boot_gaps()
 	test_card_dirty()
 	test_mc2()
+	test_mc_get_info_reboot()
 	test_sd_mmix()
 	test_sd_mvol() // last: it leaves the master volumes off unity
 
@@ -8119,6 +8123,21 @@ mc2_all :: proc(b: []u8, x: u8) -> bool {return b != nil && slice.all_of(b, x)}
 // the first write and changed blocks written in place; ECC corrected on
 // read only; the backup blocks; a new card until 13; snapshots and rollback; host
 // writes off; images read in, one of the wrong size refused.
+test_mc_get_info_reboot :: proc() {
+	OUT :: 0x00110000
+	info := proc(port: u32) -> i32 {
+		buf: [0x30]u8
+		w := ([^]u32)(raw_data(buf[:]))
+		w[1], w[5], w[7] = port, 1, OUT
+		check(iop.sif.servers[0x80000400](1, buf[:], 0x30), "mc getinfo: served")
+		return i32(w[0])
+	}
+	iop.mcserv_reboot() // what earlier tests left
+	check(info(0) == -1 && info(0) == 0 && info(1) == -1 && mem.rd32(OUT) == 2, "mc getinfo: new card once per port, then the same card")
+	send_pkt(iop.SIF_CMD_RESET, 0, 0, 0) // an empty path at +24
+	check(info(0) == -1 && info(0) == 0 && info(1) == -1, "mc getinfo: an IOP reset makes each card new again")
+}
+
 test_mc2 :: proc() {
 	A :: 0x00110000
 	B :: 0x00118000

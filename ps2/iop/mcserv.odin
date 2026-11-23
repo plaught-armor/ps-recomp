@@ -536,6 +536,25 @@ mc_get_ent_space :: proc(port: u32, name: string) -> i32 {
 	return 0xfe if ok && is_dir else MC_NO_ENTRY
 }
 
+// An IOP reboot starts mcman and mcserv afresh: every handle is closed, each
+// port's directory is the root again, a GetDir listing in progress is
+// dropped, and each port's next GetInfo says new card (-1). The cards stay.
+// Gran Turismo 4's loader reads the cards, reboots the IOP, and its main
+// program scans a card again only on that -1.
+mcserv_reboot :: proc() {
+	for &f in mc.files {
+		delete(f.path)
+		f = {}
+	}
+	for &c in mc.cwd {
+		delete(c)
+		c = ""
+	}
+	clear(&mc.dir)
+	mc.dir_pos = 0
+	mc.known = {}
+}
+
 // Emulated state, saved and restored by snapshots (snap.odin).
 mcserv_snap :: proc() {
 	core.snap_add(&mc)

@@ -423,6 +423,7 @@ sif_command :: proc(a, pc: u32) {
 		sif_bind_retries = {}
 		sif.ee_buf = 0
 		sif_drop_replies()
+		mcserv_reboot()
 		// sifman's completion callbacks owed (iop_sifcmd.dma_cb) stay, as
 		// the IOP's other interrupt state (timer, vblank, CD and libsd
 		// handlers) does.
