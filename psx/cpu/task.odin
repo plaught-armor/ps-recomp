@@ -1,6 +1,6 @@
 package psx_cpu
 
-@(require) import "core:fmt" // used only without FLAT
+import "core:fmt"
 
 import "ps:core"
 
@@ -15,6 +15,13 @@ import "ps:core"
 // which are the $sp and link of the call into the routine the task made
 // when it switched away. One that matches no suspended task starts a new
 // coroutine running the guest code at that $ra.
+//
+// FLAT has no host coroutines: a task's open calls are its flat run's
+// records (Flat_Ctx.frames), and a switch swaps them (Task_Run), as a BIOS
+// thread's run has records of its own. flat_task_switch makes it when a
+// native callee of the run's guest code came back in another task; one in
+// native code or in a guest call the host made cannot switch (task_switch
+// counts and warns once), as host frames below it would run on.
 //
 // The registers are the guest's: the routine saved and loaded them in its
 // own memory, so a switch moves none.
@@ -43,147 +50,200 @@ task_switches, tasks_reaped, tasks_lost: u64
 
 LOST_RING :: 64
 
+// FLAT: the records a task made here may hold (20 bytes each, Flat_Frame),
+// so its stack is at most 20 KB and the table's at most MAX_TASKS times
+// that, 960 KB. Deeper is fatal, as FLAT_DEPTH_MAX is for a run's own.
+TASK_DEPTH_MAX :: 1024
+
 // The host callee of a call with $sp sp and link came back (call_back,
-// interp_call). On another $sp, it entered another task (task_switch) when
-// its $ra is not the link, or is and a task suspended there goes on at that
-// $sp and $ra: tasks waiting in one routine go on at one return address
-// (Racing Lagoon 0x8006c988, after the switch call in its wait-frames loop),
-// and only $sp tells them apart. Back at the link with no such task, the
-// callee moved the stack and returned (a SetSp, as Driver 2's f_00090300
-// is): the call goes on.
+// interp_call, flat_task_switch). On another $sp, it entered another task
+// (task_switch) when task_leaves.
 task_returned :: #force_inline proc(sp, link: u32) {
-	to_sp, to_ra := state.r[29], state.r[31]
-	if to_sp == sp {return}
-	if to_ra == link && !task_waits(to_sp, to_ra) {return}
-	task_switch(sp, link)
+	if task_leaves(sp, link) {task_switch(sp, link)}
 }
 
-when !core.FLAT {
-	// Whether a suspended task goes on at sp and ra. One discarded there
-	// (a SetSp cannot be told from it) counts in tasks_lost.
+// Whether the host callee of a call with $sp sp and link that came back
+// entered another task: on another $sp, when its $ra is not the link, or is
+// and a task suspended there goes on at that $sp and $ra. Tasks waiting in
+// one routine go on at one return address (Racing Lagoon 0x8006c988, after
+// the switch call in its wait-frames loop), and only $sp tells them apart.
+// Back at the link with no such task, the callee moved the stack and
+// returned (a SetSp, as Driver 2's f_00090300 is): the call goes on.
+task_leaves :: #force_inline proc(sp, link: u32) -> bool {
+	to_sp, to_ra := state.r[29], state.r[31]
+	if to_sp == sp {return false}
+	return to_ra != link || task_waits(to_sp, to_ra)
+}
+
+when core.FLAT {
+	// A suspended task's records under FLAT: its run's open calls, with the
+	// state of the run that goes with them, as a coroutine's host frames are.
 	@(private = "file")
-	task_waits :: proc(sp, ra: u32) -> bool {
-		for t in tasks {
-			if t.co != nil && t.sp == sp && t.ra == ra {return true}
+	Task_Run :: struct {
+		// The run (a BIOS thread's) the records are on.
+		ctx:        ^Flat_Ctx,
+		frames:     []Flat_Frame,
+		depth:      u32,
+		start:      u32,
+		frame_ret:  u32,
+		tail_depth: int,
+		// Made here (Flat_Ctx.task).
+		task:       bool,
+		inner:      ^Mod_Inner,
+	}
+} else {
+	@(private = "file")
+	Task_Run :: ^core.Coroutine
+}
+
+@(private = "file")
+Guest_Task :: struct {
+	// Where it goes on: the $sp and link of its call into the switch.
+	sp, ra:      u32,
+	// The guest pc and $sp it started at (0, 0: not made here).
+	entry, sp0:  u32,
+	run:         Task_Run,
+	// Order of suspension, for the full table.
+	stamp:       u64,
+	// A task started since on the $sp it started on.
+	stale:       bool,
+	// Not a free entry.
+	live:        bool,
+}
+
+// The suspended tasks.
+@(private = "file")
+tasks: [MAX_TASKS]Guest_Task
+
+// The running task's start, for its entry when it switches away.
+@(private = "file")
+task_entry, task_sp0: u32
+
+@(private = "file")
+task_stamp: u64
+
+@(private = "file")
+task_full_warned: bool
+
+// Where the last LOST_RING discarded tasks would have gone on ($sp, $ra;
+// 0, 0: none), for tasks_lost.
+@(private = "file")
+lost: [LOST_RING][2]u32
+
+@(private = "file")
+lost_next: int
+
+// Whether a suspended task goes on at sp and ra. One discarded there
+// (a SetSp cannot be told from it) counts in tasks_lost.
+@(private = "file")
+task_waits :: proc(sp, ra: u32) -> bool {
+	for t in tasks {
+		if t.live && t.sp == sp && t.ra == ra {return true}
+	}
+	for &l in lost {
+		if l == {sp, ra} {
+			tasks_lost += 1
+			l = {}
+			break
 		}
+	}
+	return false
+}
+
+// Discard suspended task t, remembering where it would have gone on.
+@(private = "file")
+task_reap :: proc(t: ^Guest_Task) {
+	task_drop(t.run)
+	lost[lost_next] = {t.sp, t.ra}
+	lost_next = (lost_next + 1) % LOST_RING
+	t^ = {}
+	tasks_reaped += 1
+}
+
+// The host callee of a call with $sp sp and link came back with another
+// task's $sp and $ra. Natively, returns when some task switches back to
+// this one, with its registers loaded: $sp sp and $ra link. Under FLAT it
+// returns at once, the run's records the other task's (task_go).
+task_switch :: proc(sp, link: u32) {
+	to_sp, to_ra := state.r[29], state.r[31]
+	if !task_can_switch(sp, link) {return}
+	if mod_depth > 0 {
+		fatal("game task switch to %#08x inside a mod hook: hooks run in frozen time and cannot switch tasks (sp %#08x)", to_ra, to_sp)
+	}
+	if .Call in core.trace.active && core.trace_pc_ok(to_ra) {
+		core.tracef(.Call, "task %08x sp=%x -> %08x sp=%x", link, sp, to_ra, to_sp)
+	}
+	to: Task_Run
+	found := false
+	to_entry, to_sp0 := to_ra, to_sp
+	for &t in tasks {
+		if t.live && t.sp == to_sp && t.ra == to_ra {
+			to, to_entry, to_sp0, found = t.run, t.entry, t.sp0, true
+			t = {}
+			break
+		}
+	}
+	if !found {
 		for &l in lost {
-			if l == {sp, ra} {
+			if l == {to_sp, to_ra} {
 				tasks_lost += 1
 				l = {}
 				break
 			}
 		}
-		return false
-	}
-
-	@(private = "file")
-	Guest_Task :: struct {
-		// Where it goes on: the $sp and link of its call into the switch.
-		sp, ra:      u32,
-		// The guest pc and $sp its coroutine started at (0, 0: not made here).
-		entry, sp0:  u32,
-		co:          ^core.Coroutine,
-		// Order of suspension, for the full table.
-		stamp:       u64,
-		// A task started since on the $sp it started on.
-		stale:       bool,
-	}
-
-	// The suspended tasks; co nil is a free entry.
-	@(private = "file")
-	tasks: [MAX_TASKS]Guest_Task
-
-	// The running task's start, for its entry when it switches away.
-	@(private = "file")
-	task_entry, task_sp0: u32
-
-	@(private = "file")
-	task_stamp: u64
-
-	@(private = "file")
-	task_full_warned: bool
-
-	// Where the last LOST_RING discarded tasks would have gone on ($sp, $ra;
-	// 0, 0: none), for tasks_lost.
-	@(private = "file")
-	lost: [LOST_RING][2]u32
-
-	@(private = "file")
-	lost_next: int
-
-	// Discard suspended task t, remembering where it would have gone on.
-	@(private = "file")
-	task_reap :: proc(t: ^Guest_Task) {
-		core.co_kill(t.co)
-		lost[lost_next] = {t.sp, t.ra}
-		lost_next = (lost_next + 1) % LOST_RING
-		t^ = {}
-		tasks_reaped += 1
-	}
-
-	// The host callee of a call with $sp sp and link came back with another
-	// task's $sp and $ra. Returns when some task switches back to this one,
-	// with its registers loaded: $sp sp and $ra link.
-	task_switch :: proc(sp, link: u32) {
-		to_sp, to_ra := state.r[29], state.r[31]
-		if mod_depth > 0 {
-			fatal("game task switch to %#08x inside a mod hook: hooks run in frozen time and cannot switch tasks (sp %#08x)", to_ra, to_sp)
-		}
-		if .Call in core.trace.active && core.trace_pc_ok(to_ra) {
-			core.tracef(.Call, "task %08x sp=%x -> %08x sp=%x", link, sp, to_ra, to_sp)
-		}
-		to: ^core.Coroutine
-		to_entry, to_sp0 := to_ra, to_sp
+		// The game made a task over on a stack: the one that started
+		// there before most likely never goes on. It is discarded first
+		// when a slot is wanted, not now: it may be suspended on another
+		// stack still and be switched back to (Racing Lagoon 0x8007ebc0).
 		for &t in tasks {
-			if t.co != nil && t.sp == to_sp && t.ra == to_ra {
-				to, to_entry, to_sp0 = t.co, t.entry, t.sp0
-				t = {}
-				break
+			if t.live && t.entry != 0 && t.sp0 == to_sp {
+				t.stale = true
 			}
 		}
-		if to == nil {
-			for &l in lost {
-				if l == {to_sp, to_ra} {
-					tasks_lost += 1
-					l = {}
-					break
-				}
-			}
-			// The game made a task over on a stack: the one that started
-			// there before most likely never goes on. It is discarded first
-			// when a slot is wanted, not now: it may be suspended on another
-			// stack still and be switched back to (Racing Lagoon 0x8007ebc0).
-			for &t in tasks {
-				if t.co != nil && t.entry != 0 && t.sp0 == to_sp {
-					t.stale = true
-				}
-			}
-			to = core.co_create(task_run, rawptr(uintptr(to_ra)))
+	}
+	// A free entry, else the stale task suspended longest, else the task
+	// made here suspended longest.
+	slot := -1
+	for t, i in tasks {
+		if !t.live {slot = i; break}
+		if t.entry == 0 {continue}
+		if slot < 0 {slot = i; continue}
+		s := &tasks[slot]
+		if t.stale != s.stale ? t.stale : t.stamp < s.stamp {slot = i}
+	}
+	if slot < 0 {
+		fatal("game task switch to %#08x: %d tasks suspended, none made by a switch to discard", to_ra, MAX_TASKS)
+	}
+	if t := &tasks[slot]; t.live {
+		if !t.stale && !task_full_warned {
+			fmt.eprintfln("cpu: %d game tasks suspended; discarding the one at %#08x (sp %#08x), suspended longest", MAX_TASKS, t.ra, t.sp)
+			task_full_warned = true
 		}
-		// A free entry, else the stale task suspended longest, else the task
-		// made here suspended longest.
-		slot := -1
-		for t, i in tasks {
-			if t.co == nil {slot = i; break}
-			if t.entry == 0 {continue}
-			if slot < 0 {slot = i; continue}
-			s := &tasks[slot]
-			if t.stale != s.stale ? t.stale : t.stamp < s.stamp {slot = i}
-		}
-		if slot < 0 {
-			fatal("game task switch to %#08x: %d tasks suspended, none made by a switch to discard", to_ra, MAX_TASKS)
-		}
-		if t := &tasks[slot]; t.co != nil {
-			if !t.stale && !task_full_warned {
-				fmt.eprintfln("cpu: %d game tasks suspended; discarding the one at %#08x (sp %#08x), suspended longest", MAX_TASKS, t.ra, t.sp)
-				task_full_warned = true
-			}
-			task_reap(t)
-		}
-		task_stamp += 1
-		tasks[slot] = {sp, link, task_entry, task_sp0, core.co_current, task_stamp, false}
-		task_entry, task_sp0 = to_entry, to_sp0
-		task_switches += 1
+		task_reap(t)
+	}
+	task_stamp += 1
+	tasks[slot] = {sp, link, task_entry, task_sp0, task_suspend(), task_stamp, false, true}
+	task_entry, task_sp0 = to_entry, to_sp0
+	task_switches += 1
+	task_go(to, found, to_ra)
+}
+
+when !core.FLAT {
+	@(private = "file")
+	task_can_switch :: #force_inline proc(sp, link: u32) -> bool {return true}
+
+	@(private = "file")
+	task_suspend :: #force_inline proc() -> Task_Run {return core.co_current}
+
+	@(private = "file")
+	task_drop :: proc(run: Task_Run) {core.co_kill(run)}
+
+	// Switch to the coroutine of the task found, or a new one at ra; back
+	// when some task switches back to this one.
+	@(private = "file")
+	task_go :: proc(to: Task_Run, found: bool, ra: u32) {
+		to := to
+		if !found {to = core.co_create(task_run, rawptr(uintptr(ra)))}
 		// A mod's replacement may switch tasks, as the function it stands in
 		// for may: the replacements running are this task's. So are the
 		// interpreted calls open (interp_top) and the tail calls in progress
@@ -217,18 +277,53 @@ when !core.FLAT {
 	@(private = "file")
 	task_warned: bool
 
-	// FLAT keeps no suspended tasks.
+	// Only a run's own guest code can switch (flat_can_stop): in native code
+	// or a guest call the host made, the host frames below would run on. That
+	// call goes on with the other task's registers, as before: counted and
+	// warned.
 	@(private = "file")
-	task_waits :: proc(sp, ra: u32) -> bool {return false}
-
-	// FLAT has no host coroutines to hold a task's native frames on, so the
-	// call goes on at its link with the other task's registers, as before:
-	// counted and warned.
-	task_switch :: proc(sp, link: u32) {
+	task_can_switch :: proc(sp, link: u32) -> bool {
+		if flat_can_stop() {return true}
 		task_switches += 1
 		if !task_warned {
-			fmt.eprintfln("cpu: game task switch from %#08x (sp %#08x) to %#08x (sp %#08x) under FLAT: not supported, goes on at the link", link, sp, state.r[31], state.r[29])
+			fmt.eprintfln("cpu: game task switch from %#08x (sp %#08x) to %#08x (sp %#08x) in native code or a guest call the host made, under FLAT: not supported, goes on", link, sp, state.r[31], state.r[29])
 			task_warned = true
 		}
+		return false
+	}
+
+	// The running task's records, now the table's. A continuation open (a
+	// mod's replacement chain) is the run's, not the task's: fatal.
+	@(private = "file")
+	task_suspend :: proc() -> Task_Run {
+		x := flat_cur
+		if x.hosts > 0 {
+			fatal("game task switch to %#08x with %d continuations open (a mod's replacement) under FLAT: not supported", state.r[31], x.hosts)
+		}
+		return {x, x.frames, x.depth, x.start, frame_ret, tail_depth, x.task, mod_inner}
+	}
+
+	@(private = "file")
+	task_drop :: proc(run: Task_Run) {
+		x := Flat_Ctx{start = run.start, depth = run.depth, frames = run.frames}
+		flat_free(&x)
+	}
+
+	// The run goes on in the task found, with its records, or in a new one at
+	// ra, with none yet: its first call (.Task) is owed (flat_settle).
+	@(private = "file")
+	task_go :: proc(to: Task_Run, found: bool, ra: u32) {
+		x := flat_cur
+		if !found {
+			x.frames, x.depth, x.start, x.task = nil, 0, ra, true
+			frame_ret, tail_depth, mod_inner = ra, 0, nil
+			x.enter = true
+			return
+		}
+		if to.ctx != x {
+			fatal("game task switch to %#08x (sp %#08x): suspended on another BIOS thread's flat run", ra, state.r[29])
+		}
+		x.frames, x.depth, x.start, x.task = to.frames, to.depth, to.start, to.task
+		frame_ret, tail_depth, mod_inner = to.frame_ret, to.tail_depth, to.inner
 	}
 }

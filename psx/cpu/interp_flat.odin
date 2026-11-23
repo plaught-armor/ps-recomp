@@ -6,7 +6,7 @@
 //
 // A record is one call that has not returned, as one host frame of call is
 // in the recursive model:
-//   - a guest run's (kind Base, Call, Tail or Jump), whose code runs at
+//   - a guest run's (kind Base, Call, Tail, Jump or Task), whose code runs at
 //     Flat_Ctx.pc while it is on top;
 //   - a host callee's (host set): a fixed or overlay function, a BIOS vector
 //     or an HLE stub. It returns when the loop gets control back with the
@@ -53,6 +53,7 @@ Flat_Kind :: enum u8 {
 	Tail, // goto_target's tail call: its return ends the caller's run too, but one to ret (goto_link; 0 once it made a call that never returns, flat_enter)
 	Jump, // jump's tail call at a run's first word, counted in tail_depth
 	Cont, // a continuation, x.host[slot]
+	Task, // a game task's first call (task_switch made the task): its return to its own entry calls it again, as task_run does; any other is fatal
 }
 
 // Where flat_enter looks for a callee: every table, as call does; all but
@@ -103,6 +104,10 @@ Flat_Ctx :: struct {
 	// has its own, as each has its own records.
 	frame_ret:  u32,
 	tail_depth: int,
+	// The records are a game task's that task_switch made: its first call
+	// is .Task, and they are at most TASK_DEPTH_MAX. The run's own, and
+	// those of the tasks suspended on it, are in task_switch's table.
+	task:    bool,
 	// Records, innermost last; len is the capacity, emu heap.
 	frames:  []Flat_Frame,
 }
@@ -191,6 +196,7 @@ when core.FLAT {
 		x.goto_owed = false
 		x.ended = false
 		x.frame_ret, x.tail_depth = 0, 0
+		x.task = false
 	}
 
 	// Let go of x's shadow stack.
@@ -433,6 +439,7 @@ when core.FLAT {
 	@(private = "file")
 	flat_grow :: proc(x: ^Flat_Ctx) {
 		n := max(2 * len(x.frames), FLAT_DEPTH_MIN)
+		if x.task && n > TASK_DEPTH_MAX {fatal("guest calls nested %d deep in a game task at %08x", TASK_DEPTH_MAX, x.pc)}
 		if n > FLAT_DEPTH_MAX {fatal("guest calls nested %d deep at %08x", FLAT_DEPTH_MAX, x.pc)}
 		frames, err := make([]Flat_Frame, n, flat_allocator())
 		if err != nil {fatal("flat: shadow stack of %d not allocated", n)}
@@ -510,22 +517,20 @@ when core.FLAT {
 	}
 
 	// A game's own task switch (task_switch): the host callee of the call
-	// record at came back with another task's $ra and $sp (no_returns n
-	// before it). The record pops, and the run goes on in that task as it
-	// would after an interpreted switch routine's `jr $ra` (a jump, or
-	// flat_unwind's return to a call still open). One made from native code
-	// cannot switch here: task_switch counts and warns.
+	// record at came back in another task (task_leaves; no_returns n before
+	// it). The record pops, the run's records become that task's, and it
+	// goes on at its $ra. One back at the calling run's own return address
+	// is a coroutine's yield (flat_settle). One made inside a guest call the
+	// host made cannot switch: task_switch counts and warns, and the run goes
+	// on at the $ra on the records it has.
 	@(private = "file")
 	flat_task_switch :: proc(x: ^Flat_Ctx, at, ret: u32, kind: Flat_Kind, n: u32) {
 		if kind != .Call || at != x.depth - 1 || no_returns != n {return}
-		ra := state.r[31]
-		if ra == ret || ra == x.frames[at].outer || state.r[29] == x.frames[at].sp {return}
-		if .Call in core.trace.active {
-			core.tracef(.Call, "task %08x sp=%x -> %08x sp=%x (FLAT)", ret, x.frames[at].sp, ra, state.r[29])
-		}
-		task_switches += 1
+		f := x.frames[at]
+		if state.r[31] == f.outer || !task_leaves(f.sp, ret) {return}
 		flat_pop(x, false)
-		x.pc = ra
+		task_switch(f.sp, ret)
+		x.pc = state.r[31]
 	}
 
 	// The interpreted callee of f, from entry, begins a LEARN run: not a mod
@@ -584,6 +589,11 @@ when core.FLAT {
 				tail_depth -= 1
 			case .Cont:
 				fatal("flat: a return into a continuation's record")
+			case .Task:
+				// x.pc, x.start and frame_ret are its entry again.
+				if state.r[31] != f.ret {fatal("game task started at %#08x returned (ra %#08x)", f.ret, state.r[31])}
+				x.enter = true
+				return
 			}
 		}
 	}
@@ -607,7 +617,7 @@ when core.FLAT {
 			if flat_stop || x.ended {return false}
 			if x.enter {
 				x.enter = false
-				flat_enter(x, x.pc, 0, .Base)
+				if x.task {flat_enter(x, x.pc, x.pc, .Task)} else {flat_enter(x, x.pc, 0, .Base)}
 				continue
 			}
 			if x.depth > 0 {

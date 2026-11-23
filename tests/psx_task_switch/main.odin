@@ -13,12 +13,14 @@
 // interpreted, then with only S native (interpreted callers: interp_call's
 // and, under FLAT, flat_enter's host return), then all native (the four
 // functions compiled apart, as jal targets are, and marked as a blob build
-// marks them). Under FLAT, A runs on a flat run of its own, and a switch
-// made in native code is not supported (task_switch warns): the all-native
-// cases are skipped there. A's loop ends on bgtz, so a broken switch fails,
-// not hangs. A third case has tasks E and F each wait one switch in one
-// routine W, so a switch from E to F returns at W's own link on F's $sp;
-// under FLAT it runs interpreted only. It runs again with A going round 100
+// marks them). Under FLAT, A runs on a flat run of its own, each task on
+// records of its own, and a switch made in native code is not supported
+// (task_switch warns): the all-native cases are skipped there. A's loop
+// ends on bgtz, so a broken switch fails, not hangs. A third case has tasks
+// E and F each wait one switch in one routine W, so a switch from E to F
+// returns at W's own link on F's $sp; under FLAT with S native, E's and F's
+// calls of W are open on records each task's own, and A's last `jr $ra`
+// must find its return in A's. It runs again with A going round 100
 // times, and must discard no task: a switch missed with only S native would
 // leave a task suspended each round and fill the table.
 // G calls P, a SetSp (as Driver 2's f_00090300): P moves $sp and returns to
@@ -268,15 +270,9 @@ main :: proc() {
 	cases :: proc(mode: string) -> (bad: int) {
 		for n in u32(2) ..= 3 {if !run(mode, n) {bad += 1}}
 		if !run(mode, 2, D) {bad += 1}
-		// Under FLAT the tasks share one run's call records: E's and F's
-		// calls of W stay open under the switches, and A's last `jr $ra`
-		// finds its return in none of them (flat_unwind) and jumps. Only the
-		// interpreted switch goes on right there.
-		if !core.FLAT || mode == "interp" {
-			if !run(mode, 3, E) {bad += 1}
-			// More rounds than the table has tasks (cpu MAX_TASKS 48).
-			if !run(mode, 3, E, 100) {bad += 1}
-		}
+		if !run(mode, 3, E) {bad += 1}
+		// More rounds than the table has tasks (cpu MAX_TASKS 48).
+		if !run(mode, 3, E, 100) {bad += 1}
 		if !set_sp(mode) {bad += 1}
 		return
 	}
