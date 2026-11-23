@@ -318,6 +318,9 @@ when core.FLAT {
 		return flat_cur != nil && flat_nest_depth == flat_nest_base && flat_native > 0
 	}
 
+	// Native code is running, at the run's own level or below a nested run.
+	flat_under_native :: proc() -> bool {return flat_native > 0}
+
 	// What flat_hold puts aside: the state of the running run that is not in
 	// its Flat_Ctx or its host frames.
 	Flat_Hold :: struct {

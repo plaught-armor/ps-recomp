@@ -315,11 +315,15 @@ when !core.FLAT {
 
 	// A run's own guest code can switch (flat_can_stop), and native code it
 	// called (task_go holds it). In a guest call the host made the host frames
-	// below would run on: that call goes on with the other task's registers,
-	// as before, counted and warned.
+	// below would run on. Native code's (a function the runs after left to the
+	// interpreter, called by native code) is fatal, naming that native code
+	// for the next run to leave to the interpreter too (flat_block). Other
+	// host code's goes on with the other task's registers, as before, counted
+	// and warned.
 	@(private = "file")
 	task_can_switch :: proc(sp, link: u32) -> bool {
 		if flat_can_stop() || flat_in_native() {return true}
+		if flat_under_native() {flat_block("a game task switch")}
 		task_switches += 1
 		if !task_warned {
 			fmt.eprintfln("cpu: game task switch from %#08x (sp %#08x) to %#08x (sp %#08x) in native code or a guest call the host made, under FLAT: not supported, goes on", link, sp, state.r[31], state.r[29])
