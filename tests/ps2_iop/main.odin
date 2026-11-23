@@ -5807,6 +5807,15 @@ test_cdvd_search_server :: proc() {
 	check(ncmd(1, rbuf[:], 0x18), "stream: a Read to compare against")
 	check(iop.sif.call_hold == iop.cd_read_ee(2), "stream: the Read holds its RPC_END for the drive's time")
 	iop.sif.call_hold = 0
+	// ReadIOPm (N-command 0x0d) reads the same sectors into IOP memory.
+	IOP_DEST :: 0x00100000
+	rw[0], rw[1], rw[2] = 23, 2, IOP_DEST
+	check(ncmd(0x0d, rbuf[:], 0x18) && rw[0] == 1, "ReadIOPm: answers 1")
+	check(iop.sif.call_hold == iop.cd_read_ee(2), "ReadIOPm: holds its RPC_END for the drive's time")
+	iop.sif.call_hold = 0
+	same_iop := true
+	for i in u32(0) ..< 2 * 2048 {same_iop &&= iop.iop_ram[IOP_DEST + i] == mem.ram_slice(READ_DEST + i, 1)[0]}
+	check(same_iop, "ReadIOPm: IOP memory holds the sectors the Read put in EE memory")
 	check(stream(ncmd, 5, 64, 8, 0x80000) == 1, "stream: init")
 	check(stream(ncmd, 2, 0, 1, ST_DEST) == 0, "stream: a read with no stream takes nothing")
 	check(stream(ncmd, 6, 0, 0, 0) == 0, "stream: no status with no stream")

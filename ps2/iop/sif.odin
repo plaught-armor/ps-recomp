@@ -1295,6 +1295,19 @@ cdvd_ncmd_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		cd_spin()
 		w[0] = 1
 	case 0x09: w[0] = cd_stream(w[3], w[0], w[1], w[2]) // Stream {lsn, sectors, buffer, cmd, mode[3]}
+	case 0x0d: // ReadIOPm {lsn, sectors, IOP buffer, mode[4]}: a Read into IOP memory
+		if buf[0xe] != 0 {
+			fmt.eprintfln("cdvd: IOP read with data pattern %d", buf[0xe])
+			return false
+		}
+		if cpu.debug >= 1 {fmt.eprintfln("cdvd: IOP read lsn %x sectors %d -> %x", w[0], w[1], w[2])}
+		sector: [DISC_SECTOR]u8
+		for k in 0 ..< min(w[1], IOP_RAM_SIZE / DISC_SECTOR) {
+			disc_sectors(w[0] + k, sector[:])
+			copy(iop_ram_at(w[2] + k * DISC_SECTOR, DISC_SECTOR), sector[:])
+		}
+		sif.call_hold = cd_read_ee(w[1])
+		w[0] = 1
 	case 0x0e: w[0] = 2 // DiskReady (non-blocking): 2 is ready, 6 not ready
 	case: return false
 	}
