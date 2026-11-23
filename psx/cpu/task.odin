@@ -28,9 +28,11 @@ import "ps:core"
 // code's, which stops the run inside the hold, where native code's would be
 // held above the held task's host frames. The native code is named for the
 // runs after to leave to the interpreter (flat_native_switched), as a held
-// task may never go on. One in a
-// guest call the host made cannot switch (task_switch counts and warns
-// once), as the host frames below it would run on.
+// task may never go on. One in a guest call native code made (the
+// interpreter's run nested in it) holds the run there too, the others on
+// the thread's own run. One in a guest call other host code made cannot
+// switch (task_switch counts and warns once), as the host frames below it
+// would run on.
 //
 // The registers are the guest's: the routine saved and loaded them in its
 // own memory, so a switch moves none.
@@ -313,17 +315,15 @@ when !core.FLAT {
 	flat_thread: proc() -> int
 	flat_others: proc(home: int)
 
-	// A run's own guest code can switch (flat_can_stop), and native code it
-	// called (task_go holds it). In a guest call the host made the host frames
-	// below would run on. Native code's (a function the runs after left to the
-	// interpreter, called by native code) is fatal, naming that native code
-	// for the next run to leave to the interpreter too (flat_block). Other
-	// host code's goes on with the other task's registers, as before, counted
-	// and warned.
+	// A run's own guest code can switch (flat_can_stop), and code under
+	// native code it called: task_go holds the run there, in the native code
+	// or in a guest call it made (a function the runs before left to the
+	// interpreter, which native code calls), host frames and all. In a guest
+	// call other host code made the host frames below would run on: it goes
+	// on with the other task's registers, as before, counted and warned.
 	@(private = "file")
 	task_can_switch :: proc(sp, link: u32) -> bool {
-		if flat_can_stop() || flat_in_native() {return true}
-		if flat_under_native() {flat_block("a game task switch")}
+		if flat_can_stop() || flat_under_native() {return true}
 		task_switches += 1
 		if !task_warned {
 			fmt.eprintfln("cpu: game task switch from %#08x (sp %#08x) to %#08x (sp %#08x) in native code or a guest call the host made, under FLAT: not supported, goes on", link, sp, state.r[31], state.r[29])
@@ -336,11 +336,12 @@ when !core.FLAT {
 	// mod's replacement chain) is the run's, not the task's: fatal.
 	@(private = "file")
 	task_suspend :: proc() -> Task_Run {
-		x := flat_cur
-		if x.hosts > 0 {
-			fatal("game task switch to %#08x with %d continuations open (a mod's replacement) under FLAT: not supported", state.r[31], x.hosts)
+		if flat_cur.hosts > 0 {
+			fatal("game task switch to %#08x with %d continuations open (a mod's replacement) under FLAT: not supported", state.r[31], flat_cur.hosts)
 		}
-		held := task_holds + 1 if flat_in_native() else 0
+		// The thread's run, under any nested run of a task held (task_go).
+		x := flat_own
+		held := task_holds + 1 if flat_under_native() else 0
 		return {x, x.frames, x.depth, x.start, frame_ret, tail_depth, x.task, mod_inner, held}
 	}
 
@@ -358,14 +359,15 @@ when !core.FLAT {
 	// held in native code (the one on top) is gone back to by stopping the run
 	// inside its hold. From native code, the run is held there and the other
 	// tasks run on it until one switches back to this one: then the native
-	// code goes on.
+	// code goes on. So from a guest call native code made: the nested run
+	// held as well, the others run on the thread's run (flat_own) under it.
 	@(private = "file")
 	task_go :: proc(to: Task_Run, found: bool, ra: u32) {
-		x := flat_cur
+		x := flat_own
 		if found && to.ctx != x {
 			fatal("game task switch to %#08x (sp %#08x): suspended on another BIOS thread's flat run", ra, state.r[29])
 		}
-		if !flat_in_native() {
+		if !flat_under_native() {
 			if found && to.held != 0 {
 				if to.held != task_holds {
 					fatal("game task switch to %#08x (sp %#08x): held in native code below another task's hold (FLAT)", ra, state.r[29])

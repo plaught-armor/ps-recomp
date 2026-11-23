@@ -27,6 +27,11 @@
 // G calls P, a SetSp (as Driver 2's f_00090300): P moves $sp and returns to
 // its link, loading $ra through a0. That is no task switch; G counts
 // CNT(3) once and puts $sp back.
+// H is A switching through W(1), not S itself. A mode with all native but W
+// has native code (H, E, F) make a guest call of W the interpreter runs,
+// nested in it, and S switch there: under FLAT that switch holds the run in
+// the native code below, as one native code makes itself does (Racing
+// Lagoon's blob calls its 0x8006c910 natively, left to the interpreter).
 // The R3000 code waits out each load's delay slot.
 package main
 
@@ -49,6 +54,7 @@ E :: u32(0x80020600)
 F :: u32(0x80020700)
 G :: u32(0x80020800)
 P :: u32(0x80020900)
+H :: u32(0x80020a00)
 DATA :: u32(0x80010000)
 CUR :: DATA // the running task's index
 NTASK :: DATA + 4
@@ -106,13 +112,15 @@ s_code :: proc() -> Code {
 	return c
 }
 
-a_code :: proc() -> Code {
-	c := Code{at = A}
-	// A(a0): a0 rounds.
+// A(a0): a0 rounds, each switching once: at A through S itself, at H
+// through W(1).
+a_code :: proc(at := A) -> Code {
+	c := Code{at = at}
 	emit(&c, addiu(SP, SP, 0xfff0), sw(RA, 0, SP), addu(S0, A0, ZERO), lui(S1, DATA >> 16))
 	loop := pc(c)
 	emit(&c, lw(T0, cnt(0) - DATA, S1), NOP, addiu(T0, T0, 1), sw(T0, cnt(0) - DATA, S1))
-	emit(&c, jal(S), NOP, addiu(S0, S0, 0xffff))
+	if at == H {emit(&c, addiu(A0, ZERO, 1))}
+	emit(&c, jal(at == H ? W : S), NOP, addiu(S0, S0, 0xffff))
 	emit(&c, bgtz(pc(c), S0, loop), NOP)
 	emit(&c, lw(RA, 0, SP), NOP, JR_RA, addiu(SP, SP, 16))
 	return c
@@ -191,12 +199,12 @@ fail :: proc(what: string) -> ! {
 	os.exit(1)
 }
 
-// The ten functions, each discovered apart, then marked as a blob build
+// The eleven functions, each discovered apart, then marked as a blob build
 // marks them (r3000.returns_elsewhere: A's, B's, C's, D's and W's jal S get
 // the call_back check, since S loads $ra through t1, and G's jal P, since
-// P loads it through a0), then lowered.
-compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [10]native.Blob_Func) {
-	fs: [10]^mips.Func
+// P loads it through a0; H's jal W does not), then lowered.
+compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [11]native.Blob_Func) {
+	fs: [11]^mips.Func
 	for c, k in codes {
 		fs[k] = mips.func_make(c.at, pc(c), c.at)
 		mips.discover(r3000.RULES, {base = c.at, data = ([^]u8)(raw_data(c.w))[:4 * len(c.w)], entry = c.at}, fs[k], nil)
@@ -224,9 +232,9 @@ call_guest :: proc(entry: u32) {
 }
 
 // One case of n tasks, task 1 starting at first (B, D, or E, with task 2
-// at F), A going round rounds times; true when it came out right and
-// discarded no task.
-run :: proc(mode: string, n: u32, first := B, rounds := ROUNDS) -> bool {
+// at F), the main task (A or H) going round rounds times; true when it came
+// out right and discarded no task.
+run :: proc(mode: string, n: u32, first := B, rounds := ROUNDS, main_task := A) -> bool {
 	for a := DATA; a < DATA + 0x5000; a += 4 {wr(a, 0)}
 	wr(NTASK, n)
 	wr(slot(1), first)
@@ -235,13 +243,13 @@ run :: proc(mode: string, n: u32, first := B, rounds := ROUNDS) -> bool {
 	wr(slot(2) + 4, STACK_C)
 	reaped := cpu.tasks_reaped
 	cpu.state.r[4] = rounds
-	call_guest(A)
+	call_guest(main_task)
 	got := [7]u32{rd(cnt(0)), rd(cnt(1)), rd(cnt(2)), rd(CUR), cpu.state.r[29], cpu.state.r[31], u32(cpu.tasks_reaped - reaped)}
 	want := [7]u32{rounds, rounds, n == 3 ? rounds : 0, 0, STACK_A, RET, 0}
 	// E and F start in A's first switch and count once in each later one.
 	if first == E {want[1], want[2] = rounds - 1, rounds - 1}
 	ok := got == want
-	fmt.printfln("%s %d tasks%s, %d rounds: cnt cur sp ra reaped %x, want %x %s", mode, n, first == D ? " (task 1 starts over)" : first == E ? " (both wait in one routine)" : "", rounds, got, want, ok ? "ok" : "FAIL")
+	fmt.printfln("%s %d tasks%s%s, %d rounds: cnt cur sp ra reaped %x, want %x %s", mode, n, first == D ? " (task 1 starts over)" : first == E ? " (both wait in one routine)" : "", main_task == H ? " (main switching in W)" : "", rounds, got, want, ok ? "ok" : "FAIL")
 	return ok
 }
 
@@ -262,14 +270,17 @@ main :: proc() {
 	cpu.register_funcs(nil)
 	when core.FLAT {cpu.interp_run = cpu.flat_nested} else {cpu.interp_run = cpu.interp_loop}
 	cpu.next_event = max(u64)
-	codes := [10]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code(), d_code(), w_code(), wait_task_code(E, 1, 1), wait_task_code(F, 2, 1), g_code(), p_code()}
-	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S && pc(codes[3]) <= D && pc(codes[4]) <= W && pc(codes[5]) <= E && pc(codes[6]) <= F && pc(codes[7]) <= G && pc(codes[8]) <= P)
+	codes := [11]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code(), d_code(), w_code(), wait_task_code(E, 1, 1), wait_task_code(F, 2, 1), g_code(), p_code(), a_code(H)}
+	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S && pc(codes[3]) <= D && pc(codes[4]) <= W && pc(codes[5]) <= E && pc(codes[6]) <= F && pc(codes[7]) <= G && pc(codes[8]) <= P && pc(codes[9]) <= H)
 	for c in codes {put(c)}
 	bad := 0
-	// Each mode: 2 and 3 tasks, then 2 with task 1 at D, then 3 at E and F,
-	// short and long, then the SetSp.
+	// Each mode: 2 and 3 tasks, with A and with H, then 2 with task 1 at D,
+	// then 3 at E and F, short and long, then the SetSp.
 	cases :: proc(mode: string) -> (bad: int) {
-		for n in u32(2) ..= 3 {if !run(mode, n) {bad += 1}}
+		for n in u32(2) ..= 3 {
+			if !run(mode, n) {bad += 1}
+			if !run(mode, n, main_task = H) {bad += 1}
+		}
 		if !run(mode, 2, D) {bad += 1}
 		if !run(mode, 3, E) {bad += 1}
 		// More rounds than the table has tasks (cpu MAX_TASKS 48).
@@ -285,12 +296,16 @@ main :: proc() {
 		blob := r3000.learned_blob({{S, S, s.w[:]}}, .Wasm32)
 		if !psx_native.load_learned_blob(blob, "learned") {fail("load the learned blob")}
 		bad += cases("S learned")
-		// Then the others learned too: S's callers switch in native code.
+		// Then all but W learned too: S's callers switch in native code, and
+		// in W's guest calls from native code (H, E, F).
 		all: [dynamic]r3000.Learned
 		for c, k in codes {
-			if k != 3 {append(&all, r3000.Learned{c.at, c.at, c.w[:]})}
+			if k != 3 && k != 5 {append(&all, r3000.Learned{c.at, c.at, c.w[:]})}
 		}
 		if !psx_native.load_learned_blob(r3000.learned_blob(all[:], .Wasm32), "learned") {fail("load the second learned blob")}
+		bad += cases("all but W learned")
+		w := codes[5]
+		if !psx_native.load_learned_blob(r3000.learned_blob({{W, W, w.w[:]}}, .Wasm32), "learned") {fail("load the third learned blob")}
 		bad += cases("learned")
 		if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
 		fmt.println("ok")
@@ -300,11 +315,16 @@ main :: proc() {
 	funcs := compile(&na, codes[:])
 	code, err := core.native_load(native.make_blob(&na, funcs[:], {}), psx_native.imports())
 	if err != "" {fail(fmt.tprint("native_load:", err))}
-	fns: [10]cpu.Func_Entry
+	fns: [11]cpu.Func_Entry
 	for e, k in funcs {fns[k] = {e.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(code.funcs[k].off))}}
 	// S and P native: interp_call's host returns.
 	cpu.register_funcs({fns[3], fns[9]})
 	bad += cases("S native")
+	// All but W native: native code's guest calls of W switch in S.
+	but_w: [dynamic]cpu.Func_Entry
+	for e, k in fns {if k != 5 {append(&but_w, e)}}
+	cpu.register_funcs(but_w[:])
+	bad += cases("all but W native")
 	cpu.register_funcs(fns[:])
 	bad += cases("native")
 	if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}

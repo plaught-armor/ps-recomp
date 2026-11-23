@@ -118,6 +118,9 @@ when core.FLAT {
 	flat_stop: bool
 	// The run the loop is on, nil outside one.
 	flat_cur: ^Flat_Ctx
+	// The run flat_run is on, the one under the nested runs open (flat_cur
+	// in none): a BIOS thread's, whose records a game task switch swaps.
+	flat_own: ^Flat_Ctx
 	// Steps the continuation h on top of x (the owner's: the IOP's, the PS1's mod_flat_step).
 	flat_step: proc(x: ^Flat_Ctx, h: ^Flat_Host)
 	// Calls returned by `jr`, those whose target was not the call's return
@@ -220,13 +223,16 @@ when core.FLAT {
 	flat_run :: proc(x: ^Flat_Ctx) -> bool {
 		if flat_cur != nil {fatal("a flat run started inside another")}
 		flat_cur = x
+		// A run inside a hold (task_go) puts the held one's back at its end.
+		outer_own := flat_own
+		flat_own = x
 		outer_ret, outer_tail := frame_ret, tail_depth
 		frame_ret, tail_depth = x.frame_ret, x.tail_depth
 		flat_learning = core.learn_on(learn_cpu)
 		if flat_learning {flat_loop(x, true)} else {flat_loop(x, false)}
 		x.frame_ret, x.tail_depth = frame_ret, tail_depth
 		frame_ret, tail_depth = outer_ret, outer_tail
-		flat_cur = nil
+		flat_cur, flat_own = nil, outer_own
 		flat_stop = false
 		flat_stop_owed = false
 		flat_late_owed = false
@@ -312,13 +318,8 @@ when core.FLAT {
 		return flat_cur != nil && flat_nest_depth == flat_nest_base && flat_native == 0
 	}
 
-	// The running run is in native code at its own level: no nested run
-	// open, so flat_hold can hold it there (task_go).
-	flat_in_native :: proc() -> bool {
-		return flat_cur != nil && flat_nest_depth == flat_nest_base && flat_native > 0
-	}
-
-	// Native code is running, at the run's own level or below a nested run.
+	// Native code is running, at the run's own level or below a nested run:
+	// flat_hold can hold the run there (task_go).
 	flat_under_native :: proc() -> bool {return flat_native > 0}
 
 	// What flat_hold puts aside: the state of the running run that is not in
