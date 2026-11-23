@@ -99,7 +99,7 @@ interp_unwinds, interp_jumps: u64
 // Say the `jr $ra` counts (at quit, in both builds; under FLAT from flat_print).
 interp_print :: proc() {
 	who := learn_cpu == .Iop ? "iop" : "psx"
-	fmt.eprintfln("%s jr $ra: %d unwinds to an outer call, %d jumps; %d native returns past the caller", who, interp_unwinds, interp_jumps, call_backs)
+	fmt.eprintfln("%s jr $ra: %d unwinds to an outer call, %d jumps; %d native returns past the caller; %d game task switches, %d tasks discarded", who, interp_unwinds, interp_jumps, call_backs, task_switches, tasks_reaped)
 }
 
 interp_loop :: proc(start: u32) {
@@ -207,7 +207,7 @@ interp_call :: proc(st: ^Interp, ret, t: u32, tail := false) -> bool {
 		tail   = tail,
 		prev   = interp_top,
 	}
-	mine := frame_ret
+	mine, nr := frame_ret, no_returns
 	interp_top = &fr
 	interp_next = t
 	call(t)
@@ -226,6 +226,9 @@ interp_call :: proc(st: ^Interp, ret, t: u32, tail := false) -> bool {
 			st.done = true
 			return true
 		}
+		// Back with another task's $ra and $sp: a game's task switch
+		// (cpu.call_back); this run goes on at ret once switched back to.
+		if host && !tail && state.r[31] != ret && state.r[29] != fr.sp && no_returns == nr {task_switch(fr.sp, ret)}
 		return false
 	}
 	if interp_unwind == &fr {

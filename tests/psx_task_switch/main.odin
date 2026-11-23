@@ -1,0 +1,198 @@
+// A game's own cooperative task switch (psx/cpu task_switch): its routine S
+// saves $ra, $sp and $s0-$s7 of the running task in that task's slot, loads
+// the next task's from its slot, and ends with `jr $ra`, so it "returns" into
+// another task. Racing Lagoon's 0x8006cf24 does this. Native code must go on
+// in the task S switched to, as the interpreter does; before task_switch, a
+// native call of S came back to its own caller with the other task's $ra and
+// $sp, and ran on there.
+//
+// A is the main task: it counts CNT(0) up three times and calls S after each.
+// B and C count CNT(1) and CNT(2) in s0 and call S forever; S switches round
+// robin over NTASK tasks. Right, for 2 and 3 tasks: every count 3, CUR 0, and
+// A returns to its caller with sp and $ra as it was called. Each case runs
+// interpreted, then with only S native (interpreted callers: interp_call's
+// and, under FLAT, flat_enter's host return), then all native (the four
+// functions compiled apart, as jal targets are, and marked as a blob build
+// marks them). Under FLAT, A runs on a flat run of its own, and a switch
+// made in native code is not supported (task_switch warns): the all-native
+// cases are skipped there. A's loop ends on bgtz, so a broken switch fails,
+// not hangs.
+// The R3000 code waits out each load's delay slot.
+package main
+
+import "core:fmt"
+import "core:os"
+import "ps:core"
+import cpu "ps:psx/cpu"
+import psx_native "ps:psx/native"
+import "ps:recomp/mips"
+import "ps:recomp/native"
+import "ps:recomp/r3000"
+
+A :: u32(0x80020000)
+B :: u32(0x80020100)
+C :: u32(0x80020200)
+S :: u32(0x80020300)
+DATA :: u32(0x80010000)
+CUR :: DATA // the running task's index
+NTASK :: DATA + 4
+STACK_A :: DATA + 0x2000
+STACK_B :: DATA + 0x3000
+STACK_C :: DATA + 0x4000
+RET :: u32(0x80000080) // the caller's return address of the call of A
+
+cnt :: proc(i: u32) -> u32 {return DATA + 0x10 + 4 * i}
+slot :: proc(i: u32) -> u32 {return DATA + 0x100 + 0x40 * i} // +0 ra, +4 sp, +8 s0..s7
+
+ZERO, T0, T1, T2, T7, S0, S1, SP, RA :: u32(0), u32(8), u32(9), u32(10), u32(15), u32(16), u32(17), u32(29), u32(31)
+NOP :: u32(0)
+JR_RA :: u32(0x03e00008)
+
+lui :: proc(rt, imm: u32) -> u32 {return 0x0f << 26 | rt << 16 | imm & 0xffff}
+lw :: proc(rt, off, base: u32) -> u32 {return 0x23 << 26 | base << 21 | rt << 16 | off & 0xffff}
+sw :: proc(rt, off, base: u32) -> u32 {return 0x2b << 26 | base << 21 | rt << 16 | off & 0xffff}
+addiu :: proc(rt, rs, imm: u32) -> u32 {return 0x09 << 26 | rs << 21 | rt << 16 | imm & 0xffff}
+sll :: proc(rd, rt, sa: u32) -> u32 {return rt << 16 | rd << 11 | sa << 6}
+addu :: proc(rd, rs, rt: u32) -> u32 {return rs << 21 | rt << 16 | rd << 11 | 0x21}
+jal :: proc(t: u32) -> u32 {return 0x03 << 26 | t >> 2 & 0x03ffffff}
+j :: proc(t: u32) -> u32 {return 0x02 << 26 | t >> 2 & 0x03ffffff}
+bne :: proc(pc, rs, rt, t: u32) -> u32 {return 0x05 << 26 | rs << 21 | rt << 16 | (t - pc - 4) >> 2 & 0xffff}
+bgtz :: proc(pc, rs, t: u32) -> u32 {return 0x07 << 26 | rs << 21 | (t - pc - 4) >> 2 & 0xffff}
+
+Code :: struct {
+	at: u32,
+	w:  [dynamic]u32,
+}
+
+pc :: proc(c: Code) -> u32 {return c.at + 4 * u32(len(c.w))}
+emit :: proc(c: ^Code, words: ..u32) {append(&c.w, ..words)}
+
+// t1 = SLOT(t0)
+emit_slot :: proc(c: ^Code) {emit(c, sll(T1, T0, 6), addu(T1, T1, T7), addiu(T1, T1, 0x100))}
+
+s_code :: proc() -> Code {
+	c := Code{at = S}
+	emit(&c, lui(T7, DATA >> 16), lw(T0, 0, T7), NOP)
+	emit_slot(&c)
+	emit(&c, sw(RA, 0, T1), sw(SP, 4, T1))
+	for k in u32(0) ..< 8 {emit(&c, sw(S0 + k, 8 + 4 * k, T1))}
+	emit(&c, addiu(T0, T0, 1), lw(T2, NTASK - DATA, T7), NOP)
+	at := pc(c)
+	emit(&c, bne(at, T0, T2, at + 12), NOP, addu(T0, ZERO, ZERO))
+	emit(&c, sw(T0, 0, T7))
+	emit_slot(&c)
+	// The lw $ra through t1, not $sp, is what makes S return elsewhere.
+	emit(&c, lw(RA, 0, T1), lw(SP, 4, T1))
+	for k in u32(0) ..< 8 {emit(&c, lw(S0 + k, 8 + 4 * k, T1))}
+	emit(&c, NOP, JR_RA, NOP)
+	return c
+}
+
+a_code :: proc() -> Code {
+	c := Code{at = A}
+	emit(&c, addiu(SP, SP, 0xfff0), sw(RA, 0, SP), addiu(S0, ZERO, 3), lui(S1, DATA >> 16))
+	loop := pc(c)
+	emit(&c, lw(T0, cnt(0) - DATA, S1), NOP, addiu(T0, T0, 1), sw(T0, cnt(0) - DATA, S1))
+	emit(&c, jal(S), NOP, addiu(S0, S0, 0xffff))
+	emit(&c, bgtz(pc(c), S0, loop), NOP)
+	emit(&c, lw(RA, 0, SP), NOP, JR_RA, addiu(SP, SP, 16))
+	return c
+}
+
+// A side task at at counting CNT(i) in s0, forever.
+task_code :: proc(at, i: u32) -> Code {
+	c := Code{at = at}
+	emit(&c, addiu(SP, SP, 0xfff8), addu(S0, ZERO, ZERO), lui(S1, DATA >> 16))
+	loop := pc(c)
+	emit(&c, addiu(S0, S0, 1), sw(S0, cnt(i) - DATA, S1), jal(S), NOP, j(loop), NOP)
+	return c
+}
+
+put :: proc(c: Code) {
+	for w, k in c.w {(^u32le)(&cpu.ram[(c.at & 0x1fffff) + u32(k) * 4])^ = u32le(w)}
+}
+
+rd :: proc(at: u32) -> u32 {return u32((^u32le)(&cpu.ram[at & 0x1fffff])^)}
+wr :: proc(at, v: u32) {(^u32le)(&cpu.ram[at & 0x1fffff])^ = u32le(v)}
+
+fail :: proc(what: string) -> ! {
+	fmt.eprintln("FAIL psx_task_switch:", what)
+	os.exit(1)
+}
+
+// The four functions, each discovered apart, then marked as a blob build
+// marks them (r3000.returns_elsewhere: A's, B's and C's jal S get the
+// call_back check, since S loads $ra through t1), then lowered.
+compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [4]native.Blob_Func) {
+	fs: [4]^mips.Func
+	for c, k in codes {
+		fs[k] = mips.func_make(c.at, pc(c), c.at)
+		mips.discover(r3000.RULES, {base = c.at, data = ([^]u8)(raw_data(c.w))[:4 * len(c.w)], entry = c.at}, fs[k], nil)
+	}
+	if r3000.returns_elsewhere({fs[:]}) != 3 {fail("the jal S of A, B and C are not marked as returning elsewhere")}
+	for f, k in fs {
+		out[k] = {f.entry, r3000.native_func(na, f, nil, 1)}
+		mips.func_free(f)
+	}
+	free_all(context.temp_allocator)
+	return
+}
+
+// One case of n tasks; true when it came out right.
+run :: proc(mode: string, n: u32) -> bool {
+	for a := DATA; a < DATA + 0x5000; a += 4 {wr(a, 0)}
+	wr(NTASK, n)
+	wr(slot(1), B)
+	wr(slot(1) + 4, STACK_B)
+	wr(slot(2), C)
+	wr(slot(2) + 4, STACK_C)
+	cpu.state.r[29], cpu.state.r[31] = STACK_A, RET
+	when core.FLAT {
+		@(static) x: cpu.Flat_Ctx
+		cpu.flat_start(&x, A)
+		if !cpu.flat_run(&x) {fail("A's flat run stopped")}
+	} else {
+		cpu.call(A)
+	}
+	got := [6]u32{rd(cnt(0)), rd(cnt(1)), rd(cnt(2)), rd(CUR), cpu.state.r[29], cpu.state.r[31]}
+	want := [6]u32{3, 3, n == 3 ? 3 : 0, 0, STACK_A, RET}
+	ok := got == want
+	fmt.printfln("%s %d tasks: cnt cur sp ra %x, want %x %s", mode, n, got, want, ok ? "ok" : "FAIL")
+	return ok
+}
+
+main :: proc() {
+	cpu.register_funcs(nil)
+	when core.FLAT {cpu.interp_run = cpu.flat_nested} else {cpu.interp_run = cpu.interp_loop}
+	cpu.next_event = max(u64)
+	codes := [4]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code()}
+	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S)
+	for c in codes {put(c)}
+	bad := 0
+	for n in u32(2) ..= 3 {if !run("interp", n) {bad += 1}}
+	when ODIN_ARCH == .wasm32 {
+		// wasm32 has no PS1 blob of fixed functions: S is learned code, as
+		// the play page runs native PS1 code (load_learned_blob).
+		s := codes[3]
+		blob := r3000.learned_blob({{S, S, s.w[:]}}, .Wasm32)
+		if !psx_native.load_learned_blob(blob, "learned") {fail("load the learned blob")}
+		for n in u32(2) ..= 3 {if !run("S learned", n) {bad += 1}}
+		if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
+		fmt.println("ok")
+		return
+	}
+	na := native.make_asm(native.Arch(core.NATIVE_ARCH), r3000.native_ram(), r3000.NATIVE_CACHED[:])
+	funcs := compile(&na, codes[:])
+	code, err := core.native_load(native.make_blob(&na, funcs[:], {}), psx_native.imports())
+	if err != "" {fail(fmt.tprint("native_load:", err))}
+	fns: [4]cpu.Func_Entry
+	for e, k in funcs {fns[k] = {e.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(code.funcs[k].off))}}
+	cpu.register_funcs(fns[3:])
+	for n in u32(2) ..= 3 {if !run("S native", n) {bad += 1}}
+	when !core.FLAT {
+		cpu.register_funcs(fns[:])
+		for n in u32(2) ..= 3 {if !run("native", n) {bad += 1}}
+	}
+	if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
+	fmt.println("ok")
+}

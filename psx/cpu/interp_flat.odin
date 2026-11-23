@@ -463,6 +463,7 @@ when core.FLAT {
 				// link to go on at (goto_target). fn may have grown the
 				// stack, or restarted the run: f is not used again.
 				if kind == .Tail && ret != 0 && no_returns != n && at < x.depth {x.frames[at].ret = 0}
+				flat_task_switch(x, at, ret, kind, n)
 				return
 			}
 		}
@@ -481,17 +482,23 @@ when core.FLAT {
 			}
 			if e.slot == e.addr {code_promote(e)}
 			f.host = true
+			at, n := x.depth - 1, no_returns
 			flat_native_in(addr)
 			e.fn()
 			flat_native -= 1
+			flat_task_switch(x, at, ret, kind, n)
 			return
 		}
 		if learned_loaded {
 			f.host = true
+			at, n := x.depth - 1, no_returns
 			flat_native_in(addr)
 			ok := run_learned(addr)
 			flat_native -= 1
-			if ok {return}
+			if ok {
+				flat_task_switch(x, at, ret, kind, n)
+				return
+			}
 			f.host = false
 		}
 		report_once(addr, "interpreting")
@@ -500,6 +507,25 @@ when core.FLAT {
 		x.pc, x.start = addr, addr
 		flat_learn_begin(f, addr)
 		events_due()
+	}
+
+	// A game's own task switch (task_switch): the host callee of the call
+	// record at came back with another task's $ra and $sp (no_returns n
+	// before it). The record pops, and the run goes on in that task as it
+	// would after an interpreted switch routine's `jr $ra` (a jump, or
+	// flat_unwind's return to a call still open). One made from native code
+	// cannot switch here: task_switch counts and warns.
+	@(private = "file")
+	flat_task_switch :: proc(x: ^Flat_Ctx, at, ret: u32, kind: Flat_Kind, n: u32) {
+		if kind != .Call || at != x.depth - 1 || no_returns != n {return}
+		ra := state.r[31]
+		if ra == ret || ra == x.frames[at].outer || state.r[29] == x.frames[at].sp {return}
+		if .Call in core.trace.active {
+			core.tracef(.Call, "task %08x sp=%x -> %08x sp=%x (FLAT)", ret, x.frames[at].sp, ra, state.r[29])
+		}
+		task_switches += 1
+		flat_pop(x, false)
+		x.pc = ra
 	}
 
 	// The interpreted callee of f, from entry, begins a LEARN run: not a mod
