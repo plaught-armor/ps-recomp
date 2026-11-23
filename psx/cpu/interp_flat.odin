@@ -169,12 +169,14 @@ when core.FLAT {
 	flat_nest_base: int
 	// Runs held, and those of them gone on (flat_resume).
 	flat_holds, flat_resumes: u64
-	// Called with the entries flat_block's fatal names (those not 0,
-	// outermost first) just before it, nil none: play keeps them for the
-	// runs after to leave to the interpreter (core.known_switches). Each
-	// fatal names at least the outermost native function; one it reached
-	// through native code alone is named once that one is interpreted.
-	flat_native_fatal: proc(entries: []u32)
+	// Called with the native entries running (those not 0, outermost
+	// first; flat_native_named) when a switch was made under them: just
+	// before flat_block's fatal, and when a game task's switch holds the run
+	// (task_go). Nil none. Play keeps them for the runs after to leave to the
+	// interpreter (core.known_switches). Each names at least the outermost
+	// native function; one it reached through native code alone is named
+	// once that one is interpreted.
+	flat_native_switched: proc(entries: []u32)
 	@(private = "file")
 	flat_dummy: Interp
 	// Set while call runs a callee for host code, so a mod thunk it reaches
@@ -276,15 +278,22 @@ when core.FLAT {
 		// interpreter, where there is no nesting.
 		if flat_native > 0 {
 			b := strings.builder_make(context.temp_allocator)
-			named := flat_native_at[:min(flat_native, FLAT_NAMED)]
+			named := flat_native_named()
 			for e, k in named {
 				fmt.sbprintf(&b, "%s%08x", " > " if k > 0 else "", e)
 			}
-			if flat_native_fatal != nil {flat_native_fatal(named)}
 			fatal("%s inside native code (FLAT), entered at %s, ra %08x", what, strings.to_string(b), state.r[31])
 		}
 		if flat_nest_depth > flat_nest_base {fatal("%s inside a guest call made by host code (FLAT runs those nested)", what)}
 		flat_stop = true
+	}
+
+	// The native entries running now, outermost first, given to
+	// flat_native_switched: a switch was made under them.
+	flat_native_named :: proc() -> []u32 {
+		named := flat_native_at[:min(flat_native, FLAT_NAMED)]
+		if flat_native_switched != nil {flat_native_switched(named)}
+		return named
 	}
 
 	@(private = "file")

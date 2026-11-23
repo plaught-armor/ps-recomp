@@ -26,7 +26,9 @@ import "ps:core"
 // until one switches back; it then goes on in the native code. Meanwhile
 // the others run interpreted (task_holding): their switch back is guest
 // code's, which stops the run inside the hold, where native code's would be
-// held above the held task's host frames. One in a
+// held above the held task's host frames. The native code is named for the
+// runs after to leave to the interpreter (flat_native_switched), as a held
+// task may never go on. One in a
 // guest call the host made cannot switch (task_switch counts and warns
 // once), as the host frames below it would run on.
 //
@@ -373,6 +375,10 @@ when !core.FLAT {
 		}
 		// Its host frames are below this native code's.
 		if found && to.held != 0 {flat_block("a game task switch back to a task held in native code")}
+		// A task held may never go on (Racing Lagoon makes its slot's task
+		// over), and all code runs interpreted while one is: the runs after
+		// leave this native code to the interpreter, which switches unheld.
+		flat_native_named()
 		saved, inner := x^, mod_inner
 		h: Flat_Hold
 		if !flat_hold(&h) {

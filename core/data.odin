@@ -15,8 +15,8 @@
 //     thumb.ppm            the picture a run last showed (thumb.odin)
 //     play.log             what the last run the launcher started printed
 //     press.txt            a PRESS script for compatibility runs
-//     switches.<arch>.txt  native entries a thread switch was fatal under
-//                          (wasm32, known_switches)
+//     switches.<arch>.txt  native entries a thread switch was fatal under,
+//                          or a game task's held (wasm32, known_switches)
 //
 // <data> is the DATA setting, else SDL's per-user directory for ps-recomp
 // (~/.local/share/ps-recomp, ~/Library/Application Support/ps-recomp,
@@ -237,9 +237,10 @@ make_dir :: proc(path: string) -> bool {
 	return false
 }
 
-// The native entries a thread switch was fatal under (a wasm32 PS1 run,
-// psx/cpu flat_block), which play leaves to the interpreter on the runs
-// after: one hex address a line in the disc directory's Switches file.
+// The native entries a thread switch was fatal under, or a game task's
+// switch held (a wasm32 PS1 run, psx/cpu flat_native_named), which play
+// leaves to the interpreter on the runs after: one hex address a line in
+// the disc directory's Switches file.
 // Temp allocated; none when the file is missing. A line that is no address
 // is skipped.
 known_switches :: proc(dir: string) -> []u32 {

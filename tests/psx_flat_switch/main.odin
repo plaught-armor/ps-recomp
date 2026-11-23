@@ -590,7 +590,7 @@ done :: proc() {
 
 // A ChangeTh in guest code that native code called is fatal under FLAT, the
 // nested run and the native frame both being in the host's. The fatal must
-// first name that native code (flat_native_fatal), or every later run dies
+// first name that native code (flat_native_switched), or every later run dies
 // the same way (MGS1's 0x800150c4, above the nested 0x8001fc3c). The hook
 // runs just before the fatal, so it ends the test.
 when core.FLAT {
@@ -605,7 +605,7 @@ when core.FLAT {
 		for w, k in task {cpu.w32(TASK + 4 * u32(k), w)}
 		cpu.register_funcs({{NATIVE, proc() {cpu.call(TASK)}}})
 		cpu.bios_b = proc(_: u32) {cpu.flat_block("a test's ChangeTh")}
-		cpu.flat_native_fatal = proc(entries: []u32) {
+		cpu.flat_native_switched = proc(entries: []u32) {
 			if len(entries) != 1 || entries[0] != NATIVE {
 				fmt.eprintfln("FAIL psx_flat_switch: a switch under native code names %x, want %x", entries, u32(NATIVE))
 				os.exit(1)
@@ -683,7 +683,7 @@ LEARNED :: "learned"
 @(private = "file")
 child_script :: proc(name: string) {
 	when core.FLAT {
-		cpu.flat_native_fatal = proc(_: []u32) {
+		cpu.flat_native_switched = proc(_: []u32) {
 			fmt.println(LEARNED)
 			os.flush(os.stdout)
 		}

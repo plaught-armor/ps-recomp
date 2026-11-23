@@ -124,7 +124,8 @@ native_key: string
 @(private = "file")
 switches_dir: string
 
-// A wasm32 build's PS1 thread switch was fatal under native code
+// A wasm32 build's PS1 thread switch was fatal under native code, or a game
+// task's switch held it
 // (psx.Boot.native_switched): its native entries are kept, for the runs
 // after to leave to the interpreter (core.known_switches).
 @(private = "file")

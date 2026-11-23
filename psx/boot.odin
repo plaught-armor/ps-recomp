@@ -37,7 +37,8 @@ Boot :: struct {
 	native_failed: proc(),
 	// The blob's functions to leave to the interpreter (load_native's
 	// skip), and what a wasm32 build calls with the native entries a
-	// thread switch is fatal under (cpu.flat_native_fatal); play keeps
+	// thread switch is fatal under, or a game task's switch holds
+	// (cpu.flat_native_switched); play keeps
 	// those (core.known_switches) and passes them here on the runs after.
 	native_skip:     []u32,
 	native_switched: proc(entries: []u32),
@@ -140,7 +141,7 @@ run :: proc(b: Boot) -> bool {
 	// above refuses what they load), so it refers to no map_code.
 	standalone := len(b.funcs) == 0
 	when LOADERS {
-		when core.FLAT {cpu.flat_native_fatal = b.native_switched}
+		when core.FLAT {cpu.flat_native_switched = b.native_switched}
 		if b.native != "" && !load_native(b.native, standalone, b.native_skip) && standalone {
 			if b.native_failed != nil {b.native_failed()}
 			return false
