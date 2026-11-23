@@ -226,9 +226,9 @@ interp_call :: proc(st: ^Interp, ret, t: u32, tail := false) -> bool {
 			st.done = true
 			return true
 		}
-		// Back on another task's $sp, at ret or not: a game's task switch
-		// (cpu.call_back); this run goes on at ret once switched back to.
-		if host && !tail && state.r[29] != fr.sp && no_returns == nr {task_switch(fr.sp, ret)}
+		// Back on another $sp: maybe a game's task switch (task_returned,
+		// as cpu.call_back); this run goes on at ret once switched back to.
+		if host && !tail && no_returns == nr {task_returned(fr.sp, ret)}
 		return false
 	}
 	if interp_unwind == &fr {

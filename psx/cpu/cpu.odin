@@ -222,12 +222,9 @@ call :: proc(addr: u32) {
 // address of the function making the call (its frame_ret), not to the
 // call's own (the $ra the jal left): that function returns too, as the
 // interpreter's `jr $ra` unwinds to the outer call. Else 0: it goes on.
-// One that came back on another $sp entered another task (a game's own task
-// switch): this task waits in task_switch until it is switched back to, and
-// then goes on. Its $ra may be the call's own link: tasks waiting in the
-// same routine go on at the same return address (Racing Lagoon 0x8006c988,
-// after the switch call in its wait-frames loop), and only $sp tells them
-// apart. Not one that made a host call that
+// One that came back on another $sp may have entered another task (a game's
+// own task switch, task_returned): this task waits in task_switch until it
+// is switched back to, and then goes on. Not one that made a host call that
 // never returns on the console (no_returns): its registers are another
 // context's for that reason.
 call_back :: proc(addr: u32) -> u32 {
@@ -238,7 +235,7 @@ call_back :: proc(addr: u32) -> u32 {
 		call_backs += 1
 		return 1
 	}
-	if state.r[29] != sp && no_returns == nr {task_switch(sp, link)}
+	if no_returns == nr {task_returned(sp, link)}
 	return 0
 }
 

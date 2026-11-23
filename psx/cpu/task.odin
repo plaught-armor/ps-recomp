@@ -9,9 +9,8 @@ import "ps:core"
 // ends with `jr $ra` (Racing Lagoon 0x8006cf24). On the console that jr
 // enters the other task; a native call to the routine returns to its caller
 // on the host with the other task's registers. call_back and interp_call
-// see that (the host callee came back with an $ra that is neither the
-// call's link nor the caller's return, on another $sp) and switch host
-// coroutines instead, as the BIOS ChangeTh HLE does for BIOS threads. A task
+// see that (task_returned: the host callee came back on another $sp) and
+// switch host coroutines instead, as the BIOS ChangeTh HLE does for BIOS threads. A task
 // is known only by where it goes on: the $sp and $ra the routine loaded,
 // which are the $sp and link of the call into the routine the task made
 // when it switched away. One that matches no suspended task starts a new
@@ -44,7 +43,39 @@ task_switches, tasks_reaped, tasks_lost: u64
 
 LOST_RING :: 64
 
+// The host callee of a call with $sp sp and link came back (call_back,
+// interp_call). On another $sp, it entered another task (task_switch) when
+// its $ra is not the link, or is and a task suspended there goes on at that
+// $sp and $ra: tasks waiting in one routine go on at one return address
+// (Racing Lagoon 0x8006c988, after the switch call in its wait-frames loop),
+// and only $sp tells them apart. Back at the link with no such task, the
+// callee moved the stack and returned (a SetSp, as Driver 2's f_00090300
+// is): the call goes on.
+task_returned :: #force_inline proc(sp, link: u32) {
+	to_sp, to_ra := state.r[29], state.r[31]
+	if to_sp == sp {return}
+	if to_ra == link && !task_waits(to_sp, to_ra) {return}
+	task_switch(sp, link)
+}
+
 when !core.FLAT {
+	// Whether a suspended task goes on at sp and ra. One discarded there
+	// (a SetSp cannot be told from it) counts in tasks_lost.
+	@(private = "file")
+	task_waits :: proc(sp, ra: u32) -> bool {
+		for t in tasks {
+			if t.co != nil && t.sp == sp && t.ra == ra {return true}
+		}
+		for &l in lost {
+			if l == {sp, ra} {
+				tasks_lost += 1
+				l = {}
+				break
+			}
+		}
+		return false
+	}
+
 	@(private = "file")
 	Guest_Task :: struct {
 		// Where it goes on: the $sp and link of its call into the switch.
@@ -185,6 +216,10 @@ when !core.FLAT {
 } else {
 	@(private = "file")
 	task_warned: bool
+
+	// FLAT keeps no suspended tasks.
+	@(private = "file")
+	task_waits :: proc(sp, ra: u32) -> bool {return false}
 
 	// FLAT has no host coroutines to hold a task's native frames on, so the
 	// call goes on at its link with the other task's registers, as before:
