@@ -305,6 +305,12 @@ when !core.FLAT {
 	@(private = "file")
 	task_back: bool
 
+	// The BIOS's: the running thread's slot, and, when the run inside a hold
+	// stopped for a thread switch instead, what runs the other threads until
+	// that one's turn again (bios.flat_others). Nil, none: the stop is fatal.
+	flat_thread: proc() -> int
+	flat_others: proc(home: int)
+
 	// A run's own guest code can switch (flat_can_stop), and native code it
 	// called (task_go holds it). In a guest call the host made the host frames
 	// below would run on: that call goes on with the other task's registers,
@@ -375,9 +381,15 @@ when !core.FLAT {
 		task_holds += 1
 		x.frame_ret, x.tail_depth, mod_inner = task_load(x, to, found, ra)
 		x.pc, x.goto_owed = ra, false
-		if flat_run(x) {fatal("a game task's run ended inside a task held in native code (FLAT)")}
-		if !task_back {
-			fatal("a run stopped inside a game task held in native code (FLAT): a BIOS thread switch cannot wait there (ra %#08x)", state.r[31])
+		home := flat_thread() if flat_thread != nil else 0
+		for {
+			if flat_run(x) {fatal("a game task's run ended inside a task held in native code (FLAT)")}
+			if task_back {break}
+			// A BIOS thread switch: the other threads run, then this one's goes on.
+			if flat_others == nil {
+				fatal("a run stopped inside a game task held in native code (FLAT), with no BIOS to switch threads (ra %#08x)", state.r[31])
+			}
+			flat_others(home)
 		}
 		task_back = false
 		task_holds -= 1

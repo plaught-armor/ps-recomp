@@ -24,6 +24,8 @@ hooks_init :: proc "contextless" () {
 	when core.FLAT {
 		cpu.interp_run = cpu.flat_nested
 		cpu.flat_step = bios.flat_step
+		cpu.flat_thread = bios.flat_thread
+		cpu.flat_others = bios.flat_others
 	} else {
 		cpu.interp_run = cpu.interp_loop
 	}

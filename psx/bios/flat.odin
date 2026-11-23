@@ -136,24 +136,8 @@ when core.FLAT {
 	@(private)
 	flat_switch_held :: proc(h: ^cpu.Flat_Hold, j: int) {
 		home := cur_thread
-		flat.held[home] = true
-		// The replacements running are the held thread's, as in switch_to.
-		inner := cpu.mod_inner
-		cpu.mod_inner = nil
 		flat.preempt_owed = false
-		switch_to(j)
-		ended := false
-		// The scheduler's loop, as flat_main's: it lasts as long as the others run.
-		for !ended && !flat.held[cur_thread] {ended = flat_run_current()}
-		to := cur_thread
-		if ended {
-			if to == 0 && flat.boot {
-				cpu.fatal("the executable returned from its entry with a thread held in native code (FLAT)")
-			}
-			thread_returned(to)
-		}
-		flat.held[home] = false
-		cpu.mod_inner = inner
+		to := flat_held_run(home, j)
 		cpu.flat_resume(h)
 		if flat.fresh[home] || to != home && !resumable(home) {
 			cpu.flat_block("a thread closed or started over while held")
@@ -170,5 +154,56 @@ when core.FLAT {
 	@(private = "file")
 	resumable :: proc(i: int) -> bool {
 		return i < thread_count() && thread_started(i) && cpu.r32(tcb(i) + TCB_EPC) == TCB_PARKED
+	}
+
+	// Hold thread home, switch to thread j (none for -1: a ChangeTh made
+	// it), and own the runs until a held thread is switched to: that one is
+	// returned.
+	@(private = "file")
+	flat_held_run :: proc(home, j: int) -> int {
+		flat.held[home] = true
+		// The replacements running are the held thread's, as in switch_to.
+		inner := cpu.mod_inner
+		cpu.mod_inner = nil
+		if j >= 0 {switch_to(j)}
+		ended := false
+		// The scheduler's loop, as flat_main's: it lasts as long as the others run.
+		for !ended && !flat.held[cur_thread] {ended = flat_run_current()}
+		to := cur_thread
+		if ended {
+			if to == 0 && flat.boot {
+				cpu.fatal("the executable returned from its entry with a thread held in native code (FLAT)")
+			}
+			thread_returned(to)
+		}
+		flat.held[home] = false
+		cpu.mod_inner = inner
+		return to
+	}
+
+	// cpu.flat_thread: the running thread's slot.
+	flat_thread :: proc() -> int {return cur_thread}
+
+	// cpu.flat_others: the run of thread home, inside a game task held in
+	// its native code (cpu.task_go), stopped for a thread switch, a preempt's
+	// owed or a ChangeTh's made. The others run, as in flat_switch_held, until
+	// home is switched back to; its run goes on then. A switch to a thread
+	// held below cannot be owed on past the native code, as flat_switch_held
+	// owes it: the run that stopped is the other game task's, not the native
+	// code's.
+	flat_others :: proc(home: int) {
+		j := -1
+		if flat.preempt_owed {
+			flat.preempt_owed = false
+			if i, ok := preempt_target(); ok {
+				j = i
+			} else {
+				cpu.flat_switches_dropped += 1
+			}
+		}
+		if j < 0 && cur_thread == home {return}
+		if to := flat_held_run(home, j); to != home {
+			cpu.fatal("thread %d switched to inside thread %d's game task held in native code (FLAT): it is held below", to, home)
+		}
 	}
 }
