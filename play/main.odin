@@ -124,16 +124,36 @@ native_key: string
 @(private = "file")
 switches_dir: string
 
+// The known thread switches (core.known_switches): read once at boot, then
+// added to by native_switched as the run finds rows.
+@(private = "file")
+switches_known: [dynamic]u32
+
 // A wasm32 build's PS1 thread switch was fatal under native code, or a game
 // task's switch held it
 // (psx.Boot.native_switched): its native entries are kept, for the runs
 // after to leave to the interpreter (core.known_switches).
+// A row already known (switches_known) is passed over: a held run can
+// repeat one thousands of times a run, and the file is not read again for it.
 @(private = "file")
 native_switched :: proc(entries: []u32) {
 	// One row per crash: native code calling native code is not in entries,
 	// so a deeper caller is found by a later crash, one level each.
-	if core.known_switches_add(switches_dir, entries) {
-		fmt.eprintfln("play: known thread switch row %08x (%d known); this native code is left to the interpreter from the next run", entries, len(core.known_switches(switches_dir)))
+	fresh := make([dynamic]u32, context.temp_allocator)
+	outer: for e in entries {
+		if e == 0 {continue}
+		for k in switches_known {
+			if k == e {continue outer}
+		}
+		for f in fresh {
+			if f == e {continue outer}
+		}
+		append(&fresh, e)
+	}
+	if len(fresh) == 0 {return}
+	append(&switches_known, ..fresh[:])
+	if core.known_switches_add(switches_dir, fresh[:]) {
+		fmt.eprintfln("play: known thread switch row %08x (%d known); this native code is left to the interpreter from the next run", fresh[:], len(switches_known))
 	}
 }
 
@@ -583,6 +603,7 @@ play :: proc(image: string) -> int {
 	when core.NATIVE_ARCH == core.NATIVE_ARCH_WASM32 {
 		switches_dir = dir
 		b.native_skip = slice.clone(core.known_switches(dir))
+		append(&switches_known, ..b.native_skip)
 		b.native_switched = native_switched
 	}
 	// The PS1 code it records is loaded as it is compiled
