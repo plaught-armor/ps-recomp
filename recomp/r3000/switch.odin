@@ -344,10 +344,10 @@ writes :: proc(w: u32, r: int) -> bool {
 // returns to the decompressor's caller; run on at jal+8, the decompressor
 // went on past its buffer and wrote over the program.
 //
-// A callee counts when it loads $ra other than from its stack frame
-// (returns_elsewhere_here). One that saves $ra in a global and restores it
-// to return to its own caller counts too (Crash, FF7): its calls only cost
-// the check. mods holds each module's functions.
+// A callee counts when it loads $ra other than from its stack frame, or
+// loads one it never stored (returns_elsewhere_here). One that saves $ra
+// in a global and restores it to return to its own caller counts too
+// (Crash, FF7): its calls only cost the check. mods holds each module's functions.
 //
 // With outside, a call to the entry of no function in mods counts too:
 // nothing here shows how that callee returns. Learned runs need it, since
@@ -378,12 +378,23 @@ returns_elsewhere :: proc(mods: [][]^mips.Func, outside := false) -> int {
 	return n
 }
 
-// Whether f loads $ra (lw $31) through a base other than $sp or $fp.
+// Whether f loads $ra (lw $31) through a base other than $sp or $fp, or
+// loads it and stores it nowhere: it restores a $ra its caller saved, as
+// Racing Lagoon's 0x800beff8 jumps into its caller 0x800bea04's epilogue,
+// which loads $ra and $sp back through the scratchpad $sp the caller set.
 returns_elsewhere_here :: proc(f: ^mips.Func) -> bool {
 	LW :: 0x23
+	SW :: 0x2b
+	loads, stores := false, false
 	for _, i in f.insns {
-		if i.w >> 26 != LW || (i.w >> 16) & 31 != 31 {continue}
-		if base := (i.w >> 21) & 31; base != 29 && base != 30 {return true}
+		if (i.w >> 16) & 31 != 31 {continue}
+		switch i.w >> 26 {
+		case LW:
+			if base := (i.w >> 21) & 31; base != 29 && base != 30 {return true}
+			loads = true
+		case SW:
+			stores = true
+		}
 	}
-	return false
+	return loads && !stores
 }

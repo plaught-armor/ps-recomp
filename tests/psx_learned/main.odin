@@ -233,6 +233,7 @@ main :: proc() {
 
 	test_tail_call(tmp)
 	test_yield(tmp)
+	test_restore(tmp)
 	test_first_wins()
 	test_recomp(tmp)
 	test_switches(tmp)
@@ -739,4 +740,62 @@ test_yield :: proc(tmp: string) {
 	got: Regs
 	got, native_ran = run(YIELD_OUTER, 0, 0)
 	check(native_ran && same(got, want), fmt.tprintf("learned call to a yield: v0 %d, want %d", got.r[2], want.r[2]))
+}
+
+// An interpreted loop calls a learned run that saves $ra and $sp at SAVE
+// (through $at) and moves $sp there; its learned callee runs the caller's
+// epilogue: it loads $ra and $sp back through $sp, which it never stored,
+// and returns past its caller with v0 = 1, as Racing Lagoon's 0x800beff8
+// jumps into its caller 0x800bea04's tail. The caller must return too, not
+// go on at jal+8 (v0 + 100): the loop then adds 1000.
+@(private = "file")
+RESTORE_OUTER :: 0x80029000
+@(private = "file")
+RESTORE_CALLER :: 0x80029040
+@(private = "file")
+RESTORE_CALLEE :: 0x80029080
+@(private = "file")
+SAVE :: 0x80030000
+@(rodata, private = "file")
+CODE_RESTORE_OUTER := [?]u32 {
+	0x03e08025, // or s0, ra, zero
+	0x0c000000 | (RESTORE_CALLER >> 2) & 0x3ffffff, // jal RESTORE_CALLER
+	0x00000000,
+	0x244203e8, // addiu v0, v0, 1000
+	0x02000008, // jr s0
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_RESTORE_CALLER := [?]u32 {
+	0x3c010000 | SAVE >> 16, // lui at, SAVE >> 16
+	0xac3f0380, // sw ra, 0x380(at)
+	0xac3d03a8, // sw sp, 0x3a8(at)
+	0x0020e825, // or sp, at, zero
+	0x0c000000 | (RESTORE_CALLEE >> 2) & 0x3ffffff, // jal RESTORE_CALLEE
+	0x00000000,
+	0x24420064, // addiu v0, v0, 100
+	0x03e00008, // jr ra (the callee's $ra: no reload, so a wrong run ends)
+	0x00000000,
+}
+@(rodata, private = "file")
+CODE_RESTORE_CALLEE := [?]u32 {
+	0x8fbf0380, // lw ra, 0x380(sp)
+	0x8fbd03a8, // lw sp, 0x3a8(sp)
+	0x00000000,
+	0x03e00008, // jr ra
+	0x24020001, // addiu v0, zero, 1
+}
+
+test_restore :: proc(tmp: string) {
+	outer, caller, callee := CODE_RESTORE_OUTER, CODE_RESTORE_CALLER, CODE_RESTORE_CALLEE
+	put(RESTORE_OUTER, outer[:])
+	put(RESTORE_CALLER, caller[:])
+	put(RESTORE_CALLEE, callee[:])
+	want, native_ran := run(RESTORE_OUTER, 0, 0)
+	check(want.r[2] == 1001 && !native_ran, fmt.tprintf("interpreted call to a restoring callee: v0 %d, want 1001", want.r[2]))
+	runs := [?]r3000.Learned{{RESTORE_CALLER, RESTORE_CALLER, caller[:]}, {RESTORE_CALLEE, RESTORE_CALLEE, callee[:]}}
+	check(psx_native.load_learned(write(tmp, "restore.bin", blob(runs[:]))), "load the restoring callee and its caller")
+	got: Regs
+	got, native_ran = run(RESTORE_OUTER, 0, 0)
+	check(native_ran && same(got, want), fmt.tprintf("learned call to a restoring callee: v0 %d, want %d", got.r[2], want.r[2]))
 }
