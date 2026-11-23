@@ -167,8 +167,8 @@ when core.FLAT {
 	flat_held: int
 	@(private = "file")
 	flat_nest_base: int
-	// Runs held.
-	flat_holds: u64
+	// Runs held, and those of them gone on (flat_resume).
+	flat_holds, flat_resumes: u64
 	// Called with the entries flat_block's fatal names (those not 0,
 	// outermost first) just before it, nil none: play keeps them for the
 	// runs after to leave to the interpreter (core.known_switches). Each
@@ -349,6 +349,7 @@ when core.FLAT {
 		no_returns, flat_stop = h.no_returns, h.stop
 		flat_learning, flat_host_call = h.learning, h.host_call
 		flat_held -= 1
+		flat_resumes += 1
 		flat_nest_base = h.nest_base
 	}
 
@@ -418,7 +419,7 @@ when core.FLAT {
 	flat_print :: proc() {
 		when core.FLAT {
 			who := learn_cpu == .Iop ? "iop" : "psx"
-			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run, %d owed thread switches dropped, %d runs held in native code", who, flat_returns, flat_mismatch, flat_max_depth, flat_late, flat_switches_dropped, flat_holds)
+			fmt.eprintfln("%s flat: %d returns, %d with the target not the call's return address, %d deep at most, %d stops put off past native code or a nested run, %d owed thread switches dropped, %d runs held in native code, %d gone on", who, flat_returns, flat_mismatch, flat_max_depth, flat_late, flat_switches_dropped, flat_holds, flat_resumes)
 			interp_print()
 		}
 	}
