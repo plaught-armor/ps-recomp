@@ -131,7 +131,15 @@ when !core.FLAT {
 		// No replacement runs in a new task (mod_call_original), and no
 		// call of it is open yet.
 		mod_inner, interp_top, tail_depth = nil, nil, 0
-		call(pc)
+		// A task whose $ra is its own entry starts over when it returns, as
+		// its `jr $ra` does on the console (Racing Lagoon 0x8007e5f8, made
+		// with its entry as $ra).
+		for {
+			call(pc)
+			if state.r[31] != pc {
+				break
+			}
+		}
 		fatal("game task started at %#08x returned (ra %#08x)", pc, state.r[31])
 	}
 } else {

@@ -72,6 +72,7 @@ Card_File :: struct {
 	first: int, // first data block (1..15)
 	pos:   u32,
 	size:  u32,
+	async: bool, // opened with bit 15 (FASYNC): read/write return 0 once started
 }
 
 // Called after every read from a card file, with the file's name, the file
@@ -409,7 +410,7 @@ card_write_file :: proc(slot: int, name: string, data: []u8) -> bool {
 // ---------------------------------------------------------------- file API
 
 // B(32h) open(name, mode): bit 0 read, bit 1 write, bit 9 create with
-// mode>>16 blocks. Returns a descriptor or -1.
+// mode>>16 blocks, bit 15 asynchronous. Returns a descriptor or -1.
 card_open :: proc(path: string, mode: u32) -> u32 {
 	slot, name, ok := card_filename(path)
 	if !ok {
@@ -431,7 +432,13 @@ card_open :: proc(path: string, mode: u32) -> u32 {
 	}
 	for &fl, i in card.files {
 		if !fl.used {
-			fl = {used = true, slot = slot, first = first, size = get_u32(frame_ptr(img, first), 4)}
+			fl = {
+				used  = true,
+				slot  = slot,
+				first = first,
+				size  = get_u32(frame_ptr(img, first), 4),
+				async = mode & 0x8000 != 0,
+			}
 			return u32(FD_BASE + i)
 		}
 	}
@@ -477,7 +484,9 @@ card_seek :: proc(fd, offset, whence: u32) -> u32 {
 
 // B(34h)/B(35h): whole frames from a frame-aligned position, clipped to
 // the file; a partial last frame is dropped. Async opens complete
-// immediately; the SwCARD event tells the game.
+// immediately and return 0, as the retail call does once the transfer has
+// started; the SwCARD event tells the game. Racing Lagoon retries its
+// scenario write until write() returns 0.
 card_rw :: proc(fd, buf, length: u32, write: bool) -> u32 {
 	fl := card_fd(fd)
 	if fl == nil || fl.pos % FRAME_SIZE != 0 || fl.pos >= fl.size {
@@ -510,7 +519,7 @@ card_rw :: proc(fd, buf, length: u32, write: bool) -> u32 {
 		return 0xffffffff
 	}
 	card_event(EV_SPEC_IOE)
-	return done
+	return fl.async ? 0 : done
 }
 
 // Fill a BIOS DIRENTRY: name[20], attr, size, next, head (the file's first
