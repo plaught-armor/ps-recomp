@@ -24,6 +24,11 @@
 // must find its return in A's. It runs again with A going round 100
 // times, and must discard no task: a switch missed with only S native would
 // leave a task suspended each round and fill the table.
+// M makes task 1 over on its stack: E waits in W, then M points task 1's
+// slot at F on STACK_B, and F waits in W at E's $sp and link. A switch
+// back there must go on in F, not in E's suspended host frames, which
+// would count CNT(1) on F's registers (Racing Lagoon's task at 0x800b6e48
+// went on in 0x800b6fd4's loop so).
 // G calls P, a SetSp (as Driver 2's f_00090300): P moves $sp and returns to
 // its link, loading $ra through a0. That is no task switch; G counts
 // CNT(3) once and puts $sp back.
@@ -55,6 +60,7 @@ F :: u32(0x80020700)
 G :: u32(0x80020800)
 P :: u32(0x80020900)
 H :: u32(0x80020a00)
+M :: u32(0x80020b00)
 DATA :: u32(0x80010000)
 CUR :: DATA // the running task's index
 NTASK :: DATA + 4
@@ -121,6 +127,23 @@ a_code :: proc(at := A) -> Code {
 	emit(&c, lw(T0, cnt(0) - DATA, S1), NOP, addiu(T0, T0, 1), sw(T0, cnt(0) - DATA, S1))
 	if at == H {emit(&c, addiu(A0, ZERO, 1))}
 	emit(&c, jal(at == H ? W : S), NOP, addiu(S0, S0, 0xffff))
+	emit(&c, bgtz(pc(c), S0, loop), NOP)
+	emit(&c, lw(RA, 0, SP), NOP, JR_RA, addiu(SP, SP, 16))
+	return c
+}
+
+// M(a0): switch once to E on STACK_B, which waits in W(1); then make the
+// task over on STACK_B as F, which waits in W(1) at the same $sp and link
+// (E's and F's frames are one size), and go round a0 times switching once.
+// F goes on in each, E never (its frames are F's now).
+m_code :: proc() -> Code {
+	c := Code{at = M}
+	// a0 into s0 first: S keeps s0, E's W call sets a0.
+	emit(&c, addiu(SP, SP, 0xfff0), sw(RA, 0, SP), lui(S1, DATA >> 16), addu(S0, A0, ZERO), jal(S), NOP)
+	emit(&c, lui(T0, F >> 16), addiu(T0, T0, F & 0xffff), sw(T0, slot(1) - DATA, S1))
+	emit(&c, lui(T0, STACK_B >> 16), addiu(T0, T0, STACK_B & 0xffff), sw(T0, slot(1) + 4 - DATA, S1))
+	loop := pc(c)
+	emit(&c, jal(S), NOP, addiu(S0, S0, 0xffff))
 	emit(&c, bgtz(pc(c), S0, loop), NOP)
 	emit(&c, lw(RA, 0, SP), NOP, JR_RA, addiu(SP, SP, 16))
 	return c
@@ -199,17 +222,17 @@ fail :: proc(what: string) -> ! {
 	os.exit(1)
 }
 
-// The eleven functions, each discovered apart, then marked as a blob build
-// marks them (r3000.returns_elsewhere: A's, B's, C's, D's and W's jal S get
-// the call_back check, since S loads $ra through t1, and G's jal P, since
-// P loads it through a0; H's jal W does not), then lowered.
-compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [11]native.Blob_Func) {
-	fs: [11]^mips.Func
+// The twelve functions, each discovered apart, then marked as a blob build
+// marks them (r3000.returns_elsewhere: A's, B's, C's, D's, W's and M's two
+// jal S get the call_back check, since S loads $ra through t1, and G's jal
+// P, since P loads it through a0; H's jal W does not), then lowered.
+compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [12]native.Blob_Func) {
+	fs: [12]^mips.Func
 	for c, k in codes {
 		fs[k] = mips.func_make(c.at, pc(c), c.at)
 		mips.discover(r3000.RULES, {base = c.at, data = ([^]u8)(raw_data(c.w))[:4 * len(c.w)], entry = c.at}, fs[k], nil)
 	}
-	if r3000.returns_elsewhere({fs[:]}) != 6 {fail("the jal S of A, B, C, D and W and G's jal P are not marked as returning elsewhere")}
+	if r3000.returns_elsewhere({fs[:]}) != 8 {fail("the jal S of A, B, C, D, W and M and G's jal P are not marked as returning elsewhere")}
 	for f, k in fs {
 		out[k] = {f.entry, r3000.native_func(na, f, nil, 1)}
 		mips.func_free(f)
@@ -253,6 +276,23 @@ run :: proc(mode: string, n: u32, first := B, rounds := ROUNDS, main_task := A) 
 	return ok
 }
 
+// M's 2 tasks, task 1 made over from E to F on its stack; true when F
+// counted in each round after its first, E in none, and M came back as
+// called.
+made_over :: proc(mode: string) -> bool {
+	for a := DATA; a < DATA + 0x5000; a += 4 {wr(a, 0)}
+	wr(NTASK, 2)
+	wr(slot(1), E)
+	wr(slot(1) + 4, STACK_B)
+	cpu.state.r[4] = ROUNDS
+	call_guest(M)
+	got := [5]u32{rd(cnt(1)), rd(cnt(2)), rd(CUR), cpu.state.r[29], cpu.state.r[31]}
+	want := [5]u32{0, ROUNDS - 1, 0, STACK_A, RET}
+	ok := got == want
+	fmt.printfln("%s 2 tasks (task 1 made over on its stack): cnt1 cnt2 cur sp ra %x, want %x %s", mode, got, want, ok ? "ok" : "FAIL")
+	return ok
+}
+
 // G's call of the SetSp P; true when it counted once, came back as called,
 // and switched no task.
 set_sp :: proc(mode: string) -> bool {
@@ -270,8 +310,8 @@ main :: proc() {
 	cpu.register_funcs(nil)
 	when core.FLAT {cpu.interp_run = cpu.flat_nested} else {cpu.interp_run = cpu.interp_loop}
 	cpu.next_event = max(u64)
-	codes := [11]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code(), d_code(), w_code(), wait_task_code(E, 1, 1), wait_task_code(F, 2, 1), g_code(), p_code(), a_code(H)}
-	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S && pc(codes[3]) <= D && pc(codes[4]) <= W && pc(codes[5]) <= E && pc(codes[6]) <= F && pc(codes[7]) <= G && pc(codes[8]) <= P && pc(codes[9]) <= H)
+	codes := [12]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code(), d_code(), w_code(), wait_task_code(E, 1, 1), wait_task_code(F, 2, 1), g_code(), p_code(), a_code(H), m_code()}
+	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S && pc(codes[3]) <= D && pc(codes[4]) <= W && pc(codes[5]) <= E && pc(codes[6]) <= F && pc(codes[7]) <= G && pc(codes[8]) <= P && pc(codes[9]) <= H && pc(codes[10]) <= M)
 	for c in codes {put(c)}
 	bad := 0
 	// Each mode: 2 and 3 tasks, with A and with H, then 2 with task 1 at D,
@@ -285,6 +325,7 @@ main :: proc() {
 		if !run(mode, 3, E) {bad += 1}
 		// More rounds than the table has tasks (cpu MAX_TASKS 48).
 		if !run(mode, 3, E, 100) {bad += 1}
+		if !made_over(mode) {bad += 1}
 		if !set_sp(mode) {bad += 1}
 		return
 	}
@@ -315,7 +356,7 @@ main :: proc() {
 	funcs := compile(&na, codes[:])
 	code, err := core.native_load(native.make_blob(&na, funcs[:], {}), psx_native.imports())
 	if err != "" {fail(fmt.tprint("native_load:", err))}
-	fns: [11]cpu.Func_Entry
+	fns: [12]cpu.Func_Entry
 	for e, k in funcs {fns[k] = {e.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(code.funcs[k].off))}}
 	// S and P native: interp_call's host returns.
 	cpu.register_funcs({fns[3], fns[9]})

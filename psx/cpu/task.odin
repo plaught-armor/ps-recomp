@@ -59,6 +59,10 @@ MAX_TASKS :: 48
 // back to a discarded task (of the last LOST_RING discarded).
 task_switches, tasks_reaped, tasks_lost: u64
 
+// Suspended tasks dropped as another made here suspended at their $sp and
+// link (task_switch): their frames on the guest stack are gone.
+tasks_replaced: u64
+
 LOST_RING :: 64
 
 // FLAT: the records a task made here may hold (20 bytes each, Flat_Frame),
@@ -234,6 +238,20 @@ task_switch :: proc(sp, link: u32) {
 			task_full_warned = true
 		}
 		task_reap(t)
+	}
+	// A task made here suspended at this $sp and link already: its frames
+	// were on this stack, which this task's overwrote (the game made a task
+	// over on it, and the new one waits at the same depth in the same
+	// routine), so it never goes on. A switch back here could find it
+	// first and run its host frames on this task's registers: Racing
+	// Lagoon's slot remade from 0x800b6fd4 to 0x800b6e48, both waiting in
+	// 0x8006c910 under a 0x78-byte frame.
+	for &t in tasks {
+		if t.live && t.entry != 0 && t.sp == sp && t.ra == link && !task_held(t.run) {
+			task_drop(t.run)
+			t = {}
+			tasks_replaced += 1
+		}
 	}
 	task_stamp += 1
 	tasks[slot] = {sp, link, task_entry, task_sp0, task_suspend(), task_stamp, false, true}
