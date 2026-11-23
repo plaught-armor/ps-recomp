@@ -19,9 +19,16 @@ import "ps:core"
 // FLAT has no host coroutines: a task's open calls are its flat run's
 // records (Flat_Ctx.frames), and a switch swaps them (Task_Run), as a BIOS
 // thread's run has records of its own. flat_task_switch makes it when a
-// native callee of the run's guest code came back in another task; one in
-// native code or in a guest call the host made cannot switch (task_switch
-// counts and warns once), as host frames below it would run on.
+// native callee of the run's guest code came back in another task. One in
+// native code (a wasm32 build's blob calling the routine natively) holds the
+// run there (flat_hold), host frames and all, as a BIOS preempt in native
+// code does, and runs the other tasks on the same records swap inside it
+// until one switches back; it then goes on in the native code. Meanwhile
+// the others run interpreted (task_holding): their switch back is guest
+// code's, which stops the run inside the hold, where native code's would be
+// held above the held task's host frames. One in a
+// guest call the host made cannot switch (task_switch counts and warns
+// once), as the host frames below it would run on.
 //
 // The registers are the guest's: the routine saved and loaded them in its
 // own memory, so a switch moves none.
@@ -90,6 +97,9 @@ when core.FLAT {
 		// Made here (Flat_Ctx.task).
 		task:       bool,
 		inner:      ^Mod_Inner,
+		// Held in native code (task_go): its level, 1 the first held; 0 not.
+		// Its records stay its run's, and it is never discarded.
+		held:       int,
 	}
 } else {
 	@(private = "file")
@@ -202,11 +212,11 @@ task_switch :: proc(sp, link: u32) {
 		}
 	}
 	// A free entry, else the stale task suspended longest, else the task
-	// made here suspended longest.
+	// made here suspended longest; never one held in native code (FLAT).
 	slot := -1
 	for t, i in tasks {
 		if !t.live {slot = i; break}
-		if t.entry == 0 {continue}
+		if t.entry == 0 || task_held(t.run) {continue}
 		if slot < 0 {slot = i; continue}
 		s := &tasks[slot]
 		if t.stale != s.stale ? t.stale : t.stamp < s.stamp {slot = i}
@@ -237,6 +247,9 @@ when !core.FLAT {
 
 	@(private = "file")
 	task_drop :: proc(run: Task_Run) {core.co_kill(run)}
+
+	@(private = "file")
+	task_held :: #force_inline proc(run: Task_Run) -> bool {return false}
 
 	// Switch to the coroutine of the task found, or a new one at ra; back
 	// when some task switches back to this one.
@@ -277,13 +290,28 @@ when !core.FLAT {
 	@(private = "file")
 	task_warned: bool
 
-	// Only a run's own guest code can switch (flat_can_stop): in native code
-	// or a guest call the host made, the host frames below would run on. That
-	// call goes on with the other task's registers, as before: counted and
-	// warned.
+	// Tasks held in native code now (task_go), the last held on top.
+	@(private = "file")
+	task_holds: int
+
+	// A task is held in native code: flat_enter runs no native code, so the
+	// other tasks' switch back to it is made by guest code (flat_task_jr),
+	// which can stop the run inside the hold. Native code of theirs that
+	// switched would be held above it, and the held task's host frames could
+	// not go on until that one's had.
+	task_holding :: #force_inline proc() -> bool {return task_holds > 0}
+
+	// The run inside a hold stopped to go back to the task held on top.
+	@(private = "file")
+	task_back: bool
+
+	// A run's own guest code can switch (flat_can_stop), and native code it
+	// called (task_go holds it). In a guest call the host made the host frames
+	// below would run on: that call goes on with the other task's registers,
+	// as before, counted and warned.
 	@(private = "file")
 	task_can_switch :: proc(sp, link: u32) -> bool {
-		if flat_can_stop() {return true}
+		if flat_can_stop() || flat_in_native() {return true}
 		task_switches += 1
 		if !task_warned {
 			fmt.eprintfln("cpu: game task switch from %#08x (sp %#08x) to %#08x (sp %#08x) in native code or a guest call the host made, under FLAT: not supported, goes on", link, sp, state.r[31], state.r[29])
@@ -300,7 +328,8 @@ when !core.FLAT {
 		if x.hosts > 0 {
 			fatal("game task switch to %#08x with %d continuations open (a mod's replacement) under FLAT: not supported", state.r[31], x.hosts)
 		}
-		return {x, x.frames, x.depth, x.start, frame_ret, tail_depth, x.task, mod_inner}
+		held := task_holds + 1 if flat_in_native() else 0
+		return {x, x.frames, x.depth, x.start, frame_ret, tail_depth, x.task, mod_inner, held}
 	}
 
 	@(private = "file")
@@ -309,21 +338,65 @@ when !core.FLAT {
 		flat_free(&x)
 	}
 
-	// The run goes on in the task found, with its records, or in a new one at
-	// ra, with none yet: its first call (.Task) is owed (flat_settle).
+	@(private = "file")
+	task_held :: #force_inline proc(run: Task_Run) -> bool {return run.held != 0}
+
+	// The run goes on in the task found, at ra, or in a new one there. From
+	// guest code, at once: the run's records become the task's, and a task
+	// held in native code (the one on top) is gone back to by stopping the run
+	// inside its hold. From native code, the run is held there and the other
+	// tasks run on it until one switches back to this one: then the native
+	// code goes on.
 	@(private = "file")
 	task_go :: proc(to: Task_Run, found: bool, ra: u32) {
 		x := flat_cur
-		if !found {
-			x.frames, x.depth, x.start, x.task = nil, 0, ra, true
-			frame_ret, tail_depth, mod_inner = ra, 0, nil
-			x.enter = true
-			return
-		}
-		if to.ctx != x {
+		if found && to.ctx != x {
 			fatal("game task switch to %#08x (sp %#08x): suspended on another BIOS thread's flat run", ra, state.r[29])
 		}
+		if !flat_in_native() {
+			if found && to.held != 0 {
+				if to.held != task_holds {
+					fatal("game task switch to %#08x (sp %#08x): held in native code below another task's hold (FLAT)", ra, state.r[29])
+				}
+				task_back = true
+				flat_stop = true
+				return
+			}
+			frame_ret, tail_depth, mod_inner = task_load(x, to, found, ra)
+			return
+		}
+		// Its host frames are below this native code's.
+		if found && to.held != 0 {flat_block("a game task switch back to a task held in native code")}
+		saved, inner := x^, mod_inner
+		h: Flat_Hold
+		if !flat_hold(&h) {
+			fatal("game task switch to %#08x in native code: %d flat runs held already (FLAT)", ra, FLAT_HOLDS)
+		}
+		task_holds += 1
+		x.frame_ret, x.tail_depth, mod_inner = task_load(x, to, found, ra)
+		x.pc, x.goto_owed = ra, false
+		if flat_run(x) {fatal("a game task's run ended inside a task held in native code (FLAT)")}
+		if !task_back {
+			fatal("a run stopped inside a game task held in native code (FLAT): a BIOS thread switch cannot wait there (ra %#08x)", state.r[31])
+		}
+		task_back = false
+		task_holds -= 1
+		x^ = saved
+		mod_inner = inner
+		flat_resume(&h)
+	}
+
+	// Put the records of task to (found), or none yet for a new task at ra,
+	// its first call (.Task) owed (flat_settle), on run x; the run's state that
+	// goes with them is returned.
+	@(private = "file")
+	task_load :: proc(x: ^Flat_Ctx, to: Task_Run, found: bool, ra: u32) -> (u32, int, ^Mod_Inner) {
+		if !found {
+			x.frames, x.depth, x.start, x.task = nil, 0, ra, true
+			x.enter = true
+			return ra, 0, nil
+		}
 		x.frames, x.depth, x.start, x.task = to.frames, to.depth, to.start, to.task
-		frame_ret, tail_depth, mod_inner = to.frame_ret, to.tail_depth, to.inner
+		return to.frame_ret, to.tail_depth, to.inner
 	}
 }

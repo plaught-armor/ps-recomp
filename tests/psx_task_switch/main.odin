@@ -14,8 +14,9 @@
 // and, under FLAT, flat_enter's host return), then all native (the four
 // functions compiled apart, as jal targets are, and marked as a blob build
 // marks them). Under FLAT, A runs on a flat run of its own, each task on
-// records of its own, and a switch made in native code is not supported
-// (task_switch warns): the all-native cases are skipped there. A's loop
+// records of its own, and a switch made in native code holds the run there
+// while the other tasks run (task_go); for wasm32, all native is all
+// learned (a second learned blob of every function but S). A's loop
 // ends on bgtz, so a broken switch fails, not hangs. A third case has tasks
 // E and F each wait one switch in one routine W, so a switch from E to F
 // returns at W's own link on F's $sp; under FLAT with S native, E's and F's
@@ -284,6 +285,13 @@ main :: proc() {
 		blob := r3000.learned_blob({{S, S, s.w[:]}}, .Wasm32)
 		if !psx_native.load_learned_blob(blob, "learned") {fail("load the learned blob")}
 		bad += cases("S learned")
+		// Then the others learned too: S's callers switch in native code.
+		all: [dynamic]r3000.Learned
+		for c, k in codes {
+			if k != 3 {append(&all, r3000.Learned{c.at, c.at, c.w[:]})}
+		}
+		if !psx_native.load_learned_blob(r3000.learned_blob(all[:], .Wasm32), "learned") {fail("load the second learned blob")}
+		bad += cases("learned")
 		if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
 		fmt.println("ok")
 		return
@@ -297,10 +305,8 @@ main :: proc() {
 	// S and P native: interp_call's host returns.
 	cpu.register_funcs({fns[3], fns[9]})
 	bad += cases("S native")
-	when !core.FLAT {
-		cpu.register_funcs(fns[:])
-		bad += cases("native")
-	}
+	cpu.register_funcs(fns[:])
+	bad += cases("native")
 	if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
 	fmt.println("ok")
 }

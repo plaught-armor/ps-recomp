@@ -303,6 +303,12 @@ when core.FLAT {
 		return flat_cur != nil && flat_nest_depth == flat_nest_base && flat_native == 0
 	}
 
+	// The running run is in native code at its own level: no nested run
+	// open, so flat_hold can hold it there (task_go).
+	flat_in_native :: proc() -> bool {
+		return flat_cur != nil && flat_nest_depth == flat_nest_base && flat_native > 0
+	}
+
 	// What flat_hold puts aside: the state of the running run that is not in
 	// its Flat_Ctx or its host frames.
 	Flat_Hold :: struct {
@@ -459,7 +465,9 @@ when core.FLAT {
 		f := flat_push(x, kind, ret)
 		frame_ret = state.r[31]
 		if kind == .Jump {tail_depth += 1}
-		if lookup == .All && is_ram_addr(addr) && addr & 3 == 0 {
+		// A game task held in native code: the others run interpreted (task_holding).
+		native := !task_holding()
+		if native && lookup == .All && is_ram_addr(addr) && addr & 3 == 0 {
 			if fn := dispatch.fixed[fn_index(addr)]; fn != nil {
 				f.host = true
 				at, n := x.depth - 1, no_returns
@@ -479,7 +487,7 @@ when core.FLAT {
 			host_call(addr, true)
 			return
 		}
-		if e := lookup != .Guest ? resolve_overlay(addr) : nil; e != nil {
+		if e := native && lookup != .Guest ? resolve_overlay(addr) : nil; e != nil {
 			when FALLBACK_COUNT {
 				if addr in dispatch_demoted {
 					dispatch_demoted[addr] += 1
@@ -496,7 +504,7 @@ when core.FLAT {
 			flat_task_switch(x, at, ret, kind, n)
 			return
 		}
-		if learned_loaded {
+		if native && learned_loaded {
 			f.host = true
 			at, n := x.depth - 1, no_returns
 			flat_native_in(addr)
@@ -531,6 +539,21 @@ when core.FLAT {
 		flat_pop(x, false)
 		task_switch(f.sp, ret)
 		x.pc = state.r[31]
+	}
+
+	// A task held in native code (task_holding), the others interpreted: the
+	// switch routine's `jr $ra` back in another task (task_leaves on the $sp
+	// and link of the call on top) switches as its host code's return would
+	// (flat_task_switch), so the one back to the held task stops the run.
+	@(private = "file")
+	flat_task_jr :: proc(x: ^Flat_Ctx, $L: bool) -> bool {
+		if x.depth == 0 {return false}
+		f := x.frames[x.depth - 1]
+		if f.host || f.kind != .Call || state.r[31] == f.outer || !task_leaves(f.sp, f.ret) {return false}
+		flat_pop(x, L)
+		task_switch(f.sp, f.ret)
+		x.pc = state.r[31]
+		return true
 	}
 
 	// The interpreted callee of f, from entry, begins a LEARN run: not a mod
@@ -776,7 +799,10 @@ when core.FLAT {
 				case 0x08:
 					t := r[rs]
 					flat_slot(x, pc, L, lf)
-					if t == frame_ret {
+					// Before the return: tasks waiting in one routine go on at one link.
+					if rs == 31 && task_holding() && flat_task_jr(x, L) {
+						settle = true
+					} else if t == frame_ret {
 						flat_return(x, t, L)
 						settle = true
 					} else if rs == 31 && flat_unwind(x, t, L) {
