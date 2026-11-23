@@ -621,10 +621,12 @@ when core.FLAT {
 		}
 	}
 
-	// Whether goto_target makes a jump to target a tail call.
+	// Whether goto_target makes a jump to target a tail call. Not native code
+	// flat_enter would interpret (task_holding): a loop branching back to its
+	// function's first word would push a record each time round.
 	@(private = "file")
 	flat_fn_target :: #force_inline proc(target: u32) -> bool {
-		return is_ram_addr(target) && dispatch.fixed[fn_index(target)] != nil || host_call(target, false)
+		return !task_holding() && is_ram_addr(target) && dispatch.fixed[fn_index(target)] != nil || host_call(target, false)
 	}
 
 	// Do what x owes before its guest code runs on: start it, return from host
