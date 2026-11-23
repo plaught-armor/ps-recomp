@@ -716,6 +716,7 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 	result: i32
 	extra: [3]u32 // READ: unaligned head/tail sizes (zero: data goes straight to RAM)
 	stat: [FIO_STAT]u8 // GETSTAT: the reply carries it after the EE address
+	hold: u64 // READ of a disc file: the drive's time for its sectors
 	switch fno {
 	case 0: // OPEN {hdr, flags, mode, name[0x400], slot}
 		result = fileio_open(string(cstring(&buf[0x14])), w[3])
@@ -732,6 +733,7 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		copy(mem.ram_slice(w[4], u32(got)), tmp[:got])
 		gd_file_load(.Ee, f.file, pos, w[4], tmp[:got])
 		result = i32(got)
+		if f.rom == nil {hold = cd_read_ee(u32((got + DISC_SECTOR - 1) / DISC_SECTOR))}
 	case 3: // WRITE {hdr, fd, buffer, size, unaligned size, data...}: read-only disc
 		result = -EBADF
 	case 4: // SEEK {hdr, fd, offset, whence, slot}
@@ -759,7 +761,14 @@ fileio_server :: proc(fno: u32, buf: []u8, send_size: u32) -> bool {
 		r[5] = extra[0]
 		if fno == 12 {copy(reply[0x18:], stat[:])} else {r[6], r[7] = extra[1], extra[2]}
 	}
-	sif_reply(FILEIO_REPLY, 0, {})
+	// A disc READ's reply waits the drive's time (sif_reply's hold), and its
+	// RPC_END the RPC's round trip after it: the EE thread waiting on the
+	// read blocks meanwhile, as on hardware, and lower-priority threads run.
+	// SotC (SCUS-97472) loads GAMECORE.XFF so: answered at once, its loader
+	// thread ran on, started thread 10, whose callback thread 9's late init
+	// then wiped, and the game waited forever on a request nobody served.
+	sif_reply(FILEIO_REPLY, 0, {}, hold = hold)
+	if hold != 0 {sif.call_hold = CD_ST_READ_EE}
 	w[0] = 1 // accepted; zero makes the EE library return EAGAIN
 	return true
 }

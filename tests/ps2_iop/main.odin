@@ -5731,6 +5731,22 @@ test_fileio_getstat :: proc() {
 	check(call(fio, 1, u32(fd)) == 0 && call(fio, 2, u32(fd), EE_BUF, 1) == -9, "rom0: close; the fd is bad after")
 	check(call(fio, 0, 2, 0, name = "rom0:ROMVER") == -2, "rom0: a write open fails")
 	check(call(fio, 0, 1, 0, name = "rom0:OSDSYS") == -2, "rom0: another rom0 file is not found")
+	check(len(iop.sif.held) == 0 && iop.sif.call_hold == 0, "rom0: a ROM read's reply is not held")
+
+	// A disc file's READ: the reply is held the drive's time for its
+	// sectors, the RPC_END the round trip after it; the data is in RAM at once.
+	fd = call(fio, 0, 1, 0, name = "cdrom0:\\BIG.BIN;1")
+	check(fd >= 0, "disc read: BIG.BIN opens")
+	drop_replies() // the OPEN's and the ROM calls' replies
+	now := cpu.state.cycles
+	n := call(fio, 2, u32(fd), EE_BUF, 2 * SECTOR + 1)
+	check(n == 2 * SECTOR + 1, "disc read: gets the bytes asked")
+	hold := iop.sif.call_hold
+	iop.sif.call_hold = 0 // the RPC dispatcher's, which this direct call skips
+	cmd := len(iop.sif.held) == 1 ? ([^]u32)(raw_data(iop.sif.held[0].p))[2] : 0
+	check(cmd == iop.FILEIO_REPLY && iop.sif.held[0].due == now + iop.cd_read_ee(3), "disc read: the reply is held the drive's time for 3 sectors")
+	check(len(iop.sif.replies) == 0 && hold == iop.CD_ST_READ_EE, "disc read: none sent at once, the RPC_END held its round trip after")
+	drop_replies()
 }
 
 test_cdvd_search_server :: proc() {
