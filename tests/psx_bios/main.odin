@@ -870,6 +870,19 @@ main :: proc() {
 	check("byte written by A(03h)", u32(cpu.r8(CARD_BUF + 0x7f)), 0xa5)
 	check("close", b(0x36, fd), fd)
 
+	// An asynchronous open (mode bit 15): read and write return 0 once the
+	// transfer has started, and SwCARD IOE says it is done. Racing Lagoon
+	// retries its write until write() returns 0.
+	sw_done := open(0xf4000001, 0x0004, 0x2000)
+	afd := b(0x32, guest_string("bu00:BASLUS-00001AB"), 0x8001)
+	cpu.w8(CARD_BUF + 0x7f, 0)
+	check("async read returns 0", b(0x34, afd, CARD_BUF, 0x80), 0)
+	check("byte read by the async read", u32(cpu.r8(CARD_BUF + 0x7f)), 0x7f)
+	check("SwCARD IOE after the async read", test(sw_done), 1)
+	check("position after the async read", b(0x33, afd, 0, 1), 0x80)
+	check("close of the async file", b(0x36, afd), afd)
+	b(0x09, sw_done)
+
 	// The cards answer on SIO0 as the hardware does, from the same images
 	// the B functions use. Each byte but a frame's last is acknowledged.
 	sio_byte :: proc(tx: u8) -> (rx: u8, ack: bool) {

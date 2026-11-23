@@ -16,7 +16,9 @@
 // marks them). Under FLAT, A runs on a flat run of its own, and a switch
 // made in native code is not supported (task_switch warns): the all-native
 // cases are skipped there. A's loop ends on bgtz, so a broken switch fails,
-// not hangs.
+// not hangs. A third case has tasks E and F each wait one switch in one
+// routine W, so a switch from E to F returns at W's own link on F's $sp;
+// under FLAT it runs interpreted only.
 // The R3000 code waits out each load's delay slot.
 package main
 
@@ -33,6 +35,10 @@ A :: u32(0x80020000)
 B :: u32(0x80020100)
 C :: u32(0x80020200)
 S :: u32(0x80020300)
+D :: u32(0x80020400)
+W :: u32(0x80020500)
+E :: u32(0x80020600)
+F :: u32(0x80020700)
 DATA :: u32(0x80010000)
 CUR :: DATA // the running task's index
 NTASK :: DATA + 4
@@ -44,7 +50,7 @@ RET :: u32(0x80000080) // the caller's return address of the call of A
 cnt :: proc(i: u32) -> u32 {return DATA + 0x10 + 4 * i}
 slot :: proc(i: u32) -> u32 {return DATA + 0x100 + 0x40 * i} // +0 ra, +4 sp, +8 s0..s7
 
-ZERO, T0, T1, T2, T7, S0, S1, SP, RA :: u32(0), u32(8), u32(9), u32(10), u32(15), u32(16), u32(17), u32(29), u32(31)
+ZERO, A0, T0, T1, T2, T7, S0, S1, SP, RA :: u32(0), u32(4), u32(8), u32(9), u32(10), u32(15), u32(16), u32(17), u32(29), u32(31)
 NOP :: u32(0)
 JR_RA :: u32(0x03e00008)
 
@@ -99,6 +105,40 @@ a_code :: proc() -> Code {
 	return c
 }
 
+// A side task at D counting CNT(1) once and switching once, then returning:
+// it is made with its entry as $ra, so its `jr $ra` starts it over, as
+// Racing Lagoon's task at 0x8007e5f8 is.
+d_code :: proc() -> Code {
+	c := Code{at = D}
+	emit(&c, addiu(SP, SP, 0xfff8), sw(RA, 0, SP), lui(S1, DATA >> 16))
+	emit(&c, lw(T0, cnt(1) - DATA, S1), NOP, addiu(T0, T0, 1), sw(T0, cnt(1) - DATA, S1))
+	emit(&c, jal(S), NOP, lw(RA, 0, SP), NOP, JR_RA, addiu(SP, SP, 8))
+	return c
+}
+
+// W(a0): wait a0 switches, then return; Racing Lagoon's 0x8006c910 waits
+// frames so. Tasks waiting in it go on at one link (after its jal S): only
+// their $sp tells a switch from one to another from W's own return.
+w_code :: proc() -> Code {
+	c := Code{at = W}
+	emit(&c, addiu(SP, SP, 0xfff0), sw(RA, 0, SP), sw(S0, 4, SP), addu(S0, A0, ZERO))
+	loop := pc(c)
+	emit(&c, jal(S), NOP, addiu(S0, S0, 0xffff))
+	emit(&c, bgtz(pc(c), S0, loop), NOP)
+	emit(&c, lw(RA, 0, SP), lw(S0, 4, SP), NOP, JR_RA, addiu(SP, SP, 16))
+	return c
+}
+
+// A side task at at counting CNT(i) up after each W(k), forever.
+wait_task_code :: proc(at, i, k: u32) -> Code {
+	c := Code{at = at}
+	emit(&c, addiu(SP, SP, 0xfff8), lui(S1, DATA >> 16))
+	loop := pc(c)
+	emit(&c, addiu(A0, ZERO, k), jal(W), NOP)
+	emit(&c, lw(T0, cnt(i) - DATA, S1), NOP, addiu(T0, T0, 1), sw(T0, cnt(i) - DATA, S1), j(loop), NOP)
+	return c
+}
+
 // A side task at at counting CNT(i) in s0, forever.
 task_code :: proc(at, i: u32) -> Code {
 	c := Code{at = at}
@@ -120,16 +160,16 @@ fail :: proc(what: string) -> ! {
 	os.exit(1)
 }
 
-// The four functions, each discovered apart, then marked as a blob build
-// marks them (r3000.returns_elsewhere: A's, B's and C's jal S get the
-// call_back check, since S loads $ra through t1), then lowered.
-compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [4]native.Blob_Func) {
-	fs: [4]^mips.Func
+// The eight functions, each discovered apart, then marked as a blob build
+// marks them (r3000.returns_elsewhere: A's, B's, C's, D's and W's jal S get
+// the call_back check, since S loads $ra through t1), then lowered.
+compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [8]native.Blob_Func) {
+	fs: [8]^mips.Func
 	for c, k in codes {
 		fs[k] = mips.func_make(c.at, pc(c), c.at)
 		mips.discover(r3000.RULES, {base = c.at, data = ([^]u8)(raw_data(c.w))[:4 * len(c.w)], entry = c.at}, fs[k], nil)
 	}
-	if r3000.returns_elsewhere({fs[:]}) != 3 {fail("the jal S of A, B and C are not marked as returning elsewhere")}
+	if r3000.returns_elsewhere({fs[:]}) != 5 {fail("the jal S of A, B, C, D and W are not marked as returning elsewhere")}
 	for f, k in fs {
 		out[k] = {f.entry, r3000.native_func(na, f, nil, 1)}
 		mips.func_free(f)
@@ -138,13 +178,14 @@ compile :: proc(na: ^native.Asm, codes: []Code) -> (out: [4]native.Blob_Func) {
 	return
 }
 
-// One case of n tasks; true when it came out right.
-run :: proc(mode: string, n: u32) -> bool {
+// One case of n tasks, task 1 starting at first (B, D, or E, with task 2
+// at F); true when it came out right.
+run :: proc(mode: string, n: u32, first := B) -> bool {
 	for a := DATA; a < DATA + 0x5000; a += 4 {wr(a, 0)}
 	wr(NTASK, n)
-	wr(slot(1), B)
+	wr(slot(1), first)
 	wr(slot(1) + 4, STACK_B)
-	wr(slot(2), C)
+	wr(slot(2), first == E ? F : C)
 	wr(slot(2) + 4, STACK_C)
 	cpu.state.r[29], cpu.state.r[31] = STACK_A, RET
 	when core.FLAT {
@@ -156,8 +197,10 @@ run :: proc(mode: string, n: u32) -> bool {
 	}
 	got := [6]u32{rd(cnt(0)), rd(cnt(1)), rd(cnt(2)), rd(CUR), cpu.state.r[29], cpu.state.r[31]}
 	want := [6]u32{3, 3, n == 3 ? 3 : 0, 0, STACK_A, RET}
+	// E and F start in A's first switch and count once in each later one.
+	if first == E {want[1], want[2] = 2, 2}
 	ok := got == want
-	fmt.printfln("%s %d tasks: cnt cur sp ra %x, want %x %s", mode, n, got, want, ok ? "ok" : "FAIL")
+	fmt.printfln("%s %d tasks%s: cnt cur sp ra %x, want %x %s", mode, n, first == D ? " (task 1 starts over)" : first == E ? " (both wait in one routine)" : "", got, want, ok ? "ok" : "FAIL")
 	return ok
 }
 
@@ -165,18 +208,31 @@ main :: proc() {
 	cpu.register_funcs(nil)
 	when core.FLAT {cpu.interp_run = cpu.flat_nested} else {cpu.interp_run = cpu.interp_loop}
 	cpu.next_event = max(u64)
-	codes := [4]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code()}
-	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S)
+	codes := [8]Code{a_code(), task_code(B, 1), task_code(C, 2), s_code(), d_code(), w_code(), wait_task_code(E, 1, 1), wait_task_code(F, 2, 1)}
+	assert(pc(codes[0]) <= B && pc(codes[1]) <= C && pc(codes[2]) <= S && pc(codes[3]) <= D && pc(codes[4]) <= W && pc(codes[5]) <= E && pc(codes[6]) <= F)
 	for c in codes {put(c)}
 	bad := 0
-	for n in u32(2) ..= 3 {if !run("interp", n) {bad += 1}}
+	// Each mode: 2 and 3 tasks, then 2 with task 1 at D, then 3 at E and F.
+	cases :: proc(mode: string) -> (bad: int) {
+		for n in u32(2) ..= 3 {if !run(mode, n) {bad += 1}}
+		if !run(mode, 2, D) {bad += 1}
+		// Under FLAT the tasks share one run's call records: E's and F's
+		// calls of W stay open under the switches, and A's last `jr $ra`
+		// finds its return in none of them (flat_unwind) and jumps. Only the
+		// interpreted switch goes on right there.
+		if !core.FLAT || mode == "interp" {
+			if !run(mode, 3, E) {bad += 1}
+		}
+		return
+	}
+	bad += cases("interp")
 	when ODIN_ARCH == .wasm32 {
 		// wasm32 has no PS1 blob of fixed functions: S is learned code, as
 		// the play page runs native PS1 code (load_learned_blob).
 		s := codes[3]
 		blob := r3000.learned_blob({{S, S, s.w[:]}}, .Wasm32)
 		if !psx_native.load_learned_blob(blob, "learned") {fail("load the learned blob")}
-		for n in u32(2) ..= 3 {if !run("S learned", n) {bad += 1}}
+		bad += cases("S learned")
 		if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
 		fmt.println("ok")
 		return
@@ -185,13 +241,13 @@ main :: proc() {
 	funcs := compile(&na, codes[:])
 	code, err := core.native_load(native.make_blob(&na, funcs[:], {}), psx_native.imports())
 	if err != "" {fail(fmt.tprint("native_load:", err))}
-	fns: [4]cpu.Func_Entry
+	fns: [8]cpu.Func_Entry
 	for e, k in funcs {fns[k] = {e.addr, cast(cpu.Func_Proc)rawptr(code.base + uintptr(code.funcs[k].off))}}
-	cpu.register_funcs(fns[3:])
-	for n in u32(2) ..= 3 {if !run("S native", n) {bad += 1}}
+	cpu.register_funcs(fns[3:4])
+	bad += cases("S native")
 	when !core.FLAT {
 		cpu.register_funcs(fns[:])
-		for n in u32(2) ..= 3 {if !run("native", n) {bad += 1}}
+		bad += cases("native")
 	}
 	if bad > 0 {fail(fmt.tprintf("%d runs wrong: a native call of a task switch ran on in the task it left", bad))}
 	fmt.println("ok")

@@ -20,10 +20,16 @@ import "ps:core"
 // The registers are the guest's: the routine saved and loaded them in its
 // own memory, so a switch moves none.
 //
-// What reaps a task that never goes on: its coroutine is discarded when a
-// new task starts at the same entry on the same $sp (the game made the task
-// over in its slot), or, the table full, the one suspended longest is, with
-// a warning. Both count in tasks_reaped. Only coroutines made here are
+// What reaps a task that never goes on: the table full, a stale task's
+// coroutine is discarded, the one suspended longest. A task is stale once a
+// new task starts on the $sp it started on (the game made a task over in
+// that slot, at the same entry or another, as Racing Lagoon does with its
+// 0x30-byte task slots); it stays until a slot is wanted, as it may be
+// suspended on another stack and still go on. No stale task: the one made
+// here suspended longest is, with a warning. Both count in tasks_reaped. A
+// discarded task the game switches back to cannot go on (its host frames
+// are gone): that starts a coroutine at its resume point, and counts in
+// tasks_lost. Only coroutines made here are
 // discarded: a BIOS thread's or the main one may be suspended in the table
 // too (a task switch made in a thread), and stays.
 // The pool's coroutines (core CO_POOL, 64) are shared with the BIOS threads
@@ -32,8 +38,11 @@ import "ps:core"
 // not in one.
 MAX_TASKS :: 48
 
-// Game-level task switches made, and suspended tasks discarded.
-task_switches, tasks_reaped: u64
+// Game-level task switches made, suspended tasks discarded, and switches
+// back to a discarded task (of the last LOST_RING discarded).
+task_switches, tasks_reaped, tasks_lost: u64
+
+LOST_RING :: 64
 
 when !core.FLAT {
 	@(private = "file")
@@ -45,6 +54,8 @@ when !core.FLAT {
 		co:          ^core.Coroutine,
 		// Order of suspension, for the full table.
 		stamp:       u64,
+		// A task started since on the $sp it started on.
+		stale:       bool,
 	}
 
 	// The suspended tasks; co nil is a free entry.
@@ -60,6 +71,24 @@ when !core.FLAT {
 
 	@(private = "file")
 	task_full_warned: bool
+
+	// Where the last LOST_RING discarded tasks would have gone on ($sp, $ra;
+	// 0, 0: none), for tasks_lost.
+	@(private = "file")
+	lost: [LOST_RING][2]u32
+
+	@(private = "file")
+	lost_next: int
+
+	// Discard suspended task t, remembering where it would have gone on.
+	@(private = "file")
+	task_reap :: proc(t: ^Guest_Task) {
+		core.co_kill(t.co)
+		lost[lost_next] = {t.sp, t.ra}
+		lost_next = (lost_next + 1) % LOST_RING
+		t^ = {}
+		tasks_reaped += 1
+	}
 
 	// The host callee of a call with $sp sp and link came back with another
 	// task's $sp and $ra. Returns when some task switches back to this one,
@@ -82,35 +111,46 @@ when !core.FLAT {
 			}
 		}
 		if to == nil {
-			// The game made a task over at its entry on its stack: the one
-			// that started there before never goes on.
+			for &l in lost {
+				if l == {to_sp, to_ra} {
+					tasks_lost += 1
+					l = {}
+					break
+				}
+			}
+			// The game made a task over on a stack: the one that started
+			// there before most likely never goes on. It is discarded first
+			// when a slot is wanted, not now: it may be suspended on another
+			// stack still and be switched back to (Racing Lagoon 0x8007ebc0).
 			for &t in tasks {
-				if t.co != nil && t.entry == to_ra && t.sp0 == to_sp {
-					core.co_kill(t.co)
-					t = {}
-					tasks_reaped += 1
+				if t.co != nil && t.entry != 0 && t.sp0 == to_sp {
+					t.stale = true
 				}
 			}
 			to = core.co_create(task_run, rawptr(uintptr(to_ra)))
 		}
+		// A free entry, else the stale task suspended longest, else the task
+		// made here suspended longest.
 		slot := -1
 		for t, i in tasks {
 			if t.co == nil {slot = i; break}
-			if t.entry != 0 && (slot < 0 || t.stamp < tasks[slot].stamp) {slot = i}
+			if t.entry == 0 {continue}
+			if slot < 0 {slot = i; continue}
+			s := &tasks[slot]
+			if t.stale != s.stale ? t.stale : t.stamp < s.stamp {slot = i}
 		}
 		if slot < 0 {
 			fatal("game task switch to %#08x: %d tasks suspended, none made by a switch to discard", to_ra, MAX_TASKS)
 		}
-		if t := tasks[slot]; t.co != nil {
-			if !task_full_warned {
+		if t := &tasks[slot]; t.co != nil {
+			if !t.stale && !task_full_warned {
 				fmt.eprintfln("cpu: %d game tasks suspended; discarding the one at %#08x (sp %#08x), suspended longest", MAX_TASKS, t.ra, t.sp)
 				task_full_warned = true
 			}
-			core.co_kill(t.co)
-			tasks_reaped += 1
+			task_reap(t)
 		}
 		task_stamp += 1
-		tasks[slot] = {sp, link, task_entry, task_sp0, core.co_current, task_stamp}
+		tasks[slot] = {sp, link, task_entry, task_sp0, core.co_current, task_stamp, false}
 		task_entry, task_sp0 = to_entry, to_sp0
 		task_switches += 1
 		// A mod's replacement may switch tasks, as the function it stands in
