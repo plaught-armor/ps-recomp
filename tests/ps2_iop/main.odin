@@ -4142,8 +4142,65 @@ test_start_intr :: proc() {
 	id, _ := iop.iop_load(build_mod("modsp", &a, entry), "modsp", nil)
 	check(id > 0, "start: a start spinning on its transfer handler's flag returns")
 	check(id > 0 && iop.iop_u32(module_base(id) + flag)^ == 1, "start: the handler set the flag")
+	test_start_trans_callback(false)
+	test_start_trans_callback(true)
 	test_start_block_cross()
 	test_start_delay()
+}
+
+// A start that spins on a flag set at its voice transfer's end, as ICO's
+// SNDN2DRV syncs with an old-style sceSdSetTransCallback (fno 21): the
+// callback runs with a0 0 and the start returns. With a handler
+// (sceSdSetTransIntrHandler) set too, the handler runs and the callback does
+// not, as retail picks it first.
+test_start_trans_callback :: proc(with_handler: bool) {
+	fresh()
+	a: Asm
+	sd := imports(&a, "libsd", 17, 21, 26)
+	flag := at(&a)
+	put(&a, 0, 0xffffffff, 0) // flag, the callback's a0, the callback ran
+	src := at(&a)
+	put(&a, 0, 0, 0, 0, 0, 0, 0, 0)
+	cb := at(&a) // the callback: flag = 1, its a0 and 1 after the flag, returns 0
+	la(&a, T0, flag)
+	li(&a, T2, 1)
+	put(&a, 0xad000000 | T2 << 16, 0xad000004 | A0 << 16, 0xad000008 | T2 << 16) // sw t2, 0(t0); sw a0, 4(t0); sw t2, 8(t0)
+	put(&a, JR_RA, 0x24020000) // jr ra; li v0, 0
+	h := at(&a) // the handler: flag = 1, returns 0
+	la(&a, T0, flag)
+	li(&a, T2, 1)
+	put(&a, 0xad000000 | T2 << 16, JR_RA, 0x24020000) // sw t2, 0(t0); jr ra; li v0, 0
+	entry := at(&a)
+	put(&a, 0x27bdffe0, 0xafbf001c) // addiu sp, sp, -32; sw ra, 28(sp)
+	li(&a, A0, 0)
+	la(&a, A1, cb)
+	jal(&a, sd + 8) // sceSdSetTransCallback(0, cb)
+	if with_handler {
+		li(&a, A0, 0)
+		la(&a, A1, h)
+		li(&a, A2, 0)
+		jal(&a, sd + 16) // sceSdSetTransIntrHandler(0, h, 0)
+	}
+	li(&a, T2, 32)
+	put(&a, 0xafa00010 | T2 << 16) // sw t2, 16(sp): the size
+	li(&a, A0, 0)
+	li(&a, A1, 0)
+	la(&a, A2, src)
+	li32(&a, 7, 0x5000)
+	jal(&a, sd) // sceSdVoiceTrans(0, write, src, 0x5000, 32)
+	spin := at(&a)
+	lw_at(&a, T2, flag)
+	put(&a, 0x11400000 | (spin - at(&a) - 4) / 4 & 0xffff, 0) // beqz t2, spin
+	li(&a, V0, 0)
+	put(&a, 0x8fbf001c, JR_RA, 0x27bd0020) // lw ra, 28(sp); jr ra; addiu sp, sp, 32
+	id, _ := iop.iop_load(build_mod("modtc", &a, entry), "modtc", nil)
+	w :: proc(id: i32, at: u32) -> u32 {return iop.iop_u32(module_base(id) + at)^}
+	if !with_handler {
+		check(id > 0 && w(id, flag) == 1, "start: a start spinning on its old-style transfer callback's flag returns")
+		check(id > 0 && w(id, flag + 4) == 0, "start: the transfer callback runs with a0 0")
+	} else {
+		check(id > 0 && w(id, flag) == 1 && w(id, flag + 8) == 0, "start: with a transfer handler set too, the handler runs and the callback does not")
+	}
 }
 
 // A start that delays then finishes, as Jak II's OVERLORD polls a mailbox

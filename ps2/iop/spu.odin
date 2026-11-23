@@ -1251,7 +1251,7 @@ sd_next_ee :: proc() -> u64 {
 	if iop_sd.pending != 0 {return r3000.state.cycles * IOP_EE_RATIO}
 	t := max(u64)
 	for &b, c in spu.block {
-		if iop_sd.trans[c].func != 0 {t = min(t, sd_block_due(&b))}
+		if sd_trans_on(u32(c)) {t = min(t, sd_block_due(&b))}
 		if spu.irq_watch & (1 << u32(c)) != 0 {t = min(t, spu.in_irq[c])}
 	}
 	return t

@@ -7,7 +7,9 @@
 // transfer's buffer; the SPU2 handler (sceSdSetSpu2IntrHandler) when a core
 // with its IRQ enabled reaches IRQA. They run as the IOP's clock reaches
 // them (sd_intr_run, from iop_tick), on the handler coroutine sifcmd's
-// command handlers run on (th_intr). An id a call does not decode changes
+// command handlers run on (th_intr). With no handler set, the old-style
+// callback (sceSdSetTransCallback, sceSdSetIRQCallback) runs in its place,
+// with a0 0 (sd_pick). An id a call does not decode changes
 // nothing and raises a compat row.
 package ps2_iop
 
@@ -33,10 +35,29 @@ Sd_Handler :: struct {
 }
 
 Iop_Sd :: struct {
-	trans:   [2]Sd_Handler, // per channel
-	spu2:    Sd_Handler,
-	pending: u8, // the interrupts raised and not yet run, SD_PENDING_*
-	effect:  [2]Sd_Effect, // per core, as the last sceSdSetEffectAttr left it
+	trans:    [2]Sd_Handler, // per channel
+	trans_cb: [2]u32, // per channel, sceSdSetTransCallback's func: runs only while trans has none
+	spu2:     Sd_Handler,
+	spu2_cb:  u32, // sceSdSetIRQCallback's func: runs only while spu2 has none
+	pending:  u8, // the interrupts raised and not yet run, SD_PENDING_*
+	effect:   [2]Sd_Effect, // per core, as the last sceSdSetEffectAttr left it
+}
+
+// The function libsd's interrupt calls, and its a0: the handler
+// sceSdSetTransIntrHandler (26) or SetSpu2IntrHandler (27) set, with a0
+// `a0` and a1 its arg; else the old-style callback sceSdSetTransCallback
+// (21) or SetIRQCallback (22) set, with a0 0, as retail calls it (ICO's
+// LIBSD.IRX: transfer at text 0x2548 then 0x2580, SPU2 at 0x11d4 then
+// 0x11f8). func 0 when neither is set.
+@(private = "file")
+sd_pick :: proc(h: Sd_Handler, cb, a0: u32) -> (Sd_Handler, u32) {
+	if h.func != 0 {return h, a0}
+	return {cb, 0}, 0
+}
+
+// Whether channel c's transfer interrupt calls a handler or a callback.
+sd_trans_on :: proc(c: u32) -> bool {
+	return iop_sd.trans[c & 1].func != 0 || iop_sd.trans_cb[c & 1] != 0
 }
 
 Sd_Effect :: struct {
@@ -80,14 +101,14 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		// finishes inline without calling the handler. Burnout 3's RWA takes
 		// a handler call as its DMA request's end and dereferences the
 		// request, null after its IO-mode init transfers.
-		if a1 & 8 == 0 && s.trans[a0 & 1].func != 0 {s.pending |= SD_PENDING_TRANS << (a0 & 1)}
+		if a1 & 8 == 0 && sd_trans_on(a0) {s.pending |= SD_PENDING_TRANS << (a0 & 1)}
 		// Retail moves whole 64-byte blocks and returns the size rounded up
 		// to them, and callers check it: Jak II's OVERLORD takes less as a
 		// short transfer and retries it forever.
 		return (size + 63) &~ 63, true
 	case 18: // sceSdBlockTrans(channel, mode, iop address, size, start address)
 		v := sd_block_trans(a0, a1, a2, a3, r32(r[29] + 16))
-		if a1 & 3 != 2 {sd_block_arm(a0, s.trans[a0 & 1].func != 0)} // not a stop
+		if a1 & 3 != 2 {sd_block_arm(a0, sd_trans_on(a0))} // not a stop
 		iop_wake_set()
 		return v, true
 	case 19: // sceSdVoiceTransStatus(channel, flag): always done
@@ -96,6 +117,15 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		return sd_block_status(a0), true
 	case 30: // sceSdStopTrans(channel): voice transfers are done at once, so only a block transfer stops
 		return sd_stop_trans(a0), true
+	case 21: // sceSdSetTransCallback(channel, func): the previous func
+		old := s.trans_cb[a0 & 1]
+		s.trans_cb[a0 & 1] = a1
+		iop_wake_set()
+		return old, true
+	case 22: // sceSdSetIRQCallback(func): the previous func
+		old := s.spu2_cb
+		s.spu2_cb = a0
+		return old, true
 	case 23: // sceSdSetEffectAttr(core, sceSdEffectAttr *)
 		e := a1
 		return sd_set_effect_attr(a0, {r32(e), r32(e + 4), r32(e + 8), r32(e + 12), r32(e + 16)}), true
@@ -119,7 +149,7 @@ libsd_fn :: proc(fno: u32) -> (v0: u32, ok: bool) {
 		if mode >= 10 {return transmute(u32)i32(-100), true}
 		if mode == 0 {return 0, true}
 		sd_clear_effect(a0)
-		if s.trans[a1 & 1].func != 0 {s.pending |= SD_PENDING_TRANS << (a1 & 1)}
+		if sd_trans_on(a1) {s.pending |= SD_PENDING_TRANS << (a1 & 1)}
 		return 0, true
 	case 26: // sceSdSetTransIntrHandler(channel, func, arg): the previous func
 		h := &s.trans[a0 & 1]
@@ -289,13 +319,15 @@ sd_proc_batch_ex :: proc(batch, returns, count, mask: u32) -> u32 {
 sd_undo :: proc(saved: Iop_Sd, freed: []Sys_Block) {
 	s := &iop_sd
 	for c in u32(0) ..< 2 {
-		if sys_in(freed, s.trans[c].func) || sys_in(freed, s.trans[c].arg) {
+		if sys_in(freed, s.trans[c].func) || sys_in(freed, s.trans[c].arg) || sys_in(freed, s.trans_cb[c]) {
 			s.trans[c] = saved.trans[c]
+			s.trans_cb[c] = saved.trans_cb[c]
 			s.pending &~= SD_PENDING_TRANS << c
 		}
 	}
-	if sys_in(freed, s.spu2.func) || sys_in(freed, s.spu2.arg) {
+	if sys_in(freed, s.spu2.func) || sys_in(freed, s.spu2.arg) || sys_in(freed, s.spu2_cb) {
 		s.spu2 = saved.spu2
+		s.spu2_cb = saved.spu2_cb
 		s.pending &~= SD_PENDING_SPU2 | SD_PENDING_SPU2 << 1
 	}
 	sd_block_drop(freed)
@@ -424,11 +456,11 @@ sd_intr_run :: proc(now: u64) {
 	s := &iop_sd
 	for c in u32(0) ..< 2 {
 		for _ in 0 ..< SD_INTR_MAX {
-			h := s.trans[c]
+			h, a0 := sd_pick(s.trans[c], s.trans_cb[c], c)
 			if h.func == 0 {break}
 			crossed, generation := sd_block_cross(c, now)
 			if !crossed {break}
-			sd_intr(h, c)
+			sd_intr(h, a0)
 			sd_block_refilled(c, generation)
 		}
 	}
@@ -436,12 +468,14 @@ sd_intr_run :: proc(now: u64) {
 	p := s.pending
 	s.pending = 0
 	for c in u32(0) ..< 2 {
-		if p & (SD_PENDING_TRANS << c) != 0 && s.trans[c].func != 0 {sd_intr(s.trans[c], c)}
+		h, a0 := sd_pick(s.trans[c], s.trans_cb[c], c)
+		if p & (SD_PENDING_TRANS << c) != 0 && h.func != 0 {sd_intr(h, a0)}
 	}
 	// One call for the cores raised, a0 a bit each, as libsd's handler
 	// passes them (ps2sdk's freesd, Spu2Interrupt).
 	cores := u32(p / SD_PENDING_SPU2) & 3
-	if cores != 0 && s.spu2.func != 0 {sd_intr(s.spu2, cores)}
+	h, a0 := sd_pick(s.spu2, s.spu2_cb, cores)
+	if cores != 0 && h.func != 0 {sd_intr(h, a0)}
 }
 
 // Runs handler h with a0 `a0` and a1 its argument; one that waits is

@@ -681,7 +681,8 @@ drop_dangling :: proc(freed: []Sys_Block, m: Iop_Module) -> (handlers, stubs, li
 	for c in s.dma_cb[:s.n_dma_cb] {handlers += in_f(freed, c.func)}
 	for i in 0 ..< min(s.user_size, IOP_RAM_SIZE / 8) {handlers += in_f(freed, r32(s.user_tab + 8 * i))}
 	for h in iop_sd.trans {handlers += in_f(freed, h.func)}
-	handlers += in_f(freed, iop_sd.spu2.func)
+	for f in iop_sd.trans_cb {handlers += in_f(freed, f)}
+	handlers += in_f(freed, iop_sd.spu2.func) + in_f(freed, iop_sd.spu2_cb)
 	for h in iop_sdr.user {handlers += in_f(freed, h)}
 	for x in iop_vbl.h[:iop_vbl.n] {handlers += in_f(freed, x.handler)}
 	handlers += in_f(freed, iop_cd.callback)
