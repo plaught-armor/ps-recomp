@@ -319,6 +319,13 @@ emit_func :: proc(f: ^Func, out: ^strings.Builder, name: string, patches: []Patc
 			put(out, depth, fmt.aprintf("c.cycles += %d", s.n))
 		case .Return:
 			put(out, depth, "return")
+		case .Return_Link:
+			put(out, depth, fmt.aprintf("if back := cpu.return_link(%s, %s); back != 1 {{", hexu(f.start), hexu(f.end)))
+			put(out, depth + 1, "pc = back")
+			put(out, depth + 1, "if c.cycles >= cpu.next_event {io.run_events()}")
+			put(out, depth + 1, "continue")
+			put(out, depth, "}")
+			put(out, depth, "return")
 		case .Patch:
 			put(out, depth, fmt.aprintf("if %s {{", s.cond))
 			append(&ifs, true)

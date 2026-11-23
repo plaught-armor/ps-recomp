@@ -268,6 +268,17 @@ tail_call :: proc(addr, start, end: u32) -> u32 {
 	return ra
 }
 
+// A `jr $ra` in recompiled code in [start, end) that calls a routine in its
+// own code (recomp/r3000 local_links): the pc in this code where it goes on,
+// when $ra is one other than this code's return address (a link of a call
+// it made, the loop through a routine having branched into that routine's
+// code); else 1 (never an aligned pc), a return.
+return_link :: proc(start, end: u32) -> u32 {
+	ra := state.r[31]
+	if ra == frame_ret || ra - start >= end - start {return 1}
+	return ra
+}
+
 @(private)
 resolve_overlay :: proc(addr: u32) -> ^Ovl_Entry {
 	list, ok := dispatch.overlay[addr]

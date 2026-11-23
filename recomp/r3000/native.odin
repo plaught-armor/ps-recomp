@@ -78,6 +78,7 @@ R3000_SIGS := [?]native.Sig {
 	{"cpu.bad_insn", 2, false},
 	{"cpu.call", 1, false},
 	{"cpu.tail_call", 3, true},
+	{"cpu.return_link", 2, true},
 	{"cpu.call_back", 1, true},
 	{"cpu.jump_unknown", 2, false},
 	{"cpu.trace_block", 1, false},
@@ -1016,6 +1017,20 @@ native_func :: proc(a: ^native.Asm, f: ^Func, patches: []Patch, cycles: int, exa
 			native.state_add64(a, CYCLES, s.n)
 		case .Return:
 			native.ret(a)
+			leaves = true
+		case .Return_Link:
+			// 1: a return; else on at the pc in A, as a Goto_Reg
+			back := native.new_label(a)
+			native.mov_imm(a, .A, f.start)
+			native.mov_imm(a, .B, f.end)
+			native.call(a, "cpu.return_link", .A, .B)
+			native.br_cmp_imm(a, .Ne, .A, 1, back)
+			native.ret(a)
+			native.bind(a, back)
+			native.mov(a, .T, .A)
+			events(a)
+			if lookup < 0 {lookup = native.new_label(a)}
+			native.jmp(a, lookup)
 			leaves = true
 		case .Patch:
 			if !is_ident(s.cond) {

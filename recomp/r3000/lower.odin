@@ -14,6 +14,7 @@ Step_Kind :: enum u8 {
 	Bad,        // reserved instruction `i`
 	Cycles,     // charge `n` cycles
 	Return,
+	Return_Link, // a `jr $ra` where $ra may be a link this function set (local_links): pc = $ra when it is a pc in the function other than its return address (cpu.return_link); else Return
 	Patch,      // when `cond` holds, the steps up to the matching End
 	Goto,       // pc = `target` within the function; `check`: run due events first
 	Call,       // call the function at `target`
@@ -87,6 +88,29 @@ goto_ :: proc(l: ^Lowering, src, t: u32) {
 	put(l, {kind = .Return})
 }
 
+// Whether f calls a routine in its own code (a jal to a pc inside f other
+// than its entry), labelling each such call's return address. That routine
+// is f's code as well as a function of its own: f can branch into it with
+// the link of an earlier call still in $ra (a loop through a routine), and
+// its `jr $ra` then goes on in f at that link, not to f's caller. Hand-written
+// decoders do (Driver 2's MDEC VLC decoder at 0x80117980, learned as one run
+// with its routine at 0x80117ac0). Such a `jr $ra` lowers to Return_Link.
+// Functions split at every jal target (a disc's) seldom have such a call:
+// only one whose range starts below its entry (Tarzan's 0x8002ff2c, from
+// 0x8002fe80, which it calls).
+@(private = "file")
+local_links :: proc(l: ^Lowering) -> bool {
+	f := l.f
+	found := false
+	for pc, i in l.insns {
+		if i.kind == .Call && i.target != f.entry && inside(f, i.target) {
+			f.labels[pc + 8] = {}
+			found = true
+		}
+	}
+	return found
+}
+
 // f's steps, in context.temp_allocator, as is all else lower takes (but
 // f.warnings): its callers free it per function (native_func, emit_func).
 lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step {
@@ -107,6 +131,7 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step 
 	for pc, i in f.insns {
 		l.insns[pc] = decode(pc, i.w)
 	}
+	local := local_links(&l)
 	skip_delay := make(Set, context.temp_allocator)
 	for idx := 0; idx < len(pcs); {
 		pc := pcs[idx]
@@ -249,7 +274,7 @@ lower :: proc(f: ^Func, patches: []Patch, cycles: int, exact := true) -> []Step 
 		case .Jr:
 			if i.rs == 31 {
 				delay(&l, d, slot_op)
-				put(&l, {kind = .Return})
+				put(&l, {kind = local ? .Return_Link : .Return})
 			} else {
 				put(&l, {kind = .Jump_Reg, n = i.rs})
 				delay(&l, d, slot_op)

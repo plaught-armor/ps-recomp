@@ -33,8 +33,10 @@ import "core:slice"
 BLOB_MAGIC :: 0x4e525350 // "PSRN"
 // core.NATIVE_VERSION, which reads it. 5: a wasm32 blob imports a shared
 // memory (wasm.odin). 6: EE code takes cop0[9] as the base of Count
-// (ps2/cpu count_read).
-BLOB_VERSION :: 6
+// (ps2/cpu count_read). 7: a PS1 `jr $ra` in a function that calls a
+// routine in its own code goes on at that call's link (recomp/r3000
+// local_links).
+BLOB_VERSION :: 7
 
 // core/native.odin's Native_Kind.
 Span_Kind :: enum u32 {
